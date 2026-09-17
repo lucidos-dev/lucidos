@@ -9,9 +9,7 @@ use crate::core::PreferenceStore;
 use crate::engine::agentic_loop::{
     cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
 };
-use crate::engine::context::{
-    agent_context_char_budget, tool_definitions_chars, trim_history_from_oldest,
-};
+use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest};
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
@@ -1381,7 +1379,14 @@ impl LucidosEngine {
         // have exited. The two remaining awaits (stopped-server summaries, the
         // capture preference) are in-memory / single-row and are followed
         // immediately by the loop's own pre-iteration check.
-        tools.extend(self.mcp_manager.get_tool_definitions().await);
+        let mcp_surface = self.mcp_manager.tool_surface().await;
+        // The stamp rides with the tools so the loop can tell whether what it
+        // holds is still current. It is the only part of the array that can
+        // move mid-turn; see `TurnTools`.
+        let tools = crate::engine::agentic_loop::TurnTools::new(
+            tools.into_iter().chain(mcp_surface.tools).collect(),
+            mcp_surface.generation,
+        );
         if cancel_token.is_cancelled() {
             return Ok(self
                 .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
@@ -1398,8 +1403,7 @@ impl LucidosEngine {
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let total_budget = agent_context_char_budget(self.context_window_for(resolved_model));
-        let tool_defs_chars = tool_definitions_chars(&tools);
-        let prompt_overhead: usize = system_prompt.len() + tool_defs_chars;
+        let prompt_overhead: usize = system_prompt.len() + tools.defs_chars();
         let message_budget = total_budget.saturating_sub(prompt_overhead);
 
         // `loaded_knowhow_docs` was already populated up in the follow-up
@@ -1545,6 +1549,12 @@ impl LucidosEngine {
         // so the same `&str` reference can be reused by `build_capture_sections`
         // below without violating control-flow init checks. Empty strings are
         // filtered out of both the user-message parts and the capture rows.
+        //
+        // Read once, and this block is fixed for the turn: rewriting it would
+        // forfeit the message-prefix cache. The tool array is NOT fixed (ADR
+        // 0195), so a server the agent starts mid-turn leaves this list wrong.
+        // The loop corrects it in the round's tail rather than here, via
+        // `agentic_loop::mcp_surface_correction`.
         let stopped_summaries = self.mcp_manager.get_stopped_server_summaries().await;
         let mcp_stopped_context = if !stopped_summaries.is_empty() {
             format!(
@@ -1630,7 +1640,6 @@ impl LucidosEngine {
             &resume_tool_blocks,
             capture_body,
         );
-        let capture_tools: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         let capture_model = resolved_model.to_string();
 
         let user_content = build_user_content_with_images(
@@ -1665,7 +1674,7 @@ impl LucidosEngine {
             .run_agentic_loop(
                 &mut messages,
                 &system_prompt,
-                &tools,
+                tools,
                 request_id,
                 thread_id,
                 response_channel,
@@ -1684,8 +1693,6 @@ impl LucidosEngine {
                 &mut terminator_settled,
                 crate::engine::agentic_loop::ContextCaptureSeed {
                     sections: &capture_sections,
-                    tools: &capture_tools,
-                    tool_defs_chars,
                     model: &capture_model,
                     capture_body,
                 },

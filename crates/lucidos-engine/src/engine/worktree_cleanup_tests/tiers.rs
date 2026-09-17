@@ -521,6 +521,58 @@ async fn tier_2_preserves_branch_if_unmerged_commits_exist() {
     teardown_test_db(&db_name).await;
 }
 
+/// A Tier-2 reclaim under hard pressure is announced.
+///
+/// `run_once` folds every other tier's freed bytes into `total_freed_under_hard`,
+/// and `emit_auto_cleanup_alert` is gated on that total being above zero. The
+/// Tier-2 arm threw its own count away. A cycle where Tier 2 was the only
+/// reclaim then deleted the user's worktree and told them nothing. With Tier 1
+/// also running, the notification fired but named Tier 1's bytes alone.
+///
+/// The fixture is the shape that reaches Tier 2 on its own: no build artifacts
+/// for Tier 1 to strip, and a commit on the branch, which is what makes Tier 0
+/// decline it.
+#[tokio::test]
+async fn a_tier_2_only_reclaim_under_hard_pressure_is_announced() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.free_hard_bytes = u64::MAX;
+    worker.free_soft_bytes = u64::MAX;
+
+    let rx = bus.subscribe();
+    worker.run_once().await;
+
+    assert!(
+        !worktree.exists(),
+        "precondition: Tier 2 is the arm that ran, and it removed the worktree"
+    );
+    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
+    let alerts: Vec<_> = notifications
+        .into_iter()
+        .filter(|n| n.title == "Lucidos reclaimed disk space")
+        .collect();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "the engine deleted a worktree under hard pressure and must say so. \
+         Tier 2's bytes were dropped from the freed total, which is what the \
+         notification is gated on. Got: {:?}",
+        alerts
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn legacy_random_suffix_worktrees_are_skipped() {
     // Anything in `.lucidos/worktrees/` whose name doesn't match the

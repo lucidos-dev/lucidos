@@ -1,8 +1,110 @@
 use super::super::types::*;
 use super::collect_dismissed_event_ids;
+use super::spoken_merge::{is_one_utterance, join_spoken};
 use crate::core::EventRow;
 use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
 use chrono::{DateTime, Utc};
+
+/// Who said a spoken row, and under whose label the doer reads it.
+///
+/// The two sides never merge into each other, so this is the identity
+/// [`push_spoken`] compares. The talker carries its own agent (ADR 0150), so
+/// the doer never reads a spoken reply as its own prior turn.
+enum SpokenSide {
+    Caller,
+    Talker(Option<AgentParticipant>),
+}
+
+/// The spoken row most recently pushed, so the next one can ask whether the
+/// two are one thing said.
+struct SpokenTail {
+    index: usize,
+    from_caller: bool,
+    created: DateTime<Utc>,
+    /// Which CALL it belonged to. A dropped line redialled within the gap
+    /// bound would otherwise glue the end of one call onto the start of the
+    /// next: nothing between them reaches `messages`, so adjacency alone reads
+    /// them as neighbours.
+    session: Option<String>,
+}
+
+/// The call a spoken row belongs to, as its payload names it.
+fn session_of(event: &EventRow) -> Option<String> {
+    event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Add one spoken row, folding it into the row before it when the two are one
+/// thing said.
+///
+/// One breath is several rows (ADR 0201), and the doer must read the sentence
+/// rather than the pieces. The rule is [`super::spoken_merge`]; this places it.
+///
+/// **Only a row still at the very end folds.** Anything else reaching
+/// `messages` between the two means they are not neighbours, however close
+/// their clocks are.
+fn push_spoken(
+    messages: &mut Vec<SessionMessage>,
+    tail: &mut Option<SpokenTail>,
+    side: SpokenSide,
+    event: &EventRow,
+    text: &str,
+    current_thread_id: Option<String>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let from_caller = matches!(side, SpokenSide::Caller);
+    let session = session_of(event);
+    if let Some(prev) = tail.as_mut() {
+        let adjacent = prev.index + 1 == messages.len();
+        let gap = (event.created - prev.created).num_milliseconds() as f64 / 1000.0;
+        let same_speaker = prev.from_caller == from_caller && prev.session == session;
+        if adjacent && is_one_utterance(gap, same_speaker) {
+            let merged = join_spoken(&messages[prev.index].content, text);
+            messages[prev.index].content = merged;
+            // Measured between NEIGHBOURS, so a long run of quick pieces stays
+            // one utterance rather than timing out against its own first word.
+            prev.created = event.created;
+            return;
+        }
+    }
+    let (role, agent, completed) = match side {
+        SpokenSide::Caller => ("user", None, None),
+        SpokenSide::Talker(agent) => ("assistant", agent, Some(true)),
+    };
+    messages.push(SessionMessage {
+        role: role.to_string(),
+        content: text.trim().to_string(),
+        created_at: event.created,
+        channel: None,
+        steps: vec![],
+        images: vec![],
+        user_image_hashes: vec![],
+        image_description: None,
+        completed,
+        canceled: false,
+        aborted: false,
+        text_chunks: vec![],
+        events: vec![],
+        request_event_id: None,
+        event_id: Some(event.id.to_string()),
+        thread_id: event
+            .thread_id
+            .map(|uuid| uuid.to_string())
+            .or(current_thread_id),
+        agent,
+    });
+    *tail = Some(SpokenTail {
+        index: messages.len() - 1,
+        from_caller,
+        created: event.created,
+        session,
+    });
+}
 
 /// Which agent authored this event, when its actor names one (ADR 0150).
 ///
@@ -120,6 +222,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
     let mut last_text_event_len: usize = 0;
     let mut current_request_event_id: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
+    let mut spoken_tail: Option<SpokenTail> = None;
 
     // `ContextDismissed` records ask the projection to drop the corresponding
     // history entry on every future read. They came from the retired
@@ -818,32 +921,19 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if !text.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "assistant".to_string(),
-                        content: text.to_string(),
-                        created_at: event.created,
-                        channel: None,
-                        steps: vec![],
-                        images: vec![],
-                        user_image_hashes: vec![],
-                        image_description: None,
-                        completed: Some(true),
-                        canceled: false,
-                        aborted: false,
-                        text_chunks: vec![],
-                        events: vec![],
-                        request_event_id: None,
-                        event_id: Some(event.id.to_string()),
-                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
-                        agent: authoring_agent(event),
-                    });
-                }
+                push_spoken(
+                    &mut messages,
+                    &mut spoken_tail,
+                    SpokenSide::Talker(authoring_agent(event)),
+                    event,
+                    text,
+                    current_thread_id.clone(),
+                );
             }
             "SpokenMessageReceived" => {
-                // Something the caller said that the talker answered alone. It
-                // started no turn, so it is not a `MessageReceived`. The doer
-                // still has to read it: the next question can lean on it.
+                // Something the caller said on a call. It started no turn, so
+                // it is not a `MessageReceived`. The doer still has to read it:
+                // the next question can lean on it.
                 //
                 // A `user` message, because the caller said it. Consumes
                 // nothing pending, exactly as a spoken reply does.
@@ -852,27 +942,14 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if !text.trim().is_empty() {
-                    messages.push(SessionMessage {
-                        role: "user".to_string(),
-                        content: text.to_string(),
-                        created_at: event.created,
-                        channel: None,
-                        steps: vec![],
-                        images: vec![],
-                        user_image_hashes: vec![],
-                        image_description: None,
-                        completed: None,
-                        canceled: false,
-                        aborted: false,
-                        text_chunks: vec![],
-                        events: vec![],
-                        request_event_id: None,
-                        event_id: Some(event.id.to_string()),
-                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
-                        agent: None,
-                    });
-                }
+                push_spoken(
+                    &mut messages,
+                    &mut spoken_tail,
+                    SpokenSide::Caller,
+                    event,
+                    text,
+                    current_thread_id.clone(),
+                );
             }
             "WorkDelegated" => {
                 // Why the talker asked for this turn, in its own words. Under

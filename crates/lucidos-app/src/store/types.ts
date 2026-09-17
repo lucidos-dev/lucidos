@@ -365,9 +365,6 @@ export type ResponseEvent =
       type: 'spoken_reply';
       text: string;
       interrupted: boolean;
-      /** Still being said, so the words are still arriving. The talker's LIVE
-       *  row wears this; the engine's own row never does. */
-      live?: boolean;
       /** Another spoken row came directly before this one, so the call mark is
        *  drawn on that one alone. A run says "this was said aloud" once. */
       follows?: boolean;

@@ -97,9 +97,12 @@ impl CommandShell {
         }
     }
 
-    /// True when the resolved shell applies `pipefail`. Read by tests and by
-    /// callers that want to describe the guarantee; the spawn helpers apply it
-    /// themselves.
+    /// True when the resolved shell applies `pipefail`.
+    ///
+    /// Read by the tests below, which is its whole job: a box with no bash
+    /// genuinely does not hold the guarantee, so they skip the pipeline cases
+    /// rather than assert a lie. No production caller asks, because the spawn
+    /// helpers apply the flag themselves and the resolver logs the fallback.
     pub fn has_pipefail(&self) -> bool {
         self.pipefail
     }

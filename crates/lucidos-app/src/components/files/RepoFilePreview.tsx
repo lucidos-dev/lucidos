@@ -248,7 +248,10 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   const content = loadable.status === 'loaded' ? loadable.data : null;
   const isCode = CODE_EXTS.includes(ext);
 
-  const renderedHtml = useMemo(() => {
+  // What this string IS depends on `body`, which is why it cannot be named for
+  // HTML: markdown and csv render to markup, and svg renders to an object URL an
+  // `<img src>` loads. Only the branch that produced it may say which.
+  const renderedBody = useMemo(() => {
     if (!content) return null;
     if (body === 'markdown') return renderMarkdown(content);
     if (body === 'csv') return renderCsvTable(content);
@@ -257,8 +260,8 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   }, [content, body]);
 
   useEffect(() => {
-    if (renderedHtml && body === 'svg') return () => URL.revokeObjectURL(renderedHtml);
-  }, [renderedHtml, body]);
+    if (renderedBody && body === 'svg') return () => URL.revokeObjectURL(renderedBody);
+  }, [renderedBody, body]);
 
   const rows = useMemo(
     () => fileRows(content ? (isCode ? highlightFileLines(content, ext) : content.split('\n').map(escapeHtml)) : []),
@@ -274,11 +277,11 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   //
   // `.repo-file-rendered` insets the content to match the rendered diff
   // (.rendered-diff), so toggling between them keeps the same gutter.
-  if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} /></div>;
-  if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
+  if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedBody! }} /></div>;
+  if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedBody! }} />;
   // The media variant keeps a definite height so the image's max-height:100%
   // still fits the pane (the bare padding wrapper would leave it unconstrained).
-  if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedHtml!} alt={path} /></div>;
+  if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedBody!} alt={path} /></div>;
 
   return (
     <div class="repo-file-content">

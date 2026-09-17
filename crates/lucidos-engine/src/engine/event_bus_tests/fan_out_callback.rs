@@ -1850,3 +1850,269 @@ async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// ---------------------------------------------------------------------------
+// The auto-resume hold: a terminal the engine will resume is not a completion
+// ---------------------------------------------------------------------------
+
+/// Emit the terminal a Claude Code turn produces when the upstream connection
+/// dies mid-response. This is the exact string from the incident.
+async fn emit_api_drop_failure(bus: &EventBus, thread_id: Uuid) {
+    emit_response_failed(bus, thread_id, API_DROP_ERROR).await;
+}
+
+const API_DROP_ERROR: &str =
+    "API Error: Connection lost mid-response. The response above may be incomplete.";
+
+async fn emit_response_failed(bus: &EventBus, thread_id: Uuid, error: &str) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseFailed {
+            error: error.into(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// Read the `status` of the single completion card sitting on `parent_id`.
+async fn read_completion_status(pool: &PgPool, parent_id: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'status' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .flatten()
+}
+
+async fn emit_api_error_continuation(bus: &EventBus, thread_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ContinuationRequested {
+            reason: crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON.to_string(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+}
+
+/// **The incident.** A child died on a transient upstream drop, the engine
+/// resumed it, and the parent was told it had FAILED. The parent believed the
+/// card, read the child's branch as empty, and spawned a duplicate session onto
+/// the same files.
+///
+/// A held terminal announces nothing, and the resumed turn's own terminal is the
+/// one report. Note what the hold does NOT touch: `parent_callback_pending`
+/// stays TRUE, which is exactly what lets the real terminal through.
+#[tokio::test]
+async fn a_held_terminal_is_not_announced_and_the_resumed_turn_reports_once() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    // The engine decided to resume before it emitted the terminal.
+    bus.auto_resume_holds()
+        .hold(child_id, API_DROP_ERROR.into());
+
+    // Both events a dropped turn produces, in the order the run loop emits them.
+    emit_api_drop_failure(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "a terminal the engine is about to resume must not be announced as a completion: \
+         a parent that believes it spawns a duplicate onto the same files"
+    );
+    assert!(
+        callback_rx.try_recv().is_err(),
+        "and the parent must not be woken to react to it"
+    );
+    assert!(
+        read_callback_pending(&pool, child_id).await,
+        "the child still owes its parent a card, so the marker must survive the hold: \
+         clearing it would send the real terminal into the dedup guard"
+    );
+
+    // The resume lands and the child works again.
+    emit_api_error_continuation(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "the resumed child is working again").await;
+
+    // The real terminal. THIS is the report.
+    bus.auto_resume_holds().release(child_id);
+    emit_cc_idle(&bus, child_id, true, None).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "exactly one card for the whole episode, at the real terminal"
+    );
+    assert_eq!(
+        read_completion_status(&pool, parent_id).await.as_deref(),
+        Some("success"),
+        "and it describes what the child actually did, not the drop it survived"
+    );
+    let mut wakes = 0;
+    while callback_rx.try_recv().is_ok() {
+        wakes += 1;
+    }
+    assert_eq!(wakes, 1, "and exactly one wake");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// **The counterweight, and the more dangerous direction.** Past the budget the
+/// thread parks for good, so the card MUST fire. A silent dead child is worse
+/// than the duplicate spawn this change fixes.
+///
+/// That is why suppression keys on the HOLD and never on the error class. The
+/// same drop that was withheld above reports here, because the engine took no
+/// hold for it. The budget's own half of the decision is DB-backed next door, in
+/// `resume_tests::api_error_budget_accumulates_then_resets_on_a_completed_turn`.
+#[tokio::test]
+async fn an_unheld_api_drop_reports_the_failure_to_the_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_api_drop_failure(&bus, child_id).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a parked child MUST report: nothing else is going to move this thread"
+    );
+    assert_eq!(
+        read_completion_status(&pool, parent_id).await.as_deref(),
+        Some("failure"),
+        "and it reports the failure honestly"
+    );
+    assert!(callback_rx.try_recv().is_ok(), "and wakes the parent");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A failure the engine would never resume reports immediately, exactly as
+/// before. `error_max_turns` reproduces on resume, so it takes no hold.
+#[tokio::test]
+async fn a_non_transient_failure_still_reports_immediately() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_response_failed(&bus, child_id, "error_max_turns").await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a deterministic failure is a real completion and reaches the parent at once"
+    );
+    assert_eq!(
+        read_completion_status(&pool, parent_id).await.as_deref(),
+        Some("failure"),
+    );
+    assert!(callback_rx.try_recv().is_ok(), "and wakes the parent");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// **The promise the hold makes, paid back.** The card was withheld because a
+/// resume was coming. When the continuation does not persist, nothing will ever
+/// move this thread, so the withheld failure has to reach the parent after all.
+#[tokio::test]
+async fn a_resume_that_never_happened_announces_the_terminal_it_withheld() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    bus.auto_resume_holds()
+        .hold(child_id, API_DROP_ERROR.into());
+    emit_api_drop_failure(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "withheld while the hold stands"
+    );
+
+    // The continuation did not persist, so the release announces instead.
+    let withheld = bus.auto_resume_holds().release(child_id).unwrap();
+    bus.announce_withheld_completion(child_id, withheld).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a decision nobody actuated must still reach the parent"
+    );
+    assert_eq!(
+        read_completion_status(&pool, parent_id).await.as_deref(),
+        Some("failure"),
+        "reported as the failure it was, not as a completed turn"
+    );
+    let summary: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'summary' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        summary.as_deref(),
+        Some(API_DROP_ERROR),
+        "carrying the error the hold kept, so the parent learns what went wrong"
+    );
+    assert!(callback_rx.try_recv().is_ok(), "and wakes the parent");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A hold names one child. Another child failing in the same breath, which is
+/// what a network drop looks like from here, still reports.
+#[tokio::test]
+async fn a_hold_on_one_child_does_not_silence_its_sibling() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, held_child) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, held_child).await;
+    let sibling = Uuid::new_v4();
+    emit_cc_message_received(&bus, sibling, Some(parent_id), "the other half").await;
+    emit_cc_session_started(&bus, sibling).await;
+
+    bus.auto_resume_holds()
+        .hold(held_child, API_DROP_ERROR.into());
+    emit_api_drop_failure(&bus, held_child).await;
+    emit_api_drop_failure(&bus, sibling).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "only the held child stays quiet; the sibling nobody is resuming reports"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

@@ -166,8 +166,10 @@ impl PanelPreviewSlots {
 /// was offset by whatever gap `main` happened to have.
 fn title_bar_gap(window: &tauri::Window, viewport_height: f64) -> f64 {
     let scale = window.scale_factor().unwrap_or(1.0);
-    let window_h = window
-        .inner_size()
+    // Through `app_window::window_content_size`, never `inner_size`, which
+    // answers with the PAGE on macOS (ADR 0202). Asking the page how tall the
+    // window is makes this gap the difference between the page and itself.
+    let window_h = crate::app_window::window_content_size(window)
         .map(|s| s.height as f64 / scale)
         .unwrap_or(0.0);
     (window_h - viewport_height).max(0.0)

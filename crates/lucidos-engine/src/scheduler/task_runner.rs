@@ -874,7 +874,36 @@ async fn detach_tracked_task(
     tracked.remove(&task_id);
 }
 
-/// Check health of tracked tasks and restart any that have crashed
+/// What the health monitor does with a tracked runner whose task has finished.
+///
+/// A clean exit and a panic look identical through a `JoinHandle`, so the
+/// decision is read off the config instead. Pure, so the dead-schedule case is
+/// testable without a scheduler or an engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FinishedRunner {
+    /// Spawn a fresh runner: the trigger is live and its schedule can fire.
+    Restart,
+    /// Drop the tracked entry, naming the problem. A runner whose cron can
+    /// never fire exits in microseconds, so restarting it logged a crash and
+    /// spawned a replacement twice a minute, forever.
+    Drop(String),
+    /// Leave the entry alone: the trigger is paused, schedule-less, or gone.
+    Leave,
+}
+
+fn finished_runner_action(config: &TriggerConfig) -> FinishedRunner {
+    if let Some(problem) = config.schedule_error() {
+        return FinishedRunner::Drop(problem);
+    }
+    if config.paused || config.schedule.is_empty() {
+        return FinishedRunner::Leave;
+    }
+    FinishedRunner::Restart
+}
+
+/// Check health of tracked tasks and restart any that have crashed. A runner
+/// that exited on a dead schedule is untracked instead, per
+/// [`finished_runner_action`].
 pub(super) async fn check_task_health_and_restart(
     tracked: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: SharedEngine,
@@ -886,33 +915,58 @@ pub(super) async fn check_task_health_and_restart(
     }
 
     let mut to_restart: Vec<(uuid::Uuid, String, String, Vec<String>, String)> = Vec::new();
+    let mut to_drop: Vec<uuid::Uuid> = Vec::new();
 
     // Check which tasks have finished (crashed or exited)
     {
         let tracked_read = tracked.read().await;
         let configs = trigger_configs.read().unwrap();
         for (task_id, task_info) in tracked_read.iter() {
-            if task_info.handle.is_finished() {
-                // Find matching config by deriving UUID from trigger_id
-                let matching_config = configs
-                    .values()
-                    .find(|c| trigger_id_to_uuid(&c.id) == *task_id);
-                if let Some(config) = matching_config {
-                    if !config.paused && !config.schedule.is_empty() {
-                        log!(
-                            "[Scheduler] Task '{}' crashed or exited unexpectedly, will restart",
-                            task_info.task_name
-                        );
-                        to_restart.push((
-                            *task_id,
-                            config.id.clone(),
-                            config.name.clone(),
-                            config.schedule.clone(),
-                            config.timezone.clone(),
-                        ));
-                    }
-                }
+            if !task_info.handle.is_finished() {
+                continue;
             }
+            // Find matching config by deriving UUID from trigger_id. A trigger
+            // deleted while its runner was finishing has none, and the entry is
+            // left for the delete handler to clear.
+            let matching = configs
+                .values()
+                .find(|c| trigger_id_to_uuid(&c.id) == *task_id);
+            let Some(config) = matching else {
+                continue;
+            };
+            match finished_runner_action(config) {
+                FinishedRunner::Restart => {
+                    log!(
+                        "[Scheduler] Task '{}' crashed or exited unexpectedly, will restart",
+                        task_info.task_name
+                    );
+                    to_restart.push((
+                        *task_id,
+                        config.id.clone(),
+                        config.name.clone(),
+                        config.schedule.clone(),
+                        config.timezone.clone(),
+                    ));
+                }
+                FinishedRunner::Drop(problem) => {
+                    log!(
+                        "[Scheduler] Task '{}' exited because its schedule can never fire: {}. Not restarting it; fix the cron to re-arm it.",
+                        task_info.task_name,
+                        problem
+                    );
+                    to_drop.push(*task_id);
+                }
+                FinishedRunner::Leave => {}
+            }
+        }
+    }
+
+    // Untrack the dead-schedule runners, so the line above is logged once
+    // rather than on every 30-second tick.
+    if !to_drop.is_empty() {
+        let mut tracked_write = tracked.write().await;
+        for task_id in to_drop {
+            tracked_write.remove(&task_id);
         }
     }
 
@@ -1040,6 +1094,57 @@ mod tests {
         let tracked = Arc::new(RwLock::new(HashMap::new()));
         cancel_tracked_task(&tracked, uuid::Uuid::new_v4()).await;
         assert!(tracked.read().await.is_empty());
+    }
+
+    // ── What the health monitor does with a finished runner ─────────────────
+
+    /// A replayed trigger on `schedule`, built by the same parser boot uses.
+    fn scheduled_trigger(schedule: &[&str], paused: bool) -> TriggerConfig {
+        let mut config = TriggerConfig::from_created_payload(&serde_json::json!({
+            "trigger_id": "t-1",
+            "name": "Nightly",
+            "schedule": schedule,
+            "timezone": "UTC",
+            "run": { "type": "intent", "intent": "go" },
+        }))
+        .expect("the payload parses");
+        config.paused = paused;
+        config
+    }
+
+    /// A cron that can never fire exits its runner at once, and that is not a
+    /// crash.
+    ///
+    /// `warn_on_dead_schedules` keeps such a trigger registered on purpose, so
+    /// `run_task_loop` returns "no more occurrences" in microseconds. The
+    /// monitor used to read the finished handle as a crash, so it spawned a
+    /// replacement every 30 seconds, forever.
+    #[test]
+    fn a_dead_schedule_is_dropped_rather_than_restarted() {
+        let config = scheduled_trigger(&["0 0 9 31 2 *"], false);
+        let problem = config.schedule_error().expect("February 31 never fires");
+        let action = finished_runner_action(&config);
+        assert_eq!(action, FinishedRunner::Drop(problem));
+    }
+
+    #[test]
+    fn a_live_schedule_is_still_restarted() {
+        assert_eq!(
+            finished_runner_action(&scheduled_trigger(&["0 0 8 * * *"], false)),
+            FinishedRunner::Restart
+        );
+    }
+
+    #[test]
+    fn a_paused_or_schedule_less_trigger_is_left_alone() {
+        assert_eq!(
+            finished_runner_action(&scheduled_trigger(&["0 0 8 * * *"], true)),
+            FinishedRunner::Leave
+        );
+        assert_eq!(
+            finished_runner_action(&scheduled_trigger(&[], false)),
+            FinishedRunner::Leave
+        );
     }
 
     // ── Missed-slot catch-up decision ───────────────────────────────────────

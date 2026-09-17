@@ -1005,11 +1005,12 @@ export function ThreadView() {
         el.scrollTop = pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight);
     }, [edgeKey]);
 
-    // After the up-chevron renders the full thread (set renderCount = Infinity),
-    // jump to the genuine top once the expanded list commits. scrollToTop() forces
-    // _resizeMode='ignore' first, so the huge render-all ResizeObserver grow can't
-    // hit onResize's scroll-mode branch and pin us back to the bottom. Runs before
-    // paint so the user never sees the intermediate position.
+    // After the up-chevron sets a whole-thread render floor, jump to the genuine
+    // top once the expanded list commits. `scrollToTop()` starts a tween, and
+    // `honourGrowth` in scrollState stands every growth round down while one is
+    // in flight. So the render-all's ResizeObserver cannot pin the reader back
+    // to the bottom. Runs before paint so the user never sees the intermediate
+    // position.
     useLayoutEffect(() => {
         if (!pendingScrollTopRef.current) return;
         pendingScrollTopRef.current = false;

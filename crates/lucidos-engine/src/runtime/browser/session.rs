@@ -365,8 +365,8 @@ impl BrowserRuntime {
         Ok(format!("Closed {} browser instance(s)", count))
     }
 
-    /// Delete all browser data: profile directory and login records.
-    /// Closes any running browsers first.
+    /// Delete all browser data: profile directory, login records and the
+    /// headless blocklist. Closes any running browsers first.
     pub async fn clear_data(&self) -> Result<String, String> {
         self.close_all().await?;
 
@@ -381,6 +381,12 @@ impl BrowserRuntime {
         BrowserLogins::clear(&self.pool)
             .await
             .map_err(|e| format!("Failed to clear browser logins: {}", e))?;
+
+        // The only way to undo a headless block. Nothing else removes a row,
+        // so a false positive would otherwise outlive the profile it came from.
+        HeadlessBlocklist::clear(&self.pool)
+            .await
+            .map_err(|e| format!("Failed to clear headless blocklist: {}", e))?;
 
         Ok("All browser data cleared (cookies, logins, localStorage, cache)".to_string())
     }

@@ -59,6 +59,25 @@ export const WORDS_BOUND_MS = 10_000;
 export const HEARING_YOU = 'Hearing you';
 
 /**
+ * How long the caller must have been quiet before their next word cuts the
+ * talker off.
+ *
+ * **A barge-in is the caller TAKING the floor.** Somebody finishing the
+ * sentence the talker talked over is taking nothing: they never handed it over.
+ * The gate alone cannot tell the two apart, because it shuts after 320 ms and a
+ * breath before a trailing "please" is longer than that.
+ *
+ * One second. A comma-length pause is a few hundred milliseconds. A caller who
+ * really did hand the floor over has been quiet for the provider's whole round
+ * trip.
+ *
+ * Read off the CAPTURED AUDIO, never off a wall clock: the runner counts quiet
+ * frames, which are 40 ms each. So this measures the caller's own silence, and
+ * a slow render cannot stretch it.
+ */
+export const BARGE_IN_QUIET_MS = 1_000;
+
+/**
  * A call holds every word either side has said, as it is said.
  *
  * ADR 0174 is why the caller's finished words are kept: the engine holds them
@@ -155,8 +174,12 @@ export type CallInput =
    * One input for both readings. Over the talker it is an interruption, and on
    * the caller's own floor it is an utterance starting. Which one it is depends
    * on the phase, which is this reducer's to know and not the gate's.
+   *
+   * `quietMs` is how long they had been quiet before this edge, measured in
+   * captured audio. It is what separates cutting the talker off from finishing
+   * a sentence it talked over. See {@link BARGE_IN_QUIET_MS}.
    */
-  | { kind: 'speech'; open: boolean }
+  | { kind: 'speech'; open: boolean; quietMs: number }
   /** An utterance whose words never landed has run out of time. */
   | { kind: 'utterance-timeout' }
   | { kind: 'socket-closed' }
@@ -270,7 +293,7 @@ export function stepCall(
     case 'frame':
       return onFrame(state, input.frame);
     case 'speech':
-      return onSpeech(state, input.open);
+      return onSpeech(state, input.open, input.quietMs);
     case 'utterance-timeout':
       // The words never came, so the row promising them is withdrawn. Only a
       // wait can time out: a `live` utterance is bounded by the caller.
@@ -293,12 +316,22 @@ function unchanged(state: CallState): { state: CallState; effects: CallEffect[] 
 /**
  * The caller started or stopped making speech.
  *
- * Over the talker, the start is an interruption AND the beginning of an
- * utterance. Both, because the barge-in hands the floor straight back: by the
- * time anything reads this state the caller has it and is using it. Splitting
- * the two would cost the row the 120 ms the gate has already spent.
+ * Over the talker, a start that CUTS IN is an interruption AND the beginning of
+ * an utterance. Both, because the barge-in hands the floor straight back: by
+ * the time anything reads this state the caller has it and is using it.
+ * Splitting the two would cost the row the 120 ms the gate has already spent.
+ *
+ * **A start that does not cut in leaves the talker speaking.** The caller is
+ * finishing a sentence it talked over, so nothing is stopped and nothing is
+ * sent. Cutting there is what punched a hole in one reply: the speaker's queue
+ * went, the talker carried on, and the caller heard the rest of the same
+ * sentence land after their own words. See {@link BARGE_IN_QUIET_MS}.
  */
-function onSpeech(state: CallState, open: boolean): { state: CallState; effects: CallEffect[] } {
+function onSpeech(
+  state: CallState,
+  open: boolean,
+  quietMs: number,
+): { state: CallState; effects: CallEffect[] } {
   if (!hearsTheCaller(state.phase)) return unchanged(state);
   if (!open) {
     return state.utterance === 'live'
@@ -306,7 +339,7 @@ function onSpeech(state: CallState, open: boolean): { state: CallState; effects:
       : unchanged(state);
   }
   const heard = startUtterance(state);
-  return state.phase === 'speaking'
+  return state.phase === 'speaking' && quietMs >= BARGE_IN_QUIET_MS
     ? { state: { ...heard, phase: 'listening' }, effects: [STOP_PLAYBACK, BARGE_IN] }
     : { state: heard, effects: [] };
 }

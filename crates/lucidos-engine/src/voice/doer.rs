@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::thread_lifecycle::ThreadType;
-use crate::engine::LucidosEngine;
+use crate::engine::{LucidosEngine, PreEmittedOrigin};
 
 /// Which agent holds a thread, as far as a call is concerned.
 ///
@@ -84,33 +84,31 @@ pub async fn doer_for(pool: &sqlx::PgPool, thread_id: Uuid) -> ThreadDoer {
 /// What a delegated utterance does to the thread it was spoken on.
 #[async_trait]
 pub trait TurnStarter: Send + Sync {
-    /// The talker asked for the doer. Record the utterance, and get it working.
+    /// The talker asked for the doer. Start a turn on what the caller said.
     ///
-    /// **Only the delegated half comes here.** An utterance the talker answers
-    /// alone never reaches this: `call.rs` writes it down as a
-    /// `SpokenMessageReceived`, which starts nothing. That split is what keeps
-    /// a talker-only turn from leaving the thread claiming a turn.
+    /// **The words are already on the thread.** `call.rs` writes every caller
+    /// utterance down as a `SpokenMessageReceived` the instant it finishes,
+    /// whether the talker fields it or delegates it (ADR 0201). So this records
+    /// nothing, and the doer reads the words back out of its own history.
     ///
     /// "Wake" is what happens on this side, not what the talker asked for. A
     /// turn already running absorbs this one, because single-flight admission
     /// turns a second message into an injection. The talker is never told
     /// which it got, and never has to be.
     ///
-    /// Returns once the utterance is recorded, never once the turn is done. The
-    /// call loop has audio to pump, and a turn can take minutes.
+    /// Returns once the turn is queued, never once it is done. The call loop
+    /// has audio to pump, and a turn can take minutes.
     ///
-    /// `session_id` is what marks the message as spoken. It is the whole of
-    /// how the transcript tells speech from typing: the composer stays live
-    /// during a call (ADR 0148), so nothing around the message can say.
+    /// `delegation` is the `WorkDelegated` row this turn anchors on. That row
+    /// is the turn's starter: it is what the talker DID, where the utterance is
+    /// only what the caller said.
     ///
-    /// Returns whether the utterance was TAKEN. `false` means no turn started
-    /// and nothing was written, so the caller's words are still owed a row and
-    /// `call.rs` writes one. Without that answer a refusal here would leave a
-    /// `WorkDelegated` beside no record of what was actually said.
+    /// Returns whether the turn was TAKEN. `false` means nothing started, so
+    /// `call.rs` keeps the words for a later ask and tells the caller.
     async fn wake(
         &self,
         thread_id: Uuid,
-        session_id: Uuid,
+        delegation: Uuid,
         transcript: &str,
         actor: Option<MessageOrigin>,
     ) -> bool;
@@ -151,15 +149,15 @@ impl TurnStarter for ThreadTurn {
     async fn wake(
         &self,
         thread_id: Uuid,
-        session_id: Uuid,
+        delegation: Uuid,
         transcript: &str,
         actor: Option<MessageOrigin>,
     ) -> bool {
         let message = transcript.trim().to_string();
         if message.is_empty() {
-            // Taken, in the sense that matters: there is nothing to write down
-            // and nothing is owed. `call.rs` refuses to hold a wordless
-            // transcript, so this is belt and braces.
+            // Taken, in the sense that matters: there is nothing to run on and
+            // nothing is owed. `call.rs` refuses to hold a wordless transcript,
+            // so this is belt and braces.
             return true;
         }
 
@@ -189,29 +187,15 @@ impl TurnStarter for ThreadTurn {
             _ => None,
         };
 
-        // Record before the turn is queued. At pool-max the turn waits for a
-        // slot, and the utterance belongs in the thread either way.
+        // The turn anchors on the talker's `WorkDelegated`, which `call.rs`
+        // wrote before calling this. Nothing is recorded here: the caller's
+        // words already have their own row, so a second one would put the same
+        // sentence in the store twice (ADR 0201).
         //
-        // This refuses while a question is open, and the turn then answers the
-        // question instead of starting a new exchange. That is the behaviour a
-        // typed answer already gets, and reading the question aloud is phase 6.
-        let pre_emitted = self
-            .engine
-            .pre_emit_chat_message_received(
-                Some(thread_id),
-                true,
-                ActorMode::Human,
-                None,
-                &message,
-                None,
-                device_id.as_deref(),
-                None,
-                None,
-                None,
-                actor.clone(),
-                Some(session_id),
-            )
-            .await;
+        // `Message` rather than `EngineReentry`, because the caller really did
+        // say this. A re-entry routes as engine text, and a live turn would
+        // then read the caller's own words as something the engine injected.
+        let pre_emitted = Some(PreEmittedOrigin::Message(delegation));
 
         let engine = self.engine.clone();
         let handle = tokio::spawn(async move {
@@ -248,10 +232,9 @@ impl TurnStarter for ThreadTurn {
                     pre_emitted,
                     None,
                     actor,
-                    // Belt and braces with the pre-emit above. A pre-emit whose
-                    // own write failed hands this path the message, and it must
-                    // still land marked.
-                    Some(session_id),
+                    // No `MessageReceived` is emitted on this path, so there is
+                    // nothing here for a voice session id to mark.
+                    None,
                     crate::engine::FollowUpUrgency::Normal,
                 )
                 .await;

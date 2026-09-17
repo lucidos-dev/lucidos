@@ -992,20 +992,6 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
   );
 }
 
-/** Threads in the Current drawer section, ignoring the active filter.
- *  `displaySection` ignores `meta.state`, so the drawer-hidden carve-out is
- *  applied here too. This is the UNFILTERED section membership. The
- *  archive-next-focus picker walks the drawer's filter-aware render order
- *  (`orderedCurrentForReview`), so it lands only on a visible thread. */
-export function getCurrentThreads(): ThreadState[] {
-  const result: ThreadState[] = [];
-  for (const thread of threadMap.value.values()) {
-    if (isExcludedFromSections(thread)) continue;
-    if (getThreadDisplaySection(thread) === 'current') result.push(thread);
-  }
-  return result;
-}
-
 /** Whether a thread needs the user's attention. It sits in the Current or
  *  Saved section AND the agent is stuck waiting on the user: a question or a
  *  permission request, both of which surface as `waiting_for_user_answer`, or

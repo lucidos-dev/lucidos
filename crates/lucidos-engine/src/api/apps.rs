@@ -1,4 +1,4 @@
-use super::app_ui::{rescope_app_html, rewrite_for_thread_id};
+use super::app_ui::{ensure_app_favicon, rescope_app_html, rewrite_for_thread_id};
 use super::*;
 
 use std::path::PathBuf;
@@ -294,11 +294,11 @@ pub(super) async fn write_app_source(
 
 /// GET /app/:app_id/ - Serve app UI index.html.
 ///
-/// Apps are static and returned untouched, except for two rewrites: gateway
-/// re-scoping of absolute engine refs, and (for `?thread_id=` WIP previews)
-/// appending the thread-id suffix to relative `src`/`href`. SDK, theme CSS,
-/// audio shim, favicon, `<title>` are opt-in via tags in the app's HTML (see
-/// `knowhow/js-sdk.md`).
+/// Apps are static and returned with three rewrites. The brand tab icon goes
+/// in when the document names none. Absolute engine refs are re-scoped for the
+/// gateway. A `?thread_id=` WIP preview also gets the thread-id suffix on its
+/// relative `src`/`href`. SDK, theme CSS, audio shim and `<title>` stay opt-in
+/// via tags in the app's HTML (see `knowhow/js-sdk.md`).
 pub(super) async fn serve_app_ui(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -348,6 +348,7 @@ pub(super) async fn serve_app_ui(
                 Some(tid) => rewrite_for_thread_id(&content, tid),
                 None => content,
             };
+            let html = ensure_app_favicon(&html);
             let html = rescope_app_html(&html, &prefix);
             (
                 [

@@ -3,7 +3,7 @@ import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen }
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
-import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard } from '../../utils/dom';
+import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard, getRemPx } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
 
 export { SwipeTouch } from '../../utils/swipe';
@@ -11,42 +11,55 @@ export { SwipeTouch } from '../../utils/swipe';
 // Rubber band factor at edges (0 = no movement, 1 = full movement)
 const RUBBER_BAND = 0.3;
 
-/** Width of the LEFT screen-edge strip (px) treated as a potential iOS *back*
- *  navigation swipe and suppressed. It MUST cover the full `.edge-swipe-left`
- *  zone (2.5rem ≈ 40px in mobile.css): over an app iframe in the content pane,
- *  the ONLY place a pane swipe can begin is that edge zone (the iframe captures
- *  every other touch), so an app→thread back-swipe is forced to start there
- *  every time. With the old 24px guard, a swipe beginning in the 24–40px band
- *  reached the in-app handler but did NOT preventDefault — so WebKit's native
- *  pop gesture fired and the PWA navigated out to the workspace gateway picker.
- *  Matching the zone width closes that band. iOS's interactive pop activates
- *  from roughly the outermost ~20pt, well within 40px. */
-export const EDGE_NAV_GUARD_LEFT_PX = 40;
+/** Width of the LEFT screen-edge strip treated as a potential iOS *back*
+ *  navigation swipe and suppressed, in REM. It must cover the whole
+ *  `.edge-swipe-left` zone, which mobile.css authors at this same 2.5rem.
+ *
+ *  Over an app iframe the ONLY place a pane swipe can begin is that edge zone:
+ *  the iframe captures every other touch. So an app-to-thread back-swipe is
+ *  forced to start there every time. A guard narrower than the zone leaves a
+ *  band that reaches the in-app handler with no preventDefault(). WebKit's
+ *  native pop then takes the PWA out to the workspace gateway picker.
+ *
+ *  Rem and not px, because the mobile breakpoint puts the root at 112.5% and
+ *  the UI scale moves it again across 75 to 200%. A px literal is right at
+ *  exactly one of those roots, and wrong at the rest: too narrow leaks the band
+ *  above, too wide eats vertical scrolling on ordinary content. iOS activates
+ *  its interactive pop from roughly the outermost 20pt, inside the zone at
+ *  every scale. */
+export const EDGE_NAV_GUARD_LEFT_REM = 2.5;
 
-/** Width of the RIGHT screen-edge strip — the *forward* navigation gesture.
- *  Covers the `.edge-swipe-right` zone (1.25rem ≈ 20px) with a little margin.
- *  Kept narrower than the left strip so it stays clear of content/scrolling. */
-export const EDGE_NAV_GUARD_RIGHT_PX = 24;
+/** Width of the RIGHT screen-edge strip, the *forward* navigation gesture, in
+ *  REM. Covers the `.edge-swipe-right` zone, which mobile.css authors at this
+ *  same 1.25rem. Narrower than the left strip, so it stays clear of content and
+ *  scrolling. */
+export const EDGE_NAV_GUARD_RIGHT_REM = 1.25;
 
 /** Pure decision: should a touchstart at `clientX` call preventDefault() to
  *  suppress iOS's native back/forward navigation swipe?
  *
  *  A standalone iOS PWA exposes NO CSS/touch-action opt-out for this gesture,
  *  and WebKit's edge recognizer commits before our in-app 8px horizontal lock
- *  (SwipeTouch) — so preventing the default in onTouchMove runs too late. The
+ *  (SwipeTouch), so preventing the default in onTouchMove runs too late. The
  *  only reliable suppression is preventDefault on the touchstart itself. Scoped
  *  to the screen-edge strips (sized to the `.edge-swipe-*` zones) and to
  *  non-interactive, non-text-input targets so taps on edge controls and
- *  vertical scrolling elsewhere survive. */
+ *  vertical scrolling elsewhere survive.
+ *
+ *  `remPx` is handed in rather than read here, so the edge math stays testable
+ *  without a DOM. The caller measures it per touch, which is what keeps both
+ *  guards on their zones when the user moves the UI scale. */
 export function shouldSuppressEdgeNavigation(args: {
   clientX: number;
   viewportWidth: number;
+  remPx: number;
   targetIsInteractive: boolean;
   textInputFocused: boolean;
 }): boolean {
-  const { clientX, viewportWidth, targetIsInteractive, textInputFocused } = args;
+  const { clientX, viewportWidth, remPx, targetIsInteractive, textInputFocused } = args;
   if (targetIsInteractive || textInputFocused) return false;
-  return clientX <= EDGE_NAV_GUARD_LEFT_PX || clientX >= viewportWidth - EDGE_NAV_GUARD_RIGHT_PX;
+  return clientX <= EDGE_NAV_GUARD_LEFT_REM * remPx
+    || clientX >= viewportWidth - EDGE_NAV_GUARD_RIGHT_REM * remPx;
 }
 
 /** Pure decision: may a Lucidos pane swipe START for this touch?
@@ -289,6 +302,9 @@ export function MobileSwipeContainer() {
     if (t && !touchTargetScrollable.current && shouldSuppressEdgeNavigation({
       clientX: t.clientX,
       viewportWidth: window.innerWidth,
+      // Read per touch, never captured at mount: the guards track the rem zones
+      // through a UI-scale change the user makes with the app open.
+      remPx: getRemPx(),
       targetIsInteractive: isInteractiveTarget(target),
       textInputFocused,
     })) {

@@ -168,6 +168,10 @@ pub fn injected_secrets<'a>(
 /// trip exactly across every Unicode whitespace character, which is a second
 /// thing to get wrong. The caller answers 502 naming the fix: rename the
 /// credential.
+///
+/// Three callers, exactly as [`scope_is_recordable`] has. The proxy gates first,
+/// for that 502. The seed filters, writing the record directly.
+/// [`bind_injects_if_absent`] refuses as a floor under any future caller.
 pub fn injects_are_recordable(injects: &BTreeSet<String>) -> bool {
     injects
         .iter()
@@ -383,6 +387,17 @@ pub fn bind_injects_if_absent(
     }
     if injects.is_empty() {
         return Ok(BindOutcome::NotBindable);
+    }
+    // The same forgery the scope column has. A credential name carrying a
+    // newline ends this record and starts one of its own, on a hash the caller
+    // picked. The proxy gates on [`injects_are_recordable`] and answers 502;
+    // this is the backstop that keeps any other caller from writing one.
+    if !injects_are_recordable(injects) {
+        return Err(format!(
+            "refusing to record injects for '{rel_path}': a secret name containing a comma \
+             or whitespace cannot be written to the approvals record"
+        )
+        .into());
     }
     if !runs_the_approved_bytes(workspace_path, rel_path, &approval.hash) {
         return Ok(BindOutcome::NotBindable);
@@ -982,6 +997,40 @@ mod tests {
             !is_approved(ws.path(), script, b"whatever the attacker wrote"),
             "the runner must not accept bytes the forged line would have named"
         );
+    }
+
+    /// The injects column's half of the forgery above, and the floor the
+    /// sibling already had. A credential name is free text, and `apis.json` is
+    /// writable over the unauthenticated data API. A newline in one would end
+    /// the record and start a line carrying a hash nobody authored.
+    #[test]
+    fn a_newline_in_an_injected_name_cannot_forge_an_approval_line() {
+        let ws = ws();
+        let script = "data/scripts/auth/legit.py";
+        write_script(ws.path(), script, "print(1)");
+        record(ws.path(), script, b"print(1)").unwrap();
+
+        // 64 hex characters, so the forged line would pass `parse`'s hash test.
+        let forged_hash = "a".repeat(64);
+        let forged = format!("c:ok\n{forged_hash}  -  -  data/scripts/auth/evil.py");
+        let hostile = secrets(&[forged.as_str()]);
+
+        let outcome = bind_injects_if_absent(ws.path(), script, &hostile);
+        assert!(
+            outcome.is_err(),
+            "a secret name with a newline must be refused, got {outcome:?}"
+        );
+
+        // Nothing was written, so the record still holds exactly the one entry
+        // and the script is still bound to no secret at all.
+        let after = entries(ws.path());
+        assert_eq!(after.len(), 1, "no second record was forged");
+        assert!(
+            after.contains_key(script),
+            "the authored script must still be the recorded path, got {:?}",
+            after.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(injects_for(ws.path(), script), None);
     }
 
     /// Padding is not forgery. Every layer on this path trims before it uses

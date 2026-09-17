@@ -5,6 +5,9 @@
  *  is a claim the delete does not make: branch work on a chat thread, backups
  *  on a workspace that never took one, forgetting on a thread that taught
  *  nothing.
+ *
+ *  The closing Archive line answers to the same rule, on the one fact that is
+ *  not in the preflight: whether this thread still has an Archive to take.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -60,11 +63,11 @@ describe('deleteConfirmation', () => {
   describe('every conditional line is off until its flag is on', () => {
     for (const { label, on, phrase } of CONDITIONAL_LINES) {
       it(`${label} is hidden when its flag is off`, () => {
-        expect(deleteConfirmation(preflight(), 'Heat pump').message).not.toContain(phrase);
+        expect(deleteConfirmation(preflight(), 'Heat pump', false).message).not.toContain(phrase);
       });
 
       it(`${label} is shown when its flag is on`, () => {
-        expect(deleteConfirmation(preflight(on), 'Heat pump').message).toContain(phrase);
+        expect(deleteConfirmation(preflight(on), 'Heat pump', false).message).toContain(phrase);
       });
     }
   });
@@ -78,25 +81,46 @@ describe('deleteConfirmation', () => {
         backups_present: true,
       }),
       'Heat pump',
+      false,
     ).message;
     for (const { phrase } of CONDITIONAL_LINES) expect(all).toContain(phrase);
   });
 
   it('always names the thread and always says there is no undo', () => {
-    const bare = deleteConfirmation(preflight(), 'Heat pump experiments');
+    const bare = deleteConfirmation(preflight(), 'Heat pump experiments', false);
     expect(bare.title).toBe('Delete this thread?');
     expect(bare.message).toContain('"Heat pump experiments"');
     expect(bare.message).toContain('This cannot be undone.');
   });
 
   it('falls back to a generic name for an untitled thread', () => {
-    expect(deleteConfirmation(preflight(), '   ').message).toContain('"this thread"');
+    expect(deleteConfirmation(preflight(), '   ', false).message).toContain('"this thread"');
+  });
+
+  it('names Archive only where Archive is on offer', () => {
+    // An archived thread has no Archive action left, and delete is its only way
+    // out. Pointing at a way out the dialog does not show is the same lie as a
+    // warning that does not apply.
+    expect(deleteConfirmation(preflight(), 'Heat pump', false).message)
+      .not.toContain('Archive');
+    expect(deleteConfirmation(preflight(), 'Heat pump', true).message)
+      .toContain('Archive keeps it instead, in the Archive section, where search still finds it.');
+  });
+
+  it('says them when the archive would take the sub-threads too', () => {
+    const family = deleteConfirmation(
+      preflight({ thread_count: 3, sub_thread_titles: ['a', 'b'] }),
+      'Heat pump',
+      true,
+    );
+    expect(family.message).toContain('Archive keeps them instead');
   });
 
   it('counts the cascade in the title and in the first line', () => {
     const family = deleteConfirmation(
       preflight({ thread_count: 4, sub_thread_titles: ['a', 'b', 'c'] }),
       'Heat pump',
+      false,
     );
     expect(family.title).toBe('Delete 4 threads?');
     expect(family.message).toContain('and its 3 sub-threads');
@@ -106,6 +130,7 @@ describe('deleteConfirmation', () => {
     const pair = deleteConfirmation(
       preflight({ thread_count: 2, sub_thread_titles: ['only child'] }),
       'Heat pump',
+      false,
     );
     expect(pair.title).toBe('Delete 2 threads?');
     expect(pair.message).toContain('and its sub-thread,');
@@ -113,7 +138,7 @@ describe('deleteConfirmation', () => {
   });
 
   it('mentions no cascade for a thread that is alone', () => {
-    const alone = deleteConfirmation(preflight(), 'Heat pump');
+    const alone = deleteConfirmation(preflight(), 'Heat pump', false);
     expect(alone.message).not.toContain('sub-thread');
     expect(alone.details).toBeUndefined();
   });
@@ -122,6 +147,7 @@ describe('deleteConfirmation', () => {
     const family = deleteConfirmation(
       preflight({ thread_count: 3, sub_thread_titles: ['Pump curves', '   '] }),
       'Heat pump',
+      false,
     );
     expect(family.details?.groups[0].header).toBe('2 sub-threads');
     expect(family.details?.groups[0].items).toEqual(['Pump curves', 'Untitled thread']);
@@ -134,6 +160,7 @@ describe('deleteConfirmation', () => {
     const all = deleteConfirmation(
       preflight({ memory_count: 1, has_applied_changes: true }),
       'Heat pump',
+      false,
     ).message;
     expect(all.split('\n\n')).toHaveLength(4);
   });

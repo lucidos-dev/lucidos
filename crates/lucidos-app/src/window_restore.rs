@@ -1,4 +1,11 @@
-//! Sanity clamp on the geometry `tauri-plugin-window-state` restores.
+//! What frame a window may wear on the displays attached right now.
+//!
+//! One judgement, asked at two moments. A RESTORE asks it of a rect that came
+//! off a file, and that is the whole of [`sanitize`]. A DESK CHANGE asks it of
+//! a window the user is looking at, and there only the size rule applies: see
+//! [`fit_to_displays`] for why the rest would be fighting them.
+//!
+//! The paragraphs below are the restore half's own story. `# Units` binds both.
 //!
 //! The plugin writes the saved rect straight onto the window, and its only guard
 //! is that some currently-attached monitor `intersects` the SAVED rect. A rect
@@ -317,6 +324,31 @@ pub(crate) fn sanitize(restored: Rect, displays: &Displays, policy: &Policy) -> 
     (fixed != restored).then_some(fixed)
 }
 
+/// The correction a LIVE window is owed now that the desk has changed, or
+/// `None` to leave it exactly as it is.
+///
+/// Pure, so the runtime rule is testable without a second monitor.
+///
+/// **One gate in front of [`sanitize`], and no arithmetic of its own.** A
+/// second notion of a healthy frame is how the restore path and the runtime
+/// path would come to different arrangements for one window.
+///
+/// The gate is the SIZE rule alone. A frame no attached SCREEN can hold is a
+/// shape no gesture can produce, so it is corruption wherever it comes from
+/// (ADR 0193). Everything else `sanitize` asks is about a rect nobody has seen
+/// yet: a size under the declared minimum, a title bar with nowhere to be
+/// grabbed, a window on a display that is gone. A live window's position is
+/// where the user PUT it, and ADR 0173 refused to move one parked on an edge.
+///
+/// So this fires on an unplug, and never on a drag. The user can carry a big
+/// window onto a small display all day while the big one is still attached.
+pub(crate) fn fit_to_displays(live: Rect, displays: &Displays, policy: &Policy) -> Option<Rect> {
+    if a_screen_can_hold(&live, displays) {
+        return None;
+    }
+    sanitize(live, displays, policy)
+}
+
 /// The declared window config to judge `label` against, falling back to the
 /// declared `main` window.
 ///
@@ -354,14 +386,108 @@ pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
     Some((config.min_width?, config.min_height?))
 }
 
+/// What a rect has to be judged against: the declared floors, and the desk as
+/// it is right now. `None` when any of it is unreadable, which every caller
+/// treats as "leave the geometry alone".
+///
+/// One reader, so judging a rect the client is ABOUT to write and judging one a
+/// window already wears cannot drift apart.
+fn policy_and_displays(
+    app: &tauri::AppHandle,
+    window: &tauri::Window,
+    label: &str,
+) -> Option<(Policy, Displays)> {
+    let Some(config) = policy_config(&app.config().app.windows, label).cloned() else {
+        eprintln!("[Tauri] No window config to judge `{label}` against: skipping the clamp");
+        return None;
+    };
+    // Absent minimums mean no floor rather than a guessed one, so removing them
+    // from the config can never shrink a window. `tauri_conf_declares_minimums`
+    // below is what keeps them declared.
+    let policy = Policy::from_declared(
+        config.min_width.unwrap_or(0.0),
+        config.min_height.unwrap_or(0.0),
+        config.width,
+        config.height,
+    );
+    let Ok(monitors) = window.available_monitors() else {
+        eprintln!("[Tauri] Could not enumerate monitors: skipping the restore clamp");
+        return None;
+    };
+    let primary = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| monitors.first().cloned());
+    let Some(primary) = primary else {
+        eprintln!("[Tauri] No monitor to place the window on: skipping the restore clamp");
+        return None;
+    };
+    Some((
+        policy,
+        Displays {
+            panels: monitors.iter().map(panel_points).collect(),
+            primary: panel_points(&primary).work_area,
+        },
+    ))
+}
+
+/// Say what a correction did, in the one wording both callers use.
+fn log_correction(what: &str, before: Rect, after: Rect) {
+    eprintln!(
+        "[Tauri] {what} {}x{} at {},{} is unusable on the attached displays: \
+         correcting to {}x{} at {},{} (logical points)",
+        before.width,
+        before.height,
+        before.x,
+        before.y,
+        after.width,
+        after.height,
+        after.x,
+        after.y
+    );
+}
+
+/// The frame to actually place a window at, given the one a record names.
+///
+/// The same judgement [`clamp_restored_geometry`] makes, taken BEFORE the frame
+/// is written rather than after. A placement is deferred to tao's main queue. A
+/// clamp issued behind one therefore reads the geometry the window still has,
+/// and judges the rect it is about to lose. That is ADR 0193's own trap, one
+/// step over: there the stale read was the window's birth size, here it would
+/// be the window-state plugin's.
+///
+/// A healthy rect comes back unchanged, so the caller can place the result
+/// unconditionally.
+pub(crate) fn sanitized_frame(app: &tauri::AppHandle, label: &str, frame: Rect) -> Rect {
+    let Some(window) = app.get_window(label) else {
+        return frame;
+    };
+    let Some((policy, displays)) = policy_and_displays(app, &window, label) else {
+        return frame;
+    };
+    match sanitize(frame, &displays, &policy) {
+        Some(fixed) => {
+            log_correction(&format!("The frame `{label}` is owed is"), frame, fixed);
+            fixed
+        }
+        None => frame,
+    }
+}
+
 /// Read a window's restored geometry, sanity-check it, and correct it in place
 /// if it is unusable.
 ///
-/// Every caller runs just before a window reaches the screen, which is the rule
-/// (ADR 0193). Four of them: `show_startup_window`, `reopen_client`,
-/// `open_app_window`, and `front_window` for one brought forward that is not up
-/// yet. NOT `setup`, where tao's deferred setters have not landed and the read
-/// is of the geometry the window was born at.
+/// For a window whose geometry the client did NOT choose. Every caller runs
+/// just before it reaches the screen, which is the rule (ADR 0193): the startup
+/// show when no frame is remembered, `reopen_client`, `open_app_window`, and
+/// `front_window` for one brought forward that is not up yet. NOT `setup`,
+/// where tao's deferred setters have not landed and the read is of the geometry
+/// the window was born at.
+///
+/// Where the client DOES choose the frame, [`sanitized_frame`] judges it first
+/// and this never runs. Clamping after a placement would read the geometry the
+/// placement has not replaced yet.
 ///
 /// A window already ON screen is not a caller, and `front_window` gates on that
 /// for the reason its own comment gives.
@@ -372,19 +498,45 @@ pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 /// By window, not webview window, per ADR 0140. Every read and every correction
 /// here is a window operation.
 pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
+    clamp_geometry(app, label, "Restored window geometry", sanitize);
+}
+
+/// Read a LIVE window's geometry, ask whether the desk can still hold it, and
+/// shrink it onto a display that can if not.
+///
+/// The runtime twin of [`clamp_restored_geometry`], and the only path in the
+/// client that corrects a window already on screen. `window_desk` is its one
+/// caller, once per display-configuration change.
+///
+/// [`fit_to_displays`] is what makes that safe: the size rule alone, so a
+/// window the user sized, moved or parked is untouched while a display can hold
+/// it.
+pub(crate) fn clamp_live_geometry(app: &tauri::AppHandle, label: &str) {
+    clamp_geometry(app, label, "Live window geometry", fit_to_displays);
+}
+
+/// The body both clamps share: read the window's real geometry in points, ask
+/// `decide` about it, and place the answer.
+///
+/// One reader, so the two moments cannot come to different arrangements for one
+/// window. They differ in the QUESTION alone, which is the `decide` argument.
+fn clamp_geometry(
+    app: &tauri::AppHandle,
+    label: &str,
+    what: &str,
+    decide: fn(Rect, &Displays, &Policy) -> Option<Rect>,
+) {
     let Some(window) = app.get_window(label) else {
         return;
     };
-    // `window_state_flags` restores FULLSCREEN as well, and a fullscreen window
-    // is the one case where being outside every work area is CORRECT: macOS
-    // gives it the whole screen, menu-bar strip included, so its title strip
-    // fails the reachability check by construction (pinned by
+    // A fullscreen window is the one case where being outside every work area
+    // is CORRECT. macOS gives it the whole screen, menu-bar strip included, so
+    // its title strip fails the reachability check by construction (pinned by
     // `a_fullscreen_frame_reads_as_unreachable_which_is_why_it_is_skipped`).
-    // Clamping it would move a window the plugin deliberately put there, and the
-    // AppKit transition is asynchronous, so the correction would land mid-flight.
-    // tao records the flag synchronously inside `set_fullscreen`, so this reads
-    // true from the moment the plugin asked for it rather than when the
-    // animation ends.
+    // macOS owns that frame, and the AppKit transition is asynchronous, so a
+    // correction would land mid-flight. tao records the flag synchronously
+    // inside `set_fullscreen`, so this reads true from the moment it was asked
+    // for rather than when the animation ends.
     //
     // MAXIMIZED is deliberately NOT skipped: a genuinely maximized window's rect
     // IS the work area, which `sanitize` passes through untouched, while a
@@ -393,73 +545,35 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
     if window.is_fullscreen().unwrap_or(false) {
         return;
     }
-    let Some(config) = policy_config(&app.config().app.windows, label).cloned() else {
-        eprintln!("[Tauri] No window config to clamp `{label}` against: skipping the clamp");
+    let Some((policy, displays)) = policy_and_displays(app, &window, label) else {
         return;
     };
 
-    // Absent minimums mean no floor rather than a guessed one, so removing them
-    // from the config can never shrink a window. `tauri_conf_declares_minimums`
-    // below is what keeps them declared.
-    let policy = Policy::from_declared(
-        config.min_width.unwrap_or(0.0),
-        config.min_height.unwrap_or(0.0),
-        config.width,
-        config.height,
-    );
-
-    // `outer_position` + `inner_size` is deliberately the pair the window-state
-    // plugin itself persists and restores, so the clamp reasons about the exact
-    // numbers that produced the bad state. On this window the two sizes are the
-    // same anyway: `titleBarStyle: "Overlay"` gives the content view the full
-    // frame, so there is no title bar outside it.
+    // Position plus content size: the pair the window-state plugin itself
+    // persists and restores, and the pair `window_persist` captures. So all
+    // three reason about one set of numbers.
+    //
+    // The size comes from `app_window::window_content_size`, never from
+    // `inner_size`, which answers with the PAGE on macOS. This clamp spent its
+    // life judging the webview's frame and calling it the window's (ADR 0202).
     //
     // The scale factor comes with them, and an unreadable one skips the clamp
     // rather than falling back to 1.0. It is what converts the pair into
     // points, so a guess here is a wrong rect, not a coarse threshold.
     let (Ok(position), Ok(size), Ok(scale)) = (
         window.outer_position(),
-        window.inner_size(),
+        crate::app_window::window_content_size(&window),
         window.scale_factor(),
     ) else {
-        eprintln!("[Tauri] Could not read the restored window geometry: skipping the clamp");
+        eprintln!("[Tauri] Could not read the geometry of `{label}`: skipping the clamp");
         return;
     };
-    let restored = Rect::from_physical(position, size, scale);
+    let worn = Rect::from_physical(position, size, scale);
 
-    let Ok(monitors) = window.available_monitors() else {
-        eprintln!("[Tauri] Could not enumerate monitors: skipping the restore clamp");
+    let Some(fixed) = decide(worn, &displays, &policy) else {
         return;
     };
-    let primary = window
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| monitors.first().cloned());
-    let Some(primary) = primary else {
-        eprintln!("[Tauri] No monitor to place the window on: skipping the restore clamp");
-        return;
-    };
-    let displays = Displays {
-        panels: monitors.iter().map(panel_points).collect(),
-        primary: panel_points(&primary).work_area,
-    };
-
-    let Some(fixed) = sanitize(restored, &displays, &policy) else {
-        return;
-    };
-    eprintln!(
-        "[Tauri] Restored window geometry {}x{} at {},{} is unusable on the attached displays: \
-         correcting to {}x{} at {},{} (logical points)",
-        restored.width,
-        restored.height,
-        restored.x,
-        restored.y,
-        fixed.width,
-        fixed.height,
-        fixed.x,
-        fixed.y
-    );
+    log_correction(what, worn, fixed);
     // Through the one placer, rather than a setter pair of its own. It applies
     // logical values, which tao passes through untouched, and it MOVES before
     // it resizes. A correction can send a window to another display. A resize
@@ -578,6 +692,40 @@ mod tests {
             work_area: external,
             frame: external,
         });
+        displays
+    }
+
+    /// A 1x laptop panel with a 1x external display beside it: one desk, ONE
+    /// scale factor.
+    ///
+    /// The variant of the reported bug that fires no `ScaleFactorChanged` at
+    /// all, because tao emits that event only when the backing factor actually
+    /// changes. Nothing here can tell: the decision is in points and never
+    /// reads a scale factor. That is exactly why it covers the variant.
+    fn two_one_x_panels() -> Displays {
+        let laptop = panel_under_a_menu_bar(0, 0, 1440, 900, 25);
+        let external = Rect {
+            x: 1440,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        Displays {
+            panels: vec![
+                laptop,
+                Panel {
+                    work_area: external,
+                    frame: external,
+                },
+            ],
+            primary: laptop.work_area,
+        }
+    }
+
+    /// The desk above after the external display is unplugged.
+    fn the_laptop_alone() -> Displays {
+        let mut displays = two_one_x_panels();
+        displays.panels.truncate(1);
         displays
     }
 
@@ -1004,6 +1152,176 @@ mod tests {
             let fixed = sanitize(rect, &one_panel(), &policy()).expect("must be corrected");
             assert_eq!(
                 sanitize(fixed, &one_panel(), &policy()),
+                None,
+                "correcting {rect:?} produced {fixed:?}, which needs correcting again"
+            );
+        }
+    }
+
+    // ── What a DESK CHANGE decides, about a window the user is looking at ────
+
+    // The report. A window sized on the external display, carried to the
+    // built-in panel by unplugging the external one. Nothing in the client saw
+    // this before: every clamp call site is a window creation or a show.
+    #[test]
+    fn an_undocked_window_is_capped_to_the_panel_that_is_left() {
+        let sized_on_the_external = Rect {
+            x: 1850,
+            y: 60,
+            width: 2000,
+            height: 1200,
+        };
+        let fixed = fit_to_displays(sized_on_the_external, &one_panel(), &policy())
+            .expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (1728, 1080));
+        assert_eq!((fixed.x, fixed.y), (0, 37));
+    }
+
+    // The variant that fires no `ScaleFactorChanged`, since both displays
+    // report the same backing factor. One decision covers both, because the
+    // decision is in points and never reads a factor.
+    #[test]
+    fn an_undock_between_two_one_x_displays_is_the_same_decision() {
+        let sized_on_the_external = Rect {
+            x: 1500,
+            y: 100,
+            width: 2200,
+            height: 1300,
+        };
+        let displays = two_one_x_panels();
+        assert_eq!(
+            fit_to_displays(sized_on_the_external, &displays, &policy()),
+            None
+        );
+        let fixed = fit_to_displays(sized_on_the_external, &the_laptop_alone(), &policy())
+            .expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (1440, 875));
+        assert_eq!((fixed.x, fixed.y), (0, 25));
+    }
+
+    // The mixed-DPI desk, where the two panels agree with each other and with
+    // nothing else in physical pixels. Unplugging the ultrawide leaves a window
+    // no remaining screen can hold.
+    #[test]
+    fn a_window_sized_for_the_ultrawide_is_capped_to_the_retina_panel() {
+        let sized_on_the_ultrawide = Rect {
+            x: 200,
+            y: 100,
+            width: 3000,
+            height: 1200,
+        };
+        assert_eq!(
+            fit_to_displays(sized_on_the_ultrawide, &mixed_dpi_desk(), &policy()),
+            None
+        );
+        let panel = mixed_dpi_desk().panels[1];
+        let retina_alone = Displays {
+            panels: vec![panel],
+            primary: panel.work_area,
+        };
+        let fixed = fit_to_displays(sized_on_the_ultrawide, &retina_alone, &policy())
+            .expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (1728, 1117));
+        assert_eq!((fixed.x, fixed.y), (2025, 1625));
+    }
+
+    // The lenient rule, at runtime. ADR 0193 weighed it and chose it: a window
+    // sized for a monitor that is merely away comes back whole. Dragging one
+    // onto the small panel is therefore not a correction either, which is what
+    // keeps the pass off a live drag between displays.
+    #[test]
+    fn a_window_another_attached_display_can_hold_is_left_alone() {
+        let big = Rect {
+            x: 1850,
+            y: 60,
+            width: 2000,
+            height: 1200,
+        };
+        let displays = two_panels();
+        assert_eq!(fit_to_displays(big, &displays, &policy()), None);
+        let dragged_onto_the_small_panel = Rect {
+            x: 100,
+            y: 100,
+            ..big
+        };
+        assert_eq!(
+            fit_to_displays(dragged_onto_the_small_panel, &displays, &policy()),
+            None
+        );
+    }
+
+    // The gate is the size rule ALONE, and these two are why. A rect off a file
+    // with no grabbable title bar is unusable, so the restore clamp nudges it.
+    // The same rect on a live window is where the user dragged it.
+    #[test]
+    fn a_window_the_user_parked_half_off_screen_is_left_alone() {
+        let hanging = Rect {
+            x: 1628,
+            y: 250,
+            width: 1024,
+            height: 768,
+        };
+        let displays = one_panel();
+        assert!(sanitize(hanging, &displays, &policy()).is_some());
+        assert_eq!(fit_to_displays(hanging, &displays, &policy()), None);
+    }
+
+    // The declared floor is a restore rule too. `open_app_window` applies
+    // `min_inner_size` to every window it builds, so no gesture reaches this
+    // shape; correcting it would only be the pass inventing work.
+    #[test]
+    fn a_live_window_under_the_declared_minimum_is_left_alone() {
+        let degenerate = Rect {
+            x: 500,
+            y: 400,
+            width: 1,
+            height: 1,
+        };
+        let displays = one_panel();
+        assert!(sanitize(degenerate, &displays, &policy()).is_some());
+        assert_eq!(fit_to_displays(degenerate, &displays, &policy()), None);
+    }
+
+    // The second lock on the pass fighting itself. The first is that our own
+    // placement cannot post a screen-parameters change, so nothing re-arms the
+    // pass. This one is that a correction leaves a rect the pass has no more to
+    // say about.
+    #[test]
+    fn a_desk_change_correction_is_itself_healthy_so_the_pass_cannot_loop() {
+        let cases = [
+            (
+                Rect {
+                    x: 1850,
+                    y: 60,
+                    width: 2000,
+                    height: 1200,
+                },
+                one_panel(),
+            ),
+            (
+                Rect {
+                    x: 1500,
+                    y: 100,
+                    width: 2200,
+                    height: 1300,
+                },
+                the_laptop_alone(),
+            ),
+            // Oversize in one axis only.
+            (
+                Rect {
+                    x: 100,
+                    y: 200,
+                    width: 3000,
+                    height: 700,
+                },
+                one_panel(),
+            ),
+        ];
+        for (rect, displays) in cases {
+            let fixed = fit_to_displays(rect, &displays, &policy()).expect("must be corrected");
+            assert_eq!(
+                fit_to_displays(fixed, &displays, &policy()),
                 None,
                 "correcting {rect:?} produced {fixed:?}, which needs correcting again"
             );

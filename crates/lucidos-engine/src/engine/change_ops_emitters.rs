@@ -14,65 +14,95 @@ use crate::engine::thread_events::{
 };
 use crate::engine::LucidosEngine;
 
-impl LucidosEngine {
-    /// Broadcast the current changes state (pending/applied/restart) to all SSE clients.
-    /// On any DB read failure, skip the broadcast — the next event-driven emit
-    /// will retry, and an SSE payload with stale/wrong counts is worse than
-    /// none at all (clients would render emptied lists and "all clear" badges).
-    pub(crate) async fn broadcast_changes_updated(&self) {
-        let proj = self.changes();
-        // UNIX_EPOCH ≈ "since forever" for restart-required tracking. Don't use
-        // `DateTime::MIN_UTC` — its year (-262143) is outside Postgres
-        // timestamptz range (4713 BC … 294276 AD), so binding it errors with
-        // "timestamp out of range" and the helper falls back to false, hiding
-        // any actual restart-required change.
-        let (pending_r, applied_r, restart_r) = tokio::join!(
-            proj.list_pending(),
-            proj.list_recently_applied(15, None),
-            proj.requires_restart_since(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH),
-        );
-        let (mut pending, mut applied, restart) = match (pending_r, applied_r, restart_r) {
-            (Ok(p), Ok(a), Ok(r)) => (p, a, r),
-            (perr, aerr, rerr) => {
-                if let Err(e) = perr {
-                    log!("[Changes] broadcast_changes_updated: list_pending: {}", e);
-                }
-                if let Err(e) = aerr {
-                    log!(
-                        "[Changes] broadcast_changes_updated: list_recently_applied: {}",
-                        e
-                    );
-                }
-                if let Err(e) = rerr {
-                    log!(
-                        "[Changes] broadcast_changes_updated: requires_restart_since: {}",
-                        e
-                    );
-                }
-                log!("[Changes] broadcast_changes_updated: skipping ChangesUpdated emit");
-                return;
+/// How many applied changes a `ChangesUpdated` frame carries. The panel pages
+/// the rest through `GET /api/v1/changes/applied`.
+const APPLIED_IN_BROADCAST: i64 = 15;
+
+/// The one window every `ChangesUpdated` frame answers `restart_required`
+/// over: has any restart-requiring change been applied at all.
+///
+/// Don't reach for `DateTime::MIN_UTC`. Its year (-262143) sits outside the
+/// Postgres timestamptz range, so binding it errors with "timestamp out of
+/// range". The helper then falls back to false and hides a real
+/// restart-required change.
+const RESTART_REQUIRED_WINDOW: chrono::DateTime<chrono::Utc> =
+    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+
+/// Build the `ChangesUpdated` payload every emitter sends, or `None` when a
+/// read failed and the caller should skip the emit.
+///
+/// One builder, because two of them drifted. The HTTP handler enriched
+/// `thread_unsettled` and the engine one did not. So any unrelated thread
+/// finishing replaced the panel's list with rows whose Apply button was live
+/// again, and clicking it 409'd against `guard_change_action`.
+///
+/// A read failure skips the whole frame rather than sending a partial one. A
+/// client would render emptied lists and an "all clear" badge, which is worse
+/// than one missed refresh. The next event-driven emit retries.
+async fn changes_updated_payload(
+    pool: &sqlx::PgPool,
+    proj: &crate::core::changes_projection::ChangesProjection,
+) -> Option<SystemEvent> {
+    let (pending_r, applied_r, restart_r) = tokio::join!(
+        proj.list_pending(),
+        proj.list_recently_applied(APPLIED_IN_BROADCAST, None),
+        proj.requires_restart_since(RESTART_REQUIRED_WINDOW),
+    );
+    let (mut pending, mut applied, restart_required) = match (pending_r, applied_r, restart_r) {
+        (Ok(p), Ok(a), Ok(r)) => (p, a, r),
+        (perr, aerr, rerr) => {
+            if let Err(e) = perr {
+                log!("[Changes] changes_updated_payload: list_pending: {}", e);
             }
+            if let Err(e) = aerr {
+                log!(
+                    "[Changes] changes_updated_payload: list_recently_applied: {}",
+                    e
+                );
+            }
+            if let Err(e) = rerr {
+                log!(
+                    "[Changes] changes_updated_payload: requires_restart_since: {}",
+                    e
+                );
+            }
+            log!("[Changes] changes_updated_payload: skipping ChangesUpdated emit");
+            return None;
+        }
+    };
+    let (r1, r2) = tokio::join!(
+        crate::core::changes::enrich_thread_titles(pool, &mut pending),
+        crate::core::changes::enrich_thread_titles(pool, &mut applied),
+    );
+    if let Err(e) = r1 {
+        log!("[Changes] enrich pending titles: {}", e);
+    }
+    if let Err(e) = r2 {
+        log!("[Changes] enrich applied titles: {}", e);
+    }
+    // The gate the UI disables Apply on, and the one the bulk paths filter by.
+    // A frame without it re-offers Apply on a thread that is still working.
+    if let Err(e) = crate::core::changes::enrich_thread_unsettled(pool, &mut pending).await {
+        log!("[Changes] enrich pending thread_unsettled: {}", e);
+    }
+    Some(SystemEvent::ChangesUpdated {
+        total_pending: pending.len(),
+        pending,
+        applied,
+        restart_required,
+    })
+}
+
+impl LucidosEngine {
+    /// Broadcast the current changes state (pending/applied/restart) to every
+    /// SSE client. The sole `ChangesUpdated` emitter for both the engine's own
+    /// call sites and the `/api/v1/changes` handlers.
+    pub(crate) async fn broadcast_changes_updated(&self) {
+        let Some(event) = changes_updated_payload(self.pool(), self.changes()).await else {
+            return;
         };
-        let (r1, r2) = tokio::join!(
-            crate::core::changes::enrich_thread_titles(self.pool(), &mut pending),
-            crate::core::changes::enrich_thread_titles(self.pool(), &mut applied),
-        );
-        if let Err(e) = r1 {
-            log!("[Changes] enrich pending titles: {}", e);
-        }
-        if let Err(e) = r2 {
-            log!("[Changes] enrich applied titles: {}", e);
-        }
         self.event_bus
-            .emit_or_log(
-                BusEvent::System(SystemEvent::ChangesUpdated {
-                    total_pending: pending.len(),
-                    pending,
-                    applied,
-                    restart_required: restart,
-                }),
-                "[Changes] ChangesUpdated",
-            )
+            .emit_or_log(BusEvent::System(event), "[Changes] ChangesUpdated")
             .await;
     }
 
@@ -676,6 +706,87 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// Every `ChangesUpdated` frame carries the gate the Apply button is
+    /// disabled by. The thread-queue executor, standing apply, recovery and
+    /// thread archive all reach this emitter. A frame without the gate
+    /// re-offers an Apply the endpoint then answers 409.
+    #[tokio::test]
+    async fn a_changes_updated_frame_carries_the_thread_unsettled_gate() {
+        use crate::core::changes_projection::ChangesProjection;
+        use crate::engine::event_bus::EventBus;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db) = setup_test_db().await;
+        let (bus, _cb_rx) = EventBus::new(pool.clone());
+        let thread = Uuid::new_v4();
+        let change = Uuid::new_v4();
+
+        bus.emit(BusEvent::Thread {
+            thread_id: thread,
+            event: ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                session_id: format!("cc-{thread}"),
+                branch: String::new(),
+                repo_id: None,
+                coding_agent_kind: Default::default(),
+                coding_agent_folder: String::new(),
+                app_id: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .expect("start a coding-agent thread");
+
+        bus.emit(BusEvent::Thread {
+            thread_id: thread,
+            event: ThreadEvent::ChangeProposed {
+                change_id: change.to_string(),
+                description: Some("work".to_string()),
+                files: vec!["a.rs".to_string()],
+                requires_restart: false,
+                origin: None,
+                commit_sha: None,
+                branch_name: "claude-code/work".to_string(),
+                repo_root: "/repo".to_string(),
+                hardened: true,
+                incomplete: false,
+                path: String::new(),
+                diff: String::new(),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("propose the change");
+
+        // The thread went straight on into another turn, so Apply is withheld
+        // until it settles.
+        sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
+            .bind(thread)
+            .execute(&pool)
+            .await
+            .expect("put the thread mid-turn");
+
+        let proj = ChangesProjection::new(pool.clone());
+        let event = changes_updated_payload(&pool, &proj)
+            .await
+            .expect("every read answered");
+        match event {
+            SystemEvent::ChangesUpdated { pending, .. } => {
+                assert_eq!(pending.len(), 1, "one pending change, got {:?}", pending);
+                assert!(
+                    pending[0].thread_unsettled,
+                    "the frame must report the thread as unsettled"
+                );
+            }
+            other => panic!("expected ChangesUpdated, got {:?}", other),
+        }
+
+        teardown_test_db(&db).await;
+    }
 
     /// An engine-affecting change ALWAYS rebuilds, whatever else it touched.
     /// This is the arm that regressed: a mixed Rust+TS Apply from a live

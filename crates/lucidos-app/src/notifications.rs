@@ -175,7 +175,7 @@ pub(crate) enum TapTarget {
 /// Pick the window a tap raised by `owner` belongs in, given every top-level app
 /// window as `(label, url)`.
 ///
-/// **This is the native counterpart of `clientInScope` + `clients.openWindow` in
+/// **This is the native counterpart of `isWorkspaceShell` + `clients.openWindow` in
 /// `public/sw.js`**, and it enforces the same rule the service worker does for
 /// web push: a tap lands in the workspace that RAISED it, or in a window opened
 /// for it, and never in a window sitting on a different workspace.

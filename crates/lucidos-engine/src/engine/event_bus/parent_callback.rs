@@ -103,11 +103,14 @@ impl EventBus {
     /// sends a callback message with results.
     ///
     /// `terminal_event_id` is `event`'s own row id. It travels to the parent on
-    /// the [`ParentCallback`], where the stand-down gate needs it.
+    /// the [`ParentCallback`], where the stand-down gate needs it. `None` when
+    /// the caller has no row to name: [`Self::announce_withheld_completion`]
+    /// replays a terminal whose own fan-in already stood down, and the gate then
+    /// abstains, which is the fail-open side.
     pub(super) async fn notify_parent_if_child(
         &self,
         child_thread_id: Uuid,
-        terminal_event_id: Uuid,
+        terminal_event_id: Option<Uuid>,
         event: &ThreadEvent,
     ) {
         // Cancel = user-driven, terminal. Abort splits on `AbortCause::is_transient`:
@@ -141,6 +144,31 @@ impl EventBus {
             _ => false,
         };
         if !is_terminal {
+            return;
+        }
+
+        // **A terminal the engine is about to auto-resume is not a completion.**
+        // The child is still working, and the resume lands seconds later. A card
+        // here tells the parent the work is lost, and a parent that believes it
+        // spawns a duplicate onto the same files. Withhold, and let the REAL
+        // terminal report.
+        //
+        // Below the `is_terminal` gate on purpose, and not above it. A hold can
+        // only ever concern a terminal, while this function runs in PostCommit
+        // for EVERY persisted thread event. Asking first would take a global
+        // mutex per streamed token and log a withholding line for events that
+        // carry no card.
+        //
+        // `parent_callback_pending` is deliberately left alone, so the next
+        // terminal still fires. Standing down before the decrement gate is fine
+        // too: the counter comes down through the in-tx reconcile either way,
+        // and `ContinuationRequested` puts it back.
+        if self.auto_resume_holds.is_held(child_thread_id) {
+            crate::log!(
+                "[FanOut] Child {} ended on a terminal the engine is auto-resuming: \
+                 withholding the parent's completion card until the real terminal",
+                child_thread_id
+            );
             return;
         }
 
@@ -516,11 +544,37 @@ impl EventBus {
             parent_id,
             child_thread_id,
             emit_result.event_id,
-            Some(terminal_event_id),
+            terminal_event_id,
             parent_is_cc,
         ) {
             Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
         }
+    }
+
+    /// Announce a terminal the fan-in withheld, because the auto-resume it was
+    /// withheld for is not going to happen.
+    ///
+    /// The withheld terminal was always a `ResponseFailed`: only
+    /// `is_transient_api_failure` takes a hold. So the replay reconstructs one
+    /// from the error the hold carried, and the parent gets the same
+    /// `status: failure` card the un-held path would have sent.
+    ///
+    /// No terminal event id, because this is a replay rather than an emit. The
+    /// stand-down gate abstains without one and may cost a duplicate turn, which
+    /// is the recoverable direction. `refire_unprocessed_child_completions`
+    /// passes `None` for the same reason.
+    pub(crate) async fn announce_withheld_completion(&self, child_thread_id: Uuid, error: String) {
+        crate::log!(
+            "[FanOut] Child {} was not resumed after all: announcing the completion card its \
+             terminal held back",
+            child_thread_id
+        );
+        Box::pin(self.notify_parent_if_child(
+            child_thread_id,
+            None,
+            &ThreadEvent::ResponseFailed { error },
+        ))
+        .await;
     }
 
     /// Mark the parent awake on a child completion that warrants user

@@ -21,9 +21,9 @@ use crate::engine::agent_session::lifecycle::{
     is_resume_settle_result, is_silent_resume, is_stale_resume_signal,
     may_touch_change_state_at_idle, reset_per_turn_flags, settle_inputs_awaiting_result,
     should_auto_commit_on_cleanup, terminal_clears_user_hit_stop, terminate_decision,
-    watchdog_gate, IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, WatchdogGate,
-    WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
-    WATCHDOG_TICK_INTERVAL_SECS,
+    watchdog_gate, IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal,
+    WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS,
+    WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, resolve_resume_context,
@@ -1100,6 +1100,13 @@ impl LucidosEngine {
         // this None or non-Generated, which means no auto-commit and no spurious
         // Apply card. Reset per turn alongside `emitted_terminal_event`.
         let mut last_terminal_kind: Option<TerminalKind> = None;
+        // withheld_api_error: what the released *auto-resume hold* handed back,
+        // so the error of a terminal whose completion card the fan-in withheld.
+        // The hold itself only spans the terminal and idle emits. This carries
+        // both the decision and the announcement on to the exit that actuates
+        // it. Written in lockstep with `last_terminal_kind`, and reset with it
+        // at a turn boundary, because it describes THAT terminal.
+        let mut withheld_api_error: Option<String> = None;
         // Set by the watchdog tick below; consumed by the safety net to
         // pick ContinuationRequested auto-resume vs ResponseAborted. Not derived
         // from `agent_cancel.is_cancelled()` because the stale-resume and
@@ -1236,9 +1243,8 @@ impl LucidosEngine {
                             // anything else is coming.
                             self.maybe_auto_resume_after_api_error(
                                 thread_id,
-                                &last_terminal_kind,
                                 &meta,
-                                conflict_change.is_some(),
+                                withheld_api_error.take(),
                                 !orphans.is_empty(),
                             )
                             .await;
@@ -1295,7 +1301,10 @@ impl LucidosEngine {
                             &mut emitted_terminal_event,
                             &mut user_hit_stop,
                             &mut interrupt_is_redirect,
-                            &mut last_terminal_kind,
+                            TurnTerminal {
+                                kind: &mut last_terminal_kind,
+                                withheld_api_error: &mut withheld_api_error,
+                            },
                             &mut meta.actor,
                         );
                     }
@@ -1889,6 +1898,18 @@ impl LucidosEngine {
                                         // cleanup both read it to refuse partial
                                         // work.
                                         last_terminal_kind = terminal_kind.clone();
+                                        // Decide the auto-resume BEFORE emitting:
+                                        // the emit is what tells the parent, and
+                                        // the exit that resumes runs long after.
+                                        // Released below, once both emits are
+                                        // out. See ADR 0199.
+                                        self.hold_completion_if_api_error_resume(
+                                            thread_id,
+                                            &last_terminal_kind,
+                                            is_shutdown,
+                                            conflict_change.is_some(),
+                                        )
+                                        .await;
                                         if let Some(kind) = terminal_kind {
                                             // A Result is a turn boundary, so both
                                             // the user-stop latch and the cancel
@@ -2023,6 +2044,18 @@ impl LucidosEngine {
                                             ).await;
                                             last_emitted_idle = true;
                                         }
+                                        // Both fan-in-visible events for this
+                                        // terminal are out, so the hold has done
+                                        // its whole job. Releasing HERE rather
+                                        // than at the resume site is what keeps a
+                                        // hold from outliving the terminal it
+                                        // names. A `KeepAlive` below can carry
+                                        // this loop through another turn, and a
+                                        // Stop or a safety net inside that turn
+                                        // must report normally. What comes back
+                                        // carries the decision on from here.
+                                        withheld_api_error =
+                                            self.event_bus.auto_resume_holds().release(thread_id);
 
                                         // Propose the change at idle time so the Apply button
                                         // shows immediately (propose_change deduplicates). When
@@ -2307,7 +2340,10 @@ impl LucidosEngine {
                         &mut emitted_terminal_event,
                         &mut user_hit_stop,
                         &mut interrupt_is_redirect,
-                        &mut last_terminal_kind,
+                        TurnTerminal {
+                            kind: &mut last_terminal_kind,
+                            withheld_api_error: &mut withheld_api_error,
+                        },
                         &mut meta.actor,
                     );
                     {
@@ -2463,6 +2499,10 @@ impl LucidosEngine {
                             crate::engine::thread_events::CancelCause::UserStop
                         },
                     ));
+                    // In lockstep, because the two describe one terminal. A
+                    // cancel is nobody's auto-resume, and carrying an earlier
+                    // turn's withheld error here would resume off it.
+                    withheld_api_error = None;
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     self.emit_stop_terminal(
@@ -2619,6 +2659,7 @@ impl LucidosEngine {
             normalized_model,
             cc_reasoning_effort,
             last_terminal_kind,
+            withheld_api_error,
             external_terminal_emitted,
             external_continuation_requested,
             &agent_cancel,

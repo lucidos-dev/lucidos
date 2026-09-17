@@ -755,6 +755,16 @@ pub(crate) const STATUS_FILTER_SQL: &str = "($1::text[] IS NULL \
      OR ($2 = FALSE AND t.status = ANY($1)) \
      OR ($2 = TRUE AND NOT (t.status = ANY($1))))";
 
+/// What a list of thread names calls a thread with no name at all.
+///
+/// The last resort, after [`format_display_title`] has tried the title and the
+/// first message. One word, because the two voice lines that need it read out
+/// next to each other.
+///
+/// It is a name rather than a gap: a thread is often busiest before it has a
+/// title, so dropping it would report the workspace as quieter than it is.
+pub const UNTITLED_THREAD: &str = "Untitled";
+
 /// Statuses considered "active": the agentic loop is mid-flow.
 ///
 /// A thread merely holding an *event wait* does NOT count: a subscription does

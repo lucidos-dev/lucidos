@@ -114,11 +114,51 @@ async fn shutdown_signal(
     // its port against the successor's preview.
     engine.stop_frontend_preview().await;
 
+    // And for the MCP server children, which nothing else on this path stops.
+    shutdown_mcp_servers(&engine).await;
+
     if let Err(e) = scheduler.lock().await.shutdown().await {
         log!("[Shutdown] Error shutting down scheduler: {}", e);
     }
 
     log!("[Shutdown] Shutdown complete.");
+}
+
+/// Stop every running MCP server child, so none of them outlives this engine.
+///
+/// The only other teardown is `Drop for McpClient`, and the supervisor's 15 s
+/// force-kill runs no destructor. An orphaned server then keeps its memory and
+/// its upstream connections, and the successor engine starts a second copy of
+/// it, once per restart. The Chrome and Vite sweeps beside the call site cover
+/// their children for the same reason.
+///
+/// Concurrent, because one stop waits up to 3 s on its own child. Run in turn,
+/// a few wedged servers would spend the whole shutdown budget.
+async fn shutdown_mcp_servers(engine: &SharedEngine) {
+    let running: Vec<String> = match engine.mcp_manager.list_servers().await {
+        Ok(servers) => servers
+            .into_iter()
+            .filter(|s| s.running)
+            .map(|s| s.id)
+            .collect(),
+        Err(e) => {
+            log!(
+                "[Shutdown] Could not read the MCP servers to stop them: {}",
+                e
+            );
+            return;
+        }
+    };
+    if running.is_empty() {
+        return;
+    }
+    log!("[Shutdown] Stopping {} MCP server(s)...", running.len());
+    futures::future::join_all(running.iter().map(|id| async move {
+        if let Err(e) = engine.mcp_manager.stop_server(id).await {
+            log!("[Shutdown] Error stopping MCP server '{}': {}", id, e);
+        }
+    }))
+    .await;
 }
 
 /// Postgres `undefined_table`. This read runs before `LucidosEngine::new` has
@@ -417,14 +457,29 @@ async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     let net = net_config::read_network_toml();
     // The per-workspace bind only matters when engines do NOT inherit the
     // gateway bind; read it from this workspace's DB then.
+    //
+    // A read that could not RUN is not the same answer as an unset setting, the
+    // same distinction `read_vertex_region_pref` makes. Both fall back the same
+    // way, and only one of them says so. A silent fallback reads as "you never
+    // chose a bind". A transient DB error then sends the user hunting a
+    // connection refused on the address they did choose.
     let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
-        lucidos_engine::core::preferences::PreferenceStore::get(
+        match lucidos_engine::core::preferences::PreferenceStore::get(
             engine.pool(),
             net_config::NETWORK_BIND_PREF_KEY,
         )
         .await
-        .ok()
-        .flatten()
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                log!(
+                    "[Startup] WARNING: could not read the network_bind setting ({}), \
+                     falling back",
+                    e
+                );
+                None
+            }
+        }
     } else {
         None
     };

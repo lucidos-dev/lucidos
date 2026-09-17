@@ -46,6 +46,7 @@ mod installs;
 mod net_config;
 mod next_boot;
 mod pairing_qr;
+mod peers;
 mod postgres;
 mod proxy;
 mod registry;

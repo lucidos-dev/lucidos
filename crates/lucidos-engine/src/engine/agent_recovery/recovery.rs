@@ -6,7 +6,7 @@ use super::super::change_ops::branch_is_hardened;
 use super::super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use super::super::git_ops::{
     add_paths_to_worktree_exclude, commit_worktree_or_err, default_local_branch,
-    describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
+    describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd, git_ran_ok,
     main_worktree, proposal_files_for_branch, worktrees_dir, WorktreeLookup,
 };
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin, QuestionOption};
@@ -259,7 +259,12 @@ impl LucidosEngine {
         }
 
         if let Some(delete_root) = stale_discard_branch_delete_root(discard, &repo, &branch_name) {
-            if let Err(e) = git_cmd(&["branch", "-D", &branch_name], delete_root).await {
+            // `git_ran_ok`, not `git_cmd`: a non-zero exit is an `Ok` there, so
+            // a refused delete logged nothing. Git refuses while a worktree
+            // still holds the branch, which is what an Unknown lookup leaves
+            // behind: the removal above is skipped, and the branch survives the
+            // Discard with its commits.
+            if let Err(e) = git_ran_ok(&["branch", "-D", &branch_name], delete_root).await {
                 log!("[Recovery] Failed to delete branch {}: {}", branch_name, e);
             }
         }

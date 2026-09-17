@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { TS, getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThread, nextSeq, resetSeqCounter } from './thread-flows-helpers';
-import { activeExchangeIndex, exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserChannel, exchangeUserMessage, groupIntoExchanges, handleEvent, isPendingFollowup, queuedFollowupRun, type Exchange, type ThreadState } from '../thread-events';
+import { exchangeResponseEvents, exchangeResponseTimestamp, exchangeStatus, exchangeTimestamp, exchangeUserMessage, groupIntoExchanges, handleEvent, queuedFollowupRun, type Exchange, type ThreadState } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
 import { isActive, statusLabel } from '../exchange-status';
 import { effectiveThreadStatus } from '../store';
@@ -606,6 +606,12 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
     return exchanges;
   }
 
+  /** The channel the synthesis wrote onto a pending exchange's user event. */
+  function pendingChannel(exchange: Exchange): string | undefined | false {
+    const ev = exchange.userEvent;
+    return ev.type === 'MessageReceived' && ev.channel;
+  }
+
   it('pending message in CC thread should have channel "claude_code"', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
@@ -623,7 +629,7 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
 
     expect(exchanges).toHaveLength(2);
     // The pending exchange must have channel "claude_code", not default to "chat"
-    expect(exchangeUserChannel(exchanges[1])).toBe('claude_code');
+    expect(pendingChannel(exchanges[1])).toBe('claude_code');
   });
 
   it('pending message in regular chat thread should have channel "chat"', () => {
@@ -639,7 +645,7 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
     appendPendingExchanges(exchanges, pending, map.get(id)!.meta.channel);
 
     expect(exchanges).toHaveLength(2);
-    expect(exchangeUserChannel(exchanges[1])).toBe('chat');
+    expect(pendingChannel(exchanges[1])).toBe('chat');
   });
 
   it('CC follow-up pending message is removed when SSE event arrives with matching event_id', () => {
@@ -829,19 +835,16 @@ describe('Queued follow-ups behind an active turn', () => {
     ({ userEvent: { type: 'MessageReceived', text: 'p' + n, _displayCreated: TS } as any, userSeq: -n, steps: [] });
   const real = (): Exchange =>
     ({ userEvent: { type: 'MessageReceived', text: 'a', created: TS } as any, userSeq: 1, steps: [] });
+  /** Which exchange owns the turn, read the way `CreateThreadView` reads it. */
+  const activeIndexOf = (list: Exchange[], busy: boolean): number =>
+    queuedFollowupRun(list, busy).activeIndex;
 
-  it('isPendingFollowup: true only for an optimistic (no-created) chat MessageReceived', () => {
-    expect(isPendingFollowup(pend(1))).toBe(true);
-    expect(isPendingFollowup(real())).toBe(false); // confirmed message carries `created`
-    expect(isPendingFollowup({ userEvent: { type: 'UserQuestionAsked', tool_use_id: 't', question: 'q' } as any, userSeq: 1, steps: [] })).toBe(false);
-  });
-
-  it('activeExchangeIndex: active turn owns the stream while busy, literal last when idle', () => {
+  it('the active turn owns the stream while busy, and the literal last when idle', () => {
     const list = [real(), pend(1), pend(2)];
-    expect(activeExchangeIndex(list, /* busy */ true)).toBe(0);  // the active turn
-    expect(activeExchangeIndex(list, /* busy */ false)).toBe(2); // freshly-sent last
-    expect(activeExchangeIndex([real(), real()], true)).toBe(0); // first stepless MR is in-flight
-    expect(activeExchangeIndex([pend(1), pend(2)], true)).toBe(0); // first optimistic MR is in-flight
+    expect(activeIndexOf(list, /* busy */ true)).toBe(0);  // the active turn
+    expect(activeIndexOf(list, /* busy */ false)).toBe(2); // freshly-sent last
+    expect(activeIndexOf([real(), real()], true)).toBe(0); // first stepless MR is in-flight
+    expect(activeIndexOf([pend(1), pend(2)], true)).toBe(0); // first optimistic MR is in-flight
   });
 
   it('queuedFollowupRun includes persisted MessageReceived follow-ups before injection', () => {
@@ -856,7 +859,6 @@ describe('Queued follow-ups behind an active turn', () => {
       steps: [],
     };
 
-    expect(isPendingFollowup(persistedFollowup)).toBe(false);
     const run = queuedFollowupRun([active, persistedFollowup], /* busy */ true);
     expect(run.activeIndex).toBe(0);
     expect([...run.queuedIndices]).toEqual([1]);
@@ -963,9 +965,8 @@ describe('Queued follow-ups behind an active turn', () => {
     const exchanges = getExchangesWithPending(map, id, /* useDisplayCreated */ true);
     expect(exchanges).toHaveLength(3);
 
-    const threadBusy = true; // status 'running'
-    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
-    expect(activeIdx).toBe(0); // the active turn, not a queued follow-up
+    const run = queuedFollowupRun(exchanges, /* threadBusy */ true);
+    expect(run.activeIndex).toBe(0); // the active turn, not a queued follow-up
 
     // Active turn (played as 'last') reads streaming — NOT 'interrupted' — so the
     // live response stays under it, not under the last queued message.
@@ -974,7 +975,7 @@ describe('Queued follow-ups behind an active turn', () => {
     // BOTH follow-ups are queued (the engine drains the whole FIFO — none are
     // superseded), mirroring renderExchanges' isQueued computation.
     for (let i = 1; i < exchanges.length; i++) {
-      expect(threadBusy && i !== activeIdx && isPendingFollowup(exchanges[i])).toBe(true);
+      expect(run.queuedIndices.has(i)).toBe(true);
     }
   });
 
@@ -988,11 +989,9 @@ describe('Queued follow-ups behind an active turn', () => {
       { text: 'meanwhile', eventId: 'm1', created: '2026-01-01T00:00:05Z' },
     ];
     const exchanges = getExchangesWithPending(map, id, true);
-    const threadBusy = true; // waiting_for_user_answer
-    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
-    expect(exchanges[activeIdx].userEvent.type).toBe('UserQuestionAsked');
-    const followupIdx = exchanges.length - 1;
-    expect(threadBusy && followupIdx !== activeIdx && isPendingFollowup(exchanges[followupIdx])).toBe(true);
+    const run = queuedFollowupRun(exchanges, /* threadBusy */ true); // waiting_for_user_answer
+    expect(exchanges[run.activeIndex].userEvent.type).toBe('UserQuestionAsked');
+    expect(run.queuedIndices.has(exchanges.length - 1)).toBe(true);
   });
 
   it('a freshly-sent first message is active (Requesting), not queued', () => {
@@ -1002,10 +1001,9 @@ describe('Queued follow-ups behind an active turn', () => {
     ];
     const exchanges = getExchangesWithPending(map, id, true);
     expect(exchanges).toHaveLength(1);
-    const threadBusy = true;
-    const activeIdx = activeExchangeIndex(exchanges, threadBusy);
-    expect(activeIdx).toBe(0);
-    expect(threadBusy && 0 !== activeIdx && isPendingFollowup(exchanges[0])).toBe(false); // active, not queued
+    const run = queuedFollowupRun(exchanges, /* threadBusy */ true);
+    expect(run.activeIndex).toBe(0);
+    expect(run.queuedIndices.has(0)).toBe(false); // active, not queued
     expect(exchangeStatus(exchanges[0], '', /* isLast */ true, false, false, /* threadIdle */ false)).toBe('pending');
   });
 });

@@ -491,17 +491,18 @@ which is what lets the boot sweep find one whose engine died mid-call.
 |---|---|---|---|---|
 | `VoiceSessionStarted` | A voice session opened on this thread. Carries `session_id: Uuid`, and the `actor` (from `EventMeta`) is the device that opened the socket. Exactly one session may be live per thread, so a second upgrade is refused and writes no second row. Placing a call bumps the thread's recency and nothing else. It does NOT promote a draft: connecting is not a conversation, so the first spoken word does that instead (ADR 0167). | lifecycle (rare per thread) | yes | yes |
 | `VoiceSessionEnded` | The session closed. Carries the same `session_id`, `duration_secs: u64`, and `reason`: `hangup` (the caller rang off), `agent_hangup` (the caller said they were done and Lucidos rang off for them, which ends the call and never the work), `disconnected` (the socket died with no goodbye), `provider_failed` (the talker could not go on), `engine_shutdown` (the engine went away under the call, or the boot sweep settled a start its process never got to end). A sweep-settled row carries `duration_secs: 0`, because the engine holding the clock is gone. | lifecycle (rare per thread) | yes | yes |
-| `SpokenReplyGenerated` | The talker finished saying something out loud, and this is what it said. Carries `session_id: Uuid`, `text: String`, and `interrupted: bool` (the caller spoke over it, so only that much was heard). One per stretch of speech, whether the talker composed the words itself or was reading the agent's answer aloud: both are what the caller heard. A stretch is everything it said between two moves of the conversation, so it can span several provider turns (ADR 0188). A reply cut off before a word was said writes nothing. The `actor` names the talker as a guest agent, so the agent reading the thread sees it under its own speaker label rather than as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status and a talker turn landing mid-turn must not settle it. Like the spoken message beside it, it MAKES THE THREAD REAL (ADR 0167). That matters because the talker usually greets first. | a few per call | yes | yes |
-| `SpokenMessageReceived` | The caller said something and the talker answered it alone, from what it already knew. Carries `session_id: Uuid` and `text: String`, and the `actor` is the caller's device rather than the talker. It started no agent turn, which is exactly why it is not a `MessageReceived`: that variant is a Start event, and using it here would leave the thread claiming a turn that never runs. `Metadata`, and it moves no section. It MAKES THE THREAD REAL, as the spoken reply beside it does (ADR 0167): a draft the call was placed from becomes an ordinary thread, its stored draft is cleared, and every device is told. The caller's FIRST spoken words also become the thread's `first_message`, which is what titles a call nobody delegated from. | a few per call | yes | yes |
-| `WorkDelegated` | The talker asked for the agent, with its `delegate` tool. Carries `session_id: Uuid` and `reason: String`, the talker's own few words on what the caller wants. Never empty: a call with no reason gets a stand-in rather than being dropped. The `actor` names the talker as a guest agent, as on a spoken reply. It sits BESIDE the `MessageReceived` that started the turn, never in place of it, so it is `Metadata` and moves no section. | a few per call | yes | yes |
+| `SpokenReplyGenerated` | The talker finished a turn of speech, and this is what it said. Carries `session_id: Uuid`, `text: String` and `interrupted: bool` (the caller spoke over it, so only that much was heard). Written the moment the provider ends that turn, so `created` IS when the words stopped and the transcript can read every row by the clock alone (ADR 0201). One per provider TURN, whether the talker composed the words itself or was reading the agent's answer aloud: both are what the caller heard. A transcriber cuts a sentence wherever the speaker breathes, so one sentence is several rows, and the transcript and the agent's own history join neighbours back together. A reply the caller CUT OFF carries only what they heard, and the turn end reporting the whole of it afterwards writes nothing (ADR 0200). A reply cut off before a word was said writes nothing at all. The `actor` names the talker as a guest agent, so the agent reading the thread sees it under its own speaker label rather than as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status and a talker turn landing mid-turn must not settle it. Like the spoken message beside it, it MAKES THE THREAD REAL (ADR 0167). That matters because the talker usually greets first. | a few per call | yes | yes |
+| `SpokenMessageReceived` | The caller said something on a call. EVERY caller utterance, whatever the talker does with it (ADR 0201). Carries `session_id: Uuid` and `text: String`, and the `actor` is the caller's device rather than the talker. Written the instant the provider ends the caller's turn, so `created` is when they stopped speaking. It starts no agent turn, which is exactly why it is not a `MessageReceived`: that variant is a Start event, and using it here would leave the thread claiming a turn that never runs. What starts a delegated turn is the talker's own `WorkDelegated`. `Metadata`, and it moves no section. It MAKES THE THREAD REAL, as the spoken reply beside it does (ADR 0167): a draft the call was placed from becomes an ordinary thread, its stored draft is cleared, and every device is told. The caller's FIRST spoken words also become the thread's `first_message`, which is what titles a call nobody delegated from. | a few per call | yes | yes |
+| `WorkDelegated` | The talker asked for the agent, with its `delegate` tool. Carries `session_id: Uuid` and `reason: String`, the talker's own few words on what the caller wants. Empty when the talker composed none, which is every ask on a protocol whose delegation frame carries no words: the transcript then draws no row for it, rather than putting the caller's own sentence in the talker's mouth (ADR 0200). The `actor` names the talker as a guest agent, as on a spoken reply. **`Start`: this row is what begins a delegated call's turn** (ADR 0201), and the turn anchors on it. No `MessageReceived` is written beside it, because the caller's words already have their own row. | a few per call | yes | yes |
 
 No payload here carries audio, and audio is never persisted at all.
 
 **The talker decides whether a spoken turn needs the agent.** It holds exactly
 three tools and none of them acts (ADR 0170). `delegate` takes a short reason.
-What it delegates persists as a `MessageReceived` and starts the agent's turn
-through the same single-flight admission a typed message uses. What it answers
-alone persists as a `SpokenMessageReceived` and starts nothing.
+Every caller utterance persists as a `SpokenMessageReceived`, whichever it
+does. A delegation writes `WorkDelegated` beside it, and THAT row starts the
+agent's turn, through the same single-flight admission a typed message uses
+(ADR 0201).
 
 `answer` settles something waiting on the caller: a question card, or a
 permission card in any of its three lanes. It hands back a choice id the engine
@@ -518,15 +519,10 @@ Either way the utterance is recorded exactly once, so a call's transcript is
 the thread's transcript: the caller's words, the agent's answer where there was
 one, and the `SpokenReplyGenerated` rows for what was actually said out loud.
 
-**The caller's words are always written before the reply to them.** Both rows
-go down when the conversation MOVES on: the caller speaking again, a new thing
-handed to the talker to say, or the call ending. A pause in the talker's words
-is none of those and writes nothing. It says nothing about whether the talker
-is about to ask for the agent (ADR 0191).
-
-That `MessageReceived` carries `voice_session_id`, naming the session it was
-spoken on. It is the only thing that tells the message apart from a typed one,
-because the composer stays live during a call.
+**Every row lands when its own turn ends.** Nothing waits for a move of the
+conversation. So nothing finished lives only in engine memory, and no row is
+stamped later than it happened (ADR 0201). The caller's words therefore read
+above the reply to them, because that is the order they were said in.
 
 **The tool is an ask, not a wake.** The talker is never told whether an agent
 turn is already running, and never has to be. It calls `delegate` for every
@@ -600,7 +596,7 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
 
 `mode` is `ActorMode` (`human` / `agent` / `engine`). `origin` is the structured `MessageOrigin` (`Device` / `Api` / `Workspace` / `ThreadLink` / `Engine` / `System`). Old DB rows may be missing `origin` — the frontend's `legacyOrigin()` synthesizes from `device_id` / `parent_thread_id`.
 
-`voice_session_id` is present only when the message was **spoken** on a *voice session*, and it names that session. Absent means typed, which is every row written before voice existed. It has to live on the message. Voice is a mode of a thread, so the composer stays live during a call. A typed message therefore sits between the same pair of session events a spoken one does. The transcript reads it to mark the bubble as spoken.
+`voice_session_id` names the *voice session* a message was **spoken** on. No `MessageReceived` carries one today: a caller's words are a `SpokenMessageReceived` instead (ADR 0201). Rows written before that change still carry it, and the transcript still reads it to mark such a bubble as spoken.
 
 The `Api` variant carries an optional `source_thread_id`:
 
@@ -1001,6 +997,8 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 **One callback per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
 
 **A steer is not a completion.** A `ResponseCanceled` whose cause is `superseded_by_followup` is the mid-turn redirect the engine arms when a follow-up lands on a live Codex turn: the caller steered, they did not abandon, and the child runs the redirected turn immediately afterwards. It fires no `ChildThreadCompleted` and no parent callback. The redirected turn's own terminal is the report.
+
+**A terminal the engine is about to resume is not a completion either.** A coding-agent turn that dies on a transient upstream `API Error` emits a real `ResponseFailed`, and the engine resumes the same session seconds later. That `ResponseFailed`, and the `CodingAgentIdled` behind it, fire no `ChildThreadCompleted` and no parent callback: the child is still working, and the resumed turn's own terminal is the report. So a parent sees ONE card for the whole episode, describing what its child actually did rather than the drop it survived. The suppression is conditional on the resume actually being scheduled, never on the error: past `MAX_API_ERROR_AUTO_RESUMES` the thread parks for good and the `failure` card fires normally. See ADR 0199.
 
 **Running more than one child at a time: `system-knowhow/orchestrating-sub-threads.md`.** This edge and the *child follow-up* below are the only two carrying traffic between threads, and nothing carries it sideways. That file is the operating manual for a parent coordinating several children. It covers what a child may do about a sibling's events, and how a ruling reaches a child that already finished.
 

@@ -11,6 +11,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { toasts, focusedThreadId, threadMap } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
+import { makeThreadAggregate } from '../actions/threads-test-helpers';
 
 // focusThread imports React/Preact-coupled modules (scrollState, navigation)
 // that aren't usable in this unit test — stub it so the toast onClick is
@@ -78,12 +79,14 @@ describe('MissingHardeningDetected SSE toast', () => {
   });
 
   it('falls back to the noun "thread" when the title is missing', () => {
-    // No seedThread — threadMap is empty.
+    // No seedThread, so threadMap is empty and the event's own aggregate is
+    // what makes the skeleton. A skeleton carries the placeholder title.
     handleThreadEvent({
       thread_id: 'thread-A',
       seq: 1,
       event: { type: 'MissingHardeningDetected' },
       created: '2026-01-01T00:00:00Z',
+      aggregate: makeThreadAggregate('thread-A'),
     });
 
     const t = toasts.value.find(t => t.message.toLowerCase().includes('hardening required'));

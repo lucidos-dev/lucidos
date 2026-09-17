@@ -5,8 +5,11 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vite
 const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
-import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, followPosition, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setAgentLive, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
+import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
+
+/** Is a marker the CURRENT landing? Asked the way `scrollState` asks it. */
+const hasNavFocus = (): boolean => navFocusElement() !== null;
 
 /** The one `[Client/deeplink] outcome` payload this test drove, or null. */
 function outcomeLine(): Record<string, unknown> | null {
@@ -418,16 +421,16 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     vi.useFakeTimers();
     container = makeContainer();
     setActiveScrollElement(container);
-    // The premise of every test in this block. `setThreadLive` is a module
+    // The premise of every test in this block. `setAgentLive` is a module
     // global, so the afterEach un-says it rather than leaving a live thread for
     // the next block.
-    setThreadLive(true);
+    setAgentLive(true);
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
     stopFollowingBottom();
-    setThreadLive(false);
+    setAgentLive(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -472,7 +475,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(19200);
     // Recorded as the live edge, not as the offset the landing produced. So
     // coming back to the thread resumes the ride instead of parking them.
-    expect(isFollowScroll(container)).toBe(true);
+    expect(followPosition(container)).toBe('live-edge');
   });
 
   it('ends the ride when the link lands ABOVE the live edge', () => {
@@ -521,7 +524,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
-    setThreadLive(false);         // idle, so the chevron leaves the ride armed
+    setAgentLive(false);         // idle, so the chevron leaves the ride armed
     scrollToTop();                // and its glide is in flight, having moved nobody yet
     expect(container.scrollTop).toBe(9200);
 
@@ -550,7 +553,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(followingLiveEdge.value).toBe(true);
     // The ride's OWN motion took them there, so its frames are held writes and
     // the position still records as the live edge.
-    expect(isFollowScroll(container)).toBe(true);
+    expect(followPosition(container)).toBe('live-edge');
 
     container.scrollHeight = 20000;
     onResize();
@@ -699,13 +702,13 @@ describe('a deep-link landing ends the ride on an IDLE thread too', () => {
     vi.useFakeTimers();
     container = makeContainer();
     setActiveScrollElement(container);
-    // Deliberately never `setThreadLive(true)`: an idle thread is the premise.
+    // Deliberately never `setAgentLive(true)`: an idle thread is the premise.
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
     setFollowLiveEdge(false); // un-press, so the *follow seed* does not leak
-    setThreadLive(false);
+    setAgentLive(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -759,7 +762,7 @@ describe('a deep-link landing ends the ride on an IDLE thread too', () => {
     // them to the live edge here. Now nothing does.
     const { onResize } = armThenLandOnAnOldTurn();
 
-    setThreadLive(true);
+    setAgentLive(true);
     container.scrollHeight = 20000;
     onResize();
 

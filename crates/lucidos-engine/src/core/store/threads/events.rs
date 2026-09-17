@@ -90,6 +90,12 @@ impl EventStore {
     /// emitted by the agentic loop after iteration 1 (latest-wins per source).
     /// Falls back to the legacy `MessageReceived.image_description` payload
     /// field for pre-backfill rows in the deprecation window.
+    ///
+    /// **A spoken row counts.** A call the talker answered alone writes only
+    /// `SpokenMessageReceived`. Reading the typed variant alone left every such
+    /// thread with no first message, and so with no title. The client's
+    /// `threadTitle.ts` already takes either, and its comment says the two
+    /// surfaces agree. This is what makes that true.
     pub async fn get_thread_first_message(
         &self,
         thread_id: &str,
@@ -100,9 +106,9 @@ impl EventStore {
             r#"
             SELECT id, payload
             FROM events
-            WHERE event_type = 'MessageReceived'
+            WHERE event_type IN ('MessageReceived', 'SpokenMessageReceived')
               AND thread_id = $1
-            ORDER BY created ASC
+            ORDER BY created ASC, sequence ASC
             LIMIT 1
             "#,
         )

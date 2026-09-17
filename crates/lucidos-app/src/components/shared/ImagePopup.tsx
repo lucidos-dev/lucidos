@@ -719,9 +719,11 @@ export function ImagePopup() {
       layoutRef.current = null;
       zoomApiRef.current = null;
     };
-    // ImagePopup is always mounted at App root; the strip DOM only exists
-    // when state is non-null. Re-run on open/close transitions so listeners
-    // attach to the freshly-mounted strip.
+    // The dep is constant-true for this component's whole life: `App.tsx`
+    // renders us behind a slot that returns null while `popupImage` is unset,
+    // so we mount and unmount with the signal. It stays because the strip is
+    // what the listeners attach to, and only a non-null state draws one.
+    // Nothing here survives a close, so do not reason about state that does.
   }, [state !== null]);
 
   // Fit the image the popup just landed on. Declared after the gesture effect

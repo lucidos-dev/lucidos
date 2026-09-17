@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -879,13 +879,14 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // once, on the first. Eight of them down one reply is the marker
         // saying the same thing eight times.
         const after = events[events.length - 1];
+        // The live row wears the same type, so it takes this arm too, and it
+        // is drawn IDENTICALLY (ADR 0197). A row that read as live would keep
+        // saying so long after the sentence ended, the engine's own row being
+        // what retires it.
         events.push({
           type: 'spoken_reply',
           text: e.text,
           interrupted: e.interrupted === true,
-          // The live row wears the same type, so it takes this arm too. One
-          // shape for a reply being said and for the same reply written down.
-          ...(isLiveReplyRow(event) ? { live: true as const } : {}),
           ...(after?.type === 'spoken_reply' ? { follows: true as const } : {}),
         });
         break;
@@ -1388,10 +1389,11 @@ export function abortTookEngineDown(ev: ThreadEvent): boolean {
  *  be a voice row, so the doer's first tool call takes the exchange back to the
  *  ordinary machinery.
  *
- *  A DELEGATED utterance qualifies while its doer sleeps, which is the whole of
- *  the wait this arm exists to show. It is a `MessageReceived` rather than a
- *  spoken turn, and `voice_session_id` is what says it was said rather than
- *  typed (`isCallerUtterance`). */
+ *  A DELEGATED utterance qualifies while its doer sleeps, which is the whole
+ *  of the wait this arm exists to show. Its own card carries the delegation as
+ *  a step, and `isCallerUtterance` takes both spellings of the boundary: a
+ *  `SpokenMessageReceived`, or the `MessageReceived` rows written before
+ *  ADR 0201. What stops the wait being read as settled is `tookTheTurn`. */
 function isCallOnly(exchange: Exchange): boolean {
   if (!isCallBoundary(exchange.userEvent)) return false;
   return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
@@ -1407,8 +1409,13 @@ function isCallOnly(exchange: Exchange): boolean {
  *  while the doer works, routinely before the doer has even woken. Counting
  *  that stall would settle the exact wait this arm exists to show. The answer
  *  there is the doer's, and the doer's first step takes the exchange out of
- *  `isCallOnly` entirely. */
+ *  `isCallOnly` entirely.
+ *
+ *  Read off `tookTheTurn`, which is the fact itself: this card holds a turn.
+ *  A delegated utterance was a `MessageReceived` until ADR 0201, and that type
+ *  is kept for the rows written before it. */
 function callAnswered(exchange: Exchange): boolean {
+  if (exchange.tookTheTurn) return false;
   if (exchange.userEvent.type === 'MessageReceived') return false;
   if (exchange.userEvent.type === 'SpokenReplyGenerated') return true;
   return exchange.steps.some(s => s.event.type === 'SpokenReplyGenerated');
@@ -1509,13 +1516,6 @@ function isRecoveryInterruptMarker(event: ThreadEvent): boolean {
     && event.reason === IDLE_ENGINE_RESTART_INTERRUPT_REASON;
 }
 
-const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'ResponseGenerated',
-  'ResponseFailed',
-  'ResponseCanceled',
-  'ResponseAborted',
-  'CodingAgentIdled',
-]);
 
 /** Read the engine note (UserPromptInjected step) from a ContinuationStarted
  *  exchange. Returns the full text and a coarse count of bullet entries for
@@ -1583,24 +1583,12 @@ function supersededAbortIndices(steps: SequencedEvent[]): Set<number> {
   return superseded;
 }
 
-/** A pending (optimistic, not-yet-ingested) chat follow-up exchange.
- *  `computeExchanges` synthesizes these from `thread.pendingUserMessages` with
- *  a `_displayCreated` stamp and NO `created`, then sorts them to the end of
- *  the timeline. A coding-agent follow-up goes to stdin immediately and so
- *  carries a real `created`, which makes this predicate chat-only. */
-export function isPendingFollowup(exchange: Exchange): boolean {
-  const ev = exchange.userEvent;
-  return ev.type === 'MessageReceived' && !ev.created && !!ev._displayCreated;
-}
-
 function exchangeHasTerminalStep(exchange: Exchange): boolean {
+  // The shared list, plus `SessionEnded`. A coding-agent session ending is a
+  // terminal a QUEUE reads, not one the fold reads: it never resolves a turn's
+  // continuation, so `TERMINAL_EVENT_TYPES` leaves it out.
   return exchange.steps.some(({ event }) =>
-    event.type === 'ResponseGenerated'
-    || event.type === 'ResponseCanceled'
-    || event.type === 'ResponseAborted'
-    || event.type === 'ResponseFailed'
-    || event.type === 'CodingAgentIdled'
-    || event.type === 'SessionEnded'
+    TERMINAL_EVENT_TYPES.has(event.type) || event.type === 'SessionEnded'
   );
 }
 
@@ -1610,6 +1598,10 @@ function exchangeHasTerminalStep(exchange: Exchange): boolean {
  *  queued bubble. */
 function canQueueBehind(exchange: Exchange): boolean {
   if (exchangeHasTerminalStep(exchange)) return false;
+  // A boundary that STARTED no turn can still hold one: a caller's utterance
+  // takes the running turn's continuation (ADR 0201). A follow-up queues
+  // behind that turn, wherever it is now showing.
+  if (exchange.tookTheTurn) return true;
   switch (exchange.userEvent.type) {
     case 'MessageReceived':
     case 'TriggerStarted':
@@ -1755,18 +1747,6 @@ export function queuedMessagesFromExchanges(
   return out;
 }
 
-/** Index of the exchange the agent is working on: the one that owns the live
- *  stream and reads 'streaming' or 'working', not the literal last exchange.
- *
- *  When the thread is busy, follow-ups typed while it worked are queued. The
- *  active exchange is then the live or parked non-queued turn when one exists,
- *  and otherwise the first stepless user message. When the thread is idle, the
- *  literal last exchange is active. A freshly-sent message is about to be
- *  picked up and must read 'Requesting' rather than 'Queued'. */
-export function activeExchangeIndex(exchanges: Exchange[], threadBusy: boolean): number {
-  return queuedFollowupRun(exchanges, threadBusy).activeIndex;
-}
-
 /** Derive ExchangeStatus for an exchange.
  *
  *  @param isLast the last (newest) exchange in the thread.
@@ -1805,8 +1785,9 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     return isSettledLiveUtterance(exchange.userEvent) ? 'done' : 'pending';
   }
   // The talker's own live row. Nothing is in flight BEHIND it: the row is the
-  // activity, and the words moving in it are what says so. A pending verdict
-  // here would put a second waiting mark under a reply already being read.
+  // activity, and the words moving in it are what says so. The row itself
+  // claims no liveness (ADR 0197). So a pending verdict here would be the one
+  // thing on screen calling the reply unfinished, long after it ended.
   if (isLiveReplyRow(exchange.userEvent)) return 'done';
   let isComplete = false;
   let isCanceled = false;
@@ -2093,7 +2074,10 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     // outlives the call, so a hangup says nothing about whether the turn ran.
     // Falling through hands it to the ordinary machinery, which reports a turn
     // that produced nothing as the crash it is.
-    if (exchange.userEvent.type !== 'MessageReceived') return 'done';
+    //
+    // `tookTheTurn` is the fact, and the type beside it covers the rows
+    // written before ADR 0201, where a delegation was a `MessageReceived`.
+    if (!exchange.tookTheTurn && exchange.userEvent.type !== 'MessageReceived') return 'done';
   }
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // Agent idle. WaitingBanner handles the "can interact" state separately.

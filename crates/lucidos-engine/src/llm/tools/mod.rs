@@ -22,7 +22,8 @@
 //! - `proxy` — reload_proxy_modules, proxy_request, http_request
 //! - `images` — save_thread_image, generate_image
 //! - `misc` — navigate_ui, git_clone, get_backup_status, request_credential,
-//!   connect_oauth_account, execute_intent, ask_user_question, todo_write
+//!   connect_oauth_account, execute_intent, ask_user_question, await_event,
+//!   list_event_waits, cancel_event_wait, todo_write
 //!   (env-var management is the grouped `env_vars` tool, see below)
 //!
 //! Grouped, manifest-driven tools (one tool per domain with an `action` enum,
@@ -64,7 +65,6 @@ mod web;
 use crate::llm::provider::ToolDefinition;
 
 pub use images::{get_image_generation_tool, get_save_thread_image_tool, get_view_image_tool};
-pub use misc::get_navigate_ui_tool;
 /// The Settings sub-sections a deep link may name. Re-exported so a notification
 /// producer's test can hold its own tap destination to this list, rather than
 /// keeping a copy that drifts.

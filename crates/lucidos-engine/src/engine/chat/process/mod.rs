@@ -71,10 +71,12 @@ pub(crate) use turn_tail::TurnTail;
 /// ingested with no visible acknowledgment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreEmittedOrigin {
-    /// A message from a person or an agent whose `MessageReceived` the caller
-    /// persisted before dispatch: the chat API boundary's emit-before-ack, or
-    /// the Thread Queue executor's eager child `MessageReceived`. Routes
-    /// exactly like a message this function emitted itself.
+    /// Real input from a person or an agent, whose starter event the caller
+    /// persisted before dispatch: the chat API boundary's emit-before-ack, the
+    /// Thread Queue executor's eager child `MessageReceived`, or a call's
+    /// `WorkDelegated` (ADR 0201). Routes exactly like a message this function
+    /// emitted itself, which is the point: the words are the user's, so they
+    /// must not reach a live turn framed as engine text.
     Message(Uuid),
     /// An engine-internal re-entry on an existing thread, anchored to an event
     /// the UI already renders: a child thread's completion re-opening its parent

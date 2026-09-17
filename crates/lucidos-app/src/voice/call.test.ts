@@ -8,8 +8,13 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SPEECH_GATE_DEFAULTS } from './speechGate';
-import { PREROLL_FRAMES_MAX, type CallRunner, createCallRunner } from './call';
-import { LANDING_BOUND_MS, WORDS_BOUND_MS, type CallState } from './callState';
+import { CAPTURE_FRAME_MS, PREROLL_FRAMES_MAX, type CallRunner, createCallRunner } from './call';
+import {
+  BARGE_IN_QUIET_MS,
+  LANDING_BOUND_MS,
+  WORDS_BOUND_MS,
+  type CallState,
+} from './callState';
 import { CAPTURE_FRAME_SAMPLES, floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, SocketHandlers } from './ports';
 import {
@@ -20,6 +25,14 @@ import {
 } from './refusals';
 
 const THREAD = 'thread-1';
+
+/**
+ * Quiet frames enough that the caller's next word takes the floor back.
+ *
+ * Derived rather than written out, so the two numbers behind it cannot drift
+ * apart. Below this a word is somebody finishing their sentence.
+ */
+const GAVE_UP_THE_FLOOR = Math.ceil(BARGE_IN_QUIET_MS / CAPTURE_FRAME_MS);
 
 interface Harness {
   runner: CallRunner;
@@ -46,6 +59,8 @@ interface Harness {
   releaseAudio(): Promise<void>;
   armSlowAudio(): void;
   armAudioFailure(error: unknown): void;
+  /** Make every device handed out from here refuse to close. */
+  armCloseFailure(error: unknown): void;
   armSocketFailure(error: unknown): void;
   /** Make the echo report that no hop carries an upgrade. */
   armBlockedUpgrade(): void;
@@ -123,6 +138,7 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
   let failure: unknown = null;
   let socketFailure: unknown = null;
   let releases = 0;
+  let deviceCloseError: unknown = null;
   let upgradeCarried = true;
   let probeFailure: unknown = null;
 
@@ -137,6 +153,7 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
       if (slow) await new Promise<void>((resolve) => (pending = resolve));
       if (failure !== null) throw failure;
       const device = new FakeDevice();
+      device.closeError = deviceCloseError;
       device.note = deviceNote;
       devices.push(device);
       return device;
@@ -185,6 +202,9 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
     },
     armAudioFailure(error) {
       failure = error;
+    },
+    armCloseFailure(error) {
+      deviceCloseError = error;
     },
     armSocketFailure(error) {
       socketFailure = error;
@@ -310,6 +330,7 @@ describe('barge-in', () => {
   it('cuts the talker off after a run of loud frames', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
+    h.hush(GAVE_UP_THE_FLOOR);
     h.speak();
     expect(h.socket().controls()).toEqual(['barge_in']);
     expect(h.device().stops).toBeGreaterThan(0);
@@ -339,18 +360,35 @@ describe('barge-in', () => {
     expect(h.last().utteranceCount).toBe(1);
   });
 
-  /** The caller never stopped, so the gate was already open when the talker
-   *  started. Only an EDGE reaches the reducer. Without measuring afresh at
-   *  the flip there is no edge left to make. The caller could then not cut in
-   *  without first shutting up for a third of a second. */
-  it('cuts in for a caller who never stopped talking', async () => {
+  /** **The caller never stopped, so they cut nobody off.** The talker took the
+   *  floor over the top of them, which is the provider endpointing on a
+   *  breath. Their next words finish the sentence it talked over.
+   *
+   *  Cut here, the client throws the speaker's queue away while the talker
+   *  carries on, and the caller hears the reply resume as a fragment. Their
+   *  utterance still opens: only the CUT is withheld. */
+  it('stays quiet for a caller who never stopped talking', async () => {
     const h = await liveCall();
     h.speak();
     expect(h.last().utterance).toBe('live');
     h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
-    expect(h.socket().controls()).toEqual(['barge_in']);
-    expect(h.last().phase).toBe('listening');
+    expect(h.socket().controls()).toEqual([]);
+    expect(h.device().stops).toBe(0);
+    expect(h.last().phase).toBe('speaking');
+  });
+
+  /** The breath before a trailing "please" is longer than the gate's own
+   *  hangover and shorter than handing the floor over. It is the exact gap the
+   *  reported call was chopped at. */
+  it('stays quiet for a caller drawing breath mid-sentence', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    h.socket().say({ type: 'talker_transcript', text: 'Still ' });
+    h.speak();
+    expect(h.socket().controls()).toEqual([]);
+    expect(h.device().stops).toBe(0);
   });
 
   /** Every delta of the reply arrives as one of these. Measuring afresh on
@@ -358,10 +396,24 @@ describe('barge-in', () => {
   it('measures afresh only on the first delta of a reply', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'here ' });
+    h.hush(GAVE_UP_THE_FLOOR);
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
     h.socket().say({ type: 'talker_transcript', text: 'is the answer' });
     h.speak(1);
     expect(h.socket().controls()).toEqual(['barge_in']);
+  });
+
+  /** One interruption is one cut, whatever the gate does after it. A caller
+   *  talking through a reply raises an edge per breath they take. */
+  it('cuts once however many breaths the caller takes over it', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'one moment' });
+    h.hush(GAVE_UP_THE_FLOOR);
+    h.speak();
+    h.hush();
+    h.speak();
+    expect(h.socket().controls()).toEqual(['barge_in']);
+    expect(h.device().stops).toBe(1);
   });
 });
 
@@ -669,12 +721,29 @@ describe('a microphone that will not close', () => {
     await Promise.resolve();
     expect(h.problems.join(' ')).toContain('microphone could not be released');
   });
+
+  /** The other release, and it owes the same report. A rejection dropped here
+   *  is an unhandled one, and the reader is left with a lit indicator and no
+   *  reason for it. */
+  it('says so for a microphone that arrived after its call ended', async () => {
+    const h = harness();
+    h.armSlowAudio();
+    h.armCloseFailure(new Error('device busy'));
+    h.runner.press(THREAD);
+    h.runner.press(THREAD); // rings off while still connecting
+    await h.releaseAudio();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.device().closes).toBe(1);
+    expect(h.problems.join(' ')).toContain('microphone could not be released');
+  });
 });
 
 describe('the frames a call sends', () => {
   it('are only the two the engine will read', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'hm' });
+    h.hush(GAVE_UP_THE_FLOOR);
     h.speak();
     h.runner.press(THREAD);
     expect(new Set(h.socket().controls())).toEqual(new Set(['barge_in', 'hang_up']));

@@ -28,9 +28,16 @@ function drive(inputs: CallInput[], from: CallState = CALL_IDLE) {
 }
 
 const PRESS: CallInput = { kind: 'toggle', threadId: THREAD };
-/** The local gate opening and shutting on the caller's own voice. */
-const SPOKE: CallInput = { kind: 'speech', open: true };
-const HUSHED: CallInput = { kind: 'speech', open: false };
+/**
+ * The local gate opening and shutting on the caller's own voice.
+ *
+ * `SPOKE` follows a long silence, so over the talker it takes the floor back.
+ * `RESUMED` follows a breath, which is somebody finishing the sentence the
+ * talker talked over.
+ */
+const SPOKE: CallInput = { kind: 'speech', open: true, quietMs: 4_000 };
+const RESUMED: CallInput = { kind: 'speech', open: true, quietMs: 200 };
+const HUSHED: CallInput = { kind: 'speech', open: false, quietMs: 0 };
 const TIMED_OUT: CallInput = { kind: 'utterance-timeout' };
 const frame = (f: ServerFrame): CallInput => ({ kind: 'frame', frame: f });
 /** The engine reporting the caller's finished words. */
@@ -223,7 +230,7 @@ describe('who has the floor', () => {
     const { state } = drive(
       [
         SPOKE,
-        { kind: 'speech', open: false },
+        HUSHED,
         frame({ type: 'user_turn_ended', transcript: words[0] }),
         frame({ type: 'talker_transcript', text: words[1] }),
       ],
@@ -273,7 +280,7 @@ describe('a frame landing mid-word captions nothing', () => {
     const { state } = drive(
       [
         frame({ type: 'user_turn_ended', transcript: 'an earlier sentence' }),
-        { kind: 'speech', open: false },
+        HUSHED,
         frame({ type: 'user_turn_ended', transcript: 'this one' }),
       ],
       midWord(),
@@ -320,6 +327,43 @@ describe('barge-in', () => {
     const { state, effects } = drive([frame({ type: 'interrupted' })], talking());
     expect(state.phase).toBe('listening');
     expect(has(effects, 'stop-playback')).toBe(true);
+  });
+
+  /** **The reported defect.** A caller says "Status", draws breath, and the
+   *  talker answers into the pause. The rest of their sentence is not a
+   *  barge-in: they never handed the floor over.
+   *
+   *  Cutting there threw the speaker's queue away while the talker carried on,
+   *  so the caller heard "Still" ... their own words ... "in it." */
+  it('leaves the talker speaking when the caller finishes their sentence', () => {
+    const { state, effects } = drive([RESUMED], talking());
+    expect(sent(effects)).toEqual([]);
+    expect(has(effects, 'stop-playback')).toBe(false);
+    expect(state.phase).toBe('speaking');
+  });
+
+  /** Their words are still theirs. Only the CUT is withheld, so the bubble is
+   *  drawn and the row it promises still lands. */
+  it('still opens their utterance while the talker keeps the floor', () => {
+    const { state } = drive([RESUMED], talking());
+    expect(state.utterance).toBe('live');
+    expect(state.utteranceCount).toBe(1);
+  });
+
+  /** The other half, and the one a fluency fix must not cost. A caller who has
+   *  been quiet through a reply is taking the floor back. */
+  it('cuts the talker off for a caller who gave the floor up', () => {
+    const { state, effects } = drive([SPOKE], talking());
+    expect(sent(effects)).toEqual(['barge_in']);
+    expect(state.phase).toBe('listening');
+  });
+
+  /** A caller talking through a whole reply raises an edge per breath. One
+   *  interruption is one cut, whatever the gate does after it. */
+  it('cuts once however many breaths the caller takes over it', () => {
+    const { effects } = drive([SPOKE, HUSHED, RESUMED, HUSHED, SPOKE], talking());
+    expect(sent(effects)).toEqual(['barge_in']);
+    expect(effects.filter((e) => e.kind === 'stop-playback')).toHaveLength(1);
   });
 });
 

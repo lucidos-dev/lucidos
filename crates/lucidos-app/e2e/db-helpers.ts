@@ -89,22 +89,32 @@ export function psql(sql: string): string {
  *  bypasses the chat flow since the drawer only reads from the projection.
  *  `state='active'` is required: the column default is 'composing' which
  *  categorizeThreads filters out entirely. Default `archive_state='archived'`
- *  keeps every seeded thread in one section so families nest together. */
-export function seedThreadRow({ id, title, parentId, totalChildren = 0, now }: {
+ *  keeps every seeded thread in one section so families nest together.
+ *
+ *  `now` stamps `created_at` as well as `last_activity`, because the Archive
+ *  section both sorts and paginates on `created_at`. A pagination test needs
+ *  rows spread across that axis, and one whose two timestamps disagreed would
+ *  sort in the drawer somewhere its cursor never looks. `source` is settable
+ *  for the same reason: the drawer's channel filter is what narrows a window
+ *  down to a list too short to scroll. It offers only the two sources this row
+ *  shape is honest for. `is_coding_agent` is hardcoded false below, so a
+ *  `claude_code` row here would deny being one. */
+export function seedThreadRow({ id, title, parentId, totalChildren = 0, now, source = 'chat' }: {
   id: string;
   title: string;
   parentId?: string;
   totalChildren?: number;
   now: string;
+  source?: 'chat' | 'trigger';
 }): string {
-  const cols = ['thread_id', 'title', 'source', 'last_activity', 'message_count',
+  const cols = ['thread_id', 'title', 'source', 'created_at', 'last_activity', 'message_count',
     'is_saved', 'has_response', 'status', 'archive_state', 'state',
     'is_coding_agent', 'active_children_count', 'total_children_count',
     'coding_agent_proposed', 'coding_agent_requires_restart',
     'coding_agent_is_external_repo',
     ...(parentId ? ['parent_thread_id'] : []),
   ].join(', ');
-  const vals = [`'${id}'`, `'${title}'`, `'chat'`, `'${now}'`, '1',
+  const vals = [`'${id}'`, `'${title}'`, `'${source}'`, `'${now}'`, `'${now}'`, '1',
     'false', 'true', `'idle'`, `'archived'`, `'active'`,
     'false', '0', String(totalChildren),
     'false', 'false', 'false',

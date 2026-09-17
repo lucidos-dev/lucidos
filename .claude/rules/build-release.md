@@ -18,6 +18,9 @@ paths:
   - "scripts/lib/updater_payload*.sh"
   - "scripts/lib/codesign.sh"
   - "scripts/lib/cargo_lock_holders_test.sh"
+  # The release gate on the one version source, described under "One source of
+  # truth for the version" below.
+  - "scripts/lib/version_sources_test.sh"
   - "install.sh"
   - "uninstall.sh"
   - "docker-entrypoint.sh"
@@ -241,7 +244,9 @@ The self-contained runtime tree — the 7 `RESOURCE_NAMES`: `lucidos-engine`, `l
 
 **`scripts/lib/resource_contract.sh` is the ONE list**, and it is what both build scripts read `RESOURCE_NAMES`, `BUNDLED_EXECUTABLES` and the Tauri `bundle.resources` map out of. Do not restate any of them.
 
-`resource_contract_check` asserts a **three-way set equality** against the two RUNTIME launchers, neither of which the build scripts own: `service_runtime_env_pairs` + `service_runtime_program` (`scripts/lib/service.sh`, the headless service), and the `*_RESOURCE_NAME` constants in `crates/lucidos-app/src/desktop.rs` (the packaged `.app`). Both name all seven. Drop one from the list and both other sources still carry it, so `--check` goes red on both vehicles.
+`resource_contract_check` asserts a **three-way set equality** against the two RUNTIME launchers, neither of which the build scripts own: `service_runtime_env_pairs` + `service_runtime_program` (`scripts/lib/service.sh`, the headless service), and `spawn_gateway` in `crates/lucidos-app/src/desktop.rs` (the packaged `.app`). Both name all seven. Drop one from the list and both other sources still carry it, so `--check` goes red on both vehicles.
+
+**Both arms read USE, not declarations.** The packaged arm reads `spawn_gateway`'s `.env` block and its `Command::new(&bundle.…)` program, then follows each `BundledResources` field through `bundled_resources` to the `*_RESOURCE_NAME` constant it joins. It used to grep those constants directly, which proves a name exists rather than that anything is told where it lives: a declared, staged and signed resource whose `.env` line was never written passed on that vehicle, which is ADR 0121's own failure mode. A shape the scan cannot follow is an error, so a refactor there goes red and is fixed by teaching `resource_contract_desktop_names` the new shape.
 
 That shape is the whole fix. `build-dmg.sh`'s old `check_resource_contract` compared `RESOURCE_NAMES` against a literal `resource_map_json()` **in the same file**, so editing both together passed. `build-headless.sh`'s `--check` was a `printf` and an `exit 0` and could not fail at all. Net effect: `system-knowhow` could be dropped from `Contents/Resources` **and** from `--emit-tarball` with every gate green, shipping an engine whose live per-turn reference docs are absent.
 

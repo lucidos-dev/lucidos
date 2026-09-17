@@ -146,12 +146,33 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
   (`set_content_size_async`, `set_frame_top_left_point_async`), and that queue is
   not drained until the run loop turns. Every caller reads back in the same
   turn.
-- **Status:** Open, and NARROWER twice. ADR 0178 hands the remembered frame to
-  the builder, which applies it as it creates the NSWindow. The clamp therefore
-  reads real geometry on the new-window path. The `setup` half is **closed**:
-  the clamp moved into `show_startup_window`, which both racers reach after the
-  run loop has drained those setters and before the window is shown (ADR 0193).
-  The reopen still reads early, and its residue is one launch at the wrong size.
+- **Status:** **Closed**, in three steps.
+  - ADR 0178 hands the remembered frame to the builder, which applies it as it
+    creates the NSWindow. The clamp reads real geometry on that path.
+  - ADR 0193 moved the clamp into `show_startup_window`, which both racers
+    reach after the run loop has drained those setters.
+  - ADR 0202 removed the read this gap is about. A frame the client CHOOSES
+    goes through `window_restore::sanitized_frame`, judged before it is
+    written, and the clamp runs only where the client chose nothing. The
+    startup show and the reopen share that shape, through
+    `app_window::settle_main_geometry`.
+
+### A window too big for the display it sits on is left alone while a bigger one is attached
+- **Where:** `crates/lucidos-app/src/window_restore.rs`, `fit_to_displays`; its
+  caller `window_desk::watch_desk`. The rule it applies is ADR 0193's, and the
+  runtime pass is ADR 0204.
+- **Gap:** drag a window sized for a 2560-wide external display onto the
+  built-in panel, with the external still plugged in, and it keeps its size.
+  Content hangs off the right edge until you drag it back or resize it by hand.
+- **Why:** the trigger is "no attached display can hold this window", not "the
+  display it is on cannot". The stricter reading catches this case and costs a
+  worse one: a window whose big monitor is merely away for the day gets shrunk,
+  and the user has to undo that by hand every time. ADR 0193 weighed the pair
+  and chose lenient; ADR 0204 kept the same gate at runtime so the two moments
+  cannot disagree.
+- **Status:** Open by design. The big display is attached and right there, so
+  the window can be dragged back onto it. Unplug it and the pass corrects the
+  window within about a second.
 
 ## Notifications & push
 

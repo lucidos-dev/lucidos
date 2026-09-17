@@ -55,16 +55,117 @@ fn the_session_delegates_to_us_and_never_to_a_rented_backend() {
     );
 }
 
-/// The persona is the cached prefix, so it is the whole of the opening
-/// instructions. What this session knows arrives separately.
+/// The persona opens the instructions. What this session KNOWS arrives
+/// separately, as the resident block.
 #[test]
 fn the_opening_frame_carries_the_persona_and_not_the_resident_block() {
     let start = session_start("gpt-live-1", &opening());
-    assert_eq!(start["session"]["instructions"], "You are Lucidos.");
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    assert!(
+        instructions.starts_with("You are Lucidos."),
+        "the persona is not the prefix: {}",
+        instructions
+    );
     assert!(
         !start.to_string().contains("WHAT YOU ALREADY KNOW"),
         "the resident block was folded into the opening frame"
     );
+}
+
+/// The one thing a tool-less talker has nowhere else to read.
+///
+/// Realtime carries this in the `delegate` tool's description, which client
+/// delegation never declares. Without it the talker promises to go and look and
+/// then asks for nothing, which is the defect this closes.
+#[test]
+fn a_tool_less_talker_is_told_when_to_ask_for_help() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    for label in [
+        "Backend tools:",
+        "Delegate to the backend when:",
+        "Do not delegate to the backend when:",
+    ] {
+        assert!(
+            instructions.contains(label),
+            "{} is missing from the policy: {}",
+            label,
+            instructions
+        );
+    }
+}
+
+/// The load-bearing half: a promise and the handover are one turn.
+///
+/// Its absence is what a caller actually meets. They hear "on it", nothing is
+/// asked for, and they wait until they hang up.
+#[test]
+fn the_talker_may_not_promise_work_it_has_not_handed_over() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    assert!(
+        instructions.contains("SAME turn"),
+        "nothing ties the promise to the handover: {}",
+        instructions
+    );
+}
+
+/// Handing over is also how this talker settles what is waiting on the caller.
+///
+/// It holds no answering tool, so the ask is the whole of its reach. The engine
+/// reads one against a parked question as the caller's answer. A talker that
+/// never asks therefore leaves the card open for good, which is the reported
+/// call.
+///
+/// Both halves, because one without the other is a different defect. Told only
+/// to hand over, it settles the card with somebody still weighing it up.
+#[test]
+fn the_talker_is_told_that_handing_over_is_what_settles_a_card() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    for half in [
+        "handing their words over IS the answer",
+        "has not chosen yet",
+    ] {
+        assert!(
+            instructions.contains(half),
+            "{} is missing from the policy: {}",
+            half,
+            instructions
+        );
+    }
+}
+
+/// The protocol has no transcription settings, so the opening frame names
+/// neither the workspace's transcriber nor its language.
+///
+/// Asserted rather than assumed. `SessionOpening` carries both, the Realtime
+/// provider configures both, and the natural reading of that asymmetry is that
+/// this one forgot. It did not: there is no key to write them to.
+#[test]
+fn the_opening_frame_configures_no_transcriber_and_no_language() {
+    let mut opening = opening();
+    opening.transcriber = "gpt-4o-mini-transcribe".to_string();
+    opening.language = Some(crate::voice::language::SpokenLanguage {
+        code: Some("nb".to_string()),
+        name: "Norwegian".to_string(),
+    });
+    let start = session_start("gpt-live-1", &opening).to_string();
+    for absent in ["transcription", "gpt-4o-mini-transcribe", "\"nb\""] {
+        assert!(
+            !start.contains(absent),
+            "{} reached the opening frame",
+            absent
+        );
+    }
 }
 
 /// One format both ways, at the rate the seam named. A client that cannot
@@ -80,14 +181,20 @@ fn the_audio_format_and_voice_come_from_the_opening() {
 
 /// The talker declares no tools, because client delegation has none to declare.
 /// A payload that grew a tool list would be Responses mode by another name.
+///
+/// Read off the session OBJECT, never off the frame's text. The instructions
+/// now discuss delegating in prose. A substring scan hits that policy and says
+/// nothing about what was declared.
 #[test]
 fn the_opening_frame_declares_no_tools() {
-    let start = session_start("gpt-live-1", &opening()).to_string();
-    for absent in ["tools", "tool_choice", "delegate", "hang_up"] {
+    let start = session_start("gpt-live-1", &opening());
+    let session = &start["session"];
+    for absent in ["tools", "tool_choice"] {
         assert!(
-            !start.contains(absent),
-            "{} reached the opening frame",
-            absent
+            session[absent].is_null(),
+            "{} reached the opening frame: {}",
+            absent,
+            start
         );
     }
 }
@@ -327,7 +434,7 @@ fn caller_deltas_are_forwarded_as_partials_and_still_held() {
     // Still whole when something finally asks for it, so the partial path
     // costs the delegation nothing.
     assert_eq!(
-        caller_finished(&mut turn),
+        caller_finished(&mut turn, None),
         vec![VoiceEvent::UserTurnEnded {
             transcript: "what is on today".to_string()
         }]
@@ -366,7 +473,8 @@ fn a_hole_in_the_talkers_audio_never_cuts_the_callers_sentence() {
         );
     }
     // One sentence, still whole, still waiting for a real boundary.
-    let VoiceEvent::UserTurnEnded { transcript } = caller_finished(&mut turn).remove(0) else {
+    let VoiceEvent::UserTurnEnded { transcript } = caller_finished(&mut turn, None).remove(0)
+    else {
         panic!("the caller's words were not held");
     };
     assert!(transcript.starts_with("Why didn't you"));
@@ -532,8 +640,12 @@ fn the_socket_closing_ends_a_turn_the_talker_was_still_speaking() {
 
 // Delegation, which is the whole of this protocol's tool surface.
 
-/// The ask carries an id and no words, so the caller's own words are both the
-/// utterance and the reason.
+/// The ask carries an id and no words. It hands the caller's words over as the
+/// utterance, and asks for nothing in its own name.
+///
+/// **The reason is empty, and that is the fix.** It used to be the caller's
+/// transcript, which the transcript then drew back at them as something the
+/// talker said.
 #[test]
 fn a_delegation_hands_over_the_callers_words_and_then_asks() {
     let mut turn = TurnState::default();
@@ -554,10 +666,41 @@ fn a_delegation_hands_over_the_callers_words_and_then_asks() {
             },
             VoiceEvent::DelegationRequested {
                 tool_call_id: "item_9tA".to_string(),
-                reason: "move my three o'clock".to_string(),
+                reason: String::new(),
             },
         ]
     );
+}
+
+/// **The caller never hears their own sentence read back.** A Live delegation
+/// composes no words, so it carries none, however long the question was.
+///
+/// `WorkDelegated` renders a reason under the talker's speaker label, and
+/// `build.rs` writes no row for a blank one. That is what keeps the caller's
+/// question out of the talker's mouth, and out of the doer's history twice.
+#[test]
+fn a_delegation_carries_no_reason_of_its_own() {
+    for question in ["move my three o'clock", "", &"a".repeat(1_000)] {
+        let mut turn = TurnState::default();
+        if !question.is_empty() {
+            frame(caller_said(question), &mut turn);
+        }
+        let events = frame(
+            serde_json::json!({
+                "type": "session.delegation.created",
+                "delegation": { "id": "item_9tA" }
+            }),
+            &mut turn,
+        );
+        let asked = events
+            .iter()
+            .find_map(|event| match event {
+                VoiceEvent::DelegationRequested { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("nothing was delegated");
+        assert_eq!(asked, "", "the ask spoke for the caller: {:?}", asked);
+    }
 }
 
 /// An ask with nothing held still reaches the doer, and says so rather than
@@ -591,10 +734,10 @@ fn a_delegation_with_no_id_is_dropped() {
     assert!(events.is_empty());
 }
 
-/// A long question is clipped for the row that records it, never for the
-/// utterance itself.
+/// A long question reaches the doer whole. Only the LOG line is clipped, and a
+/// turn started on half a question is a turn answering something else.
 #[test]
-fn a_long_question_is_clipped_in_the_reason_and_whole_in_the_utterance() {
+fn a_long_question_is_handed_over_whole() {
     let mut turn = TurnState::default();
     let long = "a".repeat(super::super::READ_ALOUD_CHARS * 2);
     frame(caller_said(&long), &mut turn);
@@ -610,10 +753,6 @@ fn a_long_question_is_clipped_in_the_reason_and_whole_in_the_utterance() {
         panic!("the caller's words were not handed over");
     };
     assert_eq!(transcript.chars().count(), long.chars().count());
-    let VoiceEvent::DelegationRequested { reason, .. } = &events[1] else {
-        panic!("nothing was delegated");
-    };
-    assert!(reason.ends_with('…'), "{}", reason);
 }
 
 // Errors and the frames the seam has no word for.
@@ -809,13 +948,172 @@ fn words_the_engine_took_are_gone_from_the_reader() {
     // What `LiveSession::caller_words_were_taken` does.
     shared.lock().expect("caller words").clear();
 
-    assert!(caller_finished(&mut turn).is_empty());
+    assert!(caller_finished(&mut turn, None).is_empty());
     // And the next thing they say is still theirs.
     frame(caller_said("to restart it"), &mut turn);
     assert_eq!(
-        caller_finished(&mut turn),
+        caller_finished(&mut turn, None),
         vec![VoiceEvent::UserTurnEnded {
             transcript: "to restart it".to_string()
         }]
+    );
+}
+
+// The session clock.
+
+/// A caller fragment that says where it sits on the session timeline.
+fn caller_said_at(text: &str, start_ms: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "session.input_transcript.delta",
+        "delta": text,
+        "start_ms": start_ms,
+        "end_ms": start_ms + 200,
+    })
+}
+
+/// A talker fragment on the same clock. Its `start_ms` is the boundary.
+fn talker_said_at(text: &str, start_ms: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "session.output_transcript.delta",
+        "delta": text,
+        "start_ms": start_ms,
+        "end_ms": start_ms + 200,
+    })
+}
+
+fn a_delegation_at(offset_ms: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "session.delegation.created",
+        "offset_ms": offset_ms,
+        "delegation": { "id": "item_9tA", "type": "delegation", "target": "client" }
+    })
+}
+
+/// Pull the finished utterances out of what a frame produced.
+fn utterances(events: &[VoiceEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            VoiceEvent::UserTurnEnded { transcript } => Some(transcript.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **The boundary is a point on the clock, not a moment of arrival.** Words the
+/// caller said after the talker took the floor are them talking OVER the reply.
+///
+/// Swept into the turn the talker just answered, they read as part of a
+/// question that was already put.
+#[test]
+fn what_they_said_after_the_boundary_is_not_part_of_the_turn_before_it() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("What's going on", 500), &mut turn);
+    frame(caller_said_at(" never mind", 2_900), &mut turn);
+
+    let cut = frame(talker_said_at("On", 2_500), &mut turn);
+    assert_eq!(utterances(&cut), vec!["What's going on".to_string()]);
+
+    // Still theirs, and still owed a turn of its own.
+    assert_eq!(
+        utterances(&closing_events(&mut turn)),
+        vec!["never mind".to_string()]
+    );
+}
+
+/// Arrival order is not timeline order, so the row is assembled by the clock.
+#[test]
+fn the_pieces_are_joined_in_the_order_they_were_spoken() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("the workspace ", 900), &mut turn);
+    frame(caller_said_at("What is in ", 400), &mut turn);
+    frame(caller_said_at("doing", 1_400), &mut turn);
+
+    assert_eq!(
+        caller_finished(&mut turn, None),
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "What is in the workspace doing".to_string()
+        }]
+    );
+}
+
+/// A stream that times some pieces and not others is joined as it arrived.
+///
+/// An untimed piece sorts ahead of every timed one. Sorting a mixed set would
+/// move a word from the middle of a sentence to its front.
+#[test]
+fn a_piece_with_no_timing_does_not_jump_to_the_front() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("What is ", 400), &mut turn);
+    frame(caller_said("the workspace "), &mut turn);
+    frame(caller_said_at("doing", 1_400), &mut turn);
+
+    assert_eq!(
+        caller_finished(&mut turn, None),
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "What is the workspace doing".to_string()
+        }]
+    );
+}
+
+/// An ask cuts on its own place in the session, for the same reason a spoken
+/// word does.
+#[test]
+fn an_ask_cuts_the_caller_off_where_the_frame_says_it_landed() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("move my three o'clock", 500), &mut turn);
+    frame(caller_said_at(" and book a car", 4_500), &mut turn);
+
+    assert_eq!(
+        frame(a_delegation_at(4_000), &mut turn),
+        vec![
+            VoiceEvent::UserTurnEnded {
+                transcript: "move my three o'clock".to_string()
+            },
+            VoiceEvent::DelegationRequested {
+                tool_call_id: "item_9tA".to_string(),
+                reason: String::new(),
+            },
+        ]
+    );
+}
+
+/// The socket going takes everything, boundary or not. A piece held back for a
+/// turn that will never come is a piece lost for good.
+#[test]
+fn the_closing_socket_takes_every_piece_that_is_left() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("What's going on", 500), &mut turn);
+    frame(talker_said_at("On", 2_500), &mut turn);
+    frame(caller_said_at("and what is next", 3_200), &mut turn);
+
+    assert_eq!(
+        utterances(&closing_events(&mut turn)),
+        vec!["and what is next".to_string()]
+    );
+}
+
+/// **The caller's words lead the reply they triggered, in one batch.**
+///
+/// `call.rs` reads a finished utterance as a MOVE of the conversation: it
+/// closes the talker's row and writes the caller's. Released any later, it cuts
+/// the reply it is the question for in half (ADR 0188, ADR 0198).
+#[test]
+fn the_callers_words_reach_the_seam_ahead_of_the_reply_they_triggered() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("What's going on", 500), &mut turn);
+
+    let batch = frame(talker_said_at("On", 2_500), &mut turn);
+
+    assert_eq!(
+        batch,
+        vec![
+            VoiceEvent::UserTurnEnded {
+                transcript: "What's going on".to_string()
+            },
+            VoiceEvent::TalkerTranscript {
+                text: "On".to_string()
+            },
+        ]
     );
 }

@@ -32,6 +32,25 @@ export const NO_MICROPHONE_API =
   'This page cannot open a microphone. A call needs a secure connection.';
 
 /**
+ * The browser would not open audio at the one rate a call speaks.
+ *
+ * `new AudioContext({ sampleRate })` is a request, and nothing downstream could
+ * survive a refusal. The capture worklet posts raw quanta at whatever rate the
+ * context came up at, and `pcm.ts` then labels them 24 kHz on the wire. So the
+ * caller's voice would reach the provider at the wrong speed and transcribe as
+ * nothing.
+ *
+ * A refusal rather than a warning, because there is no degraded call here: a
+ * caller nobody can hear has no way to say so out loud. Raised before the
+ * microphone opens, so nothing lights a recording indicator for a call that
+ * cannot work.
+ */
+export function wrongAudioRate(actualHz: number, wantedHz: number): string {
+  return `This browser opened audio at ${actualHz} Hz, and a call needs ${wantedHz} Hz. `
+    + 'Your voice would not come through, so the call was not placed.';
+}
+
+/**
  * The handshake was refused, and a browser never says why.
  *
  * A `WebSocket` hides the response status, so the cause is MEASURED rather

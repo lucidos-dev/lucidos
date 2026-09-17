@@ -30,7 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
-import { awayFromBottom, isFollowScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
+import { awayFromBottom, followPosition, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -158,10 +158,10 @@ describe('focusThread', () => {
       withTranscript((el) => {
         focusThread('t1');
         setFollowLiveEdge(true); // the reader arms it here
-        expect(isFollowScroll(el)).toBe(true);
+        expect(followPosition(el)).toBe('live-edge');
 
         focusThread('t2');
-        expect(isFollowScroll(el)).toBe(false);
+        expect(followPosition(el)).toBeNull();
       });
     });
 
@@ -174,7 +174,7 @@ describe('focusThread', () => {
         setFollowLiveEdge(true);
 
         focusThread('t1');
-        expect(isFollowScroll(el)).toBe(true);
+        expect(followPosition(el)).toBe('live-edge');
       });
     });
 
@@ -186,7 +186,7 @@ describe('focusThread', () => {
         setFollowLiveEdge(true);
 
         unfocusThread();
-        expect(isFollowScroll(el)).toBe(false);
+        expect(followPosition(el)).toBeNull();
       });
     });
   });

@@ -18,15 +18,18 @@
 /// one-liner, not a transcript — keep it short.
 const FALLBACK_SUMMARY_MAX_CHARS: usize = 200;
 
-/// Trim `line` and cap it at [`FALLBACK_SUMMARY_MAX_CHARS`] chars (char-boundary
-/// safe), appending an ellipsis when truncated.
+/// Trim `line` and cap it at [`FALLBACK_SUMMARY_MAX_CHARS`] characters,
+/// appending an ellipsis when truncated.
+///
+/// Counted in characters, never bytes. The cap used to compare `line.len()`,
+/// which cut a 100-character Japanese status line down to about 66.
 fn clamp_line(line: &str) -> String {
-    let line = line.trim();
-    if line.len() > FALLBACK_SUMMARY_MAX_CHARS {
-        let end = line.floor_char_boundary(FALLBACK_SUMMARY_MAX_CHARS);
-        format!("{}…", &line[..end])
+    let mut chars = line.trim().chars();
+    let head: String = chars.by_ref().take(FALLBACK_SUMMARY_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
     } else {
-        line.to_string()
+        head
     }
 }
 
@@ -158,10 +161,10 @@ mod tests {
         // the summary stays a one-liner regardless of script output.
         let huge = "x".repeat(10_000);
         let s = script_fallback_summary(&format!("noise\n{huge}"), "T", 0);
-        assert!(
-            s.chars().count() <= FALLBACK_SUMMARY_MAX_CHARS + 1,
-            "len {}",
-            s.chars().count()
+        assert_eq!(
+            s.chars().count(),
+            FALLBACK_SUMMARY_MAX_CHARS + 1,
+            "the cap plus the ellipsis: {s}"
         );
         assert!(s.ends_with('…'));
         assert!(!s.contains('\n'));
@@ -172,5 +175,20 @@ mod tests {
         // Capping must respect char boundaries (no byte-index slice panic).
         let s = script_fallback_summary(&"é".repeat(500), "T", 0);
         assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), FALLBACK_SUMMARY_MAX_CHARS + 1);
+    }
+
+    /// The cap is characters, and a byte cap passes the assertion above
+    /// trivially. A 100-character Japanese line is 300 bytes, so a byte cap
+    /// truncated it to about 66 characters and appended an ellipsis.
+    #[test]
+    fn the_cap_counts_characters_not_bytes() {
+        let line = "確認".repeat(50);
+        assert_eq!(line.chars().count(), 100);
+        assert!(line.len() > FALLBACK_SUMMARY_MAX_CHARS, "300 bytes");
+
+        let s = script_fallback_summary(&line, "T", 0);
+        assert_eq!(s, line, "a 100-character line is well inside the cap");
+        assert!(!s.ends_with('…'));
     }
 }

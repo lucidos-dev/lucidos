@@ -23,7 +23,7 @@ import { openSettingsSubview } from './actions/menu';
 import { storedVoiceInputDevice } from './actions/preferences';
 import { effectiveCodingAgentBackend } from '../components/chat/promptToggleMode';
 import { createCallRunner } from '../voice/call';
-import { CALL_IDLE, type CallState } from '../voice/callState';
+import { CALL_IDLE, isOnCall, type CallState } from '../voice/callState';
 import { type CallPorts, browserPorts } from '../voice/ports';
 import { isSettingsProblem } from '../voice/refusals';
 import { errorDetail } from '../utils/errorDetail';
@@ -179,6 +179,41 @@ export function createVoiceCallStore(deps: VoiceCallDeps): VoiceCallStore {
   });
 
   return { call, press, dispose };
+}
+
+export interface CallLivenessDeps {
+  call: Signal<CallState>;
+  /** The thread on screen. */
+  focused: Signal<string | null>;
+  /** Tell the transcript whether a call is up on the thread it is showing. */
+  setLive(live: boolean): void;
+}
+
+/**
+ * Tell the transcript's *standing follow* that a call is a LIVE SOURCE.
+ *
+ * The follow carries an armed reader toward whatever is arriving, and asks the
+ * thread whether anything is (`threadIsLive` in `components/chat/scrollState`).
+ * A call answers no by every measure that module has: every event a call writes
+ * is `Metadata` (ADR 0165), so no turn ever runs and the thread projection
+ * stays quiescent for the whole conversation. So the reader was left behind by
+ * their own call.
+ *
+ * It lives here, beside the watcher above, because both ask the same question:
+ * is this call still the focused thread's. That watcher ENDS a call that is
+ * not, so it closes the window itself, but only once the socket has gone.
+ * Asking here too keeps the answer exact meanwhile. The follow is about the
+ * transcript on screen, never about a call anywhere.
+ *
+ * A factory, like the store above, so a test drives its own call and focus.
+ * Returns the dispose.
+ */
+export function watchCallLiveness(deps: CallLivenessDeps): () => void {
+  return effect(() => {
+    const call = deps.call.value;
+    const focused = deps.focused.value;
+    deps.setLive(isOnCall(call.phase) && call.threadId !== null && call.threadId === focused);
+  });
 }
 
 /**

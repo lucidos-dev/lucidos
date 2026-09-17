@@ -176,6 +176,10 @@ export function mockTranscript(opts: {
      *  anchor between two opens. The live Thinking row is derived, so the last
      *  turn loses it the moment that turn finishes (ADR 0066). */
     setTurnHeightOf: (eventId: string, px: number) => { heights.set(eventId, px); },
+    /** The browser re-clamping `scrollTop` after the content shrank under a
+     *  reader parked near the bottom. A real container does it itself, where
+     *  this mock holds its offset until something writes one. */
+    reclamp: () => { el.scrollTop = top; },
     /** A transcript nobody can MEASURE, which a collapsed desktop split gives:
      *  every rect reads all-zero while the children are still there. The
      *  browser clamps `scrollTop` to the vanished range, and that clamp is what

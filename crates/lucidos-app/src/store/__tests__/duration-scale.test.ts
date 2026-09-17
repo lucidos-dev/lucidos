@@ -111,6 +111,15 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     expr: /scaledDurationMs\(TOGGLES_FADE_MS\) \+ TOGGLES_FADE_SLACK_MS/,
     what: 'keeps the compose-destination row mounted through its fade-out',
   },
+  // The only entry whose transition is INLINE rather than a token. The FLIP
+  // writes `transform` and `height` durations onto the element itself, so
+  // nothing in the CSS carries the scale for it. Both come off the same
+  // `scaledDurationMs(PROMPT_FLIP_MS)` this timer does.
+  {
+    file: '../../components/layout/ThreadPane.tsx',
+    expr: /scaledDurationMs\(PROMPT_FLIP_MS\) \+ 100/,
+    what: 'clears the compose-to-thread prompt slide gate if transitionend never fires',
+  },
 ];
 
 describe('timers that mirror a CSS duration', () => {

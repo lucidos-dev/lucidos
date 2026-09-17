@@ -726,38 +726,42 @@ async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() 
 /// The retry is scoped to lock collisions: a command that fails for its own
 /// reasons must come back on the first attempt, not after the full budget.
 ///
-/// The ceiling is CALIBRATED against this host, not a fixed millisecond count.
-/// What the retry costs is `LOCK_FILE_RETRIES` backoffs of sleep plus that many
-/// extra `git` forks, and only the sleep half is predictable: a fork that takes
-/// 90ms on an idle machine took 838ms during a full-suite run (which forks
-/// constantly), so the old flat 500ms bound was measuring fork latency and
-/// failed on load alone. Timing one bare `git_cmd` of the same failing command
-/// first prices a fork here and now, and the assertion rides on that.
+/// The ceiling is CALIBRATED against this host, and priced from the SLOWEST of
+/// several forks rather than one. A fork costing 90ms idle cost 838ms under a
+/// full-suite run. A single sample prices an idle fork, and the measured call
+/// then pays a loaded one. That asymmetry is the whole flake, and it failed two
+/// earlier shapes: a flat 500ms bound, then a one-sample calibration.
+///
+/// A paused clock would be exact and cannot be used: `git_cmd` wraps its own
+/// 30s `timeout`, which auto-advance fires instantly while the real fork runs.
+///
+/// A burnt budget costs `LOCK_FILE_RETRIES` sleeps, a full second, plus that
+/// many extra forks. It clears any of these bounds by an order of magnitude,
+/// so the headroom below only has to absorb fork jitter.
 #[tokio::test]
 async fn git_cmd_await_lock_file_does_not_retry_a_real_failure() {
     let (_tmp, repo) = make_test_repo().await;
     let failing = ["checkout", "-f", "no-such-branch"];
 
-    // One un-retried fork of the identical command: the cost floor.
-    let control_started = std::time::Instant::now();
-    assert!(!git_cmd(&failing, &repo).await.unwrap().status.success());
-    let one_fork = control_started.elapsed();
+    // Price a fork here and now, worst of three, so a momentarily idle machine
+    // cannot set a floor the next fork blows through.
+    let mut one_fork = Duration::ZERO;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        assert!(!git_cmd(&failing, &repo).await.unwrap().status.success());
+        one_fork = one_fork.max(started.elapsed());
+    }
 
     let started = std::time::Instant::now();
     let out = git_cmd_await_lock_file(&failing, &repo).await.unwrap();
     let elapsed = started.elapsed();
 
     assert!(!out.status.success());
-    // Burning the budget costs LOCK_FILE_RETRIES sleeps AND that many more
-    // forks, so it overshoots this by an order of magnitude. Deliberately loose
-    // enough to absorb one slow fork: on a loaded host, fork jitter is larger
-    // than a single 50ms backoff, so no wall-clock bound can tell one stray
-    // retry from none, and pretending otherwise is what made this flake.
-    let ceiling = one_fork * 2 + LOCK_FILE_RETRIES * LOCK_FILE_BACKOFF / 2;
+    let ceiling = one_fork * 4 + LOCK_FILE_RETRIES * LOCK_FILE_BACKOFF / 2;
     assert!(
         elapsed < ceiling,
         "a non-lock failure must not burn the retry budget: took {elapsed:?}, \
-         ceiling {ceiling:?} (one fork measured {one_fork:?})"
+         ceiling {ceiling:?} (slowest of three forks measured {one_fork:?})"
     );
 }
 

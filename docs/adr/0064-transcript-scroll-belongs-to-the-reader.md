@@ -67,6 +67,13 @@ the edge out from under someone who never left it. A reader SCROLLED AWAY is
 carried only while the agent is live, because a quiet thread has nothing to be
 carried toward.
 
+> **Amended: a LIVE SOURCE, and a voice call is one.** The term above reads
+> against every source now, rather than the agent alone. A call runs no turn, so
+> the projection stays quiescent for the whole conversation (ADR 0165). Read
+> through the agent alone, it was a quiet thread, and a call has plenty to carry
+> the reader toward. The disarm follows the same term, so an upward gesture
+> during a call ends the ride as one mid-reply does.
+
 > **A turn control's reveal is the READER's own act, not the app's rendering.**
 > A press names one thing to change, so that thing is what must not move
 > (ADR 0147). The reveal therefore carries nobody on a quiet thread, and the
@@ -156,9 +163,10 @@ a thread names the ride's own place, so it ends nothing.
   itself when a scroll retires the follow underneath it. It is exported
   read-only, so reading the state cannot become a way of setting it.
 - The request belongs to a thread and outlives leaving it. It is written down
-  per thread as one of the two forms a reading position takes, and re-armed on
-  re-entry. Only a toggle press can ever be recorded, so a resume can only
-  replay a request the reader made in that thread.
+  per thread BESIDE the place the reader parked, and re-armed on re-entry. Only
+  a toggle press can ever be recorded, so a resume can only replay a request the
+  reader made in that thread. The resume MOVES them only where they left off the
+  live edge, which is the ARMED and CARRYING split again.
 - The reader's last toggle press is also seeded across threads and reloads,
   device-scoped. A brand-new thread with no reading position of its own can
   still ride. The seed ships armed, so a device that has pressed nothing rides
@@ -236,6 +244,22 @@ changes `scrollHeight` and never `scrollTop`, so the position test is exact for
 growth and only for growth. The keyboard, an app resume and any other
 platform-driven scroll move the container with no gesture. Each retired a follow
 the reader had armed and never touched.
+
+**Let one slot hold either the PLACE or the REQUEST.** The reading position did,
+and recording one threw the other away. It also made the recorder ask the
+position test above, which the disarm had already outgrown. So a scroll that
+left the stamp without ending the ride rewrote the live edge as a turn. The
+toggle stayed lit over a request that was gone.
+
+Two everyday scrolls do that. A shrink clamps a rider down, the live Thinking
+row folding into its summary being the last thing most turns do. And the reader
+scrolls on a quiet thread, which the disarm ignores on purpose. The thread then
+gains a turn while they are away, and re-entry puts them on the old bottom,
+which is the middle now.
+
+The record carries both now. A rider parked away from the edge keeps the request
+in front of the place, and re-entry re-arms without moving them: ARMED is not
+CARRYING, and coming back is not the thread running.
 
 **Read "was the reader on the live edge" from a measurement alone.** The reading
 is taken at the end of each scroll and resize round, so it describes the reader

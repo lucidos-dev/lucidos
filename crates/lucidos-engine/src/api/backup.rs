@@ -45,13 +45,40 @@ pub struct KeyExistsResponse {
     pub exists: bool,
 }
 
+/// The stored provider id for a spelling that arrived either way.
+///
+/// Public API parameter VALUES are kebab-case. So `provider=google-drive` is
+/// the spelling every other value on this API uses, and it used to be refused
+/// as an unknown provider. The stored id stays `google_drive`: that is what
+/// the preference rows, the provider registry and every caller hold.
+///
+/// An id no provider answers to passes through untouched, so
+/// `resolve_provider` still names it in its own 400.
+fn canonical_provider_id(raw: &str) -> String {
+    backup::PROVIDER_IDS
+        .iter()
+        .find(|id| id.replace('_', "-") == raw)
+        .map_or_else(|| raw.to_string(), |id| (*id).to_string())
+}
+
+/// Read a `provider` field, taking the kebab spelling as an alias.
+fn deserialize_provider<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(canonical_provider_id(&raw))
+}
+
 #[derive(Deserialize)]
 pub struct BackupRequest {
+    #[serde(deserialize_with = "deserialize_provider")]
     pub provider: String,
 }
 
 #[derive(Deserialize)]
 pub struct ScheduleRequest {
+    #[serde(deserialize_with = "deserialize_provider")]
     pub provider: String,
     /// Cron expression, or "off" / empty to disable
     pub schedule: String,
@@ -989,6 +1016,37 @@ mod tests {
         assert_eq!(second, "BackupCompleted");
 
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Public API parameter VALUES are kebab-case. `provider=google-drive` is
+    /// the spelling every other value on this API uses, and it was refused as
+    /// an unknown provider.
+    #[test]
+    fn a_provider_arrives_in_either_spelling_and_resolves_to_one() {
+        assert_eq!(canonical_provider_id("google-drive"), "google_drive");
+        assert_eq!(canonical_provider_id("google_drive"), "google_drive");
+        assert_eq!(canonical_provider_id("dropbox"), "dropbox");
+        // An id no provider answers to reaches `resolve_provider` unchanged,
+        // so its own 400 still names what the caller asked for.
+        assert_eq!(canonical_provider_id("nextcloud"), "nextcloud");
+        assert_eq!(canonical_provider_id(""), "");
+    }
+
+    /// Both bodies carrying a provider read it through the same alias, so the
+    /// backup, the status read and the schedule cannot disagree.
+    #[test]
+    fn both_request_shapes_take_the_kebab_spelling() {
+        let backup: BackupRequest =
+            serde_json::from_value(serde_json::json!({ "provider": "google-drive" }))
+                .expect("the kebab spelling parses");
+        assert_eq!(backup.provider, "google_drive");
+
+        let schedule: ScheduleRequest = serde_json::from_value(
+            serde_json::json!({ "provider": "google-drive", "schedule": "0 0 3 * * *" }),
+        )
+        .expect("the kebab spelling parses");
+        assert_eq!(schedule.provider, "google_drive");
+        assert_eq!(schedule.schedule, "0 0 3 * * *");
     }
 
     /// The reported regression: with the schedule off, the configured

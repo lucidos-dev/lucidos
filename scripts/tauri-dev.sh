@@ -70,7 +70,11 @@ echo "Launching Tauri desktop app..."
 
 # Run Tauri in foreground — when user closes the window, cleanup trap fires.
 # --config: override devUrl to the engine's port, which serves the built dist/.
+# Trailing `-- --locked` reaches the inner cargo build, so this window is built
+# strictly from the committed Cargo.lock and errors on manifest drift instead of
+# rewriting it (ADR 0020). Same form as `cargo tauri build` in build-dmg.sh.
 cd "$FRONTEND_DIR"
 cargo tauri dev \
     --no-watch \
-    --config "{\"build\":{\"devUrl\":\"$PROTO://localhost:$ENGINE_PORT\"}}"
+    --config "{\"build\":{\"devUrl\":\"$PROTO://localhost:$ENGINE_PORT\"}}" \
+    -- --locked

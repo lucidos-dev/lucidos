@@ -17,7 +17,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  than a browser's. Neither can see the two things only a real engine has:
  *  whether a real wheel over a real transcript reaches the listener at all, and
  *  whether the live term is actually TRUE while the agent works
- *  (`setThreadLive`, published from `ChatExchange` off the thread projection,
+ *  (`setAgentLive`, published from `ChatExchange` off the thread projection,
  *  which no unit test drives).
  *
  *  Desktop only, like its sibling: the mobile header's own scroll compensation

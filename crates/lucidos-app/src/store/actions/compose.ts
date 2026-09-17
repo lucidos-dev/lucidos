@@ -847,14 +847,21 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
 /** Forget every per-thread compose map this module owns, for a thread that will
  *  never be fetched again.
  *
- *  The maps are module-private, so a teardown elsewhere cannot reach them and a
- *  ninth map would have to be remembered in two places. One export instead.
+ *  The maps are module-private, so a teardown elsewhere cannot reach them and
+ *  the next one would have to be remembered in two places. One export instead.
  *
  *  `dropUndeliveredComposeDraft` is the load-bearing one. Leave the id in that
  *  set and the next resume re-sends a draft for a thread that is gone. That
  *  pins the unreachable-drafts toast until a flush collects it.
  *
- *  Two callers: discarding a draft, and deleting the thread (ADR 0192).
+ *  It really is EVERY map, including the four that only record what this device
+ *  and the engine have said to each other. None of them is read for a thread
+ *  with no draft, so keeping them would be pure growth: one entry each per
+ *  discarded or deleted thread, for the life of the page.
+ *
+ *  Two callers: discarding a draft, and deleting the thread (ADR 0192). The
+ *  discard can be rolled back, so it snapshots every map here that its restore
+ *  cannot re-derive, the epoch fence included.
  */
 export function forgetComposeState(threadId: string): void {
   cancelPendingPush(threadId);
@@ -863,6 +870,10 @@ export function forgetComposeState(threadId: string): void {
   lastSyncedImageHashes.delete(threadId);
   lastSyncedComposeMode.delete(threadId);
   composePutSettledAt.delete(threadId);
+  composeEpoch.delete(threadId);
+  composeEditedAt.delete(threadId);
+  composeEditWatermark.delete(threadId);
+  serverDraft.delete(threadId);
 }
 
 function cancelPendingPush(threadId: string): void {
@@ -925,6 +936,9 @@ function rollbackOptimistic(threadId: string): void {
   // `sendMessage`'s rollback: nothing will ever fetch this thread again.
   forgetThreadEventsFailures(threadId);
   clearDraft(threadId);
+  // `ensureFocusedComposeThread` seeded this id's scope before the POST went
+  // out. Leaving it behind keeps an override for a thread that never existed.
+  clearComposeSelection(threadId);
 }
 
 /** In-flight POST /threads promises keyed by thread id. Callers needing the row
@@ -1152,10 +1166,20 @@ export async function sendSeededPrompt(text: string, what: string): Promise<bool
  *  Releases focus if the discarded thread was the focused one so the next
  *  keystroke lazy-creates a fresh draft via ensureFocusedComposeThread.
  *  The draft entry is dropped; if DELETE fails we restore it to the
- *  pre-discard text so the user doesn't lose what they typed. */
+ *  pre-discard text AND its destination, so the user loses neither what they
+ *  typed nor where they aimed it. */
 export async function discardCompose(threadId: string): Promise<void> {
   if (focusedThreadId.value === threadId) setFocusedThread(null);
   const restoreDraft = snapshotDraft(threadId);
+  // A draft is text AND a destination. `forgetComposeState` below drops both,
+  // so both are snapshotted. Copied, because the rollback must not alias an
+  // object a later pick could mutate.
+  const restoreSelection: ComposeSelectionOverride = { ...getComposeSelectionOverride(threadId) };
+  // The epoch fence and the server's copy ride back too. Without the epoch a
+  // rolled-back draft PUTs unfenced, so a send another device already made can
+  // be resurrected as a live draft everywhere.
+  const restoreEpoch = composeEpoch.get(threadId);
+  const restoreServerDraft = serverDraft.get(threadId);
   mutateThreadMeta(threadId, { state: 'discarded' });
   // Drops the draft, the per-draft dropdown overrides and every sync marker.
   // A stray override would seed a future draft that happens to reuse the id.
@@ -1168,7 +1192,17 @@ export async function discardCompose(threadId: string): Promise<void> {
   } catch (err) {
     if (isAlreadyGone(err)) return;
     mutateThreadMeta(threadId, { state: 'composing' });
+    // Unsent local work again, and the forget above dropped every marker
+    // saying so. Re-stamp first, so a GET already in flight cannot blank what
+    // the user can see.
+    markLocallyEdited(threadId);
     if (restoreDraft) setDraft(threadId, restoreDraft);
+    // The destination rides back with the text. Without it `resolveScope`
+    // answers Lucidos, and Send then runs the coding agent against the Lucidos
+    // source rather than the repo the user picked.
+    seedComposeSelection(threadId, restoreSelection);
+    if (restoreEpoch !== undefined) composeEpoch.set(threadId, restoreEpoch);
+    if (restoreServerDraft !== undefined) serverDraft.set(threadId, restoreServerDraft);
     showToast(`Discard failed: ${errorDetail(err)}`, 'error');
   }
 }

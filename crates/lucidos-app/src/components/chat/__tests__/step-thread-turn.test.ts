@@ -17,7 +17,7 @@ import {
   awayFromBottom,
   followingLiveEdge,
   setFollowLiveEdge,
-  setThreadLive,
+  setAgentLive,
   stopFollowingBottom,
 } from '../scrollState';
 
@@ -173,7 +173,7 @@ describe('stepThreadTurn and the standing follow', () => {
   beforeEach(() => {
     awayFromBottom.value = false;
     stopFollowingBottom();
-    setThreadLive(true);
+    setAgentLive(true);
     const origMM = globalThis.matchMedia;
     (globalThis as any).matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
     restoreMatchMedia = () => { (globalThis as any).matchMedia = origMM; };
@@ -230,7 +230,7 @@ describe('stepThreadTurn and the standing follow', () => {
     // writing to is browsing, and the reader's next submit should still carry
     // them to the live edge.
     ridingLongThread();
-    setThreadLive(false);
+    setAgentLive(false);
 
     stepThreadTurn(-1);
 
@@ -251,7 +251,7 @@ describe('stepThreadTurn and the standing follow', () => {
     const el = ridingLongThread();
     const { onScroll } = makeScrollObservers(el);
     onScroll();                 // the arm's own event, recording them on the edge
-    setThreadLive(false);
+    setAgentLive(false);
 
     stepThreadTurn(-1);
     const landed = el.scrollTop;

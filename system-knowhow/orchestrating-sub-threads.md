@@ -141,8 +141,12 @@ you saw and carry on with your own work.
    file is your mistake, not theirs. There is no lease and no lock, so nothing
    stops them both writing.
 2. **Decide what you need to see.** A child's domain events do not re-open you
-   unless you subscribed. A child's terminal always re-opens you, through
-   `ChildThreadCompleted`.
+   unless you subscribed. A child's terminal re-opens you, through
+   `ChildThreadCompleted`. Two terminals deliberately do not: a mid-turn steer,
+   and a transient upstream failure the engine is already resuming past. Both
+   mean the child is still working, and both report at the real terminal. So a
+   card you DO get is never a child mid-retry, and respawning on one is never
+   the right move. See `system-knowhow/thread-events.md`.
 3. **Rule from the record, not from testimony.** When two children disagree,
    read the events and the artifacts yourself. Each child reports its own view,
    and neither can see the other's reasoning.

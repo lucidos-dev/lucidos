@@ -141,6 +141,15 @@ describe('the Voice settings section', () => {
     expect(rendered).toContain('does not reach the usage rollup');
   });
 
+  /** A Live call settles a question out loud and a permission on the card, and
+   *  the row has to say which is which. The copy denied both until ADR 0205,
+   *  which is a reader picking Realtime for something Live already does. */
+  it('says which half of a card a Live call settles out loud', () => {
+    const rendered = vnodeToText(TalkerModelExplainer());
+    expect(rendered).toContain('a question it asks you can answer by just saying your answer');
+    expect(rendered).toContain('a permission is a tap');
+  });
+
   /** The transcriber row is read by a Realtime call and by nothing else. A
    *  setting with no effect and nothing saying so is the worst kind, and only
    *  the row itself can say it. */

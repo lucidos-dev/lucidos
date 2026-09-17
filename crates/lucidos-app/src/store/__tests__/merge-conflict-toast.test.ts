@@ -10,6 +10,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { toasts, focusedThreadId, threadMap } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
+import { makeThreadAggregate } from '../actions/threads-test-helpers';
 import { focusThread } from '../actions/threads';
 
 // focusThread imports React/Preact-coupled modules (scrollState, navigation)
@@ -78,12 +79,14 @@ describe('MergeConflictDetected SSE toast', () => {
   });
 
   it('falls back to the noun "thread" when the title is missing', () => {
-    // No seedThread — threadMap is empty.
+    // No seedThread, so threadMap is empty and the event's own aggregate is
+    // what makes the skeleton. A skeleton carries the placeholder title.
     handleThreadEvent({
       thread_id: 'thread-A',
       seq: 1,
       event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
       created: '2026-01-01T00:00:00Z',
+      aggregate: makeThreadAggregate('thread-A'),
     });
 
     const t = toasts.value.find(t => t.message.toLowerCase().includes('merge conflict'));

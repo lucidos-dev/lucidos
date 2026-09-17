@@ -125,11 +125,6 @@ impl TriggerDefinition {
     }
 }
 
-/// `data/`-relative path of a trigger's definition file (for serving / preview).
-pub fn trigger_toml_data_relpath(slug: &str) -> String {
-    format!("triggers/{slug}/trigger.toml")
-}
-
 /// Absolute path of a trigger's definition file under the workspace.
 fn trigger_toml_abspath(workspace_path: &Path, slug: &str) -> PathBuf {
     workspace_path
@@ -238,9 +233,23 @@ const TRIGGER_TOML_EXCLUDE: &str = "data/triggers/*/trigger.toml";
 /// repo-local `.git/info/exclude` (so the committed `.gitignore` is untouched).
 /// Idempotent + best-effort: a non-standard `.git` (worktree file, missing info
 /// dir) just degrades to the files showing as untracked — never an error.
+///
+/// A read that FAILED is not an empty file. A non-UTF-8 byte or any I/O error
+/// leaves the file alone, because the write below replaces the whole thing.
 pub fn ensure_trigger_toml_gitignored(workspace_path: &Path) {
     let exclude = workspace_path.join(".git").join("info").join("exclude");
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&exclude) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            crate::log!(
+                "[TriggerDefn] read {:?} failed, leaving it untouched: {}",
+                exclude,
+                e
+            );
+            return;
+        }
+    };
     if existing.lines().any(|l| l.trim() == TRIGGER_TOML_EXCLUDE) {
         return;
     }
@@ -257,7 +266,9 @@ pub fn ensure_trigger_toml_gitignored(workspace_path: &Path) {
     next.push_str("# Lucidos: derived trigger definition projection (ADR 0019)\n");
     next.push_str(TRIGGER_TOML_EXCLUDE);
     next.push('\n');
-    let _ = std::fs::write(&exclude, next);
+    if let Err(e) = std::fs::write(&exclude, next) {
+        crate::log!("[TriggerDefn] write {:?} failed: {}", exclude, e);
+    }
 }
 
 #[cfg(test)]

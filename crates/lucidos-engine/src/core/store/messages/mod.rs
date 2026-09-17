@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 
 mod build;
 mod resume;
+pub(crate) mod spoken_merge;
 
 pub use build::format_child_thread_completed_block;
 pub(crate) use build::{build_session_messages, newest_conversation_summary, CachedSummary};

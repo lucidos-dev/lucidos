@@ -99,8 +99,9 @@ impl SideEffectCategory {
     }
 
     /// Short user-facing label for the trigger side-effect-grant UI. Kept in
-    /// sync with the frontend `SIDE_EFFECT_CATEGORIES` list (a `/harden` check
-    /// would flag drift between the wire values and the UI).
+    /// sync with the frontend `SIDE_EFFECT_CATEGORIES` list by
+    /// `components/triggers/__tests__/side-effect-categories-mirror.test.ts`,
+    /// which reads these arms and the enum above out of this file.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Email => "Send email or messages",

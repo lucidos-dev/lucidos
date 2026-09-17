@@ -117,7 +117,7 @@ beforeEach(() => {
   focusedThreadId.value = null;
 });
 
-describe('upsertThread — status staleness guard (loadAllThreads path)', () => {
+describe('upsertThread: the snapshot staleness guard (loadAllThreads path)', () => {
   it('does not regress a live idle to running when the GET snapshot is stale', () => {
     const map = new Map<string, ThreadState>();
     // Live state: the terminal ResponseGenerated already applied idle and
@@ -139,6 +139,32 @@ describe('upsertThread — status staleness guard (loadAllThreads path)', () => 
     upsertThread(map, summary({ status: 'running', last_activity: IDLE_AT }), false);
 
     expect(map.get('t1')!.meta.status).toBe('running');
+  });
+
+  /** The lifecycle marker is the same kind of field and the same trap. An iOS
+   *  wake fires `loadAllThreads`, the user presses Send while that GET is out,
+   *  and the answer still says `composing`. Unguarded, the composer replaces
+   *  the transcript the message just went into. */
+  it('does not send an active thread back to composing on a stale GET', () => {
+    const map = new Map<string, ThreadState>();
+    // Live state: the send flipped it to active and `MessageReceived` confirmed
+    // it, advancing updatedAt past what the in-flight GET can carry.
+    map.set('t1', makeThreadState('t1', { meta: { id: 't1', state: 'active', updatedAt: IDLE_AT } }));
+
+    upsertThread(map, summary({ state: 'composing', last_activity: RUNNING_AT }), false);
+
+    expect(map.get('t1')!.meta.state).toBe('active');
+  });
+
+  /** The guard must stay one-sided. A fresh snapshot is still what rescues an
+   *  SSE skeleton stuck at `composing`, which no drawer section draws. */
+  it('applies state from a fresh GET snapshot', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', { meta: { id: 't1', state: 'composing', updatedAt: RUNNING_AT } }));
+
+    upsertThread(map, summary({ state: 'active', last_activity: IDLE_AT }), false);
+
+    expect(map.get('t1')!.meta.state).toBe('active');
   });
 });
 

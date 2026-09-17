@@ -491,10 +491,13 @@ impl LucidosEngine {
         // Run similarity searches in chunks to avoid exhausting the DB pool
         const DB_CONCURRENCY: usize = 10;
         let mut similarity_results = Vec::with_capacity(embeddings.len());
+        let embedding_model = self.embedder.model_id();
         for chunk in embeddings.chunks(DB_CONCURRENCY) {
             let chunk_futures: Vec<_> = chunk
                 .iter()
-                .map(|embedding| index.find_similar(embedding, MEMORY_SUPERSEDE_THRESHOLD, 5))
+                .map(|embedding| {
+                    index.find_similar(embedding, MEMORY_SUPERSEDE_THRESHOLD, 5, embedding_model)
+                })
                 .collect();
             similarity_results.extend(futures::future::join_all(chunk_futures).await);
         }

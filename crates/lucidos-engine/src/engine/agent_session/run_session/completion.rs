@@ -2,9 +2,10 @@ use super::idle_snapshot::CodingAgentIdleSnapshot;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
     auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
-    conflict_resolution_cleanup_action, discarded_worktree_removal, is_transient_api_failure,
-    should_auto_commit_on_cleanup, ConflictResolutionCleanupAction, SafetyNetAction,
-    SessionEndAction, TerminalKind, WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
+    conflict_resolution_cleanup_action, discarded_worktree_removal, held_completion_release,
+    should_auto_commit_on_cleanup, transient_api_failure_error, ConflictResolutionCleanupAction,
+    HeldCompletionRelease, SafetyNetAction, SessionEndAction, TerminalKind, WorktreeRemoval,
+    MAX_API_ERROR_AUTO_RESUMES,
 };
 use crate::engine::agent_session::resume::{
     api_error_auto_resumes_spent, change_description_fallback,
@@ -113,6 +114,59 @@ async fn remove_discarded_worktree(
 }
 
 impl LucidosEngine {
+    /// Decide, at the moment a turn's terminal is classified, whether the engine
+    /// will auto-resume past it. When it will, take an *auto-resume hold* so the
+    /// child-to-parent fan-in withholds the completion card.
+    ///
+    /// **This runs BEFORE the terminal is emitted, and that is the point.** A
+    /// `ResponseFailed` fires the fan-in inside its own emit, so the parent is
+    /// told its child failed well before the idle exit resumes it. The emit
+    /// cannot move here to meet the card, so the decision moves here instead.
+    ///
+    /// **The caller releases the hold, once both emits are out.** What the
+    /// release hands back is the decision AND the error to announce, so
+    /// `maybe_auto_resume_after_api_error` needs no second copy of either. A
+    /// hold living longer would swallow the NEXT turn's card, because a
+    /// `KeepAlive` at idle can carry the loop through another turn.
+    ///
+    /// Incident, alternatives and gap analysis: ADR 0199, and
+    /// `docs/plans/2026-09-16-a-terminal-the-engine-will-resume-is-not-a-completion.md`.
+    pub(super) async fn hold_completion_if_api_error_resume(
+        &self,
+        thread_id: Uuid,
+        terminal: &Option<TerminalKind>,
+        is_shutdown: bool,
+        is_conflict_session: bool,
+    ) {
+        let Some(error) = transient_api_failure_error(terminal) else {
+            return;
+        };
+        let resumes_spent = api_error_auto_resumes_spent(
+            self.pool(),
+            thread_id,
+            crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
+        )
+        .await;
+        if !auto_resume_after_api_error(terminal, resumes_spent, is_shutdown, is_conflict_session) {
+            log!(
+                "[AgentSession] thread {} ended on a transient upstream API failure with {} of {} auto-resumes spent: not resuming, so its parent hears about the failure now",
+                thread_id,
+                resumes_spent,
+                MAX_API_ERROR_AUTO_RESUMES,
+            );
+            return;
+        }
+        log!(
+            "[AgentSession] thread {} ended on a transient upstream API failure ({} of {} auto-resumes already spent): resuming, and withholding its parent's completion card until the real terminal",
+            thread_id,
+            resumes_spent,
+            MAX_API_ERROR_AUTO_RESUMES,
+        );
+        self.event_bus
+            .auto_resume_holds()
+            .hold(thread_id, error.to_string());
+    }
+
     /// Emit `ContinuationRequested{auto_resume_after_api_error}` when the turn
     /// ended on a TRANSIENT upstream failure the backend reported itself (its
     /// own `API Error: …`, e.g. a connection closed mid-response). Resume the
@@ -124,6 +178,12 @@ impl LucidosEngine {
     /// of it.
     ///
     /// Bounded, unlike the watchdog's: see `auto_resume_after_api_error`.
+    ///
+    /// **It decides nothing.** `hold_completion_if_api_error_resume` already
+    /// made the call, at terminal-classification time, and what its released
+    /// *auto-resume hold* handed back is what this reads. That is deliberate:
+    /// the fan-in stood down on that hold, so a second copy of the predicate
+    /// here could disagree with a card already out the door.
     ///
     /// **Called from BOTH ways a session run can end**, and it has to be, which
     /// is the whole reason this is a helper rather than an inline block. The
@@ -167,32 +227,25 @@ impl LucidosEngine {
     pub(super) async fn maybe_auto_resume_after_api_error(
         &self,
         thread_id: Uuid,
-        last_terminal_kind: &Option<TerminalKind>,
         meta: &crate::engine::thread_events::EventMeta,
-        is_conflict_session: bool,
+        withheld_error: Option<String>,
         followups_queued: bool,
     ) {
-        let resumes_spent = if last_terminal_kind
-            .as_ref()
-            .is_some_and(is_transient_api_failure)
-        {
-            api_error_auto_resumes_spent(
-                self.pool(),
-                thread_id,
-                crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
-            )
-            .await
-        } else {
-            0
-        };
-        if !auto_resume_after_api_error(
-            last_terminal_kind,
-            resumes_spent,
-            self.is_shutting_down(),
-            is_conflict_session,
-        ) {
+        // The decision arrived as a value: the error the run loop's released
+        // hold handed back, or `None` for a terminal nobody withheld. Asking
+        // `auto_resume_after_api_error` again here would be a second copy of the
+        // predicate, and the two could disagree about a card already out.
+        let Some(withheld_error) = withheld_error else {
             return;
-        }
+        };
+        // Re-asked, not reused: a shutdown that began since the decision was
+        // taken must be seen HERE. Recovery re-adopts in-flight threads after
+        // restart, and a continuation emitted into a dying engine races it. A
+        // bare stop carries no device actor, though, so recovery parks the
+        // thread behind a manual Continue rather than resuming it. Nothing
+        // would then report, which is why this falls through to the release
+        // decision instead of returning.
+        let shutting_down = self.is_shutting_down();
         // Someone is already coming. A follow-up drained at either exit is
         // re-submitted by the caller (`process_orphan_chain`), so the thread
         // gets driven regardless, and a continuation on top of it would inject
@@ -201,27 +254,39 @@ impl LucidosEngine {
         // reasoning the budget encodes by resetting on `MessageReceived`: a new
         // message is progress, and this recovery is only for the unattended
         // case where nothing else will move the thread.
-        if followups_queued {
+        let continuation_persisted = if shutting_down {
+            log!(
+                "[AgentSession] thread {} would auto-resume after a transient upstream API failure, but the engine is shutting down: telling its parent instead of resuming",
+                thread_id,
+            );
+            false
+        } else if followups_queued {
             log!(
                 "[AgentSession] thread {} ended on a transient upstream API failure, but a follow-up is already queued for it: leaving the thread to that message rather than resuming",
                 thread_id,
             );
-            return;
+            false
+        } else {
+            crate::engine::thread_events::emit_continuation_requested_or_log(
+                &self.event_bus,
+                thread_id,
+                crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
+                meta.actor.clone(),
+                "[AgentSession] ContinuationRequested (auto-resume after transient API failure)",
+            )
+            .await
+        };
+        // The card was withheld on a promise of a resume. Keep the promise, or
+        // tell the parent. A rejected continuation reaches no dispatcher, so
+        // nothing else would ever move this thread.
+        match held_completion_release(continuation_persisted, followups_queued) {
+            HeldCompletionRelease::KeepWithholding => {}
+            HeldCompletionRelease::Announce => {
+                self.event_bus
+                    .announce_withheld_completion(thread_id, withheld_error)
+                    .await;
+            }
         }
-        log!(
-            "[AgentSession] thread {} ended on a transient upstream API failure ({} of {} auto-resumes already spent): resuming the session instead of leaving it failed",
-            thread_id,
-            resumes_spent,
-            MAX_API_ERROR_AUTO_RESUMES,
-        );
-        crate::engine::thread_events::emit_continuation_requested_or_log(
-            &self.event_bus,
-            thread_id,
-            crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
-            meta.actor.clone(),
-            "[AgentSession] ContinuationRequested (auto-resume after transient API failure)",
-        )
-        .await;
     }
 
     /// Completion / teardown lifecycle stage of `run_direct_agent`, extracted
@@ -247,6 +312,10 @@ impl LucidosEngine {
         normalized_model: Option<String>,
         cc_reasoning_effort: Option<String>,
         last_terminal_kind: Option<TerminalKind>,
+        // What the run loop's released *auto-resume hold* handed back: the error
+        // of a terminal whose completion card the fan-in withheld, or `None`
+        // when nothing was withheld.
+        withheld_api_error: Option<String>,
         external_terminal_emitted: Arc<std::sync::atomic::AtomicBool>,
         external_continuation_requested: Arc<std::sync::atomic::AtomicBool>,
         agent_cancel: &tokio_util::sync::CancellationToken,
@@ -373,9 +442,8 @@ impl LucidosEngine {
 
         self.maybe_auto_resume_after_api_error(
             thread_id,
-            &last_terminal_kind,
             meta,
-            conflict_change.is_some(),
+            withheld_api_error,
             !cc_orphans.is_empty(),
         )
         .await;
@@ -433,6 +501,12 @@ impl LucidosEngine {
                 "[Shutdown] Skipping cleanup for thread {}: session will resume after restart",
                 thread_id
             );
+            // Hand the drained follow-ups back, the way every other exit does.
+            // The message is already a persisted `MessageReceived`, and the
+            // post-restart resume sends "Continue from where you left off",
+            // never the user's own text. Dropping it here loses it for good.
+            // The idle exit in `run.rs` returns its drain under shutdown too,
+            // so this adds no exposure the common path does not already carry.
             return Ok(ProcessResult {
                 response: String::new(),
                 steps: vec![],
@@ -441,7 +515,7 @@ impl LucidosEngine {
                 thread_id,
                 proposed_change: false,
                 auto_apply: false,
-                orphaned_injections: vec![],
+                orphaned_injections: cc_orphans,
             });
         }
 
@@ -748,7 +822,13 @@ impl LucidosEngine {
                 remove_discarded_worktree(wt, &repo_root, &branch_name, discard_branch.as_deref())
                     .await;
                 log!("[AgentSession] Discarding changes (branch {})", branch_name);
-                if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
+                // `git_ran_ok`, not `git_cmd`: a non-zero exit is an `Ok` there,
+                // so a refused delete logged nothing. Git refuses while a
+                // worktree still has the branch checked out, which is exactly
+                // what `remove_discarded_worktree` leaves when it keeps the
+                // tree. The branch then keeps its commits, and the next session
+                // end proposes the discarded work again.
+                if let Err(e) = git_ran_ok(&["branch", "-D", &branch_name], &repo_root).await {
                     log!(
                         "[AgentSession] Failed to delete branch {}: {}",
                         branch_name,
@@ -1086,5 +1166,114 @@ mod tests {
         let mut sessions: HashMap<Uuid, AgentSession> = HashMap::new();
         reap_own_session_entry(&mut sessions, Uuid::new_v4(), &token);
         assert!(sessions.is_empty());
+    }
+
+    /// This file's own source, for the two wiring tripwires below.
+    ///
+    /// `finalize_direct_agent` needs a `LucidosEngine`, and no harness can build
+    /// one, so both properties are pinned by source. Same stance as
+    /// `both_teardown_sites_consult_the_preserve_guard`.
+    const COMPLETION_SRC: &str = include_str!("completion.rs");
+
+    /// [`COMPLETION_SRC`] up to the `#[cfg(test)]` marker.
+    ///
+    /// The scans read the file they live in, so this module's own literals
+    /// would otherwise match them.
+    fn production_src() -> &'static str {
+        let cut = COMPLETION_SRC
+            .find("#[cfg(test)]")
+            .expect("completion.rs still carries its test module marker");
+        &COMPLETION_SRC[..cut]
+    }
+
+    /// The line `at` sits on, for a failure message that names the offender.
+    fn line_at(src: &str, at: usize) -> &str {
+        let start = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        src[start..].lines().next().unwrap_or_default().trim()
+    }
+
+    /// Every `git branch -D` here reports a refusal.
+    ///
+    /// `git_cmd` answers `Ok` for a non-zero exit, so an `if let Err` over it
+    /// fires only on a spawn failure or the 30s timeout. Git refuses to delete
+    /// a branch a worktree still has checked out, the state
+    /// `remove_discarded_worktree` leaves when it keeps the tree. That refusal
+    /// went nowhere: the branch kept its commits, and the next session end
+    /// proposed the discarded work a second time.
+    #[test]
+    fn every_branch_delete_here_reports_its_refusal() {
+        let src = production_src();
+        let sites: Vec<usize> = src
+            .match_indices(r#"&["branch", "-D","#)
+            .map(|m| m.0)
+            .collect();
+        for at in &sites {
+            let line = line_at(src, *at);
+            assert!(
+                line.contains("git_ran_ok("),
+                "a `git branch -D` in completion.rs must run through `git_ran_ok`, \
+                 which folds a non-zero exit into `Err`. `git_cmd` calls a refused \
+                 delete `Ok` and the log never names it. Offending line: {line}"
+            );
+        }
+        assert_eq!(
+            sites.len(),
+            2,
+            "completion.rs deletes two branches: the one an explicit Discard threw \
+             away, and the Tier-3 temp branch the merge attempt made"
+        );
+    }
+
+    /// Real git, in a tempdir this test made: the refusal the scan above is
+    /// about is a non-zero exit, which only `git_ran_ok` reports.
+    #[tokio::test]
+    async fn git_refuses_to_delete_a_branch_a_worktree_holds() {
+        const BRANCH: &str = "claude-code/20260803-045152-discard";
+        let (_tmp, repo, wt) = crate::test_support::make_repo_and_worktree(BRANCH).await;
+        assert!(wt.exists(), "the worktree is what makes git refuse");
+
+        assert!(
+            git_cmd(&["branch", "-D", BRANCH], &repo).await.is_ok(),
+            "git_cmd reads a refused delete as Ok, which is why the old site was silent"
+        );
+        assert!(
+            git_ran_ok(&["branch", "-D", BRANCH], &repo).await.is_err(),
+            "git_ran_ok must surface the refusal so the log can name it"
+        );
+        assert!(
+            crate::engine::git_ops::branch_head_sha(&repo, BRANCH)
+                .await
+                .is_some(),
+            "and the branch survived both attempts, discarded commits and all"
+        );
+    }
+
+    /// No exit here throws the drained follow-ups away.
+    ///
+    /// `finalize_direct_agent` drains `msg_rx` so the caller can re-submit each
+    /// message. The shutdown exit returned an empty list instead, and the
+    /// user's follow-up was gone. The post-restart resume sends "Continue from
+    /// where you left off", never their own text.
+    #[test]
+    fn every_exit_here_returns_the_drained_followups() {
+        let src = production_src();
+        let exits: Vec<usize> = src
+            .match_indices("orphaned_injections:")
+            .map(|m| m.0)
+            .collect();
+        for at in &exits {
+            let line = line_at(src, *at);
+            assert!(
+                line.contains("cc_orphans"),
+                "every `ProcessResult` in completion.rs hands the drained follow-ups \
+                 back. An exit returning an empty list drops a persisted user message \
+                 with nothing in the log naming it. Offending line: {line}"
+            );
+        }
+        assert_eq!(
+            exits.len(),
+            2,
+            "completion.rs has two exits: the shutdown one and the normal one"
+        );
     }
 }

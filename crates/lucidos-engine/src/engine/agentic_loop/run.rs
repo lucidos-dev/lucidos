@@ -4,7 +4,6 @@
 
 use crate::engine::inline_question_repair::InlineQuestionLeak;
 use crate::llm::provider::LlmResponse;
-use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use crate::llm::{ContentBlock, Message, MessageContent};
 use tokio::sync::mpsc;
@@ -58,11 +57,13 @@ impl LucidosEngine {
         &self,
         messages: &mut Vec<Message>,
         system_prompt: &str,
-        tools: &[ToolDefinition],
+        // Owned, because the MCP slice of it is rebuilt when a server starts
+        // or stops mid-turn. See [`TurnTools`].
+        mut tools: TurnTools,
         request_id: Uuid,
         thread_id: Uuid,
         response_channel: Option<crate::engine::thread_events::EventChannel>,
-        message_budget: usize,
+        mut message_budget: usize,
         extraction_ctx: &str,
         // `(description, model)` — the model name is needed so the
         // `ImageDescribed` event records which Flash model produced the text.
@@ -246,6 +247,11 @@ impl LucidosEngine {
         // Reported in the NEXT round's framing, which is the first surface the
         // model reads after writing.
         let mut notices = wu::RoundNotices::default();
+        // The message budget with the schemas added back, so a round that
+        // changes the array can re-derive the budget instead of nudging it.
+        // Fixed for the turn: the caller subtracted the schemas from a total
+        // that depends only on the resolved model and the system prompt.
+        let budget_with_no_tools = message_budget + tools.defs_chars();
 
         // Agent loop
         loop {
@@ -314,6 +320,39 @@ impl LucidosEngine {
                 ));
             }
 
+            // What this round owes the stopped-server list in `messages[0]`,
+            // filled in by the refresh below and appended with the tail.
+            let mut mcp_correction: Option<String> = None;
+
+            // The MCP tool surface can move under a running turn: the model
+            // starts or stops a server with the `mcp` tool, or the user does
+            // it from Settings. Rebuild the slice when it has. A server
+            // started this turn is then callable in the very next round,
+            // rather than only after the next user message.
+            //
+            // Gated on a generation the manager bumps, because this is the one
+            // mid-turn change to the array Lucidos makes. The array is the
+            // FIRST cache segment, so re-sending it forfeits every tier behind
+            // it. A speculative rebuild per round would pay that on every
+            // turn. See ADR 0088, and ADR 0195 for why this one is worth it.
+            if tools.mcp_generation() != self.mcp_manager.tool_surface_generation() {
+                let before = tools.defs().len();
+                let before_servers = tools.mcp_server_ids();
+                tools.refresh_mcp(self.mcp_manager.tool_surface().await);
+                mcp_correction = mcp_surface_correction(&before_servers, &tools.mcp_server_ids());
+                // The schemas and the messages share one window, so a bigger
+                // array has to leave the trimmer less room. Recomputed from
+                // the fixed total rather than nudged, so it cannot drift.
+                message_budget = budget_with_no_tools.saturating_sub(tools.defs_chars());
+                log!(
+                    "[AgenticLoop] thread={} round={} MCP tools changed mid-turn: {} → {} tools in the array",
+                    thread_id,
+                    rounds,
+                    before,
+                    tools.defs().len()
+                );
+            }
+
             // Pin the current turn's user message so removal cannot drop it
             // (`Some(user_message_idx)`), and keep every tracked image-bearing
             // message's bytes for the whole turn (`keep_image_idxs`). The
@@ -377,12 +416,12 @@ impl LucidosEngine {
             let render_tail_blocks = |messages: &[Message]| -> (String, String) {
                 use crate::engine::chat::process::context_panel as panel;
                 let items = panel::tool_result_items(messages, &panel_first_seen, rounds, schedule);
-                let fixed_chars = system_chars + capture_seed.tool_defs_chars;
+                let fixed_chars = system_chars + tools.defs_chars();
                 let view = panel::PanelView {
                     items: &items,
                     fixed: panel::FixedRegions {
                         system_chars,
-                        tool_defs_chars: capture_seed.tool_defs_chars,
+                        tool_defs_chars: tools.defs_chars(),
                     },
                     held_open: &held_open,
                     budget_chars: message_budget + fixed_chars,
@@ -483,6 +522,15 @@ impl LucidosEngine {
                 // The framing answers the round that wrote it, so it is spent
                 // once rendered.
                 notices = wu::RoundNotices::default();
+            }
+
+            // `messages[0]` still lists as stopped whatever was stopped at turn
+            // setup, and rewriting it would forfeit the message-prefix cache.
+            // One line in the tail is what keeps it from contradicting the
+            // array this round carries. Outside the `mode_on` block, because
+            // the disagreement is the same either way.
+            if let Some(correction) = mcp_correction {
+                crate::engine::chat::process::context_panel::append_to_tail(messages, correction);
             }
 
             // Always measure AFTER trimming. Pass 0 strips images even when no
@@ -599,7 +647,7 @@ impl LucidosEngine {
                 }) as crate::llm::TokenCallback)
             };
 
-            let call_tools = tools.to_vec();
+            let call_tools = tools.defs().to_vec();
 
             // Race LLM call against cancel token so stop button works immediately.
             // Scoped for the prompt-cache probe, which reads the correlation off
@@ -747,9 +795,8 @@ impl LucidosEngine {
             // Tool schemas are part of every request and the trim budget already
             // subtracts them, so the reported total must include them too —
             // otherwise the Context Viewer under-reports what was actually sent.
-            let estimated_total_tokens: usize = estimate_tokens_from_chars(
-                system_chars + capture_seed.tool_defs_chars + context_chars,
-            );
+            let estimated_total_tokens: usize =
+                estimate_tokens_from_chars(system_chars + tools.defs_chars() + context_chars);
             // Surface the schemas as their own row so the section tree still
             // adds up to `estimated_total_tokens`. Counting them in the total
             // without showing them would leave a user auditing a near-full
@@ -757,10 +804,10 @@ impl LucidosEngine {
             // the schemas are generated, and dumping ~70 of them would dwarf
             // the capture.
             let tool_definitions = crate::engine::ContextSection {
-                name: format!("Tool Definitions ({})", capture_seed.tools.len()),
+                name: format!("Tool Definitions ({})", tools.names().len()),
                 content: None,
-                budget_delta_chars: capture_seed.tool_defs_chars,
-                content_chars: Some(capture_seed.tool_defs_chars),
+                budget_delta_chars: tools.defs_chars(),
+                content_chars: Some(tools.defs_chars()),
                 role: crate::engine::ContextRole::System,
                 group: None,
             };
@@ -791,7 +838,7 @@ impl LucidosEngine {
             // `estimated` deliberately includes the tool schemas, matching what
             // the budget subtracts, so the comparison is like-for-like.
             if let Some(u) = usage {
-                let counted_chars = system_chars + capture_seed.tool_defs_chars + context_chars;
+                let counted_chars = system_chars + tools.defs_chars() + context_chars;
                 log!(
                     "[Context] calibration model={} estimated={} actual_input={} \
                      cache_read={} cache_creation={} chars={} implied_chars_per_token={:.2}",
@@ -817,7 +864,7 @@ impl LucidosEngine {
                             model: capture_seed.model.to_string(),
                             context_window: capture_window,
                             sections: iter_sections,
-                            tools: capture_seed.tools.to_vec(),
+                            tools: tools.names().to_vec(),
                             estimated_total_tokens,
                             usage,
                             trimmed,
@@ -896,7 +943,7 @@ impl LucidosEngine {
             // synthesised call flows through the same command guard + circuit
             // breakers as a real call. See `inline_tool_call_repair`.
             let tool_call_repair = if response.tool_calls.is_empty() {
-                let known: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                let known: Vec<&str> = tools.names().iter().map(String::as_str).collect();
                 response.content.as_deref().and_then(|c| {
                     crate::engine::inline_tool_call_repair::detect_inline_tool_call(c, &known)
                 })

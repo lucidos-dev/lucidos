@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.38.1 — 2026-09-17
+
+### Changed
+
+- The call control and the prompt row paint the phase the call is in. Connecting sweeps, speaking deepens and breathes, ending drains to grey and takes no press. Under reduced motion the colour and shape carry the four states.
+- A connect that is waiting on the browser's microphone prompt says so after two seconds, rather than showing a spinner.
+
+### Fixed
+
+- Answer a waiting question out loud on a GPT Live call. A question card that parks the work is put to you by the talker, and speaking your answer settles it. A permission card is still settled on screen.
+- A call's transcript reads in the order things were said. Your words land under what they followed, one breath is one row, and a pause mid-sentence no longer splits your sentence into two turns with the reply chopped between them.
+- Cutting the talker off stops the reply you were hearing, and the rest of it never reaches the transcript.
+- A thread you only ever spoke on gets a name.
+- The view carries every spoken row while you are on a call, and keeps your standing follow through a scroll. A deep link that lands away from the live edge stays where it landed.
+- A coding-agent turn that dies on a transient provider error and is then resumed no longer reports itself finished to the parent thread, so nothing spawns a second session onto the same files.
+- A notification tap repaints the view it lands on, and routes to the workspace window rather than a popped-out app tab.
+- Uninstalling waits for the gateway and every engine to exit before it deletes the data tree.
+- An append to a file under `data/` from a Python run keeps what the file already held.
+- `fetch_news` no longer promises a country filter it never applied.
+- An ordinary 403 no longer blocklists a whole domain for the headless browser, and clearing browser data clears the blocklist.
+- An MCP server whose process died stops being reported as running, and MCP children are swept when the engine shuts down.
+- An app's proxy call carries the engine's own auth header and framing, refuses a redirect that leaves the configured base URL, and replays a 303 as a GET. A header value that cannot be sent refuses the request instead of going out bare.
+- The nightly backup fires at the hour you set across a daylight-saving change. Its key file is created readable only by you.
+- Two triggers of one name no longer share a directory, and a trigger whose cron can never fire is no longer respawned every thirty seconds.
+- A credential that cannot be read drops its provider, rather than running the turn on a different account's key. Grounded search that comes back blocked falls through to the next provider.
+- A memory correction no longer re-inserts a duplicate entry on every rebuild.
+- `.lucidos/exhaust` is pruned on a seven-day window, so a frequent trigger no longer adds a directory per run forever.
+- A branch delete git refused is logged, so the same work stops being offered for discard again. A follow-up queued while a session is shutting down survives.
+- A cross-install thread link cannot name a different install that shares a port.
+- A discarded draft keeps the destination you chose, so the next send runs against the repository you picked.
+- The Plugins panel no longer polls every five minutes, git-cloning every registered marketplace.
+- A Tailscale auth key is typed into a password field and cleared after a failed sign-in.
+- A fast double tap on the call control cannot leave a call speaking into a closed audio context.
+- An app window's page fills its window, and a window that came up mis-sized corrects itself on the next resize.
+- The main window comes up on the frame it remembers, judged before it is written, and a menu-bar-only login start gets that frame too.
+- A live window the display can no longer hold is refitted when the desk changes, on an undock or a resolution change. A window a display can still hold is left where you put it.
+- Restart from the packaged client runs off the main thread and names the device that asked for it.
+- Reduced motion no longer strands the drawer open and the shell inert.
+- A thread event with no projection behind it no longer conjures a titleless row in the drawer.
+- Enter committing an IME candidate no longer sends the message or renames the thread, and Escape mid-composition cancels the candidate rather than the turn.
+- A link in a user message, an injected prompt, a trigger fold or a child summary routes like every other link.
+- The question mark in a status badge is centred.
+- One emitter owns the changes frame, so Apply stops reappearing on a thread that is still mid-turn. The Diff button stays when a git probe cannot answer.
+- A composed image is capped before it is written to disk, and a malformed paging cursor is refused rather than widening the query.
+- An uploaded plugin archive is reclaimed, a failed mail send reports the OAuth cause, and reordering a single trigger group sticks.
 ## v0.38.0 — 2026-09-16
 
 ### Added

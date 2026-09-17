@@ -1,6 +1,6 @@
 # 0188: One thing the talker said is one row, closed by the conversation moving
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR 0201
 - **Date**: 2026-09-15
 
 Corrects [ADR 0187](0187-a-talker-turn-ends-when-its-words-do.md), which is

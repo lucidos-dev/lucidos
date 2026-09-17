@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_cron_scheduler::{Job, JobScheduler};
+use tokio_util::sync::CancellationToken;
 
 /// Grace period for missed task execution (applies to both startup catch-up and late wake)
 const MISSED_TASK_GRACE_MINUTES: i64 = 60;
@@ -172,12 +173,12 @@ pub struct SchedulerManager {
     /// Track spawned task handles for lifecycle management
     /// Key: task_id, Value: JoinHandle and metadata
     tracked_tasks: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
-    /// Job UUID for the scheduled backup (so we can remove/replace it).
-    /// Shared (`Arc<Mutex>`) so the EventBus subscriber task can re-register the
-    /// job — on a `timezone` change or an agent/HTTP backup-pref write — without
-    /// owning `&mut self`. Only ever held briefly (take/store a Uuid), never
+    /// Cancel token of the running backup loop (so we can stop or replace it).
+    /// Shared (`Arc<Mutex>`) so the EventBus subscriber task can re-arm the loop
+    /// without owning `&mut self`, on a `timezone` change or an agent/HTTP
+    /// backup-pref write. Only ever held briefly (take/store a token), never
     /// across an `.await`.
-    backup_job_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+    backup_runner: BackupRunner,
     /// Shared flag signaling task runners to stop scheduling new executions
     shutdown_flag: Arc<AtomicBool>,
     /// In-memory trigger configs, rebuilt from events on startup and kept
@@ -214,7 +215,7 @@ impl SchedulerManager {
             engine,
             pool,
             tracked_tasks: Arc::new(RwLock::new(HashMap::new())),
-            backup_job_id: Arc::new(std::sync::Mutex::new(None)),
+            backup_runner: Arc::new(std::sync::Mutex::new(None)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             trigger_configs,
             trigger_groups,
@@ -779,12 +780,10 @@ impl SchedulerManager {
         let tracked_tasks = self.tracked_tasks.clone();
         let engine = self.engine.clone();
         let shutdown_flag = self.shutdown_flag.clone();
-        // For re-registering the backup cron when the timezone or a backup
-        // preference changes (Job::new_async_tz bakes a fixed offset, and the
-        // agent/HTTP write path is event-driven — tools can't reach the
-        // scheduler directly).
-        let scheduler = self.scheduler.clone();
-        let backup_job_id = self.backup_job_id.clone();
+        // For re-arming the backup loop when the timezone or a backup
+        // preference changes. The agent/HTTP write path is event-driven,
+        // because a tool cannot reach the scheduler directly.
+        let backup_runner = self.backup_runner.clone();
         let pool = self.pool.clone();
 
         tokio::spawn(async move {
@@ -853,34 +852,31 @@ impl SchedulerManager {
                                         &trigger_groups,
                                     );
                                 }
-                                // Re-register the backup cron when the user's
-                                // timezone changes — `Job::new_async_tz` bakes a
-                                // FIXED offset at registration, so the schedule
-                                // must be re-baked to keep firing at the
-                                // configured local time across the change (incl.
-                                // DST).
+                                // Re-arm the backup loop when the user's
+                                // timezone changes, so the next fire is
+                                // resolved in the new zone.
                                 SystemEvent::TimezoneSet { .. } => {
                                     reload_backup_schedule(
-                                        &scheduler,
-                                        &backup_job_id,
+                                        &backup_runner,
                                         &engine,
+                                        &shutdown_flag,
                                         &pool,
                                     )
                                     .await;
                                 }
-                                // Re-register when the backup schedule/provider
-                                // changes via any write path — the agent's
-                                // `set_preference` (the tool layer can't reach the
-                                // scheduler) or the HTTP handler. Idempotent with
-                                // the handler's own direct call.
+                                // Re-arm when the backup schedule or provider
+                                // changes via any write path: the agent's
+                                // `set_preference` (the tool layer cannot reach
+                                // the scheduler) or the HTTP handler. Idempotent
+                                // with the handler's own direct call.
                                 SystemEvent::PreferencesChanged { key, .. }
                                     if key == crate::core::backup::PREF_BACKUP_SCHEDULE
                                         || key == crate::core::backup::PREF_BACKUP_PROVIDER =>
                                 {
                                     reload_backup_schedule(
-                                        &scheduler,
-                                        &backup_job_id,
+                                        &backup_runner,
                                         &engine,
+                                        &shutdown_flag,
                                         &pool,
                                     )
                                     .await;
@@ -930,12 +926,12 @@ impl SchedulerManager {
 
     /// Load backup schedule from preferences on startup. Delegates to the shared
     /// reload path so startup, a timezone change, and an agent/HTTP pref write
-    /// all register the job identically (in the user's timezone).
+    /// all arm the loop identically (in the user's timezone).
     async fn load_backup_schedule(&mut self) {
         reload_backup_schedule(
-            &self.scheduler,
-            &self.backup_job_id,
+            &self.backup_runner,
             &self.engine,
+            &self.shutdown_flag,
             &self.pool,
         )
         .await;
@@ -972,10 +968,10 @@ impl SchedulerManager {
                 PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
                     .await?;
 
-                register_backup_job(
-                    &self.scheduler,
-                    &self.backup_job_id,
+                arm_backup_runner(
+                    &self.backup_runner,
                     &self.engine,
+                    &self.shutdown_flag,
                     expr,
                     provider,
                 )
@@ -994,7 +990,7 @@ impl SchedulerManager {
                     .await?;
                 PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
                     .await?;
-                remove_backup_job(&self.scheduler, &self.backup_job_id).await?;
+                stop_backup_runner(&self.backup_runner);
                 log!("[Scheduler] Backup schedule disabled");
             }
         }
@@ -1012,6 +1008,9 @@ impl SchedulerManager {
 
         // Signal all task runners to stop — they'll exit after their current execution finishes
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        // The backup loop reads the same flag, but the token wakes it now
+        // instead of on its next 30-second poll.
+        stop_backup_runner(&self.backup_runner);
 
         // Wait for in-flight task executions to complete (up to 60 seconds)
         let active = ACTIVE_TASK_COUNT.load(Ordering::Relaxed);
@@ -1062,10 +1061,10 @@ impl SchedulerManager {
     }
 }
 
-/// Shared `Arc<Mutex>` holding the registered backup job's id (or `None`). Aliased
-/// for the free backup-scheduling helpers below, which the methods and the
-/// EventBus subscriber both call.
-type BackupJobId = Arc<std::sync::Mutex<Option<uuid::Uuid>>>;
+/// Shared `Arc<Mutex>` holding the running backup loop's cancel token (or
+/// `None`). Aliased for the free backup-scheduling helpers below, which the
+/// methods and the EventBus subscriber both call.
+type BackupRunner = Arc<std::sync::Mutex<Option<CancellationToken>>>;
 
 /// Resolve the user's IANA timezone for backup scheduling, falling back to UTC.
 /// Mirrors `task_runner`'s per-trigger timezone handling so the backup cron
@@ -1084,45 +1083,113 @@ async fn backup_timezone(engine: &SharedEngine) -> chrono_tz::Tz {
     })
 }
 
-/// Register (or replace) the backup cron job, in the user's timezone. Removes any
-/// previously-registered backup job first, so it is idempotent — calling it twice
-/// with the same schedule converges on exactly one job.
+/// The next UTC instant `schedule` fires at in `tz`, strictly after `after`.
 ///
-/// `tokio_cron_scheduler::Job::new_async_tz` bakes a FIXED offset at registration
-/// time (it is not natively DST-aware), so this MUST be re-run whenever the
-/// offset can change: at engine startup (`load_backup_schedule`) and on a
-/// `TimezoneSet` / backup-pref change (the EventBus subscriber) — see
-/// `reload_backup_schedule`.
-async fn register_backup_job(
-    scheduler: &JobScheduler,
-    backup_job_id: &BackupJobId,
+/// Pure, which is the point: it takes the clock as an argument, so the DST
+/// behaviour is assertable without waiting six months. `chrono_tz` resolves the
+/// local time against the zone's rules at that date, so a 03:00 backup stays at
+/// 03:00 across a change of offset.
+///
+/// A `FixedOffset` cannot do that. `tokio_cron_scheduler::Job::new_async_tz`
+/// freezes one at registration, and an engine started in winter then ran every
+/// nightly backup an hour off from the last Sunday in March.
+fn next_backup_fire(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    schedule
+        .after(&after.with_timezone(&tz))
+        .next()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Run the scheduled backup on `cron_expr`, resolving each fire through `tz` at
+/// the moment it is computed.
+///
+/// The idiom is `task_runner::run_task_loop`'s, deliberately: short polls rather
+/// than one long sleep, because a monotonic timer does not advance across macOS
+/// system sleep. Exits on the shared shutdown flag or on `cancel`, whichever
+/// comes first.
+async fn run_backup_loop(
+    engine: SharedEngine,
+    schedule: cron::Schedule,
+    tz: chrono_tz::Tz,
+    provider_id: String,
+    shutdown_flag: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) || cancel.is_cancelled() {
+            return;
+        }
+        let Some(next) = next_backup_fire(&schedule, tz, chrono::Utc::now()) else {
+            log!("[Scheduler] Backup schedule has no further occurrences, stopping");
+            return;
+        };
+        loop {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let now = chrono::Utc::now();
+            if now >= next {
+                break;
+            }
+            let remaining = (next - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(1));
+            tokio::select! {
+                _ = tokio::time::sleep(remaining.min(POLL_INTERVAL)) => {}
+                _ = cancel.cancelled() => return,
+            }
+        }
+        run_scheduled_backup(engine.clone(), provider_id.clone()).await;
+    }
+}
+
+/// Arm (or re-arm) the backup loop, in the user's timezone. Cancels any running
+/// loop first, so it is idempotent: calling it twice with the same schedule
+/// converges on exactly one runner.
+///
+/// Re-run at engine startup (`load_backup_schedule`) and on a `TimezoneSet` or
+/// backup-pref change (the EventBus subscriber), which is what picks up a
+/// changed ZONE. A changed OFFSET needs nothing, because the loop re-resolves
+/// every fire through `chrono_tz`. See [`next_backup_fire`].
+async fn arm_backup_runner(
+    backup_runner: &BackupRunner,
     engine: &SharedEngine,
+    shutdown_flag: &Arc<AtomicBool>,
     cron_expr: &str,
     provider_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Remove any existing job first (lock held only to take the Uuid, never
-    // across the await).
-    let prev = backup_job_id.lock().unwrap().take();
-    if let Some(job_id) = prev {
-        scheduler.remove(&job_id).await?;
+    let schedule = crate::engine::tools::scheduler::parse_standard_cron(cron_expr)?;
+    let tz = backup_timezone(engine).await;
+
+    // Swap under ONE guard. Two arms race here in practice: the preference
+    // write emits `PreferencesChanged`, whose subscriber re-arms, while the
+    // handler that wrote it arms too. Taking the lock twice lets the second
+    // store overwrite the first token before anyone cancels it. That leaves a
+    // backup loop nothing can stop, and two uploads per tick.
+    let cancel = CancellationToken::new();
+    {
+        let mut slot = backup_runner.lock().unwrap();
+        if let Some(prev) = slot.replace(cancel.clone()) {
+            prev.cancel();
+            log!("[Scheduler] Stopped backup runner");
+        }
     }
 
-    let tz = backup_timezone(engine).await;
-    let engine_for_job = engine.clone();
-    let provider_for_job = provider_id.to_string();
-
-    let job = Job::new_async_tz(cron_expr, tz, move |_uuid, _lock| {
-        let engine = engine_for_job.clone();
-        let prov = provider_for_job.clone();
-        Box::pin(async move {
-            run_scheduled_backup(engine, prov).await;
-        })
-    })?;
-
-    let job_id = scheduler.add(job).await?;
-    *backup_job_id.lock().unwrap() = Some(job_id);
+    tokio::spawn(run_backup_loop(
+        engine.clone(),
+        schedule,
+        tz,
+        provider_id.to_string(),
+        shutdown_flag.clone(),
+        cancel,
+    ));
     log!(
-        "[Scheduler] Registered backup job: {} (provider: {}, tz: {})",
+        "[Scheduler] Armed backup runner: {} (provider: {}, tz: {})",
         cron_expr,
         provider_id,
         tz
@@ -1130,31 +1197,27 @@ async fn register_backup_job(
     Ok(())
 }
 
-/// Remove the backup job if one is registered (used when the schedule is
-/// disabled or no longer active).
-async fn remove_backup_job(
-    scheduler: &JobScheduler,
-    backup_job_id: &BackupJobId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let prev = backup_job_id.lock().unwrap().take();
-    if let Some(job_id) = prev {
-        scheduler.remove(&job_id).await?;
-        log!("[Scheduler] Removed backup job");
+/// Stop the backup loop if one is running (used when the schedule is disabled,
+/// no longer active, or about to be replaced).
+fn stop_backup_runner(backup_runner: &BackupRunner) {
+    let prev = backup_runner.lock().unwrap().take();
+    if let Some(cancel) = prev {
+        cancel.cancel();
+        log!("[Scheduler] Stopped backup runner");
     }
-    Ok(())
 }
 
-/// Re-read the persisted backup schedule + provider and (re-)register the cron in
-/// the user's CURRENT timezone — or remove it when the schedule is disabled/unset.
+/// Re-read the persisted backup schedule + provider and (re-)arm the loop in
+/// the user's CURRENT timezone, or stop it when the schedule is disabled/unset.
 /// Idempotent. This is the single registration path shared by startup
 /// (`load_backup_schedule`) and the EventBus subscriber (which calls it on a
 /// `TimezoneSet` or a `backup_schedule` / `backup_provider` `PreferencesChanged`,
-/// so an agent or HTTP write — or a timezone change — takes effect with no engine
-/// restart).
+/// so an agent write, an HTTP write or a timezone change takes effect with no
+/// engine restart).
 pub(crate) async fn reload_backup_schedule(
-    scheduler: &JobScheduler,
-    backup_job_id: &BackupJobId,
+    backup_runner: &BackupRunner,
     engine: &SharedEngine,
+    shutdown_flag: &Arc<AtomicBool>,
     pool: &PgPool,
 ) {
     use crate::core::backup::{is_schedule_active, PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE};
@@ -1174,17 +1237,15 @@ pub(crate) async fn reload_backup_schedule(
     let cron = match read_schedule {
         Ok(Some(c)) if is_schedule_active(&c) => c,
         _ => {
-            // Disabled or unset — ensure no stale job lingers.
-            if let Err(e) = remove_backup_job(scheduler, backup_job_id).await {
-                log!("[Scheduler] Failed to remove backup job: {}", e);
-            }
+            // Disabled or unset, so make sure no stale runner lingers.
+            stop_backup_runner(backup_runner);
             return;
         }
     };
     let read_provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await;
     if let Err(e) = &read_provider {
         log!(
-            "[Scheduler] Could not read {}, so the backup job stays unregistered \
+            "[Scheduler] Could not read {}, so the backup runner stays disarmed \
              for this reload: {}",
             PREF_BACKUP_PROVIDER,
             e
@@ -1192,17 +1253,15 @@ pub(crate) async fn reload_backup_schedule(
     }
     let provider = match read_provider {
         Ok(Some(p)) if !p.is_empty() => p,
-        // Schedule is active but there is no provider to upload to — drop any
-        // previously-registered job rather than leave a stale one that fires
-        // with a now-absent provider.
+        // The schedule is active but has no provider to upload to. Stop any
+        // running loop, rather than leave one firing at a now-absent provider.
         _ => {
-            if let Err(e) = remove_backup_job(scheduler, backup_job_id).await {
-                log!("[Scheduler] Failed to remove backup job: {}", e);
-            }
+            stop_backup_runner(backup_runner);
             return;
         }
     };
-    if let Err(e) = register_backup_job(scheduler, backup_job_id, engine, &cron, &provider).await {
+    if let Err(e) = arm_backup_runner(backup_runner, engine, shutdown_flag, &cron, &provider).await
+    {
         log!("[Scheduler] Failed to reload backup schedule: {}", e);
     }
 }
@@ -1611,6 +1670,54 @@ mod tests {
             None,
             "a transient frame writes no row, so neither matcher may see it"
         );
+    }
+
+    /// The backup fire time follows the zone's DST rules, not a frozen offset.
+    ///
+    /// `Job::new_async_tz` resolved 03:00 against one `FixedOffset` computed at
+    /// registration, and the job was re-registered only on startup or a
+    /// preference write. A 03:00 Oslo backup therefore ran an hour out from the
+    /// last Sunday in March until the next engine restart.
+    #[test]
+    fn the_backup_fire_time_crosses_a_dst_boundary() {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 0 3 * * *")
+            .expect("the Daily (03:00) preset parses");
+        let oslo: chrono_tz::Tz = "Europe/Oslo".parse().expect("a known IANA zone");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("a literal timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+
+        // Winter: 03:00 CET is 02:00 UTC.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-01-15T12:00:00Z")),
+            Some(at("2026-01-16T02:00:00Z"))
+        );
+        // The day the clocks go forward: 03:00 CEST is 01:00 UTC.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-03-28T12:00:00Z")),
+            Some(at("2026-03-29T01:00:00Z"))
+        );
+        // Summer stays there.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-07-15T12:00:00Z")),
+            Some(at("2026-07-16T01:00:00Z"))
+        );
+        // And back again once the clocks go back.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-26T12:00:00Z")),
+            Some(at("2026-10-27T02:00:00Z"))
+        );
+
+        // The bug, stated: an offset frozen in winter puts the summer fire an
+        // hour late, at 04:00 local.
+        let frozen = chrono::FixedOffset::east_opt(3600).expect("+01:00");
+        let frozen_summer = schedule
+            .after(&at("2026-07-15T12:00:00Z").with_timezone(&frozen))
+            .next()
+            .map(|t| t.with_timezone(&chrono::Utc));
+        assert_eq!(frozen_summer, Some(at("2026-07-16T02:00:00Z")));
     }
 
     /// A private fixture root, removed when the guard drops.

@@ -12,7 +12,6 @@ export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_an
 export const THREAD_STATUSES: readonly ThreadStatus[] = ['idle', 'running', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const;
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
 export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
-export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';
 
 export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
   chat: ['archived', 'inbox'],
@@ -95,7 +94,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   VoiceSessionEnded: 'metadata',
   SpokenReplyGenerated: 'metadata',
   SpokenMessageReceived: 'metadata',
-  WorkDelegated: 'metadata',
+  WorkDelegated: 'start',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

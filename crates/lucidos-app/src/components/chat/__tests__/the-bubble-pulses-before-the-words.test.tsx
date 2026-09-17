@@ -28,6 +28,7 @@ const voiceCallCss: string = readFileSync(
   resolve(here, '../../../styles/chat/voice-call.css'),
   'utf-8',
 );
+const partsSource: string = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'utf-8');
 
 /** The row exactly as `computeExchanges` appends it: a `MessageReceived` with
  *  no text, marked as the one nothing wrote. */
@@ -63,7 +64,7 @@ describe('the caller mid-sentence', () => {
     const initiator = describeInitiator(theRow, '', [], 'tid');
     const body = vnodeToText(initiator.details);
     expect(body).toContain(`<span class="visually-hidden">${HEARING_YOU}</span>`);
-    expect(body).toContain('live-utterance-bar');
+    expect(body).toContain('live-speech-bar');
   });
 
   it('never says "recording", because no audio is kept', () => {
@@ -123,10 +124,10 @@ describe('the caller\'s words, before the engine has written them down', () => {
     userEvent: { ...theRow.userEvent, text: 'fix the blank thread' } as StoredEvent,
   };
 
-  it('draws the words, not the pulse', () => {
+  it('draws the words, not the mark', () => {
     const body = vnodeToText(describeInitiator(spoken, '<p>fix the blank thread</p>', [], 'tid').details);
     expect(body).toContain('fix the blank thread');
-    expect(body).not.toContain('live-utterance-bar');
+    expect(body).not.toContain('live-speech-bar');
   });
 
   it('keeps the spoken mark, so it still reads as speech', () => {
@@ -179,10 +180,60 @@ describe('the caller\'s words, before the engine has written them down', () => {
   });
 });
 
-describe('the pulse', () => {
+/** The reported freeze. The talker's live row is a STEP, so the fingerprint's
+ *  step count and its last seq both hold across every word the row gains. The
+ *  bubble stopped at `You're looking` while the mark kept moving beside it. */
+describe('the talker\'s bubble while it is being said', () => {
+  const props = (exchange: Exchange) => ({
+    exchange,
+    revision: 0,
+    threadId: 'tid',
+    isLast: false,
+    streamingBuffer: '',
+  } as unknown as Parameters<typeof chatExchangePropsEqual>[0]);
+
+  /** One doer turn holding the talker's live row, exactly as
+   *  `withLiveCallRows` builds it. */
+  const turn = (liveReplyText: string): Exchange => ({
+    userEvent: {
+      type: 'MessageReceived',
+      text: 'what is waiting',
+      _eventId: 'm1',
+      channel: 'chat',
+    } as StoredEvent,
+    userSeq: 1,
+    steps: [{
+      seq: Number.MAX_SAFE_INTEGER,
+      event: {
+        type: 'SpokenReplyGenerated',
+        session_id: '',
+        text: liveReplyText,
+        interrupted: false,
+        _eventId: 'live-reply:t:1',
+        _liveReply: true,
+      } as StoredEvent,
+    }],
+    liveReplyText,
+  });
+
+  it('re-renders on every word', () => {
+    const before = props(turn("You're looking"));
+    const after = props(turn("You're looking to send your answer back to that thread?"));
+    expect(chatExchangePropsEqual(before, after)).toBe(false);
+  });
+
+  /** And the memo still earns its keep: a recompute that changed nothing must
+   *  not re-render every sibling on every event. */
+  it('still swallows a recompute that changed nothing', () => {
+    const same = () => props(turn("You're looking"));
+    expect(chatExchangePropsEqual(same(), same())).toBe(true);
+  });
+});
+
+describe('the mark', () => {
   it('holds still for a reader who asked for no motion', () => {
     const reduce = voiceCallCss.slice(voiceCallCss.indexOf('@media (prefers-reduced-motion'));
-    expect(reduce).toContain('.live-utterance-bar');
+    expect(reduce).toContain('.live-speech-bar');
     expect(reduce).toContain('animation: none');
   });
 
@@ -190,7 +241,51 @@ describe('the pulse', () => {
    *  transition, so it keeps a literal duration and never a `--duration-*`
    *  token. See `.claude/rules/frontend-css.md`. */
   it('runs on a literal duration, outside the animation-speed scale', () => {
-    expect(voiceCallCss).toContain('animation: live-utterance-pulse 1s ease-in-out infinite');
-    expect(voiceCallCss).not.toContain('live-utterance-pulse var(--duration');
+    expect(voiceCallCss).toContain('animation: live-speech-pulse 1s ease-in-out infinite');
+    expect(voiceCallCss).not.toContain('live-speech-pulse var(--duration');
+  });
+
+  const body = (exchange: Exchange, html = '') =>
+    vnodeToText(describeInitiator(exchange, html, [], 'tid').details);
+
+  /** The caller's bubble means one thing by it through both of its shapes: the
+   *  words are still arriving, and the provider has not settled them. Two
+   *  shapes for one meaning is what the caret was. */
+  it('is the one mark, before their first word and after it', () => {
+    const partial: Exchange = {
+      ...theRow,
+      userEvent: { ...theRow.userEvent, text: 'fix the bl', _livePartial: true } as StoredEvent,
+    };
+    expect(body(theRow)).toContain('live-speech-mark');
+    expect(body(partial)).toContain('live-speech-mark');
+  });
+
+  /** **The talker's row draws no mark, live or landed** (ADR 0197). Its live
+   *  row is retired by the engine's own, written at the next move of the
+   *  conversation (ADR 0188, ADR 0191). So the mark would stand over a
+   *  finished sentence until the caller spoke again, which is what was
+   *  reported. Gating it on the call phase blinks it instead. */
+  it('is never drawn on the talker\'s reply', () => {
+    const reply: Exchange = {
+      userEvent: {
+        type: 'SpokenReplyGenerated',
+        session_id: '',
+        text: 'On it',
+        interrupted: false,
+        _eventId: 'live-reply:t:1',
+        _liveReply: true,
+      } as StoredEvent,
+      userSeq: Number.MAX_SAFE_INTEGER,
+      steps: [],
+    };
+    expect(body(reply)).toContain('On it');
+    expect(body(reply)).not.toContain('live-speech-mark');
+  });
+
+  /** The caret it replaced is gone from both layers, so nothing can draw the
+   *  old shape by reaching for a class that still styles. */
+  it('leaves no caret behind', () => {
+    expect(voiceCallCss).not.toContain('live-caret');
+    expect(partsSource).not.toContain('live-caret');
   });
 });

@@ -20,7 +20,7 @@ import {
   followingLiveEdge,
   setActiveScrollElement,
   setFollowLiveEdge,
-  setThreadLive,
+  setAgentLive,
   stopFollowingBottom,
 } from '../scrollState';
 
@@ -116,7 +116,7 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
   beforeEach(() => {
     stopFollowingBottom();
     setActiveScrollElement(null);
-    setThreadLive(true);
+    setAgentLive(true);
     vi.useFakeTimers();
   });
   afterEach(() => {
@@ -272,7 +272,7 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       setFollowLiveEdge(true);
       vi.advanceTimersByTime(1500);
       expect(followingLiveEdge.value).toBe(true);
-      setThreadLive(false);
+      setAgentLive(false);
       el.scrollTop = scrollTop;
       el.settled.length = 0;
       return el;
@@ -319,7 +319,7 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       setActiveScrollElement(el);
       setFollowLiveEdge(true);
       vi.advanceTimersByTime(1500);
-      setThreadLive(false);
+      setAgentLive(false);
       el.settled.length = 0;
 
       const anchor = makeAnchor(el, 100);

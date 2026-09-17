@@ -521,6 +521,16 @@ impl McpClient {
         self.write_frame(&JsonRpcNotification::new(method)).await
     }
 
+    /// Whether the server process has exited.
+    ///
+    /// A probe that could not run is unknown, never a "no", so an `Err` from
+    /// `try_wait` answers `false`. Reading unknown as "exited" would drop a
+    /// server that is still serving calls, and the caller cannot get it back
+    /// mid-turn. The other way costs one stale entry until the next probe.
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     /// Kill the server process.
     pub async fn shutdown(&mut self) {
         let _ = self.child.start_kill();

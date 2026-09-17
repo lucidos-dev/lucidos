@@ -25,6 +25,40 @@ fn rewrite_outside_script_bodies(html: &str, rewrite: impl Fn(&str) -> String) -
     out
 }
 
+/// The brand tab icon stamped into an app document that declares none. Written
+/// as root-absolute refs, so [`rescope_app_html`] carries them to this
+/// workspace behind the gateway, and the engine's own `dist/` serves them on a
+/// direct hit.
+const BRAND_FAVICON_LINKS: &str = concat!(
+    r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#,
+    r#"<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">"#
+);
+
+/// Give an app document the Lucidos tab icon unless it names its own.
+///
+/// An app opened in its own browser tab is a top-level document, and it lives
+/// at `/<slug>/app/<id>/` rather than at the origin root. A browser with no
+/// `<link rel="icon">` to follow probes the root for `/favicon.ico`. That root
+/// is the gateway, not any workspace, so the tab falls back to the blank page
+/// glyph. Stamping the links here covers every access mode at once. An iframe
+/// ignores them, so the inline app surface is unaffected.
+pub(super) fn ensure_app_favicon(html: &str) -> String {
+    static LINK_REL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)<link\b[^>]*?\brel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+            .expect("app favicon rel regex must compile")
+    });
+    let declares_icon = LINK_REL_RE.captures_iter(html).any(|caps| {
+        (1..=3)
+            .filter_map(|i| caps.get(i))
+            .flat_map(|m| m.as_str().split_whitespace())
+            .any(|token| token.eq_ignore_ascii_case("icon"))
+    });
+    if declares_icon {
+        return html.to_string();
+    }
+    super::base_path::insert_into_head(html, BRAND_FAVICON_LINKS)
+}
+
 /// Append `?thread_id=<id>` to every relative `src` / `href` in the served
 /// HTML when previewing an app from an *app coding-agent thread*'s worktree.
 /// Without this, sub-resources (CSS, JS, images, fonts) resolve via the
@@ -151,6 +185,47 @@ mod tests {
         assert!(out.contains(r#"<script src="/work/api/v1/sdk.js">"#)); // opening tag rewritten
         assert!(out.contains(r#"var x='<img src="/api/v1/foo">';"#)); // body verbatim
         assert!(out.contains(r#"href="./style.css""#)); // relative untouched
+    }
+
+    #[test]
+    fn an_app_that_names_no_icon_gets_the_brand_favicon_in_its_head() {
+        let html = r#"<!DOCTYPE html><html><head><title>Habit Tracker</title></head><body><header>h</header></body></html>"#;
+        let out = ensure_app_favicon(html);
+        assert!(out.contains(r#"<head><link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
+        assert!(out.contains(r#"href="/favicon-32.png""#));
+        assert!(out.contains("<title>Habit Tracker</title>"));
+    }
+
+    #[test]
+    fn the_stamped_favicon_follows_the_workspace_prefix_behind_the_gateway() {
+        let out = rescope_app_html(&ensure_app_favicon("<html><head></head></html>"), "/dev/");
+        assert!(out.contains(r#"href="/dev/favicon.svg""#));
+        assert!(out.contains(r#"href="/dev/favicon-32.png""#));
+    }
+
+    #[test]
+    fn an_app_that_names_its_own_icon_keeps_it() {
+        for rel in [r#""icon""#, r#""shortcut icon""#, "icon", r#"'ICON'"#] {
+            let html = format!(r#"<html><head><link rel={rel} href="logo.png"></head></html>"#);
+            assert_eq!(ensure_app_favicon(&html), html, "rel={rel}");
+        }
+    }
+
+    #[test]
+    fn a_link_that_is_not_an_icon_does_not_count_as_one() {
+        // `apple-touch-icon` is a home-screen icon, never a tab icon, so it
+        // leaves the tab needing ours.
+        let html = r#"<html><head><link rel="stylesheet" href="/api/v1/sdk-iframe.css"><link rel="apple-touch-icon" href="t.png"></head></html>"#;
+        assert!(ensure_app_favicon(html).contains(r#"href="/favicon.svg""#));
+    }
+
+    #[test]
+    fn the_stamped_favicon_is_not_pulled_into_a_wip_preview() {
+        // Root-absolute, so the preview's relative-ref suffix skips it. The
+        // brand icon is engine-served, not part of the app's worktree.
+        let out = rewrite_for_thread_id(&ensure_app_favicon("<html><head></head></html>"), "abc");
+        assert!(out.contains(r#"href="/favicon.svg""#));
+        assert!(!out.contains("favicon.svg?thread_id"));
     }
 
     #[test]

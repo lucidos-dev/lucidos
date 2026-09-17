@@ -387,6 +387,11 @@ impl ThreadEvent {
     pub fn indexable_text(&self) -> Option<&str> {
         match self {
             Self::MessageReceived { text, .. } => Some(text),
+            // What the caller said on a CALL, which is the same fact in the
+            // other input mode. A delegated utterance was indexed through the
+            // `MessageReceived` beside it until ADR 0201 stopped writing one.
+            // Without this arm nothing spoken reaches memory at all.
+            Self::SpokenMessageReceived { text, .. } => Some(text),
             // A `UserPromptInjected` carrying `injected_message_id` is an
             // ACKNOWLEDGEMENT of a `MessageReceived` that is already persisted
             // and already indexed, with the same text copied verbatim. Indexing

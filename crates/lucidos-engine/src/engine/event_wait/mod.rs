@@ -27,6 +27,8 @@ pub(crate) use agent_surface::CancelEventWaitOutcome;
 /// Re-exported so the `await_event` tool description interpolates the real cap.
 /// A restated number would silently drift from the refusal the model hits.
 pub(crate) use register::MAX_CONSECUTIVE_SUBSCRIPTIONS;
+/// Same reason: the schema's `maximum` must be the cap the refusal uses.
+pub(crate) use register::MAX_TIMEOUT_SECS;
 pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
 
 use std::collections::HashMap;

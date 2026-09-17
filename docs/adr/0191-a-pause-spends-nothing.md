@@ -1,6 +1,6 @@
 # 0191: A pause spends nothing: it ends no row on either side
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR 0201
 - **Date**: 2026-09-16
 
 Amends [ADR 0188](0188-one-thing-the-talker-said-is-one-row.md), which is right

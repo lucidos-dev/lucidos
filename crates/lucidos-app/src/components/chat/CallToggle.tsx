@@ -20,6 +20,13 @@
  * row. `available` carries that, so one gate decides and the live-call
  * exemption below covers both reasons at once.
  *
+ * **Every phase is on the button, visibly.** A call has four non-idle phases
+ * and two of them are WORK: the connect takes seconds, and the hang-up takes a
+ * network round trip. Painting one binary on-state left both reading as a dead
+ * press, and a caller reported exactly that. So the phase rides
+ * `data-call-phase`, and the stylesheet gives each one a look of its own
+ * (`chat/input-messages.css`).
+ *
  * It also carries the call's one `status` region. A screen reader hears a call
  * connect, hears it go live, and hears it pick the caller's voice up. It is
  * the only announcer a call has: a second one would talk over this.
@@ -33,21 +40,87 @@ import { CallIcon } from '../shared/icons';
 import { MicrophonePicker } from './MicrophonePicker';
 import type { OverflowMenuOpener } from '../shared/OverflowMenu';
 import { useLongPress } from '../../hooks/useLongPress';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { callStatusLabel, isOnCall } from '../../voice/callState';
+import type { CallPhase } from '../../voice/callState';
 import { pressCallToggle, voiceCall } from '../../store/voice';
 import { preferences } from '../../store/store';
 import { voiceEnabled } from '../../store/actions/preferences';
+
+/**
+ * What the button is CALLED in each phase, which is what a press DOES.
+ *
+ * Never what the call is doing. The status region below says that, and a name
+ * repeating it would have a screen reader hear one state twice. `ending` is the
+ * one exception, because there is no press left to name.
+ */
+const PRESS_NAME: Record<CallPhase, string> = {
+  idle: 'Start a call',
+  connecting: 'Cancel the call',
+  listening: 'End the call',
+  speaking: 'End the call',
+  ending: 'Ending the call',
+};
+
+/** What the tooltip says. It is the only copy a sighted reader gets, so it
+ *  names the phase as well as the press. */
+const TOOLTIP: Record<CallPhase, string> = {
+  idle: 'Start a call and talk to Lucidos',
+  connecting: 'Connecting. Press to cancel',
+  listening: 'On a call. Press to end it',
+  speaking: 'Lucidos is speaking. Press to end the call',
+  ending: 'Ending the call',
+};
+
+/**
+ * How long a connect may run before the control stops claiming progress.
+ *
+ * A first call after a page load pays the browser's microphone prompt, and the
+ * sheet sits over our UI while a human reads it. A spinner through that says we
+ * are busy when we are waiting on THEM. The grant then holds for the life of
+ * the page, so a second call never reaches this dwell and reads as it always
+ * did.
+ */
+const CONNECT_DWELL_MS = 2_000;
+
+/**
+ * What a dwelling connect says instead.
+ *
+ * The tooltip only, and never the status region. That region narrates the
+ * phase, which really is still `connecting`. This is a guess about what the
+ * wait is, and a guess does not belong in a live region. The button keeps its
+ * name too: a name says what a press does, and this says nothing about that.
+ */
+const WAITING_TOOLTIP = 'Waiting for microphone access';
 
 export function CallToggle({ available = true }: { available?: boolean }) {
   // Subscribe to the preference signal.
   preferences.value;
   const call = voiceCall.value;
-  const on = isOnCall(call.phase);
+  const phase = call.phase;
+  const on = isOnCall(phase);
+  // A press while `ending` does nothing already: `ringOff` returns the state
+  // unchanged. So the control says so, and the press that does nothing also
+  // LOOKS like it does nothing.
+  //
+  // `aria-disabled` rather than the attribute, deliberately. A real one takes
+  // the pointer events with it. The hold below picks the microphone the NEXT
+  // call opens, and this call ending settles nothing about that.
+  const dead = phase === 'ending';
+  const connecting = phase === 'connecting';
+  // The phase is re-checked, because the flag clears in an effect and this
+  // render already knows the call has moved on.
+  const waiting = useDelayedFlag(connecting, CONNECT_DWELL_MS) && connecting;
   const openRef = useRef<OverflowMenuOpener | null>(null);
   // The hold's own paired click is swallowed by the gesture, so opening the
   // picker never also places a call. The devices are read by the menu's own
   // body as it mounts, which is the one place that knows it is on screen.
-  const press = useLongPress((button) => openRef.current?.(button), pressCallToggle);
+  const press = useLongPress(
+    (button) => openRef.current?.(button),
+    () => {
+      if (!dead) pressCallToggle();
+    },
+  );
   // A call already up survives either reason arriving mid-call, so the reader
   // never loses the control they ring off with. The switch can be turned off
   // and the destination can move; both leave the button where it was.
@@ -57,10 +130,13 @@ export function CallToggle({ available = true }: { available?: boolean }) {
       <button
         class={`icon-btn header-icon${on ? ' active' : ''}`}
         data-role="call-toggle"
+        data-call-phase={phase}
+        data-call-wait={waiting ? 'microphone' : undefined}
         data-row-item
         aria-pressed={on}
-        aria-label={on ? 'End the call' : 'Start a call'}
-        data-tooltip={on ? 'End the call' : 'Start a call and talk to Lucidos'}
+        aria-disabled={dead}
+        aria-label={PRESS_NAME[phase]}
+        data-tooltip={waiting ? WAITING_TOOLTIP : TOOLTIP[phase]}
         onPointerDown={press.onPointerDown}
         onPointerMove={press.onPointerMove}
         onPointerUp={press.onPointerUp}

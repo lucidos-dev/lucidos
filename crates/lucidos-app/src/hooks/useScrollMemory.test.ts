@@ -11,11 +11,13 @@ import {
   clearPendingEventScroll,
   followingLiveEdge,
   hasPendingEventScroll,
-  isFollowScroll,
+  followPosition,
+  makeScrollObservers,
+  readerGestureForTest,
   setFollowLiveEdge,
   scrollToEventAndPulse,
   setActiveScrollElement,
-  setThreadLive,
+  setAgentLive,
   stopFollowingBottom,
 } from '../components/chat/scrollState';
 import { _resetPageVisitForTesting } from '../utils/pageVisit';
@@ -38,11 +40,16 @@ import { mockTranscript } from '../components/chat/__tests__/scroll-test-helpers
 beforeEach(() => setFollowLiveEdge(false));
 afterEach(() => setFollowLiveEdge(false));
 
-/** And un-say "the agent is running". `setThreadLive` is a module-global
+/** And un-say "the agent is running". `setAgentLive` is a module-global
  *  `ChatExchange` normally owns. A test that sets it true leaks a live thread
  *  into every later one. The follow would then carry a reader the test never
  *  meant to arm. */
-afterEach(() => setThreadLive(false));
+afterEach(() => setAgentLive(false));
+
+/** And un-say "the reader is mid-gesture", for the same reason. The window is
+ *  wall-clock, so a stamp left standing makes the NEXT test's app-driven scroll
+ *  read as the reader taking over. */
+afterEach(() => readerGestureForTest(null, false));
 
 describe('isFullyRestorable', () => {
   it('true when scrollable range covers the saved offset', () => {
@@ -113,6 +120,31 @@ describe('parseSavedScroll', () => {
   it('returns null for NaN', () => {
     expect(parseSavedScroll('NaN')).toBeNull();
   });
+
+  it('reads the armed marker off either place form', () => {
+    // A standing follow the reader holds while parked away from the edge. The
+    // marker comes off first and the place parses exactly as a bare one does.
+    expect(parseSavedScroll('following:250')).toEqual({ kind: 'offset', top: 250, armed: true });
+    expect(parseSavedScroll('following:anchor:-150:t2'))
+      .toEqual({ kind: 'anchor', eventId: 't2', relTop: -150, armed: true });
+  });
+
+  it('leaves an unmarked value unarmed, which is every value already stored', () => {
+    expect(parseSavedScroll('250')).not.toHaveProperty('armed', true);
+    expect(parseSavedScroll('anchor:-150:t2')).not.toHaveProperty('armed', true);
+  });
+
+  it('returns null for a marker in front of nothing legible', () => {
+    // The marker qualifies a place. With no place there is no position, and
+    // guessing at one would put the reader somewhere nobody asked for.
+    expect(parseSavedScroll('following:')).toBeNull();
+    expect(parseSavedScroll('following:abc')).toBeNull();
+  });
+
+  it('reads a marked live edge as the plain one, which is armed already', () => {
+    // A value we never write, and it says the same thing twice.
+    expect(parseSavedScroll(`following:${LIVE_EDGE_VALUE}`)).toEqual({ kind: 'live-edge' });
+  });
 });
 
 describe('contentScrollKey', () => {
@@ -167,7 +199,7 @@ describe('a stamped position written by an older build still parses', () => {
 // ---------------------------------------------------------------------------
 describe('attachScrollMemory teardown', () => {
   function makeEl(scrollTop: number, scrollHeight = 5000) {
-    const listeners: Array<() => void> = [];
+    const listeners: Array<{ type: string; fn: () => void }> = [];
     return {
       scrollTop,
       scrollHeight,
@@ -177,13 +209,18 @@ describe('attachScrollMemory teardown', () => {
       // the chevron. A null parent ends the walk immediately.
       parentElement: null,
       getBoundingClientRect: () => ({ width: 800, height: 800, top: 0, bottom: 800, left: 0, right: 800 }),
-      addEventListener: (_t: string, fn: () => void) => { listeners.push(fn); },
-      removeEventListener: (_t: string, fn: () => void) => {
-        const i = listeners.indexOf(fn);
+      // Typed, because `makeScrollObservers` registers pointer listeners on the
+      // container too. A mock that fired every registration for one scroll
+      // would hand `onDown` an undefined event.
+      addEventListener: (type: string, fn: () => void) => { listeners.push({ type, fn }); },
+      removeEventListener: (type: string, fn: () => void) => {
+        const i = listeners.findIndex((l) => l.type === type && l.fn === fn);
         if (i >= 0) listeners.splice(i, 1);
       },
-      fireScroll: () => { for (const fn of [...listeners]) fn(); },
-      listenerCount: () => listeners.length,
+      fireScroll: () => {
+        for (const l of [...listeners]) if (l.type === 'scroll') l.fn();
+      },
+      listenerCount: () => listeners.filter((l) => l.type === 'scroll').length,
     } as any;
   }
 
@@ -655,7 +692,7 @@ describe('attachScrollMemory teardown', () => {
     function deadLinkOverNoRecord(el: any) {
       captureObservers();
       stopFollowingBottom();
-      setThreadLive(false);
+      setAgentLive(false);
       scrollToEventAndPulse('never-renders');
       return attachScrollMemory(el, 'k', {
         live: transcript,
@@ -987,8 +1024,8 @@ describe('attachScrollMemory teardown', () => {
           followsLiveEdge: true,
         });
         setFollowLiveEdge(true); // the reader armed the follow here
-        setThreadLive(true);     // and the agent is working
-        expect(isFollowScroll(el)).toBe(true);
+        setAgentLive(true);     // and the agent is working
+        expect(followPosition(el)).toBe('live-edge');
 
         try {
           scrollToEventAndPulse('e1');
@@ -997,7 +1034,7 @@ describe('attachScrollMemory teardown', () => {
           // than standing on its own: asserting the offset alone would pass just
           // as well against a recorder that had stopped asking which form a
           // position takes.
-          expect(isFollowScroll(el)).toBe(false);
+          expect(followPosition(el)).toBeNull();
           expect(localStorage.getItem('k')).toBe(String(el.scrollTop));
           expect(localStorage.getItem('k')).not.toBe(LIVE_EDGE_VALUE);
         } finally {
@@ -1033,13 +1070,13 @@ describe('attachScrollMemory teardown', () => {
           followsLiveEdge: true,
         });
         setFollowLiveEdge(true); // the reader armed the follow here
-        setThreadLive(true);     // and the agent is working
+        setAgentLive(true);     // and the agent is working
 
         try {
           scrollToEventAndPulse('e1');
           await vi.advanceTimersByTimeAsync(200);
           expect(followingLiveEdge.value).toBe(true);
-          expect(isFollowScroll(el)).toBe(true);
+          expect(followPosition(el)).toBe('live-edge');
           expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
@@ -1074,13 +1111,13 @@ describe('attachScrollMemory teardown', () => {
           resetOnEmpty: true,
           followsLiveEdge: true,
         });
-        setFollowLiveEdge(true); // armed, and `setThreadLive` deliberately unset
+        setFollowLiveEdge(true); // armed, and `setAgentLive` deliberately unset
 
         try {
           scrollToEventAndPulse('e1');
           await vi.advanceTimersByTimeAsync(200);
           expect(followingLiveEdge.value).toBe(true);
-          expect(isFollowScroll(el)).toBe(true);
+          expect(followPosition(el)).toBe('live-edge');
           expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
@@ -1159,7 +1196,7 @@ describe('attachScrollMemory teardown', () => {
           expect(el.scrollTop).toBe(19200);
           el.fireScroll();                         // its trailing scroll event
           await vi.advanceTimersByTimeAsync(200);
-          expect(isFollowScroll(el)).toBe(true);
+          expect(followPosition(el)).toBe('live-edge');
           expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
@@ -1290,7 +1327,7 @@ describe('attachScrollMemory teardown', () => {
       const restoreDom = withFindableTarget(el, { rectTop: 1000, reducedMotion: true });
       captureObservers();
       stopFollowingBottom();          // what focusThread does on the way in
-      setThreadLive(!!opts.live);     // what ChatExchange publishes for the thread arrived at
+      setAgentLive(!!opts.live);     // what ChatExchange publishes for the thread arrived at
       scrollToEventAndPulse('e1');    // resolves before anything attaches
       const detach = attachScrollMemory(el, 'k', {
         live: transcript,
@@ -1322,7 +1359,7 @@ describe('attachScrollMemory teardown', () => {
           // And the landing is recorded as an OFFSET: the reader asked to be at
           // one place, so coming back returns them to it.
           await vi.advanceTimersByTimeAsync(200);
-          expect(isFollowScroll(el)).toBe(false);
+          expect(followPosition(el)).toBeNull();
           expect(localStorage.getItem('k')).toBe('5200');
         } finally {
           done();
@@ -1347,6 +1384,66 @@ describe('attachScrollMemory teardown', () => {
           expect(el.scrollTop).toBe(5200);
         } finally {
           done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not let an ARMED-AND-PARKED record arm over a landing either', async () => {
+      // The third route into the same bug. This reader holds a ride while
+      // parked on a turn, and the record says both. A link that LANDED off the
+      // edge has ended that ride. Replaying it would light the toggle again,
+      // over the event the notification existed to show them.
+      //
+      // Both resolve orderings must agree, and this is the one the stand-down
+      // cannot see coming: the target renders and resolves before Preact runs
+      // the effect that attaches.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', 'following:3200');
+        const el = makeEl(4200, 20000);
+        const done = tapNotificationInto(el);
+
+        try {
+          expect(followingLiveEdge.value).toBe(false);
+          expect(el.scrollTop).toBe(5200); // the landing, and nothing over it
+          await vi.advanceTimersByTimeAsync(200);
+          expect(localStorage.getItem('k')).toBe('5200');
+        } finally {
+          done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps an ARMED-AND-PARKED record for a link still IN FLIGHT', async () => {
+      // The other half. A link that has not landed has ended nothing, so the
+      // request is held open and the record is left as it stands. The replay
+      // must not rewrite it as the live edge: a link that turns out dead is
+      // rescued from this same record.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', 'following:3200');
+        const el = makeEl(3200, 20000);
+        captureObservers();
+        stopFollowingBottom();
+        setAgentLive(false);
+        scrollToEventAndPulse('never-renders');
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          expect(el.scrollTop).toBe(3200); // nothing written over them
+          await vi.advanceTimersByTimeAsync(200);
+          expect(localStorage.getItem('k')).toBe('following:3200');
+        } finally {
+          detach();
         }
       } finally {
         vi.useRealTimers();
@@ -1392,7 +1489,7 @@ describe('attachScrollMemory teardown', () => {
         // nothing resolves and `deepLinkHasResolved()` stays false.
         captureObservers();
         stopFollowingBottom();
-        setThreadLive(false);
+        setAgentLive(false);
         scrollToEventAndPulse('never-renders');
         const detach = attachScrollMemory(el, 'k', {
           live: transcript,
@@ -1724,7 +1821,7 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
 
-      expect(isFollowScroll(el)).toBe(true);
+      expect(followPosition(el)).toBe('live-edge');
       expect(el.scrollTop).toBe(5000 - 800); // this fake's live edge
       detach();
     });
@@ -1763,7 +1860,7 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
 
-      expect(isFollowScroll(el)).toBe(false);
+      expect(followPosition(el)).toBeNull();
       expect(el.scrollTop).toBe(0); // the shared-container reset, as before
       detach();
     });
@@ -1782,7 +1879,7 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
 
-      expect(isFollowScroll(el)).toBe(false);
+      expect(followPosition(el)).toBeNull();
       expect(el.scrollTop).toBe(2000);
       detach();
     });
@@ -1800,7 +1897,7 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
 
-      expect(isFollowScroll(el)).toBe(true);
+      expect(followPosition(el)).toBe('live-edge');
       detach();
     });
 
@@ -1814,7 +1911,7 @@ describe('attachScrollMemory teardown', () => {
       const el = makeEl(300, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), resetOnEmpty: true });
 
-      expect(isFollowScroll(el)).toBe(false);
+      expect(followPosition(el)).toBeNull();
       detach();
     });
 
@@ -1848,21 +1945,104 @@ describe('attachScrollMemory teardown', () => {
       expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
     });
 
-    it('records the offset the reader landed on when they scroll away, follow still armed', () => {
-      // The listener-order case. `.thread-content` carries two scroll
-      // listeners: the disarm in `makeScrollObservers` and this save. No
-      // observers are wired here, so the flag is STILL armed when the save
-      // runs. That is the order that breaks a save asking whether the follow is
-      // armed. Asking where the container is answers the same in either order.
+    it('records a bare offset when a gesture on a LIVE thread ends the ride', () => {
+      // The listener-order case, in the order that is hard. `.thread-content`
+      // carries two scroll listeners: the disarm in `makeScrollObservers` and
+      // this save. No observers are wired here, so the flag is STILL armed when
+      // the save runs. A save asking the flag would keep the request the reader
+      // just ended. Asking the disarm's own rule answers the same either way.
       const el = makeEl(100, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
 
       armViaToggle(el);
+      setAgentLive(true);
+      readerGestureForTest(el);
       el.scrollTop = 2000; // a wheel, a drag, a flick
       el.fireScroll();
       detach();
 
       expect(localStorage.getItem('k')).toBe('2000');
+    });
+
+    it('records the same thing when the disarm gets there FIRST', () => {
+      // The other order, which is the one the app actually produces:
+      // `useScrollObservers` attaches before `useScrollMemory`. The two must
+      // agree, or the reader's ride depends on effect ordering.
+      const el = makeEl(100, 5000);
+      const observers = makeScrollObservers(el);
+      el.addEventListener('scroll', observers.onScroll);
+      const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
+
+      armViaToggle(el);
+      setAgentLive(true);
+      readerGestureForTest(el);
+      el.scrollTop = 2000;
+      el.fireScroll();
+      detach();
+      observers.detachGestures();
+
+      expect(followingLiveEdge.value).toBe(false); // the disarm ran
+      expect(localStorage.getItem('k')).toBe('2000');
+    });
+
+    it('keeps the request in front of the place on a QUIET thread', () => {
+      // The reported bug's second path. The disarm is gated on the agent being
+      // live, deliberately, so browsing a finished thread costs nobody their
+      // ride (ADR 0064). The record has to say so too, or re-entry restores the
+      // turn with the toggle dark and the request is lost.
+      const el = makeEl(100, 5000);
+      const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
+
+      armViaToggle(el);
+      readerGestureForTest(el); // their own gesture, and it retires nothing here
+      el.scrollTop = 2000;
+      el.fireScroll();
+      detach();
+
+      expect(followingLiveEdge.value).toBe(true);
+      expect(localStorage.getItem('k')).toBe('following:2000');
+    });
+
+    it('re-arms without moving a reader whose record is armed and parked', () => {
+      // ARMED and CARRYING are two states. Re-entry replays the request, and
+      // moves nobody: there is nothing to be carried toward until the thread
+      // runs. The offset is restored exactly as an unarmed one would be.
+      localStorage.setItem('k', 'following:2000');
+      const el = makeEl(0, 5000);
+      const detach = attachScrollMemory(el, 'k', {
+        live: () => ({}),
+        resetOnEmpty: true,
+        followsLiveEdge: true,
+      });
+
+      expect(el.scrollTop).toBe(2000);
+      expect(followingLiveEdge.value).toBe(true);
+      expect(followPosition(el)).toBe('parked'); // armed, not riding
+      detach();
+    });
+
+    it('carries that reader to the edge once the thread actually runs', () => {
+      // The other half, and the whole reason the arm is replayed. The growth
+      // branch owns this, on the one term that decides it: `followIsCarrying`.
+      localStorage.setItem('k', 'following:2000');
+      const el = makeEl(0, 5000);
+      const observers = makeScrollObservers(el);
+      setActiveScrollElement(el);
+      const detach = attachScrollMemory(el, 'k', {
+        live: () => ({}),
+        resetOnEmpty: true,
+        followsLiveEdge: true,
+      });
+      expect(el.scrollTop).toBe(2000);
+
+      setAgentLive(true);
+      el.scrollHeight = 9000;
+      observers.onResize();
+
+      expect(el.scrollTop).toBe(8200);
+      detach();
+      observers.detachGestures();
+      setActiveScrollElement(null);
     });
 
     it('keeps the live edge on the thread being LEFT when focusThread retires the follow', () => {
@@ -1922,7 +2102,7 @@ describe('attachScrollMemory teardown', () => {
       });
 
       expect(el.scrollTop).toBe(19200);
-      expect(isFollowScroll(el)).toBe(true); // and still following, not a one-shot landing
+      expect(followPosition(el)).toBe('live-edge'); // and still following, not a one-shot landing
       detach();
     });
 
@@ -1944,7 +2124,7 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
       expect(grown.scrollTop).toBe(4200);
-      expect(isFollowScroll(grown)).toBe(false);
+      expect(followPosition(grown)).toBeNull();
       detach2();
     });
 
@@ -1988,7 +2168,7 @@ describe('attachScrollMemory teardown', () => {
         await vi.advanceTimersByTimeAsync(600);
 
         expect(el.scrollTop).toBe(19200);
-        expect(isFollowScroll(el)).toBe(true);
+        expect(followPosition(el)).toBe('live-edge');
         detach();
       } finally {
         vi.useRealTimers();
@@ -2043,7 +2223,7 @@ describe('attachScrollMemory teardown', () => {
       page.foreground();
 
       expect(el.scrollTop).toBe(19200);
-      expect(isFollowScroll(el)).toBe(true);
+      expect(followPosition(el)).toBe('live-edge');
       detach();
     });
 
@@ -2057,6 +2237,8 @@ describe('attachScrollMemory teardown', () => {
       const detach = arriveFollowing(el);
       expect(el.scrollTop).toBe(19200);
 
+      setAgentLive(true);
+      readerGestureForTest(el);
       el.scrollTop = 6000; // a wheel, a drag, a flick: the disarm
       el.fireScroll();
       expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE); // debounce still pending
@@ -2068,7 +2250,33 @@ describe('attachScrollMemory teardown', () => {
       page.foreground();
 
       expect(el.scrollTop).toBe(6000);
-      expect(isFollowScroll(el)).toBe(false);
+      // NOT the exact state: no observers are wired, so the flag is still up
+      // and the gesture window alone decides between `null` and `parked`. That
+      // window is wall-clock, and this block runs on real timers. What the test
+      // is about is that the wake found no live edge to resume.
+      expect(followPosition(el)).not.toBe('live-edge');
+      detach();
+    });
+
+    it('moves one who scrolled away on a QUIET thread zero pixels too', () => {
+      // The same reader, on a thread with nothing running. Their ride survives
+      // that scroll (ADR 0064), so the flush records the request in front of
+      // the place. The wake replays it and writes nothing: ARMED is not
+      // CARRYING, and coming back is not the thread running.
+      const el = makeEl(0, 20000);
+      const detach = arriveFollowing(el);
+
+      readerGestureForTest(el);
+      el.scrollTop = 6000;
+      el.fireScroll();
+      page.background();
+      expect(localStorage.getItem('k')).toBe('following:6000');
+
+      el.scrollHeight = 40000; // and turns landed while they were away
+      page.foreground();
+
+      expect(el.scrollTop).toBe(6000);
+      expect(followingLiveEdge.value).toBe(true);
       detach();
     });
 
@@ -2605,5 +2813,109 @@ describe('a reading position that names a turn', () => {
     expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
     setActiveScrollElement(null);
     (globalThis as any).matchMedia = origMatchMedia;
+  });
+
+  it('keeps the live edge when a SHRINK clamps the rider down', () => {
+    // The reported bug's first path, and it needs no gesture at all. A live
+    // Thinking row folding into its summary is the ordinary case, and it is
+    // typically the last thing a turn does. The clamp takes the container off
+    // the follow's stamp, and the record used to become a turn there.
+    //
+    // Nothing disarmed, and the reader is still measurably at the bottom. So
+    // the thread gained a turn while they were away and re-entry put them on
+    // the OLD bottom, which is the middle now.
+    inertObservers();
+    const origMatchMedia = (globalThis as any).matchMedia;
+    (globalThis as any).matchMedia = () => ({ matches: true });
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN });
+    setActiveScrollElement(el);
+    const detach = attachScrollMemory(el, 'k', { ...opts, followsLiveEdge: true });
+    setFollowLiveEdge(true);
+    setAgentLive(true);
+    el.fireScroll();
+
+    el.setTurnHeightOf('t5', 100); // the Thinking row folds into its summary
+    el.reclamp();
+    el.fireScroll();
+    detach();
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+    setActiveScrollElement(null);
+    (globalThis as any).matchMedia = origMatchMedia;
+  });
+
+  it('records the request in front of the TURN when the rider scrolls up', () => {
+    // The two halves together: the place is still exact, and the request is
+    // still there. Re-entry then puts them on t2 with the toggle lit.
+    inertObservers();
+    const origMatchMedia = (globalThis as any).matchMedia;
+    (globalThis as any).matchMedia = () => ({ matches: true });
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN });
+    setActiveScrollElement(el);
+    const detach = attachScrollMemory(el, 'k', { ...opts, followsLiveEdge: true });
+    setFollowLiveEdge(true);
+    el.fireScroll();
+
+    readerGestureForTest(el); // and the thread is quiet, so this retires nothing
+    el.scrollTop = 950;
+    el.fireScroll();
+    detach();
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(localStorage.getItem('k')).toBe('following:anchor:-150:t2');
+    setActiveScrollElement(null);
+    (globalThis as any).matchMedia = origMatchMedia;
+  });
+
+  it('opens on that turn, armed, and writes no live edge', () => {
+    // The re-entry side of the test above. The turn is restored exactly as an
+    // unarmed record's would be, and nothing takes the reader to the bottom.
+    inertObservers();
+    localStorage.setItem('k', 'following:anchor:-150:t2');
+    const el = mockTranscript({ ids: [...IDS, 't6', 't7'], turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', { ...opts, followsLiveEdge: true });
+
+    expect(el.scrollTop).toBe(950);
+    expect(followingLiveEdge.value).toBe(true);
+    expect(followPosition(el)).toBe('parked'); // armed, and not riding
+    detach();
+  });
+
+  it('waits for the window to reach an ARMED turn, the arm standing throughout', () => {
+    // The replay must not retire the restore it travels with. `onFollowArmed`
+    // exists to write a NEW request down. Doing that here would stop the
+    // observers mid-walk and stamp the live edge over the reader's turn.
+    const obs = liveObservers();
+    localStorage.setItem('k', 'following:anchor:-150:t1');
+    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', { ...opts, followsLiveEdge: true });
+    expect(followingLiveEdge.value).toBe(true);
+    expect(obs.armed()).toBeGreaterThan(0); // still watching for t1
+    expect(localStorage.getItem('k')).toBe('following:anchor:-150:t1');
+
+    el.growWindowTo(1);
+    obs.fire();
+
+    expect(el.scrollTop).toBe(150);
+    expect(obs.armed()).toBe(0);
+    detach();
+  });
+
+  it('a container that cannot ride drops the marker and keeps the place', () => {
+    // The marker is the one part dropped rather than rejected with its value.
+    // The place is still one this container could have written; the request is
+    // the transcript's, and the follow is one global.
+    inertObservers();
+    localStorage.setItem('k', 'following:640');
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', { live: () => ({}), resetOnEmpty: true });
+
+    expect(el.scrollTop).toBe(640);
+    expect(followingLiveEdge.value).toBe(false);
+    detach();
   });
 });

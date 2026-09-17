@@ -38,6 +38,23 @@ pub(crate) struct PluginUpdateCheckReport {
     pub errors: Vec<String>,
 }
 
+impl PluginUpdateCheckReport {
+    /// The lines this check owes the log, one per accumulated failure, and
+    /// nothing at all for a clean run.
+    ///
+    /// Numbered `n/total`, so a partial sync says how much of the catalog it
+    /// got through: one failing marketplace out of three is a very different
+    /// morning from all three failing.
+    fn failure_log_lines(&self) -> Vec<String> {
+        let total = self.errors.len();
+        self.errors
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("sync failure {}/{}: {}", i + 1, total, e))
+            .collect()
+    }
+}
+
 struct UpdateCheckGuard;
 
 impl UpdateCheckGuard {
@@ -55,7 +72,23 @@ impl Drop for UpdateCheckGuard {
     }
 }
 
+/// Run one marketplace sync and report every failure it accumulated.
+///
+/// The log line is the whole point of the wrapper. Every caller discards the
+/// report, so a marketplace whose git fetch fails, or a corrupt
+/// `marketplaces.json`, used to leave the five-minute check running in silence.
 pub(crate) async fn run_plugin_marketplace_update_check(
+    engine: SharedEngine,
+    pool: sqlx::PgPool,
+) -> PluginUpdateCheckReport {
+    let report = check_marketplaces_for_updates(engine, pool).await;
+    for line in report.failure_log_lines() {
+        log!("[PluginUpdateCheck] {line}");
+    }
+    report
+}
+
+async fn check_marketplaces_for_updates(
     engine: SharedEngine,
     pool: sqlx::PgPool,
 ) -> PluginUpdateCheckReport {
@@ -133,12 +166,6 @@ pub(crate) async fn run_plugin_marketplace_update_check(
     if candidates.is_empty() {
         // Clear the marker so a future re-appearance of any version is "new".
         write_notified_signature(&workspace, &current);
-        if !report.errors.is_empty() {
-            log!(
-                "[PluginUpdateCheck] Marketplace sync completed with {} scan error(s)",
-                report.errors.len()
-            );
-        }
         return report;
     }
 
@@ -180,9 +207,10 @@ pub(crate) async fn run_plugin_marketplace_update_check(
             );
         }
         Err(e) => {
-            let msg = format!("emit update notification failed: {e}");
-            log!("[PluginUpdateCheck] {msg}");
-            report.errors.push(msg);
+            // Logged by the wrapper, with every other accumulated failure.
+            report
+                .errors
+                .push(format!("emit update notification failed: {e}"));
         }
     }
 

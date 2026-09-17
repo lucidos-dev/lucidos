@@ -2,6 +2,7 @@ pub mod client;
 pub mod types;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -44,6 +45,18 @@ struct CallTarget {
 }
 
 impl RunningServer {
+    /// Whether this server's process is known to be gone.
+    ///
+    /// A client that will not lock has a call in flight, which is a server
+    /// answering, so the probe is skipped rather than waited on. Both that and
+    /// a failed `try_wait` answer "still running": unknown is never a "no"
+    /// here, because the entry is what a live call dispatches against.
+    fn has_exited(&self) -> bool {
+        self.client
+            .try_lock()
+            .is_ok_and(|mut client| client.has_exited())
+    }
+
     fn target(&self) -> CallTarget {
         CallTarget {
             client: Arc::clone(&self.client),
@@ -53,6 +66,27 @@ impl RunningServer {
         }
     }
 }
+
+/// What a connected server's tools are good for, told to the model that just
+/// connected it.
+///
+/// The array used to be frozen for the turn. The agent learned that by
+/// failing, and started telling users to ask again in a new message. It now
+/// refreshes per round, and the model has no way to observe that except by
+/// being told. Pinned by
+/// `every_way_a_server_comes_up_tells_the_model_its_tools_are_live_now`.
+pub const CALLABLE_NOW: &str = "Its tools are callable right now, in this same turn: \
+     use them instead of asking the user to send another message.";
+
+/// The same fact for a caller whose tool array does NOT refresh.
+///
+/// `run_intent_loop` builds its array once from `build_intent_tools`, which
+/// never carries the MCP surface. Telling that caller the tools are live sends
+/// it looking for tools it does not have, and the repeat breaker is what stops
+/// it. The server really did start, so the sub-loop's job is to report that and
+/// let the outer turn use it.
+pub const CALLABLE_IN_THE_OUTER_TURN: &str = "Its tools are not in this sub-loop's \
+     array: report that it is running and let the outer turn call them.";
 
 /// What the model is told when it calls a tool the user switched off.
 fn disabled_tool_refusal(server_id: &str, wire_name: &str) -> String {
@@ -73,6 +107,16 @@ pub struct McpManager {
     /// stalled tool assembly for every thread in the workspace, and two
     /// servers could never work at once.
     running: Arc<RwLock<HashMap<String, RunningServer>>>,
+    /// Moves whenever [`McpManager::tool_surface`] would answer differently.
+    ///
+    /// A turn reads the tool array once and then runs for many rounds. Without
+    /// this, a server the agent started mid-turn stayed uncallable until the
+    /// next user message. The counter is what lets a running turn ask "has the
+    /// surface moved since I looked" for the price of one atomic load.
+    ///
+    /// Bumped under the `running` write lock and read under its read lock, so
+    /// a stamp always describes the map it was taken with.
+    tool_surface_generation: Arc<AtomicU64>,
     pool: sqlx::PgPool,
     /// Registry mutations announce through here. Held rather than passed per
     /// call because `McpServerStore`'s mutators require it: registering a
@@ -205,6 +249,17 @@ impl McpCostTotals {
     }
 }
 
+/// What the running MCP servers contribute to a request, and when that was
+/// true.
+///
+/// The two travel together because a turn holds them for many rounds and has
+/// to decide whether what it holds is still current. See
+/// [`McpManager::tool_surface`].
+pub struct McpToolSurface {
+    pub tools: Vec<ToolDefinition>,
+    pub generation: u64,
+}
+
 /// What a start attempt resolved to. Starting an already-running server is not
 /// an error, and the two read differently to the user, so the caller is told
 /// which happened.
@@ -220,6 +275,30 @@ impl McpStartOutcome {
             Self::AlreadyRunning { tool_count } | Self::Started { tool_count } => tool_count,
         }
     }
+
+    /// What the model is told after asking for a start. Both outcomes end in
+    /// [`CALLABLE_NOW`], because both leave a connected server the rest of
+    /// this turn can use.
+    /// `tools_live` says whether the CALLER's tool array picks the new surface
+    /// up. Only a loop that re-reads it per round may promise [`CALLABLE_NOW`].
+    /// It is a parameter rather than a default, so the promise is visible at
+    /// every call site.
+    pub fn describe(self, id: &str, tools_live: bool) -> String {
+        let state = match self {
+            Self::AlreadyRunning { tool_count } => {
+                format!("is already running with {tool_count} tools")
+            }
+            Self::Started { tool_count } => {
+                format!("started with {tool_count} tools available")
+            }
+        };
+        let reach = if tools_live {
+            CALLABLE_NOW
+        } else {
+            CALLABLE_IN_THE_OUTER_TURN
+        };
+        format!("MCP server '{id}' {state}. {reach}")
+    }
 }
 
 /// What a stop attempt resolved to. Stopping something already stopped is not
@@ -234,12 +313,85 @@ impl McpManager {
     pub fn new(pool: sqlx::PgPool, event_bus: crate::engine::event_bus::EventBus) -> Self {
         Self {
             running: Arc::new(RwLock::new(HashMap::new())),
+            tool_surface_generation: Arc::new(AtomicU64::new(0)),
             pool,
             event_bus,
         }
     }
 
+    /// Record that the offered tools just changed. Call it holding the
+    /// `running` write lock, so no reader can see the new map under the old
+    /// stamp.
+    fn bump_tool_surface(&self) {
+        self.tool_surface_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Take a server out of the registry, recording that the surface moved.
+    ///
+    /// Stop and Remove differ in what they do with the row, not in what leaves
+    /// the registry, so they share this.
+    async fn take_running(&self, id: &str) -> Option<RunningServer> {
+        let mut running = self.running.write().await;
+        let removed = running.remove(id);
+        if removed.is_some() {
+            self.bump_tool_surface();
+        }
+        removed
+    }
+
+    /// Drop every entry whose process has exited.
+    ///
+    /// Nothing else notices that an MCP server died. Until this runs the map
+    /// still says it is up: its tools ride every request, a start answers
+    /// `AlreadyRunning`, and each call fails on a closed pipe.
+    ///
+    /// The sweep reads under the read guard and takes the write guard only
+    /// when it found something, so the usual answer costs no writer. The read
+    /// guard is released first, because asking for the write guard while
+    /// holding it deadlocks. A restart can land between the two, so every
+    /// candidate is probed once more under the write guard, where nothing can
+    /// race it.
+    async fn evict_exited_servers(&self) {
+        let candidates: Vec<String> = {
+            let running = self.running.read().await;
+            running
+                .iter()
+                .filter(|(_, entry)| entry.has_exited())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut running = self.running.write().await;
+        let mut evicted = false;
+        for id in candidates {
+            if running.get(&id).is_some_and(RunningServer::has_exited) {
+                running.remove(&id);
+                evicted = true;
+                log!(
+                    "[MCP] Server '{}' exited on its own, dropping it from the registry",
+                    id
+                );
+            }
+        }
+        if evicted {
+            self.bump_tool_surface();
+        }
+    }
+
+    /// What [`McpManager::tool_surface`] would answer at, without building it.
+    ///
+    /// The per-round guard in the agentic loop: one atomic load on a turn that
+    /// changed nothing, which is nearly every turn.
+    pub fn tool_surface_generation(&self) -> u64 {
+        self.tool_surface_generation.load(Ordering::Acquire)
+    }
+
     /// Register a new MCP server (saves to DB and connects).
+    /// `tools_live` says whether the CALLER's tool array picks the new surface
+    /// up this turn. See [`McpStartOutcome::describe_in`].
     pub async fn setup_server(
         &self,
         id: &str,
@@ -247,6 +399,7 @@ impl McpManager {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        tools_live: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let server = McpServerStore::register(
             &self.pool,
@@ -263,8 +416,14 @@ impl McpManager {
         // Try to connect immediately
         match self.start_server_internal(&server).await {
             Ok(tool_count) => Ok(format!(
-                "MCP server '{}' is set up and connected with {} tools available.",
-                name, tool_count
+                "MCP server '{}' is set up and connected with {} tools available. {}",
+                name,
+                tool_count,
+                if tools_live {
+                    CALLABLE_NOW
+                } else {
+                    CALLABLE_IN_THE_OUTER_TURN
+                }
             )),
             Err(e) => {
                 // Server is saved but failed to connect — that's OK, user can start later
@@ -301,6 +460,10 @@ impl McpManager {
         &self,
         server: &McpServer,
     ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // A server whose process died must not answer `AlreadyRunning`. That
+        // answer ends in CALLABLE_NOW, which would be a lie, and a start is
+        // the recovery the model is told to reach for.
+        self.evict_exited_servers().await;
         let already_running = self
             .running
             .read()
@@ -356,14 +519,18 @@ impl McpManager {
             );
         }
 
-        self.running.write().await.insert(
-            server.id.clone(),
-            RunningServer {
-                client: Arc::new(Mutex::new(client)),
-                tools,
-                server_config: server.clone(),
-            },
-        );
+        {
+            let mut running = self.running.write().await;
+            running.insert(
+                server.id.clone(),
+                RunningServer {
+                    client: Arc::new(Mutex::new(client)),
+                    tools,
+                    server_config: server.clone(),
+                },
+            );
+            self.bump_tool_surface();
+        }
 
         Ok(tool_count)
     }
@@ -377,7 +544,7 @@ impl McpManager {
         &self,
         id: &str,
     ) -> Result<McpStopOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let removed = self.running.write().await.remove(id);
+        let removed = self.take_running(id).await;
         match removed {
             Some(RunningServer {
                 client,
@@ -405,7 +572,7 @@ impl McpManager {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         // Stop first. Deleting the row while the process runs would leave it
         // orphaned, with nothing left that names it.
-        let removed = self.running.write().await.remove(id);
+        let removed = self.take_running(id).await;
         if let Some(entry) = removed {
             entry.client.lock().await.shutdown().await;
         }
@@ -431,12 +598,19 @@ impl McpManager {
         .await?;
 
         // Mirror it onto the running snapshot, which is what the per-request
-        // `get_tool_definitions` reads. Without this a tool switched off while
-        // the server is up keeps riding every request until the next restart.
+        // `tool_surface` reads. Without this a tool switched off while the
+        // server is up keeps riding every request until the next restart.
+        //
+        // The generation moves only when the set really changed. Re-submitting
+        // the same set offers the same tools, and a turn that rebuilt its
+        // array for it would forfeit the prompt cache for identical bytes.
         if let Some(stored) = &stored {
             let mut running = self.running.write().await;
             if let Some(entry) = running.get_mut(id) {
-                entry.server_config.disabled_tools = stored.clone();
+                if entry.server_config.disabled_tools != *stored {
+                    entry.server_config.disabled_tools = stored.clone();
+                    self.bump_tool_surface();
+                }
             }
         }
 
@@ -452,6 +626,11 @@ impl McpManager {
     pub async fn list_servers(
         &self,
     ) -> Result<Vec<McpServerStatus>, Box<dyn std::error::Error + Send + Sync>> {
+        // `running` and a Live tool list are both read off the map below, so
+        // sweep the dead out of it first. Settings showing a server up when
+        // its process is gone is the report the user acts on.
+        self.evict_exited_servers().await;
+
         let servers = McpServerStore::list(&self.pool).await?;
         let running = self.running.read().await;
 
@@ -540,6 +719,11 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<(String, String, bool), Box<dyn std::error::Error + Send + Sync>> {
+        // A dead process is not a target. Dropping it here is what turns a
+        // reuse into the on-demand start below. Reusing it instead fails on a
+        // closed pipe, and nothing would ever restart the server.
+        self.evict_exited_servers().await;
+
         // Take a handle and let the registry go. Each lookup is its own
         // statement so the guard is dropped at the semicolon: holding a read
         // guard across the on-demand start below would deadlock against the
@@ -620,12 +804,18 @@ impl McpManager {
         Ok((result, target.server_name, target.auto_approve))
     }
 
-    /// Get tool definitions for all running servers, namespaced as mcp__{server_id}__{tool_name}.
+    /// The tools every running server offers, namespaced as
+    /// `mcp__{server_id}__{tool_name}`, and the generation they were read at.
     ///
     /// Runs once per LLM call, off the manifest snapshots, so it never waits on
     /// a tool call in flight.
-    pub async fn get_tool_definitions(&self) -> Vec<ToolDefinition> {
+    ///
+    /// The stamp is taken under the same read lock as the tools, which is what
+    /// makes the two describe one moment. A caller comparing a newer stamp
+    /// against older tools would skip the very change it was watching for.
+    pub async fn tool_surface(&self) -> McpToolSurface {
         let running = self.running.read().await;
+        let generation = self.tool_surface_generation.load(Ordering::Acquire);
         let mut tools = Vec::new();
 
         for (server_id, entry) in running.iter() {
@@ -649,7 +839,7 @@ impl McpManager {
             }
         }
 
-        tools
+        McpToolSurface { tools, generation }
     }
 
     /// Get tool definitions for stopped servers (name + description only, no params).
@@ -710,7 +900,7 @@ impl ToolOffer<'_> {
     /// The definition a request actually carries, if any.
     ///
     /// Consuming rather than borrowing, because the request path is the hot
-    /// caller: `get_tool_definitions` runs per LLM call over every tool of
+    /// caller: `tool_surface` runs per LLM call over every tool of
     /// every running server, and handing back a reference would make it clone
     /// each one.
     fn into_offered(self) -> Option<ToolDefinition> {
@@ -1523,6 +1713,45 @@ done
             }
             panic!("the stub outlived the client that spawned it");
         }
+
+        /// Kill this stub's process, standing in for a server that dies on its
+        /// own. Only ever the pid this stub itself wrote.
+        ///
+        /// Waits for the process to stop rather than for `kill` to return:
+        /// SIGKILL marks the target, and the exit follows. A stopped child is
+        /// a zombie until its parent reaps it, so `Z` counts as stopped and
+        /// `kill -0` cannot be the signal here.
+        async fn kill_and_await_stop(&self) {
+            let pid = std::fs::read_to_string(&self.pid_file).expect("the stub wrote its pid");
+            let pid = pid.trim().to_string();
+            let signalled = std::process::Command::new("kill")
+                .args(["-KILL", pid.as_str()])
+                .status()
+                .expect("run kill");
+            assert!(signalled.success(), "the stub pid {pid} was not signalled");
+
+            for _ in 0..250 {
+                if pid_has_stopped(&pid) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the stub kept running after SIGKILL");
+        }
+    }
+
+    /// Whether `pid` has stopped running, reading the process state directly.
+    /// Empty output is a pid that is gone, and `Z` is one waiting to be reaped.
+    fn pid_has_stopped(pid: &str) -> bool {
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+        else {
+            return false;
+        };
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        state.is_empty() || state.starts_with('Z')
     }
 
     async fn manager_with(
@@ -1654,13 +1883,13 @@ done
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
         manager.start_server("stub").await.unwrap();
 
-        let offered = |defs: Vec<ToolDefinition>| -> Vec<String> {
-            let mut names: Vec<String> = defs.into_iter().map(|d| d.name).collect();
+        let offered = |surface: McpToolSurface| -> Vec<String> {
+            let mut names: Vec<String> = surface.tools.into_iter().map(|d| d.name).collect();
             names.sort();
             names
         };
         assert_eq!(
-            offered(manager.get_tool_definitions().await),
+            offered(manager.tool_surface().await),
             vec![
                 "mcp__stub__alpha".to_string(),
                 "mcp__stub__beta".to_string()
@@ -1674,7 +1903,7 @@ done
             .expect("the server exists");
 
         assert_eq!(
-            offered(manager.get_tool_definitions().await),
+            offered(manager.tool_surface().await),
             vec!["mcp__stub__alpha".to_string()],
             "a disabled tool must leave the request without a restart"
         );
@@ -1689,7 +1918,7 @@ done
             .await
             .unwrap()
             .expect("the server exists");
-        assert_eq!(manager.get_tool_definitions().await.len(), 2);
+        assert_eq!(manager.tool_surface().await.tools.len(), 2);
 
         assert!(manager
             .set_disabled_tools("missing", &[], None)
@@ -1757,7 +1986,7 @@ done
         assert!(!stub.is_alive(), "the process must not outlive its row");
         assert!(McpServerStore::get(&pool, "stub").await.unwrap().is_none());
         assert!(
-            manager.get_tool_definitions().await.is_empty(),
+            manager.tool_surface().await.tools.is_empty(),
             "a removed server must not keep offering tools"
         );
         assert!(manager.list_servers().await.unwrap().is_empty());
@@ -1765,6 +1994,161 @@ done
         // Removing again removes nothing, which is what the route turns into a
         // 404 rather than a silent success.
         assert!(!manager.remove_server("stub", None).await.unwrap());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Three routes bring a server up, and all three end a turn the model can
+    /// still act in. Leaving one silent is what produced the reported failure:
+    /// the agent read "started" as a fact about the next turn and deferred the
+    /// work it had just enabled.
+    #[tokio::test]
+    async fn every_way_a_server_comes_up_tells_the_model_its_tools_are_live_now() {
+        assert!(McpStartOutcome::Started { tool_count: 15 }
+            .describe("slack", true)
+            .contains(CALLABLE_NOW));
+        assert!(McpStartOutcome::AlreadyRunning { tool_count: 15 }
+            .describe("slack", true)
+            .contains(CALLABLE_NOW));
+
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let registered = manager
+            .setup_server("fresh", "Fresh", &stub.command, &[], &stub.env, true)
+            .await
+            .unwrap();
+        assert!(
+            registered.contains(CALLABLE_NOW),
+            "setup connects too, so it says the same: {registered}"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// An MCP server can die with nobody watching, and its entry used to
+    /// outlive it. Every one of the three readers below then answered off a
+    /// process that was gone.
+    ///
+    /// Each step kills the stub and immediately exercises one reader, so no
+    /// earlier step can be what swept the entry out.
+    #[tokio::test]
+    async fn a_server_whose_process_died_is_evicted_before_anything_trusts_it() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+        let live = manager.tool_surface().await;
+        assert_eq!(live.tools.len(), 2);
+
+        // A start is the recovery the model is told to reach for.
+        // `AlreadyRunning` ends in CALLABLE_NOW, which a dead server makes a
+        // lie.
+        stub.kill_and_await_stop().await;
+        assert_eq!(
+            manager.start_server("stub").await.unwrap(),
+            McpStartOutcome::Started { tool_count: 2 },
+            "bringing a dead server back is a start, never AlreadyRunning"
+        );
+
+        // A call must restart it rather than dispatch into a closed pipe.
+        stub.kill_and_await_stop().await;
+        let (result, _name, _auto_approve) = manager
+            .call_tool("stub", "alpha", serde_json::json!({}))
+            .await
+            .expect("a call on a dead server restarts it");
+        assert_eq!(result, "stub ran");
+
+        // Settings reads the process, not the last thing the map was told.
+        stub.kill_and_await_stop().await;
+        let status = manager.list_servers().await.unwrap().remove(0);
+        assert!(!status.running, "a dead process is not a running server");
+        assert_eq!(
+            status.tools_source,
+            McpToolsSource::Cache,
+            "its manifest is remembered now, not read off the process"
+        );
+
+        let dropped = manager.tool_surface().await;
+        assert!(
+            dropped.tools.is_empty(),
+            "a dead server must stop costing tokens on every request"
+        );
+        assert_ne!(
+            dropped.generation, live.generation,
+            "a turn in flight has to see that the surface moved"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The generation is what a running turn watches, so it has to move on
+    /// exactly the changes the model would notice and on nothing else. A miss
+    /// leaves a started server uncallable for the rest of the turn. A false
+    /// move rebuilds the array and forfeits the prompt cache for nothing.
+    #[tokio::test]
+    async fn the_tool_surface_generation_moves_on_every_change_and_on_no_no_op() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+
+        let before_start = manager.tool_surface_generation();
+        manager.start_server("stub").await.unwrap();
+        let started = manager.tool_surface().await;
+        assert_eq!(started.tools.len(), 2);
+        assert_ne!(
+            started.generation, before_start,
+            "a started server is a new tool surface"
+        );
+        assert_eq!(
+            started.generation,
+            manager.tool_surface_generation(),
+            "the cheap read and the built surface must agree"
+        );
+
+        // Starting what is already running changes nothing, so a turn that
+        // tried it must not pay a rebuild.
+        assert_eq!(
+            manager.start_server("stub").await.unwrap(),
+            McpStartOutcome::AlreadyRunning { tool_count: 2 }
+        );
+        assert_eq!(manager.tool_surface_generation(), started.generation);
+
+        manager
+            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .await
+            .unwrap()
+            .expect("the server exists");
+        let disabled = manager.tool_surface().await;
+        assert_eq!(disabled.tools.len(), 1);
+        assert_ne!(disabled.generation, started.generation);
+
+        // Re-submitting the same set, and a write for a server nobody
+        // started, both leave the offered tools exactly as they were.
+        manager
+            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .await
+            .unwrap()
+            .expect("the server exists");
+        manager
+            .set_disabled_tools("missing", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(manager.tool_surface_generation(), disabled.generation);
+
+        manager.stop_server("stub").await.unwrap();
+        let stopped = manager.tool_surface().await;
+        assert!(
+            stopped.tools.is_empty(),
+            "a stopped server stops being callable"
+        );
+        assert_ne!(stopped.generation, disabled.generation);
+
+        // Stopping it again, and then removing a server that was already
+        // stopped, take nothing out of the array.
+        manager.stop_server("stub").await.unwrap();
+        assert!(manager.remove_server("stub", None).await.unwrap());
+        assert_eq!(manager.tool_surface_generation(), stopped.generation);
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -1796,15 +2180,15 @@ done
             .await
             .expect("a call to another server must not wait for the slow one")
             .expect("the quick server answers");
-            let definitions = tokio::time::timeout(budget, manager.get_tool_definitions())
+            let surface = tokio::time::timeout(budget, manager.tool_surface())
                 .await
                 .expect("tool assembly must not wait for a call in flight");
-            (answered, definitions)
+            (answered, surface)
         };
-        let (slow_result, (answered, definitions)) = tokio::join!(busy, meanwhile);
+        let (slow_result, (answered, surface)) = tokio::join!(busy, meanwhile);
 
         assert_eq!(answered.0, "stub ran");
-        assert_eq!(definitions.len(), 2, "both servers are still offered");
+        assert_eq!(surface.tools.len(), 2, "both servers are still offered");
         assert_eq!(
             slow_result.expect("the slow server answers in the end").0,
             "stub ran"
@@ -1979,7 +2363,7 @@ done
         assert!(!status.running);
         assert_eq!(status.tools_source, McpToolsSource::NeverObserved);
         assert!(status.tools.is_empty());
-        assert!(manager.get_tool_definitions().await.is_empty());
+        assert!(manager.tool_surface().await.tools.is_empty());
 
         // A server that genuinely advertises nothing is the other thing, and
         // it starts.

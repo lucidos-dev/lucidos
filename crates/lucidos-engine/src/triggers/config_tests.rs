@@ -809,6 +809,61 @@ fn slug_kebab_falls_back_to_uuid_short_when_empty() {
     assert_eq!(s, "trigger-abcdef12");
 }
 
+fn taken(slugs: &[&str]) -> std::collections::HashSet<String> {
+    slugs.iter().map(|s| s.to_string()).collect()
+}
+
+/// Two triggers named "Daily Summary" must not share one slug directory.
+///
+/// The slug is the `data/triggers/<slug>/` segment for the `trigger.toml`
+/// projection and the per-trigger knowhow. Sharing it means each boot's
+/// rebuild overwrites one definition with the other's.
+#[test]
+fn minting_suffixes_a_slug_another_trigger_already_owns() {
+    assert_eq!(
+        mint_unique_trigger_slug("Daily Summary", "uuid-1", &taken(&[])),
+        "daily-summary",
+        "an unclaimed name keeps the plain slug"
+    );
+    assert_eq!(
+        mint_unique_trigger_slug("Daily Summary", "uuid-2", &taken(&["daily-summary"])),
+        "daily-summary-2"
+    );
+    assert_eq!(
+        mint_unique_trigger_slug(
+            "Daily Summary",
+            "uuid-3",
+            &taken(&["daily-summary", "daily-summary-2"])
+        ),
+        "daily-summary-3"
+    );
+}
+
+#[test]
+fn every_minted_slug_is_a_valid_trigger_slug() {
+    // A suffixed slug still has to pass the boundary validator, including the
+    // 64-char cap, or the API would reject the trigger it just minted for.
+    let long = "Nightly ".repeat(20);
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..5 {
+        let slug = mint_unique_trigger_slug(&long, &format!("uuid-{i}"), &seen);
+        assert!(is_valid_trigger_slug(&slug), "minted {slug}");
+        assert!(seen.insert(slug), "each mint is distinct");
+    }
+}
+
+#[test]
+fn minting_falls_back_to_the_trigger_id_when_the_numbered_variants_run_out() {
+    let mut all = taken(&["busy"]);
+    for n in 2..=99 {
+        all.insert(format!("busy-{n}"));
+    }
+    assert_eq!(
+        mint_unique_trigger_slug("Busy", "abcdef-1234-5678", &all),
+        "trigger-abcdef12"
+    );
+}
+
 #[test]
 fn apply_update_accepts_slug_edit() {
     let payload = json!({

@@ -248,7 +248,12 @@ export function upsertThread(
     //   2. A debounced or in-flight PUT covers the value the API would clobber.
     //   3. A local edit happened AFTER this GET went out, so the response is
     //      stale with respect to compose by definition.
-    existing.meta.state = info.state;
+    //
+    // The lifecycle marker takes the same staleness guard as `status` above.
+    // A GET fired before the send lands after it, still saying `composing`.
+    // `ThreadPane` then swaps the transcript back for the compose view and the
+    // drawer drops the row, until the next event carrying an aggregate.
+    if (!statusSnapshotStale) existing.meta.state = info.state;
     const isFocusedThread = info.thread_id === focusedThreadId.value;
     // An EMPTY server snapshot genuinely means the shared draft was sent or
     // discarded by somebody, since the backend clears compose_text on those
@@ -1232,6 +1237,40 @@ export function _clearLoadedFilterSelectionForTest(): void {
   loadedFilterSelection = null;
 }
 
+/** Where the server stopped on the last Archive page: the `created_at` of the
+ *  oldest row it returned, paired with the selection it was fetched for. A
+ *  different filter is a different cursor space, so the pairing is what keeps
+ *  one selection's progress out of another's.
+ *
+ *  The loaded map cannot answer this on its own. `/threads/older` pages EVERY
+ *  thread by `created_at`, while the initial window already holds every inbox
+ *  and saved thread whatever its age. So a page can consist entirely of rows
+ *  this device already has, and the map-derived cursor below does not move on
+ *  one. The same page would then come back forever. Reading that as an
+ *  exhausted archive is the wrong verdict, and it hides the rest of the pile
+ *  for good. Remembering where the server stopped keeps the next page
+ *  continuing BELOW the duplicates instead. */
+let olderThreadsCursor: { selection: ThreadFilterSelection; before: string } | null = null;
+
+/** Test seam: forget how far pagination has walked. */
+export function _clearOlderThreadsCursorForTest(): void {
+  olderThreadsCursor = null;
+}
+
+/** The further-back of two ISO cursors, either of which may be absent.
+ *
+ *  Compared as instants rather than as strings, because the two sides come from
+ *  different places and only one of them is a loaded row. The engine writes
+ *  RFC3339 with as many fractional digits as the value needs, and `'.' < 'Z'`,
+ *  so a lexicographic `<` reads `…:27.5Z` as EARLIER than `…:27Z`. Picking the
+ *  wrong one of those skips a row. It runs once per page, so the parse is free;
+ *  the loop that scans the whole map for its own minimum keeps a bare `<`. */
+function earlierCursor(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return Date.parse(a) <= Date.parse(b) ? a : b;
+}
+
 /** Channel/facet filter params for the older-threads + archived-count APIs,
  *  read from the *applied thread filter*: the selection the drawer list is
  *  actually showing, which holds still while the thread filter panel covers it
@@ -1281,19 +1320,24 @@ export async function refreshArchivedCount(): Promise<void> {
 
 /** Load older threads for infinite scroll. Self-guards against concurrent calls.
  *  Passes channel + trigger-id filters to the API so pagination targets only
- *  matching threads. */
-export async function loadOlderThreads(): Promise<void> {
+ *  matching threads.
+ *
+ *  Resolves TRUE when the server answered, FALSE when this call declined or
+ *  failed. The drawer's fill loop reads that to decide whether to ask for
+ *  another page: a landed page always moves the cursor, so "it added no rows"
+ *  is not a reason to stop, while "nothing was fetched" is. */
+export async function loadOlderThreads(): Promise<boolean> {
   // Neither of these settles anything for the current selection: a concurrent
   // call owns the round trip, or pagination is simply off. So no stamp, and
   // whatever owed a reload still owes it (see `filterChangedSinceLoad`).
-  if (threadLoadingMore.value || !threadHasMore.value) return;
+  if (threadLoadingMore.value || !threadHasMore.value) return false;
   const applied = appliedThreadFilter.value;
   // Empty filter = nothing visible by intent; never fetch. That IS the answer
   // for this selection, so it stamps like a landed page.
   if (applied.channels.size === 0) {
     threadHasMore.value = false;
     stampLoadedFilterSelection(applied);
-    return;
+    return false;
   }
   threadLoadingMore.value = true;
 
@@ -1324,6 +1368,14 @@ export async function loadOlderThreads(): Promise<void> {
       if (!oldestTime || key < oldestTime) oldestTime = key;
     }
 
+    // The server has already answered for everything above where it last
+    // stopped, so page below whichever of the two reaches further back. This is
+    // what carries pagination over a page of rows the map already held: the
+    // loop above sees no new archived row and leaves the cursor where it was.
+    if (olderThreadsCursor?.selection === applied) {
+      oldestTime = earlierCursor(oldestTime, olderThreadsCursor.before);
+    }
+
     // Empty filter result on loaded threads — fall back to now() so the server
     // can find matches in history. Without this, a freshly-applied filter
     // permanently halts with "no more" even though matches exist on disk.
@@ -1334,7 +1386,7 @@ export async function loadOlderThreads(): Promise<void> {
       if (!sources && !triggerIds && !repoIds && !appIds) {
         threadHasMore.value = false;
         stampLoadedFilterSelection(applied);
-        return;
+        return false;
       }
       oldestTime = new Date().toISOString();
     }
@@ -1364,14 +1416,21 @@ export async function loadOlderThreads(): Promise<void> {
     const stillCurrent = appliedThreadFilter.value === applied;
     if (response.threads.length === 0) {
       if (stillCurrent) threadHasMore.value = false;
-      return;
+      return true;
     }
+    // Remember where the server stopped, BEFORE looking at what is new. The
+    // page is ordered `created_at DESC`, so its last row is its oldest, and
+    // every row it holds is strictly older than the cursor we sent. The stored
+    // cursor therefore moves strictly back on every landed page, which is what
+    // guarantees the caller's loop terminates.
+    const pageOldest = response.threads[response.threads.length - 1].created_at;
+    if (pageOldest) olderThreadsCursor = { selection: applied, before: pageOldest };
 
-    let added = 0;
+    let mapChanged = false;
     for (const info of response.threads) {
       if (!map.has(info.thread_id)) {
         upsertThread(map, info, false);
-        added++;
+        mapChanged = true;
       }
       // Promote. A thread loaded earlier as a family extension, now showing up
       // in natural pagination, is no longer family-only. It should contribute
@@ -1382,20 +1441,21 @@ export async function loadOlderThreads(): Promise<void> {
       if (!map.has(info.thread_id)) {
         upsertThread(map, info, false);
         familyExtensionIds.add(info.thread_id);
+        mapChanged = true;
       }
     }
 
-    // If server returned results but all were duplicates, treat as exhausted
-    // to prevent infinite fetch loops with the same cursor.
-    if (added === 0) {
-      if (stillCurrent) threadHasMore.value = false;
-      return;
-    }
-
+    // A page holding nothing new is ordinary, not the end of the archive. The
+    // endpoint pages every thread by `created_at`, and the initial window
+    // already holds every inbox and saved thread. So a run of those is just a
+    // stretch of history this device has read. The cursor above has moved past
+    // it, and the next page continues below.
     if (stillCurrent) threadHasMore.value = response.has_more;
-    threadMap.value = new Map(map);
+    if (mapChanged) threadMap.value = new Map(map);
+    return true;
   } catch (err) {
     showToast(`Failed to load more threads: ${errorDetail(err)}`, 'error');
+    return false;
   } finally {
     threadLoadingMore.value = false;
   }

@@ -339,10 +339,6 @@ pub const TABLES: &[TableRule] = &[
                           than reporting a live change.",
                 },
                 ExemptWriter {
-                    function: "insert",
-                    why: "Thin wrapper over insert_with_timestamp, same caller.",
-                },
-                ExemptWriter {
                     function: "delete_family_rows",
                     why: "The thread-delete cascade, which ThreadsDeleted covers \
                           as the parent event. NotificationRead is the wrong \

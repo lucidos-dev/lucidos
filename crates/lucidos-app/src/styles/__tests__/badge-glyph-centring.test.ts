@@ -19,7 +19,8 @@
  *  - no badge inherits the tracking that leans it left;
  *  - the rules cover every badge that carries a number or a sign;
  *  - badges.css is imported LAST, which lets it win their `display`;
- *  - the two badges sized by that line box keep their height.
+ *  - the two badges sized by that line box keep their height;
+ *  - no badge hands its font to a pseudo-element, which the trim cannot see.
  *
  * Nothing renders in a unit test, so the numbers above are evidence rather
  * than an assertion. What is asserted here is the shape that produced them.
@@ -159,6 +160,48 @@ describe('nothing outranks it', () => {
     // badge's own `display` today, which is what badges.css re-homes.
     expect(seen, 'the sweep found no badge display rules at all').toBeGreaterThanOrEqual(5);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('the band the trim measures is the glyph the badge draws', () => {
+  it('lets no badge put its font on a pseudo-element', () => {
+    // The trim reads the font of the BLOCK CONTAINER, which is the badge. A
+    // glyph drawn by a `::after` at its own smaller size is therefore not the
+    // band being centred. It sits on that band's baseline, riding as low as the
+    // two fonts differ, which the "?" badge did at 2.0px in Chromium and 1.7px
+    // in WebKit on a 14px badge. Its font lives on the badge now, and a font
+    // moved back onto a pseudo would silently undo it.
+    const pseudo = new RegExp(`\\.(${GLYPH_BADGES.join('|')})::?(before|after)\\b`);
+    const offenders: string[] = [];
+    let seen = 0;
+    for (const path of styleSheetPaths(resolve(stylesDir, '..'))) {
+      const css: string = readFileSync(path, 'utf-8');
+      for (const rule of cssRules(css)) {
+        for (const one of selectorList(rule.selector)) {
+          // The subject is the last compound, so a rule aimed at a CHILD of the
+          // badge is out of scope here: it draws its own box, not the badge's
+          // line box.
+          if (!pseudo.test(one.split(/[\s>+~]+/).pop() ?? '')) continue;
+          seen++;
+          const fonts = [...rule.props.keys()].filter(p => /^font(-|$)/.test(p));
+          if (fonts.length) offenders.push(`${path.split('/src/')[1]}: ${one} sets ${fonts.join(', ')}`);
+        }
+      }
+    }
+    // A FLOOR, so a sweep that matched nothing cannot read as a clean one. The
+    // "?" badge's own `content` and colour rules are the ones this counts.
+    expect(seen, 'the sweep found no badge pseudo-element rules at all').toBeGreaterThanOrEqual(2);
+    expect(offenders).toEqual([]);
+  });
+
+  it('keeps the "?" glyph a step smaller than the badge it sits in', () => {
+    // The scan above says WHERE the font goes; this says the badge still has
+    // one. Dropped, the glyph inherits the body size and outgrows its 0.7rem
+    // circle. One rule states it, so there is one band to centre.
+    const chatCss: string = readFileSync(resolve(stylesDir, 'chat', 'input-messages.css'), 'utf-8');
+    const sized = rulesTargeting(chatCss, 'thread-status-question-badge')
+      .filter(r => r.props.has('font-size'));
+    expect(sized.map(r => r.props.get('font-size'))).toEqual(['var(--font-size-3xs)']);
   });
 });
 

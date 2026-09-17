@@ -1121,7 +1121,7 @@ pub(crate) fn build_merge_prompt(
             2. If there are merge conflicts, resolve them (read the files, understand both sides, \
                edit to keep both working, `git add` each resolved file, then `git commit --no-edit`)\n\
             3. Run `/harden` to harden the merged code\n\
-            4. Run `cargo test -p lucidos-engine` and `cd crates/lucidos-app && npm test` to verify\n\
+            4. Run `make test` and `cd crates/lucidos-app && npm test` to verify\n\
             5. Fix any test failures before finishing\n\n\
             If any conflict is ambiguous, ask the user before proceeding.",
             merge_target,
@@ -1144,7 +1144,7 @@ mod tests {
         let prompt = build_merge_prompt("main", None, Some("desc"), false);
         assert!(prompt.contains("git merge main"));
         assert!(prompt.contains("/harden"));
-        assert!(prompt.contains("cargo test -p lucidos-engine"));
+        assert!(prompt.contains("make test"));
         assert!(prompt.contains("desc"));
     }
 
@@ -1152,7 +1152,7 @@ mod tests {
     /// `/harden` or the Lucidos-source test suites — app worktrees have none of
     /// that tooling. This is the CC-assisted (diverged-main) counterpart of the
     /// `apply_now` pre-merge harden-gate skip; without it, an app apply whose
-    /// `main` diverged still injected `/harden` + `cargo test` into the app
+    /// `main` diverged still injected `/harden` + `make test` into the app
     /// session (the "Create App Demo Video" / `demo-director` bug).
     #[test]
     fn merge_prompt_app_omits_harden_and_tests() {
@@ -1170,8 +1170,8 @@ mod tests {
             "app merge prompt must not mention /harden; got: {prompt}",
         );
         assert!(
-            !prompt.contains("cargo test"),
-            "app merge prompt must not mention cargo test; got: {prompt}",
+            !prompt.contains("make test"),
+            "app merge prompt must not mention make test; got: {prompt}",
         );
         assert!(
             !prompt.contains("npm test"),

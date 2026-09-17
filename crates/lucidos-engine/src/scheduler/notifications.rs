@@ -299,33 +299,12 @@ impl NotificationStore {
         Ok(())
     }
 
-    /// Insert a new notification
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert(
-        pool: &PgPool,
-        title: &str,
-        message: &str,
-        task_id: Option<Uuid>,
-        app_id: Option<&str>,
-        thread_id: Option<Uuid>,
-        event_id: Option<Uuid>,
-        tap: Tap,
-    ) -> Result<Notification, sqlx::Error> {
-        Self::insert_with_timestamp(
-            pool,
-            title,
-            message,
-            task_id,
-            app_id,
-            thread_id,
-            event_id,
-            tap,
-            Utc::now(),
-        )
-        .await
-    }
-
-    /// Insert a notification with a custom timestamp (for backdating)
+    /// Insert a notification with a custom timestamp (for backdating).
+    ///
+    /// The single insert path. A callerless `Utc::now()` wrapper used to sit
+    /// beside it, stamping `created_at` off the host clock. The dedup windows
+    /// in `scheduler/backup.rs` and `scheduler/user_tasks.rs` compare that
+    /// column against the Postgres clock (ADR 0053).
     // One arg per persisted column; matches the `notifications` row schema 1:1.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_with_timestamp(

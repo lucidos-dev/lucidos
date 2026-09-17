@@ -955,7 +955,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag if a fifth lane appears. Re-flag too if a change to the resolution
   contract has to land in all three at once, and one of them is missed.
 
-- **`Call::delegated` checks `doer_is_parked` at the ask, not at the pairing,
+- **`Call::delegated` checks `parked_on` at the ask, not at the pairing,
   and the residual race is accepted.** A reviewer traces a delegation whose
   transcript is still in flight. The doer can park in that window, and
   `settle_the_pending_utterance` then wakes it anyway.
@@ -994,6 +994,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag with evidence that a Tailscale relay drops a funnel port rather than
   resetting it, or if `answers_on` stops counting a refusal as an answer.
+
+- **`Call::began_saying_it`'s emptiness check is load-bearing, even though two
+  of its three callers guard on the same predicate first.** A reviewer reads
+  the inner `!words.trim().is_empty()` as a third copy of a rule already
+  applied by the `TalkerTurnEnded` arm and by `take_what_was_still_held`.
+
+  The third caller is `talker_said`, which takes RAW deltas. Every provider
+  forwards blank ones as they arrive, and a stretch dated by one would read
+  from before the talker spoke. So the guard belongs where the date is taken,
+  and the two callers that also guard do so for their own reasons: each is
+  assigning `last_turn_transcript` under the same condition.
+
+  Re-flag only if `talker_said` gains a guard of its own, which would make the
+  inner one genuinely dead.
 
 ## Desktop client (Tauri, macOS)
 
@@ -1067,6 +1081,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A shipping comment may cite a `docs/plans/**` path, even though the release
+  strips that directory.** A reviewer reads the private-data rule, sees that
+  `scripts/release-to-lucidos.sh` drops `docs/plans/**`, and flags the citation
+  as a pointer the public mirror cannot resolve.
+
+  It is the established convention: 107 files under `crates/lucidos-app/src`
+  carry one, including `utils/webkitRepaint.ts`, `utils/tapGesture.ts` and
+  `styles/components.css`. The plan path is a durable NAME for the reasoning,
+  which is what the prose rule asks a comment to link rather than restate.
+  `./scripts/check-knowhow-refs.sh` resolves such paths against the repo, where
+  they exist, and the release never rewrites comments.
+
+  Re-flag on two things only. The path itself carrying private data. Or a
+  `system-knowhow/**` file citing a plan, since that ships as guidance the
+  engine LLM acts on rather than as a reader's footnote.
 
 - **`min-height: 1lh` beside a `text-box-trim` is load-bearing, not
   redundant.** A reviewer sees a rule trim the line box and then state a
@@ -1297,12 +1327,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   flagged exactly this, twice, on the branch that added the flag.
 
   The in-place resume never runs on that state alone. Both callers read the
-  thread's *reading position* first: `standDownForDeepLink` resumes only for
-  `recorded?.kind === 'live-edge'`, and `onPageWake` returns early otherwise. An
-  off-edge landing records an OFFSET for that thread (`recordDeepLinkLanding`),
-  so a beat later there is no live-edge record to resume at all. The *follow
-  seed*'s own branch (`recorded === null`) reaches the same resume, and the same
-  landing gives that thread a record too.
+  thread's *reading position* first, through `replayRecordedFollow`, which
+  resumes only for a record that carries a standing follow. An off-edge landing
+  retires the ride before it records (`recordDeepLinkLanding`). So what it
+  writes is the BARE place, and a beat later there is nothing to resume. The
+  *follow seed*'s own branch (`recorded === null`) reaches the same resume, and
+  the same landing gives that thread a record too.
 
   What is left is the save's own debounce, a couple of hundred milliseconds in
   which the record still reads live-edge. Reaching it needs a second link
@@ -3728,6 +3758,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag if the gate moves to end-of-utterance, or if the engine stops sending
   `response.cancel` on `barge_in`. Also re-flag for a provider whose finished
   response is reported out of band from its transcription.
+
+- **A `WorkDelegated` row IS drawn for the reader, through the history API.**
+  A reviewer greps the SSE grouping path and finds
+  `store/thread-events/exchange-grouping.ts` saying the event "draws nothing
+  wherever it lands". They then read any claim about the caller SEEING one as
+  wrong.
+
+  A thread has two render paths and that comment covers one. The live path
+  folds the event into an exchange and paints nothing. The reload path is
+  `core/store/messages/build.rs`, whose `"WorkDelegated"` arm builds a
+  `SessionMessage` with the `[Asked for you]` prefix, and `api/history.rs`
+  serves those to the client as the transcript. A reported call showed one on
+  screen, which is the evidence ADR 0200 was written from.
+
+  Re-flag only if `build.rs` stops emitting the arm, or if `history.rs` stops
+  serving `SessionMessage` to a client.
 
 ## Product copy
 

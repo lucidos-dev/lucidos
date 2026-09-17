@@ -22,7 +22,7 @@ import {
   followSeedFromStored,
   followingLiveEdge,
   honourAnchoredMutation,
-  isFollowScroll,
+  followPosition,
   isNavigationScroll,
   markAnchorScroll,
   markNavigationScroll,
@@ -34,8 +34,9 @@ import {
   scrollToBottomAnimated,
   scrollToTop,
   setActiveScrollElement,
+  setAgentLive,
+  setCallLive,
   setFollowLiveEdge,
-  setThreadLive,
   stopFollowingBottom,
 } from '../scrollState';
 
@@ -363,11 +364,16 @@ function atBottom(el: any) {
  *  It also puts the thread in its LIVE state, which is what every test here
  *  except the idle-scroll pair is about. The disarm asks whether the agent is
  *  live, so a file-wide default of `false` would make every disarm test pass
- *  for the wrong reason. Tests that care about idle say so explicitly. */
+ *  for the wrong reason. Tests that care about idle say so explicitly.
+ *
+ *  The CALL is cleared rather than set, because it is the second live source
+ *  and only the call block arms it. Left standing, one test's call would keep
+ *  the next one's idle thread live. */
 function resetFollow() {
   stopFollowingBottom();
   setActiveScrollElement(null);
-  setThreadLive(true);
+  setAgentLive(true);
+  setCallLive(false);
   awayFromBottom.value = false;
   readerGestureForTest(null, false);
 }
@@ -674,7 +680,7 @@ describe('a scroll retires the follow only when the READER made it', () => {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
     const observers = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(true);
+    setAgentLive(true);
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     expect(followingLiveEdge.value).toBe(true);
@@ -777,7 +783,7 @@ describe('a scroll retires the follow only when the READER made it', () => {
     // Same rule as the scroll disarm: re-reading a thread nothing is writing to
     // is browsing, and the reader's next submit should still carry them.
     riding();
-    setThreadLive(false);
+    setAgentLive(false);
 
     scrollToTop();
 
@@ -786,7 +792,7 @@ describe('a scroll retires the follow only when the READER made it', () => {
 
   it('keeps the ride when the platform scrolls an IDLE thread', () => {
     const { el, onScroll } = riding();
-    setThreadLive(false);
+    setAgentLive(false);
 
     el.scrollTop = 0;
     onScroll();
@@ -868,7 +874,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
     const observers = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(true);
+    setAgentLive(true);
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     observers.onScroll();          // the glide's own trailing event
@@ -928,7 +934,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     // dismissed. Waiting for the next turn is no answer while the toggle says
     // the reader is being kept at the bottom.
     const { el, onScroll } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
 
     platformScrollsTo(el, 0, onScroll);
 
@@ -942,7 +948,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     // reader is browsing: writing them back would undo the scroll they just made
     // and make the lit toggle unusable on a finished thread.
     const { el, onScroll } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
 
     readerScrollsTo(el, 900, onScroll);
 
@@ -955,7 +961,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     // reader parked up in history. Their own scroll recorded them OFF the edge,
     // so the next platform scroll has no edge to restore them to.
     const { el, onScroll } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
     readerScrollsTo(el, 900, onScroll);
 
     readerGestureForTest(null, false);  // the coast lapses: this one is the platform
@@ -1072,7 +1078,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
 
   it("corrects one landing inside the ride's own write window", () => {
     const { el, onScroll, onResize } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
 
     el.scrollHeight = 4000;
     onResize();                 // the ride's own write, marked this instant
@@ -1085,7 +1091,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     // The recording side reads the position as the ride's own again, so this
     // thread keeps the live edge as its reading position. Recording the offset
     // the platform briefly left is what disarmed the follow on the next open.
-    expect(isFollowScroll(el)).toBe(true);
+    expect(followPosition(el)).toBe('live-edge');
   });
 
   it('and does not strand them for every round after it', () => {
@@ -1094,7 +1100,7 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
     // of the readings `keepTheLiveEdge` has. Growth then wrote nothing, ever
     // again, and the toggle stayed lit over a transcript nothing was following.
     const { el, onScroll, onResize } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
 
     el.scrollHeight = 4000;
     onResize();
@@ -1124,7 +1130,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     setActiveScrollElement(el);
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
-    setThreadLive(live);
+    setAgentLive(live);
     // The reader goes back to re-read something, with their own hand: the
     // whole question here is what a READER's scroll means on a live thread
     // versus an idle one, so it has to be one.
@@ -1137,7 +1143,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
 
     expect(followingLiveEdge.value).toBe(true);
 
-    setThreadLive(true);     // and the next reply carries them, as they asked
+    setAgentLive(true);     // and the next reply carries them, as they asked
     el.scrollHeight = 4000;
     onResize();
     expect(el.scrollTop).toBe(3500);
@@ -1195,7 +1201,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
     atBottom(el);
     setFollowLiveEdge(true);
-    setThreadLive(false); // the card is parked on the reader: nothing is running
+    setAgentLive(false); // the card is parked on the reader: nothing is running
 
     followAnsweredQuestion('q1');
     readerScrollsTo(el, 900, onScroll); // and they scroll away before the agent picks it up
@@ -1214,7 +1220,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     // slow half. The client's `meta.status` only advances when a per-event
     // aggregate carrying `running` arrives, seconds after the send. So the
     // render right after a submit writes `false` while the agent is on its way.
-    // A `setThreadLive` clearing the claim on any write would destroy it in the
+    // A `setAgentLive` clearing the claim on any write would destroy it in the
     // one window it exists for.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onScroll } = makeScrollObservers(el);
@@ -1222,10 +1228,10 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
     atBottom(el);
     setFollowLiveEdge(true);
-    setThreadLive(false);
+    setAgentLive(false);
 
     followAnsweredQuestion('q1');
-    setThreadLive(false); // the lagging projection, re-rendered after the submit
+    setAgentLive(false); // the lagging projection, re-rendered after the submit
 
     readerScrollsTo(el, 900, onScroll);
 
@@ -1248,7 +1254,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
       setActiveScrollElement(el);
       atBottom(el);
       setFollowLiveEdge(true);
-      setThreadLive(false);   // nothing running, and nothing ever will be
+      setAgentLive(false);   // nothing running, and nothing ever will be
 
       followContinuedThread(); // the POST then fails, so no status ever changes
       clock += 30_000;         // long past the claim
@@ -1282,7 +1288,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     setActiveScrollElement(el);
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);   // the toggle's glide settles on the live edge
-    setThreadLive(false);           // the reply finishes
+    setAgentLive(false);           // the reply finishes
     readerScrollsTo(el, 800, observers.onScroll); // and the reader goes back to re-read it
     expect(followingLiveEdge.value).toBe(true);   // the ride survives, per the block above
     el.writes = 0;
@@ -1333,7 +1339,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     onResize();
     expect(el.scrollTop).toBe(800);
 
-    setThreadLive(true);
+    setAgentLive(true);
     el.scrollHeight = 5000;
     onResize();
     expect(el.scrollTop).toBe(4500);
@@ -1377,7 +1383,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     onResize();              // and its resize is delivered while we still read idle
     expect(el.scrollTop).toBe(800);
 
-    setThreadLive(true);     // the effect lands a task later, with no resize behind it
+    setAgentLive(true);     // the effect lands a task later, with no resize behind it
 
     expect(el.scrollTop).toBe(3500);
   });
@@ -1391,7 +1397,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     // re-asserts the live edge over wherever they had got to.
     const { el, onScroll } = armedThenScrolledUpOnAnIdleThread();
 
-    setThreadLive(true);        // the wake: the round the observer missed
+    setAgentLive(true);        // the wake: the round the observer missed
     expect(el.scrollTop).toBe(2500);
 
     // Now put the container somewhere the follow did not, with NO gesture
@@ -1405,7 +1411,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     expect(followingLiveEdge.value).toBe(true);
     el.writes = 0;
 
-    setThreadLive(true);        // the same answer again, from a later render
+    setAgentLive(true);        // the same answer again, from a later render
 
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(1200);
@@ -1436,7 +1442,7 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
    *  exactly who the lit toggle is for.
    *
    *  A thread PARKS the instant the agent asks a question:
-   *  `waiting_for_user_answer` is quiescent, so `exchangeMarksThreadLive` says
+   *  `waiting_for_user_answer` is quiescent, so `exchangeMarksAgentLive` says
    *  idle. The card therefore arrives on a thread this module reads as doing
    *  nothing. Standing the write down for every armed reader mounts that card
    *  UNDER a rider on the live edge, with its options below the fold.
@@ -1452,7 +1458,7 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     atBottom(el);              // 2500
     observers.onScroll();      // the transcript records them ON the edge
     setFollowLiveEdge(true);   // arming from the edge writes nothing, runs no tween
-    setThreadLive(false);      // and the thread parks on the question it just asked
+    setAgentLive(false);      // and the thread parks on the question it just asked
     expect(followingLiveEdge.value).toBe(true);
     el.writes = 0;
     return { el, ...observers };
@@ -1508,7 +1514,7 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     expect(el.scrollTop).toBe(2900);
     el.writes = 0;
 
-    setThreadLive(true);
+    setAgentLive(true);
 
     expect(el.scrollTop).toBe(2900);
   });
@@ -1583,7 +1589,7 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     setActiveScrollElement(el);
     atBottom(el);
     onScroll();
-    setThreadLive(false);
+    setAgentLive(false);
     el.writes = 0;
 
     el.scrollHeight = 3400;
@@ -1592,6 +1598,203 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(2500);
     expect(awayFromBottom.value).toBe(true);
+  });
+});
+
+describe('a CALL carries the reader, though it runs no turn', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** The state the two blocks above cannot express. A voice call writes rows
+   *  with no turn running at all: the engine classifies every event a call
+   *  makes as `Metadata`, so the thread projection stays quiescent for the
+   *  whole conversation (`a_call_writes_only_metadata`).
+   *
+   *  Read through the AGENT's liveness alone, a call is therefore an idle
+   *  thread. An armed reader parked off the edge was carried by nothing while
+   *  the caller spoke, and the toggle stayed lit over a transcript following
+   *  nothing. Reported.
+   *
+   *  So a call is a LIVE SOURCE of its own, beside a running turn
+   *  (`setCallLive`). Armed plus EITHER one is carrying.
+   *
+   *  Nothing below names a row type, and that is the point. The follow writes
+   *  off the transcript's own size, so a spoken bubble, a step and a
+   *  delegation row all reach it by the same route. */
+
+  /** Parked up the thread with the ride armed, on a thread doing nothing, and
+   *  the call not placed yet. Browsing a quiet thread keeps the ride, so this
+   *  is the reader who presses call from where they are reading. */
+  function armedAndParkedBeforeTheCall() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);   // the toggle's glide settles on the live edge
+    setAgentLive(false);            // nothing is running, and nothing will be
+    readerScrollsTo(el, 800, observers.onScroll); // they go back to re-read a turn
+    expect(followingLiveEdge.value).toBe(true);
+    readerGestureForTest(null, false);
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  /** On the live edge with the ride armed and a call up. Where a call keeps an
+   *  armed reader: its own wake puts them on the edge, and a gesture off it
+   *  retires the ride, so parked-and-armed does not persist here. */
+  function armedOnTheEdgeDuringACall() {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);              // 2500
+    observers.onScroll();      // the transcript records them ON the edge
+    setFollowLiveEdge(true);   // arming from the edge writes nothing
+    setAgentLive(false);       // a call runs no turn, and none is running
+    setCallLive(true);
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  it('carries them when the caller\'s own row lands', () => {
+    const { el, onResize } = armedOnTheEdgeDuringACall();
+
+    el.addUserMessage({ top: 3000, height: 200 }); // the spoken bubble
+    el.scrollHeight = 3200;
+    onResize();
+
+    expect(el.scrollTop).toBe(2700);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('carries them as the talker\'s row grows in place', () => {
+    // The other shape a call produces, and the one an append-driven follow
+    // would miss: ONE reply row rewritten as the talker speaks, with no row
+    // added. The follow reads the transcript's size, so the two cases differ
+    // here only in whether a turn is appended.
+    const { el, onResize } = armedOnTheEdgeDuringACall();
+
+    for (const [height, edge] of [[3200, 2700], [3500, 3000], [4100, 3600]]) {
+      el.scrollHeight = height;
+      onResize();
+      expect(el.scrollTop).toBe(edge);
+    }
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('carries a PARKED reader when the call goes live, with no resize behind it', () => {
+    // The reported case, and the ordering `honourWake` exists for. A call's
+    // first row can mount before the module is told the call is on. The resize
+    // it fires is then spent while the module still reads idle.
+    const { el, onResize } = armedAndParkedBeforeTheCall();
+
+    el.scrollHeight = 4000;  // the call's first row mounts
+    onResize();              // its resize lands while we still read idle
+    expect(el.scrollTop).toBe(800);
+
+    setCallLive(true);       // the call's own signal, a task later
+
+    expect(el.scrollTop).toBe(3500);
+  });
+
+  it('acts on the EDGE only, so a repeated call signal writes nothing', () => {
+    // A call republishes its state through the whole conversation. Only the
+    // first `true` says a thread has come alive. Acting on the rest would
+    // re-assert the live edge over wherever the reader had got to.
+    const { el } = armedAndParkedBeforeTheCall();
+
+    setCallLive(true);
+    expect(el.scrollTop).toBe(2500);
+    el.writes = 0;
+
+    setCallLive(true);       // the same answer again, from a later frame
+
+    expect(el.writes).toBe(0);
+  });
+
+  it('parks nobody when a turn control is pressed mid-call', () => {
+    // The way an armed reader ends up parked during a call, and the defect's
+    // own shape. A press holds the control still, which is the opposite of
+    // riding, so a ride already CARRYING outranks it (ADR 0147). Read through
+    // the agent alone, a call is idle, so the press won and every row after it
+    // arrived below the fold.
+    const { el } = armedOnTheEdgeDuringACall();
+
+    el.scrollHeight = 5000;      // the steps unfold, above the control and below
+    markAnchorScroll(el, 3000);  // and the correction holds the control still
+    honourAnchoredMutation(el);
+
+    expect(el.scrollTop).toBe(4500);
+  });
+
+  it('keeps that when the last exchange stops being the live one', () => {
+    // The two sources clear independently, and this is the half a call needs.
+    // Every utterance is an exchange, so a call hands the `isLast` role on
+    // constantly. The outgoing exchange clears the agent's liveness as it goes,
+    // and that must not end the call's ride.
+    const { el } = armedOnTheEdgeDuringACall();
+
+    setAgentLive(true);
+    setAgentLive(false);   // the outgoing exchange's cleanup
+
+    el.scrollHeight = 5000;
+    markAnchorScroll(el, 3000);
+    honourAnchoredMutation(el);
+
+    expect(el.scrollTop).toBe(4500);
+  });
+
+  it('hands the press its hold back once the call ends', () => {
+    // The mirror, and what keeps the idle rule intact. Ringing off puts the
+    // thread back to browsing. A press holds what it pressed there, and the
+    // ride stays armed for the next time something runs.
+    const { el, onResize } = armedOnTheEdgeDuringACall();
+
+    setCallLive(false);
+
+    el.scrollHeight = 5000;
+    markAnchorScroll(el, 3000);
+    honourAnchoredMutation(el);
+    el.writes = 0;
+
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('is retired by the reader scrolling up, exactly as a streaming reply is', () => {
+    // THE READER STILL OWNS THE SCROLLBAR. A call is live, so a genuine upward
+    // gesture means "stop dragging me" here as it does mid-reply. The toggle
+    // goes dark with it, which is what says on screen that the ride has ended.
+    const { el, onScroll, onResize } = armedOnTheEdgeDuringACall();
+
+    readerScrollsTo(el, 900, onScroll);
+    expect(followingLiveEdge.value).toBe(false);
+    el.writes = 0;
+
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(900);
+  });
+
+  it('moves an UNARMED reader zero pixels, however much the call says', () => {
+    // A live source is not a request. The call changes what CARRYING means and
+    // nothing about what ARMS the follow.
+    const el = makeEl({ scrollTop: 800, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setAgentLive(false);
+    setCallLive(true);
+    el.writes = 0;
+
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(800);
   });
 });
 
@@ -1796,7 +1999,7 @@ describe('coming back to a thread resumes the follow it was left with', () => {
     resumeFollowingBottom(el);
 
     expect(isNavigationScroll(el)).toBe(true);
-    expect(isFollowScroll(el)).toBe(true);
+    expect(followPosition(el)).toBe('live-edge');
   });
 
   it('is retired by the reader exactly as a freshly armed one is', () => {
@@ -1830,7 +2033,7 @@ describe('coming back to a thread resumes the follow it was left with', () => {
     const el = makeEl({ scrollTop: 300, scrollHeight: 2000 });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(false);
+    setAgentLive(false);
 
     resumeFollowingBottom(el);
     expect(el.scrollTop).toBe(1500);
@@ -1853,7 +2056,7 @@ describe('coming back to a thread resumes the follow it was left with', () => {
     const el = makeEl({ scrollTop: 0, scrollHeight: 200 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(false);
+    setAgentLive(false);
 
     resumeFollowingBottom(el);
     expect(el.scrollTop).toBe(0);
@@ -1876,7 +2079,7 @@ describe('coming back to a thread resumes the follow it was left with', () => {
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     onScroll();                            // the glide's own trailing event
-    setThreadLive(false);
+    setAgentLive(false);
     readerScrollsTo(el, 800, onScroll);    // and they go back to re-read something
     expect(followingLiveEdge.value).toBe(true);
     el.writes = 0;
@@ -1906,7 +2109,7 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
     const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(false); // the thread the link landed on is parked on a question
+    setAgentLive(false); // the thread the link landed on is parked on a question
     el.writes = 0;
 
     resumeFollowingBottom(el, 'in-place');
@@ -1921,14 +2124,14 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
     expect(el.scrollTop).toBe(6000);
 
     // The thread wakes: the same armed request picks them back up.
-    setThreadLive(true);
+    setAgentLive(true);
     expect(el.scrollTop).toBe(20500);
   });
 
   it('is what a LIVE thread gets too: the agent decides nothing here', () => {
     // A landing off the live edge does end the ride, but liveness is the wrong
     // way to ask whether that happened. The guard is
-    // `deepLinkLandedOffLiveEdge()`, so the branch reads no `_threadLive` at
+    // `deepLinkLandedOffLiveEdge()`, so the branch reads no live source at
     // all: same call, live thread, same result as the idle one above.
     //
     // The landed-link guard itself is pinned in `hooks/useScrollMemory.test.ts`
@@ -1938,7 +2141,7 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
     const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    setThreadLive(true);
+    setAgentLive(true);
 
     resumeFollowingBottom(el, 'in-place');
 
@@ -1953,19 +2156,48 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
 
   it('leaves an ALREADY ARMED follow and its held stamp alone', () => {
     // A link into the thread the reader is already in retires nothing, so there
-    // is no request to resume. Re-arming would clear the stamp `isFollowScroll`
+    // is no request to resume. Re-arming would clear the stamp `followPosition`
     // reads. That stamp decides whether this thread's reading position is
     // recorded as the live edge or as an offset.
+    //
+    // The fixture is the one case where only the STAMP can answer: the glide
+    // has landed and growth has moved the edge on, so the reader measures OFF
+    // it while never having left. Assert it before the resume, or the two other
+    // sources answer and the guard goes unpinned.
     const el = makeEl({ scrollTop: 100, scrollHeight: 20000 });
     setActiveScrollElement(el);
     setFollowLiveEdge(true);
-    expect(isFollowScroll(el)).toBe(true);
-    setThreadLive(false);
+    vi.advanceTimersByTime(1500);   // the toggle's glide lands and stamps
+    el.scrollHeight = 21000;        // and the reply grows past them
+    expect(el.scrollTop).toBe(19500);
+    expect(followPosition(el)).toBe('live-edge');
+    setAgentLive(false);
 
     resumeFollowingBottom(el, 'in-place');
 
     expect(followingLiveEdge.value).toBe(true);
-    expect(isFollowScroll(el)).toBe(true);
+    expect(followPosition(el)).toBe('live-edge');
+  });
+
+  it('a PARKED resume takes no stamp, so growth cannot claim an edge for it', () => {
+    // `armFollowOn(null)` is the whole of that branch. A transcript shorter
+    // than its box measures as AT the live edge. A stamp taken here would hand
+    // `heldOnTheLiveEdge` a claim the reader never made. The next growth round
+    // would then write them to a bottom they did not ask for.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 400, clientHeight: 500 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setAgentLive(false);
+
+    resumeFollowingBottom(el, 'parked');
+    el.writes = 0;
+
+    el.scrollHeight = 20000;  // the rest of the transcript renders in
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(0);
+    expect(followingLiveEdge.value).toBe(true); // armed all the same
   });
 
   it('takes no stamp of its own, so the landing is recorded as an offset', () => {
@@ -1974,12 +2206,12 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
     // on re-entry instead of back to the event they went to.
     const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
     setActiveScrollElement(el);
-    setThreadLive(false);
+    setAgentLive(false);
 
     resumeFollowingBottom(el, 'in-place');
 
     expect(followingLiveEdge.value).toBe(true);
-    expect(isFollowScroll(el)).toBe(false);
+    expect(followPosition(el)).toBe('parked');
   });
 });
 

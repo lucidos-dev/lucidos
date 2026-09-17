@@ -7,6 +7,9 @@
 //! `.lucidos/tmp/plugins/uploads/<uuid>/<name>` and return the absolute path.
 //! The chat layer then sends a message like "Install the plugin at <path>",
 //! and the LLM calls `install_plugin` with that path.
+//!
+//! Those staged bytes are this module's to reclaim, and nothing downstream
+//! does it: see [`prune_uploads_older_than`].
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -39,6 +42,74 @@ use crate::engine::tools::plugins::{
 /// per-route `DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)` so axum rejects
 /// oversized requests before the body is buffered.
 pub(crate) const MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
+
+/// How long a staged upload survives before a later plugin request reclaims it.
+///
+/// One hour, matching the pending-install TTL in `engine::tools::plugins`. An
+/// archive is the input to an install, so it outlives that install's own
+/// staging by nothing.
+const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Where [`upload_archive`] stages browser uploads, one directory per upload.
+fn uploads_root(workspace_path: &std::path::Path) -> std::path::PathBuf {
+    workspace_path
+        .join(crate::core::TMP_DIR)
+        .join("plugins")
+        .join("uploads")
+}
+
+/// Delete every staged upload older than `ttl`.
+///
+/// Nothing else reclaims one. A confirmed install copies the bytes out and
+/// leaves the directory. So does a cancel, and so does an upload the browser
+/// never sends. Each holds up to [`MAX_ARCHIVE_BYTES`].
+///
+/// Best-effort over a rebuildable cache directory: a failure is logged and the
+/// request carries on. Refusing an install over an unreclaimed temp directory
+/// would cost more than the disk does.
+async fn prune_uploads_older_than(root: &std::path::Path, ttl: std::time::Duration) {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        // A workspace that never uploaded has no directory here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log!(@Plugins, "prune uploads: read {:?} failed: {}", root, e);
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !upload_is_stale(&path, now, ttl).await {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => log!(@Plugins, "pruned stale upload {}", path.display()),
+            Err(e) => log!(@Plugins, "prune uploads: remove {:?} failed: {}", path, e),
+        }
+    }
+}
+
+/// Whether one staged upload has outlived `ttl`.
+///
+/// A timestamp the engine cannot read answers "not stale". The directory may
+/// hold the archive an open install panel is about to confirm, and deleting
+/// that breaks a button the user is looking at.
+async fn upload_is_stale(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+    ttl: std::time::Duration,
+) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    now.duration_since(modified)
+        .map(|age| age >= ttl)
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct UploadArchiveResponse {
@@ -395,12 +466,11 @@ pub(super) async fn upload_archive(
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("read body: {e}")))?;
     let byte_size = bytes.len() as u64;
 
-    let upload_dir = state
-        .workspace_path
-        .join(crate::core::TMP_DIR)
-        .join("plugins")
-        .join("uploads")
-        .join(Uuid::new_v4().simple().to_string());
+    // Reclaim what earlier uploads left before adding one.
+    let uploads = uploads_root(&state.workspace_path);
+    prune_uploads_older_than(&uploads, UPLOAD_TTL).await;
+
+    let upload_dir = uploads.join(Uuid::new_v4().simple().to_string());
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
         log!(@Plugins, "upload {} ({} bytes): create_dir_all {:?} failed: {}", safe_name, byte_size, upload_dir, e);
         err(
@@ -410,13 +480,15 @@ pub(super) async fn upload_archive(
     })?;
 
     let dest = upload_dir.join(&safe_name);
-    tokio::fs::write(&dest, &bytes).await.map_err(|e| {
+    if let Err(e) = tokio::fs::write(&dest, &bytes).await {
         log!(@Plugins, "upload {} ({} bytes): write {:?} failed: {}", safe_name, byte_size, dest, e);
-        err(
+        // Only what this attempt created, and only because it failed.
+        let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+        return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("write archive: {e}"),
-        )
-    })?;
+        ));
+    }
 
     log!(@Plugins, "staged archive {} ({} bytes) at {}", safe_name, byte_size, dest.display());
 
@@ -496,12 +568,16 @@ fn pending_status(err_msg: &str) -> StatusCode {
 /// `data/`, emits `PluginInstalled` (stamped with the device that clicked
 /// Confirm), and (if the install touched any `auth-modules/` paths)
 /// auto-reloads the proxy WASM signer map.
+///
+/// Also sweeps the uploads directory, since an install is where a browser
+/// upload stops being anybody's input. See [`prune_uploads_older_than`].
 pub(super) async fn confirm_install(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(install_id): Path<String>,
     Query(query): Query<ConfirmInstallQuery>,
 ) -> Result<Json<ConfirmInstallResponse>, (StatusCode, Json<JsonValue>)> {
+    prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match confirm_pending_install(&state.engine, &install_id, query.keep_local_changes, actor).await
     {
@@ -519,12 +595,14 @@ pub(super) async fn confirm_install(
 /// staged install. Drops the staged temp dir and emits
 /// `PluginInstallCanceled` (stamped with the device that clicked Cancel)
 /// for audit. Idempotent: a missing `install_id` returns 404 (cleaner than
-/// treating "not pending" as success).
+/// treating "not pending" as success). Sweeps the uploads directory too, the
+/// same way [`confirm_install`] does.
 pub(super) async fn cancel_install(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(install_id): Path<String>,
 ) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match cancel_pending_install(&state.engine, &install_id, actor).await {
         Ok(()) => Ok(Json(serde_json::json!({"canceled": true}))),
@@ -644,6 +722,41 @@ mod tests {
     };
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
+
+    /// Nothing used to reclaim a staged upload. An install copied the bytes
+    /// out and left the directory, and an upload the browser never sent left
+    /// one too. At `MAX_ARCHIVE_BYTES` each, that is 50 MiB kept forever per
+    /// abandoned upload.
+    #[tokio::test]
+    async fn a_stale_upload_is_reclaimed_and_a_live_one_is_left_alone() {
+        let workspace = tempfile::tempdir().expect("a workspace");
+        let root = super::uploads_root(workspace.path());
+        let staged = root.join("0123abcd");
+        tokio::fs::create_dir_all(&staged).await.unwrap();
+        tokio::fs::write(staged.join("p.lucidos-plugin"), b"archive bytes")
+            .await
+            .unwrap();
+
+        super::prune_uploads_older_than(&root, std::time::Duration::from_secs(3600)).await;
+        assert!(
+            staged.exists(),
+            "an upload inside its TTL is still an open install panel's input"
+        );
+
+        super::prune_uploads_older_than(&root, std::time::Duration::ZERO).await;
+        assert!(!staged.exists(), "an upload past its TTL is reclaimed");
+        assert!(root.exists(), "the uploads root survives its own sweep");
+    }
+
+    /// The sweep runs on every upload, confirm and cancel, so a workspace that
+    /// has never uploaded has to meet it silently.
+    #[tokio::test]
+    async fn pruning_a_workspace_that_never_uploaded_is_a_no_op() {
+        let workspace = tempfile::tempdir().expect("a workspace");
+        let root = super::uploads_root(workspace.path());
+        super::prune_uploads_older_than(&root, std::time::Duration::ZERO).await;
+        assert!(!root.exists(), "the sweep creates nothing");
+    }
 
     #[test]
     fn setup_complete_only_when_not_running_or_waiting() {

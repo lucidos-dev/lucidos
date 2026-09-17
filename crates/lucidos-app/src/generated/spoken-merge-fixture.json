@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "first": "Status",
+      "gap_secs": 0.4,
+      "joined": "Status, please",
+      "merges": true,
+      "name": "a comma clause attaches",
+      "same_speaker": true,
+      "second": ", please"
+    },
+    {
+      "first": "Nothing is waiting on you",
+      "gap_secs": 1.0,
+      "joined": "Nothing is waiting on you.",
+      "merges": true,
+      "name": "a full stop attaches",
+      "same_speaker": true,
+      "second": "."
+    },
+    {
+      "first": "Still",
+      "gap_secs": 0.2,
+      "joined": "Still in it. I'm pulling the threads.",
+      "merges": true,
+      "name": "a word takes a space",
+      "same_speaker": true,
+      "second": "in it. I'm pulling the threads."
+    },
+    {
+      "first": "Status",
+      "gap_secs": 20.0,
+      "joined": "Status, please",
+      "merges": false,
+      "name": "a long pause is two things",
+      "same_speaker": true,
+      "second": ", please"
+    },
+    {
+      "first": "What's the status",
+      "gap_secs": 0.3,
+      "joined": "What's the status Nothing is waiting.",
+      "merges": false,
+      "name": "two speakers never merge",
+      "same_speaker": false,
+      "second": "Nothing is waiting."
+    },
+    {
+      "first": "Built and notarized.",
+      "gap_secs": 0.5,
+      "joined": "Built and notarized.",
+      "merges": true,
+      "name": "a blank row adds nothing",
+      "same_speaker": true,
+      "second": "   "
+    },
+    {
+      "first": "Okay",
+      "gap_secs": 5.0,
+      "joined": "Okay so what is next?",
+      "merges": true,
+      "name": "the bound itself merges",
+      "same_speaker": true,
+      "second": "so what is next?"
+    },
+    {
+      "first": "Okay",
+      "gap_secs": 5.001,
+      "joined": "Okay so what is next?",
+      "merges": false,
+      "name": "a hair past the bound does not",
+      "same_speaker": true,
+      "second": "so what is next?"
+    },
+    {
+      "first": "He said “no",
+      "gap_secs": 0.3,
+      "joined": "He said “no” and left.",
+      "merges": true,
+      "name": "a closing quote attaches",
+      "same_speaker": true,
+      "second": "” and left."
+    }
+  ],
+  "merge_gap_secs": 5.0
+}

@@ -634,6 +634,63 @@ fn an_utterance_the_talker_handled_reaches_the_doer_as_the_user() {
     assert_eq!(msgs[0].agent, None);
 }
 
+/// One breath is several rows and one message (ADR 0201).
+///
+/// The transcriber cuts a sentence wherever the speaker breathes, so the
+/// engine writes a row per turn and the history joins them. The gap is between
+/// NEIGHBOURS: four pieces two seconds apart are one utterance, where measured
+/// against the first word the last would fall outside the bound.
+#[test]
+fn the_pieces_of_one_breath_read_back_as_one_message() {
+    let events: Vec<_> = ["So what I", "wanted to ask", "you is", "this."]
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            make_event(
+                "SpokenMessageReceived",
+                json!({
+                    "session_id": "11111111-1111-4111-8111-111111111111",
+                    "text": text
+                }),
+                (i as i64) * 2,
+            )
+        })
+        .collect();
+    let msgs = build_session_messages(&events);
+    assert_eq!(msgs.len(), 1, "{:?}", msgs);
+    assert_eq!(msgs[0].content, "So what I wanted to ask you is this.");
+}
+
+/// A dropped line redialled inside the bound is still two calls.
+///
+/// Nothing between them reaches the message list, so adjacency alone reads
+/// them as neighbours. The session is what says otherwise.
+#[test]
+fn two_calls_never_read_back_as_one_sentence() {
+    let events = vec![
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "and then check the"
+            }),
+            0,
+        ),
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "22222222-2222-4222-8222-222222222222",
+                "text": "release notes"
+            }),
+            3,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    assert_eq!(msgs.len(), 2, "{:?}", msgs);
+    assert_eq!(msgs[0].content, "and then check the");
+    assert_eq!(msgs[1].content, "release notes");
+}
+
 /// Why the talker asked for this turn, in its own words and under its own
 /// label. The doer reads it as the request it is.
 #[test]

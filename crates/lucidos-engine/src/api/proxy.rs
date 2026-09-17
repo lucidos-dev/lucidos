@@ -448,9 +448,14 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
 }
 
 /// Headers to strip from the *incoming* request before forwarding upstream.
-/// Hop-by-hop + Host (reqwest sets it from the URL) + Cookie/Origin/Referer
-/// (these belong to the engine's own origin and would leak browser session
-/// context to the upstream).
+/// Hop-by-hop + Host and Content-Length, which reqwest re-frames off the body
+/// it is given. Plus Cookie/Origin/Referer, which belong to the engine's own
+/// origin and would leak browser session context to the upstream.
+///
+/// Framing has to go because the caller's value outranks the body. The client
+/// sends a Content-Length already on the request rather than the body's real
+/// length, and a `replace_body` signer changes that length. The stale one
+/// truncates the send, or hangs the upstream waiting for bytes that never come.
 ///
 /// Plus everything that MEANS something to us, which is the mirror of
 /// `hook_socket::forwarded_to_engine` on the way in. The gateway stamps
@@ -464,7 +469,13 @@ pub fn should_strip_request_header(name: &HeaderName) -> bool {
     let s = name.as_str();
     let ours = s.starts_with("x-lucidos-");
     let forwarding = matches!(s, "x-forwarded-prefix" | "x-forwarded-host");
-    is_hop_by_hop(s) || ours || forwarding || matches!(s, "host" | "cookie" | "origin" | "referer")
+    is_hop_by_hop(s)
+        || ours
+        || forwarding
+        || matches!(
+            s,
+            "host" | "content-length" | "cookie" | "origin" | "referer"
+        )
 }
 
 /// Headers to strip from the *upstream* response before returning to client.
@@ -631,6 +642,33 @@ fn path_is_within(base_path: &str, target_path: &str) -> bool {
         || target_path
             .strip_prefix(base_path)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A redirect target's path, expressed relative to `base_url`'s own prefix, so
+/// the next hop can re-anchor it through [`build_contained_target_url`].
+///
+/// A `Location` is absolute on the origin, while the next hop joins what it
+/// gets back ONTO the base. Handing the absolute path over therefore doubles
+/// the prefix: `/v1/items` under a `.../v1` base becomes `/v1/v1/items`. Worse,
+/// `/admin` becomes `/v1/admin`, a different resource that containment then
+/// waves through, fetched with the proxy's credentials.
+///
+/// `None` means the target left the prefix, which is the upstream misdirecting
+/// a credentialed request. The caller refuses the hop. The leading slash is
+/// kept, so a hop to the prefix's own trailing-slash form cannot loop against
+/// the prefix itself.
+fn redirect_path_within_base(base_url: &str, target_path: &str) -> Option<String> {
+    let base = reqwest::Url::parse(base_url.trim()).ok()?;
+    let base_path = base.path().trim_end_matches('/');
+    if !path_is_within(base_path, target_path) {
+        return None;
+    }
+    Some(
+        target_path
+            .strip_prefix(base_path)
+            .unwrap_or(target_path)
+            .to_string(),
+    )
 }
 
 /// Every deeper reading of `path`, one per decode layer. For the containment
@@ -1210,7 +1248,14 @@ pub async fn forward_request(
     };
     let mut builder = client_for(transport).request(req_method, target_url);
 
-    let filtered = filter_request_headers(&request_headers);
+    let mut filtered = filter_request_headers(&request_headers);
+    // The engine's own headers must REPLACE the caller's, and reqwest's
+    // `header` appends. Left in place, an app's own `Authorization` travels
+    // beside the injected one, and a server reading the first value of that
+    // singleton sees the app's. That suppresses our credential on any route.
+    for (name, _) in &auth_headers {
+        filtered.remove(name);
+    }
     for (name, value) in &filtered {
         // Pass raw bytes so non-ASCII header values (rare but valid) survive.
         builder = builder.header(name.as_str(), value.as_bytes());
@@ -1391,6 +1436,24 @@ fn is_redirect_status(status: StatusCode) -> bool {
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
     )
+}
+
+/// True when RFC 9110 § 15.4 re-issues the next hop as a bodyless GET.
+///
+/// A 303 means "go and fetch that instead", so anything but a HEAD becomes a
+/// GET. A 301 or 302 does the same to a POST, which is what browsers and
+/// reqwest's own default policy do. A 307 or 308 exists to preserve the method,
+/// so neither changes anything.
+///
+/// Replaying the POST instead re-sends the body to the redirect target: a 405
+/// on a well-behaved API, and a duplicated write on one with no idempotency
+/// key.
+fn redirect_downgrades_to_get(status: StatusCode, method: &Method) -> bool {
+    match status {
+        StatusCode::SEE_OTHER => *method != Method::HEAD,
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => *method == Method::POST,
+        _ => false,
+    }
 }
 
 /// The full origin a signed request is bound to: `(scheme, host, port)`.
@@ -1652,6 +1715,10 @@ async fn forward_with_redirects(
 
     let mut current_path = initial_path.to_string();
     let mut current_query: Option<String> = initial_query.map(|s| s.to_string());
+    // Per hop, because a 303 turns the next one into a bodyless GET. The
+    // pipeline signs over both, so the downgrade has to reach it too.
+    let mut current_method = method.clone();
+    let mut current_body = body.clone();
     let mut first_outcome: Option<crate::api::proxy_pipeline::PipelineOutcome> = None;
     let mut hops = 0usize;
 
@@ -1677,22 +1744,48 @@ async fn forward_with_redirects(
                 },
             )?;
 
-        let outcome =
-            crate::api::proxy_pipeline::run_pipeline(layers, method, &target_url, &[], body)
-                .await?;
+        let outcome = crate::api::proxy_pipeline::run_pipeline(
+            layers,
+            &current_method,
+            &target_url,
+            &[],
+            &current_body,
+        )
+        .await?;
 
-        let body_for_send = outcome.replace_body.clone().unwrap_or_else(|| body.clone());
+        let body_for_send = outcome
+            .replace_body
+            .clone()
+            .unwrap_or_else(|| current_body.clone());
+        // Refuse a value the codec cannot send, the same way the script layer
+        // does. Dropping the pair forwarded the call with no credential on it,
+        // and the upstream answered with an opaque 401. A stored key with a
+        // trailing newline is the common cause.
+        //
+        // The value is the credential, so the message names the header only.
         let auth_headers: Vec<(HeaderName, HeaderValue)> = outcome
             .headers
             .iter()
-            .filter_map(|(n, v)| HeaderValue::from_str(v).ok().map(|v| (n.clone(), v)))
-            .collect();
+            .map(|(header, value)| {
+                HeaderValue::from_str(value)
+                    .map(|sendable| (header.clone(), sendable))
+                    .map_err(|_| {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "proxy '{name}' produced an unsendable value for header '{}'",
+                                header.as_str()
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // Final URL for this hop = target + pipeline-added query params,
         // URL-encoded. Layers return raw values; engine handles encoding.
         let final_url = merge_query_params(&target_url, &outcome.query);
 
         let response = forward_request(
-            method.clone(),
+            current_method.clone(),
             &final_url,
             &outcome.log_url,
             headers.clone(),
@@ -1765,8 +1858,27 @@ async fn forward_with_redirects(
                 ),
             ));
         }
-        current_path = target.path().trim_start_matches('/').to_string();
+        // The `Location` is absolute on the origin and the next hop re-anchors
+        // on the base, so what carries forward is the part below the prefix.
+        current_path = redirect_path_within_base(base_url, target.path()).ok_or_else(|| {
+            log!(
+                "[Proxy] {} refused a redirect to '{}', outside its base path",
+                name,
+                target.path()
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "proxy '{name}' redirected to '{}', outside the configured base path",
+                    target.path()
+                ),
+            )
+        })?;
         current_query = target.query().map(|q| q.to_string());
+        if redirect_downgrades_to_get(response.status(), &current_method) {
+            current_method = Method::GET;
+            current_body = Bytes::new();
+        }
         hops += 1;
     }
 }

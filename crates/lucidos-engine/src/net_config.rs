@@ -32,7 +32,7 @@
 
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The per-workspace engine bind, stored as the `network_bind` preference
 /// (an `INTERNAL` key: set via Settings → Access → Network access, never by the
@@ -101,9 +101,31 @@ pub fn network_toml_path() -> Option<PathBuf> {
 /// Read + parse the machine-global config. Any failure (missing file, unreadable,
 /// malformed TOML) yields safe defaults — never a panic, never a widened bind.
 pub fn read_network_toml() -> NetworkToml {
-    match network_toml_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(contents) => parse_network_toml(&contents),
-        None => NetworkToml::default(),
+    let Some(path) = network_toml_path() else {
+        return NetworkToml::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => parse_network_toml(&contents),
+        Err(e) => {
+            if let Some(warning) = read_failure_warning(&path, &e) {
+                crate::log!("{warning}");
+            }
+            NetworkToml::default()
+        }
+    }
+}
+
+/// The log line a failed read of `network.toml` deserves. `None` for an absent
+/// file: that is the normal case, and loopback is the right default for it. Any
+/// other failure hides a config the operator wrote, so the line names the path
+/// and the error.
+fn read_failure_warning(path: &Path, e: &std::io::Error) -> Option<String> {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => None,
+        _ => Some(format!(
+            "[NetConfig] cannot read {} ({e}); using safe defaults (loopback)",
+            path.display()
+        )),
     }
 }
 
@@ -463,6 +485,33 @@ mod tests {
             parse_network_toml("this is not toml = ="),
             NetworkToml::default()
         );
+    }
+
+    /// A config the process cannot read must be told apart from one that is
+    /// simply absent. Both fall back to loopback, so the log line is the only
+    /// thing that tells an operator their tailnet bind was dropped.
+    #[test]
+    fn an_unreadable_config_warns_while_an_absent_one_stays_silent() {
+        // Both errors come from a real read, so the split holds for what the
+        // OS returns, not for an invented kind.
+        let dir = std::env::temp_dir().join(format!("lucidos-net-config-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("a writable temp directory");
+
+        let absent_path = dir.join("network.toml");
+        let absent = std::fs::read_to_string(&absent_path).expect_err("nothing was written there");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(read_failure_warning(&absent_path, &absent), None);
+
+        // A directory stands in for present-but-unreadable. It needs no chmod,
+        // so it fails the same way for a root test runner.
+        let unreadable = std::fs::read_to_string(&dir).expect_err("a directory is not a file");
+        let warning = read_failure_warning(&dir, &unreadable)
+            .expect("an unreadable config must not fall back to loopback in silence");
+        assert!(warning.contains(&dir.display().to_string()), "{warning}");
+        assert!(warning.contains(&unreadable.to_string()), "{warning}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

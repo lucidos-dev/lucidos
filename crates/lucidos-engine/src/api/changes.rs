@@ -53,79 +53,6 @@ async fn refuse_batch_change_verb(
     Ok(())
 }
 
-pub(super) async fn broadcast_changes(state: &AppState) {
-    let proj = state.engine.changes();
-    let (pending_r, applied_r, restart_r) = tokio::join!(
-        proj.list_pending(),
-        proj.list_recently_applied(15, None),
-        proj.restart_groups_since(state.started_at),
-    );
-    let mut pending = match pending_r {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log!(
-                "[Changes] broadcast: list_pending: {}, skipping broadcast",
-                e
-            );
-            return;
-        }
-    };
-    let mut applied = match applied_r {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log!(
-                "[Changes] broadcast: list_recently_applied: {}, skipping broadcast",
-                e
-            );
-            return;
-        }
-    };
-    let restart_groups = match restart_r {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log!(
-                "[Changes] broadcast: restart_groups_since: {}, skipping broadcast",
-                e
-            );
-            return;
-        }
-    };
-
-    let pool = state.engine.pool();
-    let (r1, r2) = tokio::join!(
-        crate::core::changes::enrich_thread_titles(pool, &mut pending),
-        crate::core::changes::enrich_thread_titles(pool, &mut applied),
-    );
-    if let Err(e) = r1 {
-        crate::log!("[Changes] broadcast: enrich pending titles: {}", e);
-    }
-    if let Err(e) = r2 {
-        crate::log!("[Changes] broadcast: enrich applied titles: {}", e);
-    }
-    if let Err(e) = crate::core::changes::enrich_thread_unsettled(pool, &mut pending).await {
-        crate::log!(
-            "[Changes] broadcast: enrich pending thread_unsettled: {}",
-            e
-        );
-    }
-
-    state
-        .engine
-        .event_bus
-        .emit_or_log(
-            crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::ChangesUpdated {
-                    total_pending: pending.len(),
-                    pending,
-                    applied,
-                    restart_required: !restart_groups.is_empty(),
-                },
-            ),
-            "[Changes] ChangesUpdated",
-        )
-        .await;
-}
-
 /// GET /api/v1/changes — list pending + applied changes with pagination for applied
 pub(super) async fn list_changes(
     State(state): State<AppState>,
@@ -238,7 +165,7 @@ pub(super) async fn revert_change(
     refuse_change_verb(&state, &headers, id, ThreadReachVerb::Revert).await?;
     match state.engine.revert_change(id, actor).await {
         Ok(message) => {
-            broadcast_changes(&state).await;
+            state.engine.broadcast_changes_updated().await;
             Ok(Json(serde_json::json!({ "message": message })))
         }
         Err(e) => Err(ApiError::bad_request(e.to_string())),
@@ -325,7 +252,7 @@ pub(super) async fn apply_change(
     // this handler, the no-live apply_now path, and the Apply-All driver uniformly.
     match state.engine.apply_change(id, actor).await {
         Ok(result) => {
-            broadcast_changes(&state).await;
+            state.engine.broadcast_changes_updated().await;
             Ok(Json(result))
         }
         Err(e) => Err(ApiError::bad_request(e.to_string())),
@@ -349,7 +276,7 @@ pub(super) async fn discard_change(
     .await?;
     match state.engine.discard_change(id, actor).await {
         Ok(()) => {
-            broadcast_changes(&state).await;
+            state.engine.broadcast_changes_updated().await;
             Ok(Json(serde_json::json!({ "message": "Change discarded." })))
         }
         Err(e) => Err(ApiError::bad_request(e.to_string())),
@@ -422,7 +349,7 @@ pub(super) async fn arm_standing_apply(
         })
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     Ok(Json(serde_json::json!({
         "message": "Will apply when the thread settles.",
     })))
@@ -451,7 +378,7 @@ pub(super) async fn disarm_standing_apply(
     if !dropped {
         return Err(ApiError::not_found("No standing apply on that thread"));
     }
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     Ok(Json(
         serde_json::json!({ "message": "Standing apply canceled." }),
     ))
@@ -481,7 +408,7 @@ pub(super) async fn disarm_all_standing_applies(
         .engine
         .drop_standing_applies(DisarmScope::All, DISARMED_BY_OWNER, actor)
         .await;
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     Ok(Json(serde_json::json!({ "disarmed": disarmed })))
 }
 
@@ -561,7 +488,7 @@ pub(super) async fn apply_all_changes(
                 unsettled,
             )));
         }
-        broadcast_changes(&state).await;
+        state.engine.broadcast_changes_updated().await;
         return Ok(Json(serde_json::json!({
             "batch_size": 0,
             "armed": armed,
@@ -579,7 +506,7 @@ pub(super) async fn apply_all_changes(
         unreachable!("the NothingToApply arm returned above")
     };
 
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     let remaining = batch_size.saturating_sub(1);
     match first_result {
         Ok(result) => {
@@ -643,7 +570,7 @@ pub(super) async fn cancel_apply_all_changes(
     if canceled == 0 && disarmed == 0 {
         return Err(ApiError::bad_request("No Apply All batch is running"));
     }
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     Ok(Json(serde_json::json!({
         "canceled_batches": canceled,
         "disarmed": disarmed,
@@ -747,7 +674,7 @@ pub(super) async fn discard_all_changes(
             }
         }
     }
-    broadcast_changes(&state).await;
+    state.engine.broadcast_changes_updated().await;
     let message = if failed == 0 {
         format!("{} change(s) discarded.", discarded)
     } else {

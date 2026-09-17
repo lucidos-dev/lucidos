@@ -6,8 +6,11 @@ use crate::workspace::BoxError;
 // depend on the engine crate (no `lucidos-common`), so these literals
 // must be kept in lockstep with their counterparts there. A rename on
 // either side without the matching follow-up silently breaks subprocess
-// attribution — `lucidos-e2e/tests/api_support/lucidos_cli_test.rs` is the
-// integration backstop.
+// attribution. The tests below pin the CLI's own spelling only, so they cannot
+// catch an engine-side rename. What does is
+// `the_cli_carries_the_origin_token_the_engine_minted` in the e2e CLI suite:
+// it mints through the engine and reads the header back through
+// `build_message_origin`, so both spellings have to agree.
 //
 // The token's *value* is opaque here on purpose. The engine mints it bound
 // to the spawning thread, and its own prefix is what names that thread, so

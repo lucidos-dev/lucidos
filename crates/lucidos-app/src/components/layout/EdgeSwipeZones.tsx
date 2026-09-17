@@ -20,8 +20,8 @@
  *  pane swipe is available: `shouldStartPaneSwipe` turns that off while an app is
  *  fullscreen, and the strips stay purely for the suppression.
  *
- *  Their widths are mirrored by `EDGE_NAV_GUARD_LEFT_PX` /
- *  `EDGE_NAV_GUARD_RIGHT_PX`: change one side and change its constant, or a
+ *  Their widths are mirrored by `EDGE_NAV_GUARD_LEFT_REM` /
+ *  `EDGE_NAV_GUARD_RIGHT_REM`: change one side and change its constant, or a
  *  touch can land on a strip that the suppression decision does not cover. */
 export function EdgeSwipeZones() {
   return (

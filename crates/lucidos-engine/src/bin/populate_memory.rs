@@ -382,7 +382,7 @@ fn generate_user_message(day: i64, idx: i64, project: &str) -> String {
         ),
         18 => format!(
             "Gym session - {} for {} minutes, felt great",
-            HOBBIES[seed % 6],
+            HOBBIES[seed % HOBBIES.len()],
             30 + seed % 60
         ),
         19 => format!(
@@ -691,6 +691,11 @@ struct BackdatedEvent {
     event_type: String,
     payload: serde_json::Value,
     created: chrono::DateTime<Utc>,
+    /// The thread this event belongs to, carried as the real column rather
+    /// than a payload field. A migration moved `thread_id` off the payload,
+    /// and every thread-scoped reader keys on the column. `None` for an event
+    /// that belongs to no thread, such as an artifact.
+    thread_id: Option<Uuid>,
 }
 
 impl BackdatedEvent {
@@ -700,15 +705,29 @@ impl BackdatedEvent {
             event_type: event_type.to_string(),
             payload,
             created,
+            thread_id: None,
+        }
+    }
+
+    /// [`Self::new`] for an event a thread owns.
+    fn in_thread(
+        event_type: &str,
+        thread_id: Uuid,
+        payload: serde_json::Value,
+        created: chrono::DateTime<Utc>,
+    ) -> Self {
+        Self {
+            thread_id: Some(thread_id),
+            ..Self::new(event_type, payload, created)
         }
     }
 
     fn user_message(request_id: Uuid, content: &str, created: chrono::DateTime<Utc>) -> Self {
-        Self::new(
+        Self::in_thread(
             "MessageReceived",
+            request_id,
             serde_json::json!({
                 "request_id": request_id.to_string(),
-                "thread_id": request_id.to_string(),
                 "content": content
             }),
             created,
@@ -716,11 +735,11 @@ impl BackdatedEvent {
     }
 
     fn assistant_response(request_id: Uuid, content: &str, created: chrono::DateTime<Utc>) -> Self {
-        Self::new(
+        Self::in_thread(
             "ResponseGenerated",
+            request_id,
             serde_json::json!({
                 "request_id": request_id.to_string(),
-                "thread_id": request_id.to_string(),
                 "content": content
             }),
             created,
@@ -734,11 +753,11 @@ impl BackdatedEvent {
         result_summary: &str,
         created: chrono::DateTime<Utc>,
     ) -> Self {
-        Self::new(
+        Self::in_thread(
             "TriggerCompleted",
+            request_id,
             serde_json::json!({
                 "request_id": request_id.to_string(),
-                "thread_id": request_id.to_string(),
                 "trigger_id": trigger_id.to_string(),
                 "trigger_name": trigger_name,
                 "result_summary": result_summary,
@@ -749,23 +768,43 @@ impl BackdatedEvent {
     }
 }
 
+/// The insert every seeded event goes through.
+///
+/// `thread_id` and `aggregate_id` are columns, not payload keys. Written as
+/// payload alone, a seeded event is invisible to every thread-scoped surface:
+/// the thread view, the snapshot endpoint and each projection read the column.
+const INSERT_EVENT_SQL: &str = r#"
+    INSERT INTO events (id, event_type, payload, created, thread_id, aggregate_id)
+    VALUES ($1, $2, $3, $4, $5, $6)
+"#;
+
+/// How many events one full run writes, for the line the tool opens with.
+///
+/// Two per conversation, plus the day's artifacts, plus the one
+/// `TriggerCompleted` the morning brief leaves. Miss the last term and the
+/// announced figure disagrees with the count the same run prints at the end.
+fn planned_event_total(
+    working_days: i64,
+    conversations_per_day: i64,
+    artifacts_per_day: i64,
+) -> i64 {
+    working_days * (conversations_per_day * 2 + artifacts_per_day + 1)
+}
+
 /// Insert backdated event directly
 async fn append_backdated_event(
     pool: &sqlx::PgPool,
     event: &BackdatedEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO events (id, event_type, payload, created)
-        VALUES ($1, $2, $3, $4)
-        "#,
-    )
-    .bind(event.id)
-    .bind(&event.event_type)
-    .bind(&event.payload)
-    .bind(event.created)
-    .execute(pool)
-    .await?;
+    sqlx::query(INSERT_EVENT_SQL)
+        .bind(event.id)
+        .bind(&event.event_type)
+        .bind(&event.payload)
+        .bind(event.created)
+        .bind(event.thread_id)
+        .bind(event.thread_id.map(|id| id.to_string()))
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -3534,7 +3573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Base date: 2 years ago
     let base_date = Utc::now() - Duration::days(730);
 
-    let total_events = working_days * (conversations_per_day * 2 + artifacts_per_day);
+    let total_events = planned_event_total(working_days, conversations_per_day, artifacts_per_day);
     log!(
         "\n[Populate] Populating {} events ({} days of history)...\n",
         total_events,
@@ -3689,6 +3728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             morning_time,
         );
         append_backdated_event(&pool, &task_event).await?;
+        event_count += 1;
 
         // Index the scheduled task event in memory (as regular event)
         let embedding = embedder.embed(&brief).await?;
@@ -3788,4 +3828,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log!("[Populate] Click the bell icon to see notifications!");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seeded conversation event has to be reachable from its thread.
+    ///
+    /// The thread view, the snapshot endpoint and every projection read the
+    /// `thread_id` COLUMN. Written into the payload alone, as a migration once
+    /// allowed, the whole seeded history is invisible to all of them.
+    #[test]
+    fn a_conversation_event_carries_its_thread_as_a_column() {
+        let thread = Uuid::new_v4();
+        for event in [
+            BackdatedEvent::user_message(thread, "hi", Utc::now()),
+            BackdatedEvent::assistant_response(thread, "hello", Utc::now()),
+            BackdatedEvent::trigger_completed(
+                thread,
+                Uuid::new_v4(),
+                "Morning Brief",
+                "all clear",
+                Utc::now(),
+            ),
+        ] {
+            assert_eq!(
+                event.thread_id,
+                Some(thread),
+                "{} must bind the thread column",
+                event.event_type
+            );
+        }
+    }
+
+    /// An artifact belongs to no thread, and says so rather than borrowing one.
+    #[test]
+    fn an_artifact_event_belongs_to_no_thread() {
+        let event = BackdatedEvent::new("ArtifactCreated", serde_json::json!({}), Utc::now());
+        assert_eq!(event.thread_id, None);
+    }
+
+    /// The insert has to name both columns, or the field above goes nowhere.
+    #[test]
+    fn the_insert_names_the_thread_columns() {
+        let sql = INSERT_EVENT_SQL;
+        assert!(sql.contains("thread_id"), "{sql}");
+        assert!(sql.contains("aggregate_id"), "{sql}");
+    }
+
+    /// The opening line must match the count the same run prints at the end.
+    /// Leaving out the daily `TriggerCompleted` announced 5110 against 5840.
+    #[test]
+    fn the_announced_total_counts_the_daily_trigger_event() {
+        assert_eq!(planned_event_total(730, 3, 1), 730 * 8);
+        assert_eq!(planned_event_total(1, 0, 0), 1, "the trigger fires daily");
+    }
+
+    /// A seeded gym message can name a hobby past the sixth. Indexed `% 6`,
+    /// the last 14 of the 20 entries were unreachable whatever the day.
+    #[test]
+    fn a_gym_message_reaches_past_the_first_six_hobbies() {
+        let tail = &HOBBIES[6..];
+        // Arm 18 of the message table is the gym line, reached when the day
+        // and the message index sum to 18 modulo 60.
+        let reached = (0..600i64).any(|day| {
+            (0..60i64).filter(|idx| (day + idx) % 60 == 18).any(|idx| {
+                let message = generate_user_message(day, idx, "API Migration");
+                tail.iter().any(|hobby| message.contains(hobby))
+            })
+        });
+        assert!(
+            reached,
+            "the gym line can only ever name the first six hobbies"
+        );
+    }
 }

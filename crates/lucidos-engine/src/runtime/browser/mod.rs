@@ -23,6 +23,11 @@ fn extract_domain(url: &str) -> Option<String> {
 
 /// Detect common bot-blocking patterns in page content.
 /// Returns a human-readable reason if the page looks like a bot challenge.
+///
+/// Every signal needs ALL of its markers. One match alone is too cheap: a hit
+/// blocklists the whole DOMAIN for every later headless open. A short page
+/// carrying one block-like word used to count, and a plain nginx 403 body met
+/// that bar.
 fn detect_bot_block(content: &str) -> Option<String> {
     let lower = content.to_lowercase();
     let checks: &[(&[&str], &str)] = &[
@@ -36,18 +41,14 @@ fn detect_bot_block(content: &str) -> Option<String> {
         ),
         (&["verify you are human", "captcha"], "CAPTCHA verification"),
         (&["access denied", "automated"], "bot detection"),
+        // Cloudflare's firewall block page, which says neither "attention
+        // required" nor "automated". The error code is what keeps this pair
+        // off an ordinary 403.
+        (&["error 1020", "cloudflare"], "Cloudflare firewall rule"),
     ];
     for (markers, reason) in checks {
         if markers.iter().all(|m| lower.contains(m)) {
             return Some(reason.to_string());
-        }
-    }
-    // Suspiciously short page with block-like words
-    if content.len() < 200 {
-        for word in ["blocked", "denied", "forbidden", "captcha"] {
-            if lower.contains(word) {
-                return Some("bot detection".to_string());
-            }
         }
     }
     None
@@ -94,6 +95,15 @@ impl HeadlessBlocklist {
         .bind(reason)
         .execute(pool)
         .await?;
+        Ok(())
+    }
+
+    /// Forget every blocked domain, so `browser_open` retries them headless.
+    /// A block is a guess, and the user's escape hatch is clearing browser data.
+    pub async fn clear(pool: &PgPool) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM headless_blocked")
+            .execute(pool)
+            .await?;
         Ok(())
     }
 }
@@ -200,3 +210,93 @@ enum BrowserCheck {
 
 mod actions;
 mod session;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain 4xx page is short and says "forbidden", and it is no bot wall.
+    /// One such page used to blocklist the whole domain for every headless
+    /// open, in every thread and every trigger, with nothing able to undo it.
+    #[test]
+    fn short_ordinary_error_pages_are_not_bot_detection() {
+        for body in [
+            "403 Forbidden\nnginx/1.18.0",
+            "Access Denied",
+            "Your account is blocked. Contact support.",
+            "{\"captcha_required\": false}",
+        ] {
+            assert_eq!(detect_bot_block(body), None, "body: {body}");
+        }
+    }
+
+    /// Fixtures built from the markers each surviving branch requires, so the
+    /// contract under test is the function's own.
+    #[test]
+    fn genuine_bot_walls_are_still_detected() {
+        let cloudflare = "Just a moment...\nEnable JavaScript and cookies to continue\
+                          <div class=\"cf-browser-verification\"></div>";
+        assert_eq!(
+            detect_bot_block(cloudflare).as_deref(),
+            Some("Cloudflare challenge")
+        );
+        assert_eq!(
+            detect_bot_block("Attention Required! | Cloudflare").as_deref(),
+            Some("Cloudflare challenge")
+        );
+        assert_eq!(
+            detect_bot_block("Verify you are human by solving the captcha below.").as_deref(),
+            Some("CAPTCHA verification")
+        );
+        assert_eq!(
+            detect_bot_block("Access denied: automated traffic detected.").as_deref(),
+            Some("bot detection")
+        );
+        // A firewall rule, not a challenge. Short, and it carries neither
+        // "attention required" nor "automated", so every rule above misses it.
+        let firewall = "Access denied\nError 1020\nYou do not have access to example.test.\
+                        \nCloudflare Ray ID: 8a1b2c3d4e5f";
+        assert_eq!(
+            detect_bot_block(firewall).as_deref(),
+            Some("Cloudflare firewall rule")
+        );
+    }
+
+    /// Clearing browser data is the only way back from a wrong block, and the
+    /// success message already promises it. Asserts the sibling login clear
+    /// too, because one message covers both tables.
+    #[tokio::test]
+    async fn clear_data_empties_the_headless_blocklist() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let runtime = BrowserRuntime::new(workspace.path().to_path_buf(), pool.clone());
+
+        HeadlessBlocklist::block(&pool, "example.com", "bot detection")
+            .await
+            .expect("record the block");
+        BrowserLogins::record(&pool, "example.com", "example.com")
+            .await
+            .expect("record the login");
+        assert!(HeadlessBlocklist::is_blocked(&pool, "example.com")
+            .await
+            .expect("read the blocklist")
+            .is_some());
+
+        runtime.clear_data().await.expect("clear browser data");
+
+        assert_eq!(
+            HeadlessBlocklist::is_blocked(&pool, "example.com")
+                .await
+                .expect("read the blocklist"),
+            None,
+            "a cleared workspace must retry the domain headless"
+        );
+        let logins: i64 = sqlx::query_scalar("SELECT count(*) FROM browser_logins")
+            .fetch_one(&pool)
+            .await
+            .expect("count logins");
+        assert_eq!(logins, 0);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+}

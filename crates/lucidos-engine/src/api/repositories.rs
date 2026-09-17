@@ -317,7 +317,7 @@ pub async fn get_change_diff(
     // repo; scope the diff there. None for Lucidos-source / external changes
     // (and for changes with no thread_id), leaving the diff unscoped as before.
     let pathspec = match change.thread_id {
-        Some(thread_id) => lookup_app_pathspec(&state.pool, thread_id).await,
+        Some(thread_id) => lookup_app_pathspec(&state.pool, thread_id).await?,
         None => None,
     };
     let files = run_git_diff(repo_root, &range, pathspec.as_deref()).await?;
@@ -352,7 +352,7 @@ pub async fn get_thread_cc_diff(
     // to that pathspec keeps stray writes outside the app folder out of the
     // Diff button's response — the user asked for the diff scoped to the
     // app, not to whatever the agent happened to touch.
-    let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await;
+    let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await?;
     let live_worktree = {
         let sessions = state.engine.agent_sessions.lock().await;
         live_thread_worktree(sessions.get(&thread_id))
@@ -472,22 +472,42 @@ async fn thread_owns_a_coding_agent_worktree(pool: &sqlx::PgPool, thread_id: Uui
 /// corrupted row with `kind = 'app'` but `folder = '/ws/projects/foo'`
 /// would silently scope the diff to a phantom `data/apps/foo` and the
 /// user would see an empty diff with no error.
-async fn lookup_app_pathspec(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+///
+/// A query that could not run is an error, never a `None`. `None` means "not
+/// scoped", which both callers read as "diff the whole repo". So a pool
+/// timeout used to answer 200 with every file the agent touched anywhere in
+/// the workspace. Same reasoning as `thread_owns_a_coding_agent_worktree`.
+async fn lookup_app_pathspec(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<Option<String>, (StatusCode, String)> {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT coding_agent_kind, coding_agent_folder FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
-    let (kind, folder) = row?;
+    .map_err(|e| {
+        crate::log!(
+            "[Repositories] Failed to look up the app folder for thread {}: {}",
+            thread_id,
+            e
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to look up this thread's app folder: {e}"),
+        )
+    })?;
+    let Some((kind, folder)) = row else {
+        return Ok(None);
+    };
     if kind.as_deref() != Some("app") {
-        return None;
+        return Ok(None);
     }
-    let folder = folder?;
-    let app_id = extract_app_id(&folder)?;
-    Some(format!("data/apps/{app_id}"))
+    let Some(app_id) = folder.as_deref().and_then(extract_app_id) else {
+        return Ok(None);
+    };
+    Ok(Some(format!("data/apps/{app_id}")))
 }
 
 /// Extract the app id from a `coding_agent_folder` value. Mirrors the

@@ -1,12 +1,11 @@
 /**
  * Deciding that the caller is speaking, from measured energy alone.
  *
- * One question, two readers. Armed while the talker holds the floor, the gate
- * opening is a barge-in: the engine reads an interruption from the provider's
- * own finished response, never from the caller starting to speak, and says so
- * in `voice/realtime.rs::done_events`. Armed while the caller holds it, the
- * same opening is a live utterance, which is what draws their bubble before the
- * words land.
+ * One question, two readers. Armed while the CALLER holds the floor, the gate
+ * opening is a live utterance, which draws their bubble before the words land.
+ * Armed while the talker holds it, the same opening is a barge-in only when
+ * they had given the floor up first (`callState.ts`, `BARGE_IN_QUIET_MS`).
+ * Somebody finishing a sentence the talker talked over cuts nothing off.
  *
  * Neither reader lives here. `callState.ts` decides what an edge means, so this
  * file knows nothing about who has the floor.

@@ -28,7 +28,23 @@ pub struct DeviceIdStore(pub Mutex<()>);
 
 /// The on-disk store: workspace slug → device id. `BTreeMap` for stable key order
 /// (deterministic file content, friendlier diffs).
-type DeviceIdMap = BTreeMap<String, String>;
+pub type DeviceIdMap = BTreeMap<String, String>;
+
+/// This client's device id for every workspace it has opened.
+///
+/// A plain read for a caller outside a Tauri command, which is why it takes the
+/// app-data dir rather than an `AppHandle`. The restart-intent announce
+/// (`desktop::announce_restart_intent`) runs at teardown and has neither the
+/// handle nor the managed lock.
+///
+/// It takes no lock on purpose. The writers above serialise themselves, and the
+/// file is replaced by a rename, so a concurrent write is seen whole or not at
+/// all. A missing or corrupt file reads as an empty map, exactly as it does for
+/// every other reader here: an id we cannot find costs attribution on one
+/// restart, never the restart itself.
+pub fn device_ids_by_workspace(app_data: &Path) -> DeviceIdMap {
+    load_map(&store_path(app_data))
+}
 
 /// Get-or-create the id for `slug` in `map`. Returns the resolved id and whether the
 /// map changed (i.e. the candidate was inserted). Pure — the unit of behavior, with

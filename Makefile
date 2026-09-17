@@ -115,9 +115,14 @@ lint-shell:
 lint-eval:
 	./scripts/check-eval-not-a-test.sh
 
-# Auto-fix linting issues
+# Auto-fix linting issues.
+#
+# `cargo fix` takes --locked for the reason every other cargo call here does
+# (ADR 0020), and it matters most on this target: --allow-dirty means a silently
+# rewritten Cargo.lock lands in a diff nobody inspects. `cargo fmt` stays bare,
+# the one documented exception (see lint-fmt above).
 fix:
-	cargo fix --allow-dirty --allow-staged
+	cargo fix --locked --allow-dirty --allow-staged
 	cargo fmt --all
 
 # Format code. The remediation for a `lint-fmt` failure, so it takes the same

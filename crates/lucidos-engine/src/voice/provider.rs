@@ -142,6 +142,21 @@ pub trait VoiceProvider: Send + Sync {
     /// recorded, never served to a socket.
     fn model(&self) -> &str;
 
+    /// Whether this talker can hand a choice id back, settling what is waiting.
+    ///
+    /// A capability, never a name. `call.rs` asks what the talker can do rather
+    /// than who it is, so ADR 0149's seam holds.
+    ///
+    /// **A talker that answers NO still settles a question card**, through the
+    /// one signal it does have. See [`VoiceEvent::DelegationRequested`], and
+    /// `Call::delegated` for what it does with one.
+    ///
+    /// The default is yes, which is what every provider was before one answered
+    /// no. `voice/build.rs` routes an unknown model id the same way.
+    fn holds_the_answer_tool(&self) -> bool {
+        true
+    }
+
     async fn open(&self, opening: SessionOpening) -> Result<Box<dyn VoiceSession>, BoxError>;
 }
 

@@ -616,6 +616,209 @@ fn both_session_exits_reach_the_api_drop_auto_resume() {
     );
 }
 
+/// The hold carries the error, because the announcement on the give-up path has
+/// to say what went wrong. Asked through `is_transient_api_failure`, which has
+/// its own table above, so the two cannot disagree about which terminals are
+/// holdable.
+#[test]
+fn only_a_transient_api_failure_yields_an_error_for_the_hold() {
+    use crate::engine::agent_session::lifecycle::transient_api_failure_error;
+
+    assert_eq!(
+        transient_api_failure_error(&Some(TerminalKind::Failed {
+            error: "API Error: Connection lost mid-response.".to_string(),
+        })),
+        Some("API Error: Connection lost mid-response."),
+        "the hold must carry what the withheld card would have said",
+    );
+    assert_eq!(
+        transient_api_failure_error(&Some(TerminalKind::Generated)),
+        None,
+        "a terminal the engine would never resume withholds nothing",
+    );
+}
+
+/// **The other half of the fix.** The hold is taken before the terminal is
+/// emitted, on a promise that a resume follows. When the resume does not happen,
+/// the promise has to be paid back: the parent gets the card the fan-in held.
+/// Otherwise a child that was never resumed reports nothing at all, which is
+/// strictly worse than the duplicate-spawn bug this whole change fixes.
+///
+/// Three callers reach `Announce`:
+///
+/// * a continuation the lifecycle rejected,
+/// * an engine shutdown, because a bare stop leaves no device actor and
+///   recovery then parks the thread rather than resuming it,
+/// * any future stand-down that emits nothing.
+#[test]
+fn a_resume_that_never_happens_still_reaches_the_parent() {
+    assert_eq!(
+        held_completion_release(false, false),
+        HeldCompletionRelease::Announce,
+        "no continuation and nobody else coming: the withheld failure is the last word",
+    );
+    assert_eq!(
+        held_completion_release(true, false),
+        HeldCompletionRelease::KeepWithholding,
+        "the resume is on its way, so the card belongs at the real terminal",
+    );
+    assert_eq!(
+        held_completion_release(false, true),
+        HeldCompletionRelease::KeepWithholding,
+        "a drained follow-up is re-submitted and its turn reports for itself; \
+         `parent_callback_pending` was never cleared, so that card still fires",
+    );
+    assert_eq!(
+        held_completion_release(true, true),
+        HeldCompletionRelease::KeepWithholding,
+        "unreachable today (the follow-up stand-down precedes any emit), and it must \
+         stay on the quiet side if it ever becomes reachable",
+    );
+}
+
+/// **The regression test for the incident this change fixes.** The card goes out
+/// inside the terminal's own emit. A hold taken after that is a hold taken too
+/// late, and the parent has already been told its child failed.
+///
+/// Source-text, for the same reason as its two siblings above: the property is
+/// where the call sits, not what a pure function returns. Nothing a behavioural
+/// test can reach would notice the call drifting one statement later.
+#[test]
+fn the_auto_resume_hold_is_taken_before_the_terminal_is_emitted() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");
+
+    assert!(
+        COMPLETION_SRC.contains("async fn hold_completion_if_api_error_resume("),
+        "the hold decision must stay in completion.rs, beside the resume it pairs with",
+    );
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let hold = arm.find(".hold_completion_if_api_error_resume(").expect(
+        "the Result arm must decide the auto-resume before it emits the terminal. Without \
+         it the child-to-parent fan-in announces a failure for a child the engine is about \
+         to resume, and a parent that believes the card spawns a duplicate session onto the \
+         same files.",
+    );
+    let emit = arm
+        .find("\"[AgentSession] terminal event (Result classify)\"")
+        .expect("the Result arm must still emit its terminal event");
+    assert!(
+        hold < emit,
+        "the hold must be taken BEFORE the terminal emit: the emit is what runs the fan-in, \
+         so a hold taken afterwards cannot withhold anything.",
+    );
+
+    // Outside the `if let Some(kind)`, so a classified Result always answers.
+    let terminal_branch = arm
+        .find("if let Some(kind) = terminal_kind {")
+        .expect("the Result arm must still branch on a present terminal");
+    assert!(
+        hold < terminal_branch,
+        "the hold call must sit outside the terminal branch, so every classified Result \
+         gets an answer rather than inheriting one.",
+    );
+}
+
+/// **The hold must not outlive the terminal it names.** It is thread-keyed, so a
+/// hold left standing swallows the NEXT terminal's card too: a `KeepAlive` at
+/// idle carries the loop through another whole turn, and a Stop or a safety net
+/// in that turn has to report normally.
+///
+/// The release therefore sits in the Result arm itself, right after the idle
+/// emit, which is the last fan-in-visible event the hold covers. Source-text,
+/// because the property is the release's POSITION. A behavioural test would
+/// pass on a release moved to the resume site, which is the shape that leaked.
+#[test]
+fn the_auto_resume_hold_is_released_inside_the_arm_that_took_it() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let hold = arm
+        .find(".hold_completion_if_api_error_resume(")
+        .expect("the Result arm must still take the hold");
+    let idle_emit = arm
+        .find("self.emit_coding_agent_idled(")
+        .expect("the Result arm must still emit this turn's CodingAgentIdled");
+    let release = arm.find("auto_resume_holds().release(thread_id)").expect(
+        "the Result arm must release the hold it took. Left to the resume site, the hold \
+             spans every exit in between, so a Stop or a safety net in a kept-alive turn is \
+             swallowed and the parent hears nothing about it. Whether such a Stop also \
+             cancels a pending resume is a separate, PRE-EXISTING question the plan records.",
+    );
+    assert!(
+        hold < idle_emit && idle_emit < release,
+        "the release must follow the idle emit: both the terminal and its CodingAgentIdled \
+         are fan-in-visible, so releasing between them lets the idle announce a completion \
+         for a child that is about to resume.",
+    );
+
+    // What the release hands back IS the decision, and it resets with the
+    // terminal it describes.
+    assert!(
+        RUN_SRC.contains("let mut withheld_api_error: Option<String> = None;")
+            && RUN_SRC.contains("&mut withheld_api_error,"),
+        "the released hold must travel as a per-turn local that `reset_per_turn_flags` \
+         clears, not as a register entry that outlives its turn.",
+    );
+}
+
+/// The resume helper must not re-derive the decision it is handed. Two copies of
+/// the predicate can disagree, and by then the card has gone out.
+#[test]
+fn the_resume_actuates_the_decision_rather_than_re_deciding() {
+    const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");
+
+    let helper = COMPLETION_SRC
+        .find("async fn maybe_auto_resume_after_api_error(")
+        .expect("the resume helper must keep its name");
+    let body = &COMPLETION_SRC[helper..];
+    let next_fn = body
+        .find("async fn finalize_direct_agent(")
+        .expect("finalize_direct_agent must still follow the resume helper");
+    let scope = &body[..next_fn];
+
+    assert!(
+        scope.contains("let Some(withheld_error) = withheld_error else {"),
+        "the resume helper must act on the decision the run loop handed it",
+    );
+    // Every mention inside the helper must be part of its OWN name. Counting
+    // rather than searching, because `maybe_auto_resume_after_api_error(`
+    // contains the decision function's name as a substring.
+    assert_eq!(
+        scope.matches("auto_resume_after_api_error(").count(),
+        scope.matches("maybe_auto_resume_after_api_error(").count(),
+        "the resume helper must not call the decision function: it was already asked \
+         before the terminal was emitted, and a second copy could disagree with a card \
+         already out the door.",
+    );
+
+    // Shutdown must fall THROUGH to the release decision, never return. A bare
+    // stop carries no device actor, so recovery parks the thread behind a manual
+    // Continue and nothing else ever reports.
+    let shutdown = scope
+        .find("self.is_shutting_down()")
+        .expect("the resume helper must re-ask about shutdown");
+    let decision = scope
+        .find("held_completion_release(")
+        .expect("the resume helper must route through the release decision");
+    assert!(
+        shutdown < decision,
+        "the shutdown check must precede the release decision",
+    );
+    assert!(
+        !scope[shutdown..decision].contains("return"),
+        "the shutdown arm must not return early: it withheld a card and scheduled no \
+         resume, so the parent has to be told or it waits on a child forever.",
+    );
+}
+
 /// **The second regression test for the same incident, one layer up.** Reaching the
 /// idle exit is necessary but not sufficient: the idle handler can decline to end
 /// the run at all. When `terminate_decision` returns a `KeepAlive`, the loop keeps

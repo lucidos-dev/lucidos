@@ -1341,24 +1341,29 @@ pub enum ThreadEvent {
     SpokenReplyGenerated {
         session_id: uuid::Uuid,
         text: String,
-        /// The caller spoke over it, so only this much was heard. The doer's
-        /// own answer is in the thread in full either way.
+        /// The caller took the floor back, so only this much was heard. The
+        /// doer's own answer is in the thread in full either way.
+        ///
+        /// A barge-in, or a provider reporting the cut itself. Talking OVER a
+        /// reply is not one: the talker jumps in on a mid-sentence pause, and
+        /// the rest of their breath cuts nothing off (ADR 0200).
         interrupted: bool,
     },
 
-    /// The caller said something, and the talker answered it alone.
+    /// The caller said something on a call.
     ///
-    /// The other half of a spoken utterance. One that needs the doer becomes a
-    /// `MessageReceived` carrying `voice_session_id`, exactly as a typed one
-    /// does, because it starts a turn. This is for the rest, and it starts
-    /// nothing.
+    /// **Every caller utterance, whatever the talker does with it** (ADR 0201).
+    /// Written the instant the provider ends the caller's turn, so `created` is
+    /// when they stopped speaking and the transcript can read by the clock
+    /// alone. One breath is therefore several rows, which the two readers join
+    /// back together (`core::store::messages::spoken_merge`).
     ///
-    /// **`Metadata` is the whole reason it exists.** `MessageReceived` is
-    /// `EventClass::Start`, so recording a talker-handled utterance that way
-    /// would leave the thread claiming a turn that will never run.
+    /// **`Metadata`, and that is the whole reason it exists.** It starts no
+    /// turn. What starts one is the talker's own `WorkDelegated`, which is a
+    /// separate fact and lands after this row.
     ///
-    /// It carries the caller's own actor, not the talker's. The talker
-    /// answered it; the caller said it.
+    /// It carries the caller's own actor, not the talker's. Whoever handles
+    /// it, the caller said it.
     SpokenMessageReceived {
         session_id: uuid::Uuid,
         text: String,
@@ -1374,13 +1379,17 @@ pub enum ThreadEvent {
     /// `EventMeta`. The doer reads the reason as that speaker's line, which is
     /// how it learns what it was woken for.
     ///
-    /// `Metadata`, and it moves no section. The `MessageReceived` beside it is
-    /// what starts the turn, and two Start events for one utterance is a
-    /// thread counting a turn twice.
+    /// **`Start`: this row is what begins a delegated call's turn** (ADR 0201).
+    /// The caller's words start nothing, because the talker decides whether the
+    /// doer is wanted and a row written before that decision could not know.
     WorkDelegated {
         session_id: uuid::Uuid,
-        /// The talker's own few words. Never empty: the seam substitutes a
-        /// stand-in rather than dropping a delegation over a missing argument.
+        /// The talker's own few words on what the caller wants.
+        ///
+        /// Empty where it composed none, which is every ask on a protocol
+        /// whose delegation frame carries no words. The transcript then draws
+        /// no row for it, rather than putting the caller's own sentence in the
+        /// talker's mouth (ADR 0200).
         reason: String,
     },
 

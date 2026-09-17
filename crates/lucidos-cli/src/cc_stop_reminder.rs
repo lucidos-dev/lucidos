@@ -184,6 +184,25 @@ pub(crate) fn decide_stop_action(
     }
 }
 
+/// What an unreadable commit count stands in for: one commit, which reminds
+/// when no marker is present.
+const UNKNOWN_COMMITS_AHEAD: u32 = 1;
+
+/// How many commits this branch carries that `main` does not, as the reminder
+/// reads it.
+///
+/// A probe that could not run is UNKNOWN, never zero. Zero is the one answer
+/// that lets unhardened work through, and `git rev-list` fails for reasons
+/// that say nothing about the branch: a spawn failure, a busy index, a
+/// repository with no `main`. The engine probe in [`run`] resolves its own
+/// unknown toward the reminder, and this one now matches it.
+pub(crate) fn commits_ahead_or_unknown(probe: Result<String, BoxError>) -> u32 {
+    probe
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(UNKNOWN_COMMITS_AHEAD)
+}
+
 /// `cc-settings.json` is workspace-scoped, so this hook fires for
 /// external-repo CC sessions too. `/harden` is only defined in the Lucidos
 /// repo at `.claude/commands/harden.md` — the per-session filesystem check
@@ -250,10 +269,10 @@ pub(crate) fn run() -> Result<(), BoxError> {
             None
         };
 
-    let commits_ahead = hardened::run_git(&cwd, &["rev-list", "--count", "main..HEAD"])
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+    let commits_ahead = commits_ahead_or_unknown(hardened::run_git(
+        &cwd,
+        &["rev-list", "--count", "main..HEAD"],
+    ));
 
     if question_uuid.is_none() && commits_ahead == 0 {
         return Ok(());
@@ -579,6 +598,31 @@ mod tests {
         // reminded them once).
         let action = decide_stop_action(None, false, 5, HardenedState::Missing, true);
         assert_eq!(action, StopAction::Allow);
+    }
+
+    /// A `git rev-list` that could not run says nothing about the branch being
+    /// clean. Read as zero it silenced the reminder on a session with
+    /// unhardened commits, which is the one direction that loses work.
+    #[test]
+    fn an_unreadable_commit_count_reminds_instead_of_allowing() {
+        let spawn_failed = commits_ahead_or_unknown(Err("git rev-list: no such file".into()));
+        assert_eq!(
+            decide(spawn_failed, HardenedState::Missing),
+            StopDecision::Remind,
+        );
+        // Output that will not parse is the same unknown: empty on a killed
+        // git, or a line from a repository that answered something else.
+        let unparseable = commits_ahead_or_unknown(Ok(String::new()));
+        assert_eq!(
+            decide(unparseable, HardenedState::Missing),
+            StopDecision::Remind,
+        );
+    }
+
+    #[test]
+    fn a_readable_commit_count_is_used_as_it_stands() {
+        assert_eq!(commits_ahead_or_unknown(Ok("0".to_string())), 0);
+        assert_eq!(commits_ahead_or_unknown(Ok("7\n".to_string())), 7);
     }
 
     #[test]

@@ -7,6 +7,7 @@ import {
   pcm16DurationSeconds,
   pcm16ToFloat,
 } from './pcm';
+import { wrongAudioRate } from './refusals';
 
 /** Read the bytes back as little-endian 16-bit samples. */
 function samplesOf(buffer: ArrayBuffer): number[] {
@@ -70,5 +71,20 @@ describe('how long a chunk plays for', () => {
   it('is its samples over the sample rate', () => {
     expect(pcm16DurationSeconds(1920)).toBeCloseTo(0.04, 10);
     expect(pcm16DurationSeconds(0)).toBe(0);
+  });
+});
+
+/** The whole module rests on the browser honouring the rate a call asks for.
+ *  The capture worklet posts raw quanta at whatever it gets, and this module
+ *  then labels them 24 kHz on the wire. So `openAudio` refuses the call on any
+ *  other rate, in `refusals.ts`'s words. */
+describe('the rate a call speaks', () => {
+  it('names both rates, so a report says which browser did what', () => {
+    const refusal = wrongAudioRate(48_000, SAMPLE_RATE_HZ);
+    expect(refusal).toContain('48000');
+    expect(refusal).toContain(String(SAMPLE_RATE_HZ));
+    // It says what breaks, rather than that the audio is merely rough: the
+    // caller is the half nothing resamples.
+    expect(refusal).toContain('Your voice');
   });
 });

@@ -896,15 +896,19 @@ export function MobileAccessPage() {
   // for serve and funnel has changed"), which buried the CLI's own advice, and
   // that advice is the whole payload when a syntax change is the cause. Add
   // context to the Rust message instead of a prefix here.
+  //
+  // The key is dropped on BOTH outcomes. A `tskey-auth-…` enrolls nodes onto the
+  // user's tailnet. Leaving a rejected one in the field keeps a live credential
+  // on screen for as long as the page stays open.
   const onUp = useCallback(async () => {
     setBusy('up');
     try {
       await tailscaleUp(authKey.trim() || undefined);
-      setAuthKey('');
       reload();
     } catch (e) {
       showToast(errorDetail(e), 'error');
     } finally {
+      setAuthKey('');
       setBusy(null);
     }
   }, [authKey, reload]);
@@ -1115,10 +1119,13 @@ export function MobileAccessPage() {
                   : 'Open the Tailscale app in your menu bar and sign in there. This Mac has no Tailscale command-line tool, which is what we would need to do it for you.'}
               </div>
               {row.canRun && (
+                // Masked, like every other secret field in settings. An auth key
+                // enrolls nodes onto the tailnet, and this page is read over
+                // someone's shoulder on a phone as often as at a desk.
                 <input
                   class="device-name-input"
-                  type="text"
-                  placeholder="Auth key (optional) — tskey-auth-…"
+                  type="password"
+                  placeholder="Auth key (optional): tskey-auth-…"
                   value={authKey}
                   onInput={(e) => setAuthKey((e.target as HTMLInputElement).value)}
                 />

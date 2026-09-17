@@ -111,6 +111,46 @@ fn indexable_text_returns_content_for_chat_events() {
     assert_eq!(canceled.indexable_text(), Some("partial"));
 }
 
+/// An old row still carries `spoken_secs_before`, which the variant no
+/// longer has. Serde ignores an unknown field by default, and this pins
+/// that: a deny-unknown-fields attribute would make every call written
+/// before ADR 0201 unreadable.
+#[test]
+fn a_reply_row_written_before_adr_0201_still_reads() {
+    let legacy = serde_json::json!({
+        "type": "SpokenReplyGenerated",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "text": "I'm on it, give me a sec.",
+        "interrupted": false,
+        "spoken_secs_before": 49.7
+    });
+    let event: ThreadEvent =
+        serde_json::from_value(legacy).expect("a legacy reply row deserializes");
+    match event {
+        ThreadEvent::SpokenReplyGenerated { text, .. } => {
+            assert_eq!(text, "I'm on it, give me a sec.");
+        }
+        other => panic!("wrong variant: {:?}", other),
+    }
+}
+
+/// What the caller SAID reaches memory, exactly as what they typed does.
+///
+/// A delegated utterance used to be written as a `MessageReceived`, so it was
+/// indexed through that arm. ADR 0201 stopped writing one, and without an arm
+/// of its own nothing anybody says on a call is recalled ever again.
+#[test]
+fn indexable_text_covers_what_the_caller_said_on_a_call() {
+    let spoken = ThreadEvent::SpokenMessageReceived {
+        session_id: uuid::Uuid::new_v4(),
+        text: "what did we decide about the release cadence".into(),
+    };
+    assert_eq!(
+        spoken.indexable_text(),
+        Some("what did we decide about the release cadence")
+    );
+}
+
 /// A `UserPromptInjected` is indexable only when it carries ORIGINAL text.
 ///
 /// With `injected_message_id` set it is an acknowledgement of a

@@ -225,13 +225,21 @@ describe('a spoken reply is not the written answer', () => {
     expect(findByRole(inRun, 'spoken-reply')).not.toBeNull();
   });
 
-  /** The talker's LIVE row wears the same type, and the caret is what says it
-   *  is still arriving. It survives the row becoming a step. */
-  it('carries the caret while the words are still coming', () => {
-    const saying = SpokenReply({ event: { ...spokenRow(), live: true } });
-    expect(hasHiddenName(saying, 'Saying aloud')).toBe(true);
-    const said = SpokenReply({ event: spokenRow() });
-    expect(hasHiddenName(said, 'Said aloud')).toBe(true);
+  /** **The row claims no liveness, in words or in a mark** (ADR 0197).
+   *
+   *  The live row is retired by the engine's own row, written at the next move
+   *  of the conversation (ADR 0188, ADR 0191). A finished sentence stands here
+   *  until the caller speaks again, so anything saying "still going" is a lie
+   *  for all of it. That was the report: a reply under a Done header, wearing
+   *  the mark.
+   *
+   *  The live row and the landed row therefore render identically, which also
+   *  means the swap between them moves nothing. */
+  it('never says it is still being said', () => {
+    const drawn = vnodeToText(SpokenReply({ event: spokenRow() }));
+    expect(drawn).not.toContain('live-speech-mark');
+    expect(drawn).not.toContain('Saying aloud');
+    expect(hasHiddenName(SpokenReply({ event: spokenRow() }), 'Said aloud')).toBe(true);
   });
 });
 

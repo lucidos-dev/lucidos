@@ -129,13 +129,15 @@ export function TalkerModelExplainer() {
     <Explainer title="Talker model">
       <p>Which model holds the spoken conversation. Two families, and they behave differently.</p>
       <p>
-        The <strong>Realtime</strong> models bill by the token. They can settle things out
-        loud: say which option you want, or say goodbye to ring off.
+        The <strong>Realtime</strong> models bill by the token. They can settle anything out
+        loud: say which option you want, allow or refuse a permission, or say goodbye to
+        ring off.
       </p>
       <p>
         <strong>GPT Live 1</strong> listens while it speaks, so it handles being interrupted
-        better. It holds no tools, so you settle a card by tapping it and end a call on the
-        button. It bills by the minute, and that spend does not reach the usage rollup.
+        better. It holds no tools, so it settles less out loud: a question it asks you can
+        answer by just saying your answer, but a permission is a tap and so is ringing off.
+        It bills by the minute, and that spend does not reach the usage rollup.
       </p>
     </Explainer>
   );

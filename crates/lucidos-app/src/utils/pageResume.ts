@@ -1,4 +1,5 @@
 import { isIOS, isWebKit } from './platform';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './webkitRepaint';
 
 /** Live action buttons whose tap mutates state irreversibly — answering a CC
  *  question (`.question-option`) or granting/denying a permission (the
@@ -154,4 +155,30 @@ export function onPageResume(cb: () => void): () => void {
   return () => {
     repaintSubscribers.delete(cb);
   };
+}
+
+/** Repaint the view a deep link just LANDED, rather than the one the wake found.
+ *
+ *  The resume repaint above fires on the wake. A deep link arrives after it: the
+ *  native drain is an IPC round trip, `openAppById` may await the apps list, and
+ *  the Canvas pane's app panel is a lazy chunk. So the wake repaint runs against
+ *  the view the tap is replacing, and the arriving one gets none.
+ *
+ *  That is not a corner. A native banner only shows while the page is inactive,
+ *  so a banner tap ALWAYS lands on a webview WebKit has parked. It shipped as an
+ *  app deep link whose iframe loaded while the screen kept the pre-tap frame.
+ *
+ *  Same subscribers, same elements, so a surface that already recovers on wake
+ *  needs nothing new. The schedule is the thread-open burst's, because both
+ *  answer "how long until the view is there": one number, one meaning.
+ *
+ *  Deliberately does NOT arm the wake-tap swallow. Arming is for a layer that
+ *  may still be black under the user's finger. A landed deep link is not that,
+ *  and arming here would eat their next deliberate tap. */
+export function repaintLandedContent(): void {
+  if (!isWebKit()) return;
+  for (const delay of OPEN_REPAINT_BURST_DELAYS_MS) {
+    if (delay === 0) fireRepaint();
+    else setTimeout(fireRepaint, delay);
+  }
 }

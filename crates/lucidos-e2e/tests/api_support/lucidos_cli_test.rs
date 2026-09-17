@@ -462,3 +462,167 @@ fn query_system_event_mentions(event_type: &str, field: &str, value: &str) -> bo
         .iter()
         .any(|ev| ev["payload"]["data"][field].as_str() == Some(value))
 }
+
+/// One request, captured whole: the port to aim at, and the raw text it sent.
+///
+/// Answers 200 with a JSON body so the CLI's own success path runs. Reads the
+/// headers, then the body its `Content-Length` announces, so the client is
+/// never reset mid-write.
+fn spawn_capturing_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("local_addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept the CLI's connection");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set a read timeout");
+        let mut raw: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !request_is_complete(&raw) {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
+        let body = b"{\"success\":true}";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+    });
+    (port, rx)
+}
+
+/// True once `raw` holds the headers and the body they announce.
+fn request_is_complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+    let announced = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    raw.len() >= end + 4 + announced
+}
+
+/// The captured request's headers, as the engine's resolver reads them.
+fn captured_headers(request: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.trim().as_bytes()),
+            axum::http::HeaderValue::from_str(value.trim()),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+/// The CLI's hand-copied origin-token names, proven against the engine's own.
+///
+/// `crates/lucidos-cli/src/http.rs` restates `ENV_AGENT_ORIGIN_TOKEN` and
+/// `HEADER_AGENT_ORIGIN_TOKEN` because the CLI cannot depend on the engine
+/// crate. Rename one side alone and every `lucidos` call from a coding-agent
+/// session quietly loses its Agent attribution, with every test still green.
+///
+/// The token here is minted through the engine library, so it is signed rather
+/// than shaped. The binary under test is the real CLI, spawned with the env var
+/// the ENGINE names. A stub server captures what it sent, and the engine's own
+/// `build_message_origin` reads those headers back.
+///
+/// It aims at the stub, not the workspace. The running engine's HMAC key is per
+/// startup and lives in its memory, so no outside process can mint a token it
+/// would verify. `follow_up_test.rs` records the same limit.
+#[test]
+fn the_cli_carries_the_origin_token_the_engine_minted() {
+    use lucidos_engine::api::actor::{
+        build_message_origin, init_agent_origin_secret, mint_agent_origin_token,
+        ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN,
+    };
+    use lucidos_engine::engine::thread_events::{ActorMode, MessageOrigin};
+
+    let source_thread = uuid::Uuid::new_v4();
+    // First writer wins, so a secret another test installed signs this one too,
+    // and the verify below reads whichever is installed.
+    init_agent_origin_secret("lucidos-cli-origin-mirror".to_string());
+    let token = mint_agent_origin_token(Some(source_thread), 0, None)
+        .expect("a secret is installed, so a token mints");
+
+    let (port, captured) = spawn_capturing_server();
+    let summary = unique_marker("cli-origin");
+    let out = Command::new(lucidos_bin())
+        .env("LUCIDOS_WORKSPACE", workspace_path())
+        .env("LUCIDOS_API_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env(ENV_AGENT_ORIGIN_TOKEN, &token)
+        .args([
+            "events",
+            "emit",
+            "LucidosCliOriginProbed",
+            "--payload",
+            "{}",
+            "--summary",
+            &summary,
+        ])
+        .output()
+        .expect("lucidos events emit should run");
+    assert!(
+        out.status.success(),
+        "emit against the capturing server failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let request = captured
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the CLI must reach the capturing server");
+    assert!(
+        request.to_lowercase().contains(HEADER_AGENT_ORIGIN_TOKEN),
+        "the CLI sent no {HEADER_AGENT_ORIGIN_TOKEN} header, so the engine would \
+         stamp its mutations as somebody else. Request was:\n{request}"
+    );
+
+    let origin = build_message_origin(
+        &captured_headers(&request),
+        ActorMode::Human,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    match origin {
+        Some(MessageOrigin::Api {
+            mode,
+            source_thread_id,
+            ..
+        }) => {
+            assert_eq!(
+                mode,
+                ActorMode::Agent,
+                "a token-bearing CLI call must stamp as the agent, never as the user"
+            );
+            assert_eq!(
+                source_thread_id,
+                Some(source_thread),
+                "the spawning thread must survive the hop through the CLI"
+            );
+        }
+        other => panic!("expected Api {{ mode: Agent }}, got {other:?}; request was:\n{request}"),
+    }
+}

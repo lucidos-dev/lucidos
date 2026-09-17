@@ -64,9 +64,9 @@ test.describe('Trigger group actions clear the edge-swipe strip', () => {
     });
     const del = section.locator('.trigger-group-delete');
     await expect(del).toBeVisible({ timeout: 10_000 });
-    // An empty group's delete is enabled. A disabled one is `pointer-events:
-    // none` by design and would hit-test straight through, which would make
-    // this assertion meaningless.
+    // No group delete is disabled any more: a disabled control is
+    // `pointer-events: none`, which swallows the tap AND the tooltip saying
+    // why. A group with members refuses through a toast instead.
     await expect(del).toBeEnabled();
 
     const box = (await del.boundingBox())!;

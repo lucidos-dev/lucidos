@@ -314,6 +314,7 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut user_hit_stop = true;
     let mut interrupt_is_redirect = true;
     let mut last_terminal_kind = Some(TerminalKind::Generated);
+    let mut withheld_api_error = Some("API Error: dropped".to_string());
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
         device_id: "ios-1".into(),
         label: "My iPhone".into(),
@@ -325,7 +326,10 @@ fn reset_per_turn_flags_clears_all_flags() {
         &mut emitted_terminal_event,
         &mut user_hit_stop,
         &mut interrupt_is_redirect,
-        &mut last_terminal_kind,
+        TurnTerminal {
+            kind: &mut last_terminal_kind,
+            withheld_api_error: &mut withheld_api_error,
+        },
         &mut cancel_actor,
     );
 
@@ -350,6 +354,12 @@ fn reset_per_turn_flags_clears_all_flags() {
         "must clear so the new turn's cleanup decision reflects THIS turn, \
          not the previous one — otherwise a Generated turn followed by a \
          safety-net abort would still auto-commit on cleanup"
+    );
+    assert!(
+        withheld_api_error.is_none(),
+        "must clear in lockstep with last_terminal_kind: carried into the next \
+         turn it would resume off a decision taken two exits ago, and announce \
+         that terminal's error for this one"
     );
     assert!(
         cancel_actor.is_none(),

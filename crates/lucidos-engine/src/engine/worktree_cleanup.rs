@@ -507,10 +507,16 @@ impl WorktreeCleanup {
                                     continue;
                                 }
                             }
-                            if age >= TIER_2_IDLE
-                                && self.try_tier_2(thread_id, &path, pre_size).await.is_some()
-                            {
-                                continue;
+                            if age >= TIER_2_IDLE {
+                                if let Some(freed) =
+                                    self.try_tier_2(thread_id, &path, pre_size).await
+                                {
+                                    if under_hard {
+                                        total_freed_under_hard =
+                                            total_freed_under_hard.saturating_add(freed);
+                                    }
+                                    continue;
+                                }
                             }
                             if age >= tier1_idle {
                                 if let Some(freed) = self.try_tier_1(thread_id, &path).await {

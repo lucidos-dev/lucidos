@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { updateAvailable, toasts, threadMap, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleThreadEvent } from '../actions/thread-sync';
+import { makeThreadAggregate } from '../actions/threads-test-helpers';
 
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
@@ -67,6 +68,7 @@ describe('Applied toast has no premature Refresh button', () => {
       seq: 1,
       event: { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, client_update: true },
       created: '2026-01-01T00:00:00Z',
+      aggregate: makeThreadAggregate(threadId),
     });
     const toast = toasts.value.find(t => t.key === applyKey);
     expect(toast).toBeTruthy();
@@ -82,6 +84,7 @@ describe('Applied toast has no premature Refresh button', () => {
       seq: 1,
       event: { type: 'ChangeApplied', change_id: 'c-1', requires_restart: false, client_update: true },
       created: '2026-01-01T00:00:00Z',
+      aggregate: makeThreadAggregate(threadId),
     });
     expect(toasts.value.find(t => t.key === applyKey)).toBeTruthy();
 

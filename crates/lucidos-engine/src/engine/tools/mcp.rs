@@ -1,6 +1,16 @@
 use super::super::LucidosEngine;
-use crate::mcp::{McpStartOutcome, McpStopOutcome};
+use crate::mcp::McpStopOutcome;
 use std::collections::HashMap;
+
+/// Whether the calling loop re-reads its tool array each round.
+///
+/// `run_agentic_loop` refreshes the MCP slice per round, so a server started
+/// mid-turn is callable at once. `run_intent_loop` builds its array once from
+/// `build_intent_tools`, which never carries the MCP surface. The same promise
+/// there would send the model after tools it does not have.
+fn tool_array_refreshes() -> bool {
+    super::apps::INTENT_DEPTH.try_with(|d| *d).unwrap_or(0) == 0
+}
 
 impl LucidosEngine {
     pub(crate) async fn execute_mcp_management_tool(
@@ -47,7 +57,14 @@ impl LucidosEngine {
                 }
 
                 self.mcp_manager
-                    .setup_server(id, server_name, command, &tool_args, &env)
+                    .setup_server(
+                        id,
+                        server_name,
+                        command,
+                        &tool_args,
+                        &env,
+                        tool_array_refreshes(),
+                    )
                     .await
                     .map_err(|e| format!("Failed to set up MCP server: {}", e).into())
             }
@@ -130,14 +147,7 @@ impl LucidosEngine {
                     return Ok("Error: id is required".to_string());
                 }
                 match self.mcp_manager.start_server(id).await {
-                    Ok(McpStartOutcome::AlreadyRunning { tool_count }) => Ok(format!(
-                        "MCP server '{}' is already running with {} tools.",
-                        id, tool_count
-                    )),
-                    Ok(McpStartOutcome::Started { tool_count }) => Ok(format!(
-                        "MCP server '{}' started with {} tools available.",
-                        id, tool_count
-                    )),
+                    Ok(outcome) => Ok(outcome.describe(id, tool_array_refreshes())),
                     Err(e) => Err(format!("Failed to start MCP server: {}", e).into()),
                 }
             }

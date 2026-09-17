@@ -22,9 +22,9 @@ use crate::engine::thread_state::ThreadState;
 /// SSE subscriber on every keystroke; without a cap a pathological paste
 /// (or runaway client) multiplies the bandwidth cost by N devices.
 const MAX_COMPOSE_TEXT_BYTES: usize = 64 * 1024;
-/// Cap on the JSON-encoded `compose_images` array, sized to allow ~32 modest
-/// image refs without enabling N×64KB blowups. Each image is a URL/path
-/// reference, not the binary blob.
+/// How many images one compose draft may carry. A COUNT, not a byte budget:
+/// each entry is a blob hash of fixed length, checked by `is_blob_hash`, so
+/// the two caps together bound the array at 32 x 64 bytes.
 const MAX_COMPOSE_IMAGES: usize = 32;
 /// Cap on the JSON-encoded `compose_selection` object. A partial
 /// `ComposeSelectionOverride` is a handful of short fields (~a few hundred
@@ -84,11 +84,51 @@ pub(super) struct PutComposeBody {
     pub compose_epoch: Option<i64>,
 }
 
-fn validate_mode(mode: &str) -> Result<(), ApiError> {
+/// Accept a compose mode in either spelling, and answer with the STORED one.
+///
+/// Public API parameter values are kebab-case, so `claude-code` is what a
+/// caller reading the rest of this API will send. The snake form is what the
+/// column holds (`thread_summaries.compose_mode` and `source`), so it stays the
+/// stored spelling and only the boundary aliases.
+fn canonical_mode(mode: &str) -> Result<&'static str, ApiError> {
     match mode {
-        "lucidos" | "claude_code" => Ok(()),
-        _ => Err(ApiError::bad_request("mode must be lucidos|claude_code")),
+        "lucidos" => Ok("lucidos"),
+        "claude_code" | "claude-code" => Ok("claude_code"),
+        _ => Err(ApiError::bad_request(
+            "mode must be lucidos|claude-code (claude_code is accepted, and is what is stored)",
+        )),
     }
+}
+
+/// The one refusal both image paths answer with, so the legacy upload and the
+/// hash list cannot report the same cap differently.
+fn too_many_compose_images() -> ApiError {
+    ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images")
+}
+
+/// Is `hash` the blob address `core::blobs::resolve_blob` accepts: 64 ASCII
+/// hex characters?
+///
+/// A compose image hash goes verbatim into `thread_summaries.compose_images`
+/// and back out in every `ThreadComposeChanged` frame. Unvalidated, one entry
+/// can be a string of any size, so the count cap alone bounds nothing.
+fn is_blob_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Refuse a compose image list the projection must not store: too many
+/// entries, or an entry that is not a blob address.
+fn reject_compose_images(hashes: &[String]) -> Option<ApiError> {
+    if hashes.len() > MAX_COMPOSE_IMAGES {
+        return Some(too_many_compose_images());
+    }
+    let bad = hashes.iter().find(|h| !is_blob_hash(h))?;
+    // The rejected value is reported by SIZE, never echoed. Echoing it is how
+    // a 90 MB entry becomes a 90 MB error body.
+    Some(ApiError::bad_request(format!(
+        "compose image hash must be 64 hex characters, got {} bytes",
+        bad.len()
+    )))
 }
 
 /// Map a thread row's `state` (Option = no row) to the HTTP error for an
@@ -125,7 +165,7 @@ pub(super) async fn post_thread(
     headers: HeaderMap,
     Json(body): Json<PostThreadBody>,
 ) -> Result<StatusCode, ApiError> {
-    validate_mode(&body.mode)?;
+    let mode = canonical_mode(&body.mode)?;
 
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT state, archive_state, compose_mode FROM thread_summaries WHERE thread_id = $1",
@@ -147,7 +187,7 @@ pub(super) async fn post_thread(
         // archived sub-case for a more specific 409 message.
         return match existing_state {
             ThreadState::Composing => {
-                if existing_mode.as_deref() == Some(body.mode.as_str()) {
+                if existing_mode.as_deref() == Some(mode) {
                     Ok(StatusCode::OK)
                 } else {
                     Err(ApiError::new(
@@ -171,7 +211,7 @@ pub(super) async fn post_thread(
     let event = BusEvent::Thread {
         thread_id: body.id,
         event: ThreadEvent::ThreadStarted {
-            mode: body.mode,
+            mode: mode.to_string(),
             actor: actor.clone(),
         },
         meta: EventMeta {
@@ -186,6 +226,43 @@ pub(super) async fn post_thread(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::CREATED)
+}
+
+/// Upload a legacy inline-base64 compose batch and return its blob hashes.
+///
+/// The count cap is answered BEFORE the first write. Checking it after the
+/// loop still lands one blob file per image in the workspace, and the 413 it
+/// then answers references none of them. A client repeating that with fresh
+/// pixel noise grows the blob store without bound.
+fn upload_legacy_compose_images(
+    workspace: &std::path::Path,
+    images: Vec<LegacyComposeImage>,
+) -> Result<Vec<String>, ApiError> {
+    if images.len() > MAX_COMPOSE_IMAGES {
+        return Err(too_many_compose_images());
+    }
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::log!(
+        "[Compat] legacy image upload via PUT compose ({} images)",
+        images.len()
+    );
+    let mut hashes = Vec::with_capacity(images.len());
+    for img in images {
+        let blob = write_blob_from_base64(workspace, &img.base64).map_err(|e| {
+            let status = match e {
+                crate::core::blobs::BlobError::BadEncoding(_) => StatusCode::BAD_REQUEST,
+                crate::core::blobs::BlobError::UnsupportedMime(_) => {
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                }
+                crate::core::blobs::BlobError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            ApiError::new(status, e.to_string())
+        })?;
+        hashes.push(blob.hash);
+    }
+    Ok(hashes)
 }
 
 /// The write was composed against a *compose epoch* a submission has since
@@ -231,55 +308,26 @@ pub(super) async fn put_compose(
             "compose_text exceeds 64 KiB cap",
         ));
     }
-    if let Some(ref m) = body.mode {
-        validate_mode(m)?;
-    }
+    let mode = match body.mode {
+        Some(ref m) => Some(canonical_mode(m)?),
+        None => None,
+    };
 
     // None = preserve (SQL COALESCE). `image_hashes` wins over legacy
     // `images`; the latter is uploaded inline before the UPDATE.
     let new_image_hashes: Option<Vec<String>> = if let Some(hashes) = body.image_hashes {
+        if let Some(rejection) = reject_compose_images(&hashes) {
+            return Err(rejection);
+        }
         Some(hashes)
     } else if let Some(legacy) = body.images {
-        if legacy.is_empty() {
-            Some(Vec::new())
-        } else {
-            crate::log!(
-                "[Compat] legacy image upload via PUT compose ({} images)",
-                legacy.len()
-            );
-            let mut hashes = Vec::with_capacity(legacy.len());
-            for img in legacy {
-                let blob = write_blob_from_base64(state.engine.workspace_path(), &img.base64)
-                    .map_err(|e| {
-                        let status = match e {
-                            crate::core::blobs::BlobError::BadEncoding(_) => {
-                                StatusCode::BAD_REQUEST
-                            }
-                            crate::core::blobs::BlobError::UnsupportedMime(_) => {
-                                StatusCode::UNSUPPORTED_MEDIA_TYPE
-                            }
-                            crate::core::blobs::BlobError::Io(_) => {
-                                StatusCode::INTERNAL_SERVER_ERROR
-                            }
-                        };
-                        ApiError::new(status, e.to_string())
-                    })?;
-                hashes.push(blob.hash);
-            }
-            Some(hashes)
-        }
+        Some(upload_legacy_compose_images(
+            state.engine.workspace_path(),
+            legacy,
+        )?)
     } else {
         None
     };
-
-    if let Some(ref h) = new_image_hashes {
-        if h.len() > MAX_COMPOSE_IMAGES {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "too many compose images",
-            ));
-        }
-    }
 
     let images_bind: Option<JsonValue> = new_image_hashes
         .as_ref()
@@ -335,7 +383,7 @@ pub(super) async fn put_compose(
     .bind(id)
     .bind(&body.text)
     .bind(images_bind.as_ref())
-    .bind(body.mode.as_deref())
+    .bind(mode)
     .bind(body.selection.as_ref())
     .bind(body.compose_epoch)
     .fetch_optional(state.engine.pool())
@@ -387,7 +435,7 @@ pub(super) async fn put_compose(
             // than a straggler. Archived rows carry state='active' and reach
             // this naturally. Without it the request falls through to the 204
             // below, which would swallow the mode change in silence.
-            if body.mode.is_some() && matches!(st, Some(ThreadState::Active)) {
+            if mode.is_some() && matches!(st, Some(ThreadState::Active)) {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "mode is locked once the thread has been sent",
@@ -504,4 +552,109 @@ pub(super) async fn delete_thread(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 1x1 PNG whose trailing byte varies, so each call is distinct content
+    /// and lands its own blob. Enough leading bytes to pass the magic sniff.
+    fn distinct_png_base64(seed: u8) -> String {
+        use base64::Engine as _;
+        let mut bytes: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00,
+        ];
+        bytes.push(seed);
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    fn legacy_batch(count: u8) -> Vec<LegacyComposeImage> {
+        (0..count)
+            .map(|i| LegacyComposeImage {
+                base64: distinct_png_base64(i),
+            })
+            .collect()
+    }
+
+    /// Count the blob files the workspace holds, across the 256-way fan-out.
+    fn blob_count(workspace: &std::path::Path) -> usize {
+        let root = workspace.join("data/blobs");
+        let Ok(shards) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        shards
+            .filter_map(Result::ok)
+            .filter_map(|shard| std::fs::read_dir(shard.path()).ok())
+            .map(|files| files.filter_map(Result::ok).count())
+            .sum()
+    }
+
+    /// An over-cap legacy batch is refused before anything is written. The
+    /// cap used to run after the upload loop, so the workspace kept one blob
+    /// per image of a request the engine had answered 413.
+    #[test]
+    fn an_over_cap_legacy_upload_writes_no_blobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let over_cap = (MAX_COMPOSE_IMAGES + 1) as u8;
+
+        let err = upload_legacy_compose_images(tmp.path(), legacy_batch(over_cap))
+            .expect_err("over the cap is a refusal");
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            blob_count(tmp.path()),
+            0,
+            "a refused batch must leave no blob behind"
+        );
+    }
+
+    /// A batch inside the cap still uploads, one blob per distinct image.
+    #[test]
+    fn a_legacy_upload_inside_the_cap_writes_one_blob_per_image() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hashes =
+            upload_legacy_compose_images(tmp.path(), legacy_batch(3)).expect("inside the cap");
+        assert_eq!(hashes.len(), 3);
+        assert!(hashes.iter().all(|h| is_blob_hash(h)));
+        assert_eq!(blob_count(tmp.path()), 3);
+    }
+
+    /// `image_hashes` is a list of blob addresses, and the count cap bounds it
+    /// only once each entry has a bounded length. One unvalidated entry of any
+    /// size passes the count, lands in the projection row, and goes out in
+    /// every SSE frame. A megabyte here stands in for the reported 90 MB.
+    #[test]
+    fn a_compose_image_hash_that_is_not_a_blob_address_is_refused() {
+        let real = "a".repeat(64);
+        assert!(reject_compose_images(std::slice::from_ref(&real)).is_none());
+
+        let huge = vec!["x".repeat(1024 * 1024)];
+        let err = reject_compose_images(&huge).expect("an oversized entry is refused");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.len() < 200 && !err.message.contains(&huge[0]),
+            "the refusal must not echo the rejected value back"
+        );
+
+        let non_hex = "g".repeat(64);
+        for bad in ["", "zz", non_hex.as_str(), &real[..63]] {
+            assert!(
+                reject_compose_images(&[bad.to_string()]).is_some(),
+                "{bad:?} is not a 64-character hex blob address"
+            );
+        }
+    }
+
+    /// The count cap still holds, and both image paths report it the same way.
+    #[test]
+    fn more_hashes_than_the_cap_are_refused_with_the_shared_message() {
+        let hashes: Vec<String> = (0..=MAX_COMPOSE_IMAGES)
+            .map(|i| format!("{i:064x}"))
+            .collect();
+        let err = reject_compose_images(&hashes).expect("over the cap is a refusal");
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(err.message, too_many_compose_images().message);
+    }
 }

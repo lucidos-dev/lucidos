@@ -22,7 +22,7 @@ const INTENT_EXECUTION_RULES: &str = "\
 tokio::task_local! {
     /// Current `execute_intent` nesting depth on this task. Read at the top of
     /// `handle_execute_intent`; the inner sub-loop runs scoped to `depth + 1`.
-    static INTENT_DEPTH: u32;
+    pub(crate) static INTENT_DEPTH: u32;
 }
 
 /// True when an `execute_intent` call at `current_depth` must be refused to

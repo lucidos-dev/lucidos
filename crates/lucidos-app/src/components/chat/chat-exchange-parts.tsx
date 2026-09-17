@@ -468,6 +468,12 @@ interface InitiatorPanelProps {
   collapsible: boolean;
   collapsed: boolean;
   onToggle?: (e: MouseEvent) => void;
+  /** Delegated click for the BODY, which is the transcript's link router.
+   *  This panel draws markdown too: the reader's own message, an injected
+   *  prompt, a trigger prompt, a child thread's summary. Without the router an
+   *  anchor in any of them is the browser's, and a relative one reloads the
+   *  whole workspace (ADR 0038). */
+  onBodyClick?: (e: MouseEvent) => void;
   /** User message → render the body as a right-aligned gray bubble. */
   bubble?: boolean;
   /** Drop the actor chip (icon + name) entirely — used for user messages and
@@ -489,7 +495,7 @@ function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
   );
 }
 
-export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle, bubble = false, chromeless = false }: InitiatorPanelProps) {
+export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
   // A chromeless turn whose summary opens the popover renders that summary as a
@@ -552,7 +558,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
         </span>
       </div>
       {hasBody && !collapsed && (
-        <div class="initiator-body">
+        <div class="initiator-body" onClick={onBodyClick}>
           {initiator.summary && (summaryLinks ? (
             <button type="button" class="initiator-summary initiator-summary-link" onClick={onActorClick}>
               {initiator.summary}
@@ -991,28 +997,32 @@ export function SpokenChip() {
  *  Plain text, never markdown. This is a transcript of speech, and there was
  *  no formatting to lose.
  *
+ *  **It carries no liveness mark, and nothing here could honestly carry one**
+ *  (ADR 0197). The live row is retired by the engine's own row, written at the
+ *  next move of the conversation (ADR 0188, ADR 0191). A finished sentence
+ *  therefore stands here until the caller speaks again, and a mark on it says
+ *  "more is coming" about a reply that ended.
+ *
+ *  Gating it on the call phase is the obvious repair and is worse: a pause is
+ *  not the end of a reply, so the mark would blink several times through one
+ *  bubble. The caller's own bubble keeps the mark because there the client IS
+ *  told the words are final, the provider ending the turn.
+ *
  *  Not a `.step`: a reply the caller heard is a *transcript marker*. No audio
  *  is kept, so the steps control would hide the only record of it. */
 export function SpokenReply(
-  { event, live }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }>; live?: boolean },
+  { event }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }> },
 ) {
-  const saying = live ?? event.live === true;
   return (
-    <div class="spoken-reply" data-role="spoken-reply" data-live={saying ? 'true' : undefined}>
+    <div class="spoken-reply" data-role="spoken-reply">
       {/* The mark is drawn once per RUN, and the slot is kept either way so
           the bubbles below it stay on the same left edge. */}
       <span class="spoken-reply-who" aria-hidden={event.follows ? 'true' : undefined}>
         {!event.follows && <CallIcon />}
-        {!event.follows && (
-          <span class="visually-hidden">{saying ? 'Saying aloud' : 'Said aloud'}</span>
-        )}
+        {!event.follows && <span class="visually-hidden">{'Said aloud'}</span>}
       </span>
       <span class="spoken-reply-text">
         {event.text}
-        {/* Still being said, so the words are still arriving. The caret marks
-            where the next one lands, which is what tells a reply in progress
-            from one that stopped there. */}
-        {saying && <span class="live-caret" aria-hidden="true" />}
         {/* The caller talked over it, so the text stops where they cut in. */}
         {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
       </span>
@@ -1020,22 +1030,46 @@ export function SpokenReply(
   );
 }
 
+/** ONE mark for "the caller's words are still arriving".
+ *
+ *  Three bars that rise and fall, which is what speech looks like. Their bubble
+ *  opens on them before a word exists. The words then push them along as they
+ *  arrive, and they go when the provider ends the turn.
+ *
+ *  **The caller's side only.** The talker's reply draws no mark at all, and
+ *  `SpokenReply` carries the reasoning (ADR 0197).
+ *
+ *  A blinking caret was the earlier shape, and it is gone: a text cursor is a
+ *  typing metaphor, and nobody types on a call.
+ *
+ *  Hidden from a screen reader, which has no animation to read. Whoever draws
+ *  it says the same thing in words. */
+export function LiveSpeechMark() {
+  return (
+    <span class="live-speech-mark" data-role="live-speech-mark" aria-hidden="true">
+      <span class="live-speech-bar" />
+      <span class="live-speech-bar" />
+      <span class="live-speech-bar" />
+    </span>
+  );
+}
+
 /** What a caller's bubble holds once the provider has heard some of it.
  *
- *  Plain text and a caret, on one line. NOT the markdown path a finished
+ *  Plain text and the mark, on one line. NOT the markdown path a finished
  *  message takes: a partial is a sentence cut mid-word, so half an emphasis
  *  marker or a stray backtick would render as markup the caller never meant.
  *
- *  Inline, so the caret hugs the last word rather than dropping below the
- *  block a rendered paragraph would make.
+ *  Inline, so the mark hugs the last word rather than dropping below the block
+ *  a rendered paragraph would make.
  *
- *  It carries the pulse's hidden phrase, so the bubble reads the same to a
- *  screen reader whichever of the two it holds. */
+ *  It carries the empty bubble's hidden phrase, so the bubble reads the same to
+ *  a screen reader whichever of the two it holds. */
 export function LivePartialBody({ text }: { text: string }) {
   return (
     <span class="live-partial" data-role="live-partial">
       {text}
-      <span class="live-caret" aria-hidden="true" />
+      <LiveSpeechMark />
       <span class="visually-hidden">{HEARING_YOU}</span>
     </span>
   );
@@ -1043,7 +1077,7 @@ export function LivePartialBody({ text }: { text: string }) {
 
 /** What a caller's bubble holds before any words at all.
  *
- *  Three bars in the slot the words will fill, so the swap to text moves
+ *  The mark alone, in the slot the words will fill, so the swap to text moves
  *  nothing around it. Drawn until the first partial arrives, and for the whole
  *  utterance when the transcriber streams none.
  *
@@ -1056,9 +1090,7 @@ export function LivePartialBody({ text }: { text: string }) {
 export function LiveUtteranceBody() {
   return (
     <span class="live-utterance" data-role="live-utterance">
-      <span class="live-utterance-bar" />
-      <span class="live-utterance-bar" />
-      <span class="live-utterance-bar" />
+      <LiveSpeechMark />
       <span class="visually-hidden">{HEARING_YOU}</span>
     </span>
   );

@@ -61,3 +61,8 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 tempfile = "3"
+# A self-signed cert for the https stand-in gateway in `peers_tests.rs`. Minted
+# per run rather than checked in, so no test starts failing on an expiry date.
+# Pinned to the `aws_lc_rs` backend `rustls` above already uses, so this adds no
+# second crypto stack.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }

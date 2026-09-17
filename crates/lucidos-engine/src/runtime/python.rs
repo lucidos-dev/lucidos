@@ -24,6 +24,18 @@ use std::time::Duration;
 /// it would break setup rather than a runaway.
 const EXECUTION_TIMEOUT_SECS: u64 = crate::llm::tools::MAX_TIMEOUT_SECS;
 
+/// How long a run's exhaust dir survives before the next `PythonRuntime::new`
+/// reclaims it.
+///
+/// A sweep is needed at all because nothing else prunes the sink: a one-minute
+/// script trigger mints 1,440 dirs a day and the volume fills with no warning.
+/// A blanket wipe is the wrong sweep, because `system-knowhow/running-python.md`
+/// points debugging at `.lucidos/exhaust/<run_id>/stderr.txt`.
+///
+/// Seven days keeps that affordance for the Friday failure a user reads on
+/// Monday. It caps the same trigger near 10,000 dirs instead of 525,000 a year.
+const EXHAUST_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Python bootstrap module dropped into the venv's `site-packages/` as
 /// `_lucidos_agent_origin.py` by `PythonRuntime::install_agent_origin_shim`,
 /// loaded via a sibling `_lucidos_agent_origin.pth` whose single line is
@@ -138,6 +150,9 @@ impl PythonRuntime {
     /// Build the Python runtime rooted at the canonicalized `workspace_path`.
     /// Returns `Err` if canonicalization fails — a missing or unreadable
     /// workspace at boot must surface as engine-startup failure.
+    ///
+    /// Two sweeps run here. `.lucidos/staging` is wiped, and `.lucidos/exhaust`
+    /// loses every run dir past `EXHAUST_RETENTION`.
     pub fn new(workspace_path: PathBuf) -> Result<Self, String> {
         let workspace_path = workspace_path.canonicalize().map_err(|e| {
             format!(
@@ -154,6 +169,9 @@ impl PythonRuntime {
                 e
             );
         }
+        // The staging sweep below wipes its tree wholesale. A run dir is a
+        // documented debugging affordance, so it ages out instead.
+        Self::sweep_stale_run_dirs(&exhaust_path);
 
         // Clean up orphaned staging dirs from previous crashed runs
         let staging_root = workspace_path.join(".lucidos/staging");
@@ -177,6 +195,50 @@ impl PythonRuntime {
             python_bin,
             execution_timeout: Duration::from_secs(EXECUTION_TIMEOUT_SECS),
         })
+    }
+
+    /// Reclaim every run dir past `EXHAUST_RETENTION`. Runs once per engine
+    /// start, so the whole cost is one `read_dir` of the exhaust root.
+    ///
+    /// Destructive, so it deletes only what it can prove is a spent run dir: a
+    /// real directory, named by the UUID `new_run_dir` mints, with a
+    /// readable mtime past the window. `file_type` reports a symlink without
+    /// following it, so a link planted here is never a delete of its target.
+    /// Anything the probe cannot answer is kept, because an unreadable entry is
+    /// not evidence of an expired one.
+    fn sweep_stale_run_dirs(exhaust_path: &std::path::Path) {
+        let Ok(entries) = fs::read_dir(exhaust_path) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let named_by_run_id = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok());
+            if !named_by_run_id || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            // An mtime in the future yields `Err` and keeps the dir, which is
+            // the safe side of a clock that jumped.
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age <= EXHAUST_RETENTION {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(e) = fs::remove_dir_all(&path) {
+                log!(
+                    "[Python] Failed to reclaim stale exhaust dir {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
     }
 
     /// Shorten the hard ceiling. Test-only: the regression coverage for the
@@ -517,6 +579,19 @@ impl PythonRuntime {
     /// diverted into staging, and since the committer only copies `<staging>/data`
     /// before deleting the whole staging tree, they were silently discarded while the
     /// tool still reported success.
+    ///
+    /// `_data_root` is realpath'd, exactly like the paths matched against it.
+    /// A `data` symlink onto another volume is a supported layout, and against
+    /// an unresolved root no write ever matched: every `data/` write landed on
+    /// the host, and the committer then found no staged tree to publish. The
+    /// staged layout stays `<staging>/data/<rel>` either way, which is the one
+    /// shape the committer reads back.
+    ///
+    /// The write branch seeds the staged file from the real one first. A mode
+    /// holding `w` truncates, so it is never seeded. Every other write mode
+    /// (`a`, `r+`, `x`) keeps what the file already held, and an empty staged
+    /// file loses it. The seed runs once per run: a later open must not
+    /// overwrite bytes this run already staged.
     fn staging_preamble(&self, staging_dir: &std::path::Path) -> String {
         let workspace = self.workspace_str_escaped();
         let staging = staging_dir
@@ -526,10 +601,14 @@ impl PythonRuntime {
             .replace('\\', "\\\\")
             .replace('\'', "\\'");
         format!(
-            "import builtins as _builtins, os as _os\n\
+            "import builtins as _builtins, os as _os, shutil as _shutil\n\
              _workspace = _os.path.realpath('{workspace}')\n\
              _staging = _os.path.realpath('{staging}')\n\
-             _data_dir = _os.path.join(_workspace, 'data') + _os.sep\n\
+             _data_root = _os.path.realpath(_os.path.join(_workspace, 'data'))\n\
+             _data_dir = _data_root + _os.sep\n\
+             def _staged_path(real):\n\
+             \x20   rel = _os.path.relpath(real, _data_root)\n\
+             \x20   return _os.path.join(_staging, 'data', rel)\n\
              def _staged_open(file, mode='r', *args, _orig=_builtins.open, **kwargs):\n\
              \x20   if not isinstance(file, (str, bytes, _os.PathLike)):\n\
              \x20       return _orig(file, mode, *args, **kwargs)\n\
@@ -537,13 +616,15 @@ impl PythonRuntime {
              \x20   is_write = any(c in str(mode) for c in 'wxa+')\n\
              \x20   if is_write:\n\
              \x20       if real.startswith(_data_dir):\n\
-             \x20           rel = _os.path.relpath(real, _workspace)\n\
-             \x20           staged = _os.path.join(_staging, rel)\n\
+             \x20           staged = _staged_path(real)\n\
              \x20           _os.makedirs(_os.path.dirname(staged), exist_ok=True)\n\
+             \x20           truncating = 'w' in str(mode)\n\
+             \x20           fresh = not _os.path.exists(staged)\n\
+             \x20           if not truncating and fresh and _os.path.exists(real):\n\
+             \x20               _shutil.copy2(real, staged)\n\
              \x20           return _orig(staged, mode, *args, **kwargs)\n\
              \x20   elif real.startswith(_data_dir):\n\
-             \x20       rel = _os.path.relpath(real, _workspace)\n\
-             \x20       staged = _os.path.join(_staging, rel)\n\
+             \x20       staged = _staged_path(real)\n\
              \x20       if _os.path.exists(staged):\n\
              \x20           return _orig(staged, mode, *args, **kwargs)\n\
              \x20   return _orig(file, mode, *args, **kwargs)\n\
@@ -750,3 +831,95 @@ pub(crate) fn truncate_python_error(stderr: &str) -> String {
 #[cfg(test)]
 #[path = "python_tests.rs"]
 mod tests;
+
+/// A non-truncating write must not lose the artifact it writes into. The
+/// committer copies the staged file over the real one, so a staged file that
+/// starts empty erases whatever the artifact held.
+#[cfg(test)]
+mod staging_seed_tests {
+    use super::PythonRuntime;
+    use tempfile::tempdir;
+
+    /// An append keeps the lines the artifact already held. Without the seed the
+    /// staged file starts empty and the commit drops every earlier line.
+    #[tokio::test]
+    async fn an_append_to_an_existing_data_file_keeps_the_prior_contents() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/log.jsonl"), "one\ntwo\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/append-run");
+        let out = runtime
+            .execute_staged(
+                "open('data/artifacts/log.jsonl', 'a').write('three\\n')\nprint('done')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("the append must succeed");
+        assert_eq!(out.trim(), "done");
+
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/log.jsonl")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the staged file is what the committer copies over the artifact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/log.jsonl")).unwrap(),
+            "one\ntwo\n",
+            "the real artifact stays untouched until the engine commits"
+        );
+    }
+
+    /// A `w` mode still truncates. The caller asked to discard the old bytes, so
+    /// seeding here would hand them straight back.
+    #[tokio::test]
+    async fn a_truncating_write_to_an_existing_data_file_still_truncates() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/report.csv"), "stale,rows\n1,2\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/truncate-run");
+        runtime
+            .execute_staged(
+                "open('data/artifacts/report.csv', 'w').write('fresh\\n')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("the truncating write must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/report.csv")).unwrap(),
+            "fresh\n",
+            "a 'w' mode asked for truncation, so the seed must be skipped"
+        );
+    }
+
+    /// `r+` opens for update and does not create the file. Without the seed it
+    /// raises FileNotFoundError on an artifact that plainly exists.
+    #[tokio::test]
+    async fn an_update_mode_open_reads_an_existing_data_file() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/notes.txt"), "hello\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/update-run");
+        let out = runtime
+            .execute_staged(
+                "with open('data/artifacts/notes.txt', 'r+') as f:\n    print(f.read().strip())",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("r+ on an existing artifact must not raise");
+
+        assert_eq!(out.trim(), "hello");
+    }
+}

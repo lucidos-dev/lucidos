@@ -78,6 +78,23 @@ const ANSWER_NO_IMAGES_TOOLTIP = 'Answers are text only';
  *  text, so there it stays the plain "Stop". */
 export const ANSWER_CANCEL_TOOLTIP = 'Cancel this question and ask something else';
 
+/** The legacy `keyCode` a browser reports for a key the IME swallowed. */
+const IME_HANDLED_KEYCODE = 229;
+
+/** Whether this keydown belongs to an IME composition, and so is not a command.
+ *
+ *  A Japanese, Chinese or Korean user presses Enter to COMMIT the candidate the
+ *  IME is showing. The browser dispatches that keydown before `compositionend`,
+ *  so an ungated Enter branch sends the half-converted text to the agent.
+ *
+ *  `isComposing` is the standard reading, and the one `shouldTypeToFocusPrompt`
+ *  takes in `hooks/useKeyboardShortcuts.ts`. The `keyCode` arm covers browsers
+ *  that report only the sentinel. Pure, and exported for testing and for
+ *  `ThreadTitleEditor`, whose Enter carries the same hazard. */
+export function isImeComposingKey(e: Pick<KeyboardEvent, 'isComposing' | 'keyCode'>): boolean {
+  return e.isComposing || e.keyCode === IME_HANDLED_KEYCODE;
+}
+
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
     showToast('Failed to attach image: ' + errorDetail(err), 'error');
@@ -364,6 +381,10 @@ export function PromptInput() {
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    // Nothing here acts on a keystroke the IME owns. Ahead of the Escape branch
+    // as well as the Enter one. Escape mid-composition cancels the candidate,
+    // and taking it here would abort the running turn instead.
+    if (isImeComposingKey(e)) return;
     if (e.key === 'Escape') {
       // Escape reaches the textarea only when no overlay is open: the central
       // overlay stack handles it first, in the capture phase, and stops

@@ -49,6 +49,9 @@ pub struct MockVoiceProvider {
     log: Arc<Mutex<MockLog>>,
     open_error: Option<String>,
     ends_after_script: bool,
+    /// What the seam member of the same name answers. See
+    /// [`MockVoiceProvider::holding_no_answer_tool`].
+    holds_the_answer_tool: bool,
 }
 
 impl MockVoiceProvider {
@@ -66,7 +69,17 @@ impl MockVoiceProvider {
             log: Arc::new(Mutex::new(MockLog::default())),
             open_error: None,
             ends_after_script: false,
+            holds_the_answer_tool: true,
         }
+    }
+
+    /// A talker with no way to hand a choice id back, as a Live one has.
+    ///
+    /// The whole of what separates the two providers here, so a test states
+    /// which side it is about rather than naming one.
+    pub fn holding_no_answer_tool(mut self) -> Self {
+        self.holds_the_answer_tool = false;
+        self
     }
 
     /// A talker the test drives one event at a time.
@@ -111,6 +124,7 @@ impl MockVoiceProvider {
             log: Arc::new(Mutex::new(MockLog::default())),
             open_error: Some(message.to_string()),
             ends_after_script: false,
+            holds_the_answer_tool: true,
         }
     }
 
@@ -128,6 +142,10 @@ impl VoiceProvider for MockVoiceProvider {
 
     fn model(&self) -> &str {
         "mock-talker"
+    }
+
+    fn holds_the_answer_tool(&self) -> bool {
+        self.holds_the_answer_tool
     }
 
     async fn open(&self, opening: SessionOpening) -> Result<Box<dyn VoiceSession>, BoxError> {

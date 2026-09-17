@@ -17,7 +17,6 @@ import { createLiveUtteranceBridge, installLiveUtteranceRow, liveUtteranceId } f
 import { effectiveThreadStatus, threadMap } from '../store';
 import { voiceCall } from '../voice';
 import {
-  activeExchangeIndex,
   computeExchanges,
   handleEvent,
   isLiveReplyRow,
@@ -141,7 +140,7 @@ describe('the row holds no turn', () => {
 
   it('leaves the live stream with the turn that is producing it', () => {
     const exchanges = computeExchanges(speakingOverADoer());
-    expect(activeExchangeIndex(exchanges, /* busy */ true)).toBe(0);
+    expect(queuedFollowupRun(exchanges, /* busy */ true).activeIndex).toBe(0);
   });
 
   it('is never the active exchange on an idle thread either', () => {

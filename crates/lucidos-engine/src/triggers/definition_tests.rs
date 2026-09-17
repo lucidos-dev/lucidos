@@ -1,19 +1,19 @@
 use super::{
     ensure_trigger_toml_gitignored, rebuild_trigger_definitions, remove_trigger_definition,
-    trigger_toml_data_relpath, write_trigger_definition, TriggerDefinition,
+    write_trigger_definition, TriggerDefinition,
 };
 use crate::engine::command_guard::SideEffectCategory;
 use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "lucidos_trigger_defn_{}_{}",
-        name,
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+/// A private fixture workspace, removed when the guard drops. Hold the guard
+/// for as long as the test reads the tree: dropping it deletes the directory.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("lucidos_trigger_defn_{name}_");
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
@@ -164,18 +164,19 @@ fn from_config_drops_runtime_state() {
 
 #[test]
 fn writes_then_removes_definition_and_prunes_empty_dir() {
-    let ws = tmpdir("write_remove");
+    let tmp = tmpdir("write_remove");
+    let ws = tmp.path();
     let c = config(
         "watcher",
         TriggerRun::Intent {
             intent: "watch".to_string(),
         },
     );
-    write_trigger_definition(&ws, &c);
-    let file = ws.join("data").join(trigger_toml_data_relpath("watcher"));
+    write_trigger_definition(ws, &c);
+    let file = ws.join("data/triggers/watcher/trigger.toml");
     assert!(file.exists(), "trigger.toml should be written");
 
-    remove_trigger_definition(&ws, "watcher");
+    remove_trigger_definition(ws, "watcher");
     assert!(!file.exists(), "trigger.toml should be removed");
     assert!(
         !ws.join("data/triggers/watcher").exists(),
@@ -185,19 +186,20 @@ fn writes_then_removes_definition_and_prunes_empty_dir() {
 
 #[test]
 fn remove_keeps_dir_with_sibling_knowhow() {
-    let ws = tmpdir("keep_sibling");
+    let tmp = tmpdir("keep_sibling");
+    let ws = tmp.path();
     let c = config(
         "keeper",
         TriggerRun::Intent {
             intent: "k".to_string(),
         },
     );
-    write_trigger_definition(&ws, &c);
+    write_trigger_definition(ws, &c);
     let knowhow = ws.join("data/triggers/keeper/knowhow");
     std::fs::create_dir_all(&knowhow).unwrap();
     std::fs::write(knowhow.join("notes.md"), "hi").unwrap();
 
-    remove_trigger_definition(&ws, "keeper");
+    remove_trigger_definition(ws, "keeper");
     assert!(!ws.join("data/triggers/keeper/trigger.toml").exists());
     // Sibling knowhow → the dir must survive (only trigger.toml is pruned).
     assert!(
@@ -208,7 +210,8 @@ fn remove_keeps_dir_with_sibling_knowhow() {
 
 #[test]
 fn rebuild_writes_live_and_prunes_orphans() {
-    let ws = tmpdir("rebuild");
+    let tmp = tmpdir("rebuild");
+    let ws = tmp.path();
     // Seed an orphan trigger.toml that is NOT in the live set.
     let orphan = ws.join("data/triggers/gone/trigger.toml");
     std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
@@ -220,7 +223,7 @@ fn rebuild_writes_live_and_prunes_orphans() {
             intent: "live".to_string(),
         },
     )];
-    rebuild_trigger_definitions(&ws, &live);
+    rebuild_trigger_definitions(ws, &live);
 
     assert!(
         ws.join("data/triggers/alive/trigger.toml").exists(),
@@ -231,14 +234,55 @@ fn rebuild_writes_live_and_prunes_orphans() {
 
 #[test]
 fn ensure_gitignored_is_idempotent() {
-    let ws = tmpdir("gitignore");
+    let tmp = tmpdir("gitignore");
+    let ws = tmp.path();
     std::fs::create_dir_all(ws.join(".git/info")).unwrap();
-    ensure_trigger_toml_gitignored(&ws);
-    ensure_trigger_toml_gitignored(&ws);
+    ensure_trigger_toml_gitignored(ws);
+    ensure_trigger_toml_gitignored(ws);
     let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
     let occurrences = exclude
         .lines()
         .filter(|l| l.trim() == "data/triggers/*/trigger.toml")
         .count();
     assert_eq!(occurrences, 1, "pattern added exactly once");
+}
+
+#[test]
+fn ensure_gitignored_appends_to_the_users_existing_patterns() {
+    let tmp = tmpdir("gitignore_append");
+    let ws = tmp.path();
+    let exclude = ws.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    std::fs::write(&exclude, "*.swp\nscratch/\n").unwrap();
+
+    ensure_trigger_toml_gitignored(ws);
+
+    let text = std::fs::read_to_string(&exclude).unwrap();
+    assert!(text.contains("*.swp"), "user pattern kept: {text}");
+    assert!(text.contains("scratch/"), "user pattern kept: {text}");
+    assert!(text.contains("data/triggers/*/trigger.toml"));
+}
+
+/// An unreadable exclude file is left exactly as it was.
+///
+/// The read used to `unwrap_or_default`. A non-UTF-8 byte then read as an
+/// empty file, and the write replaced every pattern the user had.
+#[test]
+fn ensure_gitignored_leaves_an_unreadable_exclude_untouched() {
+    let tmp = tmpdir("gitignore_unreadable");
+    let ws = tmp.path();
+    let exclude = ws.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    // A lone 0xFF byte is not valid UTF-8, so `read_to_string` fails with
+    // `InvalidData` rather than reporting a missing file.
+    let original: Vec<u8> = b"# keep me\nsecrets.env\n\xFF\n".to_vec();
+    std::fs::write(&exclude, &original).unwrap();
+
+    ensure_trigger_toml_gitignored(ws);
+
+    assert_eq!(
+        std::fs::read(&exclude).unwrap(),
+        original,
+        "an unreadable exclude file must not be rewritten"
+    );
 }

@@ -14,7 +14,8 @@ interface Props {
  *  - Chevron toggles the per-device collapsed state (localStorage-backed).
  *  - Member-count badge shows how many triggers are assigned.
  *  - Inline rename: the rename button reveals an edit field over the name.
- *  - Delete: refused when non-empty; the action handler surfaces the toast.
+ *  - Delete: always live. A non-empty group is refused by the server, and the
+ *    action handler surfaces that refusal as a toast.
  */
 export function TriggerGroupHeader({ group }: Props) {
   const collapsed = collapsedTriggerGroupIds.value.has(group.id);
@@ -123,13 +124,19 @@ export function TriggerGroupHeader({ group }: Props) {
         >
           <EditIcon />
         </button>
+        {/* Never `disabled`, however many triggers the group holds. ADR 0168:
+            `.icon-btn:disabled` sets `pointer-events: none`, so the tooltip that
+            states the block is the one thing a disabled button cannot show, on
+            hover or on long press. The button stays live and the server owns the
+            refusal, which `deleteTriggerGroup` reports as a toast naming the
+            count. Same rule as the change actions, pinned by
+            `changes/__tests__/no-disabled-change-action.test.tsx`. */}
         <button
           class="icon-btn row-icon trigger-group-delete"
           type="button"
           onClick={e => { e.stopPropagation(); void deleteTriggerGroup(group.id, group.name); }}
           aria-label={`Delete group “${group.name}”`}
           data-tooltip={group.member_count > 0 ? 'Move triggers out first' : 'Delete group'}
-          disabled={group.member_count > 0}
         >
           <TrashIcon />
         </button>

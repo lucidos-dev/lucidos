@@ -36,9 +36,13 @@ pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
 /// The six per-provider enable switches, in the order [`ProviderSwitches`]
-/// declares them. One list, so the preference catalog, the subscriber's watch
-/// set and the tests cannot drift apart.
-pub const PROVIDER_ENABLED_KEYS: [&str; 6] = [
+/// declares them.
+///
+/// [`PROVIDER_PREFERENCE_KEYS`] is built from this list, so the config
+/// subscriber cannot end up watching a subset of it. The preference catalog
+/// spells the keys itself, and `no_switch_is_agent_settable` below is what
+/// holds those two together.
+pub(crate) const PROVIDER_ENABLED_KEYS: [&str; 6] = [
     PREF_PROVIDER_ENABLED_VERTEX,
     PREF_PROVIDER_ENABLED_ANTHROPIC,
     PREF_PROVIDER_ENABLED_OPENAI,
@@ -57,12 +61,12 @@ pub const PROVIDER_ENABLED_KEYS: [&str; 6] = [
 pub const PROVIDER_PREFERENCE_KEYS: [&str; 8] = [
     PREF_OPENCODE_FREE_ENABLED,
     PREF_LOCAL_BASE_URL,
-    PREF_PROVIDER_ENABLED_VERTEX,
-    PREF_PROVIDER_ENABLED_ANTHROPIC,
-    PREF_PROVIDER_ENABLED_OPENAI,
-    PREF_PROVIDER_ENABLED_OPENROUTER,
-    PREF_PROVIDER_ENABLED_XAI,
-    PREF_PROVIDER_ENABLED_LOCAL,
+    PROVIDER_ENABLED_KEYS[0],
+    PROVIDER_ENABLED_KEYS[1],
+    PROVIDER_ENABLED_KEYS[2],
+    PROVIDER_ENABLED_KEYS[3],
+    PROVIDER_ENABLED_KEYS[4],
+    PROVIDER_ENABLED_KEYS[5],
 ];
 
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
@@ -214,25 +218,139 @@ struct DirectProviders {
     search_backends: Vec<Arc<dyn WebSearchProvider>>,
 }
 
-/// Read a provider credential as an `(auth_type, auth_value)` pair. A read
-/// error logs and degrades to `None`, so boot still comes up on the other
-/// providers. `display_name` names the provider in that log line.
+/// A credential read that FAILED, as distinct from one that found nothing.
+///
+/// The two must never collapse into `None` unremarked. A failed read that
+/// falls through to the environment runs later turns on whatever account that
+/// key names. That may not be the stored one.
+///
+/// It still falls through, and the log line is what makes that safe. Dropping
+/// the provider instead was tried and reverted. An engine configured by
+/// `ANTHROPIC_API_KEY` alone has no stored credential to be wrong about. One
+/// pool error at boot then left it with no provider, and `main` panicked on a
+/// key that was set. Loud and working beats silent either way.
+struct CredentialUnreadable;
+
+/// Read a provider credential as an `(auth_type, auth_value)` pair.
+///
+/// `Ok(None)` is "nothing stored". `Err` is "could not read", which the caller
+/// resolves from the environment while saying so. `display_name` names it.
 async fn read_credential_pair(
     pool: &PgPool,
     service: &str,
     display_name: &str,
-) -> Option<(AuthType, String)> {
+) -> Result<Option<(AuthType, String)>, CredentialUnreadable> {
     match CredentialStore::get(pool, service).await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
+        Ok(cred) => Ok(cred.map(|c| (c.auth_type, c.auth_value))),
         Err(e) => {
             crate::log!(
-                "[Startup] Failed to read {} credential: {}",
+                "[Startup] WARNING: could not read the {} credential ({}). \
+                 Falling back to the environment, which may name a different \
+                 account than the stored one.",
                 display_name,
+                e
+            );
+            Err(CredentialUnreadable)
+        }
+    }
+}
+
+/// The stored half of the provider material: credentials and preferences.
+///
+/// `switches` arrives as the user's vetoes, and leaves with `local` forced off
+/// if its base URL could not be read. Local is the one provider whose address
+/// is stored rather than fixed. An unreadable one would send the stored key to
+/// the default host instead of the configured one.
+///
+/// The hosted providers do NOT get that treatment. Their address is fixed, so a
+/// failed read costs only the account, which the log line names. A DB-down boot
+/// uses [`StoredInputs::default`], every field absent, so the env fallbacks
+/// still apply and nothing stored can veto.
+#[derive(Default)]
+struct StoredInputs {
+    anthropic: Option<(AuthType, String)>,
+    openai: Option<(AuthType, String)>,
+    openrouter: Option<(AuthType, String)>,
+    xai: Option<(AuthType, String)>,
+    opencode_free_pref: Option<String>,
+    local_base: Option<String>,
+    local_key: Option<String>,
+    switches: ProviderSwitches,
+}
+
+/// Read every stored credential and preference the build needs, in one place.
+async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> StoredInputs {
+    // An unreadable read leaves the field `None`, so the env fallback still
+    // applies. `read_credential_pair` has already logged which provider it
+    // was and that the account may differ.
+    let mut stored = StoredInputs {
+        anthropic: read_credential_pair(pool, "anthropic", "Anthropic")
+            .await
+            .unwrap_or(None),
+        openai: read_credential_pair(pool, "openai", "OpenAI")
+            .await
+            .unwrap_or(None),
+        openrouter: read_credential_pair(pool, "openrouter", "OpenRouter")
+            .await
+            .unwrap_or(None),
+        xai: read_credential_pair(pool, "xai", "xAI")
+            .await
+            .unwrap_or(None),
+        ..StoredInputs::default()
+    };
+
+    // OpenCode Free is a preference, not a credential. Nothing is read from the
+    // credential store and nothing is sent as a bearer. An unreadable
+    // preference costs the tier, never a key.
+    stored.opencode_free_pref = match PreferenceStore::get(pool, PREF_OPENCODE_FREE_ENABLED).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to read opencode_free_enabled preference: {}",
                 e
             );
             None
         }
+    };
+
+    // Local OpenAI-compatible: the `local_base_url` preference plus an optional
+    // `local` credential. Either read failing drops the provider, because the
+    // default base URL would send a stored key to another host.
+    match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
+        Ok(opt) => stored.local_base = opt,
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to read local_base_url preference, omitting local: {}",
+                e
+            );
+            switches.local = false;
+        }
+    }
+    match CredentialStore::get(pool, "local").await {
+        Ok(cred) => stored.local_key = cred.map(|c| c.auth_value),
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to read local provider credential, omitting local: {}",
+                e
+            );
+            switches.local = false;
+        }
+    }
+
+    stored.switches = switches;
+    stored
+}
+
+/// Build a provider only when its switch is on.
+///
+/// The veto has to gate the BUILDER, not its result. `build_x(..).filter(..)`
+/// logs "provider configured" for a provider the router never receives. That
+/// is the line a user reads when a switch looks like it did nothing.
+fn if_enabled<T>(enabled: bool, build: impl FnOnce() -> Option<T>) -> Option<T> {
+    if enabled {
+        build()
+    } else {
+        None
     }
 }
 
@@ -241,8 +359,14 @@ async fn read_credential_pair(
 /// fallbacks (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 /// `LUCIDOS_OPENROUTER_API_KEY`, `LUCIDOS_LOCAL_*`) and the Codex-detected
 /// OpenAI key all still apply, but stored credentials and the `local_base_url`
-/// preference can't be read. Every field degrades to `None` / an omitted backend
-/// on any read/build error so the engine still comes up on its other providers.
+/// preference can't be read. Every field degrades to `None` / an omitted
+/// backend on a BUILD error, so the engine still comes up on its other
+/// providers. A stored credential that cannot be READ is a different case and
+/// drops its provider: see [`CredentialUnreadable`].
+///
+/// ONE build path serves both. The degraded boot used to re-spell the seven
+/// builders, the search chain and the result literal. That chain's order is a
+/// cost decision, so a reorder could have reached one copy only.
 ///
 /// `switches` vetoes a provider the user has switched off, and takes its
 /// credential's search backend down with it: a provider that is off must not
@@ -256,115 +380,66 @@ async fn resolve_direct_providers(
     anthropic_env_key: Option<String>,
     switches: ProviderSwitches,
 ) -> DirectProviders {
-    let Some(pool) = pool else {
+    let StoredInputs {
+        anthropic: anthropic_credential,
+        openai: openai_credential,
+        openrouter: openrouter_credential,
+        xai: xai_credential,
+        opencode_free_pref,
+        local_base,
+        local_key,
+        switches,
+    } = match pool {
+        Some(pool) => read_stored_inputs(pool, switches).await,
         // No DB access, but the env-var + Codex fallbacks must still work. The
         // switches live in the preferences table, so on this path they are the
-        // all-on default and there is nothing to veto.
-        let openai_key = resolve_openai_api_key(None, openai_env_key, openai_codex_key);
-        let openai = build_openai_provider(openai_key.clone(), default_model);
-        let anthropic_auth = resolve_anthropic_auth(None, anthropic_env_key);
-        let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
-        let openrouter = build_openrouter_provider(
-            None,
-            std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
-            default_model,
-        );
-        let xai = build_xai_provider(
-            None,
-            std::env::var("LUCIDOS_XAI_API_KEY").ok(),
-            default_model,
-        );
-        let opencode_free = build_opencode_free_provider(None, default_model);
-        let local = build_local_provider(None, None, default_model);
-        // Same chain order as the DB-up path below: Anthropic, then OpenAI.
-        let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
-            anthropic_search_backend(anthropic_auth, registry, default_model)
-                .into_iter()
-                .collect();
-        search_backends.extend(openai_search_backend(openai_key, registry, default_model));
-        return DirectProviders {
-            openai,
-            anthropic,
-            openrouter,
-            xai,
-            opencode_free,
-            local,
-            search_backends,
-        };
+        // caller's all-on default and there is nothing stored to veto.
+        None => StoredInputs {
+            switches,
+            ..StoredInputs::default()
+        },
     };
 
     // Anthropic: a stored `anthropic` credential wins; otherwise the env
     // fallback. Resolved once and held past provider construction so the search
     // backend is built from the same auth (`AnthropicProvider` keeps its copy
     // private), which is also what stops the two disagreeing about which source
-    // won.
-    let anthropic_credential = read_credential_pair(pool, "anthropic", "Anthropic").await;
-    // The veto is applied to the resolved AUTH rather than to the built
-    // provider, so the search backend below drops with it: they are built from
-    // this one value precisely so they cannot disagree.
+    // won. The veto is applied to the resolved AUTH rather than to the built
+    // provider, so the search backend below drops with it.
     let anthropic_auth = resolve_anthropic_auth(anthropic_credential, anthropic_env_key)
         .filter(|_| switches.anthropic);
     let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
 
     // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
-    let openai_credential = read_credential_pair(pool, "openai", "OpenAI").await;
     // Resolved once and reused: the provider needs it, and so does the OpenAI
     // search backend. Vetoed at the key, for the reason given above Anthropic's.
     let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key)
         .filter(|_| switches.openai);
     let openai = build_openai_provider(openai_key.clone(), default_model);
 
-    // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
-    let openrouter_credential = read_credential_pair(pool, "openrouter", "OpenRouter").await;
-    let openrouter = build_openrouter_provider(
-        openrouter_credential,
-        std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
-        default_model,
-    )
-    .filter(|_| switches.openrouter);
+    // OpenRouter and xAI: a stored credential wins; otherwise the env fallback.
+    let openrouter = if_enabled(switches.openrouter, || {
+        build_openrouter_provider(
+            openrouter_credential,
+            std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
+            default_model,
+        )
+    });
+    let xai = if_enabled(switches.xai, || {
+        build_xai_provider(
+            xai_credential,
+            std::env::var("LUCIDOS_XAI_API_KEY").ok(),
+            default_model,
+        )
+    });
 
-    // xAI: a stored `xai` credential wins; otherwise the env fallback.
-    let xai_credential = read_credential_pair(pool, "xai", "xAI").await;
-    let xai = build_xai_provider(
-        xai_credential,
-        std::env::var("LUCIDOS_XAI_API_KEY").ok(),
-        default_model,
-    )
-    .filter(|_| switches.xai);
-
-    // OpenCode Free: a preference, not a credential. Nothing is read from the
-    // credential store here, and nothing is sent as a bearer.
-    let opencode_free_pref = match PreferenceStore::get(pool, PREF_OPENCODE_FREE_ENABLED).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            crate::log!(
-                "[Startup] Failed to read opencode_free_enabled preference: {}",
-                e
-            );
-            None
-        }
-    };
     let opencode_free = build_opencode_free_provider(opencode_free_pref, default_model);
 
     // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
     // default applied inside the builder) and an optional `local` credential.
-    let local_base_pref = match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read local_base_url preference: {}", e);
-            None
-        }
-    };
-    let local_key = match CredentialStore::get(pool, "local").await {
-        Ok(Some(cred)) => Some(cred.auth_value),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read local provider credential: {}", e);
-            None
-        }
-    };
-    let local =
-        build_local_provider(local_base_pref, local_key, default_model).filter(|_| switches.local);
+    let local = if_enabled(switches.local, || {
+        build_local_provider(local_base, local_key, default_model)
+    });
 
     // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
@@ -451,6 +526,31 @@ fn anthropic_search_backend(
     }
 }
 
+/// The model the OpenAI search backend runs on.
+///
+/// [`search_model_for`]'s value when it satisfies `uses_responses_api`, and
+/// the fallback constant otherwise. `web_search` exists ONLY on the Responses
+/// API. A reused Chat-Completions chat model such as `gpt-4o` would post the
+/// tool to `/responses` for a model the engine says is not served there. An
+/// OpenAI-only workspace has nothing behind it in the chain, which leaves the
+/// backend dead with no fallback.
+fn openai_search_model(
+    registry: &crate::llm::model_registry::ModelRegistry,
+    chat_model: &str,
+) -> String {
+    let model = search_model_for(
+        registry,
+        crate::llm::ProviderKind::OpenAi,
+        chat_model,
+        OPENAI_FALLBACK_SEARCH_MODEL,
+    );
+    if crate::llm::openai::uses_responses_api(&model) {
+        model
+    } else {
+        OPENAI_FALLBACK_SEARCH_MODEL.to_string()
+    }
+}
+
 /// The OpenAI search backend for a resolved key, or `None` when no key is
 /// configured. Shared by the DB-up and DB-down paths so both honor the
 /// `OPENAI_API_KEY` / Codex-CLI fallbacks identically.
@@ -460,12 +560,7 @@ fn openai_search_backend(
     default_model: &str,
 ) -> Option<Arc<dyn WebSearchProvider>> {
     let (key, _source) = resolved_key?;
-    let model = search_model_for(
-        registry,
-        crate::llm::ProviderKind::OpenAi,
-        default_model,
-        OPENAI_FALLBACK_SEARCH_MODEL,
-    );
+    let model = openai_search_model(registry, default_model);
     match OpenAiResponsesSearch::new(key, model, OPENAI_DEFAULT_BASE_URL) {
         Ok(b) => Some(Arc::new(b) as Arc<dyn WebSearchProvider>),
         Err(e) => {
@@ -1414,6 +1509,108 @@ mod tests {
                 "{chat_model} must not be sent to {provider:?}"
             );
         }
+    }
+
+    /// A reused chat model must ALSO run on the Responses API.
+    ///
+    /// `web_search` exists nowhere else, so a `models` row like `gpt-4o` would
+    /// post the tool to `/responses` for a model the engine's own predicate
+    /// rejects. OpenAI is last in the chain, so there is nothing after it.
+    #[test]
+    fn a_chat_completions_chat_model_never_becomes_the_search_model() {
+        let registry = crate::llm::model_registry::empty();
+        assert_eq!(
+            openai_search_model(&registry, "gpt-4o"),
+            OPENAI_FALLBACK_SEARCH_MODEL,
+            "gpt-4o routes to OpenAI but not to the Responses API"
+        );
+        // A Responses-API chat model is still reused, which is the whole point
+        // of preferring the tier the user picked.
+        assert_eq!(openai_search_model(&registry, "gpt-5.6-sol"), "gpt-5.6-sol");
+        // Another provider's model still falls back, as before.
+        assert_eq!(
+            openai_search_model(&registry, "claude-opus-5"),
+            OPENAI_FALLBACK_SEARCH_MODEL
+        );
+    }
+
+    /// The veto gates the BUILDER, not its result.
+    ///
+    /// Filtering afterwards logs "provider configured" for a provider the
+    /// router never receives. That is the line a user reads when a switch
+    /// looks like it did nothing.
+    #[test]
+    fn a_switched_off_provider_is_never_built() {
+        let mut built = false;
+        let vetoed = if_enabled(false, || {
+            built = true;
+            Some(())
+        });
+        assert!(vetoed.is_none());
+        assert!(!built, "a vetoed provider must not be constructed");
+
+        let mut built = false;
+        let allowed = if_enabled(true, || {
+            built = true;
+            Some(())
+        });
+        assert!(allowed.is_some());
+        assert!(built, "an enabled provider still gets built");
+    }
+
+    /// A credential the engine cannot READ omits its provider, rather than
+    /// falling through to the env key.
+    ///
+    /// Take a workspace with a stored `openai` credential for one account and
+    /// `OPENAI_API_KEY` for another. One transient pool error at boot would
+    /// otherwise put every later turn on the second account.
+    #[tokio::test]
+    async fn an_unreadable_credential_still_boots_on_the_environment_key() {
+        let (pool, db) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+
+        let readable = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            Some("sk-ant-env".to_string()),
+            ProviderSwitches::default(),
+        )
+        .await;
+        assert!(
+            readable.anthropic.is_some(),
+            "the env key alone configures the provider while the read works"
+        );
+
+        // Make every credential read fail, exactly as a pool error does.
+        sqlx::query("DROP TABLE credentials CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let unreadable = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            Some("sk-ant-env".to_string()),
+            ProviderSwitches::default(),
+        )
+        .await;
+        assert!(
+            unreadable.anthropic.is_some(),
+            "an unreadable read must not cost the engine a provider the env configures"
+        );
+        assert!(
+            backend_ids(&unreadable).contains(&"anthropic-server-tool"),
+            "and its search backend comes with it: {:?}",
+            backend_ids(&unreadable)
+        );
+
+        teardown_test_db(&db).await;
     }
 
     /// The OpenAI fallback must satisfy `uses_responses_api`, because the

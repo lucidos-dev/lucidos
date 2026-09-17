@@ -12,8 +12,11 @@
 //!
 //! **It holds no tools.** Under client delegation the API declares none, so
 //! `delegate` arrives as `session.delegation.created` and the other two have no
-//! expression at all. On a Live call the caller settles a card by tapping it and
-//! rings off on the button. ADR 0170's three tools scope to a Realtime talker.
+//! expression at all. ADR 0170's three tools scope to a Realtime talker.
+//!
+//! **A question card is still settled out loud** (ADR 0205). The delegation
+//! frame carries the caller's answer, and `Call::settle_or_refuse` reads it as
+//! one. A permission card and ringing off stay on the screen.
 //!
 //! **It has no turns either.** There is no user-turn-end frame and no
 //! output-done frame, which the provider's own guide says outright. The seam
@@ -37,6 +40,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use super::provider::{
     drain_held, wait_until, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession,
 };
+use super::DELEGATION_POLICY;
 use crate::engine::ApiUsage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -117,6 +121,15 @@ impl VoiceProvider for LiveProvider {
         &self.model
     }
 
+    /// No. Client delegation declares no functions, so there is nowhere for a
+    /// choice id to travel (ADR 0181).
+    ///
+    /// A question card is still settled out loud, by the delegation frame plus
+    /// the caller's own words. `Call::delegated` owns that route.
+    fn holds_the_answer_tool(&self) -> bool {
+        false
+    }
+
     async fn open(&self, opening: SessionOpening) -> Result<Box<dyn VoiceSession>, BoxError> {
         let mut request = LIVE_URL.into_client_request()?;
         request
@@ -148,7 +161,7 @@ impl VoiceProvider for LiveProvider {
         }
 
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let caller_words = Arc::new(Mutex::new(String::new()));
+        let caller_words = Arc::new(Mutex::new(Vec::new()));
         let held = Arc::clone(&caller_words);
         tokio::spawn(async move {
             let mut turn = TurnState {
@@ -186,7 +199,7 @@ struct LiveSession {
     rx: mpsc::Receiver<VoiceEvent>,
     /// The reader's own copy of what the caller has said, so the engine can say
     /// it took those words. See [`TurnState::caller_words`].
-    caller_words: Arc<Mutex<String>>,
+    caller_words: Arc<Mutex<Vec<Fragment>>>,
     /// How many frames this session has sent, which is what numbers the next
     /// one. See [`LiveSession::next_event_id`].
     sent: u64,
@@ -323,13 +336,19 @@ impl VoiceSession for LiveSession {
 /// `delegation.type` is `client`, never `responses`. The managed mode would
 /// rent a second brain that holds tools and acts, and ADR 0149 puts every
 /// action behind our own doer.
+///
+/// **No transcription key, because the protocol has none.** Its startup fields
+/// are the five here plus `input` and `store`, so `opening.transcriber` and
+/// `opening.language` have nowhere to go. The Realtime provider configures both
+/// under `audio.input.transcription`; this one takes the provider's default and
+/// cannot be told otherwise.
 pub fn session_start(model: &str, opening: &SessionOpening) -> Value {
     json!({
         "type": "session.start",
         "event_id": "session_start",
         "session": {
             "model": model,
-            "instructions": opening.instructions,
+            "instructions": instructions_for_a_tool_less_talker(&opening.instructions),
             "audio": {
                 "format": {
                     "type": "audio/pcm",
@@ -340,6 +359,16 @@ pub fn session_start(model: &str, opening: &SessionOpening) -> Value {
             "delegation": { "type": "client" },
         }
     })
+}
+
+/// The workspace's persona, plus how a tool-less talker asks for help.
+///
+/// The seam hands every provider the same instructions, and each one says the
+/// rest in its own way. Realtime says it in the `delegate` tool's description.
+/// Live has no tool to hang it on, so it says it here (see
+/// [`DELEGATION_POLICY`]).
+fn instructions_for_a_tool_less_talker(instructions: &str) -> String {
+    format!("{}\n\n{}", instructions, DELEGATION_POLICY)
 }
 
 /// One append, of whichever kind the caller named.
@@ -418,6 +447,23 @@ fn byte_len_of_chars(text: &str, count: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// One piece of what the caller said, and where it sits on the clock.
+///
+/// A fragment rather than a string, because arrival order is not timeline
+/// order. The transcriber runs behind the audio, so a piece of one sentence can
+/// land after the talker has already answered it. Kept apart, each piece is
+/// still assignable to the turn it was SAID in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fragment {
+    /// Milliseconds on the session timeline, as the provider reported them.
+    ///
+    /// `None` when a frame carried none. Such a piece belongs to whatever turn
+    /// is being cut now: one that will not say when it was said cannot be held
+    /// back for a later one, and dropping it would lose the words outright.
+    start_ms: Option<i64>,
+    text: String,
+}
+
 /// What the reader knows between frames.
 ///
 /// Two accumulators and one clock reading. Together they are the whole of the
@@ -431,7 +477,7 @@ pub struct TurnState {
     /// took these words. It does that when nothing answered the caller and the
     /// doer was woken with them. Left here, the next boundary would hand the
     /// same sentence over again.
-    caller_words: Arc<Mutex<String>>,
+    caller_words: Arc<Mutex<Vec<Fragment>>>,
     /// What the talker has said in the turn it is speaking now.
     talker_words: String,
     /// When the talker last said a WORD. `None` between turns.
@@ -474,7 +520,10 @@ pub fn map_event(value: &Value, turn: &mut TurnState, now: Instant) -> Vec<Voice
                 vec![]
             } else {
                 turn.last_words = Some(now);
-                caller_finished(turn)
+                // The caller's turn ends where this word STARTED, on the
+                // provider's own clock. Anything they said after that point is
+                // them talking over the reply, and belongs to the next turn.
+                caller_finished(turn, started_at(value))
             };
             turn.talker_words.push_str(text);
             events.push(VoiceEvent::TalkerTranscript {
@@ -489,7 +538,10 @@ pub fn map_event(value: &Value, turn: &mut TurnState, now: Instant) -> Vec<Voice
                 turn.caller_words
                     .lock()
                     .expect("caller words")
-                    .push_str(text);
+                    .push(Fragment {
+                        start_ms: started_at(value),
+                        text: text.to_string(),
+                    });
                 vec![VoiceEvent::UserTranscript {
                     text: text.to_string(),
                 }]
@@ -533,36 +585,51 @@ fn error_events(value: &Value) -> Vec<VoiceEvent> {
 
 /// The talker asked for help, which is this protocol's whole tool surface.
 ///
-/// The frame carries an id and no words, so the caller's own words are the
-/// reason. That is honest: the talker composed nothing to explain itself with.
+/// **The ask carries NO reason, because the frame carries no words.** A Realtime
+/// `delegate` call composes one and this one cannot, so there is nothing
+/// truthful to put there.
+///
+/// **Never the caller's own transcript.** `WorkDelegated` renders a reason as
+/// `[Asked for you] ...` under the TALKER's label, so one filled from their
+/// words says the talker spoke their sentence. ADR 0200 has the trace.
 fn delegation(value: &Value, turn: &mut TurnState) -> Vec<VoiceEvent> {
     let Some(id) = value.pointer("/delegation/id").and_then(Value::as_str) else {
         log!("[Voice] A delegation arrived with no id, so it cannot be answered");
         return vec![];
     };
-    // Asking for help is the talker's own judgment that the caller finished.
-    let spoken = std::mem::take(&mut *turn.caller_words.lock().expect("caller words"))
-        .trim()
-        .to_string();
+    // Asking for help is the talker's own judgment that the caller finished,
+    // and this frame says where on the clock that was.
+    let spoken = what_the_caller_said(turn, offset_of(value));
+    log!(
+        "[Voice] The talker asked for the doer on: {}",
+        super::clip(&spoken, super::READ_ALOUD_CHARS)
+    );
     let mut events = Vec::new();
     if !spoken.is_empty() {
-        events.push(VoiceEvent::UserTurnEnded {
-            transcript: spoken.clone(),
-        });
+        events.push(VoiceEvent::UserTurnEnded { transcript: spoken });
     }
     events.push(VoiceEvent::DelegationRequested {
         tool_call_id: id.to_string(),
-        reason: reason_for(&spoken),
+        reason: String::new(),
     });
     events
 }
 
-/// A few words on what the caller wants, for the row the wake writes.
-fn reason_for(spoken: &str) -> String {
-    if spoken.is_empty() {
-        return "the talker asked for the doer without saying why".to_string();
-    }
-    super::clip(spoken, super::READ_ALOUD_CHARS)
+/// Where a transcript delta sits on the session timeline, when it says.
+///
+/// Both transcript frames carry one, and they share a clock. That shared clock
+/// is the whole of what lets a late caller fragment be placed against a
+/// boundary the talker set.
+fn started_at(value: &Value) -> Option<i64> {
+    value.get("start_ms").and_then(Value::as_i64)
+}
+
+/// Where a delegation frame sits on the same clock.
+///
+/// Its own key, because this frame is not a transcript delta and names the
+/// moment differently.
+fn offset_of(value: &Value) -> Option<i64> {
+    value.get("offset_ms").and_then(Value::as_i64)
 }
 
 /// The talker stopped saying words, so its turn is over.
@@ -591,7 +658,9 @@ fn talker_went_quiet(turn: &mut TurnState) -> Vec<VoiceEvent> {
 /// The caller's words are owed whatever ended the call. A turn the talker was
 /// mid-way through is owed too, or its words reach no transcript.
 fn closing_events(turn: &mut TurnState) -> Vec<VoiceEvent> {
-    let mut events = caller_finished(turn);
+    // Everything, boundary or not. Nothing is coming after the socket, so a
+    // piece held back for a later turn would be held for good.
+    let mut events = caller_finished(turn, None);
     events.extend(talker_went_quiet(turn));
     events
 }
@@ -608,14 +677,56 @@ fn closing_events(turn: &mut TurnState) -> Vec<VoiceEvent> {
 /// the same cut at a higher threshold: a hole over 700 ms in the middle of one
 /// answer empties it, and the next delta re-opens a turn. The plan is
 /// `docs/plans/2026-09-14-one-thing-the-caller-said-is-one-row.md`.
-fn caller_finished(turn: &mut TurnState) -> Vec<VoiceEvent> {
-    let spoken = std::mem::take(&mut *turn.caller_words.lock().expect("caller words"))
-        .trim()
-        .to_string();
+///
+/// **A piece transcribed after its own boundary is still lost to the next
+/// turn**, and `before_ms` does not close that. Input transcription is
+/// asynchronous, so the tail of a sentence can land after the talker has
+/// answered it. Waiting for it here is what does not work: `call.rs` reads any
+/// finished utterance as a MOVE of the conversation, so a late one cuts the
+/// reply's own row in half (ADR 0188). Closing it means changing where that
+/// move is, which is its own design. ADR 0198 records the reasoning.
+fn caller_finished(turn: &mut TurnState, before_ms: Option<i64>) -> Vec<VoiceEvent> {
+    let spoken = what_the_caller_said(turn, before_ms);
     if spoken.is_empty() {
         return vec![];
     }
     vec![VoiceEvent::UserTurnEnded { transcript: spoken }]
+}
+
+/// Take the caller's words up to `before_ms`, leaving anything later held.
+///
+/// `None` takes the lot, which is what a frame with no timing and the closing
+/// socket both want.
+///
+/// Sorted by the clock before joining, because arrival order is not timeline
+/// order. Concatenated raw after that: a delta carries its own spacing, and one
+/// can split a word in two.
+///
+/// **Sorted only when EVERY piece is timed.** An untimed one sorts ahead of all
+/// the rest, so one arriving mid-sentence would move to the front of it. With
+/// nothing to place it by, arrival order is the better guess for the lot.
+fn what_the_caller_said(turn: &mut TurnState, before_ms: Option<i64>) -> String {
+    let mut held = turn.caller_words.lock().expect("caller words");
+    let mut theirs: Vec<Fragment> = match before_ms {
+        None => std::mem::take(&mut *held),
+        Some(at) => {
+            let (theirs, later) = held
+                .drain(..)
+                .partition(|piece| piece.start_ms.is_none_or(|started| started < at));
+            *held = later;
+            theirs
+        }
+    };
+    drop(held);
+    if theirs.iter().all(|piece| piece.start_ms.is_some()) {
+        theirs.sort_by_key(|piece| piece.start_ms);
+    }
+    theirs
+        .iter()
+        .map(|piece| piece.text.as_str())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn decoded_audio(value: &Value) -> Option<Vec<u8>> {

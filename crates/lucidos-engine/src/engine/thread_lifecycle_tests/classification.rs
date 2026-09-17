@@ -369,9 +369,11 @@ fn no_transition_produces_illegal_section() {
 //
 // `SpokenReplyGenerated` lands while the doer's own turn is still running, so
 // Terminal would settle a turn it has no part in. `SpokenMessageReceived`
-// starts nothing, so Start would leave the thread waiting on a turn that never
-// runs. `WorkDelegated` sits beside a `MessageReceived` that already started
-// one, so Start would count that utterance twice.
+// starts nothing: the talker decides whether the doer is wanted, so Start
+// would leave the thread waiting on a turn that never runs.
+//
+// `WorkDelegated` is the exception and has its own case below. It IS the
+// start of a delegated call's turn (ADR 0201).
 #[test]
 fn a_call_writes_only_metadata() {
     let voice_events = [
@@ -379,7 +381,6 @@ fn a_call_writes_only_metadata() {
         "VoiceSessionEnded",
         "SpokenReplyGenerated",
         "SpokenMessageReceived",
-        "WorkDelegated",
     ];
     for event_type in voice_events {
         assert_eq!(
@@ -404,6 +405,33 @@ fn a_call_writes_only_metadata() {
                     event_type, thread_type, section
                 );
             }
+        }
+    }
+}
+
+// 16b. a_delegation_starts_a_turn_exactly_as_the_message_it_replaced
+//
+// `WorkDelegated` carries the start of a delegated call's turn, and no
+// `MessageReceived` is written beside it (ADR 0201).
+//
+// Compared against `MessageReceived` rather than pinned to a literal, so the
+// two can never drift: whatever a typed message does to a thread, a delegation
+// does.
+#[test]
+fn a_delegation_starts_a_turn_exactly_as_the_message_it_replaced() {
+    assert_eq!(classify_event("WorkDelegated"), Some(EventClass::Start));
+    assert!(all_persisted_event_types().contains(&"WorkDelegated"));
+    for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+        for section in [ArchiveState::Archived, ArchiveState::Inbox] {
+            let delegated = resolve_transition("WorkDelegated", thread_type, section, false);
+            let typed = resolve_transition("MessageReceived", thread_type, section, false);
+            assert_eq!(
+                delegated.as_ref().ok().map(|r| r.new_section),
+                typed.as_ref().ok().map(|r| r.new_section),
+                "a delegation and a typed message disagree for a {:?} thread in {:?}",
+                thread_type,
+                section
+            );
         }
     }
 }

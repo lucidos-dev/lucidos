@@ -198,21 +198,78 @@ fn read_trimmed_string(payload: &Value, key: &str) -> Option<String> {
     normalize_route_setting(payload.get(key).and_then(|v| v.as_str()))
 }
 
+/// Longest slug [`is_valid_trigger_slug`] accepts, and the budget every minted
+/// slug is cut to so a collision suffix still fits.
+const MAX_TRIGGER_SLUG_LEN: usize = 64;
+
+/// How many numbered variants of one base slug are tried before falling back to
+/// the trigger's own id. Ninety-nine same-named triggers is already absurd.
+const MAX_SLUG_COLLISION_ATTEMPTS: u32 = 99;
+
+/// The slug derived from a trigger's id alone: `trigger-` plus the first 8 hex
+/// chars of the UUID. Unique by construction, which is what makes it the last
+/// resort for both a name that slugifies to nothing and an exhausted collision
+/// search.
+fn slug_from_trigger_id(trigger_id: &str) -> String {
+    let no_dashes = trigger_id.replace('-', "");
+    let suffix: String = no_dashes.chars().take(8).collect();
+    format!("trigger-{}", suffix)
+}
+
 /// Convert a human-facing trigger name to a stable kebab-case slug, guaranteeing
 /// a non-empty result by falling back to the first 8 chars of the trigger UUID
 /// (dashes stripped) when the name slugifies to empty (e.g. `"!!!"`).
 ///
 /// The slugification itself is [`crate::core::slug::slugify_kebab`], shared with
 /// coding-agent branch naming; only the trigger-specific fallback lives here.
+///
+/// **A pure function of the name, so two triggers called "Daily Summary" get the
+/// same answer.** Any create path that mints a slug for a NEW trigger must go
+/// through [`mint_unique_trigger_slug`] instead.
 pub fn slugify_trigger_name_with_fallback(name: &str, uuid: &str) -> String {
     let s = crate::core::slug::slugify_kebab(name);
     if s.is_empty() {
-        let no_dashes = uuid.replace('-', "");
-        let suffix: String = no_dashes.chars().take(8).collect();
-        format!("trigger-{}", suffix)
+        slug_from_trigger_id(uuid)
     } else {
         s
     }
+}
+
+/// Mint a slug for a NEW trigger that no live trigger already owns.
+///
+/// `taken` is every slug currently in the registry. The base is
+/// [`slugify_trigger_name_with_fallback`]; a collision appends `-2`, then `-3`,
+/// and so on. Every result is cut to [`MAX_TRIGGER_SLUG_LEN`], so what this
+/// mints always passes [`is_valid_trigger_slug`].
+///
+/// The slug is the `data/triggers/<slug>/` directory segment for both the
+/// `trigger.toml` projection and the per-trigger knowhow. Two triggers sharing
+/// one therefore overwrite each other's definition on every boot, read each
+/// other's knowhow, and lose the survivor's projection when either is deleted.
+/// The sibling precedent is the `foreign_slugs` refusal in
+/// `resync_plugin_triggers`, which declines the slug rather than renaming it:
+/// a plugin's slug is its shipped directory name, while this one is ours to pick.
+pub fn mint_unique_trigger_slug(
+    name: &str,
+    trigger_id: &str,
+    taken: &std::collections::HashSet<String>,
+) -> String {
+    let base = crate::core::slug::truncate_slug(
+        &slugify_trigger_name_with_fallback(name, trigger_id),
+        MAX_TRIGGER_SLUG_LEN,
+    );
+    if !taken.contains(&base) {
+        return base;
+    }
+    for n in 2..=MAX_SLUG_COLLISION_ATTEMPTS {
+        let suffix = format!("-{n}");
+        let head = crate::core::slug::truncate_slug(&base, MAX_TRIGGER_SLUG_LEN - suffix.len());
+        let candidate = format!("{head}{suffix}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    slug_from_trigger_id(trigger_id)
 }
 
 /// Parse a trigger payload's `on` field into a Vec of subscriptions. Accepts:
@@ -627,7 +684,7 @@ pub(crate) fn derive_app_id_from_script_path(path: &str) -> Option<String> {
 /// in-flight edits).
 pub fn is_valid_trigger_slug(slug: &str) -> bool {
     let len = slug.len();
-    if !(1..=64).contains(&len) {
+    if !(1..=MAX_TRIGGER_SLUG_LEN).contains(&len) {
         return false;
     }
     let bytes = slug.as_bytes();

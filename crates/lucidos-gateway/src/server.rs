@@ -35,11 +35,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// The dev default, and only the no-env fallback: both real launch paths pass
-/// `LUCIDOS_API_PORT`. Dev injects 5251 and the packaged app 5252, so the two
-/// coexist out of the box.
-const DEFAULT_GATEWAY_PORT: u16 = 5251;
-
 /// Build id baked in by `build.rs`: git short SHA plus a hash of any
 /// uncommitted gateway-source diff. Deterministic for identical source, so a
 /// no-op rebuild does not raise the picker's "new gateway available" badge.
@@ -641,6 +636,14 @@ impl GatewayState {
     /// deliberately answers alike.
     pub fn engine_port(&self, slug: &str) -> Option<u16> {
         self.route(slug)
+    }
+
+    /// The port this gateway is configured for.
+    ///
+    /// Read by the peer lookup, which must never hand back an install
+    /// configured for it: under port contention only one of them binds it.
+    pub fn gateway_port(&self) -> u16 {
+        self.inner.gateway_port
     }
 
     /// The pooled client for a hop to a workspace engine.
@@ -2767,10 +2770,14 @@ pub async fn run() -> Result<(), BoxError> {
     let app_data = resolve_app_data()?;
     std::fs::create_dir_all(&app_data)?;
     let registry_path = app_data.join("config/workspaces.json");
+    // The dev default, and only the no-env fallback: both real launch paths
+    // pass `LUCIDOS_API_PORT`. Dev injects 5251 and the packaged app 5252, so
+    // the two coexist out of the box. Named from `lucidos-installs`, which the
+    // scan also reads, rather than repeated here under the packaged name.
     let gateway_port = std::env::var("LUCIDOS_API_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_GATEWAY_PORT);
+        .unwrap_or(lucidos_installs::DEFAULT_DEV_GATEWAY_PORT);
     // Resolved before the resource validation, because it drives both the
     // picker's dev-only self-reload control and the static-dir check below.
     let packaged = matches!(

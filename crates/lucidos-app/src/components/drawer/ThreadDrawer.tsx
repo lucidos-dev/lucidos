@@ -664,16 +664,17 @@ function ThreadList() {
                 archivePaginationAllowed(collapsedSections.value) &&
                 sentinelInView(sentinel.getBoundingClientRect(), root.getBoundingClientRect())
             ) {
-                const before = threadMap.value.size;
-                await loadOlderThreads();
+                const landed = await loadOlderThreads();
                 pages++;
                 // Let the re-render commit so the next iteration measures the new
                 // layout (whether the freshly-loaded rows pushed the sentinel out).
                 await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
-                // Defensive stop. `loadOlderThreads` flips `threadHasMore` off
-                // when a page adds nothing. Bailing on a map that did not grow
-                // is what stops a stuck cursor spinning this loop.
-                if (threadMap.value.size === before) break;
+                // Stop when nothing was FETCHED: a concurrent call owns the round
+                // trip, or the page failed. A landed page that added no rows is
+                // not a stop, since its cursor moved and the next page continues
+                // below it. Bailing on a map that did not grow instead ends the
+                // archive short on any stretch of already-loaded history.
+                if (!landed) break;
             }
         } finally {
             fillingRef.current = false;
@@ -706,14 +707,25 @@ function ThreadList() {
     }, [hydrated, applied]);
 
     const hasMore = threadHasMore.value;
+    // Pagination feeds the Archive section, so a collapsed Archive has nothing
+    // to load INTO (see `archivePaginationAllowed`). While it is shut there is
+    // no sentinel at all, and expanding it mounts one.
+    const paginationAllowed = archivePaginationAllowed(collapsed);
     // Delay-gated, like every other loader. The fill loop pages repeatedly, and
     // a page that lands inside SPINNER_DELAY_MS would flash this line once per
     // page. Read before the unhydrated return so the hook order holds.
     const showLoadingMore = useDelayedFlag(threadLoadingMore.value);
 
+    // `paginationAllowed` is a DEPENDENCY, not just a guard, and that is the
+    // whole point: expanding Archive must re-run this effect so its kick below
+    // fires. An IntersectionObserver reports transitions only. The sentinel of
+    // a list too short to scroll is already intersecting, so nothing else would
+    // ever ask for a page. Without it the Archive stays at whatever the initial
+    // window held, with no way to reach the rest: a list that does not overflow
+    // cannot be scrolled either.
     useEffect(() => {
         const sentinel = sentinelRef.current;
-        if (!sentinel || !hydrated || !hasMore) return;
+        if (!sentinel || !hydrated || !hasMore || !paginationAllowed) return;
 
         const observer = new IntersectionObserver(
             (entries) => {
@@ -726,7 +738,7 @@ function ThreadList() {
         // scroll transition, so without this the first viewport never fills.
         void loadWhileSentinelVisible();
         return () => observer.disconnect();
-    }, [hydrated, hasMore, loadWhileSentinelVisible]);
+    }, [hydrated, hasMore, paginationAllowed, loadWhileSentinelVisible]);
 
     if (!hydrated) {
         return (
@@ -776,7 +788,7 @@ function ThreadList() {
                 {sections.every(s => s.threads.length === 0) && (
                     <div class="empty-state">No threads</div>
                 )}
-                {hasMore && (
+                {hasMore && paginationAllowed && (
                     <div ref={sentinelRef} class="thread-drawer-load-more">
                         {showLoadingMore && <span class="thread-drawer-loading">Loading...</span>}
                     </div>
@@ -843,6 +855,11 @@ export function toggleFamilyCollapse(threadId: string) {
 // pops the sentinel into view. The fill loop would then pull the ENTIRE archive
 // into memory while every row is hidden. Archive is the bottom section and the
 // one absorbing paginated older threads.
+//
+// So this decides whether the load-more sentinel EXISTS, and expanding the
+// section is what mounts one and re-arms the fill loop. A guard read only
+// inside the loop cannot do that: the loop runs when an observer fires, and an
+// expand fires nothing.
 //
 // There is NO filter-active bypass. The collapsed badge reads the
 // server-sourced `archiveThreadCount` (see `refreshArchivedCount`), so a filter

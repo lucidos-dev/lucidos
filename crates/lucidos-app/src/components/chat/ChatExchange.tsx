@@ -25,7 +25,7 @@ import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
-import { setThreadLive } from './scrollState';
+import { setAgentLive } from './scrollState';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
@@ -170,7 +170,7 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
 }
 
 /** Does this exchange mean the AGENT IS RUNNING on the thread being shown? The
- *  follow's live term (see `setThreadLive` in `scrollState`), and nothing else,
+ *  follow's live term (see `setAgentLive` in `scrollState`), and nothing else,
  *  so it can afford to be strict: it decides whether the reader's scroll means
  *  "stop dragging me" or merely "I am browsing" (ADR 0064).
  *
@@ -188,7 +188,7 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
  *
  *  Deliberately NOT fixed in `exchangeStatus`. Its `'pending'` fallthrough is
  *  load-bearing, and every status label in the app hangs off that function. */
-export function exchangeMarksThreadLive(
+export function exchangeMarksAgentLive(
   isLast: boolean,
   status: ExchangeStatus,
   threadIdle: boolean,
@@ -226,22 +226,23 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
 
-  // Tell `scrollState` whether the agent is LIVE on this thread, which is the
-  // one thing that decides whether the reader's scroll retires their standing
+  // Tell `scrollState` whether the AGENT is live on this thread. It is one of
+  // the two things deciding whether the reader's scroll retires their standing
   // follow: fleeing a reply in flight does, browsing an idle thread does not.
-  // Here because this is the component that already derives the status, and
-  // `scrollState` deliberately cannot import `store` to derive it itself.
+  // A voice call is the other, and pushes its own half in. Here because this
+  // component already derives the status, and `scrollState` deliberately
+  // cannot import `store` to derive it itself.
   //
   // Only the LAST exchange answers, since only it can be running. The cleanup
   // clears the answer rather than leaving it. A thread switch unmounts this
   // exchange, and the incoming thread's last exchange sets its own value.
   // Between the two nobody may read the thread they just left.
-  const threadLive = exchangeMarksThreadLive(isLast, status, threadIdle);
+  const agentLive = exchangeMarksAgentLive(isLast, status, threadIdle);
   useEffect(() => {
     if (!isLast) return;
-    setThreadLive(threadLive);
-    return () => setThreadLive(false);
-  }, [isLast, threadLive]);
+    setAgentLive(agentLive);
+    return () => setAgentLive(false);
+  }, [isLast, agentLive]);
 
   // Cap detection reads `ResponseGenerated.text` directly via
   // `exchangeEngineLimitDetail`. The cap is emitted with no preceding
@@ -769,6 +770,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           ? undefined
           : (e) => openInfoPanel('origin', e)}
         actions={initiatorActions}
+        // The same router the response body gets. This panel renders markdown
+        // too, so its links owe the reader the same routing and the same
+        // terminal guard.
+        onBodyClick={handleLinkClick}
         bubble={isUserMessageBubble}
         chromeless={isChromeless}
         collapsible={canCollapseInitiator}
@@ -891,6 +896,8 @@ function userBubbleText(exchange: Exchange): string | undefined {
  *     self-comparison. The captured revisions are the only honest signal.
  *   - `userSeq`, the exchange boundary.
  *   - `steps.length` plus the last step's `seq`: a new event landed here.
+ *   - `liveReplyText`, the talker's live row growing word by word. Its step
+ *     moves neither of the two terms above, so nothing else here sees it.
  *   - `questionOvertaken`, flipped when the agent ignored a question.
  *   - `continuationMoved`, the turn handed to a later exchange, which
  *     finalizes this one's pending Thinking marker.
@@ -933,6 +940,10 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   // persisted event is immutable and identity-stable, so this compare is a
   // reference check everywhere else.
   if (userBubbleText(a) !== userBubbleText(b)) return false;
+  // The talker's live row is the same shape one step down. It is a STEP, so
+  // the count and the last seq below hold across every word it gains. Without
+  // this the bubble stops on whatever prefix the first render caught.
+  if (a.liveReplyText !== b.liveReplyText) return false;
   if (a.questionOvertaken !== b.questionOvertaken) return false;
   if (a.continuationMoved !== b.continuationMoved) return false;
   if (a.steps.length !== b.steps.length) return false;
@@ -1344,7 +1355,6 @@ export function describeInitiator(
         details: (
           <SpokenReply
             event={{ type: 'spoken_reply', text: ev.text, interrupted: ev.interrupted === true }}
-            live={isLiveReplyRow(ev)}
           />
         ),
       };

@@ -1804,8 +1804,9 @@ export type ThreadEvent =
       type: 'SpokenReplyGenerated';
       session_id: string;
       text: string;
-      /** The caller spoke over it, so only this much was heard. The doer's
-       *  own answer is in the thread in full either way. */
+      /** The caller took the floor back, so only this much was heard. The
+       *  doer's own answer is in the thread in full either way.
+       *  Full reasoning is on the Rust variant. */
       interrupted: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -1814,7 +1815,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The caller said something, and the talker answered it alone.
+  /** The caller said something on a call.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'SpokenMessageReceived';
@@ -1832,8 +1833,8 @@ export type ThreadEvent =
   | {
       type: 'WorkDelegated';
       session_id: string;
-      /** The talker's own few words. Never empty: the seam substitutes a
-       *  stand-in rather than dropping a delegation over a missing argument. */
+      /** The talker's own few words on what the caller wants.
+       *  Full reasoning is on the Rust variant. */
       reason: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;

@@ -255,9 +255,9 @@ These all look reasonable in isolation; they fail the same way every time and wa
 
 ## Errors
 
-`run_python` (the sync foreground tool) auto-trims long tracebacks before returning: keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, drops the middle. The full traceback is on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for debugging.
+`run_python` (the sync foreground tool) auto-trims long tracebacks before returning: keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, drops the middle. The full traceback is on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for debugging, kept for seven days.
 
-`run_python_background` does NOT auto-trim — its stderr flows through `bash_output` raw, which is fine for short outputs but means a verbose chained import error can dump many KB of frames into your context. When you spawn a backtest / long script you expect MIGHT crash with a multi-thousand-line traceback, wrap the body in your own `try / except` and re-raise a short fingerprint: `print(f"FAIL: {type(e).__name__}: {e}", file=sys.stderr); raise`. The full traceback still lands on disk at `.lucidos/exhaust/<task_id>/stderr.txt`.
+`run_python_background` does NOT auto-trim. Its stderr flows through `bash_output` raw. That is fine for short output, but a verbose chained import error can dump many KB of frames into your context. When you spawn a backtest or long script that might crash with a huge traceback, wrap the body in your own `try / except`. Re-raise a short fingerprint: `print(f"FAIL: {type(e).__name__}: {e}", file=sys.stderr); raise`. The full traceback still lands on disk at `.lucidos/exhaust/<task_id>/stderr.txt`, kept for seven days.
 
 A `run_python` call that hits the 300 s ceiling fails with `Python script
 timed out after 300s`. That is not a crash to diagnose and never a script to

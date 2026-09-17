@@ -8,14 +8,15 @@
 use crate::auth;
 use crate::error::ApiError;
 use crate::net_config;
+use crate::peers;
 use crate::server::{GatewayState, RestoreStatus};
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub fn router() -> Router<GatewayState> {
@@ -47,6 +48,9 @@ pub fn router() -> Router<GatewayState> {
         // Every Lucidos install on this machine. Kept off `/gateway/status`
         // for the same reason as the line above: this one walks directories.
         .route("/installs", get(list_installs))
+        // Where one named workspace lives when THIS gateway does not serve it.
+        // A lookup, never a listing: see `crate::peers`.
+        .route("/workspace-location", get(workspace_location))
         // Write the machine-global release-check preference. The matching READ
         // is the `release_check` field on `/gateway/status`, so there is one
         // place the frontend gets the whole answer.
@@ -477,6 +481,81 @@ async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
 /// client to raise a dialog.
 async fn list_installs(State(state): State<GatewayState>) -> Json<lucidos_installs::Inventory> {
     Json(state.install_inventory())
+}
+
+/// Query for [`workspace_location`]: the workspace name a thread link carried.
+#[derive(Deserialize)]
+struct WorkspaceLocationQuery {
+    name: String,
+}
+
+/// Where a workspace this gateway does not serve lives, and how to reach it.
+///
+/// The shape the client acts on. `scheme` appears only on the reachable arm: it
+/// is what the peer answered, and a gateway that answered nothing said nothing
+/// about its scheme.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+enum WorkspaceLocation {
+    /// A peer gateway answered. This is the whole address the client needs.
+    Reachable {
+        install: String,
+        gateway_port: u16,
+        scheme: &'static str,
+        slug: String,
+    },
+    /// An install carries the workspace, and its gateway answered nothing.
+    /// Reported rather than started: that launch agent is not ours to run.
+    InstallNotRunning {
+        install: String,
+        gateway_port: u16,
+        slug: String,
+    },
+    /// Several installs carry the name. Picking one would be a guess.
+    Ambiguous { installs: Vec<String> },
+}
+
+/// GET /~/api/v1/control/workspace-location?name=…: locate a workspace that
+/// belongs to another install on this machine.
+///
+/// This is what turns a cross-gateway thread link from a lie ("not available")
+/// into a destination. The client navigates to the peer gateway's own origin;
+/// nothing is proxied and no workspace data crosses. See `crate::peers`.
+///
+/// A name no other install carries is a 404, so the caller learns nothing about
+/// a peer's other workspaces. The answer names exactly the one they asked for.
+async fn workspace_location(
+    State(state): State<GatewayState>,
+    Query(query): Query<WorkspaceLocationQuery>,
+) -> Result<Json<WorkspaceLocation>, ApiError> {
+    let name = query.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+    match peers::locate(&state.install_inventory(), state.gateway_port(), name) {
+        peers::Located::Nowhere => Err(ApiError::not_found(format!(
+            "no other Lucidos install on this machine serves a workspace called '{name}'"
+        ))),
+        peers::Located::Ambiguous(found) => Ok(Json(WorkspaceLocation::Ambiguous {
+            installs: found.into_iter().map(|peer| peer.install).collect(),
+        })),
+        peers::Located::One(peer) => {
+            let scheme = peers::probe_scheme(&peers::probe_client(), peer.gateway_port).await;
+            Ok(Json(match scheme {
+                Some(scheme) => WorkspaceLocation::Reachable {
+                    install: peer.install,
+                    gateway_port: peer.gateway_port,
+                    scheme,
+                    slug: peer.slug,
+                },
+                None => WorkspaceLocation::InstallNotRunning {
+                    install: peer.install,
+                    gateway_port: peer.gateway_port,
+                    slug: peer.slug,
+                },
+            }))
+        }
+    }
 }
 
 /// Body for a release-check poll request. Absent means an ordinary refresh,
@@ -913,6 +992,8 @@ mod authz_tests {
         // A read, and still behind the credential: it enumerates this user's
         // install paths, launch agents and data directories.
         ("GET", "/~/api/v1/control/installs"),
+        // A read too, and it names another install's port and slug.
+        ("GET", "/~/api/v1/control/workspace-location?name=dev"),
     ];
 
     async fn control_call(
@@ -1026,6 +1107,41 @@ mod authz_tests {
         let body = serde_json::to_value(&inventory).unwrap();
         assert!(body["installs"].is_array());
         assert!(body["conflicts"].is_array());
+    }
+
+    #[tokio::test]
+    async fn locating_a_workspace_nothing_carries_is_a_404() {
+        // The name is deliberately one no registry on any machine holds, so
+        // this asserts the route's own answer rather than the developer's
+        // install set. What a real hit looks like is `peers`' subject, against
+        // fixture trees.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/workspace-location?name=no-install-carries-this-name",
+            &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn locating_a_blank_workspace_name_is_refused() {
+        let state = crate::server::GatewayState::for_tests();
+        for query in ["name=", "name=%20%20"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "GET",
+                    &format!("/~/api/v1/control/workspace-location?{query}"),
+                    &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "{query} names no workspace"
+            );
+        }
     }
 
     #[tokio::test]

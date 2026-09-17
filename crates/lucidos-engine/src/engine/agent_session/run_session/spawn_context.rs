@@ -536,13 +536,14 @@ impl LucidosEngine {
             // ResponseFailed instead of recovering. Recreate from the branch
             // one more time so the resume self-heals; only fail — with an
             // actionable message — if even that cannot produce the directory.
+            // A stale git registration at that path is pruned by `worktree_add`
+            // itself, so there is nothing to clear first.
             if !wt_path.exists() {
                 log!(
                     "[AgentSession] worktree {} still missing after setup — recreating from branch {} before spawn",
                     wt_path.display(),
                     branch_name
                 );
-                crate::engine::git_ops::clear_stranded_worktree_dir(repo_root, &wt_path).await;
                 let recreated = if is_app_spawn {
                     match app_spawn_id.as_deref() {
                         Some(app_id) => crate::engine::git_ops::create_sparse_app_worktree(

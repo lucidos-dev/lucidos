@@ -354,6 +354,173 @@
     }
 }
 
+/* CALL PHASES. The rule above is the LIVE paint, and it was the only one a
+ * call had. It covered four phases, two of which are work rather than a steady
+ * mode: the connect takes seconds and the hang-up takes a network round trip.
+ * Both read as a dead press, and a caller reported exactly that.
+ *
+ * So each phase paints itself, off the `data-call-phase` the toggle carries.
+ * Three rules hold across all of them.
+ *
+ * The BOX never moves. Every phase paints colour, a pseudo-element or a
+ * transform, so a floor flip reflows no part of the prompt actions row.
+ *
+ * MOTION is the honest signal for work, and it is never the only one. Each
+ * transitional phase is told apart by colour and by shape as well, so the
+ * reduced-motion block at the end of this group takes the movement away and
+ * leaves the state legible.
+ *
+ * The glyph moves, never the button. An animation on the button would take its
+ * hover background and its focus ring with it, so a keyboard user would watch
+ * the ring fade in and out (the same call as the todo indicator's waiting
+ * pulse, chat/todo-list.css). */
+
+/* CONNECTING: arriving, and green, which is the colour a call is placed in on
+ * every phone. An arc sweeps the control while the microphone opens and the
+ * session comes up, so the wait reads as work. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="connecting"] {
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+}
+
+/* The sweep, on a ring that clears the glyph. Out of flow, so it costs the row
+ * no width and the button no box.
+ *
+ * The stroke stays in px like every border (.claude/rules/frontend-css.md).
+ * Nothing derives from it: it is the ring's own line and no calc reads it. */
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"]::after {
+    content: '';
+    position: absolute;
+    inset: 0.3125rem;
+    border: 2px solid transparent;
+    border-top-color: currentColor;
+    border-radius: 50%;
+    /* Indefinite, so it carries a literal duration and no `--duration-*`
+       token: an activity indicator does not ride the animation-speed scale.
+       See .claude/rules/frontend-css.md. */
+    animation: call-toggle-sweep 0.9s linear infinite;
+}
+
+/* CONNECTING, DWELT: the connect has run long enough that the browser is
+ * probably holding a microphone prompt in front of the reader. We are waiting
+ * on them, not the other way round, so the control stops claiming progress.
+ *
+ * `--accent-notable`, the tone this palette keeps for waiting, and NOT
+ * `--accent-yellow`, which is the caution tone. A browser asking permission is
+ * not a caution, and the todo indicator made the same call beside this row
+ * (chat/todo-list.css).
+ *
+ * The sweep stops and the ring closes as a DASHED circle: a line with gaps in
+ * it reads as unfinished without moving, which is what tells this from the
+ * plain connect once the motion is gone. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait] {
+    color: var(--accent-notable);
+    background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-wait]::after {
+    border-color: currentColor;
+    border-style: dashed;
+    animation: none;
+}
+
+/* SPEAKING: Lucidos has the floor, so the tint deepens and the glyph breathes.
+ * Deliberately no badge and no second glyph: this is one control in a row of
+ * five, and a mark appearing inside it would read as a light show.
+ *
+ * The deeper fill is the whole difference at rest, which is what keeps the two
+ * live phases apart with the motion taken away. LISTENING adds nothing at all:
+ * the caller has the floor, and a control at rest is what says so. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"] {
+    background: color-mix(in srgb, var(--accent-red) 35%, transparent);
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
+    /* Indefinite, so it takes a literal duration and no token, as above. */
+    animation: call-toggle-floor 1.4s ease-in-out infinite;
+}
+
+/* ENDING: leaving, and the one phase with no press left in it. `ringOff`
+ * returns the state unchanged, so the control reads as spent: the red drains
+ * to the muted grey, the frame fades with it, and the glyph pulses on the
+ * app's own waiting keyframes.
+ *
+ * No ring here, which is what tells it from CONNECTING once the motion is
+ * gone. One is being drawn, the other is running down. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"] {
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    cursor: default;
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
+    /* Indefinite, so it takes a literal duration and no token, as above. */
+    animation: progress-pulse 2s ease-in-out infinite;
+}
+
+@media (hover: hover) {
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="connecting"]:hover {
+        color: var(--accent-green);
+        background: color-mix(in srgb, var(--accent-green) 25%, transparent);
+    }
+
+    /* After the connect one above, so the dwelt state keeps its own tone under
+       the pointer instead of taking the green back. */
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait]:hover {
+        color: var(--accent-notable);
+        background: color-mix(in srgb, var(--accent-notable) 25%, transparent);
+    }
+
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"]:hover {
+        background: color-mix(in srgb, var(--accent-red) 45%, transparent);
+    }
+
+    /* A dead control brightens under the pointer for nobody. The base hover
+       above would hand it the live red back, which is the one thing this phase
+       must not offer. */
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"]:hover {
+        color: var(--text-muted);
+        background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    }
+}
+
+@keyframes call-toggle-sweep {
+    to {
+        transform: rotate(1turn);
+    }
+}
+
+@keyframes call-toggle-floor {
+    0%, 100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.14);
+    }
+}
+
+/* Still says the same thing, and says it without moving. CONNECTING keeps its
+ * ring and closes it, so an arriving call is a green control inside a complete
+ * circle. ENDING keeps no ring at all and rests at the dimmed glyph the pulse
+ * would have carried it to. SPEAKING keeps its deeper fill, which was never
+ * the animation's to give. */
+@media (prefers-reduced-motion: reduce) {
+    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"]::after {
+        border-color: currentColor;
+        animation: none;
+    }
+
+    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
+        animation: none;
+    }
+
+    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
+        animation: none;
+        opacity: 0.55;
+    }
+}
+
 /* STANDING APPLY: the follow toggle's shape again, accent only and no frame,
  * but GREEN. Arming one is an Apply the owner presses early, and every other
  * Apply in the app is `--accent-green` (`.action-btn-confirm`), so the colour
@@ -1074,6 +1241,12 @@
     background: var(--text-secondary);
 }
 
+/* The "?" font lives HERE, not on the `::after` that draws it. `badges.css`
+   centres this badge by trimming its line box to a cap band, and the trim
+   measures the font of the BLOCK CONTAINER, which is this element. A glyph a
+   step smaller than the inherited body text therefore sat on that band's
+   baseline. It rode 2.0px low in Chromium and 1.7px in WebKit, on a 14px
+   badge. Stated here, the band the trim centres IS the glyph. */
 .thread-status-question-badge {
     display: inline-flex;
     align-items: center;
@@ -1082,6 +1255,9 @@
     height: 0.7rem;
     border-radius: 50%;
     background: var(--text-secondary);
+    font-size: var(--font-size-3xs);
+    font-weight: 700;
+    line-height: 1;
 }
 
 html[data-theme="light"] .thread-status-question-badge {
@@ -1090,9 +1266,6 @@ html[data-theme="light"] .thread-status-question-badge {
 
 .thread-status-question-badge::after {
     content: "?";
-    font-size: var(--font-size-3xs);
-    font-weight: 700;
-    line-height: 1;
     color: var(--text-on-accent);
 }
 

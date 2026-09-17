@@ -28,7 +28,7 @@ import {
   stepCall,
 } from './callState';
 import { parseServerFrame } from './frames';
-import { floatToPcm16 } from './pcm';
+import { CAPTURE_FRAME_SAMPLES, SAMPLE_RATE_HZ, floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, CallSocket } from './ports';
 import { CALL_REFUSED, NO_ROUTE_FOR_A_CALL, setupRefusal } from './refusals';
 import { errorDetail } from '../utils/errorDetail';
@@ -50,6 +50,9 @@ import { errorDetail } from '../utils/errorDetail';
  * for the life of the page.
  */
 export const PREROLL_FRAMES_MAX = 200;
+
+/** How long one captured frame lasts, which is the only clock a call reads. */
+export const CAPTURE_FRAME_MS = (CAPTURE_FRAME_SAMPLES / SAMPLE_RATE_HZ) * 1_000;
 
 /**
  * How long this utterance may wait before its row is withdrawn, or `null`.
@@ -102,6 +105,19 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
   let socket: CallSocket | null = null;
   let audio: AudioDevice | null = null;
   let gate: SpeechGateState = SPEECH_GATE_SHUT;
+  /**
+   * Captured frames since the caller last stopped making speech.
+   *
+   * The whole of how a barge-in is told from somebody finishing their sentence
+   * (`callState.ts`, `BARGE_IN_QUIET_MS`). Counted in FRAMES rather than read
+   * off a clock, so it measures the caller's own silence and nothing else.
+   *
+   * Reset at both edges, so it is the length of ONE quiet stretch. It reads
+   * 80 ms long, for the frames the gate spends opening, and 320 ms short, for
+   * the hangover it spends shutting. Both are small against a bound of a
+   * second, and they pull opposite ways.
+   */
+  let quietFrames = 0;
   /**
    * The bound running on an utterance whose words have not landed, and which
    * utterance it belongs to.
@@ -191,6 +207,9 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
         audio?.stopPlayback();
         return;
       case 'forget-speech':
+        // The gate alone. `quietFrames` measures how long the CALLER has held
+        // their peace, and a floor flip is nothing they did. Reset here, the
+        // first second of every reply would be barge-in proof.
         gate = SPEECH_GATE_SHUT;
         return;
       case 'flush-audio':
@@ -200,6 +219,19 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
         teardown();
         return;
     }
+  }
+
+  /**
+   * Hand one audio device back, and say so when it will not go.
+   *
+   * Two places release one: a call that ended, and a microphone that arrived
+   * after its call did. Both owe the same report, so both come through here. A
+   * dropped rejection leaves the recording indicator lit and nobody told.
+   */
+  function releaseDevice(device: AudioDevice): void {
+    void device.close().catch((err: unknown) => {
+      options.onProblem(`The microphone could not be released: ${errorDetail(err)}`);
+    });
   }
 
   async function open(threadId: string): Promise<void> {
@@ -218,7 +250,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
       return;
     }
     if (mine !== generation) {
-      void device.close();
+      releaseDevice(device);
       return;
     }
     audio = device;
@@ -299,7 +331,13 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     }
     const wasOpen = gate.open;
     gate = stepSpeechGate(gate, frameEnergy(samples), options.speechGate);
-    if (gate.open !== wasOpen) input({ kind: 'speech', open: gate.open });
+    if (gate.open === wasOpen) {
+      if (!gate.open) quietFrames += 1;
+      return;
+    }
+    const quietMs = quietFrames * CAPTURE_FRAME_MS;
+    quietFrames = 0;
+    input({ kind: 'speech', open: gate.open, quietMs });
   }
 
   /** Send what the connect window captured, oldest first, and forget it. */
@@ -313,6 +351,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     generation++;
     dropTheHold();
     gate = SPEECH_GATE_SHUT;
+    quietFrames = 0;
     // A dial that never landed holds audio nothing will ever read.
     preroll = [];
     handshook = false;
@@ -320,11 +359,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     socket = null;
     const device = audio;
     audio = null;
-    void device?.close().catch((err: unknown) => {
-      // Reported, never swallowed. A microphone that will not close leaves the
-      // recording indicator lit, and the reader is owed the reason.
-      options.onProblem(`The microphone could not be released: ${errorDetail(err)}`);
-    });
+    if (device) releaseDevice(device);
   }
 
   return {

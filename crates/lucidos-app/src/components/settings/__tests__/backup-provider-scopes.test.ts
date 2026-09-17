@@ -6,10 +6,17 @@
  * noticed until a backup failed at `files/create_folder_v2` with a 400 naming
  * `files.content.write` (2026-08-05).
  *
- * Both halves are pinned here: every registered provider has an entry, and the
- * entries carry the scopes the engine actually checks.
+ * Three things are pinned here. Every registered provider has an entry, each
+ * entry matches that provider's Rust `GRANT_SCOPES`, and the page names the
+ * permission a grant is short.
  */
 import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
 import {
   PROVIDER_SCOPES,
   backupAccessLine,
@@ -22,6 +29,54 @@ import {
  *  the registry. Adding a provider there means adding it here, which is the
  *  point: the failure is what tells you the new provider needs scopes. */
 const BACKUP_PROVIDER_IDS = ['google_drive', 'dropbox'];
+
+const here = dirname(fileURLToPath(import.meta.url));
+/** Repo root, from `crates/lucidos-app/src/components/settings/__tests__/`. */
+const REPO_ROOT = resolve(here, '../../../../../..');
+
+/** Where each provider's `GRANT_SCOPES` lives. A new provider needs a row, and
+ *  the test below fails until it has one. */
+const GRANT_SCOPE_SOURCES: Record<string, string> = {
+  google_drive: 'crates/lucidos-engine/src/core/backup/google_drive.rs',
+  dropbox: 'crates/lucidos-engine/src/core/backup/dropbox.rs',
+};
+
+/** The scopes a provider's Rust `GRANT_SCOPES` names. */
+function rustGrantScopes(id: string): string[] {
+  const file = GRANT_SCOPE_SOURCES[id];
+  expect(file, `no GRANT_SCOPES source recorded for ${id}`).toBeTruthy();
+  const src: string = readFileSync(resolve(REPO_ROOT, file), 'utf8');
+  const start = src.indexOf('pub const GRANT_SCOPES: &[&str] = &[');
+  expect(
+    start,
+    `could not find \`GRANT_SCOPES\` in ${file}. If it was renamed or moved, update this mirror rather than deleting it.`,
+  ).toBeGreaterThan(-1);
+  const scopes = [...src.slice(start, src.indexOf('];', start)).matchAll(/"([^"]+)"/g)].map(
+    (m) => m[1],
+  );
+  expect(scopes.length, `\`GRANT_SCOPES\` in ${file} parsed as empty`).toBeGreaterThan(0);
+  return scopes;
+}
+
+/** The Grant access button asks for exactly what the engine calls granted.
+ *
+ *  Both sides carried a "change one and change the other" comment and nothing
+ *  enforced it. Add a scope in Rust alone and `name_missing_scopes` starts
+ *  reporting it while the button keeps requesting the old set. The user
+ *  completes the consent screen and returns to the same red line, with no press
+ *  of the button able to clear it. */
+describe('the grant request mirrors the engine', () => {
+  it('has a source file recorded for every provider', () => {
+    expect(Object.keys(GRANT_SCOPE_SOURCES).sort()).toEqual([...BACKUP_PROVIDER_IDS].sort());
+  });
+
+  it.each(BACKUP_PROVIDER_IDS)('%s requests exactly its `GRANT_SCOPES`', (id) => {
+    // Order is meaningless in a space-joined OAuth scope string, so compare as
+    // sets and report the difference in each direction.
+    const requested = PROVIDER_SCOPES[id].split(' ').filter(Boolean);
+    expect(requested.sort()).toEqual([...rustGrantScopes(id)].sort());
+  });
+});
 
 describe('every backup provider can be granted access', () => {
   it.each(BACKUP_PROVIDER_IDS)('%s has a non-empty scope entry', (id) => {

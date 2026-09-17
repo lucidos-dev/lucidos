@@ -17,7 +17,7 @@ if (typeof (globalThis as any).cancelAnimationFrame === 'undefined') {
 
 import { mockContainer, mockDynamicAnchor, useMockMO } from './scroll-test-helpers';
 import { withScrollAnchor } from '../CreateThreadView';
-import { resumeFollowingBottom, setActiveScrollElement, setThreadLive, stopFollowingBottom } from '../scrollState';
+import { resumeFollowingBottom, setActiveScrollElement, setAgentLive, stopFollowingBottom } from '../scrollState';
 
 /**
  * **The anchor is the element the reader clicked.**
@@ -132,7 +132,7 @@ describe('a turn control holds the element the reader clicked', () => {
   describe('with the reader on the end of a quiet thread', () => {
     function armedAtTheEnd(container: ReturnType<typeof mockContainer>) {
       setActiveScrollElement(container as any);
-      setThreadLive(false);
+      setAgentLive(false);
       resumeFollowingBottom(container as any);
     }
 

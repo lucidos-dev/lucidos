@@ -560,46 +560,44 @@ self.addEventListener('notificationclick', (event) => {
   event.waitUntil(Promise.all([logPromise, markReadPromise, routeToDeepLink(targetUrl, data)]));
 });
 
-// True if a top-level Window client belongs to THIS service worker's scope.
-// Behind the workspace gateway several workspaces share one origin
-// (`/myws/`, `/dev/`, …); a push for `/myws` is delivered to the
-// `/myws` SW, but `clients.matchAll({includeUncontrolled:true})` returns
-// EVERY same-origin tab — including an open `/dev` tab. Without this gate
-// routeToDeepLink would focus + postMessage the wrong workspace's tab, whose
-// store has no such thread/app, so the tap "goes nowhere" (the cross-workspace
-// notification-tap bug). Match only same-scope clients; tolerate a missing
-// trailing slash (`/myws` for scope `/myws/`). At the legacy root scope
-// (`/`) every same-origin client matches — correct, since there's only one
-// workspace there.
-function clientInScope(clientUrl) {
+// True if a Window client is THIS workspace's app shell, the page the SPA runs
+// in. Behind the gateway several workspaces share one origin, and
+// `clients.matchAll({includeUncontrolled:true})` returns every same-origin tab.
+// So the tap has to pick its own workspace's shell.
+//
+// The match is EXACT, not a prefix. A popped-out app tab (`/dev/app/<id>/`, a
+// real `<a target="_blank">` in the browser client) is same-scope, top-level
+// and serves its own HTML. A prefix match focused that tab and posted the deep
+// link into a page with no listener. The tap then moved the wrong window and
+// routed nothing.
+//
+// The shell always sits at the scope root: its router reads the hash and query
+// (`handleHashLocation`), and every `replaceState` it makes keeps the pathname.
+// So the root path names it exactly, and app UIs, skill UIs and `sw.js` fall
+// out without being listed. Tolerate a missing trailing slash (`/myws` for
+// scope `/myws/`).
+function isWorkspaceShell(clientUrl) {
   let pathname;
   try {
     pathname = new URL(clientUrl).pathname;
   } catch {
     return false;
   }
-  // startsWith covers the exact-match case (SCOPE_PATH ends with '/'); the
-  // second clause adds tolerance for a client at the slug with no trailing slash.
-  return pathname.startsWith(SCOPE_PATH) || pathname + '/' === SCOPE_PATH;
+  return pathname === SCOPE_PATH || pathname + '/' === SCOPE_PATH;
 }
 
 async function routeToDeepLink(targetUrl, tapData) {
   const windowClients = await clients.matchAll({ type: 'window', includeUncontrolled: true });
-  // frameType filter is the load-bearing line — same-origin app-UI iframes
-  // (src=/app/<id>/) are ALSO Window clients per the SW spec. Without the
-  // 'top-level' gate, find() can return the iframe; focusing/messaging it
-  // moves the wrong surface, manifesting as "PWA opens to the wrong view".
-  // clientInScope keeps the tap inside THIS workspace (gateway multi-workspace).
-  // URL-substring filters stay as belt-and-braces for non-iframe edge cases
-  // (skill UIs in their own window).
-  const appClient = windowClients.find(c =>
-    c.frameType === 'top-level' &&
-    clientInScope(c.url) &&
-    !c.url.includes('/sw.js') &&
-    !c.url.includes('/api/v1/skill/')
+  // isWorkspaceShell is what keeps the tap on the whole app window: this
+  // workspace's app shell, never a deeper page under the same slug. The
+  // frameType gate stays beside it: a same-origin app-UI iframe (src=/app/<id>/)
+  // is ALSO a Window client per the SW spec. Only a top-level client is a
+  // window a tap can front.
+  const shellClient = windowClients.find(c =>
+    c.frameType === 'top-level' && isWorkspaceShell(c.url)
   );
 
-  if (appClient) {
+  if (shellClient) {
     // Bring the tab forward (focus() also unfreezes a Chrome-frozen page so it
     // can process the message below), then hand the page the structured deep
     // link. postMessage → the page's navigator.serviceWorker 'message' listener
@@ -616,8 +614,8 @@ async function routeToDeepLink(targetUrl, tapData) {
     // morning" case, where the SW focused the right tab and marked the
     // notification read but the deep link silently no-op'd. postMessage is
     // independent of both. See system-knowhow/notifications.md §4.5.
-    await appClient.focus().catch(() => {});
-    appClient.postMessage({ type: 'lucidos:deep-link', target: tapData });
+    await shellClient.focus().catch(() => {});
+    shellClient.postMessage({ type: 'lucidos:deep-link', target: tapData });
     return;
   }
   // No existing top-level Lucidos window — open one at the engine-built

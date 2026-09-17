@@ -8,10 +8,16 @@
  * DB row, so the skeleton is a phantom.
  *
  * Fix: only create skeletons for persisted events (seq !== null).
+ *
+ * Second round: a persisted event can lack a DB row too. The engine reads the
+ * aggregate inside the emitting transaction, so an event carrying none means
+ * the row is gone. That skeleton is the same phantom, so both halves of the
+ * gate live here.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { threadMap, focusedThreadId } from '../store';
 import { handleThreadEvent } from '../actions/thread-sync';
+import { makeThreadAggregate } from '../actions/threads-test-helpers';
 import type { ThreadState } from '../thread-events';
 
 // handleThreadEvent uses requestAnimationFrame for batched signal updates.
@@ -107,7 +113,8 @@ describe('Phantom thread prevention', () => {
 
   it('persisted event for unknown thread DOES create a skeleton', () => {
     // Scenario: new thread starts, SessionStarted arrives via SSE.
-    // This should still create a skeleton (it has a DB row).
+    // This should still create a skeleton (it has a DB row). The aggregate is
+    // what says the row is there, so a live persisted event always carries one.
     const threadId = 'new-thread';
 
     handleThreadEvent({
@@ -115,6 +122,7 @@ describe('Phantom thread prevention', () => {
       seq: 1,
       event: { type: 'SessionStarted', session_id: 'cc-1' },
       created: '2026-04-16T12:00:00Z',
+      aggregate: makeThreadAggregate(threadId, { channel: 'claude_code' }),
     });
 
     expect(threadMap.value.has(threadId)).toBe(true);
@@ -122,6 +130,24 @@ describe('Phantom thread prevention', () => {
     expect(thread.meta.title).toBe('...');
     expect(thread.meta.channel).toBe('claude_code');
     expect(thread.eventsLoaded).toBe(false);
+  });
+
+  it('persisted event for unknown thread with NO aggregate creates nothing', () => {
+    // The aggregate is read from `thread_summaries` inside the emitting
+    // transaction, so its absence on a persisted event means the row is gone.
+    // A skeleton built from that has no title and no content, and a reload
+    // sweeps it away. Found by drawer-archive-pagination, which counted one
+    // drawer row more than it seeded.
+    const threadId = 'thread-whose-row-was-truncated';
+
+    handleThreadEvent({
+      thread_id: threadId,
+      seq: 10916,
+      event: { type: 'ContextCaptured' },
+      created: '2026-04-16T12:00:00Z',
+    });
+
+    expect(threadMap.value.has(threadId)).toBe(false);
   });
 
   it('ChildrenCountChanged for thread already in map updates it normally', () => {
@@ -164,37 +190,17 @@ describe('Phantom thread prevention', () => {
       thread_id: ancestorId,
       event: { type: 'ChildrenCountChanged', active: 3, total: 5 },
       created: '2026-04-16T12:00:00Z', // broadcast NOW() — must NOT propagate
-      aggregate: {
-        // Real backend carries the ancestor's OWN unchanged last_activity in
-        // the aggregate (update_parent_after_child_terminal doesn't touch
-        // last_activity). applyAggregateToMeta overlays it as a no-op.
-        threadId: ancestorId,
-        title: 'Test Thread',
-        channel: 'chat',
-        initiator: 'user',
-        createdAt: '2026-01-01T00:00:00Z',
+      // Real backend carries the ancestor's OWN unchanged last_activity in
+      // the aggregate (update_parent_after_child_terminal doesn't touch
+      // last_activity). applyAggregateToMeta overlays it as a no-op.
+      aggregate: makeThreadAggregate(ancestorId, {
         lastActivity: ancestorOwnLastActivity,
-        messageCount: 1,
         section: 'archived',
         activeChildrenCount: 3,
         totalChildrenCount: 5,
-        blockingDescendantCount: 2, attentionDescendantCount: 2, // descendant flipped → ancestor count moves
-        status: 'idle',
-        codingAgentHasDiff: false,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
-        lastRevivedAt: null,
-        isSaved: false,
-        hasResponse: true,
-        parentThreadId: null,
-        parentThreadTitle: null,
-        state: 'active',
-        latestTodoList: null,
-        liveEventWaitCount: 0,
-        liveEventWaits: [],
-      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+        // descendant flipped, so the ancestor count moves
+        blockingDescendantCount: 2, attentionDescendantCount: 2,
+      }),
     });
 
     const ancestor = threadMap.value.get(ancestorId)!;
@@ -217,34 +223,12 @@ describe('Phantom thread prevention', () => {
       thread_id: threadId,
       event: { type: 'CodingAgentDiffChanged', has_diff: true },
       created: '2026-04-16T12:00:00Z',
-      aggregate: {
-        threadId,
-        title: 'Test Thread',
+      aggregate: makeThreadAggregate(threadId, {
         channel: 'claude_code',
-        initiator: 'user',
-        createdAt: '2026-01-01T00:00:00Z',
         lastActivity: ownLastActivity,
-        messageCount: 1,
         section: 'archived',
-        activeChildrenCount: 0,
-        totalChildrenCount: 0,
-        blockingDescendantCount: 0, attentionDescendantCount: 0,
-        status: 'idle',
         codingAgentHasDiff: true,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
-        lastRevivedAt: null,
-        isSaved: false,
-        hasResponse: true,
-        parentThreadId: null,
-        parentThreadTitle: null,
-        state: 'active',
-        latestTodoList: null,
-        liveEventWaitCount: 0,
-        liveEventWaits: [],
-      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+      }),
     });
 
     const thread = threadMap.value.get(threadId)!;
@@ -272,34 +256,11 @@ describe('Phantom thread prevention', () => {
       thread_id: parentId,
       event: { type: 'ChildrenCountChanged', active: 0, total: 1 },
       created: '2026-04-16T12:00:00Z',
-      aggregate: {
-        threadId: parentId,
-        title: 'Test Thread',
-        channel: 'chat',
-        initiator: 'user',
-        createdAt: '2026-01-01T00:00:00Z',
+      aggregate: makeThreadAggregate(parentId, {
         lastActivity: '2026-04-01T00:00:00Z',
-        messageCount: 1,
         section: 'inbox', // <-- surfaced
-        activeChildrenCount: 0,
         totalChildrenCount: 1,
-        blockingDescendantCount: 0, attentionDescendantCount: 0,
-        status: 'idle',
-        codingAgentHasDiff: false,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
-        lastRevivedAt: null,
-        isSaved: false,
-        hasResponse: true,
-        parentThreadId: null,
-        parentThreadTitle: null,
-        state: 'active',
-        latestTodoList: null,
-        liveEventWaitCount: 0,
-        liveEventWaits: [],
-      } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
+      }),
     });
 
     expect(threadMap.value.get(parentId)!.meta.section).toBe('inbox');

@@ -209,6 +209,50 @@ async fn test_staging_data_prefixed_siblings_are_not_diverted() {
     assert!(staging.join("data/real.txt").exists());
 }
 
+/// A relocated `data/` is a supported layout, which the Codex sandbox already
+/// grants (`a_data_symlink_may_relocate_the_tree_but_never_widen_it`).
+/// Matching an UNRESOLVED `<workspace>/data` prefix makes every write miss: it
+/// lands on the host half-written, the committer finds no staged tree, and the
+/// agent hears nothing was written.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_data_root_still_stages_its_writes() {
+    let dir = tempdir().unwrap();
+    let elsewhere = tempdir().unwrap();
+    let ws = dir.path();
+    // `artifacts/` exists so the unresolved-root path lands on the host rather
+    // than raising, which is the silent version of the bug.
+    std::fs::create_dir_all(elsewhere.path().join("artifacts")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), ws.join("data")).unwrap();
+    let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+    let staging = ws.join(".lucidos/staging/relocated-data-run");
+    let out = runtime
+        .execute_staged(
+            "open('data/artifacts/report.csv', 'w').write('a,b\\n')\n\
+             print(open('data/artifacts/report.csv').read().strip())",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect("the write must succeed");
+    assert_eq!(
+        out.trim(),
+        "a,b",
+        "the read must see this run's staged bytes"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(staging.join("data/artifacts/report.csv")).unwrap(),
+        "a,b\n",
+        "the staged tree is the only thing the committer publishes"
+    );
+    assert!(
+        !elsewhere.path().join("artifacts/report.csv").exists(),
+        "a relocated data/ write must stage, not land on the host before commit"
+    );
+}
+
 // ── scripts execute in place ───────────────────────────────────────────
 //
 // A `.py` script must run from where it lives. Running a COPY out of
@@ -809,6 +853,106 @@ async fn a_timeout_leaves_a_note_in_the_exhaust_dir() {
         "the note must be marked engine-written, since every other line in \
          that file is the child's own stderr: {:?}",
         notes[0]
+    );
+}
+
+// ── the exhaust sink is bounded ────────────────────────────────────
+//
+// Nothing else prunes `.lucidos/exhaust`. A one-minute script trigger mints
+// 1,440 run dirs a day. With no sweep the volume or the inode table fills,
+// and the user gets no signal until it does.
+
+/// Move a path's mtime `age` into the past. The sweep reads mtime, and no test
+/// can wait out a window measured in days. Opening a directory read-only is
+/// enough for `futimens`, which is what `set_times` calls.
+fn backdate(path: &std::path::Path, age: Duration) {
+    let when = std::time::SystemTime::now() - age;
+    std::fs::File::open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
+}
+
+/// A spent run dir, shaped exactly as `new_run_dir` plus `spawn_python` leave
+/// one behind.
+fn spent_run_dir(exhaust: &std::path::Path) -> std::path::PathBuf {
+    let run_dir = exhaust.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("stderr.txt"), "boom\n").unwrap();
+    run_dir
+}
+
+/// Retention, not a wipe. `system-knowhow/running-python.md` points debugging
+/// at `.lucidos/exhaust/<run_id>/stderr.txt`, so a run dir has to outlive its
+/// run by a useful margin and no longer.
+#[test]
+fn engine_start_drops_run_dirs_past_the_retention_window() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let exhaust = ws.join(".lucidos/exhaust");
+    std::fs::create_dir_all(&exhaust).unwrap();
+
+    let hour = Duration::from_secs(3600);
+    let stale = spent_run_dir(&exhaust);
+    backdate(&stale, EXHAUST_RETENTION + hour);
+    let recent = spent_run_dir(&exhaust);
+    backdate(&recent, EXHAUST_RETENTION - hour);
+
+    PythonRuntime::new(ws).unwrap();
+
+    assert!(
+        !stale.exists(),
+        "a run dir past the window must be reclaimed: {}",
+        stale.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(recent.join("stderr.txt")).unwrap(),
+        "boom\n",
+        "a run dir inside the window is still the documented debugging affordance"
+    );
+}
+
+/// The sweep is destructive, so it deletes only what it can name as a run dir.
+/// A symlink is read without following, which is what stops a link planted
+/// here from taking its target with it.
+#[cfg(unix)]
+#[test]
+fn the_sweep_spares_every_entry_it_cannot_name_as_a_run_dir() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let exhaust = ws.join(".lucidos/exhaust");
+    std::fs::create_dir_all(&exhaust).unwrap();
+
+    let target = ws.join("keep");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("precious.txt"), "mine\n").unwrap();
+
+    let note = exhaust.join("README.txt");
+    std::fs::write(&note, "hand-written\n").unwrap();
+    let odd_name = exhaust.join("not-a-run-id");
+    std::fs::create_dir_all(&odd_name).unwrap();
+    let link = exhaust.join(uuid::Uuid::new_v4().to_string());
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let ancient = EXHAUST_RETENTION + Duration::from_secs(3600);
+    for path in [&note, &odd_name, &target] {
+        backdate(path, ancient);
+    }
+
+    PythonRuntime::new(ws).unwrap();
+
+    assert!(note.exists(), "a loose file is not a run dir");
+    assert!(
+        odd_name.exists(),
+        "a dir the engine never minted is not one"
+    );
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "a symlink is not a run dir, whatever it points at"
+    );
+    assert!(
+        target.join("precious.txt").exists(),
+        "following that link would have deleted a tree outside the sink"
     );
 }
 

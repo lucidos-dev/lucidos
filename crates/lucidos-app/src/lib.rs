@@ -31,6 +31,8 @@ mod shell_env;
 mod test_support;
 mod traffic_lights;
 mod updater;
+/// The displays attached right now, and the windows a change to them strands.
+mod window_desk;
 mod window_persist;
 /// The window-lifecycle probe, behind its own feature so no shipped build
 /// carries it. Public because its one caller is an `examples/` binary.
@@ -437,7 +439,13 @@ fn write_new_download(
 /// Restart the always-on gateway service via launchd. The supervisor catches
 /// the SIGTERM, tears the bundled gateway and its spawned workspace engines
 /// down gracefully, and launchd respawns the service.
-#[tauri::command]
+///
+/// `async` while the body is not, for the reason `save_to_downloads` above
+/// spells out. Tauri runs a plain sync command on the MAIN thread, and this one
+/// first tells every running engine who asked for the restart. That sweep is
+/// bounded rather than instant, so it belongs off the thread drawing the
+/// progress dialog the user is watching.
+#[tauri::command(async)]
 fn restart_service() -> Result<(), String> {
     desktop::restart_service()
 }
@@ -775,25 +783,40 @@ static STARTUP_SHOW: StartupShow = StartupShow::new();
 
 /// What the startup show does to `main`, in the order it must go out.
 ///
-/// A named pair rather than two straight-line calls, for the reason
+/// A named list rather than four straight-line calls, for the reason
 /// `app_window::placement_steps` is one: the ORDER is the whole content, and
-/// two calls read the same either way. Clamp after the show and the correction
+/// the calls read the same either way. Clamp after the show and the correction
 /// is certain to land in front of the user. Drop the clamp and a frame no
 /// display can hold reaches the screen, which is the bug this exists to prevent
 /// (ADR 0193).
 ///
+/// GEOMETRY is one step rather than a place and a clamp. Those are two answers
+/// to one question, and only one of them applies per launch. A remembered frame
+/// is the client CHOOSING the geometry, and the choice is judged before it is
+/// written. With no frame the window wears what the window-state plugin
+/// restored, and that is what gets read and clamped.
+///
+/// It is here rather than in `setup` for the reason the clamp already was.
+/// `setup` runs before `app.run()`, so a placement issued there is queued
+/// behind the plugin's own restore and the two interleave. `main` is the only
+/// app window two records size, and it was the only one whose page came up at
+/// the wrong width (ADR 0202).
+///
 /// Issued in this order, which is not the same as APPLIED in it. tao defers a
 /// placement to the main dispatch queue, and runs an order-front inline. So a
-/// launch the clamp corrects can still paint one frame at the restored size.
-/// Issuing the correction first is what keeps that to one frame.
+/// launch this corrects can still paint one frame at the restored size. Issuing
+/// the correction first is what keeps that to one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupStep {
-    Clamp,
+    Geometry,
+    Refit,
     Show,
 }
 
-/// Sanitise `main`'s restored geometry, then put it on screen.
-const STARTUP_SHOW_STEPS: [StartupStep; 2] = [StartupStep::Clamp, StartupStep::Show];
+/// Settle `main`'s geometry, put its page over the whole of it, and only then
+/// show it.
+const STARTUP_SHOW_STEPS: [StartupStep; 3] =
+    [StartupStep::Geometry, StartupStep::Refit, StartupStep::Show];
 
 /// Put the deferred startup window on screen, at most once. Returns whether this
 /// call was the one that did it, so the fallback timer can say that the frontend
@@ -827,12 +850,27 @@ fn show_startup_window(app: &tauri::AppHandle) -> bool {
 }
 
 /// The steps above, run on the main thread. One block, so nothing can land
-/// between the clamp and the show.
+/// between them.
 fn startup_clamp_and_show(app: &tauri::AppHandle) {
     for step in STARTUP_SHOW_STEPS {
         match step {
-            StartupStep::Clamp => {
-                window_restore::clamp_restored_geometry(app, app_window::MAIN_WINDOW_LABEL);
+            // A remembered frame is the client choosing, and is judged before
+            // it is written. Nothing remembered leaves the window on what the
+            // window-state plugin restored, which HAS drained by now: the
+            // moment ADR 0193 put that read at. The plan is memoized, so this
+            // is the same answer `setup` would have read.
+            StartupStep::Geometry => app_window::settle_main_geometry(
+                app,
+                window_persist::resolve_window_session_plan()
+                    .first()
+                    .and_then(|(_, frame)| *frame),
+            ),
+            // Cheap insurance on the first visible frame. The placement above is
+            // deferred, so this reads the geometry the window still has. That
+            // costs nothing: what a refit really writes is the RATE, and both
+            // halves of it read the same moment.
+            StartupStep::Refit => {
+                app_window::refit_webview(app, app_window::MAIN_WINDOW_LABEL);
             }
             StartupStep::Show => match app.get_window(app_window::MAIN_WINDOW_LABEL) {
                 Some(win) => match win.show() {
@@ -1066,9 +1104,9 @@ pub fn run() {
                 // the moment. A change between the two halves of that
                 // conversion leaves the page in a corner (ADR 0178).
                 //
-                // The net rather than the fix. `app_window::build_geometry` and
-                // `placement_steps` are what stop the client causing such a
-                // change while a resize is queued.
+                // The `Resized` arm below carries the same call, and between
+                // them the page filling its window is a standing property
+                // rather than an occasional repair.
                 tauri::WindowEvent::ScaleFactorChanged { .. }
                     if app_window::is_app_window(window.label()) =>
                 {
@@ -1093,6 +1131,12 @@ pub fn run() {
                     // the placement is a function of the window's HEIGHT.
                     if matches!(event, tauri::WindowEvent::Resized(_)) {
                         traffic_lights::place(window);
+                        // A resize is the one moment the runtime's stored rate
+                        // becomes visible, and the moment a wrong one must not
+                        // survive. Each pass re-pins the rate to 1, so nothing
+                        // can accumulate across a drag. `refit_webview` says
+                        // what a frame of that costs.
+                        app_window::refit_webview(app, window.label());
                     }
                     window_persist::note_windows_changed(app);
                 }
@@ -1149,22 +1193,17 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            // What this launch owes the user: a window per workspace that had
-            // one, at the size that workspace was left. The plugin has already
-            // written its own saved rect onto `main`, and this supersedes it
-            // whenever the record knows the workspace. `main` must be sized
-            // before it appears rather than resized after.
+            // `main`'s geometry is NOT decided here, and neither is the clamp
+            // that judges it. This runs before `app.run()`, so nothing issued
+            // here has reached the window: tao defers every setter to the main
+            // dispatch queue, and so does the window-state plugin's restore.
             //
-            // The clamp that judges the result is NOT here. This runs before
-            // `app.run()`, so neither this placement nor the plugin's has
-            // reached the window: tao defers both setters to the main dispatch
-            // queue. A clamp here reads the geometry the window was BORN at. It
-            // passed a doubled rect as healthy, which is how one reached a
-            // tester's screen. `show_startup_window` owns it now.
-            let plan = window_persist::resolve_window_session_plan();
-            if let Some((_, Some(frame))) = plan.first() {
-                window_persist::size_main_window_for_its_workspace(app.handle(), *frame);
-            }
+            // Two costs followed from placing `main` here. A clamp read the
+            // geometry the window was BORN at, and passed a doubled rect as
+            // healthy (ADR 0193). And the placement interleaved with the
+            // plugin's own, which is how `main` ended up holding a page 1.68
+            // times its width. `STARTUP_SHOW_STEPS` owns both now, in one
+            // main-thread block, on a window that is still hidden.
 
             // Best-effort: a menu build failure must not block app startup.
             if let Err(e) = install_app_menu(app) {
@@ -1227,6 +1266,12 @@ pub fn run() {
             // Cmd-H is the one hide the client does not perform itself, so it
             // is observed. See `window_screen`.
             window_screen::watch_app_hide();
+
+            // The other thing AppKit does behind the client's back: take a
+            // display away under a window sized for it. The restore clamp runs
+            // only at a creation or a show, so this is what asks the question
+            // again while the client is up. See `window_desk`.
+            window_desk::watch_desk(app.handle().clone());
 
             crash_watchdog::spawn(app.handle().clone());
 
@@ -1441,6 +1486,45 @@ mod tests {
         );
     }
 
+    /// Nothing asks a WINDOW for its inner size: ADR 0202.
+    ///
+    /// On macOS `tauri::Window::inner_size()` does not answer about the window.
+    /// For a window with no `add_child` webview the runtime hands back the
+    /// first WEBVIEW's NSView frame instead, and it does so on purpose: wry
+    /// replaces the view tao's resize event reports.
+    ///
+    /// So a page that has drifted from its window reports the drift as the
+    /// window's own size. Four callers believed it. The refit compared the page
+    /// against itself. The clamp judged the page. The session record wrote the
+    /// page's size down as the frame, and the preview measured its gap from the
+    /// page. `app_window::window_content_size` is the one honest reader.
+    ///
+    /// A scan, because every call site reads correctly. The name says window,
+    /// the type is a window, and the number is the page's.
+    ///
+    /// The needle is built from parts, so this test's own source does not match
+    /// itself and neither does the prose above.
+    #[test]
+    fn no_window_is_asked_for_its_inner_size() {
+        let needle = concat!(".inner_", "size()");
+        let mut hits = Vec::new();
+        for path in crate_source_files() {
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            for (number, line) in source.lines().enumerate() {
+                if line.contains(needle) {
+                    hits.push(format!("{file}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "this getter answers with the PAGE, not the window (ADR 0202). Call \
+             `app_window::window_content_size` instead:\n  {}",
+            hits.join("\n  ")
+        );
+    }
+
     /// No command may declare a `tauri::WebviewWindow` parameter: ADR 0140.
     ///
     /// Tauri refuses that argument outright while a URL preview is open, so
@@ -1564,14 +1648,22 @@ mod tests {
         assert!(should_show_window_at_startup(&login, true));
     }
 
-    /// The clamp goes first, and it is the step that exists at all. `setup` ran
-    /// it before tao's deferred setters had reached the window. So it judged the
-    /// geometry the window was born at, and passed a doubled rect as healthy.
-    /// Issuing it after the show instead would put the correction in front of
-    /// the user for certain, rather than at worst for one frame.
+    /// Every step is here because `setup` was the wrong place for it. `setup`
+    /// runs before tao's deferred setters reach the window. So a clamp there
+    /// judged the geometry the window was born at, and passed a doubled rect as
+    /// healthy. A placement there interleaved with the window-state plugin's
+    /// own, which is how `main` came up holding a page 1.68 times its width.
+    ///
+    /// The order carries the rest. Settle the geometry, put the page over the
+    /// result, and only then show. Settling after the show would put the
+    /// correction in front of the user for certain, rather than at worst for
+    /// one frame.
     #[test]
-    fn the_startup_show_clamps_before_it_shows() {
-        assert_eq!(STARTUP_SHOW_STEPS, [StartupStep::Clamp, StartupStep::Show]);
+    fn the_startup_show_settles_the_geometry_and_the_page_before_it_shows() {
+        assert_eq!(
+            STARTUP_SHOW_STEPS,
+            [StartupStep::Geometry, StartupStep::Refit, StartupStep::Show]
+        );
     }
 
     #[test]

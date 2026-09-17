@@ -13,7 +13,7 @@ vi.mock('../../api/threads', () => ({
 vi.mock('../../utils/liveness', () => ({ postClientLog: vi.fn() }));
 
 import { fetchOlderThreads, fetchArchivedCount } from '../../api/threads';
-import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest } from '../actions/thread-loading';
+import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest, _clearOlderThreadsCursorForTest } from '../actions/thread-loading';
 import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS } from '../store';
 import { closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
 import { makeOptimisticThreadState } from '../thread-events';
@@ -22,6 +22,36 @@ import type { ThreadSummary } from '../../api/threads';
 
 const fetchMock = vi.mocked(fetchOlderThreads);
 const countMock = vi.mocked(fetchArchivedCount);
+
+/** A `ThreadSummary` shaped the way `/threads/older` returns one. Only the few
+ *  fields pagination reads are worth varying; the rest are inert defaults. */
+function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at: string }): ThreadSummary {
+  return {
+    title: 'Older',
+    channel: 'chat',
+    initiator: 'user',
+    last_activity: over.created_at,
+    message_count: 1,
+    section: 'archived',
+    active_children_count: 0,
+    total_children_count: 0,
+    blocking_descendant_count: 0,
+    attention_descendant_count: 0,
+    live_event_wait_count: 0,
+    status: 'idle',
+    coding_agent_has_diff: false,
+    coding_agent_proposed: false,
+    coding_agent_requires_restart: false,
+    coding_agent_is_external_repo: false,
+    coding_agent_applying: false,
+    last_revived_at: null,
+    parent_thread_id: null,
+    state: 'active',
+    compose_text: '',
+    compose_images: [],
+    ...over,
+  };
+}
 
 function loaded(thread: ThreadState, updatedAt: string): ThreadState {
   thread.meta.updatedAt = updatedAt;
@@ -51,6 +81,7 @@ describe('loadOlderThreads', () => {
     selectedRepoIds.value = new Set();
     selectedAppIds.value = new Set();
     _clearFamilyExtensionIdsForTest();
+    _clearOlderThreadsCursorForTest();
   });
 
   it('passes selected trigger ids to fetchOlderThreads when set', async () => {
@@ -233,30 +264,13 @@ describe('loadOlderThreads', () => {
     }), '2026-05-17T01:23:00Z');
     threadMap.value = new Map([['parent', parent]]);
 
-    const oldChildInfo: ThreadSummary = {
+    const oldChildInfo = summary({
       thread_id: 'old-child',
       title: 'Build & test',
       channel: 'claude_code',
-      initiator: 'user',
       created_at: '2026-05-16T22:46:00Z',
-      last_activity: '2026-05-16T22:46:00Z',
-      message_count: 1,
-      section: 'archived',
-      active_children_count: 0,
-      total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
-      status: 'idle',
-      coding_agent_has_diff: false,
-      coding_agent_proposed: false,
-      coding_agent_requires_restart: false,
-      coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
-      last_revived_at: null,
       parent_thread_id: 'parent',
-      state: 'active',
-      compose_text: '',
-      compose_images: [],
-    };
+    });
     const sibling: ThreadSummary = {
       ...oldChildInfo,
       thread_id: 'base-1',
@@ -293,30 +307,12 @@ describe('loadOlderThreads', () => {
     }), '2026-05-17T01:23:00Z');
     threadMap.value = new Map([['parent', parent]]);
 
-    const oldInfo: ThreadSummary = {
+    const oldInfo = summary({
       thread_id: 'old',
       title: 'Old',
-      channel: 'chat',
-      initiator: 'user',
       created_at: '2026-05-16T22:46:00Z',
-      last_activity: '2026-05-16T22:46:00Z',
-      message_count: 1,
-      section: 'archived',
-      active_children_count: 0,
-      total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
-      status: 'idle',
-      coding_agent_has_diff: false,
-      coding_agent_proposed: false,
-      coding_agent_requires_restart: false,
-      coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
-      last_revived_at: null,
       parent_thread_id: 'parent',
-      state: 'active',
-      compose_text: '',
-      compose_images: [],
-    };
+    });
     fetchMock.mockResolvedValueOnce({ threads: [{ ...oldInfo, thread_id: 'mid', last_activity: '2026-05-17T00:30:00Z', parent_thread_id: null }], family_threads: [oldInfo], has_more: true });
     await loadOlderThreads();
 
@@ -334,6 +330,67 @@ describe('loadOlderThreads', () => {
     threadHasMore.value = true; // override the previous has_more=false so we can probe
     await loadOlderThreads();
     expect(fetchMock).toHaveBeenLastCalledWith('2026-05-16T22:46:00Z', 15, undefined, undefined, undefined, undefined);
+  });
+
+  it('pages BELOW a page that held nothing new, instead of calling the archive exhausted', async () => {
+    // The reported bug: "sometimes it's not possible to scroll to see more of
+    // the archive". `/threads/older` pages EVERY thread by created_at, while
+    // the initial window already holds every inbox and saved thread whatever
+    // its age. So a page can be entirely rows this device has. Reading that as
+    // an exhausted archive hid the rest of the pile for good, and the map-derived
+    // cursor cannot save it: no archived row arrived, so it does not move.
+    const arch = loaded(makeOptimisticThreadState({
+      id: 'arch', title: 'Oldest loaded archived', channel: 'chat', initiator: 'user',
+      eventsLoaded: false,
+    }), '2026-06-01T00:00:00Z');
+    const alreadyHere = ['inbox-a', 'inbox-b'].map((id, i) => {
+      const t = loaded(makeOptimisticThreadState({
+        id, title: id, channel: 'chat', initiator: 'user', eventsLoaded: false,
+      }), i === 0 ? '2026-05-20T00:00:00Z' : '2026-05-10T00:00:00Z');
+      t.meta.section = 'inbox';
+      return t;
+    });
+    threadMap.value = new Map([['arch', arch], ...alreadyHere.map(t => [t.meta.id, t] as const)]);
+
+    fetchMock.mockResolvedValueOnce({
+      threads: [
+        summary({ thread_id: 'inbox-a', created_at: '2026-05-20T00:00:00Z', section: 'inbox' }),
+        summary({ thread_id: 'inbox-b', created_at: '2026-05-10T00:00:00Z', section: 'inbox' }),
+      ],
+      family_threads: [],
+      has_more: true,
+    });
+    expect(await loadOlderThreads(), 'the server answered, so the page landed').toBe(true);
+    expect(fetchMock).toHaveBeenLastCalledWith('2026-06-01T00:00:00Z', 15, undefined, undefined, undefined, undefined);
+    expect(threadHasMore.value, 'a page of familiar rows is not the end of the archive').toBe(true);
+
+    // The next page continues below where the SERVER stopped, not below the
+    // oldest archived row in the map (which that page never moved).
+    fetchMock.mockResolvedValueOnce({ threads: [], family_threads: [], has_more: false });
+    await loadOlderThreads();
+    expect(fetchMock).toHaveBeenLastCalledWith('2026-05-10T00:00:00Z', 15, undefined, undefined, undefined, undefined);
+    expect(threadHasMore.value, 'an empty page IS the end').toBe(false);
+  });
+
+  it('reports whether a page landed, so the drawer fill loop knows to ask again', async () => {
+    // The fill loop used to stop when threadMap did not grow, which re-created
+    // the stall above one level up: a page of familiar rows left the list short
+    // and the sentinel stranded in view, with no scroll available to re-fire it.
+    const arch = loaded(makeOptimisticThreadState({
+      id: 'arch', title: 'A', channel: 'chat', initiator: 'user', eventsLoaded: false,
+    }), '2026-06-01T00:00:00Z');
+    threadMap.value = new Map([['arch', arch]]);
+
+    threadLoadingMore.value = true;
+    expect(await loadOlderThreads(), 'a declined call fetched nothing').toBe(false);
+
+    threadLoadingMore.value = false;
+    fetchMock.mockResolvedValueOnce({
+      threads: [summary({ thread_id: 'arch', created_at: '2026-06-01T00:00:00Z' })],
+      family_threads: [],
+      has_more: true,
+    });
+    expect(await loadOlderThreads(), 'a landed page always moves the cursor').toBe(true);
   });
 
   it('keeps a thread inserted while the page was in flight', async () => {
@@ -364,30 +421,7 @@ describe('loadOlderThreads', () => {
     ]);
 
     landPage({
-      threads: [{
-        thread_id: 'older',
-        title: 'Older',
-        channel: 'chat',
-        initiator: 'user',
-        created_at: '2025-12-01T00:00:00Z',
-        last_activity: '2025-12-01T00:00:00Z',
-        message_count: 1,
-        section: 'archived',
-        active_children_count: 0,
-        total_children_count: 0,
-        blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
-        status: 'idle',
-        coding_agent_has_diff: false,
-        coding_agent_proposed: false,
-        coding_agent_requires_restart: false,
-        coding_agent_is_external_repo: false,
-        coding_agent_applying: false,
-        last_revived_at: null,
-        parent_thread_id: null,
-        state: 'active',
-        compose_text: '',
-        compose_images: [],
-      }],
+      threads: [summary({ thread_id: 'older', created_at: '2025-12-01T00:00:00Z' })],
       family_threads: [],
       has_more: false,
     });
@@ -514,6 +548,7 @@ describe('filterChangedSinceLoad', () => {
     selectedRepoIds.value = new Set();
     selectedAppIds.value = new Set();
     _clearFamilyExtensionIdsForTest();
+    _clearOlderThreadsCursorForTest();
     _clearLoadedFilterSelectionForTest();
   });
 

@@ -186,6 +186,10 @@ impl LucidosEngine {
                 // Emit via EventBus — persists to events table AND notifies scheduler instantly
                 let trigger_id_str = uuid::Uuid::new_v4().to_string();
                 let cron_display = cron_expressions.join(", ");
+                // No slug here: the writer mints one under the lock that
+                // serializes the emit. `from_created_payload`'s derive is a pure
+                // function of the name, so legacy events replay to the same
+                // slug. Two triggers named alike would share one directory.
                 let mut event_payload = serde_json::json!({
                     "trigger_id": trigger_id_str,
                     "name": name,
@@ -250,13 +254,9 @@ impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: {}", e)),
                 }
 
-                self.emit_trigger_write(
-                    TriggerWrite::Created,
-                    &trigger_id_str,
-                    event_payload,
-                    None,
-                )
-                .await?;
+                self.trigger_registry_writer()
+                    .write_created_minting_slug(&trigger_id_str, event_payload, name, None)
+                    .await?;
 
                 let trigger_desc = trigger_description(&cron_display, &subscriptions);
                 let run_desc = match &run {

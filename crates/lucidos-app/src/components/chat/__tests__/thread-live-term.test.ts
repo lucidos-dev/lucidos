@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { exchangeMarksThreadLive } from '../ChatExchange';
+import { exchangeMarksAgentLive } from '../ChatExchange';
 import { exchangeStatus } from '../../../store/thread-events';
 import { makeExchange, step } from '../../../store/__tests__/fixtures';
 
@@ -34,7 +34,7 @@ describe("the follow's live term", () => {
     const status = exchangeStatus(boundary, '', true, false, true, true, false);
     // The rendering verdict is the generous one, which is what made this a bug.
     expect(status).toBe('pending');
-    expect(exchangeMarksThreadLive(true, status, true)).toBe(false);
+    expect(exchangeMarksAgentLive(true, status, true)).toBe(false);
   });
 
   it('is true while the coding agent is actually working', () => {
@@ -43,7 +43,7 @@ describe("the follow's live term", () => {
     ]);
     const status = exchangeStatus(working, '', true, false, true, false, false);
     expect(status).toBe('coding-agent-working');
-    expect(exchangeMarksThreadLive(true, status, false)).toBe(true);
+    expect(exchangeMarksAgentLive(true, status, false)).toBe(true);
   });
 
   it('is true in the gap between a send and its first step, which the projection has not settled', () => {
@@ -53,7 +53,7 @@ describe("the follow's live term", () => {
     const justSent = makeExchange({ type: 'MessageReceived', text: 'go' }, []);
     const status = exchangeStatus(justSent, '', true, false, true, false, false);
     expect(status).toBe('pending');
-    expect(exchangeMarksThreadLive(true, status, false)).toBe(true);
+    expect(exchangeMarksAgentLive(true, status, false)).toBe(true);
   });
 
   it('is true for a turn that armed an event wait and worked on', () => {
@@ -71,7 +71,7 @@ describe("the follow's live term", () => {
     ]);
     const status = exchangeStatus(worked, '', true, false, true, false, false);
     expect(status).toBe('coding-agent-working');
-    expect(exchangeMarksThreadLive(true, status, false)).toBe(true);
+    expect(exchangeMarksAgentLive(true, status, false)).toBe(true);
   });
 
   it('is false for a thread parked on a question, where nothing is being appended', () => {
@@ -79,7 +79,7 @@ describe("the follow's live term", () => {
       type: 'UserQuestionAsked', tool_use_id: 't1', cc_session_id: 's1', question: 'which?',
     }, []);
     const status = exchangeStatus(asked, '', true, false, true, true, true);
-    expect(exchangeMarksThreadLive(true, status, true)).toBe(false);
+    expect(exchangeMarksAgentLive(true, status, true)).toBe(false);
   });
 
   it('is false for any exchange that is not the last one', () => {
@@ -87,6 +87,6 @@ describe("the follow's live term", () => {
       step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
     ]);
     const status = exchangeStatus(working, '', true, false, true, false, false);
-    expect(exchangeMarksThreadLive(false, status, false)).toBe(false);
+    expect(exchangeMarksAgentLive(false, status, false)).toBe(false);
   });
 });

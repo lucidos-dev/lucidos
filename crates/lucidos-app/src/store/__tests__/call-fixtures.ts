@@ -33,3 +33,4 @@ export function heard(seq: number, text: string, session = 'sess-1'): readonly [
 export function said(seq: number, text: string, session = 'sess-1'): readonly [number, StoredEvent] {
   return ev(seq, { type: 'SpokenReplyGenerated', session_id: session, text, interrupted: false });
 }
+

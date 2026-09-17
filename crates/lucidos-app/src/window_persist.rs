@@ -255,14 +255,18 @@ pub(crate) fn remembered_frame(url: &str) -> Option<window_restore::Rect> {
 /// Put `main` at the frame the workspace it will open remembers.
 ///
 /// Before the show, so the window appears at its size rather than jumping to it
-/// a second later. The clamp runs after and sanitises whatever this leaves.
+/// a second later. The frame arrives already judged: `app_window`'s
+/// `settle_main_geometry` is the only caller, and it runs a chosen rect through
+/// `window_restore::sanitized_frame` first. No clamp follows this, because a
+/// clamp issued behind a deferred placement reads the rect it is replacing
+/// (ADR 0202).
 ///
 /// This is the one placement that can meet an ALREADY arranged window. It runs
-/// from `setup` after the plugin restored `main`, and from a reopen pointing an
-/// adrift `main` at a workspace. So it is the one that has to skip a fullscreen
-/// window, for the reason `window_restore::clamp_restored_geometry` gives: macOS
-/// owns that frame, and sizing it fights the AppKit transition. A window built
-/// for a frame cannot be fullscreen yet, so no other caller needs the test.
+/// from the startup show, and from a reopen. So it is the one that has to skip
+/// a fullscreen window, for the reason `window_restore::clamp_restored_geometry`
+/// gives: macOS owns that frame, and sizing it fights the AppKit transition. A
+/// window built for a frame cannot be fullscreen yet, so no other caller needs
+/// the test.
 ///
 /// By window, not webview window, per ADR 0140. Sizing and placing are window
 /// operations, and by the time a reopen runs `main` is the likeliest window of
@@ -384,6 +388,11 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
             // The same pair the plugin persists and `window_restore` clamps, so
             // all three reason about one set of numbers.
             //
+            // Through `app_window::window_content_size`, never `inner_size`,
+            // which answers with the PAGE on macOS. This capture wrote a
+            // drifted page's size down as its window's frame, and the next
+            // launch restored the window to it (ADR 0202).
+            //
             // The window's own scale factor comes with them, because that is
             // what tao multiplied them by. Unreadable drops the window from the
             // capture: a frame recorded at the wrong scale is what puts it off
@@ -391,7 +400,7 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
             let (Ok(url), Ok(position), Ok(size), Ok(scale)) = (
                 webview.url(),
                 window.outer_position(),
-                window.inner_size(),
+                crate::app_window::window_content_size(&window),
                 window.scale_factor(),
             ) else {
                 return None;

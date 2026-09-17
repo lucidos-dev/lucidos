@@ -426,3 +426,71 @@ mod app_thread_stale_settle {
         );
     }
 }
+
+mod a_refused_branch_delete_is_reported {
+    //! The stale settle's `git branch -D` must say so when git refuses.
+    //!
+    //! `git_cmd` answers `Ok` for a non-zero exit, so an `if let Err` over it
+    //! fires only on a spawn failure or the 30s timeout. Git refuses while a
+    //! worktree still holds the branch, which is what an `Unknown` lookup
+    //! leaves: `settle_stale_worktree` skips its removal, and the Discard then
+    //! failed silently with the branch and its commits still there.
+    //!
+    //! `end_stale_waiting_session` needs a `LucidosEngine`, so the call site is
+    //! pinned by source, in the style of the tripwire above. The behavioural
+    //! half proves what the scan is about, against real git in a tempdir it
+    //! made itself.
+
+    use crate::engine::git_ops::{branch_head_sha, git_cmd, git_ran_ok};
+    use crate::test_support::make_repo_and_worktree;
+
+    const BRANCH: &str = "lucidos-claude-code-repo-refused-delete-7c1a20b4";
+
+    #[test]
+    fn the_stale_settle_deletes_its_branch_through_git_ran_ok() {
+        const RECOVERY_SRC: &str = include_str!("../agent_recovery/recovery.rs");
+
+        let sites: Vec<usize> = RECOVERY_SRC
+            .match_indices(r#"&["branch", "-D","#)
+            .map(|m| m.0)
+            .collect();
+        for at in &sites {
+            let start = RECOVERY_SRC[..*at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+            let line = RECOVERY_SRC[start..]
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim();
+            assert!(
+                line.contains("git_ran_ok("),
+                "a `git branch -D` in recovery.rs must run through `git_ran_ok`, which \
+                 folds a non-zero exit into `Err`. `git_cmd` calls a refused delete `Ok` \
+                 and the log never names it. Offending line: {line}"
+            );
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "the stale settle deletes one branch, on an explicit Discard"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_refuses_while_a_worktree_holds_the_branch() {
+        let (_tmp, repo, wt) = make_repo_and_worktree(BRANCH).await;
+        assert!(wt.exists(), "the worktree is what makes git refuse");
+
+        assert!(
+            git_cmd(&["branch", "-D", BRANCH], &repo).await.is_ok(),
+            "git_cmd reads a refused delete as Ok, which is why the old site was silent"
+        );
+        assert!(
+            git_ran_ok(&["branch", "-D", BRANCH], &repo).await.is_err(),
+            "git_ran_ok must surface the refusal so the log can name it"
+        );
+        assert!(
+            branch_head_sha(&repo, BRANCH).await.is_some(),
+            "and the branch survived both attempts, with the discarded commits on it"
+        );
+    }
+}

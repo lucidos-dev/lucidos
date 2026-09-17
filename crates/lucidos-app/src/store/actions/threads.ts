@@ -51,6 +51,26 @@ export interface FocusThreadOptions {
 
 export function focusThread(threadId: string, options?: FocusThreadOptions): void {
   const wasFocused = focusedThreadId.value === threadId;
+  // A standing follow belongs to the thread it was armed in, so opening a
+  // DIFFERENT one retires it. The position this open restores to may BE that
+  // thread's bottom, which writes no scroll for the reader-moved disarm to see.
+  //
+  // BEFORE the focus moves, and that order is load-bearing. A signal assignment
+  // runs its subscribers synchronously, and `watchCallLiveness` is one. A call
+  // up on the INCOMING thread flips the transcript live inside
+  // `setFocusedThread`. The wake behind that would carry the OUTGOING thread's
+  // ride, on the element both threads share.
+  //
+  // The thread being LEFT loses nothing. Its request was recorded as the
+  // live-edge form of its reading position. Only the ARM reaches the recording
+  // side, so a retire writes nothing (see `onFollowArmed`). Re-entry resumes it.
+  //
+  // Re-focusing the thread already open is not an open, and retires nothing.
+  // `useScrollMemory` does not re-run on an unchanged key, so a retire would end
+  // a follow with nothing left to resume it. The one caller arriving with the
+  // focus already moved is `focusThreadOrBootstrapResult`'s miss path, which
+  // retires at its own optimistic focus instead.
+  if (!wasFocused) stopFollowingBottom();
   setFocusedThread(threadId);
   resetCodingAgentPendingPreferences();
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
@@ -66,26 +86,6 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // claim from a prior focus, so its suppression can't leak onto this thread's
   // load. A deep-link focus re-claims below via scrollTo*AndPulse.
   if (!hasTarget) clearPendingEventScroll();
-  // A standing follow belongs to the thread it was armed in. Opening a DIFFERENT
-  // thread is not asking to ride its live edge, and the position this one
-  // restores to may BE its bottom, which writes no scroll for the reader-moved
-  // disarm to notice. Retire it here instead.
-  //
-  // This costs the thread being LEFT nothing: its request was recorded as the
-  // live-edge form of its reading position while it was on screen, and only the
-  // ARM is broadcast to the recording side, so a retire writes nothing (see
-  // `onFollowArmed`). Re-entry resumes it.
-  //
-  // Re-focusing the thread the reader is ALREADY in is not an open at all, so it
-  // retires nothing: there is no incoming thread to protect, the reader asked for
-  // nothing, and `useScrollMemory` does not re-run on an unchanged key, so a
-  // retire here would silently end a follow with nothing left to resume it.
-  //
-  // The one caller that reaches here with the focus ALREADY moved is
-  // `focusThreadOrBootstrapResult`'s miss path, which focuses optimistically
-  // before its fetch. It retires at that optimistic focus instead, which is the
-  // moment its navigation actually leaves a thread.
-  if (!wasFocused) stopFollowingBottom();
   // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
   // it exclusively. Manual resets cause the chevron to vanish when no scroll
   // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).

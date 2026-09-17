@@ -655,11 +655,31 @@ fn default_messages_limit() -> i64 {
     20
 }
 
-/// Parse an optional RFC3339 timestamp string into `DateTime<Utc>`.
-/// Used by query endpoints that accept `since`/`until`/`before` cursors.
-fn parse_optional_rfc3339(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
-    s.and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+/// Parse an optional RFC 3339 timestamp into `DateTime<Utc>`, for the
+/// `since` / `until` / `before` cursors the query endpoints accept.
+///
+/// A present-but-unparseable value is refused, never dropped. The stores read
+/// `None` as "no bound", so dropping one widens the query. A bare date in
+/// `since` turns a windowed count into the all-time one. A dropped `before`
+/// makes every `/messages` page return the newest rows, which loops a client
+/// paging by cursor.
+///
+/// `param` names the field so the 400 says which value was wrong. Same shape
+/// as the `event_id` refusal in `query_events`.
+fn parse_optional_rfc3339(
+    param: &str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => Ok(Some(dt.with_timezone(&chrono::Utc))),
+        Err(e) => Err(format!(
+            "{param} '{raw}' is not an RFC 3339 timestamp \
+             (e.g. 2026-09-01T00:00:00Z): {e}"
+        )),
+    }
 }
 
 /// Get recent messages across all history (flat timeline)
@@ -667,7 +687,8 @@ pub(super) async fn get_recent_messages(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Vec<SessionMessage>>, (StatusCode, String)> {
-    let before = parse_optional_rfc3339(query.before.as_deref());
+    let before = parse_optional_rfc3339("before", query.before.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let limit = query.limit.clamp(1, 500);
     let messages = state
         .event_store
@@ -764,8 +785,10 @@ pub(super) async fn count_events(
     State(state): State<AppState>,
     Query(q): Query<EventsCountParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let since = parse_optional_rfc3339(q.since.as_deref());
-    let until = parse_optional_rfc3339(q.until.as_deref());
+    let since = parse_optional_rfc3339("since", q.since.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let until = parse_optional_rfc3339("until", q.until.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     if let Some(et) = q.event_type.as_deref() {
         let (count, byte_total) = state
             .event_store
@@ -817,8 +840,10 @@ pub(super) async fn query_events(
     State(state): State<AppState>,
     Query(q): Query<EventsQueryParams>,
 ) -> Result<Json<Vec<crate::core::EventRow>>, (StatusCode, String)> {
-    let since = parse_optional_rfc3339(q.since.as_deref());
-    let until = parse_optional_rfc3339(q.until.as_deref());
+    let since = parse_optional_rfc3339("since", q.since.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let until = parse_optional_rfc3339("until", q.until.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let limit = q.limit.clamp(1, 1000);
     if let Err(msg) = validate_cursor_pair(q.before_event_id, q.after_event_id) {
         return Err((StatusCode::BAD_REQUEST, msg));
@@ -990,10 +1015,13 @@ fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
 
 /// Routes for the engine-level surfaces this module's handlers own:
 /// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
-/// `/session/messages`, and the `/events*` surface (global SSE stream +
-/// event-store queries). The three `/events/:event_id/*` routes are part of
-/// the events URL surface, so they register here even though their handlers
-/// live in `api::threads`.
+/// `/session/messages`, the three `/engine/*` routes (version-status,
+/// changelog, rebuild), and the `/events*` surface (global SSE stream +
+/// event-store queries).
+///
+/// Four `/events/:event_id/*` routes join them: `context`, `tool-result`,
+/// `tool-args` and `location`. They are part of the events URL surface, so
+/// they register here even though their handlers live in `api::threads`.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
@@ -1224,6 +1252,38 @@ mod tests {
         // to a child thread's outcome after one had already completed. Being
         // told when a child finishes is what you wire up beforehand.
         assert!(seed.contains(&"ChildThreadCompleted"));
+    }
+
+    /// A cursor the engine cannot parse is refused, not dropped. Dropping it
+    /// leaves `None`, which the stores read as "no bound", so the query
+    /// silently widens to every row.
+    #[test]
+    fn a_malformed_timestamp_cursor_is_refused_rather_than_dropped() {
+        // The shape a CLI or an LLM caller naturally sends for a day window.
+        let err = parse_optional_rfc3339("since", Some("2026-09-01"))
+            .expect_err("a bare date is not RFC 3339");
+        assert!(
+            err.contains("since") && err.contains("2026-09-01"),
+            "the refusal names the parameter and the value, got: {err}"
+        );
+
+        for bad in ["", "yesterday", "2026-09-01 00:00:00", "1757030400"] {
+            assert!(
+                parse_optional_rfc3339("before", Some(bad)).is_err(),
+                "{bad:?} must not pass as a cursor"
+            );
+        }
+    }
+
+    /// Absent stays absent, and a real RFC 3339 value still parses to UTC.
+    #[test]
+    fn an_absent_cursor_is_no_bound_and_a_valid_one_lands_in_utc() {
+        assert_eq!(parse_optional_rfc3339("since", None), Ok(None));
+
+        let parsed = parse_optional_rfc3339("since", Some("2026-09-01T02:00:00+02:00"))
+            .expect("a well-formed offset timestamp")
+            .expect("present");
+        assert_eq!(parsed.to_rfc3339(), "2026-09-01T00:00:00+00:00");
     }
 
     #[test]

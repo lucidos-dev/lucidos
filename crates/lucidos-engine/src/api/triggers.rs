@@ -4,9 +4,9 @@ use crate::core::PreferenceStore;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
-    is_valid_trigger_slug, normalize_route_setting, slugify_trigger_name_with_fallback,
-    validate_script_extension, validate_trigger_reasoning_effort, EventSubscription, TriggerConfig,
-    TriggerRun, TriggerRunStatus,
+    is_valid_trigger_slug, normalize_route_setting, validate_script_extension,
+    validate_trigger_reasoning_effort, EventSubscription, TriggerConfig, TriggerRun,
+    TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -232,6 +232,20 @@ pub struct UpdateTriggerCronRequest {
     pub reasoning_effort: Option<Option<String>>,
 }
 
+/// Both checks a `run.type = "script"` path has to pass at the boundary.
+///
+/// The extension check ran alone here, so `"../../evil.sh"` answered 200 with
+/// a cron preview and showed as armed. `scheduler::user_tasks` refuses it at
+/// fire time through the canonical guard, so every fire died instead. This is
+/// the same refusal, made before the trigger exists.
+pub(crate) fn validate_script_path(path: &str) -> Result<(), String> {
+    validate_script_extension(path)?;
+    if crate::api::is_path_traversal(path) {
+        return Err(format!("Invalid script path: {}", path));
+    }
+    Ok(())
+}
+
 /// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
 /// then runs [`is_valid_trigger_slug`]; returns the trimmed value on success.
 /// Pure helper, exposed for unit tests.
@@ -246,24 +260,29 @@ pub(crate) fn validate_update_slug(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Resolve the slug for a new trigger: validate an explicit submission, or
-/// derive from `name` (UUID-shortened fallback when name slugifies to empty).
-/// Pure helper, exposed for unit tests.
-pub(crate) fn resolve_create_slug(
+/// Validate an explicit slug submitted with a create, if there is one.
+///
+/// `None` means the caller left it out, and the writer mints one under the
+/// lock that serializes the emit. Minting here instead would read the taken
+/// set before the emit, so two concurrent creates of one name could both pick
+/// the same `data/triggers/<slug>/` directory.
+///
+/// An explicit slug is taken as given, even when it collides. The caller named
+/// the directory they mean to write to, and renaming it silently would point
+/// them at a different one.
+pub(crate) fn validate_explicit_create_slug(
     explicit: Option<&str>,
-    name: &str,
-    trigger_id: &str,
-) -> Result<String, String> {
-    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        if !is_valid_trigger_slug(s) {
-            return Err(format!(
-                "Invalid slug '{}': must be 1-64 chars of [a-z0-9-], starting and ending with [a-z0-9]",
-                s
-            ));
-        }
-        return Ok(s.to_string());
+) -> Result<Option<String>, String> {
+    let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if !is_valid_trigger_slug(s) {
+        return Err(format!(
+            "Invalid slug '{}': must be 1-64 chars of [a-z0-9-], starting and ending with [a-z0-9]",
+            s
+        ));
     }
-    Ok(slugify_trigger_name_with_fallback(name, trigger_id))
+    Ok(Some(s.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -323,9 +342,9 @@ pub(super) async fn create_trigger(
         Err(e) => return ApiResult::err(format!("Invalid 'run' field: {}", e)),
     };
 
-    // Validate script extension if script trigger
+    // Validate the script path if this is a script trigger
     if let TriggerRun::Script { ref path } = run {
-        if let Err(e) = validate_script_extension(path) {
+        if let Err(e) = validate_script_path(path) {
             return ApiResult::err(e);
         }
     }
@@ -380,8 +399,10 @@ pub(super) async fn create_trigger(
     };
     let trigger_id_str = Uuid::new_v4().to_string();
 
-    // Slug: explicit (validated) or derived from name (UUID fallback).
-    let slug = match resolve_create_slug(request.slug.as_deref(), name, &trigger_id_str) {
+    // An EXPLICIT slug is validated here and rides in the payload. An omitted
+    // one is minted by the writer, under the lock that serializes the emit.
+    // Two concurrent creates of one name cannot then mint the same directory.
+    let explicit_slug = match validate_explicit_create_slug(request.slug.as_deref()) {
         Ok(s) => s,
         Err(e) => return ApiResult::err(e),
     };
@@ -389,11 +410,13 @@ pub(super) async fn create_trigger(
     let mut payload = serde_json::json!({
         "trigger_id": trigger_id_str,
         "name": name,
-        "slug": slug,
         "schedule": cron_expressions,
         "timezone": timezone,
         "run": run_value,
     });
+    if let Some(slug) = explicit_slug {
+        payload["slug"] = serde_json::json!(slug);
+    }
     if !subscriptions.is_empty() {
         payload["on"] = serde_json::to_value(&subscriptions)
             .expect("EventSubscription serialization is infallible");
@@ -451,13 +474,7 @@ pub(super) async fn create_trigger(
     };
     state
         .engine
-        .emit_trigger_write_or_log(
-            TriggerWrite::Created,
-            &trigger_id_str,
-            payload,
-            actor,
-            "[Triggers]",
-        )
+        .emit_trigger_created_minting_slug(&trigger_id_str, payload, name, actor, "[Triggers]")
         .await;
 
     ApiResult::ok_for_trigger(
@@ -500,7 +517,7 @@ pub(super) async fn update_trigger(
         match serde_json::from_value::<TriggerRun>(run_val.clone()) {
             Ok(parsed_run) => {
                 if let TriggerRun::Script { ref path } = parsed_run {
-                    if let Err(e) = validate_script_extension(path) {
+                    if let Err(e) = validate_script_path(path) {
                         return ApiResult::err(e);
                     }
                 }
@@ -748,37 +765,66 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    // --- Script paths at the create / update boundary ---
+
+    /// A traversal path used to pass create and update, because the extension
+    /// check was the only one there. The trigger answered 200 with a cron
+    /// preview, showed as armed, and every fire died on the execution guard.
+    #[test]
+    fn validate_script_path_rejects_a_traversal() {
+        for path in [
+            "../../evil.sh",
+            "../evil.py",
+            "/etc/cron/evil.sh",
+            "\\windows\\evil.sh",
+        ] {
+            let err = validate_script_path(path).unwrap_err();
+            assert!(err.contains("Invalid script path"), "{path}: {err}");
+        }
+    }
+
+    /// The extension rule still runs, and an in-tree path still passes. The
+    /// boundary refuses exactly what the fire-time guard refuses, no more.
+    #[test]
+    fn validate_script_path_keeps_the_extension_rule() {
+        assert!(validate_script_path("scripts/daily-summary.sh").is_ok());
+        assert!(validate_script_path("scripts/daily-summary.py").is_ok());
+        let err = validate_script_path("scripts/daily-summary.txt").unwrap_err();
+        assert!(err.contains("Unsupported script extension"), "{err}");
+    }
+
     // --- Slug resolution at the create boundary ---
 
     #[test]
-    fn resolve_create_slug_accepts_explicit_valid() {
-        let slug = resolve_create_slug(Some("send-daily-summary"), "Anything", "uuid").unwrap();
-        assert_eq!(slug, "send-daily-summary");
+    fn an_explicit_create_slug_is_validated_and_kept() {
+        let slug = validate_explicit_create_slug(Some("send-daily-summary")).unwrap();
+        assert_eq!(slug.as_deref(), Some("send-daily-summary"));
     }
 
     #[test]
-    fn resolve_create_slug_derives_from_name_when_omitted() {
-        let slug = resolve_create_slug(None, "Send Daily Summary", "uuid-1234").unwrap();
-        assert_eq!(slug, "send-daily-summary");
+    fn an_omitted_create_slug_leaves_the_mint_to_the_writer() {
+        assert_eq!(validate_explicit_create_slug(None).unwrap(), None);
     }
 
     #[test]
-    fn resolve_create_slug_derives_from_name_when_blank() {
-        // Whitespace-only treated like absent.
-        let slug = resolve_create_slug(Some("   "), "Send Daily Summary", "uuid").unwrap();
-        assert_eq!(slug, "send-daily-summary");
+    fn a_blank_create_slug_is_treated_as_omitted() {
+        assert_eq!(validate_explicit_create_slug(Some("   ")).unwrap(), None);
     }
 
     #[test]
-    fn resolve_create_slug_falls_back_to_uuid_when_name_empty_after_slugify() {
-        let slug = resolve_create_slug(None, "!!!", "abcdef-1234-5678").unwrap();
-        assert_eq!(slug, "trigger-abcdef12");
-    }
-
-    #[test]
-    fn resolve_create_slug_rejects_explicit_invalid() {
-        let err = resolve_create_slug(Some("Bad Slug"), "Anything", "uuid").unwrap_err();
+    fn an_invalid_explicit_create_slug_is_refused() {
+        let err = validate_explicit_create_slug(Some("Bad Slug")).unwrap_err();
         assert!(err.contains("Invalid slug"));
+    }
+
+    #[test]
+    fn a_second_trigger_of_the_same_name_gets_its_own_slug() {
+        // Both would be `daily-summary`, which is one directory under
+        // `data/triggers/`, so the second must not collide with the first.
+        let taken: std::collections::HashSet<String> =
+            ["daily-summary".to_string()].into_iter().collect();
+        let slug = crate::triggers::mint_unique_trigger_slug("Daily Summary", "uuid-2", &taken);
+        assert_eq!(slug, "daily-summary-2");
     }
 
     // --- Slug edits at the update boundary ---

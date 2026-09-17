@@ -1014,7 +1014,7 @@ async fn run_turn(
         if let Some(pid) = child_pid {
             super::spawn_env::graceful_kill_child_process_group(
                 pid,
-                std::time::Duration::from_secs(3),
+                super::claude_code::GROUP_TEARDOWN_GRACE,
             )
             .await;
         }

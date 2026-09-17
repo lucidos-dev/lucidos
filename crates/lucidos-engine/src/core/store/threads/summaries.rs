@@ -365,7 +365,7 @@ impl EventStore {
                 Some(title) if !title.trim().is_empty() => title,
                 // A thread whose title has not been generated yet is still
                 // waiting. Dropping it would report "nothing needs you".
-                _ => "Untitled".to_string(),
+                _ => UNTITLED_THREAD.to_string(),
             })
             .collect())
     }
@@ -377,6 +377,26 @@ impl EventStore {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let thread_uuid = uuid::Uuid::parse_str(thread_id)?;
         Ok(self.get_thread_title(thread_uuid).await?.is_some())
+    }
+
+    /// Has a turn ever started on this thread from a user message?
+    ///
+    /// Which is to say: does the chat path own this thread's title? It titles
+    /// on a thread's first turn, and a voice call that delegated has one. One
+    /// that the talker answered alone has none, and writes only a
+    /// `SpokenMessageReceived` (ADR 0165's split).
+    pub async fn thread_has_message_received(
+        &self,
+        thread_id: uuid::Uuid,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let (found,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM events \
+             WHERE thread_id = $1 AND event_type = 'MessageReceived')",
+        )
+        .bind(thread_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found)
     }
 
     /// Get thread info for specific thread IDs (used for active threads).

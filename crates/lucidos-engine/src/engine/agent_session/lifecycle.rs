@@ -678,13 +678,16 @@ pub(super) fn classify_session_end_action(
 /// follow-up arriving during the cancel race clears the latch on its own.
 /// Without this it would leave the prior turn's device on `meta`, or leave a
 /// stale redirect flag that mislabels a later real Stop.
+///
+/// The terminal is [`TurnTerminal`], one argument rather than two, so a caller
+/// cannot clear half of it.
 pub(super) fn reset_per_turn_flags(
     is_waiting: &mut bool,
     last_emitted_idle: &mut bool,
     emitted_terminal_event: &mut bool,
     user_hit_stop: &mut bool,
     interrupt_is_redirect: &mut bool,
-    last_terminal_kind: &mut Option<TerminalKind>,
+    terminal: TurnTerminal<'_>,
     cancel_actor: &mut Option<crate::engine::thread_events::MessageOrigin>,
 ) {
     *is_waiting = false;
@@ -692,8 +695,22 @@ pub(super) fn reset_per_turn_flags(
     *emitted_terminal_event = false;
     *user_hit_stop = false;
     *interrupt_is_redirect = false;
-    *last_terminal_kind = None;
+    *terminal.kind = None;
+    *terminal.withheld_api_error = None;
     *cancel_actor = None;
+}
+
+/// The run loop's two views of ONE ended turn, borrowed together.
+///
+/// They must move in lockstep. `withheld_api_error` is what the released
+/// *auto-resume hold* handed back for `kind`. Carried into the next turn it
+/// would resume off a decision taken two exits ago, and announce that
+/// terminal's error for this one. So they travel as ONE argument, which a
+/// caller cannot clear half of. ([`StaleResumeInputs`] next door is a named
+/// struct too, for a different hazard: transposing positional bools.)
+pub(super) struct TurnTerminal<'a> {
+    pub kind: &'a mut Option<TerminalKind>,
+    pub withheld_api_error: &'a mut Option<String>,
 }
 
 /// 10 minutes of CC silence in the narrow "awaiting Anthropic response" window
@@ -866,6 +883,20 @@ pub(super) fn is_transient_api_failure(terminal: &TerminalKind) -> bool {
     matches!(terminal, TerminalKind::Failed { error } if error.trim_start().starts_with("API Error"))
 }
 
+/// The error text of a terminal [`is_transient_api_failure`] accepts, and `None`
+/// for every other terminal.
+///
+/// The *auto-resume hold* carries this string, so the engine can still announce
+/// the failure if the resume it withheld the card for never happens. Asked
+/// through the same predicate rather than re-matching the prefix, because a
+/// second copy of that rule is how the two sides drift apart.
+pub(super) fn transient_api_failure_error(terminal: &Option<TerminalKind>) -> Option<&str> {
+    match terminal {
+        Some(t @ TerminalKind::Failed { error }) if is_transient_api_failure(t) => Some(error),
+        _ => None,
+    }
+}
+
 /// Decide whether the post-loop finalize should emit
 /// `ContinuationRequested{auto_resume_after_api_error}` so the spawn dispatcher
 /// re-enters this session via `--resume`.
@@ -893,6 +924,47 @@ pub(super) fn auto_resume_after_api_error(
         && resumes_spent < MAX_API_ERROR_AUTO_RESUMES
         && !is_shutdown
         && !is_conflict_session
+}
+
+/// What the engine owes the parent once it has settled whether the terminal it
+/// withheld will actually be resumed. See [`held_completion_release`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HeldCompletionRelease {
+    /// Somebody is coming. Stay quiet: the card belongs at the real terminal.
+    KeepWithholding,
+    /// Nobody is coming. Announce the terminal the fan-in held back, or the
+    /// parent waits on a child that will never report.
+    Announce,
+}
+
+/// Decide what to do with a withheld completion card once the resume decision
+/// has played out.
+///
+/// The hold was taken before the terminal was emitted, from
+/// [`auto_resume_after_api_error`]. Two things can still stop the resume between
+/// that decision and the emit, and they end differently:
+///
+/// * **A follow-up was drained.** `process_orphan_chain` re-submits it, so the
+///   thread gets driven and that turn emits its own terminal. The child's
+///   `parent_callback_pending` was never cleared, so the turn reports normally.
+///   Announcing here would hand the parent a failure card for work that is
+///   about to continue, which is the whole bug.
+/// * **The continuation did not persist.** The lifecycle rejected it, or the
+///   emit failed. No dispatcher will ever act on it, so nothing else will drive
+///   this thread. The withheld failure is the last word and must reach the
+///   parent.
+///
+/// `followup_queued` outranks `continuation_persisted` because the resume path
+/// stands down on it BEFORE attempting any emit, so the two are never both true.
+pub(super) fn held_completion_release(
+    continuation_persisted: bool,
+    followup_queued: bool,
+) -> HeldCompletionRelease {
+    if followup_queued || continuation_persisted {
+        HeldCompletionRelease::KeepWithholding
+    } else {
+        HeldCompletionRelease::Announce
+    }
 }
 
 /// Pure tick outcome. Fires when CC is mid-turn, no tool is in flight, and the

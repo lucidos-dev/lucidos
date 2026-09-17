@@ -490,7 +490,8 @@ impl GatewayService {
         // A restart and a crash respawn run this same teardown, so record what
         // is being stopped for the next boot. See `record_workspaces_to_restore`.
         let stopped = stop_workspace_engines(app_data);
-        record_workspaces_to_restore(app_data, &stopped);
+        let ids: Vec<String> = stopped.into_iter().map(|e| e.id).collect();
+        record_workspaces_to_restore(app_data, &ids);
         // Last, after the engines that connect to it. A permanent shutdown must
         // never leave an orphaned `postgres` holding the port and its
         // postmaster.pid for the next app version to trip over.
@@ -528,16 +529,29 @@ fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Comman
     cmd
 }
 
-/// SIGUSR1 every workspace engine the gateway spawned, returning the ids of the
-/// ones that were actually alive. Used on a full service stop. The gateway
-/// leaves engines running on its own SIGUSR1 so a restart can re-adopt them,
-/// but an explicit stop tears the whole stack down.
+/// A workspace engine a teardown asked to stop, and that was alive when it was
+/// asked. The id is what the next boot owes the user. The pid is what a caller
+/// waits out when it has to know the engine is gone, not merely signalled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalledEngine {
+    id: String,
+    pid: i32,
+}
+
+/// SIGUSR1 every workspace engine the gateway spawned, returning the ones that
+/// were actually alive. Used on a full service stop. The gateway leaves engines
+/// running on its own SIGUSR1 so a restart can re-adopt them, but an explicit
+/// stop tears the whole stack down.
 ///
 /// This checks liveness rather than trusting the pidfile, because the returned
 /// ids are what the next boot owes the user ([`record_workspaces_to_restore`]).
 /// A stale pidfile would otherwise make a restart "restore" a workspace nobody
 /// was running.
-fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
+///
+/// Signalling is not stopping. A signalled engine writes under its workspace
+/// dir until it exits, so a caller about to DELETE that tree waits the returned
+/// pids out first: see `wait_for_engines_to_exit`.
+fn stop_workspace_engines(app_data: &Path) -> Vec<SignalledEngine> {
     let workspaces = app_data.join("workspaces");
     let Ok(entries) = std::fs::read_dir(&workspaces) else {
         return Vec::new();
@@ -545,22 +559,23 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
     let mut stopped = Vec::new();
     for entry in entries.flatten() {
         let pidfile = entry.path().join(".lucidos/engine.pid");
-        let Ok(contents) = std::fs::read_to_string(&pidfile) else {
-            continue;
-        };
-        if let Ok(pid) = contents.trim().parse::<i32>() {
+        if let Some(pid) = read_engine_pid(&entry.path()) {
             #[cfg(unix)]
             {
                 // SAFETY: signal 0 checks for the process's existence without
                 // delivering anything; SIGUSR1 then asks a live engine to stop.
-                // A dead pid returns ESRCH from both.
+                // A dead pid returns ESRCH from both. `read_engine_pid` has
+                // already refused the pids that would broadcast.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 unsafe {
                     libc::kill(pid, libc::SIGUSR1);
                 }
                 if alive {
                     if let Some(id) = entry.file_name().to_str() {
-                        stopped.push(id.to_string());
+                        stopped.push(SignalledEngine {
+                            id: id.to_string(),
+                            pid,
+                        });
                     }
                 }
             }
@@ -568,6 +583,327 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
         }
     }
     stopped
+}
+
+/// The engine pid this workspace's `.lucidos/engine.pid` names, when it names
+/// one process.
+///
+/// **Strictly positive, and that is the load-bearing part.** `kill` reads 0 as
+/// "my whole process group", and -1 as "everything I may signal". A pidfile
+/// holding either turns a per-engine stop into a broadcast. The gateway writes
+/// a real child pid, so this only ever fires on a corrupt or hand-edited file.
+/// It is the same class as the never-kill-broadly rule in `CLAUDE.md`, and the
+/// cheapest place to hold it is where the number is parsed.
+///
+/// Shared by the two readers of that file, so they cannot disagree on which
+/// pidfiles name an engine: [`stop_workspace_engines`], which signals it, and
+/// [`engine_pid_is_live`], which only asks whether it is there.
+fn read_engine_pid(workspace_dir: &Path) -> Option<i32> {
+    let contents = std::fs::read_to_string(workspace_dir.join(".lucidos/engine.pid")).ok()?;
+    contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
+}
+
+// ── Telling the engines who asked (client role) ─────────────────────────────
+
+/// Header the engine reads the originating device off. Mirrors
+/// `api::actor::HEADER_DEVICE_ID` in `lucidos-engine` and `stack::HEADER_DEVICE_ID`
+/// in `lucidos-gateway`, neither of which this crate can depend on. Rename one
+/// and the others must follow in lockstep.
+const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
+
+/// The engine route recording who asked for the teardown it is about to be
+/// signalled for. Its handler is `api/internal.rs` `restart_intent`, which only
+/// stashes an actor and answers 204.
+const RESTART_INTENT_PATH: &str = "/api/v1/internal/restart-intent";
+
+/// The one scheme this announce can speak. The packaged gateway strips
+/// `LUCIDOS_TLS_*` from the engines it spawns, so a packaged engine serves plain
+/// HTTP and says so in its ports file. That value is READ and compared against
+/// this, never assumed. An engine serving TLS is skipped, because the raw
+/// `TcpStream` request below cannot reach it.
+const ENGINE_PLAIN_SCHEME: &str = "http";
+
+/// What a workspace's `.lucidos/ports` means when it names no `PROTO`. Matches
+/// the engine's own `http::workspace_resolver`, so the two readers of that file
+/// cannot disagree about an engine's scheme.
+const DEFAULT_ENGINE_PROTO: &str = "https";
+
+/// How long one restart-intent POST may take. A healthy engine answers a
+/// loopback request in well under a millisecond, so this only ever bounds a
+/// wedged one.
+const RESTART_INTENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long the whole announce may take before the remaining engines are
+/// skipped. It runs in front of a click the user is waiting on, so the sweep
+/// stays bounded however many wedged engines the machine holds.
+const RESTART_INTENT_BUDGET: Duration = Duration::from_secs(2);
+
+/// One engine to tell, and who to name to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestartIntentTarget {
+    /// The workspace slug, for the log line. The engine never sees it.
+    slug: String,
+    /// The engine's own loopback port, from its `.lucidos/ports`.
+    port: u16,
+    /// The id this client is known by in THAT workspace.
+    device_id: String,
+}
+
+/// `API_PORT` and `PROTO` out of a workspace's `.lucidos/ports`.
+///
+/// `None` when no `API_PORT` parses. An absent `PROTO` falls back to
+/// [`DEFAULT_ENGINE_PROTO`], which is what the engine's own reader does. Unknown
+/// keys are ignored, since the dev scripts write several more into this file.
+fn parse_engine_ports(contents: &str) -> Option<(u16, String)> {
+    let mut port = None;
+    let mut proto = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "API_PORT" => port = value.trim().parse::<u16>().ok().filter(|p| *p != 0),
+            "PROTO" => proto = Some(value.trim().to_string()).filter(|p| !p.is_empty()),
+            _ => {}
+        }
+    }
+    Some((
+        port?,
+        proto.unwrap_or_else(|| DEFAULT_ENGINE_PROTO.to_string()),
+    ))
+}
+
+/// Non-empty, and every byte visible ASCII with no space, so the value cannot
+/// break the request it is written into. Mirrors the engine's own
+/// `api::actor::is_header_safe_field`.
+fn is_header_safe(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| (b'!'..=b'~').contains(&b))
+}
+
+/// Why a running engine is not being told who asked, when it is not.
+///
+/// Typed rather than a bare `None`, because each arm costs that workspace's
+/// in-flight threads their auto-resume. A skip nobody can read in the log is
+/// the silent degrade this enum exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartIntentSkip {
+    /// No `.lucidos/ports`, or none naming a usable `API_PORT`.
+    NoPort,
+    /// The engine serves TLS, which a bare socket cannot reach.
+    NotPlainHttp,
+    /// This client holds no header-safe id for the workspace, so it has never
+    /// opened it or the store is corrupt.
+    NoDevice,
+}
+
+impl RestartIntentSkip {
+    /// The half-sentence the log line carries.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NoPort => "its ports file names no engine port",
+            Self::NotPlainHttp => "its engine serves TLS, which this client cannot reach",
+            Self::NoDevice => "this client holds no device id for it",
+        }
+    }
+}
+
+/// Which engine to tell for one workspace, or why this client has nothing
+/// honest to say about it.
+///
+/// None of the three skips is a failure. Each leaves that workspace exactly as
+/// it behaves today, with System attribution and a manual Continue. Absent
+/// attribution stays absent, and the caller says so in the log.
+fn restart_intent_target(
+    slug: &str,
+    ports: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<RestartIntentTarget, RestartIntentSkip> {
+    let (port, scheme) = ports
+        .and_then(parse_engine_ports)
+        .ok_or(RestartIntentSkip::NoPort)?;
+    if scheme != ENGINE_PLAIN_SCHEME {
+        return Err(RestartIntentSkip::NotPlainHttp);
+    }
+    let device_id = device_id
+        .map(str::trim)
+        .filter(|d| is_header_safe(d))
+        .ok_or(RestartIntentSkip::NoDevice)?;
+    Ok(RestartIntentTarget {
+        slug: slug.to_string(),
+        port,
+        device_id: device_id.to_string(),
+    })
+}
+
+/// The raw HTTP/1.0 request announcing a restart intent to `target`.
+///
+/// Pure, so what goes on the wire is pinned by a test. Two properties are
+/// load-bearing. It names the device in [`HEADER_DEVICE_ID`], which is the whole
+/// point of the call. And it carries no `x-forwarded-prefix`, which is what the
+/// engine refuses a restart-intent for. That refusal keeps a browser page from
+/// setting an engine's restart actor, so the call reaches the engine's own port
+/// rather than the gateway.
+fn restart_intent_request(target: &RestartIntentTarget) -> String {
+    format!(
+        "POST {RESTART_INTENT_PATH} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+         {HEADER_DEVICE_ID}: {device}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        port = target.port,
+        device = target.device_id,
+    )
+}
+
+/// Tell one engine who asked for the teardown. `true` when it acknowledged.
+///
+/// Raw HTTP/1.0 over a `TcpStream`, like [`http_ok`] and [`gateway_body`]: the
+/// desktop client carries no HTTP client crate, and this keeps it that way.
+/// [`restart_intent_target`] has already established that this engine serves
+/// plain HTTP, which is the only scheme a bare socket can reach.
+fn post_restart_intent(target: &RestartIntentTarget) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", target.port)) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(RESTART_INTENT_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(RESTART_INTENT_TIMEOUT));
+    if stream
+        .write_all(restart_intent_request(target).as_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    let first = buf.lines().next().unwrap_or_default();
+    first.contains(" 204 ") || first.ends_with(" 204")
+}
+
+/// Tell each target, stopping at `deadline`. Returns how many were told.
+///
+/// The deadline and the POST are parameters, so the bound is proved by a test
+/// rather than by a wedged engine. Nothing here can fail the caller: every
+/// outcome is a log line, because attribution is worth less than the restart the
+/// user clicked.
+fn announce_to_engines(
+    targets: &[RestartIntentTarget],
+    deadline: Instant,
+    mut post: impl FnMut(&RestartIntentTarget) -> bool,
+) -> usize {
+    let mut told = 0;
+    for (i, target) in targets.iter().enumerate() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[desktop] restart intent: out of time, {} workspace(s) not told",
+                targets.len() - i
+            );
+            break;
+        }
+        if post(target) {
+            told += 1;
+        } else {
+            eprintln!(
+                "[desktop] restart intent: '{}' did not acknowledge, so its threads will \
+                 read this restart as a crash",
+                target.slug
+            );
+        }
+    }
+    told
+}
+
+/// Does this workspace's pidfile name a process that still exists?
+///
+/// Through [`process_is_gone`], so an unanswerable probe reads as LIVE. That is
+/// the opposite default from the `alive` test in [`stop_workspace_engines`], and
+/// deliberately: the two ask different questions. That one decides what it just
+/// stopped, where a false yes invents a workspace to restore. This one decides
+/// who to tell, where a false no costs a workspace its auto-resume and the POST
+/// it skipped would have cost nothing.
+fn engine_pid_is_live(workspace_dir: &Path) -> bool {
+    let Some(pid) = read_engine_pid(workspace_dir) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        !process_is_gone(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Every running engine this install owns, with the device id this client is
+/// known by there.
+///
+/// The enumeration mirrors [`stop_workspace_engines`]: one directory per
+/// workspace under `<app-data>/workspaces/`, gated on a live
+/// `.lucidos/engine.pid`. The two must name the same engines, or we would
+/// attribute the teardown to a set other than the one being signalled. Rooted at
+/// this install's own app-data, so a second Lucidos install on the machine is
+/// never touched.
+fn restart_intent_targets(app_data: &Path) -> Vec<RestartIntentTarget> {
+    let devices = crate::device_id_store::device_ids_by_workspace(app_data);
+    let Ok(entries) = std::fs::read_dir(app_data.join("workspaces")) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for entry in entries.flatten() {
+        let Some(slug) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !engine_pid_is_live(&entry.path()) {
+            continue;
+        }
+        let ports = std::fs::read_to_string(entry.path().join(".lucidos/ports")).ok();
+        let device_id = devices.get(&slug).map(String::as_str);
+        match restart_intent_target(&slug, ports.as_deref(), device_id) {
+            Ok(target) => targets.push(target),
+            // Said out loud, because the cost lands on the user rather than
+            // here: that workspace's threads will read this restart as a crash.
+            Err(skip) => eprintln!(
+                "[desktop] restart intent: not telling '{}', {}",
+                slug,
+                skip.reason()
+            ),
+        }
+    }
+    targets
+}
+
+/// Tell every running engine that a PERSON asked for the teardown about to be
+/// signalled, and which device they were on. Returns how many were told.
+///
+/// `launchctl kickstart -k` reaches the engines as a bare `SIGUSR1`, which
+/// carries no sender. Without this they cannot tell a restart somebody clicked
+/// from a crash. Their in-flight threads then settle as interrupted, waiting for
+/// a manual Continue. See *restart intent* and *cause-gated resume* in
+/// `docs/glossary.md`.
+///
+/// Call it IMMEDIATELY before the launchctl call. An engine spends the stash at
+/// its next teardown. An announce made early enough to be abandoned would
+/// therefore attribute a later teardown to a restart that never ran.
+fn announce_restart_intent(app_data: &Path) -> usize {
+    let targets = restart_intent_targets(app_data);
+    if targets.is_empty() {
+        return 0;
+    }
+    announce_to_engines(
+        &targets,
+        Instant::now() + RESTART_INTENT_BUDGET,
+        post_restart_intent,
+    )
+}
+
+/// [`announce_restart_intent`] against this install's own app-data dir, for the
+/// caller that has not resolved it.
+fn announce_restart_intent_from_env() -> usize {
+    match app_data_dir_from_env() {
+        Ok(app_data) => announce_restart_intent(&app_data),
+        Err(e) => {
+            eprintln!("[desktop] cannot resolve app-data to announce the restart intent: {e}");
+            0
+        }
+    }
 }
 
 // ── What the next boot owes the user ────────────────────────────────────────
@@ -1195,8 +1531,9 @@ pub(crate) struct ReopenPlan {
 /// A workspace the record names and no live window is on is BUILT. An adrift
 /// `main` takes the first of those as a navigate instead. Otherwise the reopen
 /// leaves a picker window sitting behind the restored ones. It carries that
-/// workspace's frame like any other owed window: `main` here is the same window
-/// `setup` sizes from the same record, and a reopen owes what a launch owes.
+/// workspace's frame like any other owed window, because a reopen owes what a
+/// launch owes. `app_window::main_frame_owed` reads that frame off this plan,
+/// and covers the launch that never settled `main` at all.
 ///
 /// Every URL is composed here from a slug validated by `is_workspace_slug`.
 /// Every `window-*` webview holds the full IPC permission set on the gateway
@@ -1903,14 +2240,32 @@ fn kickstart_service(kill: bool) -> io::Result<()> {
 }
 
 /// Restart the gateway service in place. The supervisor catches the SIGTERM,
-/// tears the stack down gracefully, and launchd respawns it. Used by the
-/// packaged "Restart" control. In development there is no service, so this
-/// returns an error the caller can show.
+/// tears the stack down gracefully, and launchd respawns it. In development
+/// there is no service, so this returns an error the caller can show.
+///
+/// Every packaged restart a person clicked arrives here: the workspace UI's
+/// *Switch to new version* and *Restart Engine* (both through the
+/// `restart_service` command), and the in-app update
+/// (`updater::install_app_update_and_restart`). So this is where they are
+/// announced as a user action. That announce is what lets their in-flight
+/// threads auto-resume rather than read the restart as a crash.
 pub fn restart_service() -> Result<(), String> {
     if tauri::is_dev() {
         return Err("Gateway service restart is only available in a packaged build".to_string());
     }
-    kickstart_service(true).map_err(|e| e.to_string())
+    let announced = announce_restart_intent_from_env();
+    kickstart_service(true).map_err(|e| {
+        // The restart never happened, so the intents we just announced belong to
+        // nothing. An engine spends its stash at whatever teardown comes next,
+        // and we cannot reach in and clear it, so say so here.
+        if announced > 0 {
+            eprintln!(
+                "[desktop] restart did not start, but {announced} engine(s) already hold a \
+                 restart intent that their next teardown will spend"
+            );
+        }
+        e.to_string()
+    })
 }
 
 /// Stop the always-on service entirely, the explicit "Quit and Stop Background
@@ -1922,13 +2277,20 @@ pub fn restart_service() -> Result<(), String> {
 /// restore, which is right for a restart and wrong here. Declaring before the
 /// `bootout`, rather than clearing the record after it, is what keeps the
 /// ordering structural.
+///
+/// It announces itself to the engines like [`restart_service`] does, and for the
+/// same reason: a person clicked it. A Stop acts on the engine rather than on
+/// the work, so its threads resume when the workspace is next started. That is
+/// already what the gateway picker's per-workspace Stop does.
 pub fn stop_service() {
     if tauri::is_dev() {
         return;
     }
+    let mut announced = 0;
     let app_data = match app_data_dir_from_env() {
         Ok(app_data) => {
             declare_quit_intent(&app_data);
+            announced = announce_restart_intent(&app_data);
             Some(app_data)
         }
         Err(e) => {
@@ -1943,6 +2305,14 @@ pub fn stop_service() {
         // silence the NEXT restart's restore list, so take it back.
         if let Some(app_data) = &app_data {
             clear_next_boot_record(app_data);
+        }
+        // The restart intents cannot be taken back the same way: they live in
+        // the engines. Same note [`restart_service`] leaves on its own failure.
+        if announced > 0 {
+            eprintln!(
+                "[desktop] stop did not happen, but {announced} engine(s) already hold a \
+                 restart intent that their next teardown will spend"
+            );
         }
     }
 }
@@ -2184,6 +2554,163 @@ fn sh_quote(s: &str) -> String {
 
 // ── Uninstall (client role) ─────────────────────────────────────────────────
 
+/// How long to wait for a booted-out launchd job to leave the user's domain.
+///
+/// The Rust twin of `service_launchd_wait_gone` in `scripts/lib/service.sh`,
+/// and it carries that function's ceiling for the same reason. launchd
+/// escalates SIGTERM to SIGKILL only after the job's 20 second `ExitTimeOut`,
+/// and the service always takes that path. The gateway under it ignores
+/// SIGTERM. A measured teardown is about five seconds, so this is headroom
+/// rather than the expected wait.
+///
+/// The shell twin honours `LUCIDOS_LAUNCHD_TIMEOUT`. Nothing reads that here: a
+/// packaged app is launched by LaunchServices, never from a shell that could
+/// set it.
+#[cfg(target_os = "macos")]
+const LAUNCHD_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the signalled workspace engines to exit, once the
+/// service they belong to has left the launchd domain.
+///
+/// Generous: an engine stops on SIGUSR1 with no `ExitTimeOut` to wait out, and
+/// launchd's SIGKILL of the job normally takes its descendants with it.
+#[cfg(target_os = "macos")]
+const ENGINE_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often either teardown wait re-probes, matching the shell twin's cadence.
+#[cfg(target_os = "macos")]
+const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How a bounded wait for something to go away ended.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownWait {
+    /// A probe saw it leave.
+    Gone,
+    /// It was still there, or still unaccounted for, when time ran out.
+    StillThere,
+}
+
+/// Decide a single poll of a teardown wait. `None` means keep waiting.
+///
+/// `gone` is what a probe OBSERVED, so a probe that could not run passes
+/// `false`. "Cannot tell" means possibly still alive, never gone. Running out
+/// of time therefore reports [`TeardownWait::StillThere`], and the caller
+/// refuses to delete rather than deleting under a live writer.
+///
+/// Pure, so the posture is pinned by a test rather than by reading the loop.
+#[cfg(target_os = "macos")]
+fn teardown_poll(gone: bool, out_of_time: bool) -> Option<TeardownWait> {
+    if gone {
+        return Some(TeardownWait::Gone);
+    }
+    if out_of_time {
+        return Some(TeardownWait::StillThere);
+    }
+    None
+}
+
+/// Poll `gone` until it answers true, or until `timeout` has passed.
+#[cfg(target_os = "macos")]
+fn wait_until_gone(timeout: Duration, mut gone: impl FnMut() -> bool) -> TeardownWait {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(outcome) = teardown_poll(gone(), Instant::now() >= deadline) {
+            return outcome;
+        }
+        std::thread::sleep(TEARDOWN_POLL_INTERVAL);
+    }
+}
+
+/// Can this process inspect the user's launchd domain at all?
+///
+/// [`is_service_loaded`] answers false both for "not bootstrapped" and for
+/// "cannot see `gui/<uid>`", because `launchctl print` exits non-zero either
+/// way. Asking about the DOMAIN tells the two apart, so an unreadable domain
+/// stays UNKNOWN instead of reading as a stopped service. The shell twin is
+/// `service_launchd_domain_reachable`.
+#[cfg(target_os = "macos")]
+fn launchd_domain_reachable() -> bool {
+    launchctl(&["print", &launchd_domain()])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Is the service genuinely out of the launchd domain?
+///
+/// The domain probe runs only once the job looks absent, which is the one
+/// reading that could be a misreport rather than a fact.
+#[cfg(target_os = "macos")]
+fn service_has_left_the_domain() -> bool {
+    !is_service_loaded() && launchd_domain_reachable()
+}
+
+/// Wait for the booted-out service to actually leave the launchd domain.
+#[cfg(target_os = "macos")]
+fn wait_for_service_to_unload() -> TeardownWait {
+    wait_until_gone(LAUNCHD_TEARDOWN_TIMEOUT, service_has_left_the_domain)
+}
+
+/// Has `pid` left the process table? Only `ESRCH` proves it has.
+///
+/// Every other answer, a permission error included, means the process may still
+/// be there and still writing. A probe that could not run is UNKNOWN.
+///
+/// `cfg(unix)` rather than macOS-only, because both callers want this exact
+/// rule and one of them is not macOS-gated: [`engine_pid_is_live`], which asks
+/// the same question to decide whether an engine is there to be told something.
+#[cfg(unix)]
+fn process_is_gone(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing. It only asks whether the pid exists
+    // and whether this process could signal it.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Wait for every signalled engine to exit, and name the workspaces whose
+/// engine did not. An empty result means every one of them is gone.
+///
+/// All the pids are probed on each pass, so one slow engine cannot spend the
+/// whole deadline before the next is looked at.
+#[cfg(target_os = "macos")]
+fn wait_for_engines_to_exit(engines: &[SignalledEngine], timeout: Duration) -> Vec<String> {
+    let mut alive = engines.to_vec();
+    let verdict = wait_until_gone(timeout, || {
+        alive.retain(|e| !process_is_gone(e.pid));
+        alive.is_empty()
+    });
+    match verdict {
+        TeardownWait::Gone => Vec::new(),
+        TeardownWait::StillThere => alive.into_iter().map(|e| e.id).collect(),
+    }
+}
+
+/// May the uninstall delete anything, given what the two waits observed?
+///
+/// `Err` carries the sentence the user sees, and its promise is load-bearing.
+/// The caller must have deleted nothing by the time it says so. It must also
+/// leave the bundle in place, so there is something to retry with.
+///
+/// Pure, so the refusal is pinned by a test.
+#[cfg(target_os = "macos")]
+fn delete_may_proceed(service: TeardownWait, live_engines: &[String]) -> Result<(), String> {
+    let mut blockers: Vec<String> = Vec::new();
+    if service == TeardownWait::StillThere {
+        blockers.push("the background service".to_string());
+    }
+    blockers.extend(live_engines.iter().map(|id| format!("workspace {id}")));
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Lucidos did not confirm a full stop in time. Possibly still running: {}. \
+         Nothing was deleted, so you can try the uninstall again.",
+        blockers.join(", ")
+    ))
+}
+
 /// Fully remove the bundled Lucidos install from the GUI, so a non-developer
 /// never needs a terminal. Stops the service and embedded Postgres, removes the
 /// launchd agent, deletes the support data, and trashes the running `.app`.
@@ -2197,13 +2724,18 @@ fn sh_quote(s: &str) -> String {
 /// are logged and joined into any returned `Err`, but do not on their own fail
 /// the uninstall.
 ///
+/// **Nothing is deleted until the stack is observed STOPPED.** A stack that
+/// will not stop ends the uninstall with the tree and the bundle untouched. See
+/// step (c3) and `delete_may_proceed`.
+///
 /// Touches ONLY the bundled install's paths, never the developer dev-setup dirs.
 #[cfg(target_os = "macos")]
 pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
 
-    // (a) Stop per-workspace engines. Best-effort, and logged internally.
-    stop_workspace_engines(app_data);
+    // (a) Signal the per-workspace engines. Best-effort, and logged internally.
+    //     The pids come back so step (c3) can wait them out.
+    let signalled = stop_workspace_engines(app_data);
 
     // (b) Stop the embedded Postgres cluster BEFORE deleting its data dir, so
     //     no running postmaster holds the tree.
@@ -2247,6 +2779,33 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
             }
         }
     }
+
+    // (c3) Wait for the stack to be GONE, before anything is deleted.
+    //      `bootout` returns the moment launchd accepts the request, and the
+    //      engines in (a) were only signalled. So for several seconds both keep
+    //      writing under the tree step (e) is about to walk.
+    let service = if bootout_ok {
+        wait_for_service_to_unload()
+    } else {
+        // Nothing to wait for: the bootout was refused, so the job is still up.
+        TeardownWait::StillThere
+    };
+    //      The engines are waited out only once the service is gone. A live
+    //      service respawns them, so their liveness decides nothing while it is
+    //      up, and the refusal below already names it.
+    let live_engines = match service {
+        TeardownWait::Gone => wait_for_engines_to_exit(&signalled, ENGINE_EXIT_TIMEOUT),
+        TeardownWait::StillThere => Vec::new(),
+    };
+    //      A refusal ends the uninstall HERE, before the first deletion. That
+    //      is what makes its message true, and what leaves the user a bundle
+    //      and a plist to retry from.
+    if let Err(reason) = delete_may_proceed(service, &live_engines) {
+        eprintln!("[service] uninstall: refusing to delete anything: {reason}");
+        failures.push(reason);
+        return Err(failures.join("; "));
+    }
+    eprintln!("[service] uninstall: the stack is stopped; deleting");
 
     // (d) Delete BOTH LaunchAgent plists, so neither can reload at login. The
     //     login one would otherwise spend a boot trying to `open` a bundle
@@ -2320,7 +2879,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         }
     }
 
-    if bootout_ok && data_ok {
+    // Reaching here means (c3) confirmed the stack stopped, so the bootout
+    // succeeded. Only the deletions are left to have gone wrong.
+    if data_ok {
         Ok(())
     } else {
         Err(failures.join("; "))
@@ -4313,6 +4874,21 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create the workspace dir");
             std::fs::write(dir.join("engine.pid"), pid.to_string()).expect("write the pidfile");
         }
+
+        /// Lay down `workspaces/<id>/.lucidos/ports`, the way the gateway
+        /// publishes it for an engine it spawned.
+        fn write_ports(&self, id: &str, contents: &str) {
+            let dir = self.0.join("workspaces").join(id).join(".lucidos");
+            std::fs::create_dir_all(&dir).expect("create the workspace dir");
+            std::fs::write(dir.join("ports"), contents).expect("write the ports file");
+        }
+
+        /// Lay down the durable slug-to-device-id map this client keeps.
+        fn write_device_ids(&self, json: &str) {
+            let dir = self.0.join("config");
+            std::fs::create_dir_all(&dir).expect("create the config dir");
+            std::fs::write(dir.join("device-ids.json"), json).expect("write the device map");
+        }
     }
 
     impl Drop for TempAppData {
@@ -4404,7 +4980,14 @@ mod tests {
         tmp.write_pidfile("stale-ws", 999_999);
 
         let stopped = stop_workspace_engines(tmp.path());
-        assert_eq!(stopped, vec!["live-ws".to_string()]);
+        assert_eq!(
+            stopped,
+            vec![SignalledEngine {
+                id: "live-ws".to_string(),
+                pid: child.id() as i32,
+            }],
+            "the pid comes back too, so a caller can wait the engine out",
+        );
         assert!(
             !tmp.path()
                 .join("workspaces/live-ws/.lucidos/engine.pid")
@@ -4429,5 +5012,332 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("lucidos-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(delete_path(&missing).is_ok());
+    }
+
+    // ── Telling the engines who asked ────────────────────────────────────────
+
+    /// The ports file a packaged engine gets, plus the extra keys the dev
+    /// scripts write into the same file.
+    const PACKAGED_PORTS: &str = "API_PORT=49213\nPROTO=http\nPG_PORT=5433\nVITE_PORT=5173\n";
+
+    fn target(port: u16, device_id: &str) -> RestartIntentTarget {
+        RestartIntentTarget {
+            slug: "myws".to_string(),
+            port,
+            device_id: device_id.to_string(),
+        }
+    }
+
+    // `kill` reads 0 as the caller's own process group, and -1 as everything it
+    // may signal. A pidfile holding either would turn a per-engine stop into a
+    // broadcast, so neither names an engine.
+    #[test]
+    fn a_pidfile_that_would_broadcast_names_no_engine() {
+        let tmp = TempAppData::new("badpid");
+        let ws = tmp.path().join("workspaces/bad-ws");
+        let dir = ws.join(".lucidos");
+        std::fs::create_dir_all(&dir).expect("create the workspace dir");
+        for bad in ["0", "-1", "", "not-a-pid"] {
+            std::fs::write(dir.join("engine.pid"), bad).expect("write the pidfile");
+            assert_eq!(read_engine_pid(&ws), None, "{bad:?}");
+        }
+        tmp.write_pidfile("bad-ws", 4242);
+        assert_eq!(read_engine_pid(&ws), Some(4242));
+    }
+
+    #[test]
+    fn the_ports_file_yields_the_engine_port_and_scheme() {
+        assert_eq!(
+            parse_engine_ports(PACKAGED_PORTS),
+            Some((49213, "http".to_string())),
+        );
+    }
+
+    // The engine's own reader defaults an absent PROTO to https, and the two
+    // readers of this file must not disagree about a scheme.
+    #[test]
+    fn an_absent_proto_reads_as_https() {
+        assert_eq!(
+            parse_engine_ports("API_PORT=49213\n"),
+            Some((49213, "https".to_string())),
+        );
+    }
+
+    #[test]
+    fn a_ports_file_naming_no_usable_port_yields_nothing() {
+        for contents in [
+            "PROTO=http\n",
+            "API_PORT=\n",
+            "API_PORT=nope\n",
+            "API_PORT=0\n",
+        ] {
+            assert_eq!(parse_engine_ports(contents), None, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn a_running_packaged_workspace_is_told_on_its_own_port() {
+        assert_eq!(
+            restart_intent_target("myws", Some(PACKAGED_PORTS), Some("device-7")),
+            Ok(target(49213, "device-7")),
+        );
+    }
+
+    // Each of these leaves the workspace exactly as it behaves today. Absent
+    // attribution stays absent, rather than becoming a guess. The reason is
+    // typed so the caller can name it in the log.
+    #[test]
+    fn a_workspace_we_cannot_speak_for_is_skipped_for_a_named_reason() {
+        // No ports file at all.
+        assert_eq!(
+            restart_intent_target("myws", None, Some("device-7")),
+            Err(RestartIntentSkip::NoPort),
+        );
+        // This client has never opened it, so it has no id there.
+        assert_eq!(
+            restart_intent_target("myws", Some(PACKAGED_PORTS), None),
+            Err(RestartIntentSkip::NoDevice),
+        );
+        // An engine serving TLS, which the raw socket below cannot reach.
+        let tls = "API_PORT=49213\nPROTO=https\n";
+        assert_eq!(
+            restart_intent_target("myws", Some(tls), Some("device-7")),
+            Err(RestartIntentSkip::NotPlainHttp),
+        );
+    }
+
+    // A skip nobody can read is the silent degrade the typed reason prevents,
+    // so every arm has to have something to say.
+    #[test]
+    fn every_skip_explains_itself() {
+        for skip in [
+            RestartIntentSkip::NoPort,
+            RestartIntentSkip::NotPlainHttp,
+            RestartIntentSkip::NoDevice,
+        ] {
+            assert!(!skip.reason().is_empty(), "{skip:?}");
+        }
+    }
+
+    // The id is written straight into a request header, so a value carrying a
+    // line break would append headers of its own.
+    #[test]
+    fn a_device_id_that_is_not_header_safe_is_refused() {
+        for id in ["", "   ", "dev\r\nX-Evil: 1", "dev ice"] {
+            assert_eq!(
+                restart_intent_target("myws", Some(PACKAGED_PORTS), Some(id)),
+                Err(RestartIntentSkip::NoDevice),
+                "{id:?}",
+            );
+        }
+    }
+
+    // What actually goes on the wire. The device header is the whole point, and
+    // the absent forwarded-prefix is what the engine accepts the call on.
+    #[test]
+    fn the_request_names_the_device_and_claims_no_proxy_hop() {
+        let request = restart_intent_request(&target(49213, "device-7"));
+        assert!(
+            request.starts_with("POST /api/v1/internal/restart-intent HTTP/1.0\r\n"),
+            "{request}",
+        );
+        assert!(
+            request.contains("\r\nx-lucidos-device-id: device-7\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\r\nHost: 127.0.0.1:49213\r\n"),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("x-forwarded-prefix"),
+            "a restart intent claiming a proxy hop is refused: {request}",
+        );
+    }
+
+    #[test]
+    fn every_target_is_told_and_only_the_acknowledged_ones_count() {
+        let targets = [target(1, "a"), target(2, "b")];
+        let mut asked = Vec::new();
+        let told = announce_to_engines(&targets, Instant::now() + Duration::from_secs(5), |t| {
+            asked.push(t.port);
+            t.port == 1
+        });
+        assert_eq!(asked, vec![1, 2]);
+        assert_eq!(told, 1);
+    }
+
+    // The bound that keeps a wedged engine from holding up the click. A deadline
+    // already reached stops the sweep before its first call.
+    #[test]
+    fn a_spent_budget_stops_the_sweep() {
+        let targets = [target(1, "a"), target(2, "b")];
+        let mut asked = 0;
+        let told = announce_to_engines(&targets, Instant::now(), |_| {
+            asked += 1;
+            true
+        });
+        assert_eq!(asked, 0);
+        assert_eq!(told, 0);
+    }
+
+    // The set we attribute must match the set the teardown signals, which is
+    // `stop_workspace_engines`' set: a live pidfile under this install's own
+    // app-data dir.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_live_engine_this_client_knows_is_a_target() {
+        let tmp = TempAppData::new("intent-targets");
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in engine");
+        tmp.write_device_ids(r#"{"live-ws":"device-7","dead-ws":"device-7"}"#);
+        tmp.write_pidfile("live-ws", child.id());
+        tmp.write_ports("live-ws", PACKAGED_PORTS);
+        // A pidfile an engine left behind when it died. macOS caps pids well
+        // below this, so it cannot name a live process.
+        tmp.write_pidfile("dead-ws", 999_999);
+        tmp.write_ports("dead-ws", PACKAGED_PORTS);
+
+        assert_eq!(
+            restart_intent_targets(tmp.path()),
+            vec![RestartIntentTarget {
+                slug: "live-ws".to_string(),
+                port: 49213,
+                device_id: "device-7".to_string(),
+            }],
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // With no device map there is nobody to name, so nothing is announced and
+    // every engine keeps today's System attribution.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_device_store_announces_to_nobody() {
+        let tmp = TempAppData::new("intent-nodevices");
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in engine");
+        tmp.write_pidfile("live-ws", child.id());
+        tmp.write_ports("live-ws", PACKAGED_PORTS);
+
+        assert!(restart_intent_targets(tmp.path()).is_empty());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // ── Waiting for the stack to be gone ─────────────────────────────────────
+    //
+    // The uninstall's deletion runs on these decisions, so they are tested as
+    // pure functions. No test here delivers a signal, boots a job out, or
+    // deletes anything.
+
+    // Only an OBSERVED departure ends a wait early. Running out of time is a
+    // refusal, never a shrug.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_teardown_poll_ends_only_on_a_sighting_or_the_deadline() {
+        assert_eq!(teardown_poll(true, false), Some(TeardownWait::Gone));
+        assert_eq!(teardown_poll(true, true), Some(TeardownWait::Gone));
+        assert_eq!(teardown_poll(false, true), Some(TeardownWait::StillThere));
+        assert_eq!(teardown_poll(false, false), None);
+    }
+
+    // A probe that never answers must neither wait forever nor report the thing
+    // gone because patience ran out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_wait_that_runs_out_of_time_reports_it_still_there() {
+        let mut probes = 0;
+        let verdict = wait_until_gone(Duration::ZERO, || {
+            probes += 1;
+            false
+        });
+        assert_eq!(verdict, TeardownWait::StillThere);
+        assert_eq!(probes, 1, "a spent deadline probes once and gives up");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_wait_ends_as_soon_as_the_probe_sees_it_go() {
+        let mut probes = 0;
+        let verdict = wait_until_gone(LAUNCHD_TEARDOWN_TIMEOUT, || {
+            probes += 1;
+            probes >= 3
+        });
+        assert_eq!(verdict, TeardownWait::Gone);
+        assert_eq!(probes, 3, "and not one probe more");
+    }
+
+    // Only ESRCH proves a process has left. Both probes deliver signal 0, which
+    // delivers nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_liveness_probe_calls_only_a_missing_process_gone() {
+        assert!(!process_is_gone(std::process::id() as i32));
+        // A pid macOS cannot issue, since it caps pids well below this.
+        assert!(process_is_gone(999_999));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn engines_that_are_already_gone_hold_nothing_up() {
+        let engines = vec![SignalledEngine {
+            id: "dead-ws".to_string(),
+            pid: 999_999,
+        }];
+        assert!(wait_for_engines_to_exit(&engines, Duration::ZERO).is_empty());
+    }
+
+    // An engine still in the table at the deadline is named, so the refusal can
+    // say which workspace held the uninstall up. Our own pid stands in for one:
+    // it is certainly alive, and nothing signals it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_engine_that_outlives_the_deadline_is_named() {
+        let engines = vec![
+            SignalledEngine {
+                id: "dead-ws".to_string(),
+                pid: 999_999,
+            },
+            SignalledEngine {
+                id: "live-ws".to_string(),
+                pid: std::process::id() as i32,
+            },
+        ];
+        let still_alive = wait_for_engines_to_exit(&engines, Duration::ZERO);
+        assert_eq!(still_alive, vec!["live-ws".to_string()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_stack_may_be_deleted() {
+        assert_eq!(delete_may_proceed(TeardownWait::Gone, &[]), Ok(()));
+    }
+
+    // The message reaches a dialog, so it names what is still up and promises
+    // what the caller then has to honour: that nothing went.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stack_that_would_not_stop_refuses_the_delete() {
+        let ids = vec!["myws".to_string()];
+
+        let service = delete_may_proceed(TeardownWait::StillThere, &[]).unwrap_err();
+        assert!(service.contains("the background service"), "{service}");
+        assert!(service.contains("Nothing was deleted"), "{service}");
+
+        let engines = delete_may_proceed(TeardownWait::Gone, &ids).unwrap_err();
+        assert!(engines.contains("workspace myws"), "{engines}");
+        assert!(engines.contains("Nothing was deleted"), "{engines}");
+
+        let both = delete_may_proceed(TeardownWait::StillThere, &ids).unwrap_err();
+        assert!(
+            both.contains("the background service, workspace myws"),
+            "{both}"
+        );
     }
 }

@@ -1,7 +1,8 @@
 //! LLM-facing schemas for cross-cutting tools that do not belong to a
 //! single domain family: navigate_ui, git_clone, get_backup_status,
 //! request_credential, connect_oauth_account, execute_intent,
-//! ask_user_question, await_event, todo_write.
+//! ask_user_question, await_event, list_event_waits, cancel_event_wait,
+//! todo_write.
 //!
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)
@@ -77,7 +78,7 @@ pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
 ];
 
 /// Tool for navigating the Lucidos UI to a specific panel, app, or file.
-pub fn get_navigate_ui_tool() -> ToolDefinition {
+pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::NAVIGATE_UI.to_string(),
         description: "Navigate the Lucidos UI to a panel, app, file, thread, or creation form, when the user asks to open, show, or go to something.".to_string(),
@@ -200,6 +201,56 @@ pub(super) fn backup_status_tools() -> Vec<ToolDefinition> {
     }]
 }
 
+/// The six OAuth endpoint properties `request_credential` and
+/// `connect_oauth_account` both take, filled from the same
+/// `system-knowhow/oauth-providers` row.
+///
+/// One copy, because the two had already drifted: only one of them named the
+/// `authorize_params` separator, so a model on the other path had to guess it.
+/// `prefix` leads every description on a tool that also accepts other auth
+/// types, which is how `request_credential` still says where they apply.
+fn oauth_endpoint_props(prefix: &str) -> serde_json::Map<String, serde_json::Value> {
+    let text = |body: &str| json!({ "type": "string", "description": format!("{prefix}{body}") });
+    [
+        ("auth_url", text("From the knowhow; pre-fills the modal.")),
+        ("token_url", text("From that knowhow.")),
+        (
+            "userinfo_url",
+            text("Without one the account reports no email."),
+        ),
+        (
+            "userinfo_method",
+            json!({
+                "type": "string",
+                "enum": ["GET", "POST"],
+                "description": format!("{prefix}GET unless the knowhow's row says POST."),
+            }),
+        ),
+        (
+            "authorize_params",
+            text("Extra authorize-URL params, key=value&key=value, from the knowhow."),
+        ),
+        (
+            "redirect_uri",
+            text("Omit for the default loopback URI; the knowhow lists the rest."),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, schema)| (name.to_string(), schema))
+    .collect()
+}
+
+/// A tool's own properties with the shared OAuth endpoint block merged in.
+/// The tool's own names win, so a tool can still describe one of the six
+/// differently without losing the other five.
+fn with_oauth_endpoints(properties: serde_json::Value, prefix: &str) -> serde_json::Value {
+    let mut merged = oauth_endpoint_props(prefix);
+    if let serde_json::Value::Object(own) = properties {
+        merged.extend(own);
+    }
+    serde_json::Value::Object(merged)
+}
+
 pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -207,7 +258,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
             description: "Request an API credential through a secure modal, keeping the secret out of the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next.".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": {
+                "properties": with_oauth_endpoints(json!({
                     "service_name": {
                         "type": "string",
                         "description": "Service name (e.g. 'oura'). For 'oauth_client' pass the BARE provider name: the auth type marks the row as an app registration."
@@ -226,40 +277,15 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "enum": crate::core::AuthType::agent_requestable_values(),
                         "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
-                    "auth_url": {
-                        "type": "string",
-                        "description": "oauth_client only, from the knowhow."
-                    },
-                    "token_url": {
-                        "type": "string",
-                        "description": "oauth_client only, from that knowhow."
-                    },
-                    "userinfo_url": {
-                        "type": "string",
-                        "description": "oauth_client only; without one the account reports no email."
-                    },
-                    "userinfo_method": {
-                        "type": "string",
-                        "enum": ["GET", "POST"],
-                        "description": "oauth_client only. GET unless the knowhow's row says POST."
-                    },
-                    "authorize_params": {
-                        "type": "string",
-                        "description": "oauth_client only. Extra authorization-URL parameters from the knowhow row."
-                    },
                     "scopes": {
                         "type": "string",
-                        "description": "oauth_client only. Space-separated, pre-fills the modal."
-                    },
-                    "redirect_uri": {
-                        "type": "string",
-                        "description": "oauth_client only. Omit for the default loopback URI; the knowhow lists the other forms."
+                        "description": "oauth_client: space-separated, pre-fills the modal."
                     },
                     "env_var_name": {
                         "type": "string",
                         "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
                     }
-                },
+                }), "oauth_client: "),
                 // `base_urls` is required for every type but `secret`, which is
                 // sent nowhere. A JSON Schema cannot say that, so the handler
                 // enforces it and names the type in its refusal.
@@ -276,7 +302,7 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
             description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. ONE call for the whole flow: with no client credentials yet it opens the credential modal itself, then authorizes. The page opens on the USER'S DEVICE in the browser they configured, so tell them to complete it there. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": {
+                "properties": with_oauth_endpoints(json!({
                     "provider": {
                         "type": "string",
                         "description": "Provider name (e.g. 'google'). Use a distinct name for a dedicated connection that must not carry other scopes, e.g. 'ghealth' on Google's endpoints."
@@ -285,36 +311,11 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Space-separated scopes."
                     },
-                    "auth_url": {
-                        "type": "string",
-                        "description": "From the knowhow; pre-fills the modal."
-                    },
-                    "token_url": {
-                        "type": "string",
-                        "description": "From that knowhow."
-                    },
-                    "userinfo_url": {
-                        "type": "string",
-                        "description": "Without one the account reports no email."
-                    },
-                    "userinfo_method": {
-                        "type": "string",
-                        "enum": ["GET", "POST"],
-                        "description": "GET unless the row says POST."
-                    },
-                    "authorize_params": {
-                        "type": "string",
-                        "description": "Extra authorization-URL parameters, key=value&key=value, from the knowhow row."
-                    },
                     "base_url": {
                         "type": "string",
                         "description": "API base URL, pre-fills the modal."
-                    },
-                    "redirect_uri": {
-                        "type": "string",
-                        "description": "Omit for the default loopback URI; the knowhow names the other forms."
                     }
-                },
+                }), ""),
                 "required": ["provider", "scopes"]
             }),
         },
@@ -440,7 +441,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 86400,
+                        "maximum": crate::engine::event_wait::MAX_TIMEOUT_SECS,
                         "description": "REQUIRED. Seconds before giving up; there is no unbounded wait. Add margin: expiring early costs one turn, expiring late costs the whole wait."
                     },
                     "reason": {
@@ -542,6 +543,52 @@ pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolD
         description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you call this again.".to_string(),
         parameters,
     }]
+}
+
+#[cfg(test)]
+mod oauth_endpoint_tests {
+    use super::*;
+
+    fn only_tool(mut tools: Vec<ToolDefinition>) -> ToolDefinition {
+        assert_eq!(tools.len(), 1);
+        tools.remove(0)
+    }
+
+    /// Both OAuth-capable tools describe the same six endpoint properties, from
+    /// one source. The two hand-written copies had already drifted: only
+    /// `connect_oauth_account` named the `authorize_params` separator, so a
+    /// model taking the `request_credential` path had to guess it.
+    #[test]
+    fn both_oauth_tools_read_the_same_endpoint_block() {
+        let request = only_tool(request_credential_tools());
+        let connect = only_tool(connect_oauth_tools());
+        for name in [
+            "auth_url",
+            "token_url",
+            "userinfo_url",
+            "userinfo_method",
+            "authorize_params",
+            "redirect_uri",
+        ] {
+            let requested = request.parameters["properties"][name]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("request_credential dropped {name}"));
+            let connected = connect.parameters["properties"][name]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("connect_oauth_account dropped {name}"));
+            assert_eq!(
+                requested.strip_prefix("oauth_client: "),
+                Some(connected),
+                "{name} must read the same on both tools"
+            );
+        }
+        assert!(
+            request.parameters["properties"]["authorize_params"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("key=value")),
+            "the wire format the model needs must reach both paths"
+        );
+    }
 }
 
 /// Contract codegen for the `navigate_ui` `target` + `settings_view` enums.

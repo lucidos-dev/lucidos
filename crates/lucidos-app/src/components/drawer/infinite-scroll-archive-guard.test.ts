@@ -5,7 +5,10 @@
 //   fill loop pull the whole archive into memory for rows the user can't see.
 //   There is NO filter-active bypass anymore: the badge reads a server-sourced
 //   count (`refreshArchivedCount`), so a filter's matches are counted while
-//   collapsed without eager-loading hidden rows.
+//   collapsed without eager-loading hidden rows. It also gates whether the
+//   sentinel is RENDERED at all. Being a dependency of the observer effect is
+//   what makes an expand mount one and kick the fill loop
+//   (`e2e/drawer-archive-pagination.spec.ts`).
 //
 // - `sentinelInView` — the pure rect overlap the fill loop polls after each page
 //   to decide whether the freshly-loaded rows pushed the sentinel below the fold.

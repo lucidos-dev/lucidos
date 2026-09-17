@@ -1178,6 +1178,72 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
     expect(openWindow).not.toHaveBeenCalled();
   });
 
+  // A popped-out app tab is the same trap one level down. The browser client's
+  // popout control is a real `<a target="_blank">` to `/<slug>/app/<id>/`. That
+  // tab is same-origin, same-scope, top-level, and serving the app's own HTML.
+  // Focusing it moves the wrong window, and the deep link reaches a page with
+  // no listener for it. The tap must land on the workspace shell.
+  const SCOPE_DEV = 'https://example.com/dev/';
+  const APP_TAB = 'https://example.com/dev/app/habit-tracker/';
+
+  it('popped-out app tab: the shell is the tap target, never the app tab', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw({ scope: SCOPE_DEV });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const appTab = topLevelClient(APP_TAB);
+    const shell = topLevelClient(SCOPE_DEV);
+    // The app tab first, so a prefix-matching find() would (wrongly) pick it.
+    matchAll.mockResolvedValue([appTab, shell]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(shell.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: threadData });
+    expect(shell.focus).toHaveBeenCalledTimes(1);
+    expect(appTab.postMessage).not.toHaveBeenCalled();
+    expect(appTab.focus).not.toHaveBeenCalled();
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it('only a popped-out app tab open: opens the shell, leaving the app tab alone', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw({ scope: SCOPE_DEV });
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const appTab = topLevelClient(APP_TAB);
+    matchAll.mockResolvedValue([appTab]);
+
+    const ev = makeClickEvent(threadData);
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(appTab.postMessage).not.toHaveBeenCalled();
+    expect(appTab.focus).not.toHaveBeenCalled();
+    expect(openWindow).toHaveBeenCalledWith(
+      'https://example.com/dev/#notification=nid-thread&thread=tid-1&event=evt-7',
+    );
+  });
+
+  // The shell rewrites its own query and hash as it routes, and a tab can sit
+  // at the slug with no trailing slash. Both are still the shell.
+  it('the shell matches on path alone: its own query, hash and bare slug all qualify', async () => {
+    for (const url of [
+      'https://example.com/dev/?notification=older',
+      'https://example.com/dev/#notifications',
+      'https://example.com/dev',
+    ]) {
+      const { handlers, matchAll, mockFetch, openWindow } = loadSw({ scope: SCOPE_DEV });
+      mockFetch.mockResolvedValue(new Response('ok'));
+      const shell = topLevelClient(url);
+      matchAll.mockResolvedValue([shell]);
+
+      const ev = makeClickEvent(threadData);
+      handlers.notificationclick(ev);
+      await Promise.all(ev._waited);
+
+      expect(shell.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: threadData });
+      expect(openWindow).not.toHaveBeenCalled();
+    }
+  });
+
   it('marks read via the scoped notification/read endpoint (gateway scope prefix)', async () => {
     const { handlers, matchAll, mockFetch } = loadSw({ scope: SCOPE_PERSONAL });
     mockFetch.mockResolvedValue(new Response('ok'));

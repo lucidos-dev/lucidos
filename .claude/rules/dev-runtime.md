@@ -15,6 +15,7 @@ paths:
   - "scripts/dev-codesign-setup.sh"
   - "scripts/dev-refresh-app-frontend.sh"
   - "scripts/deps-state.sh"
+  - "scripts/lib/deps_state*.sh"
   - "scripts/test-engine.sh"
   - "scripts/test-scripts.sh"
   - "scripts/with-build-slot.sh"

@@ -297,8 +297,9 @@ function OptionButton({
  *  styled like the picked permission affordance. Exported for unit tests.
  *
  *  Carries `data-tool-use-id` like the live body it replaces, so the answer's
- *  landing glide (`questionCardTurn` in scrollState) finds the card whether or
- *  not this swap has already happened. The two submit sites resolve it
+ *  landing glide finds the card whether or not this swap has already happened.
+ *  That lookup is `landsOnCard` in scrollState, over the `cardTurn` matcher it
+ *  shares with the permission cards. The two submit sites resolve it
  *  synchronously, before the render, so today they see the live body; depending
  *  on that ordering to make the id unnecessary here would be one Preact
  *  scheduling change away from silently losing the glide. The TERMINATED body

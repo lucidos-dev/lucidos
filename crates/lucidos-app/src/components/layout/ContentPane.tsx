@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
+import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
+import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { contentViewKey } from './contentViewKey';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -42,17 +43,25 @@ const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.Inline
 const NAV_COVER_ANIM_MS = 200;
 const NAV_COVER_SLACK_MS = 50;
 
-/** The one view the WebKit repaint below skips. The app-ui body is `overflow: hidden`
- *  with an iframe child, so it is not the scroll container that blanks, and the
- *  iframe composites itself out of our reach: the repaint buys nothing there. It
- *  also costs something. `forceWebKitRepaint` writes a transform for one frame, which
- *  makes `.content-pane-body` the containing block for the pseudo-fullscreen app
- *  panel's `position: fixed` (`.app-ui-fullscreen`, rendered in-tree by
- *  AppUiInline), snapping a fullscreen app back to the pane's box for that frame.
- *  Reads the signal live rather than the render's `isAppUi`, because the resume
- *  subscription is mounted once and outlives every overlay change. */
-function hostsAppUiIframe(): boolean {
-  return panelOverlay.peek()?.type === 'app-ui';
+/** The one state the WebKit repaint below skips: something is painted FULLSCREEN
+ *  over this pane. Not merely an app panel being open.
+ *
+ *  `forceWebKitRepaint` writes a transform for one frame, which makes
+ *  `.content-pane-body` the containing block for a `position: fixed` descendant.
+ *  The pseudo-fullscreen panel (`.app-ui-fullscreen`, rendered in-tree by
+ *  AppUiInline) is one, so a repaint would snap it back to the pane's box for
+ *  that frame. A natively fullscreen element is painted alone, so a repaint of
+ *  the pane under it buys nothing and risks the same capture.
+ *
+ *  Native is asked of the DOM rather than of `appFullscreenHost`, which answers
+ *  null when the element is not an app panel of ours. An app that fullscreens
+ *  its own content makes the IFRAME that element, and the pane is still covered.
+ *
+ *  Read live rather than at render, because the resume subscription is mounted
+ *  once and outlives every overlay change. Why this is not every app-ui overlay:
+ *  docs/plans/2026-09-17-a-deep-link-repaints-what-it-landed.md. */
+function fullscreenCoversThePane(): boolean {
+  return appPseudoFullscreen.peek() || nativeFullscreenElement() !== null;
 }
 
 /** Mounted ONCE, by whichever layout `App` renders for the current viewport
@@ -162,7 +171,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // gets three superseding attempts, and a navigation repaint buys nothing a
   // switch-triggered render does not already cover.
   useEffect(() => onPageResume(() => {
-    if (hostsAppUiIframe()) return;
+    if (fullscreenCoversThePane()) return;
     forceWebKitRepaint(bodyRef.current);
   }), []);
 

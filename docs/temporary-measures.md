@@ -167,11 +167,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   one cost most of a session on the tenth report. `lsof -p $(cat
   <ws>/.lucidos/engine.pid)` names the file the live engine actually writes.
 
-  Each line names the face and the verdict. The eleven are `served`,
+  Each line names the face and the verdict. The fifteen are `served`,
   `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `no-lift`,
-  `click-no-touch`, `unreachable`, `repaired` and `repair-failed`. It carries
-  the travel, the row and face boxes, the viewport block and the
-  `data-keyboard-active` flag.
+  `click-no-touch`, `unreachable`, `repaired`, `repair-failed`, `activated`,
+  `keyboard-touch`, `covered` and `stray-click`. It carries the travel, the row
+  and face boxes, the viewport block and the `data-keyboard-active` flag.
 
   Three readings joined in the tenth round. The morph's own mode, the quiet
   window before the line, and, on a `missed`, why no watchable face took the
@@ -181,6 +181,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   and the distance from it to the nearest watchable face. Read `missedBy`
   first: a single-digit `px` is a near miss on a small target, and a large one
   is a press that was never aimed at a face.
+
+  **Read `quiet.covered` before concluding anything from a silence.** It counts
+  the scheduled checks in the preceding gap that asked nothing, because the app
+  had a cover up. A run of them across a long `quiet.ms` says the composer was
+  inert by our own design, not by WebKit's.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
@@ -245,7 +250,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the travel it measured rather than an asserted zero. A stationary one that
   reached nothing RUNS SEND itself, then relayouts the shell a keyboard's span
   away and straight back
-  ([ADR 0183](adr/0183-a-dead-composer-tap-runs-send-itself.md)). And every line
+  ([ADR 0183](adr/0183-a-dead-composer-tap-runs-the-commit-face.md)). And every line
   carries `screenOff`, the touch's screen-to-client offset.
 
   The Send half is the one that needs no theory. The app knows a touch reached
@@ -261,16 +266,38 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   whole investigation has died in: a silent ledger has meant both "iOS delivered
   no touch" and "iOS delivered it somewhere else". The platform research behind
   that split, and the two candidates it retires, are in
-  [ADR 0183](adr/0183-a-dead-composer-tap-runs-send-itself.md).
+  [ADR 0183](adr/0183-a-dead-composer-tap-runs-the-commit-face.md).
+- **What the thirteenth report found: the recovery had no face to run.** The
+  dead button was the ANSWER Submit, and the line written during the episode
+  carries `morph=absent`. `computeMorphMode` answers `hidden` while a question
+  is pending, so the morph node is not in the document at all. The previous
+  round's rescue opens with `readMorphState() !== 'send'`, so it could never
+  fire in the mode this episode was in. It now resolves the row's one live
+  COMMIT face, the Send morph or the answer Submit, and never a destructive one
+  or an Apply.
+
+  The ledger's own answer to the episode was one line in two and three quarter
+  minutes, plus one input that wrote nothing at all. Three paths write nothing,
+  and two of them were ours. A press declined under the app's own cover was
+  made silent by the round above. A touchless click that reached no composer
+  face returned without a word.
+
+  Both speak now, as `covered` and `stray-click`, and every line counts the
+  checks a cover stood down. So the next silent stretch says which of three
+  states it was: our own cover stuck up, a page taking clicks with no touch
+  behind them, or WebKit delivering nothing. Only the third is the platform.
+  The plan is
+  [`docs/plans/2026-09-16-the-probe-says-which-silence-it-is.md`](plans/2026-09-16-the-probe-says-which-silence-it-is.md).
 - **Status:** `active`, and now carrying a recovery as well as evidence. The
   cause is still NOT named. So the removal condition needs a quiet period with
   the bounce in place, or an episode whose `screenOff` names it.
 - **It is no longer behaviour-free, and the removal condition changes with
-  that.** The module now RUNS Send for a tap the page dropped, and relayouts the
-  shell behind it. Those two are a fix rather than a diagnostic, so deleting the
-  module would delete them. Removal therefore means moving `rescueSend`,
-  `ruleMissedPress`, `bounceHeight` and `nudgeLayout` to a permanent home first,
-  and dropping only the reporting around them.
+  that.** The module now RUNS the composer's commit face for a tap the page
+  dropped, and relayouts the shell behind it. Those two are a fix rather than a
+  diagnostic, so deleting the module would delete them. Removal therefore means
+  moving `rescueCommit`, `commitFace`, `ruleMissedPress`, `bounceHeight` and
+  `nudgeLayout` to a permanent home first, and dropping only the reporting
+  around them.
 - **Still consumes no gesture.** Every listener stays passive, and none calls
   `preventDefault` or `stopPropagation`. What it adds is an action on a press
   that reached NOTHING, which is a press no other path was going to take.
@@ -1122,10 +1149,16 @@ condition; fix the condition rather than acting on it.
 
 - **Added:** 2026-08-05
 - **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
-  (`is_transient_api_failure`, read by `auto_resume_after_api_error`), covered by
+  (`is_transient_api_failure`, read by `auto_resume_after_api_error` and by
+  `transient_api_failure_error`), covered by
   `transient_api_failures_are_recognized_by_the_api_error_prefix` and
   `deterministic_failures_are_not_transient` in
   `crates/lucidos-engine/src/engine/agent_session/lifecycle_tests/watchdog.rs`.
+  The prefix now also gates the parent-notification path. It decides the
+  *auto-resume hold* that withholds a child's completion card. The error it
+  carries becomes that card's summary if the resume never happens (ADR 0199).
+  Every reader still goes through the one predicate, so the removal condition
+  below reaches all of them.
 - **Impermanent because (tolerates):** Claude Code's `result` event exposes no
   structured code for "the upstream connection died mid-response" as distinct
   from "this turn is over and would fail the same way again". The only signal is
@@ -1704,12 +1737,29 @@ event that retires it.
 
 ### `email:`-prefixed credential fallback in `get_email_password`
 
-- **Added:** 2026-08-05
-- **Lives in:** `crates/lucidos-engine/src/core/credentials.rs`
-  (`CredentialStore::get_email_password`: the
-  `service_name = $1 OR service_name = 'email:' || $1` disjunction and its
-  `ORDER BY (service_name = $1) DESC` preference for the unprefixed row), pinned by
-  `migration_strands_an_email_row_whose_bare_name_is_taken`.
+- **Added:** 2026-08-05. **Widened:** 2026-09-17, to the four other sites that go
+  with the same removal.
+- **Lives in:** five live sites, plus the tests that pin them. The row named only
+  the first until the widening, so the rest were invisible to anyone executing the
+  condition below.
+  - `crates/lucidos-engine/src/core/credentials.rs`
+    (`CredentialStore::get_email_password`: the
+    `service_name = $1 OR service_name = 'email:' || $1` disjunction and its
+    `ORDER BY (service_name = $1) DESC` preference for the unprefixed row), pinned by
+    `migration_strands_an_email_row_whose_bare_name_is_taken`.
+  - `EmailStore::account_name_for_credential`
+    (`crates/lucidos-engine/src/core/email.rs`), the `strip_prefix("email:")` that
+    resolves a stranded row back to its `email_accounts` name.
+  - its two production callers in `crates/lucidos-engine/src/api/settings.rs`,
+    `create_credential` and `update_credential`, which sync the secret into
+    `email_accounts` so IMAP and SMTP read the new one.
+  - `emailAccountName` in
+    `crates/lucidos-app/src/components/credentials/CredentialModal.tsx`, the
+    frontend mirror. Without it the edit form's settings fetch 404s on a stranded
+    row.
+  - three `account_name_*` cases in `crates/lucidos-engine/src/core/email_tests.rs`,
+    of which `account_name_strips_a_prefix_the_migration_had_to_leave` is the one
+    that asserts the strip.
 - **Impermanent because:** `20260805134838_drop_credential_name_prefixes_use_auth_type.sql`
   strips the `email:` prefix so `auth_type = 'email_password'` is the only thing
   marking a mailbox password. It cannot strip EVERY row: `email_password` lives
@@ -1726,7 +1776,17 @@ event that retires it.
   against each live workspace database, expecting zero rows, then drop the `OR` and
   the `ORDER BY` from the query, and drop the stranded-row half of
   `migration_strands_an_email_row_whose_bare_name_is_taken` (keep the half asserting
-  the migration does not clobber the same-named API key).
+  the migration does not clobber the same-named API key). Then take the other four
+  sites in the same change:
+  - delete `EmailStore::account_name_for_credential` and its three
+    `account_name_*` cases.
+  - have both `settings.rs` callers pass `service_name` straight to
+    `EmailStore::update_password` and `EmailStore::upsert`.
+  - delete `emailAccountName` and pass `existingCred.service_name` to
+    `getEmailAccount`.
+
+  Verify with a tree-wide search for `account_name_for_credential` and
+  `emailAccountName`, which must return nothing but this row.
 - **Status:** active
 
 ### `oauth:` prefix stripped from a caller-supplied credential name
@@ -1923,6 +1983,35 @@ event that retires it.
   `--https` and `--bg`. Also drop the two-form table in `remote-access.md`
   § Route B, the paragraph on reporting both errors, the paragraph on the
   flag-parse gate, and the Expose troubleshooting row that points at it.
+- **Status:** active
+
+### The legacy `Error:`-prefix lift on a tool result
+
+- **Added:** 2026-09-17 (registered by the project harden sweep; the lift itself
+  predates this row)
+- **Lives in:** `lift_legacy_string` and the `Ok` arm of `to_outcome`, both in
+  `crates/lucidos-engine/src/engine/tools/mod.rs`. Six live call sites route
+  through it:
+  - the four plugin-tool arms in `engine/tools/plugins/mod.rs`: install, check
+    updates, update, uninstall.
+  - `handle_special_tool`'s result in `engine/agentic_loop_special_tool.rs`.
+  - the same call in `engine/agentic_loop/run.rs`.
+- **Impermanent because:** the typed `ToolOutcome` is the contract now. A failure
+  is an `Err`, and the agentic loop persists that as `ToolResult.success`. These
+  sites still return `Ok(String)` and let a prefix decide. The lift's own doc
+  comment says it is one function so the convention can be retired in one place.
+  That intention had no owner and no tracked trigger until this row.
+- **It is still spreading, not shrinking.** Two sites now DEPEND on the prefix
+  rather than merely tolerate it, and each says so at the site. The `glob_files`
+  arm in `engine/tools/files.rs` returns `Ok("Error: …")` on purpose. So does
+  `mcp_permission::denial_refusal`, whose refusal counts as a tool failure only
+  because of the prefix. Both have to return a typed `Err` before the lift can go.
+- **Removal / resolution condition:** No tool arm returns an `Ok(String)` whose
+  value starts with `Error:`, and every failure path returns a typed `Err`.
+  Verify by deleting `lift_legacy_string` and making `to_outcome` map `Ok(s)` to
+  `Ok(s)` unconditionally. The engine suite must then pass with no tool reporting
+  success on a failure. The two dependent sites move to a typed `Err` in the same
+  change, and their prefix notes go with them.
 - **Status:** active
 
 ---

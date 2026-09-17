@@ -11,6 +11,13 @@ use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::ThreadEvent;
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 
+/// Whether anything parks this thread's doer, which is what most cases here
+/// assert. Defined on the reader rather than beside it, so the two cannot
+/// disagree about what parked means.
+async fn is_parked(pool: &PgPool, thread_id: Uuid) -> bool {
+    parked_on(pool, thread_id).await.is_some()
+}
+
 fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
     QuestionOption {
         id: id.to_string(),
@@ -399,7 +406,7 @@ async fn the_reader_covers_the_coding_agent_lane_too() {
         vec!["agent:req-agent"]
     );
     assert_eq!(open[0].kind, DecisionKind::CodingAgentPermission);
-    assert!(doer_is_parked(&pool, thread_id).await);
+    assert!(is_parked(&pool, thread_id).await);
 
     teardown_test_db(&db_name).await;
 }
@@ -520,7 +527,7 @@ async fn a_thread_is_parked_by_any_lane_and_by_nothing_else() {
 
     let quiet = a_chat_thread(&pool).await;
     a_turn_starts(&bus, quiet).await;
-    assert!(!doer_is_parked(&pool, quiet).await);
+    assert!(!is_parked(&pool, quiet).await);
 
     // The coding-agent lane has its own case above: its event is legal on a
     // coding-agent thread and nowhere else.
@@ -534,9 +541,9 @@ async fn a_thread_is_parked_by_any_lane_and_by_nothing_else() {
     {
         let thread_id = a_chat_thread(&pool).await;
         a_turn_starts(&bus, thread_id).await;
-        assert!(!doer_is_parked(&pool, thread_id).await, "lane {}", index);
+        assert!(!is_parked(&pool, thread_id).await, "lane {}", index);
         seed_thread_event(&bus, thread_id, card).await;
-        assert!(doer_is_parked(&pool, thread_id).await, "lane {}", index);
+        assert!(is_parked(&pool, thread_id).await, "lane {}", index);
     }
 
     teardown_test_db(&db_name).await;
@@ -551,9 +558,9 @@ async fn answering_the_card_unparks_the_thread() {
     a_turn_starts(&bus, thread_id).await;
 
     seed_thread_event(&bus, thread_id, asks_to_run("req-cmd")).await;
-    assert!(doer_is_parked(&pool, thread_id).await);
+    assert!(is_parked(&pool, thread_id).await);
     seed_thread_event(&bus, thread_id, a_command_answer("req-cmd")).await;
-    assert!(!doer_is_parked(&pool, thread_id).await);
+    assert!(!is_parked(&pool, thread_id).await);
 
     teardown_test_db(&db_name).await;
 }
@@ -572,7 +579,7 @@ async fn another_threads_card_is_not_this_threads_decision() {
     seed_thread_event(&bus, theirs, asks_to_run("req-cmd")).await;
 
     assert!(open_on(&pool, mine).await.is_empty());
-    assert!(!doer_is_parked(&pool, mine).await);
+    assert!(!is_parked(&pool, mine).await);
     assert_eq!(open_on(&pool, theirs).await.len(), 1);
 
     teardown_test_db(&db_name).await;

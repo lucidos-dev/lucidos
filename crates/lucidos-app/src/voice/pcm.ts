@@ -6,6 +6,12 @@
  * no negotiation: the client asks the browser for exactly this rate, so nothing
  * resamples anywhere.
  *
+ * **Asking is not getting**, and nothing downstream could cope if the browser
+ * said no. The microphone worklet posts raw quanta at whatever rate the context
+ * came up at, and this module then labels them 24 kHz on the wire. So a call
+ * refuses to start on any other rate rather than sending a voice nobody can
+ * transcribe. `refusals.ts` owns that check's words.
+ *
  * Web Audio speaks Float32 in [-1, 1] and the socket speaks Int16, so every
  * frame crosses here in one direction or the other. Pure, and therefore tested.
  */

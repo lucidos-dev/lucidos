@@ -50,6 +50,14 @@ What each piece does — include only what you need:
 
 **Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below) — so it follows the user's light/dark (OS) appearance just like the rest of Lucidos. Theme integration is *technically* opt-in: the engine never auto-injects these tags, so an app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling. Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs) — otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
 
+**The tab icon is the one tag the engine does add.** An app opened in its own
+browser tab is a top-level document. Without a `<link rel="icon">` it shows the
+browser's blank page glyph. So the engine stamps the Lucidos mark into the
+served `<head>` when your HTML names no icon of its own. Ship a
+`<link rel="icon" href="…">` (or `rel="shortcut icon"`) and yours is kept
+untouched. Inside the host shell the app runs in an iframe, which has no tab, so
+this changes nothing there.
+
 ### Theme variables
 
 `sdk-iframe.css` defines these CSS custom properties on `<html>` and flips their values between light and dark automatically — driven by the `data-theme` attribute, which `applyPreferences()` sets (resolving `system` to the OS setting) and `watchPreferences()` keeps in sync. Style your app with `var(--name)` and it tracks the user's appearance for free. The canonical values live in the engine's `sdk-iframe.css`; **the names are the contract**:

@@ -45,8 +45,15 @@ describe('a call leaves the composer alone', () => {
     expect(source).not.toContain('voiceCall');
   });
 
+  /** The toggle may mark ITSELF inert while a call is ending, and that is the
+   *  one lock this file allows. What it must never reach is the composer. */
   it('leaves the textarea and Send untouched by a call', () => {
-    expect(read('CallToggle.tsx')).not.toMatch(/disabled|prompt-textarea|readOnly/);
+    const source = read('CallToggle.tsx');
+    expect(source).not.toMatch(/prompt-textarea|readOnly/);
+    // `aria-disabled` keeps the button focusable and keeps its pointer events,
+    // so the microphone picker's hold still works. The bare attribute takes
+    // both away, and nothing in this component may take a control out.
+    expect(source.replace(/aria-disabled/g, '')).not.toMatch(/disabled/);
   });
 });
 

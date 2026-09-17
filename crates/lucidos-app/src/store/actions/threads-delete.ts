@@ -9,6 +9,10 @@
  *  **Every line of the dialog is conditional on the preflight.** A warning
  *  about branch work on a chat thread claims something the delete does not do.
  *  So does one about backups on a workspace that never took one.
+ *
+ *  **The dialog offers Archive beside Delete**, so the reversible way out sits
+ *  next to the final one. It appears exactly where the ⋯ menu offers Archive,
+ *  so a thread already in the Archive section sees Delete alone.
  */
 
 import { ApiError } from '../../api/client';
@@ -24,6 +28,7 @@ import {
 import { errorDetail } from '../../utils/errorDetail';
 import { forgetComposeState } from './compose';
 import { collectThreadFamily, focusThread, unfocusThread, visibleCandidatesAround } from './threads';
+import { resolveThreadActions } from './threadActions';
 import { forgetThreadEventsFailures } from './thread-loading';
 import { removeThreadNavEntries } from './thread-navigation';
 
@@ -40,12 +45,15 @@ export interface DeleteConfirmation {
  *  One paragraph per blank-line block: `<DialogMessage>` renders each as its
  *  own `<p>`, and a single newline collapses to a space.
  *
- *  Only the first and last lines always appear. Everything between is a
- *  consequence this particular family actually has.
+ *  Only the first line and the no-undo line always appear. Everything between
+ *  is a consequence this particular family actually has, and the closing
+ *  Archive line rides `canArchive`: naming a way out the dialog does not offer
+ *  is the same lie as a warning that does not apply.
  */
 export function deleteConfirmation(
   preflight: DeletePreflight,
   targetTitle: string,
+  canArchive: boolean,
 ): DeleteConfirmation {
   const subCount = Math.max(0, preflight.thread_count - 1);
   const title =
@@ -77,6 +85,10 @@ export function deleteConfirmation(
     paragraphs.push('Backups taken before now still hold this.');
   }
   paragraphs.push('This cannot be undone.');
+  if (canArchive) {
+    const them = subCount > 0 ? 'them' : 'it';
+    paragraphs.push(`Archive keeps ${them} instead, in the Archive section, where search still finds ${them}.`);
+  }
 
   // The sub-thread count expands into the list, so the user can see WHICH
   // threads go rather than only how many.
@@ -213,14 +225,32 @@ export async function handleDeleteThread(threadId: string): Promise<void> {
     return;
   }
 
+  // Read the alternative off the same tagged actions the ⋯ menu renders, so the
+  // dialog can only offer an Archive that is actually available. A thread
+  // already in the Archive section has none, and delete is its only way out.
+  const archive = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
+
   const title = threadMap.value.get(threadId)?.meta.title ?? '';
-  const confirmation = deleteConfirmation(preflight, title);
+  const confirmation = deleteConfirmation(preflight, title, !!archive);
+  let archiveChosen = false;
   const ok = await showConfirm(confirmation.message, 'Delete', {
     title: confirmation.title,
     cancelLabel: 'Cancel',
     variant: 'danger',
     details: confirmation.details,
+    // The button only RECORDS the choice, and the archive runs below. Archive
+    // opens confirms of its own: a pinned thread, an unsent draft, a live
+    // subscription. `ConfirmDialog` closes whatever dialog is up after this
+    // handler returns. One opened from here would be the one it closes,
+    // answered "no" by the same stroke.
+    extraAction: archive
+      ? { label: 'Archive instead', onClick: () => { archiveChosen = true; } }
+      : undefined,
   });
+  if (archive && archiveChosen) {
+    await archive.invoke();
+    return;
+  }
   if (!ok) return;
 
   // The family is walked client-side so the rows leave the list the moment the

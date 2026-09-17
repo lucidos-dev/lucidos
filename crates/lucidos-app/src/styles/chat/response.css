@@ -650,10 +650,18 @@
 }
 
 /* The dashed underline is what tells an in-app link from an external one, so
-   every class the click router claims wears it. */
+   every class the click router claims wears it.
+
+   Both bodies the router is wired to, not just the reply. `.initiator-body`
+   holds the reader's own message, an injected prompt and a child thread's
+   summary, and each of those can carry a routed link. A rule naming only
+   `.response-content` leaves an identical link there looking like plain text. */
 .response-content a.artifact-link,
 .response-content a.app-link,
-.response-content a.trigger-link {
+.response-content a.trigger-link,
+.initiator-body a.artifact-link,
+.initiator-body a.app-link,
+.initiator-body a.trigger-link {
     text-decoration: underline dashed;
     cursor: pointer;
 }
@@ -661,7 +669,10 @@
 @media (hover: hover) {
     .response-content a.artifact-link:hover,
     .response-content a.app-link:hover,
-    .response-content a.trigger-link:hover {
+    .response-content a.trigger-link:hover,
+    .initiator-body a.artifact-link:hover,
+    .initiator-body a.app-link:hover,
+    .initiator-body a.trigger-link:hover {
         text-decoration: underline solid;
     }
 }

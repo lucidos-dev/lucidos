@@ -68,5 +68,9 @@ mod image_pins_unit_tests;
 mod tool_result_split_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/turn_tools.rs"]
+mod turn_tools_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]
 mod agentic_loop_db_tests;

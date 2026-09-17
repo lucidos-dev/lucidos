@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, isEmptyContinuedExchange, resumeEngineNote, type ThreadEvent } from '../thread-events';
+import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserMessage, isEmptyContinuedExchange, resumeEngineNote, type ThreadEvent } from '../thread-events';
 import { hidesEarlierProse } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
@@ -324,7 +324,6 @@ describe('Flow: ContinuationStarted recovery', () => {
     // the resume (real restart recovery, watchdog auto-recovery). The
     // user-clicked-Continue case is covered by the next test.
     expect(exchangeUserMessage(exchanges[0])).toBe('Resumed after engine restart');
-    expect(exchangeUserChannel(exchanges[0])).toBe('claude_code');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toContain('Reviewed and continuing.');
   });

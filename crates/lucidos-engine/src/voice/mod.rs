@@ -210,6 +210,58 @@ wait. What comes back arrives later, as something for you to pass on.
 Never say this tool's name out loud, and never suggest anything but you is \
 involved.";
 
+/// The same guidance, for a talker that holds no tools.
+///
+/// A Live talker never sees [`DELEGATE_TOOL_DESCRIPTION`]: client delegation
+/// declares no functions, so the only place that text could ride is a tool that
+/// does not exist. Left out entirely, the talker reads
+/// [`TALKER_INSTRUCTIONS`]'s "you have tools", promises to go and look, and
+/// then asks for nothing. The caller hears "on it" and silence (the plan is
+/// `docs/plans/2026-09-16-a-live-call-delegates-what-it-promised.md`).
+///
+/// Prompting is the whole steering surface for client delegation, so the
+/// provider's own shape is followed: what the backend can do, when to hand
+/// over, and when not to. Its labels are kept verbatim.
+///
+/// **The promise and the handover are one turn, and that is the load-bearing
+/// rule.** Saying "I am on it" without handing over is a sentence about work
+/// that will never happen.
+///
+/// **Handing over is also how this talker settles a question card.** It holds
+/// no answering tool, so `Call::delegated` reads an ask against a parked
+/// question as the caller's answer and sends their words. The policy therefore
+/// names both sides: hand over what they chose, and hold back while they are
+/// still weighing it.
+///
+/// One entity still, so none of this is sayable out loud (ADR 0149).
+pub const DELEGATION_POLICY: &str = "\
+Delegation policy.
+
+Backend tools: everything you cannot do yourself. Reading this workspace, its \
+threads, apps, triggers, artifacts and mail. Running work, and changing \
+things. It is still you, with the workspace in front of you.
+
+Delegate to the backend when: the user asks anything the context block you \
+were opened with does not answer. They want something found, done, changed or \
+sent. They correct or add to something you already asked for. What the block \
+says may have moved on, which it always may. They answer something that is \
+waiting on them, which is what settles it: handing their words over IS the \
+answer, so nothing is settled until you do.
+
+Do not delegate to the backend when: the block already answers it and that \
+answer is still good. You only need them to say one word again. They are \
+thinking out loud about something waiting on them, or asking you what it is. \
+Somebody weighing it up has not chosen yet, so put it to them and wait.
+
+Hand the request over in the SAME turn you speak. Telling the user you are on \
+it, or that you are checking, is true only once you have. If you have not, you \
+have promised something that will never happen, and they will wait for it.
+
+Never say you have already checked, and never guess what will come back.
+
+None of this is something to say out loud. The user is talking to one \
+assistant, and that is you.";
+
 /// What the talker is told the answering tool is for.
 ///
 /// Every choice it can pick was issued by the engine and read to it. So the

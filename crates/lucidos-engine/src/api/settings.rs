@@ -1530,6 +1530,54 @@ pub(super) async fn delete_device(
 
 // ===== Email Endpoints =====
 
+/// The OAuth access token a send presents, for an account linked to one.
+///
+/// Every failure here used to read as "this account has no OAuth token". The
+/// lookup folded a `sqlx::Error` into the same `None` a missing row gives. A
+/// failed refresh only logged, and the known-expired token went to SMTP
+/// anyway. XOAUTH2 was then skipped and the user read a generic authentication
+/// failure, so the real cause never reached them.
+///
+/// A refusal costs one retry. Sending on a token the engine knows is dead
+/// costs the same failure with none of the explanation.
+async fn oauth_token_for_send(
+    pool: &PgPool,
+    oauth_account_id: Option<Uuid>,
+) -> Result<Option<String>, String> {
+    let Some(oauth_id) = oauth_account_id else {
+        return Ok(None);
+    };
+    let mut account = match OAuthStore::get_by_id(pool, oauth_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return Err(format!(
+                "This email account is linked to OAuth account {oauth_id}, which no longer \
+                 exists. Reconnect it in Settings."
+            ))
+        }
+        Err(e) => {
+            log!(
+                "[Email] OAuth account lookup failed for {}: {}",
+                oauth_id,
+                e
+            );
+            return Err(format!("Could not read the linked OAuth account: {e}"));
+        }
+    };
+    if let Err(e) = crate::core::oauth::refresh_oauth_if_needed(pool, &mut account).await {
+        log!(
+            "[Email] OAuth token refresh failed for {}: {}",
+            account.provider,
+            e
+        );
+        return Err(format!(
+            "The {} token for this account could not be refreshed: {e}. Reconnect it in Settings.",
+            account.provider
+        ));
+    }
+    Ok(Some(account.access_token))
+}
+
 pub(super) async fn send_email_confirmed(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1606,26 +1654,11 @@ pub(super) async fn send_email_confirmed(
         Err(e) => return Json(serde_json::json!({ "success": false, "error": format!("{}", e) })),
     };
 
-    // Resolve OAuth token if linked
-    let oauth_token = if let Some(oauth_id) = account.oauth_account_id {
-        match OAuthStore::get_by_id(&state.pool, oauth_id).await {
-            Ok(Some(mut oauth_account)) => {
-                match crate::core::oauth::refresh_oauth_if_needed(&state.pool, &mut oauth_account)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => log!(
-                        "[Email] OAuth token refresh failed for {}: {}",
-                        oauth_account.provider,
-                        e
-                    ),
-                }
-                Some(oauth_account.access_token)
-            }
-            _ => None,
-        }
-    } else {
-        None
+    // Resolve the OAuth token if linked. A refusal here is the send's refusal:
+    // see `oauth_token_for_send`.
+    let oauth_token = match oauth_token_for_send(&state.pool, account.oauth_account_id).await {
+        Ok(token) => token,
+        Err(error) => return Json(serde_json::json!({ "success": false, "error": error })),
     };
 
     let to_str = to.join(", ");
@@ -2063,6 +2096,98 @@ mod oauth_access_token_tests {
                 resp.access_token
             ),
         }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod email_oauth_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    /// An account with no OAuth link sends on its stored password, exactly as
+    /// before. This is the only arm that may answer "no token".
+    #[tokio::test]
+    async fn an_unlinked_account_needs_no_token() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        assert_eq!(oauth_token_for_send(&pool, None).await, Ok(None));
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The reported shape: a transient pool error used to read as "no OAuth
+    /// token". The send then went out without XOAUTH2 and the user met a
+    /// generic SMTP authentication failure naming nothing.
+    #[tokio::test]
+    async fn a_failed_lookup_refuses_the_send() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let linked = crate::test_support::seed_oauth_account(
+            &pool,
+            "google",
+            Some("user@example.com"),
+            None,
+            "live-token",
+            Some("refresh-token"),
+            Some(Utc::now() + Duration::seconds(3600)),
+            "https://mail.google.com/",
+        )
+        .await
+        .unwrap();
+
+        pool.close().await;
+        let error = oauth_token_for_send(&pool, Some(linked))
+            .await
+            .expect_err("a read the engine could not make is not an answer");
+        assert!(
+            error.contains("Could not read the linked OAuth account"),
+            "the refusal has to name the failure: {error}"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A link pointing at a row that is gone is a broken account, not an
+    /// account without OAuth. Saying so beats an SMTP failure the user cannot
+    /// act on.
+    #[tokio::test]
+    async fn a_link_to_a_missing_account_refuses_the_send() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let error = oauth_token_for_send(&pool, Some(Uuid::new_v4()))
+            .await
+            .expect_err("a dangling link is not a send");
+        assert!(error.contains("no longer exists"), "{error}");
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// An expired token with no refresh token cannot be renewed. The handler
+    /// used to log that and hand SMTP the dead token anyway.
+    #[tokio::test]
+    async fn a_token_that_cannot_be_refreshed_refuses_the_send() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let linked = crate::test_support::seed_oauth_account(
+            &pool,
+            "google",
+            Some("user@example.com"),
+            None,
+            "stale-token",
+            None,
+            Some(Utc::now() - Duration::seconds(120)),
+            "https://mail.google.com/",
+        )
+        .await
+        .unwrap();
+
+        let error = oauth_token_for_send(&pool, Some(linked))
+            .await
+            .expect_err("a token known to be dead is not a token");
+        assert!(
+            error.contains("could not be refreshed"),
+            "the refusal has to name the failure: {error}"
+        );
+        assert!(
+            !error.contains("stale-token"),
+            "a refusal never carries token material: {error}"
+        );
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

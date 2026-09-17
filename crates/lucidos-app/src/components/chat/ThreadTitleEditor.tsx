@@ -6,6 +6,7 @@ import { viewportIsMobile } from '../../utils/viewport';
 import { autoResizeTextarea } from '../../utils/dom';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { isImeComposingKey } from './PromptInput';
 
 interface Props {
   threadId: string;
@@ -127,6 +128,10 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   }, [threadId, title]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    // Nothing here acts on a keystroke the IME owns. Enter COMMITS the
+    // candidate, so an ungated branch renames the thread to half-converted
+    // text. Escape cancels the candidate, so it is gated with Enter.
+    if (isImeComposingKey(e)) return;
     if (e.key === 'Enter') {
       e.preventDefault();
       void save(editValueRef.current);

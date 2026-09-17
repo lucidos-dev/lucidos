@@ -245,20 +245,6 @@ pub enum Action {
     Unsave,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum MessageLabel {
-    #[serde(rename = "Requesting")]
-    Requesting,
-    #[serde(rename = "Working")]
-    Working,
-    #[serde(rename = "Waiting")]
-    Waiting,
-    #[serde(rename = "Canceled")]
-    Canceled,
-    #[serde(rename = "Aborted")]
-    Aborted,
-}
-
 // ── Event Classification ────────────────────────────────────────────
 
 pub fn classify_event(event_type: &str) -> Option<EventClass> {
@@ -293,14 +279,14 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // often while the doer's own turn is still running. Classifying it
         // as a response would settle a turn it has no part in.
         "SpokenReplyGenerated" => EventClass::Metadata,
-        // An utterance the talker handled alone, and the delegation that
-        // asked for the doer. Metadata on both, for opposite reasons.
-        //
-        // SpokenMessageReceived starts nothing, so Start would leave the
-        // thread waiting on a turn that never runs. WorkDelegated sits BESIDE
-        // a turn the `MessageReceived` next to it already started, so Start
-        // would count one utterance twice.
-        "SpokenMessageReceived" | "WorkDelegated" => EventClass::Metadata,
+        // What the caller said. Metadata, because it starts nothing: the
+        // talker decides whether the doer is wanted, and Start here would
+        // leave the thread waiting on a turn that never runs.
+        "SpokenMessageReceived" => EventClass::Metadata,
+        // The talker asking for the doer, which is what STARTS a delegated
+        // call's turn (ADR 0201). No `MessageReceived` is written beside it,
+        // so this is the turn's only starter and its anchor.
+        "WorkDelegated" => EventClass::Start,
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "ThoughtStreamed" | "MemoryRecalled" => EventClass::Activity,

@@ -9,7 +9,13 @@
 import { CAPTURE_WORKLET_NAME, captureWorkletUrl } from './captureWorklet';
 import { microphoneConstraints, openWithFallback } from './microphone';
 import { CHANNELS, SAMPLE_RATE_HZ, pcm16DurationSeconds, pcm16ToFloat } from './pcm';
-import { CallSetupError, NO_MICROPHONE_API, NO_WEB_AUDIO, microphoneRefusal } from './refusals';
+import {
+  CallSetupError,
+  NO_MICROPHONE_API,
+  NO_WEB_AUDIO,
+  microphoneRefusal,
+  wrongAudioRate,
+} from './refusals';
 import { scheduleChunk } from './schedule';
 import { voiceSocketUrl, wsEchoUrl } from './socketUrl';
 
@@ -100,14 +106,19 @@ function audioContextCtor(): AudioContextCtor | null {
  */
 let primed: AudioContext | null = null;
 
-/** True once a call adopted the primed context, so `release` leaves it alone. */
+/** True once a call CLAIMED the primed context, so `release` leaves it alone
+ *  and the next call builds its own. Claimed at the top of `openAudio`, before
+ *  anything is awaited, which is what makes the claim exclusive. */
 let primedTaken = false;
 
 function primeContext(): void {
   const Ctor = audioContextCtor();
   if (!Ctor) return;
-  if (!primed || primed.state === 'closed') {
+  // A context another call already claimed is not this press's to hand on.
+  // Waking a fresh one keeps the gesture, and leaves that call's audio alone.
+  if (!primed || primedTaken || primed.state === 'closed') {
     primed = new Ctor({ sampleRate: SAMPLE_RATE_HZ });
+    primedTaken = false;
   }
   // Best effort, and deliberately not awaited: this runs inside the press, and
   // awaiting here is what would cost the gesture. A context that stays
@@ -132,8 +143,39 @@ async function openAudio(
   if (!Ctor) throw new CallSetupError(NO_WEB_AUDIO);
   if (!navigator.mediaDevices?.getUserMedia) throw new CallSetupError(NO_MICROPHONE_API);
 
-  if (!primed || primed.state === 'closed') primed = new Ctor({ sampleRate: SAMPLE_RATE_HZ });
-  const context = primed;
+  // Claim the primed context, or build one this call alone owns. Claimed here,
+  // before the first await, so a second call opening at the same time cannot
+  // adopt it too. Two calls on one context is how the older one's `close`
+  // silences the newer one, which then reports a microphone that was fine.
+  let context: AudioContext;
+  if (primedTaken) {
+    context = new Ctor({ sampleRate: SAMPLE_RATE_HZ });
+  } else {
+    if (!primed || primed.state === 'closed') primed = new Ctor({ sampleRate: SAMPLE_RATE_HZ });
+    context = primed;
+    primedTaken = true;
+  }
+
+  /** Give up the context this call took, on a setup step that threw.
+   *
+   *  Ownership decides how. Still holding the primed slot, so hand the claim
+   *  back and let the press's own `release` close what it woke. Otherwise the
+   *  context is ours alone and nobody else will ever close it. */
+  function abandonContext(): void {
+    if (primed === context) {
+      primedTaken = false;
+      return;
+    }
+    void context.close().catch(() => undefined);
+  }
+
+  // Before the microphone, because a call that cannot work must not light a
+  // recording indicator. `sampleRate` is fixed at construction, so this is the
+  // browser's whole answer to what we asked for.
+  if (context.sampleRate !== SAMPLE_RATE_HZ) {
+    abandonContext();
+    throw new CallSetupError(wrongAudioRate(context.sampleRate, SAMPLE_RATE_HZ));
+  }
 
   let stream: MediaStream;
   let note: string | null;
@@ -142,6 +184,7 @@ async function openAudio(
       navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(id) }),
     ));
   } catch (err) {
+    abandonContext();
     throw new CallSetupError(microphoneRefusal(err));
   }
 
@@ -169,12 +212,10 @@ async function openAudio(
     silence.connect(context.destination);
   } catch (err) {
     stream.getTracks().forEach((track) => track.stop());
+    abandonContext();
     throw new CallSetupError(microphoneRefusal(err));
   }
 
-  // Taken here and nowhere earlier: a throw above leaves the context untaken,
-  // so the press that failed can still hand it back.
-  primedTaken = true;
   let cursor = 0;
   const queued = new Set<AudioBufferSourceNode>();
 
@@ -219,8 +260,13 @@ async function openAudio(
       silence.disconnect();
       stream.getTracks().forEach((track) => track.stop());
       await context.close();
-      if (primed === context) primed = null;
-      primedTaken = false;
+      // Only the device still holding the primed context may retire it. A call
+      // that built its own must leave both alone, or it hands the NEXT call's
+      // context to a press that will close it.
+      if (primed === context) {
+        primed = null;
+        primedTaken = false;
+      }
     },
   };
 }

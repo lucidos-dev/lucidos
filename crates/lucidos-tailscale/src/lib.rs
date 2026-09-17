@@ -34,16 +34,10 @@ pub use cli::{resolve_tailscale_binary, tailscale_binary, TAILSCALE_CANDIDATES};
 #[cfg(unix)]
 mod unix;
 
-/// Is this IPv4 literal inside Tailscale's `100.64.0.0/10` CGNAT range?
+/// Is this address inside Tailscale's `100.64.0.0/10` CGNAT range?
 ///
 /// Range membership alone does **not** make an address a tailnet address: see
-/// [`select_tailnet_addr`]. Kept public because both `net_config` modules
-/// validate a user-typed bind address against it.
-pub fn is_tailnet_ipv4(ip: &str) -> bool {
-    matches!(ip.trim().parse::<Ipv4Addr>(), Ok(v4) if is_tailnet_addr(v4))
-}
-
-/// [`is_tailnet_ipv4`] for an already-parsed address.
+/// [`select_tailnet_addr`].
 pub fn is_tailnet_addr(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
     o[0] == 100 && (64..=127).contains(&o[1])
@@ -117,16 +111,14 @@ mod tests {
 
     #[test]
     fn tailnet_range_covers_100_64_through_100_127() {
-        assert!(is_tailnet_ipv4("100.64.0.1"));
-        assert!(is_tailnet_ipv4("100.100.0.1"));
-        assert!(is_tailnet_ipv4("100.127.255.255"));
+        assert!(is_tailnet_addr(v4("100.64.0.1")));
+        assert!(is_tailnet_addr(v4("100.100.0.1")));
+        assert!(is_tailnet_addr(v4("100.127.255.255")));
         // Just outside the /10 on either side.
-        assert!(!is_tailnet_ipv4("100.63.255.255"));
-        assert!(!is_tailnet_ipv4("100.128.0.1"));
-        // Ordinary private space, and garbage.
-        assert!(!is_tailnet_ipv4("192.168.1.10"));
-        assert!(!is_tailnet_ipv4("not-an-ip"));
-        assert!(!is_tailnet_ipv4(""));
+        assert!(!is_tailnet_addr(v4("100.63.255.255")));
+        assert!(!is_tailnet_addr(v4("100.128.0.1")));
+        // Ordinary private space.
+        assert!(!is_tailnet_addr(v4("192.168.1.10")));
     }
 
     #[test]

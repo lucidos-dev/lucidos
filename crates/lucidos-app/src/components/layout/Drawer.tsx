@@ -9,6 +9,7 @@ import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isMobile } from '../../utils/viewport';
+import { prefersReducedMotion } from '../../utils/platform';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
@@ -58,13 +59,23 @@ export function openDrawer(anchor?: HTMLElement) {
   }
 }
 
-/** Close the drawer; returns `false` when already closed/closing so the
- *  dismiss hook keeps the paired click un-swallowed — `drawerOpen` stays
- *  `true` for the 200ms slide-out animation, and without this signal the
- *  hook would eat a user's tap on a neighbor button (file-search, content
- *  actions, …) as if they meant to dismiss. */
+/** Close the drawer. Returns `false` when it is already closed or closing, so
+ *  the dismiss hook keeps the paired click un-swallowed. `drawerOpen` normally
+ *  stays `true` through the slide-out. Without that `false` the hook would eat
+ *  a tap on a neighbor button (file-search, content actions) as a dismiss.
+ *
+ *  Reduced motion has no slide-out to wait for. The CSS drops the animation on
+ *  `.drawer.closing`, and an element with no animation fires no `animationend`.
+ *  The panel's `onAnimationEnd` handler is the only place that clears
+ *  `drawerOpen`. So the close reads the same preference the CSS reads, rather
+ *  than racing it with a timer. A real close still returns `true` and the tap
+ *  is still swallowed. */
 export function closeDrawer(): boolean {
   if (!drawerOpen.value || drawerClosing.value) return false;
+  if (prefersReducedMotion()) {
+    forceCloseDrawer();
+    return true;
+  }
   drawerClosing.value = true;
   return true;
 }

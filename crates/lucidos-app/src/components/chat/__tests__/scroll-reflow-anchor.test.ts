@@ -35,7 +35,7 @@ import {
   scrolledFromTop,
   setActiveScrollElement,
   setFollowLiveEdge,
-  setThreadLive,
+  setAgentLive,
   stopFollowingBottom,
 } from '../scrollState';
 
@@ -132,7 +132,7 @@ beforeEach(() => {
   notAtTop.value = false;
   scrolledFromTop.value = false;
   stopFollowingBottom();
-  setThreadLive(false);
+  setAgentLive(false);
   readerGestureForTest(null, false);
   setActiveScrollElement(null);
 });

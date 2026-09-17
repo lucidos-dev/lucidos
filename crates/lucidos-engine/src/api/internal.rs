@@ -271,6 +271,29 @@ struct CodingAgentDiffRefreshResponse {
     changed: bool,
 }
 
+/// Whether `branch_name` carries un-applied work, for the durable
+/// `coding_agent_has_diff` flag.
+///
+/// `Err` means git could not answer: a spawn failure, the 30s timeout, or a
+/// branch ref that no longer resolves. The caller must then leave the flag
+/// alone. Writing the empty answer clears the Diff button for a thread that
+/// just committed. A probe that could not run is UNKNOWN, never a "no"
+/// (`.claude/rules/rust.md`).
+///
+/// `proposal_files_for_branch` cannot serve here. It folds a git failure into
+/// an empty file list, which the caller then reads as "no diff".
+async fn probe_branch_has_diff(
+    repo_root: &std::path::Path,
+    branch_name: &str,
+) -> Result<bool, String> {
+    if !crate::engine::git_ops::has_unmerged_authored_commits(repo_root, branch_name).await {
+        return Ok(false);
+    }
+    let files =
+        crate::engine::git_ops::branch_changed_files_checked(repo_root, branch_name).await?;
+    Ok(!files.is_empty())
+}
+
 /// POST /api/v1/internal/coding-agent-diff-refresh — invoked by the
 /// coding-agent worktree's git post-commit hook via `lucidos
 /// coding-agent-diff-hook`.
@@ -280,6 +303,9 @@ struct CodingAgentDiffRefreshResponse {
 /// does NOT emit `ChangeProposed`, create a `changes` row, or mark the turn as
 /// ready for Apply. Formal proposal still happens when the coding-agent turn
 /// idles.
+///
+/// A probe git could not answer takes 503 and writes nothing. The hook
+/// discards the body, and the next commit re-runs the refresh.
 pub(super) async fn coding_agent_diff_refresh(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -310,9 +336,22 @@ pub(super) async fn coding_agent_diff_refresh(
         return (StatusCode::BAD_REQUEST, "Invalid repo_root").into_response();
     }
     let repo_root = std::path::PathBuf::from(body.repo_root);
-    let has_diff = crate::engine::git_ops::proposal_files_for_branch(&repo_root, branch_name)
-        .await
-        .is_some();
+    let has_diff = match probe_branch_has_diff(&repo_root, branch_name).await {
+        Ok(has_diff) => has_diff,
+        Err(e) => {
+            crate::log!(
+                "[Internal] coding-agent diff probe could not answer for thread {} branch {}: {}",
+                thread_id,
+                branch_name,
+                e
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("coding-agent diff probe could not answer: {}", e),
+            )
+                .into_response();
+        }
+    };
 
     match state
         .engine
@@ -919,6 +958,88 @@ mod tests {
         assert!(
             data.contains("7847") && data.contains("openMs"),
             "returns serialized data for logging"
+        );
+    }
+
+    /// A temp git repo holding one commit on `main`.
+    async fn repo_on_main() -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::engine::git_ops::git_cmd;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        git_cmd(&["init", "-q", "-b", "main"], &repo).await.unwrap();
+        git_cmd(&["config", "user.email", "test@example.com"], &repo)
+            .await
+            .unwrap();
+        git_cmd(&["config", "user.name", "Test"], &repo)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("init.txt"), "initial").unwrap();
+        git_cmd(&["add", "-A"], &repo).await.unwrap();
+        git_cmd(&["commit", "-q", "-m", "initial"], &repo)
+            .await
+            .unwrap();
+        (tmp, repo)
+    }
+
+    /// Commit `file` on a fresh branch cut from `main`, then return to `main`.
+    async fn commit_on_branch(repo: &std::path::Path, branch: &str, file: &str) {
+        use crate::engine::git_ops::git_cmd;
+        git_cmd(&["checkout", "-q", "-b", branch], repo)
+            .await
+            .unwrap();
+        std::fs::write(repo.join(file), "body").unwrap();
+        git_cmd(&["add", "-A"], repo).await.unwrap();
+        git_cmd(&["commit", "-q", "-m", "work"], repo)
+            .await
+            .unwrap();
+        git_cmd(&["checkout", "-q", "main"], repo).await.unwrap();
+    }
+
+    /// The handler WRITES this answer into `thread_summaries` and broadcasts
+    /// it, so a git call that could not run must not report "no diff". A ref
+    /// git cannot resolve is the same failure shape the 30s timeout takes.
+    ///
+    /// The second assertion is the bug: the old probe read the identical
+    /// situation as a confident false, which cleared the Diff button.
+    #[tokio::test]
+    async fn a_diff_probe_git_cannot_answer_is_unknown_rather_than_no_diff() {
+        let (_tmp, repo) = repo_on_main().await;
+
+        let err = probe_branch_has_diff(&repo, "gone-branch")
+            .await
+            .expect_err("an unresolvable ref is a git failure, not an empty diff");
+        assert!(
+            err.contains("gone-branch"),
+            "the error should name the failing range, got: {err}"
+        );
+        assert!(
+            crate::engine::git_ops::proposal_files_for_branch(&repo, "gone-branch")
+                .await
+                .is_none(),
+            "the swallowing probe still answers this 'no diff', which is why it \
+             must not feed the durable flag"
+        );
+    }
+
+    /// The two answers the probe is allowed to write: real work on the branch,
+    /// and a branch carrying nothing ahead of `main`.
+    #[tokio::test]
+    async fn the_diff_probe_answers_yes_for_committed_work_and_no_for_a_bare_branch() {
+        use crate::engine::git_ops::git_cmd;
+        let (_tmp, repo) = repo_on_main().await;
+
+        commit_on_branch(&repo, "with-work", "added.txt").await;
+        assert_eq!(
+            probe_branch_has_diff(&repo, "with-work").await,
+            Ok(true),
+            "a branch with a committed file has a diff"
+        );
+
+        git_cmd(&["branch", "bare", "main"], &repo).await.unwrap();
+        assert_eq!(
+            probe_branch_has_diff(&repo, "bare").await,
+            Ok(false),
+            "a branch level with main has nothing to show"
         );
     }
 

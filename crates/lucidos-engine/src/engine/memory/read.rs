@@ -102,7 +102,12 @@ impl LucidosEngine {
         match self.embedder.embed_batch(&[q]).await {
             Ok(embeddings) => match embeddings.first().map(Vec::as_slice) {
                 Some(embedding) => match index
-                    .search_with_scores(embedding, RETRIEVAL_MIN_IMPORTANCE, SEARCH_CANDIDATES)
+                    .search_with_scores(
+                        embedding,
+                        RETRIEVAL_MIN_IMPORTANCE,
+                        SEARCH_CANDIDATES,
+                        self.embedder.model_id(),
+                    )
                     .await
                 {
                     Ok(hits) => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   listWorkspaces,
+  locateWorkspace,
   createWorkspace,
   restartWorkspace,
   stopWorkspace,
@@ -169,6 +170,54 @@ describe('restore name helpers', () => {
     expect(parseWorkspaceNameFromArchive('random.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601.enc')).toBeNull();
+  });
+});
+
+// Locating a workspace on another Lucidos install (ADR 0196). The load-bearing
+// case is the last one: the install this feature reaches for is the one running
+// an old gateway, so the old gateway's answer has to degrade rather than throw.
+describe('locateWorkspace', () => {
+  const PEER = {
+    status: 'reachable',
+    install: 'Lucidos.app in /Applications',
+    gateway_port: 5252,
+    scheme: 'http',
+    slug: 'work',
+  };
+
+  it('asks the sigil control route, by name', async () => {
+    const mock = withFetch(() =>
+      Promise.resolve(new Response(JSON.stringify(PEER), { status: 200 })),
+    );
+    await expect(locateWorkspace('My Space')).resolves.toEqual(PEER);
+    expect(mock.mock.calls[0][0]).toBe(
+      '/~/api/v1/control/workspace-location?name=My%20Space',
+    );
+  });
+
+  it('reads a 404 as "no other install carries it"', async () => {
+    withFetch(() => Promise.resolve(new Response('{"error":"nope"}', { status: 404 })));
+    await expect(locateWorkspace('ghost')).resolves.toBeNull();
+  });
+
+  // An unmatched `/~/…` path falls through to the picker's SPA shell, so a
+  // gateway with no such route answers 200 and HTML. Parsing it would report a
+  // syntax error over a workspace that is merely out of this gateway's view.
+  it('reads an older gateway\'s picker shell as "cannot say"', async () => {
+    withFetch(() =>
+      Promise.resolve(
+        new Response('<!DOCTYPE html><html><head><base href="/~/">', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        }),
+      ),
+    );
+    await expect(locateWorkspace('work')).resolves.toBeNull();
+  });
+
+  it('throws on a real failure, so the caller can name the cause', async () => {
+    withFetch(() => Promise.resolve(new Response('{"error":"boom"}', { status: 500 })));
+    await expect(locateWorkspace('work')).rejects.toThrow(/boom/);
   });
 });
 

@@ -82,6 +82,41 @@ fn multiple_candidates_navigation_focuses_alphabetically_first_by_name() {
     assert_eq!(nav.id.as_deref(), Some("habit"));
 }
 
+/// Every accumulated failure reaches the log.
+///
+/// All three callers discard the report, so a marketplace whose git fetch
+/// failed used to be recorded and then dropped. The five-minute check ran on
+/// in silence while one marketplace never synced.
+#[test]
+fn every_recorded_failure_becomes_one_log_line() {
+    let report = PluginUpdateCheckReport {
+        marketplaces: 3,
+        errors: vec![
+            "scan Weather (https://example.com/weather) failed: auth".to_string(),
+            "read installed plugins: pool closed".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    let lines = report.failure_log_lines();
+    assert_eq!(lines.len(), 2, "one line per failure: {lines:?}");
+    assert!(lines[0].contains("1/2"), "line 0: {}", lines[0]);
+    assert!(lines[0].contains("failed: auth"), "line 0: {}", lines[0]);
+    assert!(lines[1].contains("2/2"), "line 1: {}", lines[1]);
+    assert!(lines[1].contains("pool closed"), "line 1: {}", lines[1]);
+}
+
+#[test]
+fn a_clean_check_logs_nothing() {
+    let report = PluginUpdateCheckReport {
+        marketplaces: 2,
+        candidates: 1,
+        notified: true,
+        errors: vec![],
+    };
+    assert!(report.failure_log_lines().is_empty());
+}
+
 #[test]
 fn marker_roundtrips_through_disk() {
     let dir = tempfile::tempdir().unwrap();

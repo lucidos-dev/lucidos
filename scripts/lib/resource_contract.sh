@@ -19,9 +19,14 @@
 #   * service_runtime_env_pairs (scripts/lib/service.sh): the env the headless
 #     install's service runs the gateway with. Every resource appears in it as a
 #     <runtime-root>/<name> path.
-#   * the *_RESOURCE_NAME constants in crates/lucidos-app/src/desktop.rs: the
-#     packaged .app's own launcher, which resolves the same set relative to
+#   * spawn_gateway in crates/lucidos-app/src/desktop.rs: the packaged .app's own
+#     launcher, whose env block and program resolve the same set relative to
 #     Contents/Resources.
+#
+# BOTH ARMS READ USE, NOT DECLARATIONS. The packaged arm used to grep the
+# *_RESOURCE_NAME constants, which proves a name exists rather than that anything
+# is told where it lives. A resource could be declared, staged and signed while
+# spawn_gateway never passed its path on, and every gate stayed green.
 #
 # Delete a name from RESOURCE_NAMES below and both other sources still carry it,
 # so the check goes red. That is the property scripts/lib/resource_contract_test.sh
@@ -95,13 +100,85 @@ resource_contract_runtime_required() {
 }
 
 # resource_contract_desktop_names <desktop.rs>: the resource names the PACKAGED
-# launcher reaches for, read out of its *_RESOURCE_NAME constants. Sorted and
-# unique. A source scan rather than a link, because lucidos-app is a Rust crate
-# and this is shell; the build scripts are the only thing that can compare them.
+# launcher USES, read out of spawn_gateway. Sorted and unique. A source scan
+# rather than a link, because lucidos-app is a Rust crate and this is shell.
+#
+# Three hops, all inside desktop.rs:
+#
+#   1. spawn_gateway's `.env(…)` lines and its `Command::new(&bundle.…)` program
+#      give the BundledResources fields the launcher hands to the gateway.
+#   2. bundled_resources maps each field to a `*_RESOURCE_NAME` constant, through
+#      at most one local binding (`let postgres = resources.join(…)`).
+#   3. that constant's own declaration gives the staged name.
+#
+# Anything it cannot follow is an ERROR, never a silent drop. A scan that stopped
+# reading the launcher would report an empty gap as a clean contract. So a
+# refactor past these shapes (a field bound to a local before the `.env` call,
+# say) goes red here and is fixed by teaching this scan the new shape.
 resource_contract_desktop_names() {
-    local src="$1"
+    local src="$1" out rc
     [ -f "$src" ] || { echo "ERROR: desktop launcher source not found: $src" >&2; return 1; }
-    sed -n 's|^const [A-Z0-9_]*_RESOURCE_NAME: &str = "\([^"]*\)";.*|\1|p' "$src" | sort -u
+    out="$(awk -v src="$src" '
+        # The patterns reach grab as STRINGS. A /re/ literal passed as an
+        # argument is evaluated against $0 first, so grab would receive 0 or 1.
+        function grab(s, re) {
+            if (match(s, re)) return substr(s, RSTART, RLENGTH)
+            return ""
+        }
+        /^const [A-Z0-9_]+: &str = "/ {
+            key = $2; sub(/:$/, "", key)
+            val = $0; sub(/^[^"]*"/, "", val); sub(/".*$/, "", val)
+            value[key] = val
+            next
+        }
+        /^fn bundled_resources\(/ { in_map = 1; saw_map = 1; next }
+        in_map && /^}/ { in_map = 0; next }
+        in_map {
+            const_ref = grab($0, "join\\([A-Z0-9_]+\\)")
+            sub(/^join\(/, "", const_ref); sub(/\)$/, "", const_ref)
+            local_name = grab($0, "^[ \t]*let [a-z_][a-z0-9_]*")
+            sub(/^[ \t]*let /, "", local_name)
+            if (local_name != "") {
+                if (const_ref != "") local_const[local_name] = const_ref
+                next
+            }
+            field = grab($0, "^[ \t]*[a-z_][a-z0-9_]*:")
+            sub(/^[ \t]*/, "", field); sub(/:$/, "", field)
+            if (field == "") next
+            if (const_ref == "") {
+                receiver = grab($0, "[a-z_][a-z0-9_]*\\.join\\(")
+                sub(/\.join\($/, "", receiver)
+                const_ref = local_const[receiver]
+            }
+            if (const_ref != "") field_const[field] = const_ref
+            next
+        }
+        /^fn spawn_gateway\(/ { in_spawn = 1; saw_spawn = 1; next }
+        in_spawn && /^}/ { in_spawn = 0; next }
+        in_spawn && (/\.env\(/ || /Command::new\(/) {
+            rest = $0
+            while (match(rest, /bundle\.[a-z_][a-z0-9_]*/)) {
+                used[substr(rest, RSTART + 7, RLENGTH - 7)] = 1
+                rest = substr(rest, RSTART + RLENGTH)
+            }
+        }
+        END {
+            if (!saw_spawn) { print "ERROR: " src ": no top-level spawn_gateway to read"; exit 1 }
+            if (!saw_map) { print "ERROR: " src ": no top-level bundled_resources to read"; exit 1 }
+            names = ""; count = 0
+            for (f in used) {
+                c = field_const[f]
+                if (c == "") { print "ERROR: " src ": spawn_gateway uses bundle." f ", which bundled_resources maps to no resource"; exit 1 }
+                if (value[c] == "") { print "ERROR: " src ": bundle." f " needs " c ", which no const declares"; exit 1 }
+                names = names value[c] "\n"
+                count++
+            }
+            if (count == 0) { print "ERROR: " src ": spawn_gateway hands the gateway no bundled resource"; exit 1 }
+            printf "%s", names
+        }
+    ' "$src")"; rc=$?
+    [ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; return 1; }
+    printf '%s\n' "$out" | sort -u
 }
 
 # _resource_contract_diff <label> <staged-lines> <required-lines>: report a set

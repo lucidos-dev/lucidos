@@ -130,6 +130,48 @@ impl TriggerRegistryWriter<'_> {
     /// A failed emit propagates and applies nothing. Arms no cron job: that
     /// stays with the scheduler's subscriber, which owns `tracked_tasks` and
     /// reacts to the same broadcast.
+    /// Mint this trigger's slug and write it, both under the one guard.
+    ///
+    /// The slug is the `data/triggers/<slug>/` directory segment, so two
+    /// triggers must never share one. Minting it outside the lock does not
+    /// guarantee that: two creates of the same name can both read the taken
+    /// set before either has emitted, and both then mint the same slug.
+    ///
+    /// `payload` arrives WITHOUT a slug. An explicit one from the caller is
+    /// already in it and is left alone, since the caller named the directory
+    /// they mean to write to.
+    pub(crate) async fn write_created_minting_slug(
+        &self,
+        trigger_id: &str,
+        mut payload: Value,
+        name: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _guard = self.write_lock.lock().await;
+        if payload.get("slug").and_then(Value::as_str).is_none() {
+            let taken: std::collections::HashSet<String> = self
+                .trigger_configs
+                .read()
+                .unwrap()
+                .values()
+                .map(|c| c.slug.clone())
+                .collect();
+            let slug = crate::triggers::mint_unique_trigger_slug(name, trigger_id, &taken);
+            payload["slug"] = Value::String(slug);
+        }
+        let write = TriggerWrite::Created;
+        let event = write.into_event(trigger_id.to_string(), payload.clone(), actor);
+        self.event_bus.emit(BusEvent::System(event)).await?;
+        materialize_trigger_event(
+            self.trigger_configs,
+            self.workspace_path,
+            write.event_type(),
+            trigger_id,
+            &payload,
+        );
+        Ok(())
+    }
+
     pub(crate) async fn write(
         &self,
         write: TriggerWrite,
@@ -217,6 +259,25 @@ impl LucidosEngine {
         self.trigger_registry_writer()
             .write_or_log(write, trigger_id, payload, actor, module)
             .await;
+    }
+
+    /// `TriggerRegistryWriter::write_created_minting_slug`, logging a failure
+    /// the way `emit_trigger_write_or_log` does.
+    pub(crate) async fn emit_trigger_created_minting_slug(
+        &self,
+        trigger_id: &str,
+        payload: Value,
+        name: &str,
+        actor: Option<MessageOrigin>,
+        module: &str,
+    ) {
+        if let Err(e) = self
+            .trigger_registry_writer()
+            .write_created_minting_slug(trigger_id, payload, name, actor)
+            .await
+        {
+            crate::log!("{} Failed to emit TriggerCreated: {}", module, e);
+        }
     }
 }
 

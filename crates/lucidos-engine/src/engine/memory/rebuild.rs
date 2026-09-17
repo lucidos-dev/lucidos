@@ -6,7 +6,9 @@
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::LucidosEngine;
 use crate::llm::{Message, MessageContent};
-use crate::memory::{cosine_similarity, EmbeddingProvider, MemorySource};
+use crate::memory::{
+    cosine_similarity, EmbeddingProvider, MemoryEntry, MemorySource, PgVectorIndex,
+};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
@@ -471,49 +473,42 @@ impl LucidosEngine {
                         };
 
                         // Find candidates by keyword, filter by semantic similarity to wrong_fact
-                        match index.search_by_keyword(search_query, 0.0, 100).await {
-                            Ok(results) => {
-                                let candidate_texts: Vec<&str> =
-                                    results.entries.iter().map(|e| e.summary.as_str()).collect();
-                                let candidate_embeddings = match self
-                                    .embedder
-                                    .embed_batch(&candidate_texts)
-                                    .await
-                                {
-                                    Ok(e) => e,
-                                    Err(err) => {
-                                        log!(@Memory, "Correction replay: embed_batch failed: {}", err);
-                                        continue;
+                        let candidates = correction_candidates(index, search_query).await;
+                        if !candidates.is_empty() {
+                            let candidate_texts: Vec<&str> =
+                                candidates.iter().map(|e| e.summary.as_str()).collect();
+                            let candidate_embeddings = match self
+                                .embedder
+                                .embed_batch(&candidate_texts)
+                                .await
+                            {
+                                Ok(e) => e,
+                                Err(err) => {
+                                    log!(@Memory, "Correction replay: embed_batch failed: {}", err);
+                                    continue;
+                                }
+                            };
+
+                            let ids_to_delete: Vec<Uuid> = candidates
+                                .iter()
+                                .zip(candidate_embeddings.iter())
+                                .filter(|(_, embedding)| {
+                                    cosine_similarity(&wrong_embedding, embedding)
+                                        >= MEMORY_CORRECTION_THRESHOLD
+                                })
+                                .map(|(entry, _)| entry.id)
+                                .collect();
+
+                            if !ids_to_delete.is_empty() {
+                                let deleted = match index.delete_many(&ids_to_delete).await {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        log!(@Memory, "Correction replay: delete_many failed: {}", e);
+                                        0
                                     }
                                 };
-
-                                let mut ids_to_delete: Vec<uuid::Uuid> = Vec::new();
-                                for (i, entry) in results.entries.iter().enumerate() {
-                                    if i < candidate_embeddings.len() {
-                                        let similarity = cosine_similarity(
-                                            &wrong_embedding,
-                                            &candidate_embeddings[i],
-                                        );
-                                        if similarity >= MEMORY_CORRECTION_THRESHOLD {
-                                            ids_to_delete.push(entry.id);
-                                        }
-                                    }
-                                }
-
-                                if !ids_to_delete.is_empty() {
-                                    let deleted = match index.delete_many(&ids_to_delete).await {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            log!(@Memory, "Correction replay: delete_many failed: {}", e);
-                                            0
-                                        }
-                                    };
-                                    log!(@Memory, "Correction replay: deleted {} of {} entries matching '{}' (similar to '{}')",
-                                        deleted, results.entries.len(), search_query, &wrong_fact[..wrong_fact.floor_char_boundary(60)]);
-                                }
-                            }
-                            Err(e) => {
-                                log!(@Memory, "Correction replay: keyword search failed: {}", e);
+                                log!(@Memory, "Correction replay: deleted {} of {} entries matching '{}' (similar to '{}')",
+                                    deleted, candidates.len(), search_query, &wrong_fact[..wrong_fact.floor_char_boundary(60)]);
                             }
                         }
                     } else {
@@ -532,7 +527,10 @@ impl LucidosEngine {
                         for summary in &deleted_summaries {
                             match self.embedder.embed(summary).await {
                                 Ok(embedding) => {
-                                    match index.find_similar(&embedding, 0.85, 5).await {
+                                    match index
+                                        .find_similar(&embedding, 0.85, 5, self.embedder.model_id())
+                                        .await
+                                    {
                                         Ok(similar) => {
                                             for entry in &similar {
                                                 ids_to_delete.push(entry.id);
@@ -570,8 +568,7 @@ impl LucidosEngine {
                         if !correction_text.is_empty() {
                             match self.embedder.embed_batch(&[correction_text]).await {
                                 Ok(embeddings) if !embeddings.is_empty() => {
-                                    let fact_id = uuid::Uuid::new_v4();
-                                    let source = MemorySource::Event { id: fact_id };
+                                    let (fact_id, source) = correction_entry_identity(event.id);
                                     if let Err(e) = index
                                         .index_entry(
                                             fact_id,
@@ -621,5 +618,153 @@ impl LucidosEngine {
         // a `.txt` sidecar and index that out-of-band; that capability has
         // been removed, leaving nothing extra to do at upload time.
         log!(@import_bg, "Background processing complete for {}", dest_relative);
+    }
+}
+
+/// One of the four built-in v5 namespaces, the same one the other derived-id
+/// sites use (`core::image_described_backfill`, `core::aux_context_backfill`).
+const CORRECTION_NAMESPACE: Uuid = Uuid::NAMESPACE_OID;
+
+/// The id and source of the entry a `MemoryCorrected` replay writes.
+///
+/// Phase 3 replays every correction on every rebuild, so a fresh random id
+/// added one more copy of the same fact each time. Every copy was retrievable
+/// and every copy went into the pre-turn block, crowding other facts out. A v5
+/// uuid over the event id makes the write an upsert instead.
+///
+/// The source is the event itself, which is what lets `sources_indexed` see
+/// the row and "View source" resolve it.
+fn correction_entry_identity(event_id: Uuid) -> (Uuid, MemorySource) {
+    let key = format!("memory-correction:{event_id}");
+    (
+        Uuid::new_v5(&CORRECTION_NAMESPACE, key.as_bytes()),
+        MemorySource::Event { id: event_id },
+    )
+}
+
+/// Entries matching ANY WORD of a correction's `search_query`, deduped by id.
+///
+/// `search_by_keyword` matches `summary ILIKE '%needle%'`, so the whole phrase
+/// asks for that exact substring and finds nothing. That left the delete half
+/// of a replay unable to match anything it was meant to remove. One lookup per
+/// word, through the tokenizer the rest of retrieval already shares.
+async fn correction_candidates(index: &PgVectorIndex, search_query: &str) -> Vec<MemoryEntry> {
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut candidates: Vec<MemoryEntry> = Vec::new();
+    for keyword in super::keywords_for([search_query]) {
+        match index.search_by_keyword(&keyword, 0.0, 100).await {
+            Ok(results) => {
+                for entry in results.entries {
+                    if seen.insert(entry.id) {
+                        candidates.push(entry);
+                    }
+                }
+            }
+            Err(e) => {
+                log!(@Memory, "Correction replay: keyword search failed for '{}': {}", keyword, e);
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(test)]
+mod correction_replay_tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use chrono::Utc;
+
+    async fn seed(index: &PgVectorIndex, summary: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                &MemorySource::Event { id: Uuid::new_v4() },
+                "General",
+                summary,
+                0.5,
+                &[],
+                &vec![0.1f32; 384],
+                "test-model",
+                Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// One correction, any number of rebuilds, one row. The id is derived from
+    /// the event, so Phase 3 upserts rather than inserting another copy.
+    #[tokio::test]
+    async fn replaying_a_correction_twice_leaves_one_entry() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let event_id = Uuid::new_v4();
+
+        for _ in 0..2 {
+            let (fact_id, source) = correction_entry_identity(event_id);
+            index
+                .index_entry(
+                    fact_id,
+                    &source,
+                    "Memory Correction",
+                    "The dog is called Rex.",
+                    0.8,
+                    &[],
+                    &vec![0.2f32; 384],
+                    "test-model",
+                    Utc::now(),
+                    crate::memory::EXTRACTOR_VERSION,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            index.len().await.unwrap(),
+            1,
+            "a second rebuild must upsert the correction, not duplicate it"
+        );
+
+        // And the row points back at the MemoryCorrected event, so
+        // `sources_indexed` sees it and "View source" resolves.
+        let source_json = serde_json::to_value(MemorySource::Event { id: event_id }).unwrap();
+        assert_eq!(
+            index.entries_for_source(&source_json).await.unwrap().len(),
+            1,
+            "the source must be the correction event, not a random uuid"
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The delete half has to match. A whole phrase is not a keyword, so the
+    /// raw query finds nothing and the wrong fact survives every replay.
+    #[tokio::test]
+    async fn correction_candidates_match_on_words_not_the_whole_phrase() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let wrong = seed(&index, "The dog is called Bella.").await;
+
+        let phrase = "what the dog is called";
+        assert!(
+            index
+                .search_by_keyword(phrase, 0.0, 100)
+                .await
+                .unwrap()
+                .entries
+                .is_empty(),
+            "the raw phrase is an ILIKE substring, which is why it never matched"
+        );
+
+        let found = correction_candidates(&index, phrase).await;
+        assert_eq!(
+            found.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![wrong],
+            "tokenizing the query is what lets the replay delete the wrong fact"
+        );
+
+        teardown_test_db(&db_name).await;
     }
 }

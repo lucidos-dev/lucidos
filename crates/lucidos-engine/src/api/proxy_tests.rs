@@ -87,6 +87,20 @@ fn strips_our_own_namespace_and_the_headers_the_gateway_owns() {
 }
 
 #[test]
+fn strips_the_framing_headers_the_caller_sent() {
+    // `transfer-encoding` goes as hop-by-hop, and `content-length` belongs with
+    // it: the client sends a value already on the request rather than the
+    // body's real length. A signer's `replace_body` changes that length, so the
+    // caller's figure would truncate the send or hang the upstream.
+    for h in ["Content-Length", "content-length", "Transfer-Encoding"] {
+        assert!(
+            should_strip_request_header(&name(h)),
+            "expected {h} to be stripped"
+        );
+    }
+}
+
+#[test]
 fn strip_check_is_case_insensitive() {
     assert!(should_strip_request_header(&name("cookie")));
     assert!(should_strip_request_header(&name("HOST")));
@@ -244,6 +258,32 @@ fn is_redirect_status_covers_30x_we_follow() {
     assert!(!is_redirect_status(StatusCode::NOT_MODIFIED));
     assert!(!is_redirect_status(StatusCode::OK));
     assert!(!is_redirect_status(StatusCode::BAD_GATEWAY));
+}
+
+#[test]
+fn only_the_30x_rfc_9110_rewrites_turn_the_next_hop_into_a_get() {
+    // 303 sends the caller somewhere else to fetch, whatever it asked with.
+    for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+        assert!(redirect_downgrades_to_get(StatusCode::SEE_OTHER, &method));
+    }
+    // A HEAD stays a HEAD: it is already a retrieval.
+    assert!(!redirect_downgrades_to_get(
+        StatusCode::SEE_OTHER,
+        &Method::HEAD
+    ));
+    // 301 and 302 rewrite a POST only. Every other method is left alone.
+    for status in [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND] {
+        assert!(redirect_downgrades_to_get(status, &Method::POST));
+        assert!(!redirect_downgrades_to_get(status, &Method::PUT));
+        assert!(!redirect_downgrades_to_get(status, &Method::GET));
+    }
+    // 307 and 308 exist to preserve the method.
+    for status in [
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ] {
+        assert!(!redirect_downgrades_to_get(status, &Method::POST));
+    }
 }
 
 #[test]
@@ -961,6 +1001,163 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
     assert_eq!(key, Some("secret-key"));
 }
 
+/// Every value the upstream saw under `header`, in the order it arrived.
+fn recorded_values<'a>(recorded: &'a UpstreamRecord, header: &str) -> Vec<&'a str> {
+    recorded
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(header))
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// An app picks its own headers on a `lucidos.proxy(...).fetch()` call, and
+/// `Authorization` is a singleton per RFC 9110. Appended beside the injected
+/// one, the app's copy is what a server reads first. An installed app could
+/// then suppress the engine's credential on any proxied route.
+#[tokio::test]
+async fn an_injected_header_replaces_the_callers_own() {
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let url = format!("{}/x", base);
+    let caller = hm(&[
+        ("Authorization", "Bearer app-picked"),
+        ("X-Api-Key", "app-picked"),
+        ("X-Keep-Me", "yes"),
+    ]);
+    let auth_vec: Vec<(HeaderName, HeaderValue)> = vec![
+        (
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer engine-credential"),
+        ),
+        (
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("engine-key"),
+        ),
+    ];
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        caller,
+        auth_vec,
+        Bytes::new(),
+        Transport::Verified,
+    )
+    .await;
+    let recorded = slot.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        recorded_values(&recorded, "authorization"),
+        vec!["Bearer engine-credential"]
+    );
+    assert_eq!(recorded_values(&recorded, "x-api-key"), vec!["engine-key"]);
+    // A name the engine does not inject is still the caller's to set.
+    assert_eq!(recorded_values(&recorded, "x-keep-me"), vec!["yes"]);
+}
+
+/// A signer granted `replace_body` re-serialises the body, so what goes on the
+/// wire is not the length the caller declared. The client frames off the body
+/// it is given, but only once the caller's own Content-Length is gone. A value
+/// already on the request wins over the body's real length.
+#[tokio::test]
+async fn a_stale_caller_content_length_does_not_frame_the_body() {
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let url = format!("{}/sign", base);
+    let signed = r#"{"amount":1,"signature":"0abcdef"}"#;
+    // Three bytes is what the app's pre-signature body might have declared.
+    // Short enough that framing on it truncates the JSON mid-key.
+    let caller = hm(&[("Content-Length", "3")]);
+    let resp = forward_request(
+        Method::POST,
+        &url,
+        &url,
+        caller,
+        Vec::new(),
+        Bytes::copy_from_slice(signed.as_bytes()),
+        Transport::Verified,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = slot.lock().unwrap().clone().expect("upstream not called");
+    assert_eq!(String::from_utf8_lossy(&recorded.body), signed);
+    let real_length = signed.len().to_string();
+    assert_eq!(
+        recorded_values(&recorded, "content-length"),
+        vec![real_length.as_str()]
+    );
+}
+
+/// The credential body of the header the layer below produces.
+const UNSENDABLE_SECRET: &str = "tok-abc";
+
+/// A layer whose produced value the header codec refuses. It stands in for
+/// every source of one: a stored credential saved with a trailing newline, an
+/// HMAC key header, a WASM signer's `add_headers` value.
+struct UnsendableHeaderLayer;
+
+#[async_trait::async_trait]
+impl crate::api::proxy_auth_layer::AuthLayer for UnsendableHeaderLayer {
+    fn output_namespace(&self) -> &str {
+        "unsendable"
+    }
+    fn scope_bindings(&self) -> Vec<crate::api::proxy_auth_layer::ScopeBinding> {
+        // A test layer carries no real secret, so nothing binds it.
+        Vec::new()
+    }
+    async fn apply(
+        &self,
+        _input: &crate::api::proxy_auth_layer::LayerInput<'_>,
+    ) -> Result<crate::api::proxy_auth_layer::AuthMutation, (StatusCode, String)> {
+        Ok(crate::api::proxy_auth_layer::AuthMutation {
+            add_headers: vec![(
+                HeaderName::from_static("authorization"),
+                format!("Bearer {UNSENDABLE_SECRET}\n"),
+            )],
+            ..Default::default()
+        })
+    }
+}
+
+/// A value the codec refuses used to be dropped, silently and with no log. The
+/// request then reached the third-party upstream carrying no credential. Refuse
+/// it instead, and name the header without its value.
+#[tokio::test]
+async fn a_produced_header_value_the_codec_refuses_is_refused_not_dropped() {
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    let layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> =
+        vec![Arc::new(UnsendableHeaderLayer)];
+    let scoped = ScopedPipeline::bind(&ctx, "comfort", base, layers, false)
+        .await
+        .expect("a loopback upstream binds");
+
+    let err = forward_with_redirects(
+        "comfort",
+        &scoped,
+        &Method::GET,
+        "v1/items",
+        None,
+        &HeaderMap::new(),
+        &Bytes::new(),
+    )
+    .await
+    .expect_err("a credential the codec cannot send must not be dropped");
+
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("authorization"), "{}", err.1);
+    assert!(
+        !err.1.contains(UNSENDABLE_SECRET),
+        "the message carried the credential: {}",
+        err.1
+    );
+    assert!(
+        slot.lock().unwrap().is_none(),
+        "the upstream saw a request that had lost its credential"
+    );
+}
+
 #[tokio::test]
 async fn forwards_query_param_auth_to_upstream() {
     let (base, slot) = spawn_recording_upstream(200, "ok").await;
@@ -1083,6 +1280,166 @@ async fn forward_request_does_not_auto_follow_30x() {
             .get(axum::http::header::LOCATION)
             .and_then(|v| v.to_str().ok()),
         Some("https://example.invalid/never-fetched")
+    );
+}
+
+/// Spawn an upstream that answers the first request with `status` plus
+/// `Location`, then records the second. The loop's own hop is what these tests
+/// are about, where [`spawn_redirecting_upstream`] stops after the first.
+async fn spawn_redirect_then_record(status: u16, location: &'static str) -> (String, RecordSlot) {
+    let slot: RecordSlot = Arc::new(Mutex::new(None));
+    let slot_clone = slot.clone();
+    let hops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_from_handler = shutdown.clone();
+    let app = Router::new().fallback(any(move |req: axum::extract::Request| {
+        let slot = slot_clone.clone();
+        let hops = hops.clone();
+        let shutdown = shutdown_from_handler.clone();
+        async move {
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or("").to_string();
+            let headers: Vec<(String, String)> = req
+                .headers()
+                .iter()
+                .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            // Drained on both hops, so the first response can reuse the
+            // connection instead of closing on an unread body.
+            let req_body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .unwrap_or_default()
+                .to_vec();
+            if hops.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut resp = (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FOUND),
+                    "redirect",
+                )
+                    .into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::LOCATION,
+                    HeaderValue::from_str(location).unwrap(),
+                );
+                return resp;
+            }
+            *slot.lock().unwrap() = Some(UpstreamRecord {
+                method,
+                path,
+                query,
+                body: req_body,
+                headers,
+            });
+            shutdown.notify_one();
+            (StatusCode::OK, "landed").into_response()
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.notified().await;
+            })
+            .await
+            .unwrap();
+    });
+    (format!("http://{}", addr), slot)
+}
+
+/// A pipeline with no layers over `base_url`, which is all the redirect loop
+/// needs: the hop arithmetic runs the same with or without a credential.
+async fn unauthenticated_pipeline(base_url: &str) -> ScopedPipeline {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    ScopedPipeline::bind(&ctx, "backend", base_url.to_string(), Vec::new(), false)
+        .await
+        .expect("a loopback upstream binds")
+}
+
+/// A `Location` is absolute on the origin, and the next hop re-anchors on
+/// `base_url`. Carrying the absolute path over doubled the prefix, so a hop to
+/// `/v1/items/` under a `.../v1` base fetched `/v1/v1/items/` and 404'd.
+#[tokio::test]
+async fn a_redirect_under_a_base_path_does_not_double_the_prefix() {
+    let (upstream, slot) = spawn_redirect_then_record(302, "/v1/items/").await;
+    let scoped = unauthenticated_pipeline(&format!("{upstream}/v1")).await;
+
+    let (resp, _) = forward_with_redirects(
+        "backend",
+        &scoped,
+        &Method::GET,
+        "items",
+        None,
+        &HeaderMap::new(),
+        &Bytes::new(),
+    )
+    .await
+    .expect("a same-origin redirect inside the prefix is followed");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = slot.lock().unwrap().clone().expect("second hop not made");
+    assert_eq!(recorded.path, "/v1/items/");
+}
+
+/// The same doubling read as containment. `Location: /admin` became
+/// `/v1/admin`, which `path_is_within` waves through, so the proxy fetched a
+/// resource outside its configured prefix with the credentials bound to it.
+#[tokio::test]
+async fn a_redirect_out_of_the_base_path_is_refused() {
+    let (upstream, slot) = spawn_redirect_then_record(302, "/admin").await;
+    let scoped = unauthenticated_pipeline(&format!("{upstream}/v1")).await;
+
+    let err = forward_with_redirects(
+        "backend",
+        &scoped,
+        &Method::GET,
+        "items",
+        None,
+        &HeaderMap::new(),
+        &Bytes::new(),
+    )
+    .await
+    .expect_err("a Location outside the base path must not be followed");
+
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("/admin"), "{}", err.1);
+    assert!(
+        slot.lock().unwrap().is_none(),
+        "the proxy fetched a resource outside its base path"
+    );
+}
+
+/// RFC 9110 re-issues a 303 as a bodyless GET. Replaying the POST instead gives
+/// a 405 on a well-behaved API, and a duplicated write on one with no
+/// idempotency key.
+#[tokio::test]
+async fn a_303_is_replayed_as_a_bodyless_get() {
+    let (upstream, slot) = spawn_redirect_then_record(303, "/jobs/42").await;
+    let scoped = unauthenticated_pipeline(&upstream).await;
+
+    let (resp, _) = forward_with_redirects(
+        "backend",
+        &scoped,
+        &Method::POST,
+        "jobs",
+        None,
+        &HeaderMap::new(),
+        &Bytes::copy_from_slice(br#"{"run":true}"#),
+    )
+    .await
+    .expect("a same-origin 303 is followed");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = slot.lock().unwrap().clone().expect("second hop not made");
+    assert_eq!(recorded.path, "/jobs/42");
+    assert_eq!(recorded.method, "GET");
+    assert!(
+        recorded.body.is_empty(),
+        "the 303 hop replayed the original body"
     );
 }
 
@@ -1436,18 +1793,39 @@ fn decoded_readings_peels_one_layer_per_round_and_terminates() {
 
 #[test]
 fn a_same_origin_redirect_is_re_anchored_under_the_prefix() {
-    // Worth pinning, because it is easy to read the redirect loop as an escape.
-    // The loop sets `current_path` from the Location's parsed path with the
-    // leading slash trimmed, then the next hop concatenates it back onto
-    // `base_url`. So `Location: /admin` arrives here as `admin` and resolves to
-    // `/safe-prefix/admin`, which never left. Containment runs per hop anyway,
-    // so the invariant does not rest on that re-anchoring staying this way.
-    let resolved = build_contained_target_url(PREFIXED_BASE, "admin", None);
+    // A `Location` is absolute on the origin, and the next hop joins what this
+    // returns back onto the base. So what carries forward is the part below the
+    // prefix, and `/safe-prefix/next` re-anchors to itself.
+    let next = redirect_path_within_base(PREFIXED_BASE, "/safe-prefix/next").unwrap();
+    assert_eq!(next, "/next");
     assert_eq!(
-        resolved.unwrap(),
-        "https://upstream.example/safe-prefix/admin"
+        build_contained_target_url(PREFIXED_BASE, &next, None).unwrap(),
+        "https://upstream.example/safe-prefix/next"
     );
-    assert!(build_contained_target_url(PREFIXED_BASE, "safe-prefix/next", None).is_ok());
+    // The prefix and its trailing-slash form stay distinct. Collapsing the
+    // second onto the first turns a canonical trailing-slash redirect into a
+    // loop that burns the hop budget.
+    assert_eq!(
+        redirect_path_within_base(PREFIXED_BASE, "/safe-prefix").unwrap(),
+        ""
+    );
+    assert_eq!(
+        redirect_path_within_base(PREFIXED_BASE, "/safe-prefix/").unwrap(),
+        "/"
+    );
+    // Outside the prefix there is nothing to carry forward: re-anchoring
+    // `/admin` would produce `/safe-prefix/admin`, a different resource that
+    // containment then waves through with the proxy's credentials on it.
+    assert!(redirect_path_within_base(PREFIXED_BASE, "/admin").is_none());
+    // A sibling of the prefix is not inside it, the same boundary
+    // `path_is_within` draws.
+    assert!(redirect_path_within_base(PREFIXED_BASE, "/safe-prefix-evil/x").is_none());
+    // With no prefix configured the Location's path is already relative to the
+    // base, so it travels unchanged.
+    assert_eq!(
+        redirect_path_within_base("http://localhost:5005", "/living-room/play").unwrap(),
+        "/living-room/play"
+    );
 }
 
 /// The startup seed keys approvals the way the runner does, so the two

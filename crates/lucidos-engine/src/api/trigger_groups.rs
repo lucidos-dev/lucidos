@@ -5,7 +5,8 @@
 //! the registry under `LucidosEngine.trigger_groups` (same Arc the scheduler
 //! shares for replay). These handlers emit `TriggerGroup*` events through
 //! EventBus; the scheduler's subscriber updates the registry, and SSE
-//! consumers see the change live.
+//! consumers see the change live. A reorder applies to the registry inline as
+//! well, so the next `GET` cannot answer with the old order.
 
 use super::*;
 
@@ -63,7 +64,7 @@ pub(super) struct TriggerGroupIdQuery {
     id: String,
 }
 
-/// Body returned by `DELETE /trigger-groups?id=` when the group still has
+/// Body returned by `DELETE /api/v1/trigger-groups?id=` when the group still has
 /// member triggers. The LLM reads `member_count` and `member_trigger_ids` to
 /// self-correct (move or delete the members first, then retry).
 #[derive(Serialize)]
@@ -71,6 +72,41 @@ struct DeleteBlockedResponse {
     error: &'static str,
     member_count: usize,
     member_trigger_ids: Vec<String>,
+}
+
+/// Announce one group's new position, then apply it to the in-memory registry.
+///
+/// Read-your-writes: `GET /api/v1/trigger-groups` answers from that registry,
+/// so a reorder that only emitted returned 200 and then served the pre-move
+/// order until the broadcast subscriber landed. The panel re-rendered the
+/// group where it started. `api/triggers.rs` states the same rule for a pause.
+///
+/// Both reorder endpoints run this, so the emit and the apply cannot drift.
+async fn emit_and_apply_reorder(
+    bus: &crate::engine::event_bus::EventBus,
+    groups: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, TriggerGroup>>>,
+    group_id: &str,
+    order: i32,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<(), String> {
+    let payload = serde_json::json!({ "group_id": group_id, "order": order });
+    if let Err(e) = bus
+        .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
+            group_id: group_id.to_string(),
+            payload: payload.clone(),
+            actor,
+        }))
+        .await
+    {
+        return Err(e.to_string());
+    }
+    crate::scheduler::handle_trigger_group_event(
+        "TriggerGroupReordered",
+        group_id,
+        &payload,
+        groups,
+    );
+    Ok(())
 }
 
 fn to_info(group: &TriggerGroup, member_count: usize) -> TriggerGroupInfo {
@@ -103,7 +139,7 @@ fn member_trigger_ids(state: &AppState, group_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// `GET /trigger-groups` — list groups sorted by `order` asc, then `created` asc.
+/// `GET /api/v1/trigger-groups`: groups sorted by `order` asc, `created` asc.
 pub(super) async fn list_trigger_groups(
     State(state): State<AppState>,
 ) -> Json<TriggerGroupsListResponse> {
@@ -120,7 +156,8 @@ pub(super) async fn list_trigger_groups(
     Json(TriggerGroupsListResponse { groups })
 }
 
-/// `POST /trigger-groups` — create a new group. Rejects empty / duplicate names.
+/// `POST /api/v1/trigger-groups`: create a group. Rejects empty and duplicate
+/// names.
 pub(super) async fn create_trigger_group(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -165,11 +202,12 @@ pub(super) async fn create_trigger_group(
     }
 }
 
-/// `PUT /trigger-groups?id=` — partial update of name and/or order. Rename
-/// goes through the serialized helper so the unique-name invariant survives
-/// a parallel rename or create against the same target name; reorder applies
-/// lazily via the broadcast subscriber because order isn't an invariant any
-/// reader dedups against.
+/// `PUT /api/v1/trigger-groups?id=`: partial update of name and/or order.
+///
+/// Rename goes through the serialized helper, so the unique-name invariant
+/// survives a parallel rename or create against the same target name. Reorder
+/// goes through [`emit_and_apply_reorder`], which is what makes the new order
+/// visible to the very next `GET`.
 pub(super) async fn update_trigger_group(
     State(state): State<AppState>,
     Query(query): Query<TriggerGroupIdQuery>,
@@ -234,16 +272,14 @@ pub(super) async fn update_trigger_group(
 
     let new_order = request.order.unwrap_or(existing.order);
     if new_order != existing.order {
-        let payload = serde_json::json!({ "group_id": group_id, "order": new_order });
-        if let Err(e) = state
-            .engine
-            .event_bus
-            .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
-                group_id: group_id.clone(),
-                payload,
-                actor,
-            }))
-            .await
+        if let Err(e) = emit_and_apply_reorder(
+            &state.engine.event_bus,
+            &state.engine.trigger_groups,
+            &group_id,
+            new_order,
+            actor,
+        )
+        .await
         {
             log!(
                 "[TriggerGroups] Failed to emit TriggerGroupReordered: {}",
@@ -267,8 +303,8 @@ pub(super) async fn update_trigger_group(
     (StatusCode::OK, Json(serde_json::to_value(info).unwrap()))
 }
 
-/// `DELETE /trigger-groups?id=` — refuse with `409` when the group still has
-/// member triggers. The response body lists `member_count` and
+/// `DELETE /api/v1/trigger-groups?id=`: refuse with `409` when the group still
+/// has member triggers. The response body lists `member_count` and
 /// `member_trigger_ids` so the LLM can move them and retry.
 ///
 /// Returns `impl IntoResponse` (not a `(StatusCode, Json)` tuple) so the success
@@ -331,11 +367,11 @@ pub(super) async fn delete_trigger_group(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /trigger-groups/reorder` — atomic batch reorder. Validates every id
-/// up front, then emits one `TriggerGroupReordered` per group whose `order`
+/// `POST /api/v1/trigger-groups/reorder`: atomic batch reorder. Validates every
+/// id up front, then runs [`emit_and_apply_reorder`] per group whose `order`
 /// actually changes. Unknown ids reject the whole batch with `400`.
 ///
-/// Returns `impl IntoResponse` so the success path is a *bodyless* `204` — see
+/// Returns `impl IntoResponse` so the success path is a *bodyless* `204`. See
 /// `delete_trigger_group` for why a 204-with-body breaks WebKit/iOS.
 pub(super) async fn reorder_trigger_groups(
     State(state): State<AppState>,
@@ -367,16 +403,14 @@ pub(super) async fn reorder_trigger_groups(
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     for (group_id, order) in to_change {
-        let payload = serde_json::json!({ "group_id": group_id, "order": order });
-        if let Err(e) = state
-            .engine
-            .event_bus
-            .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
-                group_id: group_id.clone(),
-                payload: payload.clone(),
-                actor: actor.clone(),
-            }))
-            .await
+        if let Err(e) = emit_and_apply_reorder(
+            &state.engine.event_bus,
+            &state.engine.trigger_groups,
+            &group_id,
+            order,
+            actor.clone(),
+        )
+        .await
         {
             log!(
                 "[TriggerGroups] Failed to emit TriggerGroupReordered for {}: {}",
@@ -389,12 +423,6 @@ pub(super) async fn reorder_trigger_groups(
             )
                 .into_response();
         }
-        crate::scheduler::handle_trigger_group_event(
-            "TriggerGroupReordered",
-            &group_id,
-            &payload,
-            &state.engine.trigger_groups,
-        );
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -414,4 +442,53 @@ pub(super) fn router() -> Router<AppState> {
                 .delete(delete_trigger_group),
         )
         .route("/trigger-groups/reorder", post(reorder_trigger_groups))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    fn registry(order: i32) -> Arc<RwLock<HashMap<String, TriggerGroup>>> {
+        let group = TriggerGroup {
+            id: "group-1".to_string(),
+            name: "Morning".to_string(),
+            order,
+            created: chrono::Utc::now(),
+        };
+        Arc::new(RwLock::new(HashMap::from([(group.id.clone(), group)])))
+    }
+
+    /// Read-your-writes. The single-group `PUT` used to emit and stop there. A
+    /// `GET` right after it could still answer the pre-move order, and the
+    /// panel re-rendered the group where it started.
+    #[tokio::test]
+    async fn a_single_group_reorder_reaches_the_registry() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let groups = registry(10);
+
+        emit_and_apply_reorder(&bus, &groups, "group-1", 30, None)
+            .await
+            .expect("the reorder announces");
+
+        assert_eq!(
+            groups.read().unwrap()["group-1"].order,
+            30,
+            "the next GET reads this registry, so it has to hold the new order"
+        );
+
+        let announced: Vec<(String,)> = sqlx::query_as(
+            "SELECT event_type FROM events WHERE event_type = 'TriggerGroupReordered'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read the audit rows");
+        assert_eq!(announced.len(), 1, "the move is announced exactly once");
+
+        teardown_test_db(&db_name).await;
+    }
 }

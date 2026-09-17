@@ -143,7 +143,7 @@ pub(super) fn browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::BROWSER_CLOSE.to_string(),
-            description: "Close the browser session. It also auto-closes after 30 minutes idle.".to_string(),
+            description: "Close the browser session. Nothing else closes it.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -166,7 +166,7 @@ pub(super) fn browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::BROWSER_CLEAR_DATA.to_string(),
-            description: "Delete all Lucidos browser data (cookies, logins, localStorage, cache), closing any running browser first.".to_string(),
+            description: "Delete all Lucidos browser data (cookies, logins, localStorage, cache, and the headless bot-detection blocklist, whose only reset this is), closing any running browser first.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},

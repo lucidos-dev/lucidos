@@ -718,6 +718,51 @@ async fn resolve_diff_worktree_refuses_a_thread_id_it_does_not_know() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// A lookup that could not run used to be indistinguishable from "not an app
+/// thread": both answered `None`, which both callers read as "diff the whole
+/// repo". A pool timeout then returned every file the agent touched anywhere
+/// in the workspace, with a 200 and no log.
+#[tokio::test]
+async fn an_unanswerable_app_pathspec_lookup_fails_the_request() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let app_thread = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, coding_agent_kind, coding_agent_folder) \
+         VALUES ($1, 'app', '/ws/data/apps/habit-tracker')",
+    )
+    .bind(app_thread)
+    .execute(&pool)
+    .await
+    .expect("seed an app coding-agent thread");
+
+    assert_eq!(
+        super::lookup_app_pathspec(&pool, app_thread).await,
+        Ok(Some("data/apps/habit-tracker".to_string())),
+        "an app thread scopes its diff to its own folder"
+    );
+
+    // A thread that is not an app thread is genuinely unscoped, and stays so.
+    let other = Uuid::new_v4();
+    sqlx::query("INSERT INTO thread_summaries (thread_id) VALUES ($1)")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("seed a plain thread");
+    assert_eq!(super::lookup_app_pathspec(&pool, other).await, Ok(None));
+
+    pool.close().await;
+    let (status, message) = super::lookup_app_pathspec(&pool, app_thread)
+        .await
+        .expect_err("a lookup that could not run is not an answer");
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unscoped diff is worse than no diff: {message}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 /// A running turn owns the answer. The last idle describes where the PREVIOUS
 /// turn worked, so the live session's own worktree wins whenever both are on
 /// disk.

@@ -1259,7 +1259,6 @@ pub(super) async fn chat_submit(
         )
         .await;
 
-    let result_started_at = state.started_at;
     let engine_for_panic = state.engine.clone();
     let thread_id_for_panic = thread_id;
     let actor_for_apply = origin.clone();
@@ -1350,58 +1349,14 @@ pub(super) async fn chat_submit(
                             }
                         }
                     }
-                    let proj = engine_clone.changes();
-                    let (pending_r, applied_r, restart_r) = tokio::join!(
-                        proj.list_pending(),
-                        proj.list_recently_applied(15, None),
-                        proj.requires_restart_since(result_started_at),
-                    );
-                    match (pending_r, applied_r, restart_r) {
-                        (Ok(mut pending), Ok(mut applied), Ok(restart)) => {
-                            let (r1, r2) = tokio::join!(
-                                crate::core::changes::enrich_thread_titles(
-                                    engine_clone.pool(),
-                                    &mut pending,
-                                ),
-                                crate::core::changes::enrich_thread_titles(
-                                    engine_clone.pool(),
-                                    &mut applied,
-                                ),
-                            );
-                            if let Err(e) = r1 {
-                                log!("[Chat] enrich pending titles: {}", e);
-                            }
-                            if let Err(e) = r2 {
-                                log!("[Chat] enrich applied titles: {}", e);
-                            }
-                            engine_clone
-                                .event_bus
-                                .emit_or_log(
-                                    crate::engine::event_bus::BusEvent::System(
-                                        crate::engine::event_bus::SystemEvent::ChangesUpdated {
-                                            total_pending: pending.len(),
-                                            pending,
-                                            applied,
-                                            restart_required: restart,
-                                        },
-                                    ),
-                                    "[Chat] ChangesUpdated",
-                                )
-                                .await;
-                        }
-                        (perr, aerr, rerr) => {
-                            if let Err(e) = perr {
-                                log!("[Chat] post-process list_pending: {}", e);
-                            }
-                            if let Err(e) = aerr {
-                                log!("[Chat] post-process list_recently_applied: {}", e);
-                            }
-                            if let Err(e) = rerr {
-                                log!("[Chat] post-process requires_restart_since: {}", e);
-                            }
-                            log!("[Chat] skipping post-turn ChangesUpdated broadcast");
-                        }
-                    }
+                    // One emitter for the frame, so the unsettled gate cannot
+                    // differ per caller. That gate is what hid Apply on a
+                    // thread still mid-turn, and this block used to omit it.
+                    //
+                    // `restart_required` still differs from `GET /changes`,
+                    // which scopes to the engine's start. Nothing reads the
+                    // frame's copy: `thread-sync.ts` leaves it untouched.
+                    engine_clone.broadcast_changes_updated().await;
                 }
 
                 // Re-submit orphaned injections (follow-ups that arrived after

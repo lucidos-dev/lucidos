@@ -187,14 +187,6 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
   // Reported only while the `all` view is the one on screen: it describes what
   // is on screen, and under a status view what is on screen is that status.
   const narrowed = onAllStatuses && (typeFilterOn || deletedOptionsHidden.value);
-  // The heading's accent and check track the TYPES, which are what it heads.
-  // "Include deleted" sits above it, so accenting for that would point the cue
-  // at the wrong section, which is also why the two cues are separate.
-  //
-  // Not gated on the view, unlike the "filtered" note above: the knobs are live
-  // in every view, so the cue reports what is TICKED rather than what is in
-  // effect, and under a status view it rides the section's dim, which is what
-  // says "set, but not shaping this list".
   const takeAllStatuses = () => { setDrawerView('all'); onClose(); };
 
   return (
@@ -366,6 +358,15 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
           still reads as one. No hairline above it, since a heading already opens
           a section. */}
       <div
+        // The heading's accent and check track the TYPES, which are what it
+        // heads. "Include deleted" sits above it. Accenting for that would
+        // point the cue at the wrong section, which is why the two cues are
+        // separate.
+        //
+        // Not gated on the view, unlike the "filtered" note above. The knobs
+        // are live in every view, so the cue reports what is TICKED rather
+        // than what is in effect. Under a status view it rides the section's
+        // dim, which is what says "set, but not shaping this list".
         class={`thread-filter-title${typeFilterOn ? ' thread-filter-title-active' : ''}${channelsDimmed ? ' thread-filter-title-dimmed' : ''}`}
         id="thread-filter-types-title"
       >

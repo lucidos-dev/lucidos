@@ -1,4 +1,4 @@
-# 0183: A dead composer tap runs Send itself, then the bounce
+# 0183: A dead composer tap runs the commit face itself, then the bounce
 
 - **Status**: Accepted
 - **Date**: 2026-09-12
@@ -43,13 +43,28 @@ the relayout is for the next one.
 
 Four bounds on the Send half, each a state where the intent is not certain:
 
-- SEND mode only, so a dropped tap can never stop a running turn.
+- A COMMIT face only, so a dropped tap can never stop a running turn.
 - The keyboard must be UP, which is the state every report describes.
 - Nothing may have claimed the gesture. The rescue waits out the click grace
   window and stands down on any click, and on a later press that reaches a real
   face.
-- The morph is re-read at the moment of firing. A second tap that got through in
-  the meantime has already moved it off `send`, so this does nothing.
+- The row is re-read at the moment of firing. A second tap that got through in
+  the meantime has already moved it off a commit face, so this does nothing.
+
+**A commit face is the button that sends what the user typed.** Two qualify,
+and the row renders exactly one of them: the Send morph in `send` mode, and the
+answer Submit while a question is pending. Nothing else. A destructive face
+must never run on a tap nobody saw land, and Apply wears the same confirm green
+while merging a change nobody approved.
+
+The first draft of this decision said SEND mode only, and the thirteenth
+episode found that out. It was in answer mode, where `computeMorphMode` renders
+no morph at all, so the rescue opened with a test it could never pass. The
+user's typed answer sat unsent while the app relaid out the shell and said
+nothing.
+
+That bound was never a decision about Submit. It was drawn to exclude Cancel,
+and Submit commits typed text exactly as Send does.
 
 The bounce goes DOWN, though the keyboard's goes up. Growing the shell shrinks
 every scroller in it. The browser clamps their scroll offsets at that layout,
@@ -104,6 +119,13 @@ composer now writes a line too, throttled. That closes the blind spot every
 round has died in: "no line" has meant both "iOS delivered no touch" and "iOS
 delivered it somewhere the composer is not". The two have different fixes and
 no shared one, and until now nothing in the app could tell them apart.
+
+**A silence has two more meanings, and both are ours rather than the
+platform's.** A press the probe declines under the app's own cover writes
+`covered`, and a touchless click that reaches no composer face writes
+`stray-click`. Every line also counts the scheduled checks a cover stood down,
+which is the only reading available across a stretch nobody touched. So the
+next blank ledger names one state instead of three.
 
 ## What the platform research says
 

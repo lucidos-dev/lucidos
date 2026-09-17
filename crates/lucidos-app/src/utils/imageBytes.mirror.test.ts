@@ -13,7 +13,12 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { dirname, resolve } from 'node:path';
-import { ALLOWED_IMAGE_MIMES, HEIC_BRANDS, UNSUPPORTED_IMAGE_FORMATS } from './imageBytes';
+import {
+  ALLOWED_IMAGE_MIMES,
+  HEIC_BRANDS,
+  UNSUPPORTED_IMAGE_FORMATS,
+  describeUnsupportedImage,
+} from './imageBytes';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '../../../..');
@@ -66,5 +71,40 @@ describe('both gates name a refused format the same way', () => {
     for (const { id } of UNSUPPORTED_IMAGE_FORMATS) {
       expect(accepted.has(id)).toBe(false);
     }
+  });
+});
+
+/** How far into a text file each side looks for an SVG root element.
+ *
+ *  `looksLikeSvg` is a line-for-line copy of `looks_like_svg`, and both cut the
+ *  head at this many bytes. Widen it in Rust to catch an SVG behind a long XML
+ *  preamble and the client still reads 512. It then calls the same file a
+ *  non-image and refuses the upload with a message the server would not give.
+ *  The three tables above already read this file, and a green report next to an
+ *  unpinned constant is what makes the copy look safe. */
+describe('both gates read the same amount of an SVG', () => {
+  const declared = /const SVG_SNIFF_LIMIT:\s*usize\s*=\s*(\d+);/.exec(source);
+  const limit = Number(declared?.[1]);
+
+  /** An XML preamble padded so `<svg` STARTS at `offset`. */
+  function svgAt(offset: number): Uint8Array {
+    const head = '<?xml version="1.0"?>';
+    const text = head + ' '.repeat(offset - head.length) + '<svg xmlns="http://x"/>';
+    return Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+  }
+
+  it('reads a limit out of the Rust source', () => {
+    expect(declared, `SVG_SNIFF_LIMIT not found in ${BLOBS_RS}`).not.toBeNull();
+    expect(limit).toBeGreaterThan(0);
+  });
+
+  it('sees an SVG whose root element ends on the last byte it reads', () => {
+    expect(describeUnsupportedImage(svgAt(limit - 4))).toBe('SVG');
+  });
+
+  it('misses one that starts a byte later, as the engine does', () => {
+    // The pair is what pins the number. Widen the Rust limit alone and the
+    // first case moves out of the client's window and stops being an SVG.
+    expect(describeUnsupportedImage(svgAt(limit - 3))).toBeNull();
   });
 });

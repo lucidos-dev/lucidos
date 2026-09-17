@@ -22,9 +22,9 @@ import { copyToClipboard } from '../../utils/clipboard';
  *  installer in a terminal, which emits no event this app could subscribe to.
  *  The gateway rescans on every request, so reopening the page is the refresh.
  */
-export const installInventory = signal<Loadable<InstallInventory>>({ status: 'not-loaded' });
+const installInventory = signal<Loadable<InstallInventory>>({ status: 'not-loaded' });
 
-export async function loadInstalls(): Promise<void> {
+async function loadInstalls(): Promise<void> {
   installInventory.value = { status: 'loading' };
   try {
     installInventory.value = { status: 'loaded', data: await fetchInstallInventory() };

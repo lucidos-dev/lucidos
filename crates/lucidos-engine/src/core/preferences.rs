@@ -239,10 +239,6 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Set a global preference (insert or update, device_id IS NULL).
-    ///
-    /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
-    /// reachable mutators, and the first of them emits.
     /// Write a global preference row with no announcement.
     ///
     /// Tests only. The announcing [`Self::set`] needs an `EventBus`, and a test
@@ -256,6 +252,10 @@ impl PreferenceStore {
         Self::set_row(pool, key, value).await
     }
 
+    /// Set a global preference (insert or update, device_id IS NULL).
+    ///
+    /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
+    /// reachable mutators, and the first of them emits.
     async fn set_row(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"

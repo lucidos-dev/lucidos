@@ -43,15 +43,9 @@ impl LiveVoiceSessions {
         })
     }
 
-    /// Whether a voice session is live on this thread.
-    pub fn is_live(&self, thread_id: Uuid) -> bool {
-        self.live
-            .lock()
-            .expect("voice session registry lock")
-            .contains_key(&thread_id)
-    }
-
-    /// How many calls are up across the workspace.
+    /// How many threads hold a slot. `api/voice.rs` asserts on this to prove a
+    /// refusal claimed nothing, which a `claim` return cannot show: the refusal
+    /// paths never reach `claim` at all.
     pub fn count(&self) -> usize {
         self.live.lock().expect("voice session registry lock").len()
     }
@@ -82,7 +76,6 @@ mod tests {
         let first = sessions.claim(thread, Uuid::new_v4());
         assert!(first.is_some());
         assert!(sessions.claim(thread, Uuid::new_v4()).is_none());
-        assert!(sessions.is_live(thread));
     }
 
     #[test]
@@ -90,15 +83,15 @@ mod tests {
         let sessions = LiveVoiceSessions::new();
         let thread = Uuid::new_v4();
         drop(sessions.claim(thread, Uuid::new_v4()));
-        assert!(!sessions.is_live(thread));
         assert!(sessions.claim(thread, Uuid::new_v4()).is_some());
     }
 
     #[test]
     fn two_threads_can_each_hold_a_call() {
         let sessions = LiveVoiceSessions::new();
-        let _a = sessions.claim(Uuid::new_v4(), Uuid::new_v4()).expect("a");
-        let _b = sessions.claim(Uuid::new_v4(), Uuid::new_v4()).expect("b");
-        assert_eq!(sessions.count(), 2);
+        let a = sessions.claim(Uuid::new_v4(), Uuid::new_v4());
+        let b = sessions.claim(Uuid::new_v4(), Uuid::new_v4());
+        assert!(a.is_some(), "the first thread takes its slot");
+        assert!(b.is_some(), "a second thread is not blocked by the first");
     }
 }

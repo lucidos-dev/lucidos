@@ -1736,9 +1736,10 @@ pub(crate) async fn ensure_failure_terminator_emitted(
 }
 
 /// Static parts of a ContextCaptured event built once by `chat::process`
-/// before the loop starts: section list (system + memory + history + …),
-/// the tool list, and the model id. The loop appends a dynamic
-/// `Conversation` section per iteration sized from the current `messages`.
+/// before the loop starts: section list (system + memory + history + …)
+/// and the model id. The loop appends a dynamic `Conversation` section per
+/// iteration sized from the current `messages`, and reads the tool array off
+/// [`TurnTools`], which can move mid-turn.
 ///
 /// `capture_body` mirrors `PreferenceStore::capture_context` — read once at
 /// build time and threaded through so the loop can fill the dynamic
@@ -1747,15 +1748,126 @@ pub(crate) async fn ensure_failure_terminator_emitted(
 /// modal misleadingly showed "Body not captured (capture_context off)".
 pub(crate) struct ContextCaptureSeed<'a> {
     pub sections: &'a [crate::engine::ContextSection],
-    pub tools: &'a [String],
-    /// Total chars of the tool DEFINITIONS (schemas), as opposed to `tools`
-    /// which is just their names. Counted into `estimated_total_tokens` because
-    /// the schemas are sent on every request and the trim budget already
-    /// subtracts them — omitting them here made the reported context size
-    /// disagree with the budget the engine was actually enforcing.
-    pub tool_defs_chars: usize,
     pub model: &'a str,
     pub capture_body: bool,
+}
+
+/// The tool array this turn sends, and what it costs.
+///
+/// Almost all of it is fixed for the turn: a family is offered on workspace
+/// capability, never on the thread (ADR 0088). The MCP slice is the exception.
+/// The model can start, stop or remove a server with the `mcp` tool, and so
+/// can the user from Settings, while the turn runs. The array used to be
+/// frozen at setup, so a server started mid-turn stayed uncallable until the
+/// next user message.
+///
+/// `mcp_generation` is what the loop compares against
+/// `McpManager::tool_surface_generation()` each round. See
+/// `docs/plans/2026-09-16-mcp-tools-register-mid-turn.md`.
+pub(crate) struct TurnTools {
+    defs: Vec<ToolDefinition>,
+    names: Vec<String>,
+    defs_chars: usize,
+    mcp_generation: u64,
+}
+
+impl TurnTools {
+    /// `defs` is the whole array, MCP tools included, and `mcp_generation` is
+    /// the stamp the surface they came from was read at.
+    pub(crate) fn new(defs: Vec<ToolDefinition>, mcp_generation: u64) -> Self {
+        let mut tools = Self {
+            defs,
+            names: Vec::new(),
+            defs_chars: 0,
+            mcp_generation,
+        };
+        tools.remeasure();
+        tools
+    }
+
+    /// The schemas the next request carries.
+    pub(crate) fn defs(&self) -> &[ToolDefinition] {
+        &self.defs
+    }
+
+    /// Their names, for the `ContextCaptured` row and the inline-tool-call
+    /// repair's list of what the model is allowed to have meant.
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Total chars of the schemas. Counted into the capture's
+    /// `estimated_total_tokens` and subtracted from the message budget,
+    /// because the schemas ride every request.
+    pub(crate) fn defs_chars(&self) -> usize {
+        self.defs_chars
+    }
+
+    /// The MCP surface stamp this array was built against.
+    pub(crate) fn mcp_generation(&self) -> u64 {
+        self.mcp_generation
+    }
+
+    /// Every MCP server the array currently offers a tool for.
+    ///
+    /// Read either side of a refresh to see which servers came up and which
+    /// went away. Sorted, so the line built from it reads the same each time.
+    pub(crate) fn mcp_server_ids(&self) -> std::collections::BTreeSet<String> {
+        self.defs
+            .iter()
+            .filter_map(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name))
+            .map(|(server_id, _)| server_id)
+            .collect()
+    }
+
+    /// Swap the MCP slice for what the servers offer now.
+    ///
+    /// Only that slice: re-deriving the engine-authored families would change
+    /// nothing and cost a read, and their order is what keeps the cacheable
+    /// head of the array stable. The new tools land at the tail, where the
+    /// turn's setup put them.
+    pub(crate) fn refresh_mcp(&mut self, surface: crate::mcp::McpToolSurface) {
+        self.defs
+            .retain(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name).is_none());
+        self.defs.extend(surface.tools);
+        self.mcp_generation = surface.generation;
+        self.remeasure();
+    }
+
+    fn remeasure(&mut self) {
+        self.names = self.defs.iter().map(|t| t.name.clone()).collect();
+        self.defs_chars = crate::engine::context::tool_definitions_chars(&self.defs);
+    }
+}
+
+/// Which MCP servers came up or went away since the request was assembled.
+/// `None` when the same servers are offered.
+///
+/// `[STOPPED MCP SERVERS]` is built once at turn setup and sits in the first
+/// message. That message is fixed for the turn, which is what keeps the prefix
+/// cache. The array moves per round (ADR 0195), so the two disagree the moment
+/// a server starts. The model then reads a server it just started as stopped,
+/// and either starts it again or tells the user it is not running.
+pub(crate) fn mcp_surface_correction(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let came_up: Vec<&str> = after.difference(before).map(String::as_str).collect();
+    let went_away: Vec<&str> = before.difference(after).map(String::as_str).collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !came_up.is_empty() {
+        parts.push(format!("running and callable now: {}", came_up.join(", ")));
+    }
+    if !went_away.is_empty() {
+        parts.push(format!("no longer running: {}", went_away.join(", ")));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "[MCP UPDATE] {}. This corrects the stopped-server list above.",
+            parts.join("; ")
+        )
+    })
 }
 
 /// Cap on the `Conversation` body, matching what `chat::process` applies to

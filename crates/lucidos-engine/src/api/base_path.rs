@@ -183,27 +183,36 @@ fn escape_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Insert `tag` as the first child of `<head>`; prepend it when there is no
-/// `<head>`. Shared by the base-href, gateway-port and workspace-id stampers.
-fn insert_into_head(html: &str, tag: &str) -> String {
-    match find_head_open_end(html) {
-        Some(pos) => {
-            let mut out = String::with_capacity(html.len() + tag.len());
-            out.push_str(&html[..pos]);
-            out.push_str(tag);
-            out.push_str(&html[pos..]);
-            out
-        }
-        None => format!("{tag}{html}"),
-    }
+/// Insert `tag` as the first child of `<head>`. Shared by the base-href,
+/// gateway-port and workspace-id stampers, and by the app-UI favicon stamper
+/// (see [`super::app_ui::ensure_app_favicon`]).
+pub(super) fn insert_into_head(html: &str, tag: &str) -> String {
+    let at = head_insert_offset(html);
+    let mut out = String::with_capacity(html.len() + tag.len());
+    out.push_str(&html[..at]);
+    out.push_str(tag);
+    out.push_str(&html[at..]);
+    out
 }
 
-/// Byte offset just past the opening `<head …>` tag, case-insensitively.
-fn find_head_open_end(html: &str) -> Option<usize> {
-    let lower = html.to_ascii_lowercase();
-    let start = lower.find("<head")?;
-    let close = lower[start..].find('>')? + start;
-    Some(close + 1)
+/// Byte offset the first head child belongs at, case-insensitively: just past
+/// `<head …>`, else just past `<html …>`, else just past a leading doctype,
+/// else the very start.
+///
+/// The fallbacks are for an app document the engine did not author. A tag ahead
+/// of a doctype would drop the page into quirks mode. The parser opens a head
+/// for a tag that arrives before the document's own.
+fn head_insert_offset(html: &str) -> usize {
+    static OPENERS: std::sync::LazyLock<[regex::Regex; 3]> = std::sync::LazyLock::new(|| {
+        // `\b` is what keeps `<head` off `<header>`, which an app document has
+        // in its body and the frontend shell does not.
+        ["<head\\b[^>]*>", "<html\\b[^>]*>", "<!doctype\\b[^>]*>"]
+            .map(|p| regex::Regex::new(&format!("(?i){p}")).expect("head opener regex"))
+    });
+    OPENERS
+        .iter()
+        .find_map(|re| re.find(html))
+        .map_or(0, |m| m.end())
 }
 
 #[cfg(test)]
@@ -268,6 +277,24 @@ mod tests {
         assert_eq!(
             inject_base_href(html, "/dev/"),
             "<base href=\"/dev/\"><p>x</p>"
+        );
+    }
+
+    /// The fallbacks exist for an app document, which the engine did not
+    /// author: it may open straight into `<html>`, and its `<header>` must not
+    /// be mistaken for the `<head>` it never wrote.
+    #[test]
+    fn a_document_without_a_head_falls_back_outwards_and_never_past_the_doctype() {
+        assert_eq!(
+            insert_into_head(
+                r#"<!DOCTYPE html><html lang="en"><body>x</body></html>"#,
+                "<i>"
+            ),
+            r#"<!DOCTYPE html><html lang="en"><i><body>x</body></html>"#
+        );
+        assert_eq!(
+            insert_into_head("<!DOCTYPE html><body><header>h</header></body>", "<i>"),
+            "<!DOCTYPE html><i><body><header>h</header></body>"
         );
     }
 

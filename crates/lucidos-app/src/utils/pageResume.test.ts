@@ -1,16 +1,30 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error — same
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
+
+// `isWebKit` is a module-level const read from the real user-agent. Node's fails
+// it, so the engine gate is off here and every repaint path would no-op. Flip it
+// per case through a hoisted box. Partial, because `webkitRepaint` (pulled in
+// below) reads other exports of this module.
+const platform = vi.hoisted(() => ({ webkit: true }));
+vi.mock('./platform', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./platform')>()),
+  isWebKit: () => platform.webkit,
+}));
+
 import {
   reduceResumeGuard,
   isIrreversibleTapTarget,
+  onPageResume,
+  repaintLandedContent,
   IRREVERSIBLE_TAP_SELECTOR,
   type ResumeEvent,
 } from './pageResume';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './webkitRepaint';
 
 describe('reduceResumeGuard', () => {
   it('a foreground-resume arms the guard and requests a repaint', () => {
@@ -171,5 +185,66 @@ describe('ThreadView resume repaint wiring', () => {
   it('drives its WebKit repaint off the shared onPageResume signal', () => {
     expect(threadViewSrc).toMatch(/import\s*\{[^}]*\bonPageResume\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/pageResume['"]/);
     expect(threadViewSrc).toMatch(/onPageResume\(/);
+  });
+});
+
+// A deep link lands its view AFTER the wake that delivered it, so the wake
+// repaint runs against the view being replaced. `repaintLandedContent` is the
+// second edge: same subscribers, fired when content arrives. See the plan
+// docs/plans/2026-09-17-a-deep-link-repaints-what-it-landed.md.
+describe('repaintLandedContent', () => {
+  beforeEach(() => {
+    platform.webkit = true;
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fires every subscriber once per arrival delay', () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    const stopA = onPageResume(a);
+    const stopB = onPageResume(b);
+
+    repaintLandedContent();
+    // The leading attempt is synchronous, so a view already committed paints
+    // without waiting a tick.
+    expect(a).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(Math.max(...OPEN_REPAINT_BURST_DELAYS_MS));
+    expect(a).toHaveBeenCalledTimes(OPEN_REPAINT_BURST_DELAYS_MS.length);
+    expect(b).toHaveBeenCalledTimes(OPEN_REPAINT_BURST_DELAYS_MS.length);
+
+    stopA();
+    stopB();
+  });
+
+  it('spans the arrival of a lazily-chunked view, not just the next frame', () => {
+    // The Canvas pane's app panel is a lazy chunk behind an IPC drain, so a
+    // one-shot toggle can fire before the view exists.
+    expect(Math.max(...OPEN_REPAINT_BURST_DELAYS_MS)).toBeGreaterThanOrEqual(1000);
+  });
+
+  it('costs nothing off WebKit', () => {
+    // The compositor bug is that engine's. Chrome, Firefox and the e2e browsers
+    // must pay neither a timer nor a transform.
+    platform.webkit = false;
+    const cb = vi.fn();
+    const stop = onPageResume(cb);
+
+    repaintLandedContent();
+    vi.advanceTimersByTime(Math.max(...OPEN_REPAINT_BURST_DELAYS_MS));
+    expect(cb).not.toHaveBeenCalled();
+
+    stop();
+  });
+
+  it('never arms the wake-tap swallow', () => {
+    // Arming is for a wake, where the layer may still be black. A landed deep
+    // link is not one, and arming here would eat the user's next deliberate tap
+    // on a question or permission card.
+    const landed = resumeSrc.match(/export function repaintLandedContent[\s\S]*?\n}/)?.[0] ?? '';
+    expect(landed).toMatch(/fireRepaint/);
+    expect(landed).not.toMatch(/step\(|'resume'|scheduleSettle/);
   });
 });

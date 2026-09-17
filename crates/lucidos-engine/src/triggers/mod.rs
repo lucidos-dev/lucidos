@@ -12,8 +12,8 @@ pub mod summary;
 /// re-export keeps trigger code reading in trigger terms.
 pub use crate::core::event_subscription::EventSubscription;
 pub use config::{
-    is_valid_reasoning_effort, is_valid_trigger_slug, normalize_route_setting,
-    slugify_trigger_name_with_fallback, validate_script_extension,
+    is_valid_reasoning_effort, is_valid_trigger_slug, mint_unique_trigger_slug,
+    normalize_route_setting, slugify_trigger_name_with_fallback, validate_script_extension,
     validate_trigger_reasoning_effort, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 pub use groups::{

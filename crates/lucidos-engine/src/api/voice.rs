@@ -7,10 +7,12 @@
 //! **The client stays dumb.** Binary frames are audio and text frames are the
 //! small control vocabulary in `voice::wire`. Nothing here names a provider.
 //!
-//! Two refusals happen before the upgrade, because both are things the caller
-//! asked for and can stop asking for: an unknown thread, and a thread already
-//! on a call. A failure to reach the talker happens after, as an `error` frame,
-//! because the caller cannot have known and a person has to read it.
+//! Four refusals happen before the upgrade, because each is a thing the caller
+//! asked for and can stop asking for: voice switched off, a coding-agent
+//! thread, an unknown thread, and a thread already on a call. A thread the
+//! engine cannot read answers 500 there too, which is nobody's fault. A
+//! failure to reach the talker happens after, as an `error` frame, because the
+//! caller cannot have known and a person has to read it.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -92,7 +94,43 @@ async fn voice(
                 },
             )
             .await;
+            name_a_call_that_ran_no_turn(&state.engine, thread_id).await;
         }))
+}
+
+/// Title a thread whose whole conversation was spoken.
+///
+/// The chat path titles a thread on its first turn, and a call the talker
+/// answered alone starts none: `SpokenMessageReceived` is `Metadata` (ADR
+/// 0165's split). Left out, such a thread is named after its first spoken row
+/// for as long as it exists, which is a fragment of a sentence.
+///
+/// **A call that DELEGATED is left alone.** Its turn wrote a `MessageReceived`,
+/// and the chat titler owns that thread. Two titlers on one thread is one
+/// wasted call and two events for one name.
+///
+/// At the END of the call rather than on the first row, because that is when
+/// the thread is settled: no turn can still arrive and take the naming over.
+/// The titler reads the thread's FIRST spoken row and nothing after it, so
+/// what waiting buys is the check above, not a better name.
+///
+/// Every failure leaves the thread as it was. A thread with no name reads as
+/// its first words, which is the behaviour this improves on rather than one it
+/// has to guarantee.
+async fn name_a_call_that_ran_no_turn(engine: &crate::engine::LucidosEngine, thread_id: Uuid) {
+    let store = engine.event_store();
+    if store
+        .thread_has_message_received(thread_id)
+        .await
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let id = thread_id.to_string();
+    if store.thread_has_title(&id).await.unwrap_or(true) {
+        return;
+    }
+    engine.spawn_title_generation(&id).await;
 }
 
 /// Decide whether this thread may take a call, and claim its slot if so.

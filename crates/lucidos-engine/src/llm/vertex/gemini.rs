@@ -54,37 +54,7 @@ impl VertexProvider {
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse Gemini search response: {}", e))?;
 
-        // Extract the grounded text answer
-        let answer = parsed["candidates"][0]["content"]["parts"]
-            .as_array()
-            .and_then(|parts| {
-                parts
-                    .iter()
-                    .find_map(|p| p["text"].as_str().map(|s| s.to_string()))
-            })
-            .unwrap_or_default();
-
-        // Extract grounding chunks (sources with URL and title)
-        let metadata = &parsed["candidates"][0]["groundingMetadata"];
-        let chunks = metadata["groundingChunks"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-
-        let mut sources: Vec<(String, String)> = Vec::new();
-        for chunk in chunks.iter().take(max_results) {
-            let title = chunk["web"]["title"].as_str().unwrap_or("Untitled");
-            let uri = chunk["web"]["uri"].as_str().unwrap_or("");
-            if !uri.is_empty() {
-                sources.push((title.to_string(), uri.to_string()));
-            }
-        }
-
-        // Shared with the Anthropic and OpenAI backends so all three render one
-        // shape; hand-rolling it here is what let this backend drift.
-        Ok(crate::llm::web_search::format_search_result(
-            &answer, &sources,
-        ))
+        grounded_search_result(&parsed, max_results)
     }
 
     pub(super) async fn chat_gemini(
@@ -171,6 +141,69 @@ impl VertexProvider {
 
         Ok(response)
     }
+}
+
+/// Render a Gemini grounding response into the shared search-result shape.
+///
+/// A 200 with no candidate is an ERROR, not an empty web. So is a candidate
+/// that stopped for a reason other than `STOP` with nothing to show. The
+/// shared "no results" line returns `Ok`, and `WebSearchChain` treats `Ok` as
+/// terminal: a safety block on Vertex would stop the chain and tell the user
+/// nothing exists, with Anthropic and OpenAI never tried. Same guard
+/// `web_search::anthropic` and `web_search::openai` already carry.
+fn grounded_search_result(
+    parsed: &serde_json::Value,
+    max_results: usize,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(candidate) = parsed["candidates"].as_array().and_then(|c| c.first()) else {
+        let reason = parsed["promptFeedback"]["blockReason"]
+            .as_str()
+            .unwrap_or("no candidates returned");
+        return Err(format!("Gemini search returned no answer ({reason})").into());
+    };
+
+    // The grounded text answer.
+    let answer = candidate["content"]["parts"]
+        .as_array()
+        .and_then(|parts| {
+            parts
+                .iter()
+                .find_map(|p| p["text"].as_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_default();
+
+    // Grounding chunks: the sources, with URL and title.
+    let chunks = candidate["groundingMetadata"]["groundingChunks"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for chunk in chunks.iter().take(max_results) {
+        let title = chunk["web"]["title"].as_str().unwrap_or("Untitled");
+        let uri = chunk["web"]["uri"].as_str().unwrap_or("");
+        if !uri.is_empty() {
+            sources.push((title.to_string(), uri.to_string()));
+        }
+    }
+
+    let finish_reason = candidate["finishReason"].as_str();
+    if answer.trim().is_empty()
+        && sources.is_empty()
+        && !matches!(finish_reason, None | Some("STOP"))
+    {
+        return Err(format!(
+            "Gemini search stopped with finishReason {} before returning any result",
+            finish_reason.unwrap_or("unknown")
+        )
+        .into());
+    }
+
+    // Shared with the Anthropic and OpenAI backends so all three render one
+    // shape; hand-rolling it here is what let this backend drift.
+    Ok(crate::llm::web_search::format_search_result(
+        &answer, &sources,
+    ))
 }
 
 /// Build the `generationConfig.thinkingConfig` for a Gemini call. Only Gemini 3.x
@@ -1100,6 +1133,73 @@ mod tests {
         );
         // Unknown falls back to "high" — the model default.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "bogus"), "high");
+    }
+
+    /// A safety block is a 200 with no candidate. Reporting it as "no results"
+    /// returns `Ok`, and the chain stops there: Vertex leads the chain, so
+    /// Anthropic and OpenAI would never be asked.
+    #[test]
+    fn a_blocked_grounding_response_is_an_error_not_an_empty_search() {
+        let body = serde_json::json!({
+            "promptFeedback": { "blockReason": "SAFETY" }
+        });
+        let err = grounded_search_result(&body, 5)
+            .expect_err("a blocked query must fall through to the next backend")
+            .to_string();
+        assert!(err.contains("SAFETY"), "{err}");
+    }
+
+    /// The same for a candidate that stopped early with nothing to show. The
+    /// answer and the sources are both empty, so there is no partial result to
+    /// keep and no reason to end the chain.
+    #[test]
+    fn a_non_stop_finish_reason_with_no_result_is_an_error() {
+        for reason in ["SAFETY", "RECITATION", "BLOCKLIST", "MAX_TOKENS"] {
+            let body = serde_json::json!({
+                "candidates": [{ "content": { "parts": [] }, "finishReason": reason }]
+            });
+            match grounded_search_result(&body, 5) {
+                Err(e) => assert!(e.to_string().contains(reason), "{e}"),
+                Ok(rendered) => {
+                    panic!(
+                        "finishReason {reason} with no result must be an error, got {rendered:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    /// A genuinely empty search still succeeds, so the chain stops instead of
+    /// re-billing the same query on every remaining backend.
+    #[test]
+    fn an_empty_but_finished_grounding_response_stays_ok() {
+        let body = serde_json::json!({
+            "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }]
+        });
+        assert_eq!(
+            grounded_search_result(&body, 5).unwrap(),
+            "No search results found."
+        );
+    }
+
+    /// Partial output is kept: a stopped candidate that still carried sources
+    /// is worth returning, exactly as the Anthropic and OpenAI guards do it.
+    #[test]
+    fn a_grounded_answer_renders_with_its_sources() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Rust 1.99 shipped." }] },
+                "finishReason": "MAX_TOKENS",
+                "groundingMetadata": {
+                    "groundingChunks": [
+                        { "web": { "title": "Release notes", "uri": "https://example.com/rust" } }
+                    ]
+                }
+            }]
+        });
+        let rendered = grounded_search_result(&body, 5).expect("a real answer is a success");
+        assert!(rendered.contains("Rust 1.99 shipped."), "{rendered}");
+        assert!(rendered.contains("https://example.com/rust"), "{rendered}");
     }
 
     #[test]

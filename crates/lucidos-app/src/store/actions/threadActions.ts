@@ -244,7 +244,9 @@ function tagAction(
         category: 'close',
         label: 'Archive',
         // handleArchiveThread confirms internally only when the thread is saved.
-        invoke: () => void handleArchiveThread(threadId),
+        // Its promise is returned, not voided: the close cascade and the delete
+        // dialog's Archive both await this to know the archive finished.
+        invoke: () => handleArchiveThread(threadId),
       };
     case 'save':
       return {

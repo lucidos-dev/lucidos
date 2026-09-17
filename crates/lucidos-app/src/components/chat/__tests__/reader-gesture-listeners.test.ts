@@ -10,7 +10,7 @@ import {
   readerGestureForTest,
   setActiveScrollElement,
   setFollowLiveEdge,
-  setThreadLive,
+  setAgentLive,
   stopFollowingBottom,
 } from '../scrollState';
 
@@ -82,7 +82,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     };
     stopFollowingBottom();
     setActiveScrollElement(null);
-    setThreadLive(true);
+    setAgentLive(true);
     readerGestureForTest(null, false);
     vi.useFakeTimers();
   });
@@ -287,7 +287,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     // like. Growth on an idle thread is the transcript finishing its own
     // rendering (`followIsCarrying`), so it carries nobody.
     const { el, onScroll, onResize } = ridingAndAnchored();
-    setThreadLive(false);
+    setAgentLive(false);
 
     el.fire('focusin', { target: { nodeName: 'BUTTON' } });
     platformScrollsTo(el, 400, onScroll);

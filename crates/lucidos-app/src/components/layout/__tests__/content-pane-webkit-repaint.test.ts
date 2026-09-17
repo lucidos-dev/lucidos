@@ -110,23 +110,38 @@ describe('ContentPane iOS resume repaint', () => {
     }
   });
 
-  it('skips the app-ui overlay on the repaint path', () => {
+  it('skips only a pane something is FULLSCREEN over, nothing wider', () => {
     // `forceWebKitRepaint` writes a transform for one frame, which makes
-    // `.content-pane-body` the containing block for the pseudo-fullscreen app
-    // panel's `position: fixed` (`.app-ui-fullscreen`, rendered in-tree by
-    // AppUiInline), snapping a fullscreen app back to the pane's box for that
-    // frame. It also buys nothing there: that body is `overflow: hidden` around an
-    // iframe, so it is not the scroll container that blanks. One guard for the one
-    // repaint path; a second path would need its own.
-    const guards = contentPaneCode.match(/if\s*\(hostsAppUiIframe\(\)\)\s*return/g) ?? [];
+    // `.content-pane-body` the containing block for a `position: fixed`
+    // descendant. The pseudo-fullscreen panel (`.app-ui-fullscreen`, rendered
+    // in-tree by AppUiInline) is one, so the repaint would snap it back to the
+    // pane's box for that frame. One guard for the one repaint path; a second
+    // path would need its own.
+    const guards = contentPaneCode.match(/if\s*\(fullscreenCoversThePane\(\)\)\s*return/g) ?? [];
     expect(guards).toHaveLength(1);
   });
 
-  it('reads the overlay live in the guard, not the render-time isAppUi', () => {
+  it('does not skip an ordinary in-pane app', () => {
+    // It used to skip every app-ui overlay, which excluded the one view a deep
+    // link most often lands in: a banner tap to an app painted nothing. The
+    // hazard is fullscreen, so the predicate reads no overlay type at all.
+    const predicate = contentPaneCode.match(/function fullscreenCoversThePane\(\)[\s\S]*?\n}/)?.[0] ?? '';
+    expect(predicate).not.toMatch(/panelOverlay|'app-ui'/);
+  });
+
+  it('asks the DOM about native fullscreen, not the app-panel overlay mount', () => {
+    // `appFullscreenHost` is null whenever the fullscreen element is not an app
+    // panel of ours. An app that fullscreens its OWN content makes the iframe
+    // that element, and the pane is covered just the same.
+    expect(contentPaneCode).toMatch(/nativeFullscreenElement\(\)\s*!==\s*null/);
+    expect(contentPaneCode).not.toMatch(/appFullscreenHost\.peek/);
+  });
+
+  it('reads the fullscreen state live, not at render time', () => {
     // The resume subscription is mounted once with `[]` deps, so a captured
-    // `isAppUi` would be frozen at whatever the pane showed at mount and the guard
-    // would consult the wrong overlay forever after.
-    expect(contentPaneCode).toMatch(/function hostsAppUiIframe\(\)[\s\S]{0,120}?panelOverlay\.peek\(\)/);
+    // value would be frozen at whatever the pane showed at mount and the guard
+    // would consult the wrong state forever after.
+    expect(contentPaneCode).toMatch(/appPseudoFullscreen\.peek\(\)/);
   });
 
   it('uses the shared repaint utilities rather than a hand-rolled toggle', () => {

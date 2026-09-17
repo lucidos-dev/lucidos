@@ -109,17 +109,17 @@ describe('a call in progress says so', () => {
 
   /** A caller's question the talker delegated, with the doer still asleep. Its
    *  only step is the delegation marker. */
+  /** A delegated utterance in the shape the engine writes: the caller's own
+   *  words, then the talker's `WorkDelegated` starting the turn (ADR 0201). */
   function delegatedAndWaiting(): Map<number, StoredEvent> {
     return new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
       said(2, 'Hi there. How can I help?'),
-      ev(3, { type: 'WorkDelegated', session_id: 'sess-1', reason: 'Check the workspace.' }),
+      heard(3, "What's going on in the codebase today?"),
       ev(4, {
-        type: 'MessageReceived',
-        text: "What's going on in the codebase today?",
-        mode: 'human',
-        channel: 'chat',
-        voice_session_id: 'sess-1',
+        type: 'WorkDelegated',
+        session_id: 'sess-1',
+        reason: 'Check the workspace.',
         _eventId: MSG,
       }),
     ]);

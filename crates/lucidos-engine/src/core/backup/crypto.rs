@@ -182,17 +182,36 @@ pub fn load_key_file(path: &Path) -> Result<Option<Vec<u8>>, BoxError> {
 
 /// Save a key to a file as base64.
 ///
-/// Owner-only on Unix. This one file decrypts every cloud backup the workspace
-/// has ever uploaded, and a default umask would leave it world-readable.
+/// Owner-only on Unix, from the moment the file exists. This one file decrypts
+/// every cloud backup the workspace has ever uploaded, and a default umask
+/// would leave it world-readable.
+///
+/// The mode rides on the `open` rather than a `set_permissions` after the
+/// write. Chmodding second leaves the key at `0644` for a window on a shared
+/// host, and permanently if the engine is killed between the two calls:
+/// nothing on the read path ever re-applies the mode.
 pub fn save_key_file(path: &Path, key: &[u8]) -> Result<(), BoxError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, key_to_base64(key))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // `mode` applies only when THIS call creates the file, so an existing
+        // key left world-readable by an older engine keeps its mode. Re-apply
+        // it, rather than trusting the file we are about to overwrite.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(key_to_base64(key).as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, key_to_base64(key))?;
     }
     Ok(())
 }
@@ -401,6 +420,64 @@ mod tests {
 
         let loaded = load_key_file(&path).unwrap().unwrap();
         assert_eq!(key, loaded);
+    }
+
+    /// The saved key is owner-only, fresh and on rewrite. This one file
+    /// decrypts every cloud backup the workspace has ever uploaded.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/backup.key");
+        save_key_file(&path, &generate_key()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a fresh key file must be owner-only"
+        );
+
+        // A key an older engine left world-readable is narrowed on rewrite,
+        // because `mode` on the open applies only to a file this call creates.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key = generate_key();
+        save_key_file(&path, &key).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "rewriting an exposed key file must narrow it"
+        );
+        assert_eq!(load_key_file(&path).unwrap().unwrap(), key);
+    }
+
+    /// The key is CREATED owner-only, never created and then narrowed.
+    ///
+    /// No runtime assertion can see the difference: both shapes end at `0600`.
+    /// What differs is the mode the file exists at in between, which under the
+    /// usual `022` umask is `0644`. An engine killed in that window leaves it
+    /// there for good, since nothing on the read path re-applies the mode. So
+    /// the shape is pinned at the source, as `lucidos-installs` pins its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_created_owner_only_rather_than_chmodded_afterwards() {
+        let source = include_str!("crypto.rs");
+        let body = source
+            .split_once("pub fn save_key_file")
+            .expect("save_key_file must be declared here")
+            .1;
+        let unix_arm = body
+            .split_once("#[cfg(not(unix))]")
+            .expect("save_key_file must keep both platform arms")
+            .0;
+        assert!(
+            unix_arm.contains(".mode(0o600)"),
+            "the unix arm must set the mode on the open: {unix_arm}"
+        );
+        assert!(
+            !unix_arm.contains("fs::write("),
+            "a plain write creates the key at the umask's mode first: {unix_arm}"
+        );
     }
 
     /// The scheduled backup (and the manual path) rely on `ensure_key` to never

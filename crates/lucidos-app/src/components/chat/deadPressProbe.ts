@@ -236,7 +236,9 @@ type PressVerdict =
   | 'repaired'
   | 'repair-failed'
   | 'activated'
-  | 'keyboard-touch';
+  | 'keyboard-touch'
+  | 'covered'
+  | 'stray-click';
 
 /** How often the reachability question may be asked.
  *
@@ -286,11 +288,19 @@ interface QuietWindow {
   ms: number;
   checks: number;
   unreachable: number;
+  /** Checks that asked nothing, because the app's own cover was up.
+   *
+   *  The thirteenth episode is why. A cover makes every reading here decline,
+   *  and declining used to be silent. So a stuck cover and a dead touch
+   *  pipeline wrote the same nothing. This number tells them apart across a
+   *  silence, which is the one stretch neither can be asked about. */
+  covered: number;
 }
 
 let lastInputAt: number | null = null;
 let checksSinceInput = 0;
 let unreachableSinceInput = 0;
+let coveredSinceInput = 0;
 let quiet: QuietWindow | null = null;
 
 /** Close the running quiet window and open a fresh one. Called for every
@@ -301,11 +311,13 @@ function noteInput(now: number): void {
       ms: Math.round(now - lastInputAt),
       checks: checksSinceInput,
       unreachable: unreachableSinceInput,
+      covered: coveredSinceInput,
     };
   }
   lastInputAt = now;
   checksSinceInput = 0;
   unreachableSinceInput = 0;
+  coveredSinceInput = 0;
 }
 
 /** The engine-log breadcrumb, written for EVERY press the probe watches.
@@ -342,6 +354,9 @@ function recordPress(facts: {
   /** `screenOffset` for this press. The one reading not taken from the layout
    *  side, so a page hit-testing away from the glass says so here. */
   screenOff?: { x: number; y: number };
+  /** Which cover the app had up when it declined to judge the press. Only the
+   *  `covered` branch fills it. */
+  cover?: string;
   /** Written with no user input behind it, by the scheduled check. */
   scheduled?: boolean;
   /** Whether the relayout actually ran. A `repair-failed` that never nudged
@@ -381,30 +396,131 @@ function recordPress(facts: {
  *  report describes. */
 let lastStrayTouchAt = Number.NEGATIVE_INFINITY;
 
-function noteStrayTouch(
-  t: { clientX: number; clientY: number; screenX: number; screenY: number },
-  target: Element | null,
-  rowRect: ProbeRect | null,
-): void {
-  if (!readViewport().keyboardActive) return;
-  const now = Date.now();
-  if (now - lastStrayTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
-  lastStrayTouchAt = now;
+/** A touch as an UNRULED line carries it: where the finger was reported, what
+ *  answered there, the offset between the two coordinate spaces, and the row it
+ *  did not reach. Every verdict without a pressed face wants all four. */
+type ProbeTouch = { clientX: number; clientY: number; screenX: number; screenY: number };
+
+function touchLanding(t: ProbeTouch, rowRect: ProbeRect | null) {
   const point = { x: Math.round(t.clientX), y: Math.round(t.clientY) };
-  recordPress({
-    face: describe(target) ?? 'nothing',
-    verdict: 'keyboard-touch',
-    movedPx: 0,
+  return {
     point,
     screenOff: screenOffset(t),
     elementAtPoint: describe(document.elementFromPoint(point.x, point.y)),
     rowRect,
+  };
+}
+
+function noteStrayTouch(t: ProbeTouch, target: Element | null, rowRect: ProbeRect | null): void {
+  if (!readViewport().keyboardActive) return;
+  const now = Date.now();
+  if (now - lastStrayTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
+  lastStrayTouchAt = now;
+  recordPress({
+    face: describe(target) ?? 'nothing',
+    verdict: 'keyboard-touch',
+    movedPx: 0,
+    ...touchLanding(t, rowRect),
   });
 }
 
+/** A touch that reached the composer's row while the app's own cover was up.
+ *
+ *  The third meaning a blank ledger has carried. `coveredOnPurpose` makes every
+ *  reading below decline, and declining used to write nothing. So a press the
+ *  probe REFUSED read exactly like a press that never arrived.
+ *
+ *  Only for a touch the probe would otherwise have ruled. A tap anywhere else
+ *  under a cover is the user working the overlay. A line per menu item is the
+ *  noise that made the eleventh round stand this down in the first place.
+ *
+ *  Throttled with the stray touch above, since a cover persists and a flick
+ *  under one buys nothing a single line does not. */
+let lastCoveredTouchAt = Number.NEGATIVE_INFINITY;
+
+function noteCoveredTouch(t: ProbeTouch, rowRect: ProbeRect | null): void {
+  const now = Date.now();
+  if (now - lastCoveredTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
+  lastCoveredTouchAt = now;
+  recordPress({
+    face: 'the row',
+    verdict: 'covered',
+    movedPx: 0,
+    cover: coverOverShell(),
+    ...touchLanding(t, rowRect),
+  });
+}
+
+/** A click with no touch behind it that reached no composer face.
+ *
+ *  The click-side twin of `keyboard-touch`, and the last silent path an input
+ *  could take. `click-no-touch` already names a touchless click that LANDS on a
+ *  face, which is the page taking clicks while the gesture pipeline is dead.
+ *  One that lands anywhere else says the same about the pipeline, and it also
+ *  says the page hit-tested it somewhere the composer is not.
+ *
+ *  Gated exactly as `noteStrayTouch` is: only while the keyboard is up, and
+ *  never under a cover. Without that gate this is not the rare verdict it reads
+ *  as. Two ordinary gestures produce a touchless click: a press held past the
+ *  touch-behind window, and a POINTER click on a touch-capable laptop. The
+ *  second writes a line per click, and a ledger whose value is that a line is
+ *  unusual cannot afford that. */
+let lastStrayClickAt = Number.NEGATIVE_INFINITY;
+
+/** A click's landing, or null when it carries no coordinates.
+ *
+ *  A programmatic `HTMLElement.click()` dispatches with zeroes. Reading those
+ *  as a point would put a hit test at the top-left corner of the screen into
+ *  the line. Null says the click had no place.
+ *
+ *  `screenOff` rides along because a `MouseEvent` carries both spaces, and the
+ *  gap between them is the one reading this module does not take from layout.
+ *  A verdict about the page hit-testing elsewhere needs it most of all. */
+interface ClickLanding {
+  point: { x: number; y: number };
+  screenOff: { x: number; y: number };
+}
+
+function clickLanding(e: {
+  clientX?: number; clientY?: number; screenX?: number; screenY?: number;
+}): ClickLanding | null {
+  const { clientX: x, clientY: y } = e;
+  if (typeof x !== 'number' || typeof y !== 'number') return null;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (x === 0 && y === 0) return null;
+  const screenX = typeof e.screenX === 'number' ? e.screenX : x;
+  const screenY = typeof e.screenY === 'number' ? e.screenY : y;
+  return {
+    point: { x: Math.round(x), y: Math.round(y) },
+    screenOff: screenOffset({ screenX, screenY, clientX: x, clientY: y }),
+  };
+}
+
+function noteStrayClick(target: Element | null, at: ClickLanding | null): void {
+  if (!readViewport().keyboardActive) return;
+  if (coveredOnPurpose()) return;
+  const now = Date.now();
+  if (now - lastStrayClickAt < STRAY_TOUCH_THROTTLE_MS) return;
+  lastStrayClickAt = now;
+  recordPress({
+    face: describe(target) ?? 'nothing',
+    verdict: 'stray-click',
+    movedPx: 0,
+    point: at?.point,
+    screenOff: at?.screenOff,
+    elementAtPoint: at ? describe(document.elementFromPoint(at.point.x, at.point.y)) : null,
+    rowRect: roundRect(watchableRow()?.getBoundingClientRect() ?? null),
+  });
+}
+
+/** The morph node, or null in the modes that do not render it. One reader, so
+ *  the selector is written once and two callers cannot ask about two nodes. */
+function morphElement(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
+}
+
 /** The morph button as the DOM currently holds it. */
-function readMorphState(): MorphState {
-  const el = document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
+function readMorphState(el = morphElement()): MorphState {
   return morphStateOf({
     present: !!el,
     placeholder: !!el?.classList.contains('morph-placeholder'),
@@ -413,31 +529,64 @@ function readMorphState(): MorphState {
   });
 }
 
-/** Run Send for a press the page dropped, and say whether it did.
+/** The row's one live COMMIT face: the button that sends what the user typed.
+ *
+ *  Two faces qualify and the row renders exactly one of them. The Send morph
+ *  while it is in `send` mode, and the answer Submit while a question is
+ *  pending. `PromptInput` chooses between them at one JSX position, so the two
+ *  are never in the document together. That is why the morph is asked about
+ *  first: its ABSENCE is what says the row is in answer mode.
+ *
+ *  Not `computeMorphMode`, which answers `send` for a typed answer just as it
+ *  does for a typed message. The mode says what the morph WOULD show, and the
+ *  choice above is what decides whether it is drawn at all.
+ *
+ *  NOTHING else in the row. A destructive face must never run on a tap nobody
+ *  saw land, and Apply wears the same confirm styling while merging a change
+ *  nobody approved.
+ *
+ *  The thirteenth episode is what this widening is for. It was in answer mode,
+ *  where the rescue below had no face to run and did nothing but relayout. */
+interface CommitFace {
+  el: HTMLButtonElement;
+  /** What the toast calls the action. The accessible name reads as a label
+   *  rather than a verb, and this sentence needs the verb. */
+  action: string;
+}
+
+function commitFace(): CommitFace | null {
+  const morph = morphElement();
+  if (morph) return readMorphState(morph) === 'send' ? { el: morph, action: 'Send' } : null;
+  const submit = document.querySelector<HTMLButtonElement>(
+    `${ROW_SELECTOR} [aria-label="Submit answer"]`,
+  );
+  return submit ? { el: submit, action: 'Submit' } : null;
+}
+
+/** Run the commit face for a press the page dropped, and say which it ran.
  *
  *  The app knows enough to do this. A touch reached the document, its
- *  coordinates were inside the composer row, no button claimed it, and Send is
- *  live with a draft behind it. Relaying out the shell helps the NEXT tap. This
- *  is what answers the one the user just made (ADR 0183).
+ *  coordinates were inside the composer row, no button claimed it, and the face
+ *  is live with a draft behind it. Relaying out the shell helps the NEXT tap.
+ *  This is what answers the one the user just made (ADR 0183).
  *
  *  Four bounds, and each is a state where the intent is not certain. Nothing
- *  may be covering the composer. SEND mode only, so a dropped tap can never
+ *  may be covering the composer. A commit face only, so a dropped tap can never
  *  stop a running turn. The keyboard must be UP, which is the state every
- *  report describes. And the morph is re-read at the moment of firing. A
- *  second tap that got through has already moved it off `send`. */
-function rescueSend(): boolean {
+ *  report describes. And the row is re-read at the moment of firing. A second
+ *  tap that got through has already moved it off a commit face. */
+function rescueCommit(): CommitFace | null {
   // A cover can go up in the grace window between the tap and this, and a
   // synthetic click ignores it. Under one, the composer is unreachable by
   // design and the user is looking at something else.
-  if (coveredOnPurpose()) return false;
-  if (readMorphState() !== 'send') return false;
-  if (!readViewport().keyboardActive) return false;
-  const el = document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
-  if (!el || el.disabled || !el.isConnected) return false;
-  // The morph's click path asks its tap gate, and a gate holding no press
-  // counts as a tap: that is how a keyboard Enter activates. See `createTapGate`.
-  el.click();
-  return true;
+  if (coveredOnPurpose()) return null;
+  if (!readViewport().keyboardActive) return null;
+  const face = commitFace();
+  if (!face || face.el.disabled || !face.el.isConnected) return null;
+  // The face's click path asks its tap gate, and a gate holding no press counts
+  // as a tap: that is how a keyboard Enter activates. See `createTapGate`.
+  face.el.click();
+  return face;
 }
 
 /** The composer's action row, and the faces inside it a press may activate.
@@ -626,19 +775,31 @@ function watchableRow(): HTMLElement | null {
  *  the moment it answers again, so a state that returns reports again. */
 const reportedUnreachable = new Set<string>();
 
-/** Is something MEANT to be over the row? The probe answers no question through
- *  a cover the app raised on purpose.
+/** Which cover the app has raised over the row, or the empty string for none.
  *
  *  An open overlay inerts the shell behind it, and a client refresh dims and
  *  locks the whole page until the reload lands. A face under either is
- *  unreachable by design. Reporting it is a false alarm, and the episode's one
- *  repair goes on a layout nobody is waiting for.
+ *  unreachable BY DESIGN. Calling that a wedge is a false alarm, and the
+ *  episode's one repair then goes on a layout nobody is waiting for.
  *
  *  The refresh half was missing, so a user got the wedge report naming
- *  `div.ui-blocking-overlay`, stacked over the app's own "Refreshing" status. */
-function coveredOnPurpose(): boolean {
+ *  `div.ui-blocking-overlay`, stacked over the app's own "Refreshing" status.
+ *
+ *  It answers with a NAME rather than a flag, because declining to judge is not
+ *  a reason to say nothing. A press the probe refused under a cover writes a
+ *  line carrying which cover refused it. */
+function coverOverShell(): string {
   const root = document.documentElement;
-  return root.hasAttribute('data-overlay-open') || root.hasAttribute('data-ui-blocked');
+  const open = root.hasAttribute('data-overlay-open');
+  const blocked = root.hasAttribute('data-ui-blocked');
+  if (open && blocked) return 'data-overlay-open data-ui-blocked';
+  if (open) return 'data-overlay-open';
+  if (blocked) return 'data-ui-blocked';
+  return '';
+}
+
+function coveredOnPurpose(): boolean {
+  return coverOverShell() !== '';
 }
 
 /** The first watchable face the browser does not answer with at its own centre,
@@ -862,6 +1023,10 @@ function runScheduledCheck(): void {
   const faces = watchableFaces();
   if (faces.length === 0) return;
   checksSinceInput += 1;
+  // Asked here as well as inside the check, so a stand-down is COUNTED rather
+  // than merely silent. A cover holding for a whole quiet window is the reading
+  // that separates our own bookkeeping from the platform.
+  if (coveredOnPurpose()) { coveredSinceInput += 1; return; }
   const unreachable = firstUnreachableFace(faces);
   if (!unreachable) return;
   unreachableSinceInput += 1;
@@ -1041,18 +1206,19 @@ export function installDeadPressProbe(): void {
   const ruleMissedPress = (miss: ArmedMiss) => {
     if (miss.movedPx > TAP_MOVE_THRESHOLD_PX) return;
     // The grace window first. A click still on its way means the press was not
-    // dead, and running Send over it would send the draft twice.
+    // dead, and running the commit face over it would send the draft twice.
     if (missSettle !== null) clearTimeout(missSettle);
     missSettle = setTimeout(() => {
       missSettle = null;
-      if (rescueSend()) {
+      const ran = rescueCommit();
+      if (ran) {
         recordPress({
-          face: 'Send message',
+          face: nameOf(ran.el),
           verdict: 'activated',
           movedPx: miss.movedPx,
           toasted: true,
         });
-        showToast('That tap did not register, so Send was run for you.', 'warning');
+        showToast(`That tap did not register, so ${ran.action} was run for you.`, 'warning');
       }
       // The relayout runs either way: it is what the NEXT tap needs.
       if (miss.target) attemptRepair(miss.target, false, false);
@@ -1117,10 +1283,14 @@ export function installDeadPressProbe(): void {
     const faces = every.filter((btn) => exclusionOf(btn) === 'watchable');
     const pressed = faces.find((f) => !!target && (target === f || f.contains(target)));
     if (!pressed) {
-      // Something is over the row on purpose, so no reading here means anything.
-      // The cover answers at the composer's own pixels, and both reports below
-      // would name it.
-      if (coveredOnPurpose()) return;
+      // Something is over the row on purpose, so no JUDGEMENT here means
+      // anything. The cover answers at the composer's own pixels, and both
+      // reports below would name it.
+      //
+      // Declining to judge is not declining to speak. A touch that reached the
+      // row under a cover takes the `covered` line below, which is the state
+      // round 11 left indistinguishable from silence.
+      const covered = coveredOnPurpose();
       // The reachability question comes FIRST, in front of the row-attribution
       // gate below. It is the one check immune to a coordinate space out of
       // step with layout. For two rounds it sat behind the very gate such a
@@ -1130,7 +1300,7 @@ export function installDeadPressProbe(): void {
       // gate. A wedge would otherwise put a `missed` line under every touch in
       // the app for as long as it lasted.
       const now = Date.now();
-      if (now - lastReachabilityAt >= REACHABILITY_THROTTLE_MS) {
+      if (!covered && now - lastReachabilityAt >= REACHABILITY_THROTTLE_MS) {
         lastReachabilityAt = now;
         const unreachable = firstUnreachableFace(faces);
         if (unreachable) {
@@ -1156,7 +1326,17 @@ export function installDeadPressProbe(): void {
       // A touch that is neither still gets ONE line while the keyboard is up.
       // That is the blind spot: the composer being untappable and the page
       // taking no touch at all used to be the same silence.
-      if (!onRow && !inRow) { noteStrayTouch(touch, target, roundRect(rowRect)); return; }
+      //
+      // Under a cover it gets none. The user is working the overlay, and a line
+      // per tap inside one is the noise round 11 stood this whole branch down
+      // to avoid.
+      if (!onRow && !inRow) {
+        if (!covered) noteStrayTouch(touch, target, roundRect(rowRect));
+        return;
+      }
+      // The press reached the composer and the app itself is holding a cover
+      // over it. Nothing below can judge that, so say it instead.
+      if (covered) { noteCoveredTouch(touch, roundRect(rowRect)); return; }
       // One layout read per watchable face. Three questions here are about the
       // same boxes: which face the finger was on, the box the line carries, and
       // the distance it missed by. Each used to re-measure them.
@@ -1406,7 +1586,13 @@ export function installDeadPressProbe(): void {
     if (!isMobile() || !isTouchDevice()) return;
     if (touchBehind) return;
     const face = watchableFaces().find((f) => target === f || f.contains(target));
-    if (!face) return;
+    // A touchless click that reached no face used to return in silence, which
+    // is the last of the three silences an input could disappear into. It says
+    // the same thing about the pipeline and more about the hit test.
+    if (!face) {
+      noteStrayClick(target, clickLanding(e));
+      return;
+    }
     // No toast. The click RAN the button's action, so the user got what they
     // asked for. What the line records is that they got it through the path
     // that was still alive.

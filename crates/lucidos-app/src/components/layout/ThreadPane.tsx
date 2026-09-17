@@ -1,10 +1,15 @@
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsComposing, composeViewActive } from '../../store/store';
+import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsComposing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
 import { prefersReducedMotion } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
+
+/** The compose-to-thread prompt slide, at 1x. Both inline transitions and the
+ *  safety timer below scale from this one base. So the app's most prominent
+ *  animation obeys the speed slider, like every pane and toast around it. */
+const PROMPT_FLIP_MS = 300;
 
 export function ThreadPane() {
   const tid = focusedThreadId.value;
@@ -113,17 +118,20 @@ export function ThreadPane() {
 
     // Safety timeout: if transitionend doesn't fire (e.g. element off-screen
     // on mobile during pane swipe), clear the gate so content isn't hidden.
-    let safetyTimer = setTimeout(clearAnimation, 400);
+    // The 100ms slack sits OUTSIDE the scaled call: it is a fixed margin, not
+    // animation, so scaling it would balloon to dead time at 0.1x.
+    let safetyTimer = setTimeout(clearAnimation, scaledDurationMs(PROMPT_FLIP_MS) + 100);
 
     let raf1: number | undefined;
     let raf2: number | undefined;
     raf1 = requestAnimationFrame(() => {
       raf2 = requestAnimationFrame(() => {
         el.addEventListener('transitionend', onTransitionEnd);
-        el.style.transition = 'transform 0.3s ease';
+        const flipMs = scaledDurationMs(PROMPT_FLIP_MS);
+        el.style.transition = `transform ${flipMs}ms ease`;
         el.style.transform = '';
         if (animateHeight && ta) {
-          ta.style.transition = 'height 0.3s ease';
+          ta.style.transition = `height ${flipMs}ms ease`;
           ta.style.height = `${newHeight}px`;
         }
       });

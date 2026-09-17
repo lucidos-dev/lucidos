@@ -956,8 +956,11 @@
     /* Edge swipe zones: transparent strips at screen edges that sit above
        iframes so touch events reach the parent swipe handler. Without these,
        iframes capture all touches and pane navigation doesn't work.
-       Left zone is wider (2.5rem / 40px) so the "back" swipe gesture is easy
-       to initiate — Apple's HIG recommends 44px minimum touch targets. */
+       Left zone is wider (2.5rem) so the "back" swipe gesture is easy to
+       initiate: Apple's HIG recommends 44px minimum touch targets, which
+       2.5rem clears at the mobile root size. The px equivalent moves with the
+       user's UI scale, so `MobileSwipeContainer` mirrors these in rem and
+       multiplies by the live root size. */
     .edge-swipe-zone {
         position: absolute;
         top: 0;

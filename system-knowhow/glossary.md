@@ -214,6 +214,11 @@ with, so it takes no base URL and no header. A *webhook* signing secret is the
 first of them, and generating one from **Settings > Webhooks** saves it here.
 See also: *connected account*, *environment variable*, *config*, *webhook*.
 
+### Cross-gateway link
+A link to a *thread* in a *workspace* your OTHER Lucidos install serves. Almost every machine runs one install, and there no link is ever cross-gateway. A machine running the packaged app beside a dev checkout runs two, each with its own workspaces. A link written in one used to say the other's workspace was not available.
+
+It opens in a tab on that install's own address, port and all. That install checks the browser itself, so a browser it has never met lands on its pairing screen rather than in the workspace: pairing is per gateway, see *paired device*. You reach it from the machine, or from wherever you reach Lucidos on its own port. Through a forwarded address (`tailscale serve`, an ssh tunnel) only one install is on the far end. There the link says where the workspace lives, rather than opening a tab that cannot load. A workspace neither install has heard of still says it is not available.
+
 ### Disabled tool
 One tool on an *MCP* server that the user switched off, so the *Lucidos Agent*
 is never offered it. Distinct from stopping the whole server: the rest of that
@@ -250,7 +255,7 @@ Permanently removing a *thread*, its *sub-threads*, everything said in them, and
 
 Offered in the Lucidos UI to the workspace owner only, in the thread's own ⋯ menu. **Never to the *Lucidos Agent* or a *coding-agent thread***. There is no tool, CLI verb or SDK method for it. The route refuses any caller that is not a signed-in device, including one carrying the owner's *standing instruction*.
 
-It cascades over the family like *cascading archive*. The refusal is the same: no member may be running, waiting on an answer, or holding a pending *change*. One confirmation names how many threads go, then they are gone.
+It cascades over the family like *cascading archive*. The refusal is the same: no member may be running, waiting on an answer, or holding a pending *change*. One confirmation names how many threads go, then they are gone. That confirmation also offers **Archive instead**, wherever Archive is still available for the thread.
 
 Distinct from discarding a draft, which throws away a thread that was never sent.
 See also: `docs/adr/0192-thread-delete-is-the-one-sanctioned-removal.md`.
@@ -342,6 +347,8 @@ An outside program that offers the *Lucidos Agent* extra tools over the Model Co
 Two things about that page are easy to misread. **Nothing starts an MCP server when the engine starts.** A server only ever runs for the current session, and a restart switches them all off. That is why the page labels a live one "Running, this session". A **stopped** server still has a cost worth knowing, because its tool list is cached from the last successful connect: the page states that figure conditionally, stamped with when the tools were last seen. A server nobody has ever connected to says so instead of showing zero.
 
 Every enabled tool's definition rides on every request, so a server with forty tools is a permanent per-turn tax. The page gives two levers: switch the whole server off, or switch off a single *disabled tool*. It also holds the allowlist behind the *MCP permission card*, since a pattern there names a server and a tool.
+
+**Starting or stopping one reaches a turn already running.** The agent can start a server mid-answer and use its tools in the same answer, without being sent another message. Switch a server off while it is working and its tools go, so the very next thing the agent does is already without them.
 
 A server whose stored id cannot be used on the wire is shown as unusable and offers only Remove. Nothing on it can ever be called, whatever it is started or stopped. See *wire tool name* in the developer glossary for why an id has that restriction.
 
@@ -763,7 +770,7 @@ A *child follow-up* the parent marked `urgent: true`, which stops the child's cu
 See also: *child follow-up*, *coding agent*.
 
 ### Call toggle
-The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*. One control for both directions: press it to call, press it again to ring off. It turns red while a call is up, because that is what the next press does.
+The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*. One control for both directions: press it to call, press it again to ring off. It wears the call: green while connecting, red while up because that is what the next press does, and grey while hanging up. A connect that takes a while says it is waiting for microphone access, which your browser asks for once per launch.
 
 It is a toggle rather than a microphone you hold down. The microphone is open for the whole call, and holding a button through a conversation is not how a call works. It sits in every prompt input, the compose view included, so voice has no entry point of its own.
 
@@ -788,6 +795,8 @@ While a call is up, the handset turns red, and there is no separate panel to wat
 **Speaking wakes the thread**, unless Lucidos answers you itself. A sentence it hands on lands as a message and starts an ordinary turn, the same one typing would. One it answers from what it already knows starts nothing, and is written down all the same.
 
 **You can answer out loud what Lucidos is waiting on.** A question it asked, or a permission it needs, is read to you on the call, and saying which one you want settles it. That writes the same thing the buttons on screen write. The two widest "Always allow" choices stay on screen only, so a permission by voice is allow once, allow for this conversation, or no. While something is waiting, a new request is not started: Lucidos is stuck inside the question, and says so.
+
+**How much of that you get depends on the talker.** A Realtime one settles everything out loud. GPT Live holds no tools, so it settles a question by sending what you actually said, word for word. That is what typing a reply under an open question does too. A permission there is a tap, and so is ringing off. The talker row in Settings says which you are on.
 
 **Saying you are done ends the call.** "That's all, thanks" rings off after the goodbye, and work already running keeps running.
 

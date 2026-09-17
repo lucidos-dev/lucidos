@@ -26,6 +26,15 @@ export type Exchange = {
    *  markers are stale — a pending TOOL step can still be resolved by a result
    *  that re-routes back by tool id. */
   continuationMoved?: boolean;
+  /** True when a running turn's continuation was handed to this exchange by a
+   *  boundary that STARTED no turn of its own.
+   *
+   *  One case today: a caller's utterance landing mid-turn. The doer keeps
+   *  working, and everything it emits from then on happened after those words,
+   *  so it reads below them (ADR 0201). The words started nothing. The card
+   *  still holds a turn, and `exchangeHoldsNoTurn` has to say so, or the
+   *  status machinery steps over the card the work is in. */
+  tookTheTurn?: boolean;
   /** `seq` of every tool call in this exchange that a permission card is
    *  holding, and of every one a decision refused. The renderer reads them at
    *  the `ToolCalled` / `CodingAgentToolCalled` case and emits `'blocked'` /
@@ -40,6 +49,18 @@ export type Exchange = {
    *  a thread that never sees one allocates nothing. */
   blockedStepSeqs?: Set<number>;
   deniedStepSeqs?: Set<number>;
+  /** What the talker's LIVE row in this exchange says right now.
+   *
+   *  A step whose TEXT moves under a stable identity, which is the one shape
+   *  the memo's step fingerprint cannot see. The row keeps its seq and the
+   *  step count does not change. Without this field every word after the first
+   *  render compares equal, and the bubble stops mid-sentence. The caller's own
+   *  bubble is the other such row, and `userBubbleText` covers that one.
+   *
+   *  Written by `withLiveCallRows` on the clone it already makes, so reading it
+   *  costs the memo nothing. Undefined on every exchange holding no live
+   *  reply, which is all of them outside a call. */
+  liveReplyText?: string;
   /** Mutation counter for the incremental grouping cache. The cached fold
    *  mutates Exchange objects IN PLACE on later appends (steps push,
    *  questionOvertaken flip, absorb re-anchor), so a memo comparing
@@ -168,23 +189,6 @@ export function exchangeUserMessage(exchange: Exchange): string {
   return '';
 }
 
-/** Derive the user channel from the exchange's user event.
- *  Reads the `channel` field from MessageReceived, or infers from event type. */
-export function exchangeUserChannel(exchange: Exchange): string | undefined {
-  const t = exchange.userEvent.type;
-  if (t === 'TriggerStarted') return 'trigger';
-  if (t === 'ContinuationStarted' || t === 'MissingHardeningDetected' || t === 'MergeConflictDetected') {
-    return 'claude_code';
-  }
-  if (t === 'ResponseAborted' || t === 'ResponseCanceled') {
-    // Boundary event — channel is the original thread's channel; leaving it
-    // undefined lets the caller fall back to thread meta when needed.
-    return undefined;
-  }
-  if (exchange.userEvent.type === 'MessageReceived') return exchange.userEvent.channel;
-  return undefined;
-}
-
 /** Change lifecycle event types — render as terminal initiator-only panels. */
 export type ChangeLifecycleType =
   | 'ChangeApplied' | 'ChangeDiscarded' | 'ChangeReverted' | 'ChangeApplyFailed';
@@ -199,30 +203,11 @@ export function isChangeLifecycleEvent(event: { type: string }): event is Change
   return CHANGE_LIFECYCLE_TYPES.has(event.type);
 }
 
-/** Who sent the user event. Maps `MessageReceived.mode` to the UI's binary
- *  user-vs-system distinction: `human` → user, `agent`/`engine` → system. */
-export function exchangeUserSource(exchange: Exchange): ThreadInitiator {
-  const ev = exchange.userEvent;
-  if (ev.type === 'MessageReceived') return modeToInitiator(ev.mode);
-  return isSystemExchange(exchange) ? 'system' : 'user';
-}
-
 /** Map an `ActorMode` to the UI's binary user-vs-system label.
  *  Undefined defaults to `'user'` (mirrors the engine's `default_mode_human`
  *  for old DB rows persisted before the `mode` field existed). */
 export function modeToInitiator(mode: ActorMode | undefined): ThreadInitiator {
   return mode === 'agent' || mode === 'engine' ? 'system' : 'user';
-}
-
-/** Whether this exchange was system-initiated (auto-recovery, auto-hardening,
- *  auto-merge, scheduled trigger, change lifecycle, abort/resume boundary)
- *  rather than user-initiated. */
-function isSystemExchange(exchange: Exchange): boolean {
-  const ev = exchange.userEvent;
-  return ev.type === 'ContinuationStarted' || ev.type === 'TriggerStarted'
-    || ev.type === 'MissingHardeningDetected' || ev.type === 'MergeConflictDetected'
-    || ev.type === 'ResponseAborted'
-    || isChangeLifecycleEvent(ev);
 }
 
 /** Extract user-pasted image hashes from the exchange's MessageReceived event.

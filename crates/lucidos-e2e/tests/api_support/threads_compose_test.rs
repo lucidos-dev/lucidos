@@ -163,7 +163,9 @@ async fn put_compose_updates_text_images_and_mode() {
         .put(compose_url(&id))
         .json(&json!({
             "text": "hello world",
-            "image_hashes": ["hash-1", "hash-2"],
+            // Real blob addresses: the engine refuses anything that is not
+            // 64 hex characters, since each entry rides every SSE frame.
+            "image_hashes": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
             "mode": "claude_code",
         }))
         .send()
@@ -173,8 +175,14 @@ async fn put_compose_updates_text_images_and_mode() {
 
     let (_state, text, images, mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "hello world");
-    assert_eq!(images[0], "hash-1");
-    assert_eq!(images[1], "hash-2");
+    assert_eq!(
+        images[0],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        images[1],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
     assert_eq!(mode.as_deref(), Some("claude_code"));
 }
 

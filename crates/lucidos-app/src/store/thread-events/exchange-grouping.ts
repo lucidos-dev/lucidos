@@ -2,6 +2,7 @@ import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
 import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
+import { isOneUtterance, joinSpoken } from './spokenMerge';
 import { isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
@@ -59,13 +60,109 @@ function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[
     if (at === -1) {
       out.push({ userEvent, userSeq: seq, steps: [] });
     } else {
-      // Cloned, never mutated: the fold's result is memoized, and pushing onto
-      // its array would make the live row permanent.
-      out[at] = { ...out[at], steps: [...out[at].steps, { seq, event: userEvent }] };
+      // Filed where it was SAID, by the rule the persisted row takes, so the
+      // swap moves nothing.
+      //
+      // Its moment is the browser's own clock, and every step it is ordered
+      // against carries the database's. That skew is the one this cannot
+      // close, and it is not bounded by a step: a device minutes behind files
+      // the bubble minutes too early, until the engine's row corrects it.
+      //
+      // Cloned, never mutated: the fold's result is memoized, and splicing
+      // into its array would make the live row permanent.
+      const steps = [...out[at].steps];
+      steps.splice(callRowIndex(steps, instantMicros(userEvent._displayCreated)), 0, {
+        seq,
+        event: userEvent,
+      });
+      out[at] = {
+        ...out[at],
+        steps,
+        liveReplyText: userEvent.type === 'SpokenReplyGenerated' ? userEvent.text : undefined,
+      };
     }
     seq += 1;
   }
   return out;
+}
+
+/**
+ * Where a call row belongs among an exchange's steps, given its own `created`.
+ *
+ * The row goes to the BOTTOM exchange rather than to `current`, so that
+ * exchange can already hold steps stamped after the words (ADR 0201). This
+ * walks to the first step that followed them.
+ *
+ * The END for a row with no stamp, and a step with no `created` is stepped
+ * over rather than compared. A session mark was never said, and a legacy row
+ * cannot say when it was, so both keep the placement they have always had.
+ *
+ * **Never INSIDE a run of streamed text**, which the renderer merges only
+ * while adjacent: a row dropped mid-run cuts one answer in two.
+ */
+function callRowIndex(steps: SequencedEvent[], saidAt: number | null): number {
+  if (saidAt === null) return steps.length;
+  let at = steps.length;
+  for (let i = 0; i < steps.length; i++) {
+    const landed = instantMicros(steps[i].event.created);
+    if (landed !== null && landed > saidAt) {
+      at = i;
+      break;
+    }
+  }
+  return runStartBefore(steps, at, steps[at]?.event);
+}
+
+/** Back out to the start of a run of streamed text, when the row would land
+ *  INSIDE one. `rightOf` is what follows it there.
+ *
+ *  **Both sides have to be text.** A row that merely FOLLOWS a finished run is
+ *  not inside it. Lifting it there puts a note above the whole answer it came
+ *  after, where the live row that drew it sat below.
+ *
+ *  One walk, two callers: a row filed by the clock and a row lifted back out
+ *  of a run the next delta extended. Two copies would let the same three
+ *  events land in different orders depending only on arrival timing. */
+function runStartBefore(
+  steps: SequencedEvent[],
+  at: number,
+  rightOf: { type: string } | undefined,
+): number {
+  if (!rightOf || !isStreamedText(rightOf)) return at;
+  let i = at;
+  while (i > 0 && isStreamedText(steps[i - 1].event)) i -= 1;
+  return i;
+}
+
+/** A step the renderer folds into the prose beside it, so two of them in a row
+ *  are one document rather than two. */
+function isStreamedText(event: { type: string }): boolean {
+  return event.type === 'TextStreamed' || event.type === 'CodingAgentTextStreamed';
+}
+
+/** Put one step at the end, keeping a run of streamed text whole.
+ *
+ *  A spoken row said mid-answer lands at the end of the run so far, because
+ *  nothing yet says the run continues. The next delta is what says so, and
+ *  this is where it lands: the row is lifted to the run's start rather than
+ *  left cutting one answer into two markdown documents.
+ *
+ *  Only a CALL row is ever lifted. Every other step belongs to the same turn
+ *  as the text around it, and its position says something about the work. */
+function appendStep(exchange: Exchange, seq: number, event: StoredEvent): void {
+  const steps = exchange.steps;
+  const last = steps.length - 1;
+  if (
+    isStreamedText(event)
+    && last >= 1
+    && CALL_ROW_TYPES.has(steps[last].event.type)
+    && isStreamedText(steps[last - 1].event)
+  ) {
+    const [lifted] = steps.splice(last, 1);
+    // `event` is the run's next delta, which is what says the run continues.
+    steps.splice(runStartBefore(steps, steps.length, event), 0, lifted);
+  }
+  steps.push({ seq, event });
 }
 
 /** The call's live rows as synthetic events, oldest first.
@@ -418,6 +515,7 @@ export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
  *  is missing. The caller then starts a new exchange, so the UPI still renders
  *  rather than vanishing. */
 function findAbsorbTarget(
+  state: GroupFoldState,
   current: Exchange | null,
   exchanges: Exchange[],
   event: StoredEvent,
@@ -429,9 +527,17 @@ function findAbsorbTarget(
     return current;
   }
   if (event.injected_message_id) {
-    return exchanges.find(ex =>
+    const own = exchanges.find(ex =>
       ex.userEvent.type === 'MessageReceived' && ex.userEvent._eventId === event.injected_message_id,
-    ) ?? null;
+    );
+    // The message's OWN card first, always. The absorb RE-ANCHORS that card to
+    // where the loop picked the message up. A redirect pointing at wherever
+    // the turn later moved would absorb into the wrong one.
+    //
+    // The fallback is for a CALL, whose turn anchors on the talker's
+    // `WorkDelegated` (ADR 0201). That is a step rather than a boundary, so no
+    // exchange wears the id and only the fold's redirect can find it.
+    return own ?? state.reqIdRedirect.get(event.injected_message_id) ?? null;
   }
   return null;
 }
@@ -513,10 +619,10 @@ function requestEventIdOf(event: { type: string }): string | undefined {
 
 /** The caller speaking, in either of the two events one utterance can be.
  *
- *  The talker fielding an utterance itself writes a `SpokenMessageReceived`.
- *  Delegating it writes a `MessageReceived` carrying `voice_session_id`. That
- *  field is the only thing marking a message as spoken, ADR 0148 adding no
- *  channel and no source value for voice.
+ *  Every caller utterance is a `SpokenMessageReceived` today, whatever the
+ *  talker does with it (ADR 0201). A row written before that carries the words
+ *  in a `MessageReceived` with `voice_session_id`, which is the only thing
+ *  marking such a message as spoken: ADR 0148 added no channel for voice.
  *
  *  **One predicate, because the reader cannot tell the two apart.** Both draw
  *  the same bubble and both open a boundary, so anything reasoning about "the
@@ -626,12 +732,17 @@ export function offerCallerUtterance(thread: ThreadState, text: string): void {
 
 /** True when this exchange draws a stretch of a call and holds no turn.
  *
- *  A spoken boundary starts nothing, so it owns nothing: not the events a
- *  running turn routes chronologically, not the live stream, not a place in the
- *  queue. Both the fold and the active-turn search step over it.
+ *  A spoken boundary STARTS nothing, so by default it owns nothing: not the
+ *  live stream, not a place in the queue. Both the fold and the active-turn
+ *  search step over it.
+ *
+ *  **Unless a running turn continued into it.** Starting a turn and holding
+ *  one are different facts, and only the second decides whose status this card
+ *  reports. See `Exchange.tookTheTurn`.
  *
  *  A DELEGATED utterance is deliberately not one of these. That one is a turn. */
 export function exchangeHoldsNoTurn(exchange: Exchange): boolean {
+  if (exchange.tookTheTurn) return false;
   if (isLiveUtteranceRow(exchange.userEvent)) return true;
   const type = exchange.userEvent.type;
   return type === 'SpokenMessageReceived' || type === 'SpokenReplyGenerated';
@@ -651,6 +762,90 @@ export function isCallBoundary(event: { type: string; voice_session_id?: string 
 export function toolUseIdOf(event: { type: string }): string | undefined {
   const id = (event as { tool_use_id?: string }).tool_use_id;
   return id ? id : undefined;
+}
+
+/** Grow a spoken row by a fragment that continues it, or answer null.
+ *
+ *  The rule is `spokenMerge.ts` and the glossary's § Spoken merge; this places
+ *  it. The row keeps the FIRST fragment's identity, so a merged bubble is that
+ *  row grown: its render key and its place in the transcript never move as the
+ *  rest of the sentence arrives.
+ *
+ *  **`created` advances to the NEWEST fragment**, which the identity does not.
+ *  So the gap is measured between neighbours, exactly as `push_spoken`
+ *  measures it, and a long run of quick pieces stays one utterance. Keeping
+ *  the first stamp timed a sentence out against its own opening word, and made
+ *  the two readers split it differently. The shared fixture cannot see that:
+ *  it pins the rule, and this is the caller.
+ *
+ *  Adjacency is the caller's job too: anything between two fragments means
+ *  they are two things said. */
+function grownSpokenRow(prev: StoredEvent, next: StoredEvent): StoredEvent | null {
+  if (prev.type !== next.type) return null;
+  if (prev.type !== 'SpokenMessageReceived' && prev.type !== 'SpokenReplyGenerated') return null;
+  if (isLiveCallRow(prev) || isLiveCallRow(next)) return null;
+  const sessions = prev as { session_id?: string };
+  if (sessions.session_id !== (next as { session_id?: string }).session_id) return null;
+  const from = instantMicros(prev.created);
+  const to = instantMicros(next.created);
+  if (from === null || to === null) return null;
+  if (!isOneUtterance((to - from) / 1_000_000, true)) return null;
+  const text = joinSpoken((prev as { text?: string }).text ?? '', (next as { text?: string }).text ?? '');
+  // `interrupted` describes how the row ENDED, so the newest piece owns it.
+  const interrupted = (next as { interrupted?: boolean }).interrupted;
+  return {
+    ...prev,
+    text,
+    created: next.created,
+    ...(interrupted === undefined ? {} : { interrupted }),
+  } as StoredEvent;
+}
+
+/** The step types that end a turn. A turn holding one is over.
+ *
+ *  Lives here rather than beside its render consumers, because the FOLD needs
+ *  the same answer: a turn that already ended has no continuation to hand to a
+ *  later exchange. */
+export const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'ResponseGenerated',
+  'ResponseFailed',
+  'ResponseCanceled',
+  'ResponseAborted',
+  'CodingAgentIdled',
+]);
+
+/** Is this exchange's turn still going, as far as its own steps say? */
+function stillRunning(exchange: Exchange): boolean {
+  return !exchange.steps.some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
+}
+
+/** Move a running turn's continuation from one exchange to a later one.
+ *
+ *  Called when a boundary opens under a turn that keeps going. Everything the
+ *  turn emits from here reads BELOW that boundary, which is where it happened.
+ *
+ *  Two writes, both needed. The loop moves any redirect that pointed at
+ *  `previous`, covering a turn that kept an ANCESTOR's req_id. Mapping
+ *  `previous`'s OWN anchor id is unconditional, and is the write that matters
+ *  when `previous` opened a fresh turn: its continuation streams under that
+ *  card's own id, so the moved entries are spurious leftovers. A redundant
+ *  entry is harmless, since nothing routes by an unused id. */
+function handOverTheTurn(
+  state: GroupFoldState,
+  previous: Exchange,
+  next: Exchange,
+  touched: Set<Exchange> | null,
+): void {
+  // Nothing else lands in `previous`, so a `Thinking` marker left pending
+  // there can never resolve on its own events. Record the handoff so rendering
+  // finalizes it. See `Exchange.continuationMoved`.
+  previous.continuationMoved = true;
+  touched?.add(previous);
+  for (const [reqId, exchange] of state.reqIdRedirect.entries()) {
+    if (exchange === previous) state.reqIdRedirect.set(reqId, next);
+  }
+  const anchorId = previous.userEvent._eventId;
+  if (anchorId) state.reqIdRedirect.set(anchorId, next);
 }
 
 /** Find an exchange by its anchor `_eventId`. Backward walk so an id collision
@@ -760,6 +955,22 @@ interface GroupFoldState {
   // 'awaiting-answer'. Route the resolution back to its divider by id.
   questionDividerOwners: Map<string, Exchange>;
   permissionDividerOwners: Map<string, Exchange>;
+  /** The card a `WorkDelegated` just marked as holding a turn, or null.
+   *
+   *  Held for exactly one boundary, so a legacy row order can be corrected.
+   *  Before ADR 0201 the delegation was written BEFORE the `MessageReceived`
+   *  that started the turn, and that message is the real starter. The mark
+   *  lands on whatever the delegation followed, and this is how it comes off
+   *  again. Cleared by any other boundary, so it can never reach further. */
+  lastDelegationHost: Exchange | null;
+  /** request_id to the divider that interrupted that turn.
+   *
+   *  A cancel says so on the divider's own card, so a standalone "Response
+   *  canceled" panel under it would be a second telling. Reading the cancel's
+   *  TARGET answers that only while the divider still holds the turn, and a
+   *  caller speaking moves it on (see `handOverTheTurn`). Remembering the
+   *  divider keeps the suppression attached to the card that tells. */
+  turnDividers: Map<string, Exchange>;
   /** request_id to the tool call a permission card is holding: the exchange
    *  owning the call step, plus that step's `seq`. Written when the request is
    *  folded, read when its resolution is, so both ends mark the same row. It is
@@ -802,6 +1013,8 @@ function newFoldState(): GroupFoldState {
     chatToolCallOwners: new Map(),
     questionDividerOwners: new Map(),
     permissionDividerOwners: new Map(),
+    lastDelegationHost: null,
+    turnDividers: new Map(),
     gatedCalls: new Map(),
     reqIdRedirect: new Map(),
     resolvedReqIds: new Set(),
@@ -816,8 +1029,9 @@ function newFoldState(): GroupFoldState {
  *  no turn, so it is the bottom without being `current`. These rows are the
  *  answer to it and the session marks around that answer.
  *
- *  `WorkDelegated` is deliberately absent. It precedes the `MessageReceived`
- *  that becomes the new bottom anyway, and it draws nothing wherever it lands. */
+ *  `WorkDelegated` is deliberately absent. It has an arm of its own: it lands
+ *  on the utterance it delegates rather than at the bottom, and that card
+ *  becomes the turn's owner (ADR 0201). */
 const CALL_ROW_TYPES: ReadonlySet<string> = new Set([
   'SpokenReplyGenerated',
   'VoiceSessionStarted',
@@ -830,9 +1044,10 @@ const CALL_ROW_TYPES: ReadonlySet<string> = new Set([
  *  marker draw nothing, yet they still fold in as steps. A set naming only the
  *  visible one would answer `false` for most real calls.
  *
- *  A delegation is in the set deliberately. It sits beside a `MessageReceived`,
- *  which is a boundary, so that turn opens an exchange of its own. The marker
- *  left here reports no work landing HERE.
+ *  A delegation is in the set deliberately, and it is the one row here that
+ *  can sit on a card holding a turn (ADR 0201). It still draws nothing, so it
+ *  reports no work landing HERE. What says a turn is running is
+ *  `Exchange.tookTheTurn`, which `isCallOnly`'s callers read separately.
  *
  *  The caller's own utterance is NOT here, and cannot be: it is an exchange
  *  start type, so the fold gives it a boundary and never a step. */
@@ -1375,11 +1590,14 @@ function foldEvent(
         }
         target.steps.push({ seq, event });
         touched?.add(target);
-        if (target.userEvent.type === 'UserQuestionAsked') {
+        // The divider that interrupted this turn, which may no longer be where
+        // the turn is showing: a caller speaking moves the continuation on.
+        const teller = (reqId ? state.turnDividers.get(reqId) : undefined) ?? target;
+        if (teller.userEvent.type === 'UserQuestionAsked') {
           // A question dismissed, or replaced by a follow-up, already says so
           // on its own card. A standalone "Response canceled" panel under it
           // would be a second telling.
-          const answered = findQuestionAnswer(target, target.userEvent.tool_use_id);
+          const answered = findQuestionAnswer(teller, teller.userEvent.tool_use_id);
           if (answered?.answer.kind === 'Canceled' || answered?.answer.kind === 'Superseded') {
             return;
           }
@@ -1451,7 +1669,32 @@ function foldEvent(
         return;
       }
     }
-    const absorbTarget = findAbsorbTarget(current, exchanges, event);
+    // **The talker asked for the doer, which STARTS a turn** (ADR 0201). The
+    // row is a step rather than a boundary: the caller's words already opened
+    // the card, and a second one would split one utterance from its answer.
+    //
+    // Two writes make that card the turn's owner. `tookTheTurn` is what stops
+    // the status machinery reading it as speech nobody is working on. The
+    // redirect is how the turn's own events find it, since the anchor they
+    // carry is this row's id and no exchange wears it.
+    //
+    // **Only onto a caller's utterance**, which is what the delegation is FOR.
+    // A greeting is not one, so a row written before ADR 0201 leaves it alone:
+    // there the `MessageReceived` behind the delegation is the turn's starter,
+    // and marking whatever happened to be open gave a greeting a turn it never
+    // held. `lastDelegationHost` takes the mark back off the rest.
+    //
+    // The card need NOT be empty. The talker routinely stalls before it asks,
+    // and that stall is its own turn, so its row is already a step here.
+    if (event.type === 'WorkDelegated' && current && isCallerUtterance(current.userEvent)) {
+      current.steps.push({ seq, event });
+      current.tookTheTurn = true;
+      state.lastDelegationHost = current;
+      if (event._eventId) reqIdRedirect.set(event._eventId, current);
+      touched?.add(current);
+      return;
+    }
+    const absorbTarget = findAbsorbTarget(state, current, exchanges, event);
     if (absorbTarget) {
       // A queued mid-flight message is ingested here, the UPI being the moment
       // the loop picked it up. Boundaries created while it sat in the queue
@@ -1475,12 +1718,47 @@ function foldEvent(
       // It owns the turn again, so a handoff recorded while it sat in the queue
       // no longer holds. See `Exchange.continuationMoved`.
       absorbTarget.continuationMoved = false;
+      // The redirect that handoff wrote no longer holds either, or the turn's
+      // own terminal settles a card the loop has moved off. See
+      // `handOverTheTurn`.
+      const ownId = absorbTarget.userEvent._eventId;
+      if (ownId) reqIdRedirect.set(ownId, absorbTarget);
       current = absorbTarget;
       if (event.type === 'UserPromptInjected') {
         const absorbedReqId = requestEventIdOf(event);
         if (absorbedReqId) reqIdRedirect.set(absorbedReqId, absorbTarget);
       }
     } else if (isExchangeStartEvent(event) && !isLegacySupersededAbort) {
+      // A LEGACY delegated message, written after its own `WorkDelegated`.
+      // That message is the turn's starter, so the mark the delegation left on
+      // the card above comes off again. Any other boundary just spends the
+      // slot, which is what keeps the correction to one row.
+      const delegationHost = state.lastDelegationHost;
+      state.lastDelegationHost = null;
+      if (delegationHost && event.type === 'MessageReceived' && isCallerUtterance(event)) {
+        delegationHost.tookTheTurn = undefined;
+        touched?.add(delegationHost);
+      }
+      // One thing the caller said is one boundary, however many turns the
+      // transcriber cut it into. A fragment continuing the row right above
+      // grows it rather than opening a second bubble under a second header.
+      //
+      // Only a STEPLESS one, and only the LAST one. Anything landing between
+      // two fragments means the caller said two things, and the reader met
+      // something in between.
+      const openUtterance = exchanges[exchanges.length - 1];
+      if (
+        event.type === 'SpokenMessageReceived'
+        && openUtterance
+        && openUtterance.steps.length === 0
+      ) {
+        const grown = grownSpokenRow(openUtterance.userEvent, event);
+        if (grown) {
+          openUtterance.userEvent = grown;
+          touched?.add(openUtterance);
+          return;
+        }
+      }
       const previousCurrent = current;
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
@@ -1506,22 +1784,27 @@ function foldEvent(
         current = previousCurrent;
         return;
       }
-      // **A caller's utterance takes no ownership of the turn either**, and for
-      // the same reason: the talker answered it alone, so it started nothing.
-      // The doer keeps working on whatever it was asked before, and its
-      // `TodoListWritten`, its background-bash pair and its `EventWaitStarted`
-      // route chronologically. Folded in here they would report a crashed turn
-      // under the caller's words, and take the real turn's park row with them.
+      // **A caller's utterance STARTS no turn, and still takes the running
+      // one's continuation.** The two are different questions, and conflating
+      // them is what drew a doer's steps above words said before them.
       //
-      // What DOES belong here is the reply, and the session rows around it.
-      // Those find it as the BOTTOM of the transcript rather than as `current`,
-      // through `callRowTarget`.
+      // It starts nothing because the talker decides whether the doer is
+      // wanted. It takes the continuation because the clock says so: every
+      // step the turn emits from here happened AFTER these words, so it reads
+      // below them (ADR 0201). The turn itself carries on untouched.
       if (event.type === 'SpokenMessageReceived') {
-        // Handed back only when there is a TURN to hand it to. A call nobody
-        // delegated from has none, and the utterances are then all there is:
-        // `current` stays on this one, so nothing that lands next falls off the
-        // end of the fold, and the newest utterance is where it goes.
-        if (previousCurrent && !exchangeHoldsNoTurn(previousCurrent)) current = previousCurrent;
+        // A call nobody delegated from has no turn to take, and the utterances
+        // are then all there is. A turn that already ENDED has none either:
+        // moving it would hand this card a continuation nobody is writing, and
+        // the card would then sit "Requesting" for ever. Nothing to hand over,
+        // and `current` stays on this one so whatever lands next has somewhere
+        // to go.
+        if (previousCurrent && !exchangeHoldsNoTurn(previousCurrent) && stillRunning(previousCurrent)) {
+          handOverTheTurn(state, previousCurrent, current, touched);
+          // It holds one now, so the status machinery must stop stepping over
+          // it. See `Exchange.tookTheTurn`.
+          current.tookTheTurn = true;
+        }
         return;
       }
       // Register divider exchanges so their resolution can route back here by
@@ -1573,27 +1856,7 @@ function foldEvent(
           && !!previousCurrent
           && !dividerStillAwaitsUser(previousCurrent));
       if (advancesRedirect && previousCurrent) {
-        // The turn now belongs to `current`, so nothing else lands in
-        // `previousCurrent`. A `Thinking` marker left pending there can never
-        // resolve on its own events. Record the handoff so rendering finalizes
-        // it. See `Exchange.continuationMoved`.
-        previousCurrent.continuationMoved = true;
-        touched?.add(previousCurrent);
-        // Two writes, both needed. Move any redirect that pointed at the
-        // previous current, covering a turn that kept an ANCESTOR's req_id.
-        // Then map the previous current's OWN anchor id to `current`,
-        // unconditionally. When `previousCurrent` itself opened a fresh turn,
-        // its continuation streams under that card's own id. The moved entries
-        // are then spurious leftovers, and only the second write routes the
-        // real reply. A redundant entry is harmless: nothing routes by an
-        // unused id.
-        for (const [reqId, exchange] of reqIdRedirect.entries()) {
-          if (exchange === previousCurrent) {
-            reqIdRedirect.set(reqId, current);
-          }
-        }
-        const anchorId = previousCurrent.userEvent._eventId;
-        if (anchorId) reqIdRedirect.set(anchorId, current);
+        handOverTheTurn(state, previousCurrent, current, touched);
       }
       // For a chat in-process divider, the post-answer continuation carries the
       // ACTIVE turn's req_id. That is `previousCurrent`'s anchor only when
@@ -1624,6 +1887,9 @@ function foldEvent(
           touched?.add(priorOwner);
         }
         reqIdRedirect.set(state.lastChatTurnReqId, current);
+        // The card that will tell the user if this turn is cancelled, however
+        // far the continuation travels afterwards.
+        state.turnDividers.set(state.lastChatTurnReqId, current);
       }
     } else if (event.type === 'CodingAgentUserMessageSent') {
       // Legacy: old data has this instead of MessageReceived for CC follow-ups.
@@ -1682,17 +1948,29 @@ function foldEvent(
       // that: a reply took the boundary above, and a mark draws nothing, so
       // there is nothing to lose and nowhere to lose it from.
       if (callTarget) {
-        callTarget.steps.push({ seq, event });
+        // Filed by the clock, like every other row. The target is the BOTTOM
+        // exchange rather than `current`, so it may already hold steps stamped
+        // after these words.
+        const at = callRowIndex(callTarget.steps, instantMicros(event.created));
+        // The row right above is the only one this can continue: anything
+        // between two fragments means the talker said two things.
+        const above = at > 0 ? callTarget.steps[at - 1] : undefined;
+        const grown = above ? grownSpokenRow(above.event, event) : null;
+        if (above && grown) {
+          callTarget.steps[at - 1] = { seq: above.seq, event: grown };
+        } else {
+          callTarget.steps.splice(at, 0, { seq, event });
+        }
         touched?.add(callTarget);
       }
     } else if (owner) {
-      owner.steps.push({ seq, event });
+      appendStep(owner, seq, event);
       touched?.add(owner);
       if (event.type === 'ToolCalled' && event._eventId) {
         chatToolCallOwners.set(event._eventId, owner);
       }
     } else if (current) {
-      current.steps.push({ seq, event });
+      appendStep(current, seq, event);
       touched?.add(current);
       if (event.type === 'CodingAgentToolCalled') {
         const id = toolUseIdOf(event);

@@ -1289,3 +1289,87 @@ async fn titles_awaiting_answer_names_a_thread_with_no_title_yet() {
 
     teardown_test_db(&db).await;
 }
+
+/// A call the talker answered alone writes only `SpokenMessageReceived`, and
+/// that thread still has a first message to be titled from.
+///
+/// Reading the typed variant alone returned `None` here, so
+/// `spawn_title_generation` gave up and the thread kept its first spoken row
+/// as its name for good.
+#[tokio::test]
+async fn the_first_message_of_a_spoken_only_thread_is_the_spoken_row() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    insert_thread(&pool, thread_id, "").await;
+    insert_message(
+        &pool,
+        thread_id,
+        "SpokenMessageReceived",
+        "what's going on in the workspace now",
+    )
+    .await;
+
+    let found = store
+        .get_thread_first_message(&thread_id.to_string())
+        .await
+        .expect("read the first message");
+
+    assert_eq!(
+        found.map(|(text, _, _)| text),
+        Some("what's going on in the workspace now".to_string())
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// Whichever came first, spoken or typed. A call that delegated writes both,
+/// and the earlier one is what the caller actually said first.
+#[tokio::test]
+async fn the_first_message_is_the_earliest_of_either_kind() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    insert_thread(&pool, thread_id, "").await;
+    insert_message(&pool, thread_id, "SpokenMessageReceived", "spoken first").await;
+    insert_message(&pool, thread_id, "MessageReceived", "typed second").await;
+
+    let found = store
+        .get_thread_first_message(&thread_id.to_string())
+        .await
+        .expect("read the first message");
+
+    assert_eq!(
+        found.map(|(text, _, _)| text),
+        Some("spoken first".to_string())
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// Who owns a thread's title. A delegated call ran a turn, so the chat path
+/// titles it; one the talker answered alone ran none.
+#[tokio::test]
+async fn only_a_thread_that_ran_a_turn_reads_as_the_chat_paths() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let spoken_only = Uuid::new_v4();
+    insert_thread(&pool, spoken_only, "").await;
+    insert_message(&pool, spoken_only, "SpokenMessageReceived", "what's up").await;
+    assert!(!store
+        .thread_has_message_received(spoken_only)
+        .await
+        .expect("read the spoken-only thread"));
+
+    let delegated = Uuid::new_v4();
+    insert_thread(&pool, delegated, "").await;
+    insert_message(&pool, delegated, "SpokenMessageReceived", "what's up").await;
+    insert_message(&pool, delegated, "MessageReceived", "what's up").await;
+    assert!(store
+        .thread_has_message_received(delegated)
+        .await
+        .expect("read the delegated thread"));
+
+    teardown_test_db(&db).await;
+}

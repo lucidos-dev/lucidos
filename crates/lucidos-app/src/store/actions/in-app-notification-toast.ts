@@ -24,6 +24,7 @@ import { currentNotificationToasts } from './preferences';
 import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded } from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
+import { repaintLandedContent } from '../../utils/pageResume';
 import { postClientLog } from '../../utils/liveness';
 
 const NOTIFICATION_TOAST_PREFIX = 'notification-';
@@ -78,7 +79,7 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
     case 'navigate':
       if (action.notification) markReadOptimistic(action.notification);
       handleNavigationRequest(action.to);
-      return true;
+      return dispatched();
     case 'view-notification':
       // viewNotification opens the detail in the content pane AND marks the row
       // read. It's async (fetches the full row), but the open + mark-read are
@@ -86,10 +87,27 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
       // failure toast on the GET, so `void` here keeps the discriminated return
       // synchronous without dropping the error path.
       void viewNotification(action.id);
-      return true;
+      return dispatched();
     case 'noop':
       return false;
   }
+}
+
+/** Close every branch that LANDED something, and answer the non-noop.
+ *
+ *  The tap that got here usually woke the page: a native banner only shows while
+ *  it is inactive, so the tap lands on a webview WebKit has parked. The wake
+ *  repaint has already run, against the view this one is replacing. So the
+ *  arriving view asks for its own, AFTER the navigation rather than before it.
+ *  Off WebKit this is free. See utils/pageResume.ts.
+ *
+ *  Called from each arm rather than after the switch, so every arm still
+ *  RETURNS. That is what keeps the union exhaustiveness-checked: a fourth
+ *  `DeepLinkAction` with no case here is a compile error rather than a silent
+ *  no-op that repaints and reports success. */
+function dispatched(): boolean {
+  repaintLandedContent();
+  return true;
 }
 
 interface InAppNotificationToastInput {

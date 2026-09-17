@@ -87,10 +87,10 @@ pub(crate) fn apply_inactivity_timeout_minutes(
 /// their session prompt explicitly opts out) — so they ALWAYS skip, regardless
 /// of marker state. This mirrors the `is_app()` harden-gate skip in
 /// `change_ops::apply_change`; without it, clicking Apply on an app thread with
-/// a live session wrongly injected "Run /harden now." + `cargo test -p
-/// lucidos-engine` into the app session and then failed the apply with
-/// "Hardening did not complete". Non-app (Lucidos-source / external) threads
-/// gate on the harden marker as before.
+/// a live session wrongly injected "Run /harden now." + `make test` into the
+/// app session and then failed the apply with "Hardening did not complete".
+/// Non-app (Lucidos-source / external) threads gate on the harden marker as
+/// before.
 pub(super) fn should_run_in_session_hardening(is_app: bool, branch_hardened: bool) -> bool {
     !is_app && !branch_hardened
 }
@@ -467,7 +467,7 @@ impl LucidosEngine {
                 idle_notify,
                 worktree_path,
                 "Hardening is done. Now run the test suite to verify nothing is broken: \
-                `cargo test -p lucidos-engine` and `cd crates/lucidos-app && npm test`. \
+                `make test` and `cd crates/lucidos-app && npm test`. \
                 If any tests fail, fix them before proceeding.",
                 "waiting for post-hardening tests",
             )
@@ -1326,7 +1326,7 @@ mod tests {
     /// Regression: clicking Apply on an *app* coding-agent thread with a live
     /// session must NOT run the Lucidos-source `/harden` + test flow, even when
     /// the branch has no harden marker. Before the fix, `apply_now_inner`
-    /// injected "Run /harden now." + `cargo test -p lucidos-engine` into the app
+    /// injected "Run /harden now." + `make test` into the app
     /// session and failed the apply with "Hardening did not complete" — exactly
     /// the reported bug on the "Create App Demo Video" (`demo-director`) thread.
     #[test]

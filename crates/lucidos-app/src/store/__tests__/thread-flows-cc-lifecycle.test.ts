@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserImageHashes, exchangeUserMessage, groupIntoExchanges, type ThreadState } from '../thread-events';
+import { exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserImageHashes, exchangeUserMessage, groupIntoExchanges, type ThreadState } from '../thread-events';
 
 beforeEach(resetSeqCounter);
 
@@ -432,7 +432,6 @@ describe('MUST TEST 4: Scheduled triggers', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
     expect(exchangeUserMessage(exchanges[0])).toBe('Check my calendar');
-    expect(exchangeUserChannel(exchanges[0])).toBe('trigger');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toBe('Your calendar is clear today.');
   });
@@ -720,41 +719,6 @@ describe('Bug: CC follow-up images not rendered', () => {
     const followUp = exchanges[exchanges.length - 1];
     const hashes = exchangeUserImageHashes(followUp);
     expect(hashes).toEqual(['sha256-of-img1']);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Bug: Channel labels missing on most exchanges
-// ---------------------------------------------------------------------------
-describe('Bug: Channel labels', () => {
-  it('user channel is undefined when no channel in event', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'Hello' },
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserChannel(exchanges[0])).toBeUndefined();
-  });
-
-  it('user channel reads from MessageReceived event payload', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'fix it', channel: 'claude_code' },
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserChannel(exchanges[0])).toBe('claude_code');
-  });
-
-  it('scheduled trigger has user channel "trigger"', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'TriggerStarted', trigger_id: 't1', trigger_name: 'Check weather' },
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserChannel(exchanges[0])).toBe('trigger');
   });
 });
 

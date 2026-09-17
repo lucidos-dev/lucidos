@@ -72,6 +72,11 @@ const SEND_BOX: Box = { left: 330, right: 374, top: 400, bottom: 444 };
 
 let row: FakeEl;
 let send: FakeEl;
+/** What the row currently holds. A case in ANSWER mode swaps the morph out for
+ *  a Submit. `PromptInput` chooses between the two at one JSX position, so the
+ *  morph node is not in the document there. That is the state the thirteenth
+ *  episode was in, and the state the rescue used to have no face for. */
+let faces: FakeEl[];
 /** A target outside the composer, so `closest` answers null and the touch is
  *  genuinely unattributed. Using the row itself would make `onRow` true and let
  *  a case pass through the old gate it was written to bypass. */
@@ -87,13 +92,19 @@ function installDom() {
   const doc = globalThis.document as unknown as Record<string, unknown>;
   doc.querySelectorAll = (sel: string) => {
     if (sel === '.prompt-actions-row') return [row];
-    if (sel === '.prompt-actions-row .action-btn') return [send];
+    if (sel === '.prompt-actions-row .action-btn') return faces;
     return [];
   };
   doc.elementFromPoint = (x: number, y: number) => (atPointNear ? atPointNear(x, y) : atPoint);
-  doc.querySelector = (sel: string) => (
-    sel === '.prompt-actions-row .send-cancel-morph' ? send : null
-  );
+  doc.querySelector = (sel: string) => {
+    if (sel === '.prompt-actions-row .send-cancel-morph') {
+      return faces.find((f) => f.classes.includes('send-cancel-morph')) ?? null;
+    }
+    if (sel === '.prompt-actions-row [aria-label="Submit answer"]') {
+      return faces.find((f) => f.label === 'Submit answer') ?? null;
+    }
+    return null;
+  };
   (globalThis as unknown as Record<string, unknown>).MutationObserver = class {
     observe() { /* the row is never mutated in these cases */ }
     disconnect() { /* nothing to release */ }
@@ -130,7 +141,9 @@ interface Line {
   point?: { x: number; y: number };
   missedBy?: { face: string; px: number } | null;
   /** The silence that ended at the input this line belongs to. */
-  quiet?: { ms: number; checks: number; unreachable: number } | null;
+  quiet?: { ms: number; checks: number; unreachable: number; covered: number } | null;
+  /** Which cover the app had up when it declined to judge the press. */
+  cover?: string;
   /** Set only on a repair line. */
   nudged?: boolean;
   connected?: boolean;
@@ -177,6 +190,7 @@ afterAll(() => {
 beforeEach(() => {
   row = new FakeEl(null, ROW_BOX, ['prompt-actions-row']);
   send = new FakeEl('Send message', SEND_BOX, ['action-btn', 'send-cancel-morph'], row);
+  faces = [send];
   elsewhere = new FakeEl(null, { left: 0, right: 390, top: 0, bottom: 300 }, ['thread-content']);
   atPoint = send;
   atPointNear = null;
@@ -342,6 +356,20 @@ describe('a click with no touch behind it', () => {
     showToast.mockClear();
   }
 
+  function root(): Record<string, unknown> {
+    return (globalThis.document as unknown as { documentElement: Record<string, unknown> })
+      .documentElement;
+  }
+
+  /** The state every report describes, and the one `stray-click` is gated on. */
+  function keyboardUp() {
+    root().hasAttribute = (name: string) => name === 'data-keyboard-active';
+  }
+
+  let priorHasAttribute: unknown;
+  beforeEach(() => { priorHasAttribute = root().hasAttribute; });
+  afterEach(() => { root().hasAttribute = priorHasAttribute; });
+
   it('is recorded, because a live click path over a dead touch path is the split', () => {
     noRecentTouch();
     fire('click', { target: send });
@@ -362,10 +390,61 @@ describe('a click with no touch behind it', () => {
     expect(verdicts()).not.toContain('click-no-touch');
   });
 
-  it('stays quiet for a click that is nowhere near a composer face', () => {
+  it('is recorded when it reached no face either, which used to be silent', () => {
+    // The last of the three silences an input could disappear into. It says the
+    // same about the pipeline as `click-no-touch`, and more about the hit test:
+    // the page took a click and answered somewhere the composer is not.
     noRecentTouch();
-    fire('click', { target: elsewhere });
+    keyboardUp();
+    fire('click', { target: elsewhere, clientX: 40, clientY: 120, screenX: 40, screenY: 179 });
+    expect(verdicts()).toEqual(['stray-click']);
+    // Named, since where a touchless click DID land is the reading.
+    expect(lines()[0].face).toContain('thread-content');
+    expect(lines()[0].point).toEqual({ x: 40, y: 120 });
+    // The one reading not taken from the layout side. A verdict about the page
+    // hit-testing elsewhere is the one that needs it most.
+    expect(lines()[0].screenOff).toEqual({ x: 0, y: 59 });
+  });
+
+  it('says nothing while the keyboard is down, which no report describes', () => {
+    // Without this gate the verdict is not rare: a pointer click on a
+    // touch-capable laptop writes one per click, and buries the ledger.
+    noRecentTouch();
+    root().hasAttribute = () => false;
+    fire('click', { target: elsewhere, clientX: 40, clientY: 120 });
     expect(verdicts()).toEqual([]);
+  });
+
+  it('says nothing under a cover, where the shell is inert by design', () => {
+    noRecentTouch();
+    root().hasAttribute = (name: string) => name === 'data-keyboard-active'
+      || name === 'data-overlay-open';
+    fire('click', { target: elsewhere, clientX: 40, clientY: 120 });
+    expect(verdicts()).toEqual([]);
+  });
+
+  it('never toasts for one, since nothing here says the press was owed', () => {
+    noRecentTouch();
+    keyboardUp();
+    fire('click', { target: elsewhere, clientX: 40, clientY: 120 });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('writes one line for a burst of them, not a stream', () => {
+    noRecentTouch();
+    keyboardUp();
+    for (let i = 0; i < 3; i++) {
+      fire('click', { target: elsewhere, clientX: 40, clientY: 120 + i });
+    }
+    expect(verdicts().filter((v) => v === 'stray-click')).toHaveLength(1);
+  });
+
+  it('carries no point for a programmatic click, which landed nowhere', () => {
+    noRecentTouch();
+    keyboardUp();
+    fire('click', { target: elsewhere, clientX: 0, clientY: 0 });
+    expect(lines()[0].point).toBeUndefined();
+    expect(lines()[0].screenOff).toBeUndefined();
   });
 });
 
@@ -523,15 +602,67 @@ describe('a cover the app raised itself is not a wedge', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  it('does not report a tap that landed on the blocker', () => {
+  it('does not JUDGE a tap that landed on the blocker, but does record it', () => {
     // The blocker takes pointer events, so it answers at the composer's own
     // pixels. The landing report would name it on every frustrated tap.
+    //
+    // Standing the judgement down is right. Standing the LINE down was not: a
+    // press the probe refused then read exactly like a press that never
+    // arrived, which is the ambiguity the thirteenth episode died in.
     settleHealthy();
     blockUi(true);
     atPoint = row;
     fire('touchstart', touch(row, 350, 420));
-    expect(verdicts()).toEqual([]);
+    expect(verdicts()).toEqual(['covered']);
+    expect(lines()[0].cover).toBe('data-ui-blocked');
     expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('names an open overlay as the cover when that is what is up', () => {
+    settleHealthy();
+    root().hasAttribute = (name: string) => name === 'data-overlay-open';
+    atPoint = row;
+    fire('touchstart', touch(row, 350, 420));
+    expect(lines()[0].cover).toBe('data-overlay-open');
+  });
+
+  it('stays silent for a tap that reached neither the row nor a face', () => {
+    // The noise this whole stand-down exists to avoid. Every tap inside an open
+    // menu is the user working the overlay, not a composer that went dead.
+    settleHealthy();
+    blockUi(true);
+    atPoint = elsewhere;
+    fire('touchstart', touch(elsewhere, 40, 120));
+    expect(verdicts()).toEqual([]);
+  });
+
+  it('writes one line for a flick across the covered row, not a stream', () => {
+    settleHealthy();
+    blockUi(true);
+    atPoint = row;
+    fire('touchstart', touch(row, 350, 420));
+    fire('touchstart', touch(row, 350, 425));
+    fire('touchstart', touch(row, 350, 430));
+    expect(verdicts().filter((v) => v === 'covered')).toHaveLength(1);
+  });
+
+  it('counts the checks a cover stood down, so a silence can be read', () => {
+    // The reading the thirteenth episode needed and did not have. Its line
+    // carried 17 checks over 50 seconds of silence, and could not say whether
+    // a cover had been up for all of them.
+    settleHealthy();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    postClientLog.mockClear();
+    blockUi(true);
+    vi.advanceTimersByTime(30000);
+    root().hasAttribute = priorHasAttribute as () => boolean;
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.checks).toBeGreaterThan(0);
+    expect(press?.quiet?.covered).toBe(press?.quiet?.checks);
+    expect(press?.quiet?.unreachable).toBe(0);
   });
 
   it('reports a real wedge again once the blocker is gone', () => {
@@ -917,6 +1048,68 @@ describe('a dead tap runs Send itself', () => {
     vi.advanceTimersByTime(700);
     expect(send.clicks).toBe(0);
   });
+
+  describe('and in answer mode it runs the Submit', () => {
+    // The mode the thirteenth episode was in. `PromptInput` draws the answer
+    // control INSTEAD of the morph, so the rescue used to find no face and
+    // relayout alone. The user's typed answer sat unsent for two and three
+    // quarter minutes.
+    const SUBMIT_BOX: Box = { left: 300, right: 374, top: 400, bottom: 444 };
+    let submit: FakeEl;
+
+    /** Answer mode as the DOM holds it: no morph, one confirm Submit. */
+    function answering(label = 'Submit answer') {
+      submit = new FakeEl(label, SUBMIT_BOX, ['action-btn', 'action-btn-confirm'], row);
+      faces = [submit];
+      // The face answers at its own centre throughout, which is the wedge this
+      // rescue is for: the finger reaches nothing while the layout is healthy.
+      atPointNear = (x: number) => (
+        x >= SUBMIT_BOX.left && x <= SUBMIT_BOX.right ? submit : row
+      );
+      root().hasAttribute = (name: string) => name === 'data-keyboard-active';
+    }
+
+    it('submits the typed answer, and says so', () => {
+      settleHealthy();
+      answering();
+      tapDeadSpace();
+      vi.advanceTimersByTime(700);
+      expect(submit.clicks).toBe(1);
+      expect(verdicts()).toContain('activated');
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining('Submit was run for you'),
+        'warning',
+      );
+    });
+
+    it('names the face it ran, so the ledger says which one', () => {
+      settleHealthy();
+      answering();
+      tapDeadSpace();
+      vi.advanceTimersByTime(700);
+      expect(lines().find((l) => l.verdict === 'activated')?.face).toBe('Submit answer');
+    });
+
+    it('refuses a Submit the app disabled, such as a multi-select at zero', () => {
+      settleHealthy();
+      answering();
+      submit.disabled = true;
+      tapDeadSpace();
+      vi.advanceTimersByTime(700);
+      expect(submit.clicks).toBe(0);
+    });
+
+    it('refuses any other confirm face, Apply above all', () => {
+      // Apply wears the same green. Running it on a tap nobody saw land would
+      // merge a change the user never approved.
+      settleHealthy();
+      answering('Apply');
+      tapDeadSpace();
+      vi.advanceTimersByTime(700);
+      expect(submit.clicks).toBe(0);
+      expect(verdicts()).not.toContain('activated');
+    });
+  });
 });
 
 describe('every press line carries the one reading layout cannot fake', () => {
@@ -1054,5 +1247,22 @@ describe('every line carries the geometry a report used to only imply', () => {
     fire('touchstart', touch(row, 10, 90));
     const [line] = lines();
     expect(JSON.stringify(line).length).toBeLessThan(4096);
+  });
+
+  it('keeps the two newest shapes inside it too, and free of what was typed', () => {
+    const root = (globalThis.document as unknown as { documentElement: Record<string, unknown> })
+      .documentElement;
+    const prior = root.hasAttribute;
+    root.hasAttribute = (name: string) => name === 'data-overlay-open';
+    atPoint = row;
+    fire('touchstart', touch(row, 350, 420));
+    root.hasAttribute = (name: string) => name === 'data-keyboard-active';
+    vi.advanceTimersByTime(2000);
+    fire('click', { target: elsewhere, clientX: 40, clientY: 120 });
+    root.hasAttribute = prior;
+    for (const line of lines()) {
+      expect(JSON.stringify(line).length).toBeLessThan(4096);
+    }
+    expect(verdicts()).toEqual(['covered', 'stray-click']);
   });
 });

@@ -1231,9 +1231,12 @@ impl LucidosEngine {
         };
 
         // Fire all semantic searches concurrently — using search_with_scores for real similarity
+        let embedding_model = self.embedder.model_id();
         let semantic_futures: Vec<_> = embeddings
             .iter()
-            .map(|emb| index.search_with_scores(emb, MIN_IMPORTANCE, RESULTS_PER_QUERY))
+            .map(|emb| {
+                index.search_with_scores(emb, MIN_IMPORTANCE, RESULTS_PER_QUERY, embedding_model)
+            })
             .collect();
         let semantic_results = futures::future::join_all(semantic_futures).await;
 

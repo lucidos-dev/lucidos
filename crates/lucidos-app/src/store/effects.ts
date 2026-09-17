@@ -1,11 +1,13 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, focusedThreadId, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
 import { installLiveUtteranceRow } from './liveUtterance';
+import { voiceCall, watchCallLiveness } from './voice';
+import { setCallLive } from '../components/chat/scrollState';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
 
@@ -288,3 +290,10 @@ installSeenTargetWatch();
 // words finally land. Its own module for the same reason as the watch above:
 // the rule belongs beside the call it reads. See store/liveUtterance.ts.
 installLiveUtteranceRow();
+
+// The transcript's standing follow rides a call as it rides a running turn. A
+// call produces rows with no turn running, so the scroll module has to be told
+// (see `watchCallLiveness`). Wired HERE rather than in `store/voice.ts`: the
+// call is the producer, the transcript the consumer, and a producer must not
+// import a consumer.
+watchCallLiveness({ call: voiceCall, focused: focusedThreadId, setLive: setCallLive });

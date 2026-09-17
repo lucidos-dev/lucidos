@@ -6,6 +6,10 @@
 Narrows ADR 0170 to the talker it was written for. The rest of it stands, and so
 does ADR 0149, whose guarantee this keeps.
 
+**Narrowed in turn by ADR 0205.** A Live call settles a QUESTION card out loud
+after all, through the one frame it has. Read every "cannot be settled by voice"
+below as the permission half.
+
 ## Context
 
 OpenAI shipped GPT-Live-1 in the API. It is not a Realtime model: its model page

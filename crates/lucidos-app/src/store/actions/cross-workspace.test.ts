@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   fetchWorkspaces: vi.fn(),
   listWorkspaces: vi.fn(),
+  locateWorkspace: vi.fn(),
   slugifyWorkspaceName: vi.fn((n: string) =>
     n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '') || 'workspace',
   ),
@@ -16,16 +17,23 @@ const mocks = vi.hoisted(() => ({
   // served directly on an engine port. Read via a getter so the SUT sees the
   // current value at call time.
   workspaceId: null as string | null,
+  // Same, for the gateway port the engine stamps into the shell. A peer hop
+  // compares it against the port the page was actually reached on.
+  gatewayPort: 5251 as number | null,
 }));
 
 vi.mock('../../api/client', () => ({ fetchWorkspaces: mocks.fetchWorkspaces }));
 vi.mock('../../api/client/control', () => ({
   listWorkspaces: mocks.listWorkspaces,
+  locateWorkspace: mocks.locateWorkspace,
   slugifyWorkspaceName: mocks.slugifyWorkspaceName,
 }));
 vi.mock('../../utils/basePath', () => ({
   get WORKSPACE_ID() {
     return mocks.workspaceId;
+  },
+  get GATEWAY_PORT() {
+    return mocks.gatewayPort;
   },
 }));
 vi.mock('./artifacts', () => ({ openUrl: mocks.openUrl }));
@@ -66,12 +74,20 @@ const wsInfo = (overrides: Partial<{ name: string; port: number | null; engine_r
 
 const stubLocation = (origin: string) => {
   const u = new URL(origin);
-  vi.stubGlobal('location', { origin: u.origin, protocol: u.protocol, hostname: u.hostname });
+  vi.stubGlobal('location', {
+    origin: u.origin,
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port,
+  });
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.isTauri.mockReturnValue(false);
+  // No other install carries it, which is what every pre-existing case assumes.
+  mocks.locateWorkspace.mockResolvedValue(null);
+  mocks.gatewayPort = 5251;
   // A tab the browser actually opened. `openNewTab` reads the return value to
   // tell an open from a blocked pop-up. A bare `vi.fn()` returns undefined,
   // which would make every one of these look blocked.
@@ -157,6 +173,132 @@ describe('openThreadInWorkspace — behind the gateway', () => {
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
       expect.stringContaining("Workspace 'ghost' is not available"),
+      'error',
+    );
+  });
+});
+
+// A machine can run the packaged app beside a source checkout, each with its
+// own gateway, port and registry (ADR 0189). A thread link into the other one
+// used to die on "not available" while the workspace ran one port away.
+describe('openThreadInWorkspace: a workspace on another install', () => {
+  const PEER = {
+    status: 'reachable' as const,
+    install: 'Lucidos.app in /Applications',
+    gateway_port: 5252,
+    scheme: 'http',
+    slug: 'work',
+  };
+
+  beforeEach(() => {
+    mocks.workspaceId = 'dev'; // served by the dev gateway on 5251
+    mocks.gatewayPort = 5251;
+    stubLocation('https://localhost:5251');
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+  });
+
+  // The scheme is the peer's, not ours: the packaged gateway serves plain http
+  // while this page is on https, so reusing our own would compose a dead URL.
+  it("opens the peer gateway's own origin, on the scheme it answered", async () => {
+    mocks.locateWorkspace.mockResolvedValue(PEER);
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.locateWorkspace).toHaveBeenCalledWith('work');
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `http://localhost:5252/work/#thread=${TID}`,
+      'lucidos-ws-5252-work',
+    );
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  // Two installs may both serve a slug, so a tab named off the slug alone would
+  // re-point the tab holding the other one.
+  it('names the tab off the peer port, not the slug alone', async () => {
+    mocks.locateWorkspace.mockResolvedValue({ ...PEER, slug: 'dev', gateway_port: 5252 });
+
+    await openThreadInWorkspace('their-dev', TID);
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(expect.any(String), 'lucidos-ws-5252-dev');
+  });
+
+  it('keeps the current host, so a tailnet address stays one', async () => {
+    stubLocation('https://tail.host:5251');
+    mocks.locateWorkspace.mockResolvedValue(PEER);
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `http://tail.host:5252/work/#thread=${TID}`,
+      'lucidos-ws-5252-work',
+    );
+  });
+
+  // Swapping the port only addresses anything when the page reached this
+  // gateway on its own port. Behind `tailscale serve` it did not.
+  it('declines to swap the port when this page came through a proxy', async () => {
+    stubLocation('https://tail.host'); // 443, fronting 5251
+    mocks.locateWorkspace.mockResolvedValue(PEER);
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('cannot reach it'),
+      'error',
+    );
+  });
+
+  it('names the install when its gateway is not running', async () => {
+    mocks.locateWorkspace.mockResolvedValue({
+      status: 'install-not-running',
+      install: 'Lucidos.app in /Applications',
+      gateway_port: 5252,
+      slug: 'work',
+    });
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('which is not running'),
+      'error',
+    );
+  });
+
+  it('refuses to guess when two installs carry the name', async () => {
+    mocks.locateWorkspace.mockResolvedValue({
+      status: 'ambiguous',
+      installs: ['Lucidos.app in /Applications', 'install.sh instance "alt"'],
+    });
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Open it from the one you mean'),
+      'error',
+    );
+  });
+
+  // Our own gateway answers first. A peer lookup for a workspace it serves
+  // would be a wasted request, and could offer a second copy of the same name.
+  it('never looks at other installs when our own gateway serves it', async () => {
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'other-ws', name: 'other-ws' })]);
+
+    await openThreadInWorkspace('other-ws', TID);
+
+    expect(mocks.locateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the cause when the lookup itself fails', async () => {
+    mocks.locateWorkspace.mockRejectedValue(new Error('boom'));
+
+    await openThreadInWorkspace('work', TID);
+
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to open thread'),
       'error',
     );
   });
@@ -300,6 +442,23 @@ describe('ensureCrossWorkspaceThreadTitle', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(`https://localhost:5180/api/v1/threads/${t}`);
     expect(crossWorkspaceThreadTitle('dev', t)).toBe('Direct name');
+  });
+
+  // The peer hop belongs to navigation. A popover render must not reach across
+  // the machine to another install just to label a link.
+  it('never looks across installs for a title', async () => {
+    const t = '5c2419a1-aaaa-bbbb-cccc-ddddeeeeffff';
+    mocks.workspaceId = 'dev';
+    stubLocation('https://localhost:5251');
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureCrossWorkspaceThreadTitle('work', t);
+
+    expect(mocks.locateWorkspace).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(crossWorkspaceThreadTitle('work', t)).toBeUndefined();
   });
 
   it('caches nothing (and never throws) when the source workspace is not running', async () => {

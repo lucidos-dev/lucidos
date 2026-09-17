@@ -789,7 +789,11 @@ pub(crate) fn format_exit_status(
 /// own teardown reaps them and a bare SIGKILL leaves them orphaned. Runs in the
 /// detached `driver_task`, off the cancel UX path, so the wait costs no
 /// interactive latency. See `spawn_env::graceful_kill_child_process_group`.
-const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+///
+/// Shared with both Codex drivers, which tear down the same way and reap the
+/// same browsers. Tuning this upward is the documented answer to a fresh
+/// pile-up, and a driver holding its own literal would sit out that fix.
+pub(super) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)

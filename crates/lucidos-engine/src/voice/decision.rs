@@ -280,6 +280,23 @@ impl OpenDecision {
         )
     }
 
+    /// The id of the choice that sends the caller's own words, when there is
+    /// one.
+    ///
+    /// Only a question card is issued one, so this is also the question of
+    /// whether a decision can be settled without interpreting anything. A
+    /// permission card answers `None`: Allow and Deny cannot be derived from
+    /// "they said something".
+    ///
+    /// Read by `Call::delegated`, which is the route a talker holding no
+    /// answering tool reaches.
+    pub fn their_words_choice(&self) -> Option<&str> {
+        self.choices
+            .iter()
+            .find(|choice| matches!(choice.act, Act::TheirWords { .. }))
+            .map(|choice| choice.id.as_str())
+    }
+
     /// The shared body of the three permission lanes: one wording and one
     /// choice set, so the caller hears the same options whichever agent asked.
     ///
@@ -368,11 +385,12 @@ pub trait DecisionResolver: Send + Sync {
         actor: Option<MessageOrigin>,
     ) -> Resolution;
 
-    /// Whether this thread's doer is parked on something waiting on the user.
+    /// What this thread's doer is parked on, if anything.
     ///
-    /// One read, and the whole of what the refusal needs: a delegation cannot
-    /// start a turn while the agent is blocked inside the call that asked.
-    async fn doer_is_parked(&self, thread_id: Uuid) -> bool;
+    /// One read, and the whole of what a delegation needs. A parked doer cannot
+    /// start a turn, being blocked inside the call that asked. WHICH card it is
+    /// then decides whether the caller can settle it out loud.
+    async fn parked_on(&self, thread_id: Uuid) -> Option<OpenDecision>;
 }
 
 /// The shipping implementation: the engine's own in-process paths.
@@ -398,8 +416,8 @@ impl DecisionResolver for ThreadDecisions {
         resolve(&self.engine, thread_id, choice_id, spoken, actor).await
     }
 
-    async fn doer_is_parked(&self, thread_id: Uuid) -> bool {
-        doer_is_parked(self.engine.pool(), thread_id).await
+    async fn parked_on(&self, thread_id: Uuid) -> Option<OpenDecision> {
+        parked_on(self.engine.pool(), thread_id).await
     }
 }
 
@@ -485,7 +503,7 @@ fn text(payload: &serde_json::Value, key: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Whether this thread's doer is parked on something waiting on the user.
+/// What this thread's doer is parked on, if anything.
 ///
 /// **The same read [`open_on`] makes, and deliberately not a cheaper one.** A
 /// yes/no `EXISTS` over the four lanes would be one query instead of four. It
@@ -497,11 +515,15 @@ fn text(payload: &serde_json::Value, key: &str) -> Option<String> {
 ///
 /// The four run concurrently, so the cost is one read of latency. It lands on a
 /// path that is about to emit an event and start a turn.
-pub async fn doer_is_parked(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+///
+/// The FIRST parking decision, in [`open_on`]'s lane order, which leads with the
+/// question card. A doer is blocked in one place at a time. Where two lanes
+/// somehow both read open, the settleable one is worth putting to the caller.
+pub async fn parked_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<OpenDecision> {
     open_on(pool, thread_id)
         .await
-        .iter()
-        .any(|decision| decision.kind.parks_the_doer())
+        .into_iter()
+        .find(|decision| decision.kind.parks_the_doer())
 }
 
 /// The newest request in one permission lane with no paired resolution.

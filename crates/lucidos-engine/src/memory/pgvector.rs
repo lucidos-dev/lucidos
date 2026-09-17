@@ -372,11 +372,20 @@ impl PgVectorIndex {
 
     /// Search by embedding and return cosine similarity scores alongside entries.
     /// Similarity is 1.0 - cosine_distance (1.0 = identical, 0.0 = orthogonal).
+    ///
+    /// `embedding_model` is the model that produced `query_embedding`, and rows
+    /// written by any other one are INVISIBLE rather than merely ranked lower.
+    /// A distance between two embedding spaces is not a similarity, and the two
+    /// coexist for the whole of a `reembed_stale` sweep: rows keep their old
+    /// model id until that sweep rewrites them, which takes tens of minutes on
+    /// a large index. Over that window an unfiltered query admits and rejects
+    /// arbitrary entries, and `engine::memory::extract` deletes on the score.
     pub async fn search_with_scores(
         &self,
         query_embedding: &[f32],
         min_importance: f32,
         limit: usize,
+        embedding_model: &str,
     ) -> Result<Vec<(MemoryEntry, f64)>, Box<dyn std::error::Error + Send + Sync>> {
         let embedding_str = to_pgvector_literal(query_embedding);
 
@@ -386,6 +395,7 @@ impl PgVectorIndex {
                    1.0 - (embedding <=> $2::vector) AS similarity
             FROM memory_entries
             WHERE importance >= $1
+              AND embedding_model = $4
             ORDER BY embedding <=> $2::vector
             LIMIT $3
             "#,
@@ -393,6 +403,7 @@ impl PgVectorIndex {
         .bind(min_importance)
         .bind(&embedding_str)
         .bind(limit as i64)
+        .bind(embedding_model)
         .fetch_all(&self.pool)
         .await?;
 
@@ -505,11 +516,17 @@ impl PgVectorIndex {
 
     /// Find entries similar to the given embedding above a similarity threshold.
     /// Uses the existing HNSW index for fast approximate nearest-neighbor search.
+    ///
+    /// `embedding_model` scopes the comparison to one embedding space, for the
+    /// reason given on [`Self::search_with_scores`]. It matters more here: the
+    /// supersede path in `engine::memory::extract` DELETES what this returns,
+    /// so a cross-space score would delete an unrelated entry.
     pub async fn find_similar(
         &self,
         embedding: &[f32],
         min_similarity: f32,
         limit: usize,
+        embedding_model: &str,
     ) -> Result<Vec<SimilarEntry>, Box<dyn std::error::Error + Send + Sync>> {
         use sqlx::Row;
 
@@ -519,7 +536,8 @@ impl PgVectorIndex {
             r#"
             SELECT id, topic, importance, entities, 1 - (embedding <=> $1::vector) AS similarity
             FROM memory_entries
-            WHERE 1 - (embedding <=> $1::vector) > $2
+            WHERE embedding_model = $4
+              AND 1 - (embedding <=> $1::vector) > $2
             ORDER BY similarity DESC
             LIMIT $3
             "#,
@@ -527,6 +545,7 @@ impl PgVectorIndex {
         .bind(&embedding_str)
         .bind(min_similarity)
         .bind(limit as i64)
+        .bind(embedding_model)
         .fetch_all(&self.pool)
         .await?;
 
@@ -897,6 +916,83 @@ mod extractor_version_tests {
         // Re-running the same delete is a no-op now that no rows are below 1.
         let deleted_again = index.delete_below_extractor_version(1).await.unwrap();
         assert_eq!(deleted_again, 0);
+
+        teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod embedding_space_tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    async fn seed(index: &PgVectorIndex, summary: &str, vector: &[f32], model: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        index
+            .index_entry(
+                id,
+                &MemorySource::Event { id: Uuid::new_v4() },
+                "topic",
+                summary,
+                0.5,
+                &[],
+                vector,
+                model,
+                Utc::now(),
+                crate::memory::EXTRACTOR_VERSION,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Both vector queries rank inside ONE embedding space.
+    ///
+    /// A model swap leaves every row stamped with the old id until
+    /// `reembed_stale` rewrites it, and the slot serves the new model the whole
+    /// time. The old rows are then not far-away neighbours, they are
+    /// meaningless ones: here they sit at distance zero and would win.
+    #[tokio::test]
+    async fn vector_search_never_ranks_rows_from_another_embedding_model() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+
+        let query = vec![0.1f32; 384];
+        // Same vector, different space. Identical scores, so an unfiltered
+        // query cannot prefer the right one by accident.
+        let current = seed(&index, "current space", &query, "new-model").await;
+        let stale = seed(&index, "stale space", &query, "old-model").await;
+
+        let scored = index
+            .search_with_scores(&query, 0.0, 10, "new-model")
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = scored.iter().map(|(entry, _)| entry.id).collect();
+        assert_eq!(
+            ids,
+            vec![current],
+            "a row embedded by another model is not comparable, so it must not rank"
+        );
+
+        let similar = index
+            .find_similar(&query, 0.5, 10, "new-model")
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = similar.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![current],
+            "the supersede path deletes what this returns, so {stale} must be invisible"
+        );
+
+        // And the sweep's own model still sees its own rows, so nothing is
+        // hidden from a workspace that has not swapped models.
+        let old_space = index
+            .search_with_scores(&query, 0.0, 10, "old-model")
+            .await
+            .unwrap();
+        assert_eq!(old_space.len(), 1);
+        assert_eq!(old_space[0].0.id, stale);
 
         teardown_test_db(&db_name).await;
     }

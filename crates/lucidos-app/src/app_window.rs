@@ -95,17 +95,83 @@ pub(crate) fn place_window(window: &tauri::Window, frame: window_restore::Rect, 
     }
 }
 
+/// How big a window's content is, in physical pixels. Ask this, never
+/// `tauri::Window::inner_size()`.
+///
+/// **On macOS that getter does not answer about the window.** For a window with
+/// no `add_child` webview the runtime returns the first WEBVIEW's NSView frame
+/// instead, and deliberately: wry replaces the view tao's resize event reports,
+/// so the runtime reports the page. A page that has drifted from its window
+/// therefore reports the drift as the window's own size.
+///
+/// Four callers inherited that, and ADR 0202 has what each one cost.
+///
+/// `outer_size()` is the NSWindow frame, which no webview touches.
+/// `titleBarStyle: "Overlay"` gives the content view the whole frame, so the
+/// two are one number for every window this client builds. Both halves are
+/// macOS facts, and so is the client: elsewhere `outer_size` carries the
+/// decorations, and this reader is where that split would go.
+pub(crate) fn window_content_size(
+    window: &tauri::Window,
+) -> tauri::Result<tauri::PhysicalSize<u32>> {
+    window.outer_size()
+}
+
+/// How far a webview may sit from filling its window before a refit is owed, in
+/// physical pixels.
+///
+/// One, because the measurement and the correction speak different units. The
+/// two sizes are compared as the physical pixels both getters answer in, and
+/// the write goes out in logical points (ADR 0173). So a content view half a
+/// point tall on a 2x panel round-trips to a neighbouring pixel. A zero
+/// tolerance would then write on every frame of a drag.
+const REFIT_TOLERANCE_PX: i64 = 1;
+
+/// Does `webview` already cover the whole of its window?
+///
+/// Pure, and the reason the refit is safe to run on every resize. Every input
+/// is a physical reading, the one space both getters answer in. No scale factor
+/// appears, so nothing here can be off by a conversion.
+///
+/// `offset` is the page's top-left relative to the window's, which is (0, 0)
+/// for an app window's own webview. It is judged too, because the runtime
+/// stores a rate per AXIS and per CORNER: a poisoned `x_rate` insets the page
+/// without changing its size.
+fn webview_fills_window(
+    window: tauri::PhysicalSize<u32>,
+    webview: tauri::PhysicalSize<u32>,
+    offset: tauri::PhysicalPosition<i32>,
+) -> bool {
+    let near = |a: i64, b: i64| (a - b).abs() <= REFIT_TOLERANCE_PX;
+    near(i64::from(window.width), i64::from(webview.width))
+        && near(i64::from(window.height), i64::from(webview.height))
+        && near(i64::from(offset.x), 0)
+        && near(i64::from(offset.y), 0)
+}
+
 /// Re-assert that an app window's own webview fills its window.
 ///
 /// An app window is exactly one webview under its own label, and that webview
-/// covers the whole window. Nothing insets it. The runtime is what keeps it
-/// there, from a resize event whose payload it converts with the scale factor
-/// of the moment. A scale change between the two halves of that conversion
-/// leaves the page in a corner at a fraction of its size (ADR 0178).
+/// covers the whole window. Nothing insets it. That is an invariant the client
+/// states absolutely, so the client ASSERTS it rather than trusting the runtime
+/// to have kept it.
 ///
-/// The NET, not the fix. [`build_geometry`] and [`placement_steps`] are what
-/// stop the client causing that change; this makes any it does not cause
-/// self-heal on the next frame.
+/// The runtime does not keep the page over the window directly. It keeps a RATE
+/// per webview, the bounds last set over the window's size at that moment, and
+/// re-applies `window_size * rate` on every resize. Nothing re-derives it, so
+/// one wrong reading survives every later move, resize and relaunch. This
+/// function used to BE that reading, through
+/// `tauri::Window::inner_size()`: see [`window_content_size`], and ADR 0202.
+///
+/// **The honest read is what makes the rate safe.** Both sides of the runtime's
+/// division now name the same thing, so the rate this records is 1.0 every
+/// time. Running on every resize is therefore the repair rather than a risk:
+/// each pass re-pins the rate, and a wrong one cannot outlive the next resize.
+///
+/// The mismatch gate is a saving, and an honest one only on a SETTLED window. A
+/// live drag writes each frame, because this runs from `on_window_event`, which
+/// the runtime calls before its own auto-resize. So the page read here is
+/// always the previous frame's.
 ///
 /// By webview, not webview window, per ADR 0140. This resizes a page inside a
 /// window, and the window may well be hosting a URL preview. That preview keeps
@@ -116,8 +182,21 @@ pub(crate) fn refit_webview(app: &tauri::AppHandle, label: &str) {
         return;
     };
     let window = webview.window();
-    let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else {
+    let Ok(size) = window_content_size(&window) else {
         eprintln!("[Tauri] Could not read {label} to refit its webview");
+        return;
+    };
+    // The gate. Read before the scale factor, so a settled window costs three
+    // getters and no write. An unreadable page is refit rather than assumed
+    // good: a needless write records a rate of 1, and skipping records the
+    // defect.
+    if let (Ok(page), Ok(at)) = (webview.size(), webview.position()) {
+        if webview_fills_window(size, page, at) {
+            return;
+        }
+    }
+    let Ok(scale) = window.scale_factor() else {
+        eprintln!("[Tauri] Could not read the scale factor of {label} to refit its webview");
         return;
     };
     // Points, through the window's OWN factor, which is what tao multiplied by
@@ -540,6 +619,81 @@ pub(crate) fn show_workspace_window(
     }
 }
 
+/// Settle `main`'s geometry: place the frame it is owed, or judge the one it
+/// already wears.
+///
+/// Never both. A placement is deferred to tao's main queue. A clamp issued
+/// behind one therefore reads the geometry that placement is about to replace,
+/// and can correct the rect it is losing (ADR 0202). A chosen frame goes
+/// through [`window_restore::sanitized_frame`] before it is written instead.
+///
+/// The one settler, shared by the startup show and by [`reopen_client`], so the
+/// two cannot come to different arrangements for the same window.
+pub(crate) fn settle_main_geometry(app: &tauri::AppHandle, frame: Option<window_restore::Rect>) {
+    match frame {
+        Some(frame) => {
+            let frame = window_restore::sanitized_frame(app, MAIN_WINDOW_LABEL, frame);
+            window_persist::size_main_window_for_its_workspace(app, frame);
+        }
+        None => window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL),
+    }
+    MAIN_GEOMETRY_SETTLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Has this launch settled `main`'s geometry yet?
+///
+/// The startup show does it, and a LOGIN START never reaches one: it comes up
+/// menu-bar-only, so neither racer can claim the show. The first reopen settles
+/// it instead, which is what this latch bounds to ONCE.
+///
+/// Unbounded, every later tray click would re-place a window the user had since
+/// dragged. Inside the save debounce it would land on the pre-drag rect, so the
+/// window would visibly snap back.
+static MAIN_GEOMETRY_SETTLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The frame a reopen owes `main`, or `None` to judge what it already wears.
+///
+/// Pure, so the precedence is testable without a window. `navigated` is the
+/// plan's answer: `Some(frame)` when this reopen is pointing `main` at a
+/// workspace, where the inner option is that workspace's remembered frame.
+///
+/// An adrift `main` takes what it is being navigated to. One already on its
+/// workspace owes nothing once the geometry is settled, because every frame
+/// after that is where the user put it. Unsettled, it takes `remembered`: see
+/// [`MAIN_GEOMETRY_SETTLED`] for the launch that leaves it so.
+fn main_frame_owed(
+    navigated: Option<Option<window_restore::Rect>>,
+    settled: bool,
+    remembered: Option<window_restore::Rect>,
+) -> Option<window_restore::Rect> {
+    match navigated {
+        Some(frame) => frame,
+        None if settled => None,
+        None => remembered,
+    }
+}
+
+/// [`main_frame_owed`]'s three inputs, read off this process.
+fn main_frame_owed_now(
+    live: &[desktop::LiveWindow],
+    plan: &desktop::ReopenPlan,
+) -> Option<window_restore::Rect> {
+    let settled = MAIN_GEOMETRY_SETTLED.load(std::sync::atomic::Ordering::SeqCst);
+    main_frame_owed(
+        plan.navigate_main.as_ref().map(|planned| planned.frame),
+        settled,
+        // Skipped when settled, so a tray click costs no file read.
+        (!settled)
+            .then(|| {
+                live.iter()
+                    .find(|window| window.label == MAIN_WINDOW_LABEL)
+                    .and_then(|window| window_persist::remembered_frame(&window.url))
+            })
+            .flatten(),
+    )
+}
+
 /// Reopen the extra windows this launch owes, at the frames they were left at.
 ///
 /// `main` takes the first restored workspace and is navigated by the caller, so
@@ -773,18 +927,12 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
     // lands.
     if let Some(planned) = &plan.navigate_main {
         desktop::navigate_main_window(app, &planned.url);
-        if let Some(frame) = planned.frame {
-            window_persist::size_main_window_for_its_workspace(app, frame);
-        }
     }
-    // Whatever put the geometry there, sanitise it before the show. It no
-    // longer rides the planned frame: a launch that came up menu-bar-only never
-    // reached `show_startup_window`, so this reopen is the first time anything
-    // judges what the plugin restored. A healthy rect makes it a no-op.
-    //
-    // The placement above is deferred, so this still reads what the window had
-    // before it. `docs/known-gaps.md` carries that half.
-    window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL);
+    // The same decision the startup show makes, and for the same reason: either
+    // the client chooses `main`'s frame, or it judges the one the window-state
+    // plugin restored. Never both, since a clamp issued behind a placement
+    // reads the geometry that placement is about to replace.
+    settle_main_geometry(app, main_frame_owed_now(&live, &plan));
     // No `native-window-active` here: these land on screen unfocused, and a
     // page that believes it is active suppresses the OS banner for a toast
     // nobody is looking at. `front_window` emits for the one that does
@@ -1028,6 +1176,117 @@ mod tests {
         let [moved, resized] = placement_steps(reported_frame());
         assert_eq!(moved.verb(), "move");
         assert_eq!(resized.verb(), "resize");
+    }
+
+    // ── Whether the page still fills its window ──────────────────────────────
+
+    fn size(width: u32, height: u32) -> tauri::PhysicalSize<u32> {
+        tauri::PhysicalSize::new(width, height)
+    }
+
+    fn at(x: i32, y: i32) -> tauri::PhysicalPosition<i32> {
+        tauri::PhysicalPosition::new(x, y)
+    }
+
+    /// The reported window, measured off the live accessibility tree. The
+    /// runtime held a rate of 1.6786 for it. So the page stayed 1.68 times the
+    /// window's width, and nothing the user could do cleared it.
+    #[test]
+    fn a_page_wider_than_its_window_owes_a_refit() {
+        assert!(!webview_fills_window(
+            size(2560, 1410),
+            size(4297, 1410),
+            at(0, 0)
+        ));
+    }
+
+    #[test]
+    fn a_page_that_already_fills_its_window_owes_nothing() {
+        assert!(webview_fills_window(
+            size(3267, 1410),
+            size(3267, 1410),
+            at(0, 0)
+        ));
+    }
+
+    /// The tolerance earns its keep here. The write goes out in points and the
+    /// reading comes back in pixels, so a neighbouring pixel is a round trip
+    /// rather than a fault. Refitting on it would write on every frame of a
+    /// drag, which is the one thing the gate exists to avoid.
+    #[test]
+    fn a_single_pixel_of_rounding_is_not_a_mismatch() {
+        for page in [size(2559, 1410), size(2561, 1410), size(2560, 1409)] {
+            assert!(
+                webview_fills_window(size(2560, 1410), page, at(0, 0)),
+                "{page:?}"
+            );
+        }
+        for page in [size(2558, 1410), size(2560, 1412)] {
+            assert!(
+                !webview_fills_window(size(2560, 1410), page, at(0, 0)),
+                "{page:?}"
+            );
+        }
+    }
+
+    /// The runtime keeps a rate per corner as well as per axis, so a page can
+    /// be the right size and still be inset. Judging the size alone would leave
+    /// that one uncorrected.
+    #[test]
+    fn a_page_the_right_size_in_the_wrong_corner_owes_a_refit() {
+        assert!(!webview_fills_window(
+            size(2560, 1410),
+            size(2560, 1410),
+            at(40, 0)
+        ));
+        assert!(!webview_fills_window(
+            size(2560, 1410),
+            size(2560, 1410),
+            at(0, -40)
+        ));
+    }
+
+    // ── What frame a reopen owes `main` ──────────────────────────────────────
+
+    fn frame() -> window_restore::Rect {
+        window_restore::Rect {
+            x: 573,
+            y: 30,
+            width: 3267,
+            height: 1410,
+        }
+    }
+
+    /// An adrift `main` is being pointed somewhere, so it takes that
+    /// workspace's frame whatever this launch has done before.
+    #[test]
+    fn a_navigated_main_takes_the_frame_it_is_navigating_to() {
+        for settled in [false, true] {
+            assert_eq!(
+                main_frame_owed(Some(Some(frame())), settled, None),
+                Some(frame()),
+                "settled {settled}"
+            );
+            // A workspace nothing is remembered about is navigated with no
+            // frame, and falls through to the clamp.
+            assert_eq!(main_frame_owed(Some(None), settled, Some(frame())), None);
+        }
+    }
+
+    /// The login start. Nothing settled `main`, so the first reopen owes it the
+    /// frame its workspace remembers.
+    #[test]
+    fn an_unsettled_main_takes_the_frame_its_workspace_remembers() {
+        assert_eq!(main_frame_owed(None, false, Some(frame())), Some(frame()));
+        assert_eq!(main_frame_owed(None, false, None), None);
+    }
+
+    /// The regression this bounds. Every reopen after the first finds `main`
+    /// where the user left it. Re-placing it there would snap a dragged window
+    /// back to whatever the record last caught.
+    #[test]
+    fn a_settled_main_is_left_exactly_where_it_is() {
+        assert_eq!(main_frame_owed(None, true, Some(frame())), None);
     }
 
     #[test]

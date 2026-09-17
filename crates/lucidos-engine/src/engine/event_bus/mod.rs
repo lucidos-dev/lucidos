@@ -211,6 +211,9 @@ pub enum BusEvent {
 mod system_event;
 pub use system_event::SystemEvent;
 
+mod auto_resume_hold;
+pub(crate) use auto_resume_hold::AutoResumeHolds;
+
 mod parent_callback;
 
 impl EmittedEvent {
@@ -385,6 +388,9 @@ pub struct EventBus {
     /// terminal event so the parent agent session wakes its run-loop.
     parent_callback_tx: mpsc::UnboundedSender<ParentCallback>,
     changes_projection: crate::core::changes_projection::ChangesProjection,
+    /// Children the engine is about to auto-resume, so `notify_parent_if_child`
+    /// withholds their completion card. See [`AutoResumeHolds`].
+    auto_resume_holds: AutoResumeHolds,
 }
 
 impl EventBus {
@@ -399,9 +405,16 @@ impl EventBus {
                 event_tx,
                 parent_callback_tx,
                 changes_projection,
+                auto_resume_holds: AutoResumeHolds::default(),
             },
             parent_callback_rx,
         )
+    }
+
+    /// The register the engine takes a hold in before it emits a terminal it
+    /// intends to auto-resume past.
+    pub(crate) fn auto_resume_holds(&self) -> &AutoResumeHolds {
+        &self.auto_resume_holds
     }
 
     pub fn changes_projection(&self) -> &crate::core::changes_projection::ChangesProjection {
@@ -913,7 +926,7 @@ impl EventBus {
                         );
                     }
                     // Run after broadcast so a panic here can't skip SSE delivery
-                    self.notify_parent_if_child(notify_thread_id, event_id, &notify_event)
+                    self.notify_parent_if_child(notify_thread_id, Some(event_id), &notify_event)
                         .await;
                     // If a child was just created, notify the parent with updated counts
                     if let ThreadEvent::MessageReceived {

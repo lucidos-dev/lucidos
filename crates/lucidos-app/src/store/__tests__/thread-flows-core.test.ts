@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeError, exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, exchangeUserSource, groupIntoExchanges, handleEvent, type ThreadEvent } from '../thread-events';
+import { exchangeError, exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserMessage, groupIntoExchanges, handleEvent, type ThreadEvent } from '../thread-events';
 import { getCollapsedVisibleEvents, hidesEarlierProse } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
@@ -232,7 +232,6 @@ describe('Flow: Scheduled trigger', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    expect(exchangeUserChannel(exchanges[0])).toBe('trigger');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toBe('Task done.');
   });
@@ -249,7 +248,6 @@ describe('Flow: Scheduled trigger', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
     expect(exchangeUserMessage(exchanges[0])).toBe('Check my emails and summarize');
-    expect(exchangeUserChannel(exchanges[0])).toBe('trigger');
   });
 
   it('TriggerStarted without prompt falls back to trigger_name', () => {
@@ -279,67 +277,6 @@ describe('Flow: Scheduled trigger', () => {
 
     const status = map.get(id)!.meta.status;
     expect(status).toBe('running');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Message mode / route label
-// ---------------------------------------------------------------------------
-describe('exchangeUserSource — reads MessageReceived.mode', () => {
-  it('human-mode MessageReceived returns "user"', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'hi', mode: 'human' } as any,
-    ]);
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserSource(exchanges[0])).toBe('user');
-  });
-
-  it('agent-mode MessageReceived returns "system"', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'auto', mode: 'agent' } as any,
-    ]);
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserSource(exchanges[0])).toBe('system');
-  });
-
-  it('engine-mode MessageReceived returns "system"', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'auto', mode: 'engine' } as any,
-    ]);
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserSource(exchanges[0])).toBe('system');
-  });
-
-  it('MessageReceived without mode defaults to "user" (mirrors engine default_mode_human for old DB rows)', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [{ type: 'MessageReceived', text: 'hi' }]);
-    const exchanges = getExchanges(map, id);
-    expect(exchangeUserSource(exchanges[0])).toBe('user');
-  });
-});
-
-describe('Route label — system-initiated thread, user follow-up', () => {
-  it('user follow-up in scheduled-trigger CC thread renders "User → Claude Code"', () => {
-    const { map, id } = makeThread();
-    insertEvents(map, id, [
-      { type: 'TriggerStarted', trigger_id: 't-1', trigger_name: 'Daily', prompt: 'Run it' },
-      { type: 'SessionStarted', session_id: 'cc-1' },
-      { type: 'ResponseGenerated' },
-      { type: 'CodingAgentIdled' },
-      { type: 'MessageReceived', text: 'what model is used?', channel: 'claude_code', mode: 'human' } as any,
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    expect(exchanges).toHaveLength(2);
-
-    expect(exchangeUserSource(exchanges[0])).toBe('system');
-    expect(exchangeUserChannel(exchanges[0])).toBe('trigger');
-
-    expect(exchangeUserSource(exchanges[1])).toBe('user');
-    expect(exchangeUserChannel(exchanges[1])).toBe('claude_code');
   });
 });
 

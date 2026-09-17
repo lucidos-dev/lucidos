@@ -95,7 +95,18 @@ impl VoiceProvider for RealtimeProvider {
 
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
         tokio::spawn(async move {
-            while let Some(Ok(message)) = reader.next().await {
+            loop {
+                let message = match reader.next().await {
+                    Some(Ok(message)) => message,
+                    // A TLS fault, a protocol error or a reset drops the call
+                    // mid-sentence. Unlogged, an operator chasing a recurring
+                    // drop has nothing to grep. `live.rs` logs the same case.
+                    Some(Err(e)) => {
+                        log!("[Voice] The Realtime socket failed: {}", e);
+                        return;
+                    }
+                    None => return,
+                };
                 let Message::Text(text) = message else {
                     continue;
                 };

@@ -32,8 +32,6 @@ function openMarketplaceSettings() {
   openSettingsSubview('marketplaces');
 }
 
-const CATALOG_REFRESH_MS = 5 * 60 * 1000;
-
 function statusLabel(plugin: MarketplacePlugin): string {
   switch (plugin.status) {
     case 'installed': return `Installed v${plugin.installed_version ?? plugin.version}`;
@@ -251,12 +249,14 @@ export function StoreTab() {
     // status + categories; the installed list gives orphan coverage and drives
     // the Installed view. refreshPluginCatalog only shows the spinner when the
     // catalog is still fresh, so a revisit re-fetch doesn't flash loading.
+    //
+    // The mount fetch is the whole refresh. `entityReferences.ts` reloads the
+    // catalog on `PluginMarketplaceRegistered` and `PluginMarketplaceRemoved`,
+    // which is the subscription this surface owes. So no interval, and no focus
+    // or visibility listener standing in for one: `.claude/rules/frontend.md`
+    // bans each. A scan git-clones every marketplace, seconds per repo.
     void refreshPluginCatalog();
     void loadInstalledPlugins();
-    const id = window.setInterval(() => {
-      if (marketplaceCatalog.value.status === 'loaded') void refreshPluginCatalog();
-    }, CATALOG_REFRESH_MS);
-    return () => window.clearInterval(id);
   }, []);
 
   // Notification deep-link (navigate_ui target `plugins`): once the list has

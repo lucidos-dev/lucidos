@@ -34,7 +34,7 @@ import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
@@ -572,6 +572,13 @@ describe('handleArchiveThread — active drawer view', () => {
 // ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — optimistic UI', () => {
+  /** Does the drawer still route this row into Current? Asked through the same
+   *  function the drawer and the family graph ask, so the two cannot drift. */
+  function currentSection(id: string): boolean {
+    const thread = threadMap.value.get(id);
+    return !!thread && getThreadDisplaySection(thread) === 'current';
+  }
+
   it('drops the target out of review before the API resolves', async () => {
     let resolveApi: (v: { archived: string[] }) => void = () => {};
     (archiveThread as ReturnType<typeof vi.fn>).mockImplementationOnce(
@@ -591,7 +598,7 @@ describe('handleArchiveThread — optimistic UI', () => {
     // Don't await — verify mid-flight (API has not resolved).
     const pending = handleArchiveThread('parent');
 
-    expect(getCurrentThreads().some(t => t.meta.id === 'parent')).toBe(false);
+    expect(currentSection('parent')).toBe(false);
     expect(focusedThreadId.value).toBe('sibling');
 
     resolveApi({ archived: ['parent'] });
@@ -620,10 +627,9 @@ describe('handleArchiveThread — optimistic UI', () => {
     const pending = handleArchiveThread('parent');
 
     // The whole family must vanish from Current before the API resolves.
-    const ids = getCurrentThreads().map(t => t.meta.id);
-    expect(ids).not.toContain('parent');
-    expect(ids).not.toContain('child');
-    expect(ids).not.toContain('grandchild');
+    for (const id of ['parent', 'child', 'grandchild']) {
+      expect(currentSection(id), id).toBe(false);
+    }
 
     resolveApi({ archived: ['parent', 'child', 'grandchild'] });
     await pending;

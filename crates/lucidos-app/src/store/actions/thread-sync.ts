@@ -256,10 +256,10 @@ function findMergeConflictEventId(threadId: string, changeId: string | undefined
 
 /** Route one frame's `data` payload into the store.
  *
- *  Exported for the transport-equivalence test. Both a direct frame and a
- *  worker-relayed one land here, so asserting on this function proves the two
- *  transports are indistinguishable to the shell. */
-export function handleHostFrame(data: string): void {
+ *  Module-private, and the one sink both transports reach: `onFrame` below
+ *  hands it a direct frame and a worker-relayed one alike, which is what makes
+ *  the two indistinguishable from here down. */
+function handleHostFrame(data: string): void {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(data);
@@ -466,6 +466,12 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       handleTransientSideEffects(event, threadId, eventId);
       return;
     }
+    // A persisted event with no aggregate has no DB row either, so it produces
+    // the same phantom. The engine builds the aggregate from `thread_summaries`
+    // inside the emitting transaction, so its absence means that row is gone.
+    // The warning above already named it. A skeleton built from nothing put a
+    // titleless row in the drawer, which a reload then swept away.
+    if (!aggregate) return;
     // Infer source from event type — coding-agent events mean claude_code, not chat
     const isCcEvent = event.type === 'SessionStarted'
       || event.type === 'ContinuationStarted'

@@ -94,6 +94,7 @@ pub(crate) async fn combined_thread_search(
                 &embedding,
                 RETRIEVAL_MIN_IMPORTANCE,
                 SEMANTIC_CANDIDATE_LIMIT,
+                engine.embedder.model_id(),
             )
             .await
         {

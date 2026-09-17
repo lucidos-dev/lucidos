@@ -469,6 +469,7 @@ describe('the breadcrumb channel', () => {
   it('records every verdict a press can end on', () => {
     for (const verdict of [
       'dead', 'clicked', 'canceled', 'missed', 'no-lift', 'click-no-touch', 'unreachable',
+      'covered', 'stray-click',
     ]) {
       expect(code).toContain(`'${verdict}'`);
     }
@@ -554,13 +555,15 @@ describe('the probe consumes no gesture', () => {
     expect(code).toMatch(/querySelectorAll<HTMLButtonElement>\(\s*`\$\{ROW_SELECTOR\} \$\{FACE_SELECTOR\}`/);
   });
 
-  it('names the morph to read it and to run it, never to pick what it watches', () => {
+  it('names the morph once, to read it, never to pick what it watches', () => {
     // "The button is there, it just doesn't work" is a claim about the morph's
-    // own state, and no line used to carry it. Two singular reaches are
-    // legitimate: reading that mode, and running Send for a tap the page
-    // dropped (ADR 0183). Building the watched SET from it is the miss above.
+    // own state, and no line used to carry it. Reaching for the node is
+    // legitimate; building the watched SET from it is the miss above.
+    //
+    // ONE reach. Its two readers, the mode and the rescue, share `morphElement`
+    // so they can never end up asking about two different nodes.
     const morphLines = code.split('\n').filter((l: string) => l.includes('send-cancel-morph'));
-    expect(morphLines).toHaveLength(2);
+    expect(morphLines).toHaveLength(1);
     for (const line of morphLines) expect(line).toContain('querySelector<HTMLButtonElement>');
   });
 

@@ -179,8 +179,7 @@ fn generate_typescript() -> String {
         status_literals.join(", ")
     ));
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
-    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n");
-    out.push_str("export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';\n\n");
+    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n\n");
 
     // LEGAL_SECTIONS
     out.push_str(

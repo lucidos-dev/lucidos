@@ -8,7 +8,7 @@ pub(super) fn fetch_news_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::FETCH_NEWS.to_string(),
-            description: "Fetch recent news articles on a topic from the GDELT global news database, all languages. Sources from the user's own country, derived from their timezone, are prioritized automatically.".to_string(),
+            description: "Fetch recent news articles on a topic from the GDELT global news database. It applies no country or language filter, so put either in the topic when the user wants one.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

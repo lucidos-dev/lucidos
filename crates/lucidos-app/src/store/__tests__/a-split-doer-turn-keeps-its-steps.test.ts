@@ -1,12 +1,14 @@
-/** One doer turn, several exchanges, and every step still under the right one.
+/** One doer turn, several exchanges, and every step where it happened.
  *
  *  A caller's utterance opens a boundary wherever it lands, so a doer turn the
- *  caller talks across is split by boundaries it does not own. The doer's own
- *  events route by request id, which is what keeps them together, and only one
+ *  caller talks across is split by boundaries it does not own. Each piece reads
+ *  under the words it followed, which is when it happened (ADR 0201). Only one
  *  of the exchanges may report the turn finishing.
  *
- *  This is the load-bearing hazard of
- *  `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
+ *  A tool RESULT is the exception, and it is pairing rather than placement: it
+ *  completes a step row that already exists, so it follows its call.
+ *
+ *  Plan: `docs/plans/2026-09-16-the-clock-is-the-only-order.md`.
  */
 import { describe, it, expect } from 'vitest';
 import { ev, heard, put, said } from './call-fixtures';
@@ -36,7 +38,7 @@ function theCall(): Map<number, StoredEvent> {
     ev(6, { type: 'ToolCalled', name: 'run_bash', args: {}, _eventId: 'tc-1', request_event_id: MSG }),
     heard(7, 'Are you still there?'),
     said(8, 'Still working on it.'),
-    ev(9, { type: 'ToolResult', name: 'run_bash', result: 'ok', request_event_id: MSG }),
+    ev(9, { type: 'ToolResult', name: 'run_bash', result: 'ok', tool_called_event_id: 'tc-1', request_event_id: MSG }),
     heard(10, 'Any idea how long?'),
     said(11, 'Almost there.'),
     ev(12, { type: 'TextStreamed', text: 'About ten minutes.', request_event_id: MSG }),
@@ -68,7 +70,10 @@ describe('a doer turn split across several exchanges', () => {
     ]);
   });
 
-  it('keeps every doer step under the utterance that asked for it', () => {
+  // The steps taken before the caller cut in stay with the question that
+  // asked for them. The RESULT joins them from below the utterance, because a
+  // step row and its outcome are one row.
+  it('keeps the steps taken before the caller spoke, and their results', () => {
     const exchanges = groupIntoExchanges(theCall());
     const delegated = exchanges[1];
     expect(delegated.userEvent.type).toBe('MessageReceived');
@@ -76,37 +81,33 @@ describe('a doer turn split across several exchanges', () => {
       'ThoughtStreamed',
       'ToolCalled',
       'ToolResult',
-      'TextStreamed',
-      'ResponseGenerated',
     ]);
   });
 
-  // The sharp version of step ownership. These two route CHRONOLOGICALLY, so
-  // an utterance that took the turn would collect them. A call that ended fine
-  // would then read Aborted, with nothing on screen to explain it.
-  it('keeps the chronological bookkeeping out of the utterances', () => {
+  // These two route CHRONOLOGICALLY, and chronologically is exactly where they
+  // belong: under the last thing said before them.
+  it('files the chronological bookkeeping under the words it followed', () => {
     const events = theCall();
     put(events, 16, { type: 'TodoListWritten', items: [], request_event_id: MSG });
     put(events, 17, { type: 'BackgroundBashStarted', task_id: 'b1', command: 'sleep 1', timeout_secs: 60, started_at: TS });
     const exchanges = groupIntoExchanges(events);
-    const turn = exchanges[1];
-    expect(turn.userEvent.type).toBe('MessageReceived');
-    expect(stepTypes(turn)).toContain('TodoListWritten');
-    expect(stepTypes(turn)).toContain('BackgroundBashStarted');
-    for (const utterance of [exchanges[2], exchanges[3]]) {
-      const spokenOnly = stepTypes(utterance).every(t => t.startsWith('Spoken') || t.startsWith('Voice'));
-      expect(spokenOnly).toBe(true);
-    }
+    const last = exchanges[exchanges.length - 1];
+    expect(last.userEvent.type).toBe('SpokenMessageReceived');
+    expect(stepTypes(last)).toContain('TodoListWritten');
+    expect(stepTypes(last)).toContain('BackgroundBashStarted');
+    // And nothing reached back into the turn that had already moved on.
+    expect(stepTypes(exchanges[1])).not.toContain('TodoListWritten');
   });
 
-  // The relay of the doer's answer lands under the LAST utterance, which is
-  // where it was said. The written answer stays with the question that asked
-  // for it, one exchange up.
-  it('leaves the intervening utterances holding only what was said', () => {
+  // Everything the doer produced after an utterance reads under it. The answer
+  // the caller heard lands there too, beside the written one.
+  it('gives each utterance the work that followed it', () => {
     const exchanges = groupIntoExchanges(theCall());
     expect(stepTypes(exchanges[2])).toEqual(['SpokenReplyGenerated']);
     expect(stepTypes(exchanges[3])).toEqual([
       'SpokenReplyGenerated',
+      'TextStreamed',
+      'ResponseGenerated',
       'SpokenReplyGenerated',
       'VoiceSessionEnded',
     ]);
@@ -116,27 +117,30 @@ describe('a doer turn split across several exchanges', () => {
     const exchanges = groupIntoExchanges(theCall());
     const holders = exchanges.filter(e => stepTypes(e).some(t => TERMINALS.has(t)));
     expect(holders).toHaveLength(1);
-    expect(holders[0].userEvent.type).toBe('MessageReceived');
+    // The one the turn was in when it ended, which is the last thing said
+    // before it finished.
+    expect(holders[0]).toBe(exchanges[exchanges.length - 1]);
   });
 
-  // Two `Done` badges for ONE turn is the failure this guards. Every exchange
-  // reads done here, and each is answering for itself: the delegated one for
-  // its terminal, the three call-only ones for the words they carry.
+  // Two `Done` badges for ONE turn is the failure this guards. The delegated
+  // exchange reads `interrupted`, which draws the "↳" continuation arrow: its
+  // turn carried on below, and saying Done there would claim it finished
+  // where it stopped. Nothing is left working once the call has rung off.
   it('reports no exchange still working once the call has rung off', () => {
     const exchanges = groupIntoExchanges(theCall());
     const verdicts = exchanges.map((e, i) =>
       exchangeStatus(e, '', i === exchanges.length - 1, false, false, true),
     );
-    expect(verdicts).toEqual(['done', 'done', 'done', 'done']);
+    expect(verdicts).toEqual(['done', 'interrupted', 'done', 'done']);
   });
 });
 
-/** The turn keeps the LIVE role too, not just its steps.
+/** The turn moves to the newest card, and its LIVE role moves with it.
  *
  *  A caller talking over a working doer opens the newest exchange, and the
- *  newest exchange is normally the active one. It owns the streaming buffer and
- *  the "Working" badge, and the running turn drops to "Done" the moment the
- *  caller speaks. A spoken boundary holds no turn, so the search steps over it.
+ *  turn carries on inside it. It owns the streaming buffer and the "Working"
+ *  badge there, because that is where the work is now showing. A spoken
+ *  boundary that took no turn is still stepped over.
  */
 describe('a caller talking over a running turn', () => {
   /** The call above, cut off while the doer is still working. */
@@ -161,11 +165,11 @@ describe('a caller talking over a running turn', () => {
     return events;
   }
 
-  it('leaves the running turn active, not the utterance', () => {
+  it('makes the utterance the running turn carried into the active one', () => {
     const exchanges = groupIntoExchanges(midTurn());
     const { activeIndex } = queuedFollowupRun(exchanges, /* threadBusy */ true);
-    expect(exchanges[activeIndex].userEvent.type).toBe('MessageReceived');
-    expect(activeIndex).toBe(exchanges.length - 2);
+    expect(exchanges[activeIndex].userEvent.type).toBe('SpokenMessageReceived');
+    expect(activeIndex).toBe(exchanges.length - 1);
   });
 
   it('keeps that turn reading as working rather than continued', () => {
@@ -180,7 +184,8 @@ describe('a caller talking over a running turn', () => {
     put(events, 9, { type: 'MessageReceived', text: 'and the changelog?', mode: 'human', _eventId: 'msg-2' });
     const exchanges = groupIntoExchanges(events);
     const run = queuedFollowupRun(exchanges, true);
-    expect(exchanges[run.activeIndex].userEvent._eventId).toBe(MSG);
+    // Behind the card the turn is showing in, which the caller's words moved.
+    expect(exchanges[run.activeIndex].userEvent.type).toBe('SpokenMessageReceived');
     expect(run.queuedOrder.map(i => exchanges[i].userEvent._eventId)).toEqual(['msg-2']);
   });
 
@@ -195,7 +200,7 @@ describe('a caller talking over a running turn', () => {
   it('answers the utterance, not the message still waiting behind it', () => {
     const events = midTurn();
     put(events, 9, { type: 'MessageReceived', text: 'and the changelog?', mode: 'human', _eventId: 'msg-2' });
-    put(events, 10, { type: 'SpokenReplyGenerated', session_id: 'sess-1', text: 'Nearly done.', interrupted: false });
+    put(events, 20, { type: 'SpokenReplyGenerated', session_id: 'sess-1', text: 'Nearly done.', interrupted: false });
     const exchanges = groupIntoExchanges(events);
     const utterance = exchanges.find(e => e.userEvent.type === 'SpokenMessageReceived')!;
     const waiting = exchanges.find(e => e.userEvent._eventId === 'msg-2')!;
@@ -332,10 +337,10 @@ describe('a caller talking over a running turn', () => {
   });
 
   // With no turn under it, the delegated question is what the reader waits on.
-  // It takes the live role even though the caller spoke since. Picked from the
-  // retractable list alone it never could: speech is not retractable, so it was
-  // never a candidate.
-  it('waits on the delegated question, not on what the caller said after it', () => {
+  // The live role follows the TURN, and the caller's words moved where the
+  // turn is showing. Picked from the retractable list alone there would be no
+  // candidate at all: speech is not retractable.
+  it('waits on the card the delegated question carried into', () => {
     const events = new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
       said(2, 'Hi there. How can I help?'),
@@ -352,7 +357,9 @@ describe('a caller talking over a running turn', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     const run = queuedFollowupRun(exchanges, /* threadBusy */ true);
-    expect(exchanges[run.activeIndex].userEvent._eventId).toBe(MSG);
+    const active = exchanges[run.activeIndex];
+    expect(active.userEvent.type).toBe('SpokenMessageReceived');
+    expect(active.tookTheTurn).toBe(true);
   });
 
   // The retract filter has to match what the retract OFFERED, or a message the
@@ -380,7 +387,9 @@ describe('a caller talking over a running turn', () => {
     for (let i = exchanges.length - 1; i >= 0; i--) {
       if (!run.queuedIndices.has(i)) { anchor = i; break; }
     }
-    expect(anchor).toBeGreaterThan(run.activeIndex);
+    // The turn moved into that later utterance, so the anchor IS the active
+    // one. Either way the queued bubble renders under the newest speech.
+    expect(anchor).toBeGreaterThanOrEqual(run.activeIndex);
     expect(exchanges[anchor].userEvent.type).toBe('SpokenMessageReceived');
   });
 });
@@ -413,8 +422,10 @@ describe('an injection absorbed after the caller spoke', () => {
       heard(5, 'Are you still there?'),
       ev(6, { type: 'UserPromptInjected', text: 'How long will the release take?', mode: 'engine', injected_message_id: MSG }),
       said(7, 'Still working on it.'),
-      said(8, 'About ten minutes.'),
-      ev(9, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 22 }),
+      // A quarter of a minute later, which is a second remark rather than the
+      // same breath cut in two.
+      said(22, 'About ten minutes.'),
+      ev(23, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 22 }),
     ]);
   }
 

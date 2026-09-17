@@ -309,6 +309,46 @@ export async function fetchInstallInventory(): Promise<InstallInventory> {
   return controlJson<InstallInventory>('/installs');
 }
 
+// ── Where a workspace this gateway does not serve lives ─────────────────────
+
+/** The gateway's answer about a workspace on another install on this machine.
+ *
+ *  Mirrors the gateway's `WorkspaceLocation`, whose serde tag is `status` and
+ *  whose variants are kebab-case. Only the reachable arm carries a `scheme`:
+ *  it is what the peer answered, and the two shipped gateways disagree (the
+ *  packaged one serves http, a dev checkout serves https). */
+export type WorkspaceLocation =
+  | {
+      status: 'reachable';
+      install: string;
+      gateway_port: number;
+      scheme: string;
+      slug: string;
+    }
+  | { status: 'install-not-running'; install: string; gateway_port: number; slug: string }
+  | { status: 'ambiguous'; installs: string[] };
+
+/** Locate a workspace this gateway does not serve, by name.
+ *
+ *  `null` means nothing here can say where it is, so the caller reports the
+ *  workspace unavailable exactly as it did before this route existed. Two
+ *  different things arrive as null, and both have to (ADR 0105):
+ *
+ *   • A 404, the gateway saying no other install on this machine carries it.
+ *   • A **picker shell**, from a gateway too old to know the route. An
+ *     unmatched `/~/…` path falls through to the SPA fallback, so the answer is
+ *     200 and HTML rather than a 404. Parsing it would report a syntax error
+ *     over a workspace that is merely somewhere this gateway cannot see. That
+ *     pairing is the ordinary case here: the install this feature reaches for
+ *     is the one running an old gateway. */
+export async function locateWorkspace(name: string): Promise<WorkspaceLocation | null> {
+  const res = await fetch(`${CONTROL}/workspace-location?name=${encodeURIComponent(name)}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(await gatewayErrorReason(res));
+  const body = (await res.json().catch(() => null)) as WorkspaceLocation | null;
+  return body && typeof body.status === 'string' ? body : null;
+}
+
 // ── Network access (machine-global gateway bind) ────────────────────────────
 
 /** The machine-global network bind config from `~/.lucidos/network.toml`.

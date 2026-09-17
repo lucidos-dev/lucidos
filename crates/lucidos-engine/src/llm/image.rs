@@ -101,6 +101,42 @@ impl OpenAiImageProvider {
             ImageSize::Auto => "auto",
         }
     }
+
+    /// Read one image response into an [`ImageResult`]. `call` names the
+    /// endpoint in every error, and is the only thing generation and editing
+    /// differ by once the response is in hand.
+    ///
+    /// The MIME type is `image/png` for both, which is what the generation
+    /// request asks for. The edit request omits `output_format`, so it takes
+    /// OpenAI's default; that predates this helper and is unchanged here.
+    async fn read_image_response(
+        &self,
+        resp: reqwest::Response,
+        call: &str,
+    ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("OpenAI image {call} failed ({status}): {text}").into());
+        }
+
+        let response: OpenAiImageResponse = resp.json().await?;
+        let b64 = response
+            .data
+            .first()
+            .and_then(|d| d.b64_json.as_ref())
+            .ok_or_else(|| format!("No image data in OpenAI {call} response"))?;
+
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+        let (input_tokens, output_tokens) = usage_tokens(&response.usage);
+        Ok(ImageResult {
+            bytes,
+            mime_type: "image/png".to_string(),
+            input_tokens,
+            output_tokens,
+            model: self.model.clone(),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,7 +180,7 @@ impl ImageProvider for OpenAiImageProvider {
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
         let size_str = Self::openai_size(size);
 
-        if input_images.is_empty() {
+        let (call, resp) = if input_images.is_empty() {
             // Text-to-image generation
             let body = serde_json::json!({
                 "model": self.model,
@@ -162,31 +198,7 @@ impl ImageProvider for OpenAiImageProvider {
                 .json(&body)
                 .send()
                 .await?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(
-                    format!("OpenAI image generation failed ({}): {}", status, text).into(),
-                );
-            }
-
-            let response: OpenAiImageResponse = resp.json().await?;
-            let b64 = response
-                .data
-                .first()
-                .and_then(|d| d.b64_json.as_ref())
-                .ok_or("No image data in OpenAI response")?;
-
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-            let (input_tokens, output_tokens) = usage_tokens(&response.usage);
-            Ok(ImageResult {
-                bytes,
-                mime_type: "image/png".to_string(),
-                input_tokens,
-                output_tokens,
-                model: self.model.clone(),
-            })
+            ("generation", resp)
         } else {
             // Image editing with multipart form
             let mut form = reqwest::multipart::Form::new()
@@ -209,30 +221,10 @@ impl ImageProvider for OpenAiImageProvider {
                 .multipart(form)
                 .send()
                 .await?;
+            ("edit", resp)
+        };
 
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("OpenAI image edit failed ({}): {}", status, text).into());
-            }
-
-            let response: OpenAiImageResponse = resp.json().await?;
-            let b64 = response
-                .data
-                .first()
-                .and_then(|d| d.b64_json.as_ref())
-                .ok_or("No image data in OpenAI edit response")?;
-
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-            let (input_tokens, output_tokens) = usage_tokens(&response.usage);
-            Ok(ImageResult {
-                bytes,
-                mime_type: "image/png".to_string(),
-                input_tokens,
-                output_tokens,
-                model: self.model.clone(),
-            })
-        }
+        self.read_image_response(resp, call).await
     }
 
     fn supports_multi_image(&self) -> bool {

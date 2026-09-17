@@ -71,6 +71,10 @@ const BACKUP_SETTINGS_NAVIGATED: &str = "Navigated to Settings → System → Ba
 /// `to_outcome`, the plugin-tool branch, and the special-tool / read-cache
 /// sites in the agentic loops all route through here so the convention can
 /// be retired in one place once every tool internally returns typed `Err`.
+///
+/// Temporary measure, registered in `docs/temporary-measures.md` under "The
+/// legacy `Error:`-prefix lift on a tool result", which carries the removal
+/// condition and the live call sites.
 pub(crate) fn lift_legacy_string(s: String) -> ToolOutcome {
     if s.starts_with("Error:") {
         Err(s)
