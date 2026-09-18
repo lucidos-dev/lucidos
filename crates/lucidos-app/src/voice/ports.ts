@@ -16,7 +16,7 @@ import {
   microphoneRefusal,
   wrongAudioRate,
 } from './refusals';
-import { scheduleChunk } from './schedule';
+import { PLAYBACK_START, type Playback, placeChunk, restartPlayback } from './schedule';
 import { voiceSocketUrl, wsEchoUrl } from './socketUrl';
 
 /** The caller's end of the socket, once it is open. */
@@ -35,6 +35,14 @@ export interface SocketHandlers {
   onClose(): void;
 }
 
+/** How often the speaker ran dry mid-reply, over one call. */
+export interface PlaybackGaps {
+  /** How many times the queue emptied with more of a reply still to come. */
+  count: number;
+  /** How long the speaker was silent across those holes, in seconds. */
+  seconds: number;
+}
+
 /** The microphone and the speaker, as one open device. */
 export interface AudioDevice {
   /** Why this is not the microphone that was asked for, or `null`.
@@ -46,6 +54,12 @@ export interface AudioDevice {
   note: string | null;
   play(pcm: ArrayBuffer): void;
   stopPlayback(): void;
+  /** What the caller did NOT hear of the talker, measured as it happened.
+   *
+   *  Read once, as the call comes down. Nothing acts on it: the caller heard
+   *  every one of these holes already, and the playback lead has grown to
+   *  cover them. It exists so a report of a choppy call carries a number. */
+  playbackGaps(): PlaybackGaps;
   close(): Promise<void>;
 }
 
@@ -89,6 +103,18 @@ export interface CallPorts {
    */
   probeUpgrade(): Promise<boolean>;
 }
+
+/**
+ * How long the speaker takes to fall silent when a reply is cut off.
+ *
+ * Short enough that a barge-in still feels immediate, and long enough that the
+ * waveform reaches zero rather than being stepped there. A step of any size is
+ * broadband, so the caller hears it as a click whatever they were listening to.
+ *
+ * Well under the playback lead a fresh start takes, so audio arriving after a
+ * cut can never land on top of the fade.
+ */
+const CUT_FADE_SECONDS = 0.015;
 
 type AudioContextCtor = new (options?: AudioContextOptions) => AudioContext;
 
@@ -196,6 +222,7 @@ async function openAudio(
   let source: MediaStreamAudioSourceNode;
   let capture: AudioWorkletNode;
   let silence: GainNode;
+  let speaker: GainNode;
   try {
     await context.audioWorklet.addModule(captureWorkletUrl());
     await context.resume();
@@ -210,28 +237,49 @@ async function openAudio(
     source.connect(capture);
     capture.connect(silence);
     silence.connect(context.destination);
+    // Every chunk of the talker plays through this one node, which is what a
+    // cut fades. One gain for the call rather than one per chunk. A chunk
+    // arrives every few tens of milliseconds, so a node each would be built
+    // and dropped on the thread that draws the transcript.
+    speaker = context.createGain();
+    speaker.connect(context.destination);
   } catch (err) {
     stream.getTracks().forEach((track) => track.stop());
     abandonContext();
     throw new CallSetupError(microphoneRefusal(err));
   }
 
-  let cursor = 0;
+  let playback: Playback = PLAYBACK_START;
+  /** Every chunk of the talker still due to play. */
   const queued = new Set<AudioBufferSourceNode>();
 
   function stopPlayback(): void {
+    const at = context.currentTime;
+    const silent = at + CUT_FADE_SECONDS;
+    // Faded, never chopped. A bare `stop()` truncates the waveform wherever it
+    // happens to be, and the caller hears that step to zero as a click on
+    // every barge-in. Cancelling first keeps two cuts in a row from stacking
+    // their ramps on one parameter.
+    speaker.gain.cancelScheduledValues(at);
+    speaker.gain.setValueAtTime(speaker.gain.value, at);
+    speaker.gain.linearRampToValueAtTime(0, silent);
+    // Back to full the moment the fade lands. Nothing can be scheduled before
+    // then: a fresh start takes the playback lead, which is far longer.
+    speaker.gain.setValueAtTime(1, silent);
     for (const node of queued) {
       // A source that already ended throws on `stop`. Nothing to do about it,
       // and nothing to report: the goal is silence and it is already silent.
       try {
-        node.stop();
+        node.stop(silent);
       } catch {
         /* already finished */
       }
-      node.disconnect();
     }
+    // Forgotten here rather than as each one ends. A chunk cut before it ever
+    // sounded is promised no `ended` event, so a set waiting on one would
+    // keep growing across a call.
     queued.clear();
-    cursor = 0;
+    playback = restartPlayback(playback);
   }
 
   return {
@@ -243,21 +291,26 @@ async function openAudio(
       buffer.copyToChannel(samples, 0);
       const node = context.createBufferSource();
       node.buffer = buffer;
-      node.connect(context.destination);
+      node.connect(speaker);
       const seconds = pcm16DurationSeconds(pcm.byteLength);
-      const placed = scheduleChunk(cursor, context.currentTime, seconds);
-      cursor = placed.cursor;
-      node.onended = () => queued.delete(node);
+      const placed = placeChunk(playback, context.currentTime, seconds);
+      playback = placed.playback;
+      node.onended = () => {
+        queued.delete(node);
+        node.disconnect();
+      };
       queued.add(node);
       node.start(placed.startAt);
     },
     stopPlayback,
+    playbackGaps: () => ({ count: playback.gaps, seconds: playback.silentSeconds }),
     async close(): Promise<void> {
       stopPlayback();
       capture.port.onmessage = null;
       source.disconnect();
       capture.disconnect();
       silence.disconnect();
+      speaker.disconnect();
       stream.getTracks().forEach((track) => track.stop());
       await context.close();
       // Only the device still holding the primed context may retire it. A call

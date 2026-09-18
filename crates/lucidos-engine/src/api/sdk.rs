@@ -198,7 +198,19 @@ pub(super) async fn ui_navigate(
             payload.insert(k.clone(), v.clone());
         }
     }
-    let payload = serde_json::Value::Object(payload);
+    let mut payload = serde_json::Value::Object(payload);
+    // An app writes this id, and the page dereferences it with no way to ask
+    // what was meant. `None` for the caller: an app iframe has no thread of its
+    // own, as the nil-thread emit below says. So the `current` alias is refused
+    // here rather than resolved to whichever thread we happen to serve.
+    if let Err(e) = super::resolve_thread_id_in_nav_payload(&mut payload, None) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
+    let payload = payload;
     log!(
         @sdk,
         "ui.navigate target={:?} app_id={:?} id={:?} (app-iframe, nil thread)",

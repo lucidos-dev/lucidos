@@ -89,6 +89,18 @@ pub struct EventWaitSummary {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One turn of a call, as a reader of the call gets it back.
+///
+/// Who spoke is a `bool` because a call has exactly two voices. The caller and
+/// the talker are the whole set, and a third would be a different feature
+/// rather than a third variant here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpokenTurn {
+    /// True when the caller said it, false when the talker did.
+    pub from_caller: bool,
+    pub text: String,
+}
+
 /// Format a display title from optional title and first_message fields.
 /// Falls back to truncated first_message if title is None.
 fn format_display_title(title: Option<String>, first_message: Option<String>) -> String {

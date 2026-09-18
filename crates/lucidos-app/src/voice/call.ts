@@ -234,6 +234,26 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     });
   }
 
+  /**
+   * Say how often the speaker ran dry mid-reply, once the call is down.
+   *
+   * No toast, and this is the one report here that owes none. The caller heard
+   * every one of these holes as it happened, so a card afterwards tells them
+   * nothing. It also names no failure they can act on: the playback lead grew
+   * to cover each one, which is the recovery.
+   *
+   * What it is for is a report of a choppy call, which otherwise carries no
+   * measurement of how much audio was held up or where. Silent on a call that
+   * played clean.
+   */
+  function reportPlaybackGaps(device: AudioDevice): void {
+    const gaps = device.playbackGaps();
+    if (gaps.count === 0) return;
+    console.warn(
+      `[Voice] The speaker ran dry ${gaps.count} times, silent for ${gaps.seconds.toFixed(2)}s mid-reply.`,
+    );
+  }
+
   async function open(threadId: string): Promise<void> {
     const mine = ++generation;
     let device: AudioDevice;
@@ -359,7 +379,10 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     socket = null;
     const device = audio;
     audio = null;
-    if (device) releaseDevice(device);
+    if (device) {
+      reportPlaybackGaps(device);
+      releaseDevice(device);
+    }
   }
 
   return {

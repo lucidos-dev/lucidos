@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, StoredEvent, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -622,10 +622,15 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // keeps the chip slot, rendered iconless with the action AS the label (see
   // `actionInitiator`). Question dividers keep their agent chip.
   const isUserMessageBubble = isUserBubbleEvent(exchange.userEvent) && initiator.variant === 'user';
-  // Both of those are exempt from the fold, on report. A change turn's body is
-  // a summary, a description and a file list; a user message is the reader's
+  // A speech-only turn joins them: it is two people talking, so neither half of
+  // it gets a header naming who spoke. The talker's greeting is the card this
+  // changes, the caller's own bubbles being chromeless already.
+  const isSpeechOnly = isSpeechOnlyTurn(exchange);
+  const isChromeless = isUserMessageBubble || isChangePanel || isSpeechOnly;
+  // Every chipless turn is exempt from the fold, on report. A change turn's body
+  // is a summary, a description and a file list; a user message is the reader's
   // own text. The control cost a row of chrome to fold a few short lines.
-  const canCollapseInitiator = !isChangePanel && !isUserMessageBubble
+  const canCollapseInitiator = !isChromeless
     && (!!initiator.summary || !!initiator.details);
   const isInitiatorCollapsed = canCollapseInitiator
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
@@ -659,7 +664,6 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       )}
     </span>
   );
-  const isChromeless = isUserMessageBubble || isChangePanel;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
   const isUnansweredDivider = dividerBodyIsSuppressed(exchange, events);
@@ -693,7 +697,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // boundaries it takes no continuation exception: the header line IS the whole
   // turn, and a response panel would be a status badge over an empty body.
   const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && (hasResponse || hasEvents || showStatus);
+  // A speech-only turn draws its panel for the WORDS alone. The header is the
+  // only thing a status badge sits on. So with no reply yet, the panel would be
+  // an empty box under the caller's bubble.
+  const speechOnlyHasWords = !isSpeechOnly || canCollapse;
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -754,7 +762,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // highlighted turn folds. Response body wins; a response-less divider/change turn
   // falls back to its initiator panel; absent when neither is collapsible so Enter
   // is a no-op there.
-  const collapseKind = canCollapse ? 'response' : canCollapseInitiator ? 'initiator' : undefined;
+  //
+  // A speech-only turn folds neither half. Both its panels draw headerless, so
+  // there is no `⋯` stub and nothing to unfold a fold with.
+  const collapseKind = isSpeechOnly ? undefined
+    : canCollapse ? 'response'
+      : canCollapseInitiator ? 'initiator' : undefined;
 
   return (
     <div class="chat-exchange" data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}
@@ -786,6 +799,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
           controls={turnControlsSlot}
+          headerless={isSpeechOnly}
           hasBody={canCollapse}
           status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent, statusClass) ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>

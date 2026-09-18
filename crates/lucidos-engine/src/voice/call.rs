@@ -19,6 +19,10 @@
 //! this file reaching into the engine. It is also what a delegation meets while
 //! the doer is parked inside a card of its own: see [`Call::settle_or_refuse`],
 //! which is how a talker holding no answering tool settles one anyway.
+//!
+//! **Naming the thread is the fourth.** A [`ThreadNamer`] is asked once the
+//! call has an exchange in it, and decides everything else on the far side of
+//! a spawn. The loop is never held up for a name.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -30,6 +34,7 @@ use uuid::Uuid;
 
 use super::decision::{DecisionKind, DecisionResolver, OpenDecision, Resolution};
 use super::doer::TurnStarter;
+use super::naming::ThreadNamer;
 use super::provider::{wait_until, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 use super::wire::{ClientControl, ServerFrame};
 use super::{build, language, resident};
@@ -174,6 +179,24 @@ it. Tell them you did not catch it, and ask them to say it again.";
 /// half by it. It runs from the last thing they said.
 const CALLER_WAITED_LONG_ENOUGH: Duration = Duration::from_secs(6);
 
+/// How many turns the talker may be heard for on one opener.
+///
+/// **An answer, not a call.** A Live turn ends at every 700 ms hole in the
+/// talker's words, so one spoken answer spans several of them (ADR 0187). That
+/// is why the floor survives a turn end. It is not a reason to survive the
+/// whole call, and held that far it licensed a recitation the caller could not
+/// stop: see [`Floor`].
+///
+/// **Counted in turns, because no silence window separates the two.** The
+/// reported recitation paused for up to 2.3 seconds between turns, and a real
+/// answer on the same thread paused for eighteen. A window short enough to cut
+/// the first truncates the second. Turn count does separate them: the longest
+/// real answer in that thread ran to six turns, the recitation to eighteen.
+///
+/// Eight leaves margin over that six. Past it the caller has heard a monologue
+/// rather than an answer, and one word from them buys the next one.
+const TURNS_ONE_OPENER_BUYS: u8 = 8;
+
 /// The reason on a wake nobody asked for.
 ///
 /// It says what happened rather than inventing an intent. The talker composed
@@ -316,12 +339,19 @@ pub struct CallSubject {
 /// Returns the reason it ended, or `None` when the talker never answered at
 /// all. That case writes NO events: a start with no call behind it would make
 /// the pair count sessions that never happened.
+///
+/// Five of the arguments are the SEAMS this file is built on, and each is a
+/// separate thing a call can be given: the talker, the caller, the doer, what
+/// is waiting, and what names the thread. Bundling them would hide which ones
+/// a test is standing in for, which is the whole point of having them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_call(
     bus: &EventBus,
     provider: &dyn VoiceProvider,
     transport: &mut dyn CallTransport,
     doer: &dyn TurnStarter,
     decisions: &dyn DecisionResolver,
+    namer: &dyn ThreadNamer,
     opening: SessionOpening,
     subject: CallSubject,
 ) -> Option<VoiceSessionEndReason> {
@@ -375,6 +405,8 @@ pub async fn run_call(
         provider,
         doer,
         decisions,
+        namer,
+        asked_for_a_name: false,
         capture: AuxCapture::new(bus, subject.thread_id, ContextPurpose::Voice),
         subject: subject.clone(),
         thread,
@@ -383,7 +415,7 @@ pub async fn run_call(
         reply_was_cut_off: CutReply::Running,
         relaying: false,
         waiting_to_be_said: VecDeque::new(),
-        spoken_so_far: String::new(),
+        spoken_so_far: SpokenTurn::default(),
         last_turn_transcript: String::new(),
         talker_answered_them: false,
         undelivered_words: None,
@@ -395,6 +427,8 @@ pub async fn run_call(
         heard_so_far: String::new(),
         answer_owed_by: None,
         told_the_caller: false,
+        floor: Floor::Shut,
+        audience: Audience::Undecided,
     };
     let reason = call.drive(&mut *session, transport).await;
     // Closed FIRST, and that ordering is the whole of it. A provider with no
@@ -460,6 +494,42 @@ enum Step {
     Ended(VoiceSessionEndReason),
 }
 
+/// The talker's words for one turn, and the moment they started arriving.
+///
+/// **One value, and that is the point.** The row needs both, and a row written
+/// without its moment reads where it was recorded rather than where it was
+/// said. Taking them apart is how that happens, so [`SpokenTurn::take`] hands
+/// back the pair or nothing (ADR 0206).
+#[derive(Default)]
+struct SpokenTurn {
+    words: String,
+    began: Option<Instant>,
+}
+
+impl SpokenTurn {
+    /// Take a delta, stamping the moment the first WORDED one arrived.
+    ///
+    /// Words are what the caller hears, so they are what the age measures. A
+    /// provider opening a turn with whitespace would otherwise start the clock
+    /// before anything was said.
+    fn push(&mut self, delta: &str) {
+        if !delta.trim().is_empty() {
+            self.began.get_or_insert_with(Instant::now);
+        }
+        self.words.push_str(delta);
+    }
+
+    /// The words and how long ago they began, leaving the stretch empty.
+    ///
+    /// The age comes off the monotonic clock, never a wall clock. The row's
+    /// `created` is Postgres's, and the transcript subtracts one from the other
+    /// (ADR 0053).
+    fn take(&mut self) -> (String, Option<f64>) {
+        let age = self.began.take().map(|at| at.elapsed().as_secs_f64());
+        (std::mem::take(&mut self.words), age)
+    }
+}
+
 /// Everything one live call carries between its three inputs.
 ///
 /// A struct rather than a column of arguments. The caller, the talker and the
@@ -471,6 +541,17 @@ struct Call<'a> {
     doer: &'a dyn TurnStarter,
     /// What this call can do about what is waiting on its own thread.
     decisions: &'a dyn DecisionResolver,
+    /// What names the thread, once this call has something to name it by.
+    namer: &'a dyn ThreadNamer,
+    /// Whether this call has already asked for a name.
+    ///
+    /// Every utterance after the first one answers a reply too, and asking on
+    /// each would put a read behind every sentence the caller says. The name is
+    /// settled by the first ask.
+    ///
+    /// Not the idempotency rule, which is the engine's: a thread that already
+    /// has a name is never renamed, whoever asks.
+    asked_for_a_name: bool,
     capture: AuxCapture,
     subject: CallSubject,
     thread: Receiver<EmittedEvent>,
@@ -498,7 +579,8 @@ struct Call<'a> {
     /// rather than a slot, because dropping one loses an answer the caller
     /// asked for and never hears.
     waiting_to_be_said: VecDeque<String>,
-    /// What the talker has said during the turn now running.
+    /// What the talker has said during the turn now running, and when it
+    /// started saying it.
     ///
     /// Built from the transcript deltas as they pass through, and written out
     /// by the turn's own end. One turn is one row, so `created` is when the
@@ -509,7 +591,7 @@ struct Call<'a> {
     /// loses the one between two words. A delta carries its own spacing.
     ///
     /// Cleared by [`Call::write_down_the_reply`], the one writer of the row.
-    spoken_so_far: String,
+    spoken_so_far: SpokenTurn,
     /// What the provider called the talker's last turn, for the one reply that
     /// streamed no deltas at all.
     ///
@@ -599,6 +681,77 @@ struct Call<'a> {
     /// The caller has already been told the voice is not answering. Once per
     /// call: a second card says nothing the first did not.
     told_the_caller: bool,
+    /// Whether the talker may be heard, and for how many more turns.
+    ///
+    /// Opened by three things, and spent by the answer it bought. See
+    /// [`Floor`], [`Call::open_the_floor`] and [`Call::the_talker_spent_a_turn`].
+    ///
+    /// Read per turn by [`Audience`]. While it is shut, the talker is talking
+    /// to nobody.
+    floor: Floor,
+    /// Who the turn the talker is speaking now is for.
+    ///
+    /// Decided by that turn's first WORD, and back to [`Audience::Undecided`]
+    /// at its end.
+    audience: Audience,
+}
+
+/// Whether the talker may be heard at all, and for how much longer.
+///
+/// **One opener buys one answer** (ADR 0213). A call opens `Shut`. Three things
+/// open it, each with a fresh budget: the caller saying anything, the provider
+/// hearing them start, and the engine handing the talker something to say.
+///
+/// The budget is what a held floor was missing. Held for the call, the caller's
+/// first hello licensed every later turn. One reported call spent forty-nine
+/// seconds reciting the thread's own history at somebody who had said one word
+/// (`docs/plans/2026-09-17-one-opener-buys-one-answer.md`).
+///
+/// **`Open` always has a turn left in it.** [`Call::the_talker_spent_a_turn`]
+/// is the only writer besides the openers, and it moves to `Shut` rather than
+/// leaving a budget of nought behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Floor {
+    /// Nothing the talker produces reaches the caller or the thread.
+    Shut,
+    /// It does, for this many more turns.
+    Open { turns_left: u8 },
+}
+
+impl Floor {
+    /// Whether an undecided turn starting now would be heard.
+    fn is_open(self) -> bool {
+        self != Floor::Shut
+    }
+}
+
+/// Who hears the turn the talker is speaking now.
+///
+/// **A call opens with the floor shut, and this is the shutter** (ADR 0211).
+/// The talker is handed the whole of this conversation at open. On a Live
+/// session that block arrives as steering. The model reads its last line as a
+/// turn nobody answered, and answers it before the caller has said hello.
+///
+/// One reported call spent fourteen seconds that way. The caller said nothing
+/// and the thread took five rows, the last four of them the thread's own
+/// history read back out
+/// (`docs/plans/2026-09-17-a-call-opens-silent-until-the-caller-speaks.md`).
+///
+/// **Decided per TURN, by its first word.** Half a babbled sentence must not
+/// start playing because the caller spoke over the other half. Words alone
+/// decide it, never audio. A Live talker streams audio between turns, so a
+/// turn read off the stream is decided at call open and never again (ADR
+/// 0187).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    /// No turn is running, so the next word decides.
+    Undecided,
+    /// Nobody. It began before the caller's first word and nothing invited it,
+    /// so it is played to no one and written nowhere.
+    Nobody,
+    /// The caller, which is every turn once they have spoken, and every turn
+    /// the engine asked for.
+    TheCaller,
 }
 
 /// What the caller did to the reply the talker is speaking now.
@@ -742,7 +895,7 @@ impl Call<'_> {
             // Dropped outright once the caller has cut this reply off. See
             // [`Call::reply_was_cut_off`].
             VoiceEvent::Audio(pcm) => {
-                if self.reply_was_cut_off.is_cut() {
+                if self.reply_was_cut_off.is_cut() || !self.the_caller_hears_this() {
                     return None;
                 }
                 return delivered(transport.send_audio(pcm).await);
@@ -763,8 +916,19 @@ impl Call<'_> {
                 // began over the top of them.
                 if !text.trim().is_empty() {
                     self.the_caller_was_not_done();
+                    self.open_the_floor();
                 }
                 ServerFrame::UserTranscript { text }
+            }
+            // The floor and nothing else. It says the caller opened their
+            // mouth, which no transcriber can withhold, and it is what a
+            // partial-less one leaves us with (ADR 0211).
+            //
+            // No frame: the client draws the caller off its own microphone
+            // (ADR 0184), so this would tell it what it already knows.
+            VoiceEvent::CallerStartedSpeaking => {
+                self.open_the_floor();
+                return None;
             }
             VoiceEvent::UserTurnEnded { transcript } => {
                 // Recorded at once, so the row's `created` is when the caller
@@ -778,11 +942,16 @@ impl Call<'_> {
                 // A transcript with no words is not a row and not held. Held,
                 // it would pair with a waiting ask and spend it on nothing.
                 if !transcript.trim().is_empty() {
+                    // Said again here as well as on the partial, because a
+                    // provider can report a finished turn having streamed no
+                    // partial for it.
+                    self.open_the_floor();
                     // The talker answered whatever came before, so those
                     // words are its business rather than the doer's. Left on
                     // the pile, a later ask would run on a question already
                     // answered plus the new one.
-                    if std::mem::take(&mut self.talker_answered_them) {
+                    let answered_before = std::mem::take(&mut self.talker_answered_them);
+                    if answered_before {
                         self.undelivered_words = None;
                     }
                     // **The reply is over only if the caller TOOK THE FLOOR.**
@@ -798,6 +967,17 @@ impl Call<'_> {
                         self.write_down_the_reply().await;
                     }
                     self.write_a_spoken_row(transcript.clone()).await;
+                    // **This is the moment a call earns a name.** The caller
+                    // answered something the talker said, so the thread holds
+                    // both voices and a subject. An opening "hey" reaches
+                    // nobody's ear but the talker's, and names nothing.
+                    //
+                    // After the row, because the namer reads the exchange back
+                    // out of the thread and this utterance is half of it.
+                    if answered_before && !self.asked_for_a_name {
+                        self.asked_for_a_name = true;
+                        self.namer.name_this_call(self.subject.thread_id).await;
+                    }
                     self.caller_said_more(&transcript);
                     self.caller_is_owed_an_answer();
                 }
@@ -821,14 +1001,11 @@ impl Call<'_> {
                 ServerFrame::UserTurnEnded { transcript }
             }
             VoiceEvent::TalkerTranscript { text } => {
-                // Dropped once the caller has cut this reply off. They never
-                // heard these words, so a row carrying them would claim they
-                // did. See [`CutReply`].
-                if self.reply_was_cut_off.is_cut() {
-                    return None;
-                }
-                // The talker is answering, so it holds the floor and nobody
-                // else owes the caller one.
+                // **Both of these run for a turn nobody hears**, which is what
+                // keeps the floor honest. The provider really is mid-turn, so
+                // an answer handed over now has to queue behind it. Skipped,
+                // `Call::say` would spend its relay flag on the turn it is
+                // speaking over, and mute the answer that follows.
                 //
                 // Both read off its WORDS, and a BLANK delta carries none.
                 // Audio the caller cannot hear is silence, and so is a stream
@@ -836,7 +1013,21 @@ impl Call<'_> {
                 // arrives. Acting on those is how a mute talker would hold the
                 // bound and the floor for a whole call.
                 if !text.trim().is_empty() {
+                    self.the_talker_said_a_word();
                     self.talker_has_the_floor = true;
+                }
+                // Dropped once the caller has cut this reply off. They never
+                // heard these words, so a row carrying them would claim they
+                // did. See [`CutReply`].
+                //
+                // Dropped again for a turn nobody is listening to, which is
+                // the same claim made a beat earlier: these words reached no
+                // ear either. See [`Audience`].
+                if self.reply_was_cut_off.is_cut() || !self.the_caller_hears_this() {
+                    return None;
+                }
+                // The talker is answering, so nobody else owes the caller one.
+                if !text.trim().is_empty() {
                     self.answer_is_no_longer_owed();
                 }
                 // Held as well as forwarded. This is the only account of the
@@ -883,15 +1074,39 @@ impl Call<'_> {
                 // the turn cost went nowhere. Audio has no chars, so the
                 // estimate is zero and the turn's own report is the only real
                 // number.
+                //
+                // Recorded for a turn nobody heard as well. We were billed for
+                // it whoever it reached.
                 self.capture
                     .record_usage(self.provider.model(), 0, Some(usage))
                     .await;
+                // Who this turn was for. A turn nobody heard reaches no row,
+                // no running round and no flag saying the caller was answered
+                // (ADR 0211).
+                //
+                // Read here, and made undecided again only once the row is
+                // past: `write_down_the_reply` asks the same question.
+                let heard = self.the_caller_hears_this();
+                if !heard {
+                    // Loud, because a caller who hears nothing has no other
+                    // trace to be found by. Their transcript failing is one way
+                    // here: the floor opens on their words.
+                    //
+                    // It names the FLOOR rather than a cause, because there are
+                    // now two. A call that never opened one, and a monologue
+                    // that spent its budget, which `the_talker_spent_a_turn`
+                    // announces once when it happens.
+                    log!(
+                        "[Voice] The floor was shut, so nobody heard the talker: {}",
+                        super::clip(transcript.trim(), super::READ_ALOUD_CHARS)
+                    );
+                }
                 // The reply is over, whatever the caller did to it. The next
                 // one is heard in full unless they cut that one off too.
                 let cut = std::mem::replace(&mut self.reply_was_cut_off, CutReply::Running);
                 // A reply already written down reports NOTHING here. See
                 // [`CutReply::CutAndWritten`].
-                let owed_a_row = cut != CutReply::CutAndWritten;
+                let owed_a_row = heard && cut != CutReply::CutAndWritten;
                 // A wordless turn reports nothing, so it must not wipe what an
                 // earlier one did report before its row was written.
                 if owed_a_row && !transcript.trim().is_empty() {
@@ -911,8 +1126,11 @@ impl Call<'_> {
                 // A CUT reply is offered to nobody. This transcript covers
                 // the tail the caller was never played. A round told they
                 // heard it makes the same wrong claim the cut refuses.
+                //
+                // A turn nobody heard is offered to nobody either, for that
+                // same reason: it was told in no one's name.
                 let relaying = std::mem::take(&mut self.relaying);
-                if !relaying && !cut.is_cut() && !transcript.trim().is_empty() {
+                if heard && !relaying && !cut.is_cut() && !transcript.trim().is_empty() {
                     self.doer
                         .overheard(self.subject.thread_id, &transcript)
                         .await;
@@ -922,6 +1140,18 @@ impl Call<'_> {
                 // stopped (ADR 0201). Rejoining the pieces is the reader's job:
                 // see `core::store::messages::spoken_merge`.
                 self.write_down_the_reply().await;
+                // One opener buys one answer, and this turn was part of one
+                // (ADR 0213). After the row, so the turn that spends the last
+                // of the budget is still heard whole.
+                //
+                // A turn nobody heard spends nothing: it was never on the
+                // budget. Nor is a wordless one, which is the provider's
+                // silence rather than an answer.
+                if heard && !transcript.trim().is_empty() {
+                    self.the_talker_spent_a_turn();
+                }
+                // The row is past, so the next word decides afresh.
+                self.audience = Audience::Undecided;
                 // The reply is over, so its cut is spent with it. Cleared here
                 // rather than with the row, because a cut that wrote no row
                 // would otherwise mark the next reply.
@@ -941,10 +1171,13 @@ impl Call<'_> {
                     // else records it. Twenty-one of these in one call is what
                     // a caller hears as the agent never answering.
                     log!("[Voice] A talker turn ended with nothing said");
-                } else {
+                } else if heard {
                     // The caller was answered, so nothing is owed. Said again
                     // here as well as on the first delta, because a transcript
                     // that lands late re-arms the bound after the reply.
+                    //
+                    // Not for a turn nobody heard. They are still owed, and
+                    // the bound is what sends them to the doer instead.
                     self.answer_is_no_longer_owed();
                 }
                 // The next turn may ask again, and must be able to.
@@ -1546,9 +1779,80 @@ impl Call<'_> {
     /// who cuts into one has been answered as far as it got. Their earlier
     /// words are the talker's business, not the doer's.
     fn talker_said(&mut self, delta: &str) {
-        self.spoken_so_far.push_str(delta);
+        self.spoken_so_far.push(delta);
         if !delta.trim().is_empty() {
             self.talker_answered_them = true;
+        }
+    }
+
+    /// This call is a conversation now, so the talker may be heard (ADR 0211).
+    ///
+    /// **Three openers, and each hands back a whole budget.** The caller's own
+    /// words, worded only, because a blank delta is the provider's silence
+    /// rather than theirs. The provider hearing them start, which is the one
+    /// opener no transcriber can withhold. And the engine asking the talker to
+    /// speak, which is how a card parked on a silent caller is put to them.
+    ///
+    /// The reset is the point. A caller who keeps talking keeps buying answers,
+    /// so a working call never meets [`TURNS_ONE_OPENER_BUYS`] at all.
+    fn open_the_floor(&mut self) {
+        self.floor = Floor::Open {
+            turns_left: TURNS_ONE_OPENER_BUYS,
+        };
+    }
+
+    /// The talker has been heard for one turn, so that turn is off the budget.
+    ///
+    /// Spending the last one shuts the floor, and only an opener reopens it. So
+    /// the caller hears an answer of any length and never a monologue: the
+    /// talker keeps speaking, and nothing it says past the bound is played or
+    /// written down (ADR 0213).
+    ///
+    /// Called at a turn END, after the row, so the turn that spends the last
+    /// one is still heard in full. What the shut floor decides is the NEXT turn.
+    fn the_talker_spent_a_turn(&mut self) {
+        let Floor::Open { turns_left } = self.floor else {
+            return;
+        };
+        // Saturating, so a budget of nought can never wrap into a floor held
+        // for 255 more turns. `Open` carries at least one today, and the arm
+        // below is what keeps that true rather than an assumption about it.
+        self.floor = match turns_left.saturating_sub(1) {
+            0 => {
+                // Loud, because the caller hears the talker carry on with its
+                // mouth shut and has nothing else to point at.
+                log!(
+                    "[Voice] The talker has had {} turns on one opener, so it is \
+                     not heard again until the caller speaks",
+                    TURNS_ONE_OPENER_BUYS
+                );
+                Floor::Shut
+            }
+            left => Floor::Open { turns_left: left },
+        };
+    }
+
+    /// Whether what the talker is producing right now reaches the caller.
+    fn the_caller_hears_this(&self) -> bool {
+        match self.audience {
+            Audience::Nobody => false,
+            Audience::TheCaller => true,
+            Audience::Undecided => self.floor.is_open(),
+        }
+    }
+
+    /// Settle who this turn is for, on the first word of it.
+    ///
+    /// One-shot per turn: the turn end is what makes it undecided again. So a
+    /// caller speaking mid-turn opens the floor for the NEXT turn, never for
+    /// the rest of the one they spoke over.
+    fn the_talker_said_a_word(&mut self) {
+        if self.audience == Audience::Undecided {
+            self.audience = if self.floor.is_open() {
+                Audience::TheCaller
+            } else {
+                Audience::Nobody
+            };
         }
     }
 
@@ -1727,7 +2031,13 @@ impl Call<'_> {
             log!("[Voice] The talker would not take the answer: {}", e);
             self.talker_has_the_floor = false;
             self.relaying = false;
+            return;
         }
+        // Only once it was taken, and never rolled back: a floor the CALLER
+        // opened is not the engine's to shut again (ADR 0211). It is a whole
+        // fresh budget either way, so an answer handed over after a monologue
+        // spent the last one is still heard (ADR 0213).
+        self.open_the_floor();
     }
 
     /// Release the next queued answer, now that the talker has stopped.
@@ -1745,10 +2055,14 @@ impl Call<'_> {
 
     /// Write down one thing the talker said, and it is the only writer.
     ///
-    /// **A turn, not a stretch.** Everything it said before the provider ended
-    /// the turn, written the moment that end lands. So `created` is when the
-    /// words stopped, which is what lets the transcript read by the clock
+    /// **A turn, not a whole reply.** Everything it said before the provider
+    /// ended the turn, written the moment that end lands. So `created` is when
+    /// the words stopped, which is what lets the transcript read by the clock
     /// alone (ADR 0201).
+    ///
+    /// The row also says how long the talker had been speaking, because those
+    /// words began before every step they were said over. The transcript reads
+    /// the row there (ADR 0206).
     ///
     /// The DELTAS are the row, because they carry their own spacing. The
     /// turn's own transcript stands in when none arrived. See
@@ -1763,12 +2077,21 @@ impl Call<'_> {
     async fn write_down_the_reply(&mut self) {
         // The turn is accounted for now, however it ended. Forgotten here,
         // so nothing downstream writes the same words a second time.
-        let streamed = std::mem::take(&mut self.spoken_so_far);
+        let (streamed, age) = self.spoken_so_far.take();
         let reported = std::mem::take(&mut self.last_turn_transcript);
-        let transcript = if streamed.trim().is_empty() {
-            reported
+        // A turn nobody heard leaves no row (ADR 0211). Taken first, so a
+        // babble the hangup caught mid-sentence is forgotten rather than
+        // written by the flush that follows the socket.
+        if !self.the_caller_hears_this() {
+            return;
+        }
+        // The age belongs to the DELTAS, so the fallback transcript carries
+        // none. Nothing timed those words, and a row with no age reads at its
+        // own `created`, which is where every reply read before ADR 0206.
+        let (transcript, spoken_secs_before) = if streamed.trim().is_empty() {
+            (reported, None)
         } else {
-            streamed.trim().to_string()
+            (streamed.trim().to_string(), age)
         };
         if transcript.trim().is_empty() {
             return;
@@ -1791,6 +2114,7 @@ impl Call<'_> {
                 session_id: self.subject.session_id,
                 text: transcript,
                 interrupted,
+                spoken_secs_before,
             },
             EventMeta::NONE.authored_by(AgentParticipant::Guest {
                 label: TALKER_LABEL.to_string(),

@@ -12,7 +12,7 @@
  *  Plan: `docs/plans/2026-09-16-the-clock-is-the-only-order.md`.
  */
 import { describe, expect, it } from 'vitest';
-import { ev, said } from './call-fixtures';
+import { ev, said, saidOver } from './call-fixtures';
 import { makeThreadState } from './thread-events-helpers';
 import { computeExchanges, groupIntoExchanges } from '../thread-events';
 import type { Exchange, StoredEvent } from '../thread-events';
@@ -195,6 +195,70 @@ describe('the walk that places it', () => {
   });
 });
 
+describe('a reply said over the work', () => {
+  /** **The reported re-arrangement.** The talker began at :15, the recall
+   *  landed at :20, and the words stopped at :25. The live bubble sat above
+   *  the recall and the engine's row filed below it, so it jumped. */
+  it('reads above the step it began before', () => {
+    const turn = theTurn(groupIntoExchanges(theCall(saidOver(25, 10, "Good idea. I'm on it."))));
+    expect(stepTypes(turn)).toEqual([
+      'SpokenReplyGenerated',
+      'MemoryRecalled',
+      'ToolCalled',
+      'ToolResult',
+    ]);
+  });
+
+  /** Begun at :33, which is after the tool call and before its result. */
+  it('reads below a step it began after', () => {
+    const turn = theTurn(groupIntoExchanges(theCall(saidOver(35, 2, 'Three threads are waiting.'))));
+    expect(stepTypes(turn)).toEqual([
+      'MemoryRecalled',
+      'ToolCalled',
+      'SpokenReplyGenerated',
+      'ToolResult',
+    ]);
+  });
+
+  /** The recall landed at :20, while the talker was still on its first
+   *  fragment (:15 to :25). It separated nothing, so the sentence is one
+   *  bubble and reads where it began. */
+  it('stays one bubble when a step lands mid-sentence', () => {
+    const events = theCall(saidOver(25, 10, 'Good idea.'));
+    const [seq, tail] = saidOver(28, 2, "I'm on it.");
+    events.set(seq, tail);
+    const turn = theTurn(groupIntoExchanges(events));
+    expect(stepTypes(turn)).toEqual([
+      'SpokenReplyGenerated',
+      'MemoryRecalled',
+      'ToolCalled',
+      'ToolResult',
+    ]);
+    const merged = turn.steps[0].event as { text: string; spoken_secs_before?: number };
+    expect(merged.text).toBe("Good idea. I'm on it.");
+    // Written at :28 and begun at :15, so the age spans both fragments. Left
+    // at the first one's ten seconds, the bubble would read from :18 and
+    // slide down as its own tail arrived.
+    expect(merged.spoken_secs_before).toBe(13);
+  });
+
+  /** Here the words stopped at :18 and the recall landed at :20, so the
+   *  reader met it in the silence. Two things said, and the step between them
+   *  says so. */
+  it('is two bubbles when the step landed in the silence between them', () => {
+    const events = theCall(saidOver(18, 3, 'Let me check.'));
+    const [seq, second] = saidOver(22, 1, 'Still going.');
+    events.set(seq, second);
+    expect(stepTypes(theTurn(groupIntoExchanges(events)))).toEqual([
+      'SpokenReplyGenerated',
+      'MemoryRecalled',
+      'SpokenReplyGenerated',
+      'ToolCalled',
+      'ToolResult',
+    ]);
+  });
+});
+
 describe('the live row', () => {
   /** The bridge draws it the moment the talker's first word arrives, which is
    *  before the doer's steps. It must file there too, or the reader watches
@@ -223,5 +287,33 @@ describe('the live row', () => {
    *  froze on whatever prefix the first render caught. */
   it('publishes its words for the memo to compare', () => {
     expect(theTurn(theLiveCall()).liveReplyText).toBe("I'm on it,");
+  });
+
+  /** The live row went up at :10 and the engine's row for those same words
+   *  lands at :25, having been said over fifteen seconds. Both read from :10,
+   *  so the swap moves the bubble nowhere. */
+  it('lands exactly where the engine row for it will', () => {
+    const landed = groupIntoExchanges(theCall(saidOver(25, 15, "I'm on it,")));
+    expect(stepTypes(theTurn(landed))).toEqual(stepTypes(theTurn(theLiveCall())));
+  });
+
+  /** The previous reply was said from :15 and written down at :25. This one
+   *  goes up at :20 on the browser's clock, while that row was still being
+   *  written. Read by its write time the older row is a wall, and the new
+   *  bubble jumps above the reply it answered. */
+  it('never reads above the reply it followed', () => {
+    const thread = makeThreadState(theCall(saidOver(25, 10, "I'm on it,")));
+    thread.liveReply = {
+      eventId: 'live-reply:thread-1:2',
+      created: '2026-08-31T07:15:20Z',
+      text: 'Still going',
+    };
+    expect(stepTypes(theTurn(computeExchanges(thread)))).toEqual([
+      'SpokenReplyGenerated',
+      'MemoryRecalled',
+      'SpokenReplyGenerated',
+      'ToolCalled',
+      'ToolResult',
+    ]);
   });
 });

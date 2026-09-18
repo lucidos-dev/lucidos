@@ -10,6 +10,7 @@ import { computeToastShifts } from './toastReflow';
 import { toastColumns, toastLayout } from './toastColumns';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
+import { isTextInput } from '../../utils/dom';
 import { viewportIsMobile } from '../../utils/viewport';
 import { progressFillWidth } from './progressBar';
 
@@ -48,6 +49,14 @@ const autofocusedToastIds = new Set<number>();
  *  the `Set` guard makes the focus fire exactly once per toast. Skips when a
  *  modal/overlay is open (it owns focus while up) — the button stays Tab-able.
  *
+ *  It also stands down while focus sits in a TEXT FIELD. A keystroke there
+ *  carries the user's own words, and Enter means "send what I typed". A
+ *  poll-driven toast can land at any moment, and the autofocus then re-aims that
+ *  Enter at a button the user never looked at. The reported case left a prompt
+ *  unsent and restarted the engine instead. The `Set` records it all the same:
+ *  the decision belongs to the moment the toast appeared, and re-deciding on a
+ *  later render would only move the steal. The button stays reachable by Tab.
+ *
  *  Touch devices are skipped entirely (`hasHoverPointer`): there's no keyboard
  *  to press Enter with, so the autofocus buys nothing and only leaves a stray
  *  focus ring on the button (iOS WebKit paints `:focus-visible` for programmatic
@@ -57,6 +66,7 @@ function autofocusToastButton(id: number, el: HTMLButtonElement | null): void {
   if (!el || autofocusedToastIds.has(id) || !hasHoverPointer()) return;
   autofocusedToastIds.add(id);
   if (document.documentElement.hasAttribute('data-overlay-open')) return;
+  if (isTextInput(document.activeElement)) return;
   el.focus({ preventScroll: true });
 }
 

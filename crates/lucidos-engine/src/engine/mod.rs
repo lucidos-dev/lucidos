@@ -751,6 +751,16 @@ pub struct LucidosEngine {
     /// a call cannot outlive the process holding its socket, and the boot sweep
     /// settles what a dead one left behind.
     pub voice_sessions: crate::voice::registry::LiveVoiceSessions,
+    /// Threads with a name being generated right now.
+    ///
+    /// A thread is named once, and `thread_has_title` alone cannot hold that:
+    /// naming takes a model call, so two askers a second apart both read "no
+    /// name yet" and both write one. A call has two askers exactly that far
+    /// apart, the caller's utterance and the turn it delegates.
+    ///
+    /// Transient, like every other guard here. A process that dies mid-name
+    /// simply leaves the thread nameable again, which is the safe direction.
+    pub(crate) threads_being_named: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     /// CC commands cache keyed by repo root — each repo has different tools.
     /// Populated from CC Init events, persisted to `.lucidos/cc-commands.json`.
     pub(crate) cc_commands_cache: tokio::sync::RwLock<HashMap<String, CcCommandsInfo>>,

@@ -198,7 +198,7 @@ describe('the Voice settings section', () => {
       voice_enabled: 'true',
       voice_resident_sections: 'this-thread',
     });
-    const on = /aria-label="This conversation so far" checked="true"/;
+    const on = /aria-label="This conversation" checked="true"/;
     const off = /aria-label="What this workspace has" checked="true"/;
     expect(rendered).toMatch(on);
     expect(rendered).not.toMatch(off);

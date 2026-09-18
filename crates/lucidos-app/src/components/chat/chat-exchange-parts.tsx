@@ -517,7 +517,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
     : null;
 
   return (
-    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}${collapsed ? ' initiator-panel-collapsed' : ''}`}>
+    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}`}>
       {/* The row is inert, like the response header's: the control owns folding.
           A row that swallowed a click announced it with nothing but a cursor,
           and it fired for any click that missed the chip. */}
@@ -687,6 +687,13 @@ interface ResponsePanelProps {
   collapsed: boolean;
   onToggle?: (e: MouseEvent) => void;
   hasBody: boolean;
+  /** Drop the header row entirely, for a *speech-only turn*. Its body is the
+   *  reply the caller heard, and the initiator above it is what they said. A
+   *  header between those two names an actor the reader already knows.
+   *
+   *  It takes the fold with it: the collapse control is in the row that goes,
+   *  so a folded turn here would have no way back out. */
+  headerless?: boolean;
   children: ComponentChildren;
 }
 
@@ -697,32 +704,35 @@ interface ResponsePanelProps {
  *  nothing, and it sat under three buttons that each mean something else. Both
  *  turn headers read that way now. */
 export function ResponsePanel({
-  executor, onExecutorClick, controls, status, timestamp, collapsed, onToggle, hasBody, children,
+  executor, onExecutorClick, controls, status, timestamp, collapsed, onToggle, hasBody, headerless = false, children,
 }: ResponsePanelProps) {
+  const folded = collapsed && !headerless;
   return (
-    <div class={`response-panel${collapsed ? ' response-panel-collapsed' : ''}${hasBody ? '' : ' response-panel-bodyless'}`}>
-      <div class="response-header">
-        <button
-          type="button"
-          class="response-executor"
-          onClick={onExecutorClick}
-          aria-label="Show executor info"
-        >
-          <span class="response-executor-icon">{executor.icon}</span>
-          <span class="response-executor-label">{executor.label}</span>
-        </button>
-        {controls}
-        <span class="response-meta">
-          {status}
-          <span class="response-timestamp">{timestamp}</span>
-        </span>
-      </div>
-      {hasBody && !collapsed && (
+    <div class="response-panel">
+      {!headerless && (
+        <div class="response-header">
+          <button
+            type="button"
+            class="response-executor"
+            onClick={onExecutorClick}
+            aria-label="Show executor info"
+          >
+            <span class="response-executor-icon">{executor.icon}</span>
+            <span class="response-executor-label">{executor.label}</span>
+          </button>
+          {controls}
+          <span class="response-meta">
+            {status}
+            <span class="response-timestamp">{timestamp}</span>
+          </span>
+        </div>
+      )}
+      {hasBody && !folded && (
         <div class="response-body">
           {children}
         </div>
       )}
-      {hasBody && collapsed && <CollapsedIndicator onToggle={onToggle} />}
+      {hasBody && folded && <CollapsedIndicator onToggle={onToggle} />}
     </div>
   );
 }
@@ -990,9 +1000,9 @@ export function SpokenChip() {
  *  the short spoken version the caller heard. So it keeps a raised surface and
  *  a mark of its own rather than blending into the response body (ADR 0150).
  *
- *  The mark is the call icon alone. The header above the row already names the
- *  speaker, so a word here would say it twice. A screen reader has no icon to
- *  read and keeps the words.
+ *  The mark is the call icon alone, and on a *speech-only turn* it is the whole
+ *  of the row's chrome: no header is drawn there to name a speaker. A screen
+ *  reader has no icon to read and keeps the words.
  *
  *  Plain text, never markdown. This is a transcript of speech, and there was
  *  no formatting to lose.

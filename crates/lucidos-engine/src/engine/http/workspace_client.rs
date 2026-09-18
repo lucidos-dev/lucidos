@@ -134,9 +134,8 @@ pub struct CrossWorkspaceSpawn<'a> {
     pub prompt: &'a str,
     /// Optional thread title; omitted from the body when `None`/empty.
     pub title: Option<&'a str>,
-    /// Deprecated alias for `folder` (a registered repo id/name).
-    pub repo: Option<&'a str>,
-    /// Canonical target folder for the spawn (`data/apps/<id>/` or a repo root).
+    /// Canonical target folder for the spawn: `data/apps/<id>/`, a repo root, or
+    /// a registered repo name (the receiver resolves it, see `api/chat.rs`).
     pub folder: Option<&'a str>,
     /// Which backend drives the thread; receiver defaults to Claude Code.
     pub coding_agent: Option<crate::runtime::CodingAgent>,
@@ -172,7 +171,6 @@ pub(crate) fn build_cross_workspace_coding_agent_body(
     // the session would take the backend default with nothing to show for it.
     for (key, value) in [
         ("title", spawn.title),
-        ("repo_id", spawn.repo),
         ("folder", spawn.folder),
         ("cc_model", spawn.model),
         ("reasoning_effort", spawn.reasoning_effort),
@@ -382,7 +380,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "do the thing",
                 title: Some("My title"),
-                repo: Some("Lucidos"),
                 folder: None,
                 coding_agent: Some(crate::runtime::CodingAgent::Codex),
                 model: Some("gpt-5.6-luna"),
@@ -401,7 +398,6 @@ mod tests {
         assert_eq!(body["thread_id"], tid.to_string());
         assert_eq!(body["use_coding_agent"], true);
         assert_eq!(body["title"], "My title");
-        assert_eq!(body["repo_id"], "Lucidos");
         assert_eq!(body["coding_agent"], "codex");
     }
 
@@ -413,7 +409,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "do the thing",
                 title: None,
-                repo: None,
                 folder: Some("data/apps/habit-tracker"),
                 coding_agent: Some(crate::runtime::CodingAgent::Codex),
                 model: None,
@@ -435,14 +430,13 @@ mod tests {
     }
 
     #[test]
-    fn build_coding_agent_body_omits_title_and_repo_when_unset_or_empty() {
+    fn build_coding_agent_body_omits_optional_fields_when_unset_or_empty() {
         let tid = Uuid::new_v4();
         let body = build_cross_workspace_coding_agent_body(
             tid,
             &CrossWorkspaceSpawn {
                 prompt: "x",
                 title: None,
-                repo: None,
                 folder: None,
                 coding_agent: None,
                 model: None,
@@ -475,7 +469,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "x",
                 title: Some(""),
-                repo: Some(""),
                 folder: Some(""),
                 coding_agent: None,
                 model: None,
@@ -489,7 +482,7 @@ mod tests {
         );
         assert!(
             body.get("repo_id").is_none(),
-            "empty repo must be omitted: {:?}",
+            "empty fields must not produce repo_id: {:?}",
             body
         );
         assert!(
@@ -546,7 +539,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "build the feature",
                 title: Some("Add feature X"),
-                repo: None,
                 folder: Some("data/apps/habit-tracker"),
                 coding_agent: Some(crate::runtime::CodingAgent::Codex),
                 model: None,
@@ -629,7 +621,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "build the feature",
                 title: None,
-                repo: None,
                 folder: None,
                 coding_agent: None,
                 model: None,
@@ -680,7 +671,6 @@ mod tests {
             &CrossWorkspaceSpawn {
                 prompt: "x",
                 title: None,
-                repo: None,
                 folder: None,
                 coding_agent: None,
                 model: None,

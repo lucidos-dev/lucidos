@@ -419,7 +419,25 @@ impl LucidosEngine {
             args.get("id").and_then(|v| v.as_str()),
             device_id
         );
-        if let Err(e) = self.request_navigation(args, thread_id, device_id).await {
+        // Same guard the notification tap takes, and for the same reason: the
+        // page dereferences this id with no way to ask what was meant.
+        // `current` resolves to the calling thread. A value that is neither
+        // alias nor uuid is refused here, rather than toasted at the reader.
+        // The whole args object rides the NavigationRequested event, so the
+        // resolved value is written back into it. The clone is scoped to the
+        // one target that can be rewritten, so no other arm holds a second
+        // name for the same args.
+        let payload;
+        let payload = if target == "thread" {
+            let mut owned = args.clone();
+            crate::api::resolve_thread_id_in_nav_payload(&mut owned, Some(thread_id))
+                .map_err(|e| format!("Error: {e}"))?;
+            payload = owned;
+            &payload
+        } else {
+            args
+        };
+        if let Err(e) = self.request_navigation(payload, thread_id, device_id).await {
             return Err(format!("Error: {}", e));
         }
 
@@ -489,78 +507,15 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        use crate::scheduler::notifications::{default_tap, Tap};
-
-        let title = match args.get("title").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => t,
-            _ => return Err("Error: title is required".to_string()),
-        };
-        let message = match args.get("message").and_then(|v| v.as_str()) {
-            Some(m) if !m.is_empty() => m,
-            _ => return Err("Error: message is required".to_string()),
-        };
-
-        // The notification popover compares `notification.app_id` against the
-        // apps list's `id` (the app dir). Only stamp it when the LLM explicitly
-        // passes one — never auto-stamp from the trigger's owning app, since
-        // most reminders/nudges/summaries shouldn't deep-link even when their
-        // trigger lives inside an app dir for organizational reasons.
-        let app_id: Option<String> = args
-            .get("app_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        // Optional event_id deep-link target. The LLM passes the row id of the
-        // event the user should jump straight to (e.g. the UserQuestionAsked
-        // from the triggering event payload). Validated as a UUID; empty, null
-        // and missing all mean "no event anchor".
-        let link_event: Option<uuid::Uuid> =
-            crate::api::parse_optional_uuid_trimmed(args.get("event_id").and_then(|v| v.as_str()))
-                .map_err(|raw| format!("Error: event_id is not a valid UUID: {}", raw))?;
-
-        // When this trigger fired in response to a thread-scoped event (e.g.
-        // `UserQuestionAsked`), the originating thread lives in a task-local
-        // set by `handle_domain_event`. Prefer it as the deep-link target.
-        // Otherwise the push would point at the trigger LLM's own thread, which
-        // the user has no reason to open.
-        let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID
-            .try_with(|t| *t)
-            .unwrap_or(thread_id);
-
-        // Missing, null and empty-string all mean the same thing: use
-        // `default_tap`. It navigates to the source event when this
-        // notification names one, and opens the card otherwise. Some LLM
-        // providers emit `"tap": null` or `"tap": ""` for an unset optional, so
-        // both take that default rather than erroring. The structured
-        // `{kind, to?}` object is the only accepted positive shape.
-        // `Tap::Deserialize` strictly rejects the legacy bare-string form
-        // ("modal" / "open_app" / "open_thread" / "none"), and the LLM is
-        // documented against the structured shape.
-        let tap: Tap = match args.get("tap") {
-            None | Some(serde_json::Value::Null) => default_tap(Some(link_thread), link_event),
-            Some(serde_json::Value::String(s)) if s.is_empty() => {
-                default_tap(Some(link_thread), link_event)
-            }
-            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
-                format!(
-                    "Error: invalid tap {}: expected an object like \
-                     {{\"kind\":\"modal\"}} or \
-                     {{\"kind\":\"navigate\",\"to\":{{\"target\":\"app\",\"app_id\":\"...\"}}}}. \
-                     Parse error: {}",
-                    v, e
-                )
-            })?,
-        };
-
+        let n = parse_send_notification_args(args, thread_id)?;
         match self
             .create_notification(
-                title,
-                message,
-                app_id.as_deref(),
-                Some(link_thread),
-                link_event,
-                tap,
+                &n.title,
+                &n.message,
+                n.app_id.as_deref(),
+                Some(n.link_thread),
+                n.link_event,
+                n.tap,
                 None,
             )
             .await
@@ -599,7 +554,7 @@ impl LucidosEngine {
         app_id: Option<&str>,
         link_thread_id: Option<uuid::Uuid>,
         link_event_id: Option<uuid::Uuid>,
-        tap: crate::scheduler::notifications::Tap,
+        mut tap: crate::scheduler::notifications::Tap,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<uuid::Uuid, Box<dyn std::error::Error + Send + Sync>> {
         if title.trim().is_empty() {
@@ -608,6 +563,13 @@ impl LucidosEngine {
         if message.trim().is_empty() {
             return Err("message is required".into());
         }
+        // Belt-and-braces, like the two guards above. The surfaces that take a
+        // caller-written tap already settled it. So this is a no-op for them,
+        // and for every engine-internal producer building one from typed uuids.
+        // What it buys is that a FUTURE producer cannot write a thread tap the
+        // page is unable to resolve. `None`: this is a chokepoint, not a turn,
+        // so there is no ambient thread an alias could mean here.
+        crate::scheduler::notifications::resolve_thread_tap_id(&mut tap, None)?;
 
         let notification_id = uuid::Uuid::new_v4();
         // `tap` is non-Copy (it owns the `NavigateUi.to` strings) so we keep
@@ -1564,6 +1526,110 @@ fn canonical_source_filter_value(value: String) -> String {
     }
 }
 
+/// Everything `send_notification` reads out of the model's args, settled.
+pub(crate) struct SendNotificationArgs {
+    pub title: String,
+    pub message: String,
+    pub app_id: Option<String>,
+    pub link_thread: uuid::Uuid,
+    pub link_event: Option<uuid::Uuid>,
+    pub tap: crate::scheduler::notifications::Tap,
+}
+
+/// Validate the `send_notification` args, so the only work left is the write.
+///
+/// Free function, like [`query_events_impl`] next door, so every refusal is
+/// unit-testable without building a whole `LucidosEngine`.
+///
+/// `thread_id` is the thread the tool call runs in. The DEEP-LINK thread is
+/// `link_thread`, which prefers the `ORIGIN_THREAD_ID` task-local, so a
+/// trigger's notification points at the conversation that fired it. That is
+/// also what the tap's `current` alias resolves to, so the stored tap and the
+/// row's own `thread_id` column name one thread.
+pub(crate) fn parse_send_notification_args(
+    args: &serde_json::Value,
+    thread_id: uuid::Uuid,
+) -> Result<SendNotificationArgs, String> {
+    use crate::scheduler::notifications::{default_tap, resolve_thread_tap_id, Tap};
+
+    let title = match args.get("title").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return Err("Error: title is required".to_string()),
+    };
+    let message = match args.get("message").and_then(|v| v.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => return Err("Error: message is required".to_string()),
+    };
+
+    // The notification popover compares `notification.app_id` against the
+    // apps list's `id` (the app dir). Only stamp it when the LLM explicitly
+    // passes one. Never auto-stamp from the trigger's owning app. Most
+    // reminders, nudges and summaries should not deep-link, even when their
+    // trigger lives in an app dir for organizational reasons.
+    let app_id: Option<String> = args
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Optional event_id deep-link target. The LLM passes the row id of the
+    // event the user should jump straight to (e.g. the UserQuestionAsked
+    // from the triggering event payload). Validated as a UUID; empty, null
+    // and missing all mean "no event anchor".
+    let link_event: Option<uuid::Uuid> =
+        crate::api::parse_optional_uuid_trimmed(args.get("event_id").and_then(|v| v.as_str()))
+            .map_err(|raw| format!("Error: event_id is not a valid UUID: {}", raw))?;
+
+    // When this trigger fired in response to a thread-scoped event (e.g.
+    // `UserQuestionAsked`), the originating thread lives in a task-local
+    // set by `handle_domain_event`. Prefer it as the deep-link target.
+    // Otherwise the push would point at the trigger LLM's own thread, which
+    // the user has no reason to open.
+    let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID
+        .try_with(|t| *t)
+        .unwrap_or(thread_id);
+
+    // Missing, null and empty-string all mean the same thing: use
+    // `default_tap`. It navigates to the source event when this
+    // notification names one, and opens the card otherwise. Some LLM
+    // providers emit `"tap": null` or `"tap": ""` for an unset optional, so
+    // both take that default rather than erroring. The structured
+    // `{kind, to?}` object is the only accepted positive shape.
+    // `Tap::Deserialize` strictly rejects the legacy bare-string form
+    // ("modal" / "open_app" / "open_thread" / "none"), and the LLM is
+    // documented against the structured shape.
+    let mut tap: Tap = match args.get("tap") {
+        None | Some(serde_json::Value::Null) => default_tap(Some(link_thread), link_event),
+        Some(serde_json::Value::String(s)) if s.is_empty() => {
+            default_tap(Some(link_thread), link_event)
+        }
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            format!(
+                "Error: invalid tap {}: expected an object like \
+                 {{\"kind\":\"modal\"}} or \
+                 {{\"kind\":\"navigate\",\"to\":{{\"target\":\"app\",\"app_id\":\"...\"}}}}. \
+                 Parse error: {}",
+                v, e
+            )
+        })?,
+    };
+
+    // The tap's thread id is the only arg here that the page dereferences
+    // LATER, on a device that cannot ask us anything. `link_thread`, not
+    // `thread_id`: `current` means the thread this notification is ABOUT,
+    // which is the one the row's `thread_id` column carries.
+    resolve_thread_tap_id(&mut tap, Some(link_thread)).map_err(|e| format!("Error: {e}"))?;
+
+    Ok(SendNotificationArgs {
+        title,
+        message,
+        app_id,
+        link_thread,
+        link_event,
+        tap,
+    })
+}
+
 /// Split a comma-separated string, trimming each part and dropping
 /// empties. Same semantics as `api::threads::parse_csv` — kept in this
 /// module so the LLM-tool path doesn't pull a `pub(super)` symbol across
@@ -1585,14 +1651,6 @@ fn bad_event_address(got: impl std::fmt::Display) -> String {
          form a tool result states, or a bare uuid."
     )
 }
-
-/// What the model writes for "the thread I am in", instead of an id it has to
-/// go and look up. Matched case-insensitively, after a trim.
-///
-/// The LLM tool is the only surface that takes them. `/api/v1/events/query` and
-/// the SDK have no ambient caller to resolve, and an alias there would name
-/// whichever thread the engine happened to be serving.
-const CURRENT_THREAD_ALIASES: [&str; 2] = ["current", "this"];
 
 /// Read core for the `events` tool's `query` action. Factored out of the
 /// `LucidosEngine` impl so unit tests can drive every refusal branch against
@@ -1620,29 +1678,15 @@ pub(crate) async fn query_events_impl(
     // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
     // arm, which widens the query to every thread.
     // The alias is the one string that is not an id, and it resolves to the
-    // caller's own thread. Anything else still has to parse as a uuid.
+    // caller's own thread. Anything else still has to parse as a uuid. Shared
+    // with every other thread-id slot an agent can write, so the vocabulary
+    // cannot drift between them.
     let thread_id = match args.get("thread_id") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(raw)) => {
-            let raw = raw.trim();
-            if CURRENT_THREAD_ALIASES
-                .iter()
-                .any(|alias| raw.eq_ignore_ascii_case(alias))
-            {
-                Some(caller_thread_id)
-            } else {
-                match uuid::Uuid::parse_str(raw) {
-                    Ok(id) => Some(id),
-                    Err(_) => {
-                        return Err(format!(
-                            "Error: thread_id '{raw}' is not a uuid. Pass 'current' for \
-                             this thread. For another thread, copy its id from the \
-                             `threads` tool's 'search' or 'list' result."
-                        ))
-                    }
-                }
-            }
-        }
+        Some(serde_json::Value::String(raw)) => Some(
+            crate::api::resolve_thread_id_arg(raw, Some(caller_thread_id))
+                .map_err(|e| format!("Error: {e}"))?,
+        ),
         Some(other) => {
             return Err(format!(
                 "Error: thread_id must be a uuid string or 'current', got {other}. Pass \

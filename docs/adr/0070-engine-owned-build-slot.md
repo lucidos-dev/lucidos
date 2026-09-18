@@ -144,7 +144,9 @@ promises nothing we do not deliver.
 **The slot partitions cargo jobs too**, exporting `CARGO_BUILD_JOBS = ncpu / N`.
 Attacks peak RSS directly and is what the e2e release path already does by
 hand. Deferred: the slot gates a build's start, and shaping the build's
-environment is a larger promise to keep.
+environment is a larger promise to keep. **Landed in ADR 0210**, as a share of
+the slots actually held rather than a fixed `ncpu / N`, and with a nice
+increment beside it.
 
 **Two hand-synced copies of the pool logic**, the way ADR 0014 forced on the
 gateway's `build_id.rs`. Rejected in favour of the `lucidos-build-slot` crate,

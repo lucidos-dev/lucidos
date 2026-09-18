@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 /**
- * The rule the whole panel is held to: it may not say a release is newer than
- * the one you run and then offer no way to get it.
+ * Two rules the whole panel is held to. It may not say a release is newer than
+ * the one you run and then offer no way to get it. And it may not offer to go
+ * and CHECK for the release it has just named.
  *
  * The pure decisions are pinned next door, in `whats-new-page.test.tsx`. This
  * file renders the panel, because the defect was an ABSENCE on screen. Only a
@@ -33,6 +34,7 @@ import {
   releaseCheck,
   whatsNewTargetRelease,
 } from '../../../store/store';
+import { isNewerVersion } from '../../../utils/version';
 import type { ChangelogRelease } from '../../../api/client';
 import type { ReleaseCheck } from '../../../api/client/control';
 
@@ -99,7 +101,35 @@ describe('What’s New offers a route to every release it marks', () => {
   // The report, verbatim: 0.31.1 wore a Newer chip and nothing else.
   it('puts a control beside a release the updater has not offered', async () => {
     await draw();
-    expect(row('0.31.1')).toEqual({ mark: 'Newer', action: 'Check for Updates' });
+    expect(row('0.31.1')).toEqual({ mark: 'Newer', action: 'How to Update' });
+  });
+
+  // The second report: a `Newer` chip beside a button offering to go and find
+  // out. A client that can install takes the release instead, and the button
+  // then states the fact, so the chip goes.
+  it('installs the release it names, in a client that can', async () => {
+    mocks.isTauri.mockReturnValue(true);
+    await draw();
+    expect(row('0.31.1')).toEqual({ mark: null, action: 'Update & Restart' });
+  });
+
+  // The whole of that second report, over every session this panel renders in.
+  // It names the label each one owes, so a panel drawing no control at all
+  // cannot pass by having nothing to read.
+  it('never offers to check for a release it has already named', async () => {
+    for (const tauri of [true, false]) {
+      for (const check of [gateway(), gateway({ supported: false })]) {
+        mocks.isTauri.mockReturnValue(tauri);
+        releaseCheck.value = check;
+        render(null, host);
+        await draw();
+        const label = `${tauri}/${check.supported}`;
+        expect(controls(), label).toHaveLength(1);
+        expect(controls()[0].textContent, label).toBe(
+          tauri ? 'Update & Restart' : 'How to Update',
+        );
+      }
+    }
   });
 
   // A source checkout never polls (ADR 0108), so a check would fail every time.
@@ -115,7 +145,7 @@ describe('What’s New offers a route to every release it marks', () => {
     lucidosRelease.value = '0.30.0';
     await draw();
     expect(controls()).toHaveLength(1);
-    expect(row('0.31.1').action).toBe('Check for Updates');
+    expect(row('0.31.1').action).toBe('How to Update');
     expect(row('0.31.0')).toEqual({ mark: 'Newer', action: null });
   });
 
@@ -135,17 +165,22 @@ describe('What’s New offers a route to every release it marks', () => {
     expect(controls()).toHaveLength(0);
   });
 
-  // The whole rule, as one assertion over the rendered panel.
-  it('never marks a row ahead of the reader without a control on screen', async () => {
-    for (const check of [gateway(), gateway({ supported: false })]) {
-      for (const running of ['0.30.0', '0.31.0', '0.31.1']) {
-        releaseCheck.value = check;
-        lucidosRelease.value = running;
-        render(null, host);
-        await draw();
-        const marked = host.querySelectorAll('.whats-new-mark.is-newer').length;
-        const label = `${running}/${check.supported}`;
-        if (marked > 0) expect(controls().length, label).toBe(1);
+  // The whole rule, as one assertion over the rendered panel. It counts rows
+  // rather than chips: an install button drops the chip, so a chip-led count
+  // would pass a packaged client by saying nothing about it.
+  it('never lists a release ahead of the reader without a control on screen', async () => {
+    for (const tauri of [true, false]) {
+      for (const check of [gateway(), gateway({ supported: false })]) {
+        for (const running of ['0.30.0', '0.31.0', '0.31.1']) {
+          mocks.isTauri.mockReturnValue(tauri);
+          releaseCheck.value = check;
+          lucidosRelease.value = running;
+          render(null, host);
+          await draw();
+          const ahead = RELEASES.some((r) => isNewerVersion(r.version, running));
+          const label = `${tauri}/${check.supported}/${running}`;
+          expect(controls().length, label).toBe(ahead ? 1 : 0);
+        }
       }
     }
   });

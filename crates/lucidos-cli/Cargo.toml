@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+# `nice(2)`, for the build-slot wrapper. A granted build runs at a lower
+# scheduling priority, and the whole compile tree inherits it.
+libc = "0.2"
 lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 # `lucidos pair --qr` draws the code in the terminal, and needs a hostname a

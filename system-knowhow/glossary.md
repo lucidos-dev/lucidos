@@ -71,8 +71,10 @@ One of N permits to run a heavy build on the host. A slot is an OS file lock in 
 
 Over the limit a build waits rather than failing: `lucidos build-slot -- <command>` blocks until a slot frees, then runs the command as its child. Deliberately **not** a queue: whoever samples a freed slot first takes it, and arrival order is not preserved. Taken by `make lint`, `make test`, the e2e build phase, and the engine's own rebuilds; frontend commands are too cheap to gate. Without a `lucidos` binary on PATH the build simply runs and is never blocked. Every release is announced as `BuildSlotReleased`, so a session that gave up on `--max-wait` and subscribed is always woken. `BuildSlotWaiting` and `BuildSlotAcquired` fire only under contention.
 
+A granted slot also governs the build's CPU share, not just whether it may start. The holder runs at `nice +10`, which the whole compile tree inherits, and gets `CARGO_BUILD_JOBS` set to the cores divided by the slots held. The share never falls below the fixed `cores / capacity` share, so a solo build keeps the machine and full contention divides it evenly. An explicit `CARGO_BUILD_JOBS` from the caller always wins, and `LUCIDOS_BUILD_SLOT_NICE` overrides the increment (`0` opts out).
+
 Exists because every *coding-agent thread* gets its own *worktree* with its own `target/`, so parallel agent sessions are N full compiles resident at once. Distinct from the engine build lock, which serialises engine-triggered builds inside one checkout's shared `target/`. Also distinct from the e2e lock, which hard-fails a second run rather than waiting.
-See also: ADR 0070, `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
+See also: ADR 0070, ADR 0210, `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
 
 ### Capacity policy
 The configurable caps governing the *Thread Queue*. The fields:
@@ -770,7 +772,7 @@ A *child follow-up* the parent marked `urgent: true`, which stops the child's cu
 See also: *child follow-up*, *coding agent*.
 
 ### Call toggle
-The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*. One control for both directions: press it to call, press it again to ring off. It wears the call: green while connecting, red while up because that is what the next press does, and grey while hanging up. A connect that takes a while says it is waiting for microphone access, which your browser asks for once per launch.
+The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*. One control for both directions: press it to call, press it again to ring off. It wears the call: green the whole time one is up, and grey while hanging up. Point at it and it turns red, which is what the next press does. A connect that takes a while says it is waiting for microphone access, which your browser asks for once per launch.
 
 It is a toggle rather than a microphone you hold down. The microphone is open for the whole call, and holding a button through a conversation is not how a call works. It sits in every prompt input, the compose view included, so voice has no entry point of its own.
 
@@ -788,7 +790,7 @@ A session starts from the **call toggle** in the prompt input, a handset beside 
 
 **A call runs on a chat thread the Lucidos Agent holds, and nowhere else.** Moving the destination to a coding agent while a call is up therefore ends it, and says so. A *coding-agent thread* offers no call at all: the handset is absent there, and the engine refuses one placed any other way.
 
-While a call is up, the handset turns red, and there is no separate panel to watch. What each of you says lands in the thread itself, as it is said. Your own bubble appears the moment you start speaking, and pulses until your words arrive in it. Speaking over the assistant stops it mid-word, as it would on the phone.
+While a call is up, the handset stays green, and there is no separate panel to watch. What each of you says lands in the thread itself, as it is said. Your own bubble appears the moment you start speaking, and pulses until your words arrive in it. Speaking over the assistant stops it mid-word, as it would on the phone.
 
 **Experimental, and off until you turn it on.** The switch is **Settings → Models → Voice**. The same place holds the two models a call uses, the voice it speaks in, and what it loads before it starts. One model does the talking, and the other turns your speech into text. A call that cannot find a talker says so and offers a button straight there.
 
@@ -833,7 +835,7 @@ The release notes panel, at **Settings > System > What's New**. It lists every p
 
 Opening the panel reads the published changelog, so a release newer than your own copy is listed too. That is the point of a panel called What's New. When it cannot be reached, the panel falls back to the copy that travels **inside the engine binary**. That copy is what makes the panel work offline, and on an installed copy with no source checkout. The fetch happens on a panel open, never on a schedule.
 
-A release the updater is **offering** is the exception, and it sits above that list. On the desktop app that row carries **Update & Restart**, the one place in the panel you can take an update from. Everywhere else it is marked **Available** instead, since a browser or a phone has no updater to run.
+A release the updater is **offering** sits above that list, and carries the control to get it. With no offer, that control sits on the newest release ahead of you: the published changelog reaches this panel before the update check does. On the desktop app the control is **Update & Restart**, and that row wears no chip: the button already says the release is there. A browser or a phone has no updater to run. There the row keeps its **Available** or **Newer** chip and offers **How to Update**, which opens the page answering for your kind of install.
 
 Its notes come from somewhere else. A version offered to you is by definition newer than the copy of Lucidos showing it. So its notes are not in that binary's history: they arrive with the update check. That is why the offer's notes appear only where a real update is pending, and why nothing falls back to the installed list. Doing so would show what your CURRENT version contains, under the heading of the one you were about to install.
 

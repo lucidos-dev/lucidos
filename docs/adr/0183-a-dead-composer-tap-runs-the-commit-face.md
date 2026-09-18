@@ -41,15 +41,42 @@ morph is live. So the press is activated directly, and the message goes.
 is the user's own recovery without the keyboard. Send answers the tap just made;
 the relayout is for the next one.
 
-Four bounds on the Send half, each a state where the intent is not certain:
+Five bounds on the Send half, each a state where the intent is not certain:
 
 - A COMMIT face only, so a dropped tap can never stop a running turn.
-- The keyboard must be UP, which is the state every report describes.
-- Nothing may have claimed the gesture. The rescue waits out the click grace
-  window and stands down on any click, and on a later press that reaches a real
-  face.
+- The gesture must be stationary. A swipe is the platform working.
+- Nothing the app raised itself may be covering the composer. A face under a
+  cover is unreachable by design, and a synthetic click ignores the inert.
+- Nothing may have CLAIMED the gesture. The rescue waits out the click grace
+  window, and stands down on a later press that reaches a real face.
 - The row is re-read at the moment of firing. A second tap that got through in
   the meantime has already moved it off a commit face, so this does nothing.
+
+Where in the row the press landed is deliberately NOT a bound. The reporter was
+asked directly and refused one: the composer takes no tap anywhere during an
+episode.
+
+**Two of those bounds were wrong as first written, and the fourteenth episode
+proved it by catching a press no bound should have refused.** The rescue had
+never run at all: the packaged app's ledger holds 245 press lines and zero
+`activated`, `repaired` or `repair-failed` verdicts. The plan is
+[`docs/plans/2026-09-17-the-rescue-answers-the-press-it-was-built-for.md`](../plans/2026-09-17-the-rescue-answers-the-press-it-was-built-for.md).
+
+- **The keyboard bound is gone.** It read `data-keyboard-active`, which means a
+  prompt textarea is focused. 150 of the 158 missed presses had no focus, and
+  the caught one was among them. This is the one bound the caught press
+  establishes.
+- **"Any click" was never the right test for a claim.** A tap the row drops
+  still dispatches a click ON the row, an inert `div`. That twin arrives inside
+  the grace window, so it kills the recovery. A click stands the rescue down
+  only where it landed on a button, or outside the row. The defect is read out
+  of the code: the ledger records no such click, so it cannot say this is what
+  refused the caught press.
+
+Every bound is now judged at one point, and a refusal writes a
+`rescue-stood-down` line naming which bound refused. It writes one only where
+there was a commit face to run, which is the rare case: of the 69 presses that
+reached nothing, 68 had no live commit face at all.
 
 **A commit face is the button that sends what the user typed.** Two qualify,
 and the row renders exactly one of them: the Send morph in `send` mode, and the
@@ -65,6 +92,36 @@ nothing.
 
 That bound was never a decision about Submit. It was drawn to exclude Cancel,
 and Submit commits typed text exactly as Send does.
+
+**A third trigger, for the silence neither answer can reach.** A second round-14
+report, from the standalone PWA rather than the packaged app, caught the state
+where no press arrives at all. The page took no touch and no click for 18.5
+seconds. Six scheduled checks found the Send face reachable, no cover was up,
+and every keystroke reached the box. The plan is
+[`docs/plans/2026-09-17-the-composer-recovers-without-being-touched.md`](../plans/2026-09-17-the-composer-recovers-without-being-touched.md).
+
+That settles the partition this ADR named. A touch delivered somewhere the
+composer is not writes `keyboard-touch`, throttled at 250ms, so taps seconds
+apart each write a line. None did. iOS delivered nothing.
+
+So the relayout runs from the scheduled tick as well, on the one channel the
+wedge leaves alive. The gate is the pre-send moment: a live commit face, the
+user typed it, and no touch has reached the page since. It opens
+`UNTOUCHED_QUIET_MS` past the last keystroke, which a healthy send never
+reaches, and closes at `UNTOUCHED_WINDOW_MS`.
+
+**A window rather than a count, and the wedge is the reason.** A count is a
+budget, and nothing this state allows can refill one: no touch and no click
+arrive, and those are the only things that reopen a quiet window. A user
+re-reading a draft would spend it before the first tap, leaving the episode it
+exists for nothing. It also stands aside while a face is latched unreachable,
+which is the other recovery's episode to own.
+
+**No commit runs there, and no keyboard bound gates it.** A dropped press is
+evidence that the user reached for the button, and a silence is not. And
+`data-keyboard-active` only means a prompt textarea is focused, which typing
+already implies, so this trigger does not rebuild the bound the rescue just
+lost.
 
 The bounce goes DOWN, though the keyboard's goes up. Growing the shell shrinks
 every scroller in it. The browser clamps their scroll offsets at that layout,
@@ -101,18 +158,61 @@ about the cause at all. The log carries an `activated` line for it, and a
 `repaired` or `repair-failed` line for the bounce behind it.
 
 The bounce is two style writes and two forced layouts in one task, so the user
-sees nothing and no scroll position moves. It fires only for a stationary
-press, so a swipe or a scroll that begins on the composer is untouched.
+sees nothing and no scroll position moves. Behind a press it fires only for a
+stationary one, so a swipe or a scroll that begins on the composer is left
+alone.
 
-A row-missed press is now ruled at its lift like every other press, and carries
-the travel it actually measured. Until now it asserted `movedPx: 0` at
-touchdown, so a swipe beginning on the row and a tap dying there wrote the same
-line.
+**The bounce can now be scored, which it never could.** Every press line carries
+`quiet.nudges`, the relayouts the typing-driven recovery spent in the silence
+before it. A press arriving with a nudge behind it and the composer still
+focused says the relayout cleared the wedge. One arriving after the user
+dismissed the keyboard by hand says it did not, and retires the relayout as a
+candidate.
+
+That trigger also runs during ordinary composing, whenever a draft waits more
+than a few seconds for its press. It costs two forced layouts per pause, silent
+and scroll-safe. What it buys is the first reading this investigation has that
+names its own result.
+
+A row-missed press is ruled at its lift like every other press, on the travel it
+actually measured. **Its LINE still does not carry that travel**, and this ADR
+claimed otherwise for two rounds. The `missed` line is written in the
+`touchstart` handler. The finger has not moved yet there, so its `movedPx: 0` is
+an assertion rather than a reading.
+
+The travel reaches the ledger only through a `rescue-stood-down` line, written
+only where there was a commit face to run. That is 1 press in 69. So a swipe
+beginning on the row and a tap dying there still write the same `missed` line.
+The next round that needs them apart has to move the reading to the lift.
 
 Every press line also carries `screenOff`, the difference between the touch's
 screen and client coordinates. No other reading here comes from outside the
-layout. So the next episode can state whether the page hit-tested where the
-finger actually was.
+layout.
+
+**It decides nothing on iOS Safari, and the fourteenth episode is what says
+so.** It reads `{0,0}` on all 29 ledger lines that carry it, on dead presses and
+healthy ones alike. WebKit reports `screenX/Y` equal to `clientX/Y` there. So a
+9 px gap between the touch and the face cannot be told from a 9 px gap between
+the page and the glass. Do not build a verdict on this reading until some
+platform is seen to vary it.
+
+**The signed miss vector narrows it**, and a missed press carries it. `dx` and
+`dy` say which way the finger fell, where the scalar says only how far. A
+displacement tends to repeat one vector across an episode, where aim scatters
+and changes sign. It costs two numbers on a line that already carries the
+distance.
+
+It does not SETTLE it, and no reading inside the page can. Repeated aiming can
+cluster, and a displacement can vary with viewport state. Every coordinate the
+page can read comes from the same layout, so the independent reference has to
+come from outside: a screen recording of one episode, lined up against the
+logged point and face rect.
+
+**Every reading on a press line is taken at the press.** The rects always were,
+and the viewport, the morph and the quiet window were not. A served line read
+those 600ms after the lift, by which time a submitted answer had dismissed the
+keyboard and regrown the shell. So each served line held a row at one height
+beside a viewport at another, and the pair read as two composers.
 
 A touch that reaches the page while the keyboard is up and does NOT reach the
 composer now writes a line too, throttled. That closes the blind spot every

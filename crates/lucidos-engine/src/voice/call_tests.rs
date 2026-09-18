@@ -112,6 +112,38 @@ fn free_doer() -> &'static NoDecisions {
     FREE.get_or_init(NoDecisions::default)
 }
 
+/// A namer that records every thread it was asked to name, and names nothing.
+///
+/// Naming reaches a model, so the real one is not something a call test can
+/// run. What a test can assert is WHEN the call asked, which is the whole of
+/// this file's half of the rule.
+#[derive(Default)]
+struct RecordingNames {
+    asked: Mutex<Vec<uuid::Uuid>>,
+}
+
+impl RecordingNames {
+    fn asked(&self) -> Vec<uuid::Uuid> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::voice::naming::ThreadNamer for RecordingNames {
+    async fn name_this_call(&self, thread_id: uuid::Uuid) {
+        self.asked.lock().unwrap().push(thread_id);
+    }
+}
+
+/// The default namer, shared: every case that is about something else.
+///
+/// The same shape as [`free_doer`]. A case asserting what was NAMED builds its
+/// own, so nothing it reads was recorded by another test.
+fn nobody_names() -> &'static RecordingNames {
+    static NOBODY: std::sync::OnceLock<RecordingNames> = std::sync::OnceLock::new();
+    NOBODY.get_or_init(RecordingNames::default)
+}
+
 #[async_trait::async_trait]
 impl DecisionResolver for NoDecisions {
     async fn resolve(
@@ -209,6 +241,21 @@ fn asks_for_the_doer(reason: &str) -> VoiceEvent {
     }
 }
 
+/// What [`the_caller_opens_the_floor`] says.
+const FIRST_WORD: &str = "hello";
+
+/// The caller's first word, which is the whole of what opens the floor.
+///
+/// A call opens silent, so nothing the talker says before this reaches
+/// anybody (ADR 0211). Most cases below are about the talker's own mechanics
+/// rather than about that gate, so they open the floor and get on with it.
+///
+/// It costs one `SpokenMessageReceived` row and one delivery, both of which a
+/// case counting either has to allow for.
+fn the_caller_opens_the_floor() -> VoiceEvent {
+    the_caller_says(FIRST_WORD)
+}
+
 /// The caller finishing a thought.
 fn the_caller_says(text: &str) -> VoiceEvent {
     VoiceEvent::UserTurnEnded {
@@ -249,6 +296,12 @@ fn subject(thread_id: uuid::Uuid, session_id: uuid::Uuid) -> CallSubject {
     }
 }
 
+/// How long a case may take past the bound it is waiting out.
+///
+/// It pays for a Postgres write, a build sharing the host, and the other cases
+/// in the suite. It is not a budget any case is meant to spend.
+const WAITING_SLACK: Duration = Duration::from_secs(20);
+
 /// Wait until `ready` holds, letting the call loop make progress meanwhile.
 ///
 /// The test runtime is single-threaded, so yielding is what hands it the
@@ -262,8 +315,13 @@ fn subject(thread_id: uuid::Uuid, session_id: uuid::Uuid) -> CallSubject {
 /// Yields first, so a condition another task on this runtime can settle costs
 /// no sleep at all. Past that it waits on the clock, which is the only thing an
 /// answer coming over a socket can be waited on with.
+///
+/// **It has to clear the longest bound any case waits out, with room to
+/// spare.** Two cases wait out [`super::CALLER_WAITED_LONG_ENOUGH`] for real,
+/// and ten seconds left them four to lose. A loaded host loses four: one of
+/// them timed out under the suite and passed on its own moments later.
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + super::CALLER_WAITED_LONG_ENOUGH + WAITING_SLACK;
     let mut spins = 0;
     loop {
         if ready() {
@@ -556,6 +614,7 @@ async fn a_hangup_pairs_the_start_with_one_end() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -594,6 +653,7 @@ async fn a_dropped_socket_still_closes_the_pair() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -644,6 +704,7 @@ async fn a_whole_call_leaves_the_thread_a_chat_thread() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -690,6 +751,7 @@ async fn a_spoken_reply_records_what_it_spent() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -730,6 +792,7 @@ async fn a_talker_that_never_answers_leaves_no_trace() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -763,9 +826,12 @@ async fn talker_audio_reaches_the_caller_and_no_event() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = a_chat_thread(&pool).await;
 
-    let provider = MockVoiceProvider::new(vec![VoiceEvent::Audio(vec![7; 960])]);
-    // SessionStarted, then the audio chunk.
-    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_opens_the_floor(),
+        VoiceEvent::Audio(vec![7; 960]),
+    ]);
+    // SessionStarted, the caller's own turn, then the audio chunk.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
     let audio_out = Arc::clone(&caller.audio_out_bytes);
 
     run_call(
@@ -774,6 +840,7 @@ async fn talker_audio_reaches_the_caller_and_no_event() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -850,6 +917,7 @@ async fn a_talker_that_drops_the_call_ends_it_as_a_failure() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -884,7 +952,10 @@ async fn a_caller_who_stops_receiving_is_not_a_provider_failure() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = a_chat_thread(&pool).await;
 
-    let provider = MockVoiceProvider::new(vec![VoiceEvent::Audio(vec![1; 320])]);
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_opens_the_floor(),
+        VoiceEvent::Audio(vec![1; 320]),
+    ]);
     let mut caller = DeafCaller { sends: 0 };
 
     let reason = run_call(
@@ -893,6 +964,7 @@ async fn a_caller_who_stops_receiving_is_not_a_provider_failure() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -928,8 +1000,10 @@ impl CallTransport for DeafCaller {
 
     async fn send_frame(&mut self, _frame: ServerFrame) -> Result<(), BoxError> {
         self.sends += 1;
-        // The opening frame lands; everything after it finds a dead socket.
-        if self.sends > 1 {
+        // The opening frame lands, and so does the caller's own first turn:
+        // the floor is shut until they speak, so nothing else is sent before
+        // it (ADR 0211). Everything after that finds a dead socket.
+        if self.sends > 2 {
             return Err("the caller is gone".into());
         }
         Ok(())
@@ -940,10 +1014,83 @@ impl CallTransport for DeafCaller {
 
 /// Whether this talker event puts a frame on the caller's socket.
 ///
-/// The delegation is the one that does not, which is the whole non-goal: the
-/// wire vocabulary gains nothing, because the caller only hears one answer.
+/// Two do not. A delegation is the whole non-goal: the wire vocabulary gains
+/// nothing, because the caller only hears one answer. The caller starting to
+/// speak is the other, and the client already draws that off its own
+/// microphone (ADR 0184).
 fn reaches_the_caller(event: &VoiceEvent) -> bool {
-    !matches!(event, VoiceEvent::DelegationRequested { .. })
+    !matches!(
+        event,
+        VoiceEvent::DelegationRequested { .. } | VoiceEvent::CallerStartedSpeaking
+    )
+}
+
+/// How many deliveries a whole script makes, read in order.
+///
+/// **Floor-aware, because the floor is what decides** (ADR 0211, ADR 0213). The
+/// talker reaches nobody before the caller's first word, and nobody again once
+/// one opener's turns are spent. Its audio and its deltas are no delivery at
+/// all then. Counted as one, the scripted caller waits on something nobody
+/// sends and the case hangs.
+///
+/// A turn END is still a frame either way, and so is an interruption. Neither
+/// carries words the caller was or was not played.
+fn deliveries_of(script: &[VoiceEvent]) -> usize {
+    let mut turns_left = 0u8;
+    // `Audience`, as the loop keeps it. `None` is undecided, and reads the
+    // floor. The latch has to be modelled now that the floor can shut
+    // MID-CALL. A caller opening it inside a turn the talker began unheard
+    // changes nothing about that turn. A helper that missed this would count
+    // frames nobody sends, which hangs the scripted caller.
+    let mut audience: Option<bool> = None;
+    let mut deliveries = 0;
+    for event in script {
+        // The openers first, because one of them reaches the caller as
+        // nothing and would be skipped below before it opened anything.
+        if opens_the_floor(event) {
+            turns_left = super::TURNS_ONE_OPENER_BUYS;
+        }
+        if latches_the_turn(event) && audience.is_none() {
+            audience = Some(turns_left > 0);
+        }
+        let heard = audience.unwrap_or(turns_left > 0);
+        if let VoiceEvent::TalkerTurnEnded { transcript, .. } = event {
+            if heard && !transcript.trim().is_empty() {
+                turns_left = turns_left.saturating_sub(1);
+            }
+            audience = None;
+        }
+        if !reaches_the_caller(event) {
+            continue;
+        }
+        let is_words = matches!(
+            event,
+            VoiceEvent::Audio(_) | VoiceEvent::TalkerTranscript { .. }
+        );
+        if is_words && !heard {
+            continue;
+        }
+        deliveries += 1;
+    }
+    deliveries
+}
+
+/// Whether this event hands the talker a fresh budget of turns.
+fn opens_the_floor(event: &VoiceEvent) -> bool {
+    match event {
+        VoiceEvent::UserTranscript { text } => !text.trim().is_empty(),
+        VoiceEvent::UserTurnEnded { transcript } => !transcript.trim().is_empty(),
+        VoiceEvent::CallerStartedSpeaking => true,
+        _ => false,
+    }
+}
+
+/// Whether this event settles who the turn it belongs to is for.
+///
+/// The talker's first WORD, exactly as `Call::the_talker_said_a_word` reads it.
+/// A blank delta settles nothing, and nor does audio.
+fn latches_the_turn(event: &VoiceEvent) -> bool {
+    matches!(event, VoiceEvent::TalkerTranscript { text } if !text.trim().is_empty())
 }
 
 /// A frame that lands on the caller and writes nothing down.
@@ -951,6 +1098,12 @@ fn reaches_the_caller(event: &VoiceEvent) -> bool {
 /// The last event of every scripted call, so the hangup is sequenced behind
 /// whatever the script did. An empty transcript delta is the cheapest event
 /// with that shape: it sends a frame and touches only the floor.
+///
+/// **It lands only while the floor is open**, being a delta like any other. A
+/// script that ends with the floor shut therefore rings off on its own last
+/// frame instead, which is safe for every such case here: a turn end writes
+/// its row before it sends that frame. A case whose last event settles
+/// something AFTER its frame has to say so with a frame of its own.
 fn the_talker_draws_breath() -> VoiceEvent {
     the_talker_is_saying("")
 }
@@ -965,6 +1118,11 @@ struct WhatTheCallDid {
     /// turn's starter, so a call that dropped it would leave the transcript
     /// unable to place the turn's own events (ADR 0201).
     anchors: Vec<uuid::Uuid>,
+    /// What a running round was told the caller had been told, in order.
+    ///
+    /// A turn nobody heard is offered to nobody, so this is where the floor
+    /// shows up on the doer's side (ADR 0211, ADR 0213).
+    overheard: Vec<String>,
 }
 
 /// One call, driven over a script, returning what it wrote and what it woke.
@@ -978,6 +1136,21 @@ async fn a_call_that_hears(
     session_id: uuid::Uuid,
     script: Vec<VoiceEvent>,
 ) -> WhatTheCallDid {
+    a_call_named_by(pool, bus, thread_id, session_id, script, nobody_names()).await
+}
+
+/// The same call, with a namer the case can read afterwards.
+///
+/// Separate because most cases are about what a call WROTE, and only the
+/// naming cases care who was asked for a name.
+async fn a_call_named_by(
+    pool: &PgPool,
+    bus: &EventBus,
+    thread_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    script: Vec<VoiceEvent>,
+    namer: &RecordingNames,
+) -> WhatTheCallDid {
     // Counted, not guessed, and with a trailing frame of its own.
     //
     // A delegation reaches the caller as NOTHING, by design: they hear one
@@ -986,13 +1159,16 @@ async fn a_call_that_hears(
     // last VISIBLE frame would let the hangup beat a silent event after it.
     // The sentinel gives every script one frame that lands last.
     let mut script = script;
-    let visible = 1 + script.iter().filter(|e| reaches_the_caller(e)).count();
     script.push(the_talker_draws_breath());
-    let deliveries = visible + 1;
+    // The opening frame, plus whatever the script itself delivers. The
+    // sentinel is counted with the rest, being droppable for the same reason
+    // any other talker frame is.
+    let deliveries = 1 + deliveries_of(&script);
     let provider = MockVoiceProvider::new(script);
     let turns = RecordingTurns::default();
     let woken = turns.woken();
     let anchors = turns.anchors();
+    let overheard = turns.overheard();
     let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(deliveries);
 
     run_call(
@@ -1001,6 +1177,7 @@ async fn a_call_that_hears(
         &mut caller,
         &turns,
         free_doer(),
+        namer,
         opening(),
         subject(thread_id, session_id),
     )
@@ -1008,10 +1185,12 @@ async fn a_call_that_hears(
 
     let woken = woken.lock().unwrap().clone();
     let anchors = anchors.lock().unwrap().clone();
+    let overheard = overheard.lock().unwrap().clone();
     WhatTheCallDid {
         events: thread_events(pool, thread_id).await,
         woken,
         anchors,
+        overheard,
     }
 }
 
@@ -1276,6 +1455,109 @@ async fn a_spoken_answer_never_lands_above_its_question() {
     teardown_test_db(&db_name).await;
 }
 
+/// **A call earns a name when the caller answers something.**
+///
+/// The opening utterance names nothing: a person starts a call with "hey" or
+/// "what's going on", and that is what the thread was called for as long as it
+/// existed. What the caller says AFTER a reply is about something, and it
+/// arrives with the reply behind it.
+#[tokio::test]
+async fn a_call_is_named_once_the_caller_answers_a_reply() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let namer = RecordingNames::default();
+
+    a_call_named_by(
+        &pool,
+        &bus,
+        thread_id,
+        uuid::Uuid::new_v4(),
+        vec![
+            the_caller_says("what's going on"),
+            the_talker_says("Watching the tab-icon fix."),
+            the_caller_says("yeah, please check"),
+        ],
+        &namer,
+    )
+    .await;
+
+    assert_eq!(
+        namer.asked(),
+        vec![thread_id],
+        "the second utterance answers a reply, so the call has a subject"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A call nobody answered is not a conversation, and names nothing.
+///
+/// The caller says one thing into the void and rings off. Named anyway, the
+/// model describes the fragment: " So, yeah, I think" became "Incomplete
+/// Conversation Opener", and a name is permanent. The fallback shows their own
+/// words instead, and the thread stays nameable.
+#[tokio::test]
+async fn a_call_nothing_answered_is_never_named() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let namer = RecordingNames::default();
+
+    a_call_named_by(
+        &pool,
+        &bus,
+        thread_id,
+        uuid::Uuid::new_v4(),
+        vec![the_caller_says(" So, yeah, I think")],
+        &namer,
+    )
+    .await;
+
+    assert!(
+        namer.asked().is_empty(),
+        "nothing answered them, so the loop asked for no name: {:?}",
+        namer.asked()
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// One ask per call, however long the call runs.
+///
+/// Every later utterance also answers a reply, and asking on each would put a
+/// model call behind every sentence a caller says. The name is settled by the
+/// first one.
+#[tokio::test]
+async fn a_long_call_asks_for_one_name() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let namer = RecordingNames::default();
+
+    a_call_named_by(
+        &pool,
+        &bus,
+        thread_id,
+        uuid::Uuid::new_v4(),
+        vec![
+            the_caller_says("what's going on"),
+            the_talker_says("Watching the tab-icon fix."),
+            the_caller_says("yeah, please check"),
+            the_talker_says("Still running."),
+            the_caller_says("and the release"),
+            the_talker_says("Tagged this morning."),
+            the_caller_says("good"),
+        ],
+        &namer,
+    )
+    .await;
+
+    assert_eq!(namer.asked(), vec![thread_id], "one name, one call");
+
+    teardown_test_db(&db_name).await;
+}
+
 /// The reply rows of a call, oldest first.
 fn replies(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
     events
@@ -1455,6 +1737,7 @@ async fn a_stall_is_written_before_the_work_it_promised() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1521,6 +1804,136 @@ async fn a_stall_is_written_before_the_work_it_promised() {
         "the tail was written before the work it followed"
     );
 
+    // Neither row claims to have begun before the one it followed, and
+    // neither begins after its own words stopped (ADR 0206).
+    for reply in &replies {
+        assert!(
+            began_speaking(reply) <= reply.1,
+            "a reply begun at {} was written at {}",
+            began_speaking(reply),
+            reply.1
+        );
+    }
+    assert!(
+        replies[0].1 <= began_speaking(&replies[1]),
+        "the tail claims to have begun at {}, before the stall ended at {}",
+        began_speaking(&replies[1]),
+        replies[0].1
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// When the talker began the words a row carries, on the row's own clock.
+///
+/// `created` is when they stopped, and the age says how long before that they
+/// started. The two are subtracted here exactly as the transcript subtracts
+/// them (ADR 0206).
+fn began_speaking(reply: &(serde_json::Value, DateTime<Utc>)) -> DateTime<Utc> {
+    let secs = reply.0["spoken_secs_before"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the row says how long it had been speaking: {:?}", reply.0));
+    reply.1 - chrono::Duration::microseconds((secs * 1_000_000.0) as i64)
+}
+
+/// **The reported re-arrangement.** The talker began `Good idea. I'm on it.`
+/// before the doer's first step and stopped after it. Placed by `created`
+/// alone, the row therefore filed under the work, and the bubble jumped down
+/// two rows as it landed.
+///
+/// A spoken row covers a stretch of time, while every step beside it is an
+/// instant. So the row says how long the talker had been speaking (ADR 0206).
+#[tokio::test]
+async fn a_reply_says_how_long_it_had_been_speaking() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+    let sent = Arc::clone(&caller.sent);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            let say = |event| async {
+                talker.send(event).await.expect("the talker is listening");
+            };
+            let transcripts = || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| matches!(f, ServerFrame::TalkerTranscript { .. }))
+                    .count()
+            };
+
+            say(the_caller_says("Make the thread title better")).await;
+            say(the_talker_is_saying("Good idea.")).await;
+            until("the first words to reach the caller", || transcripts() == 1).await;
+
+            // The work starts while the talker is still speaking, and its
+            // first step is the row the bubble jumped under.
+            tokio::time::sleep(A_BEAT).await;
+            say(asks_for_the_doer("improve the thread title")).await;
+            until("the doer to be woken", || !woken.lock().unwrap().is_empty()).await;
+
+            // The rest of one sentence, said after the work began.
+            tokio::time::sleep(A_BEAT).await;
+            say(the_talker_is_saying(" I'm on it.")).await;
+            until("the rest to reach the caller", || transcripts() == 2).await;
+            say(the_talker_says("Good idea. I'm on it.")).await;
+            hang_up.notify_one();
+        }
+    );
+
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "Good idea. I'm on it.");
+    let delegated = rows_of(&pool, thread_id, "WorkDelegated").await;
+    assert_eq!(delegated.len(), 1, "{:?}", delegated);
+    let started_working = delegated[0].1;
+
+    // The words stopped after the work started, which is why `created` alone
+    // cannot place this row.
+    assert!(
+        started_working < replies[0].1,
+        "the reply was written at {} and the work started {}",
+        replies[0].1,
+        started_working
+    );
+    // And they began before it, which is where the reader heard them.
+    assert!(
+        began_speaking(&replies[0]) < started_working,
+        "the reply began at {} and the work started {}",
+        began_speaking(&replies[0]),
+        started_working
+    );
+    // The stamp is the FIRST delta's, so the gap inside this one turn is
+    // inside the age too. Taken at the last delta it would be near zero.
+    let age = replies[0].0["spoken_secs_before"].as_f64().expect("an age");
+    assert!(
+        age >= A_BEAT.as_secs_f64(),
+        "the reply was said over {}s, which is shorter than the gap inside it",
+        age
+    );
+
     teardown_test_db(&db_name).await;
 }
 
@@ -1529,6 +1942,9 @@ async fn a_stall_is_written_before_the_work_it_promised() {
 /// Its turn's own transcript is the whole account of what was said, so it is
 /// what the row carries. Dropped, such a reply would leave no record at all of
 /// what the caller heard.
+///
+/// **And it carries no age.** Nothing timed those words, so the row reads at
+/// its own `created`, which is where every reply read before ADR 0206.
 #[tokio::test]
 async fn a_reply_with_no_deltas_is_still_written() {
     let (pool, db_name) = setup_test_db().await;
@@ -1551,6 +1967,11 @@ async fn a_reply_with_no_deltas_is_still_written() {
     let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
     assert_eq!(replies.len(), 1, "{:?}", replies);
     assert_eq!(replies[0].0["text"], "Nothing is waiting on you.");
+    assert!(
+        replies[0].0.get("spoken_secs_before").is_none(),
+        "{:?}",
+        replies[0].0
+    );
 
     teardown_test_db(&db_name).await;
 }
@@ -1579,6 +2000,7 @@ async fn the_callers_frame_matches_the_row_it_becomes() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -1633,6 +2055,7 @@ async fn a_barge_in_writes_the_question_before_the_answer() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1690,6 +2113,7 @@ async fn a_cut_that_wrote_nothing_does_not_cut_the_next_reply() {
         thread_id,
         uuid::Uuid::new_v4(),
         vec![
+            the_caller_opens_the_floor(),
             // A response cancelled before it said anything, so its turn end
             // reports no words and no row is owed.
             VoiceEvent::Interrupted,
@@ -1731,6 +2155,7 @@ async fn a_cut_reply_still_reports_what_its_turn_cost() {
         thread_id,
         uuid::Uuid::new_v4(),
         vec![
+            the_caller_opens_the_floor(),
             the_talker_is_saying("Two things are"),
             // They take the floor, so the row goes down now.
             VoiceEvent::Interrupted,
@@ -1961,6 +2386,7 @@ async fn a_cut_reply_is_not_written_again_in_full() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1969,8 +2395,12 @@ async fn a_cut_reply_is_not_written_again_in_full() {
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A call opens silent, so the floor opens before the talker
+            // says anything anybody hears (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            await_frames(&sent, 1, "the caller's first word").await;
             say(&talker, the_talker_is_saying("Two meetings and")).await;
-            await_frames(&sent, 1, "the talker to take the floor").await;
+            await_frames(&sent, 2, "the talker to take the floor").await;
 
             cut_in(&from_caller).await;
             until("the talker to be cancelled", || {
@@ -1980,11 +2410,11 @@ async fn a_cut_reply_is_not_written_again_in_full() {
 
             // Their words close the cut reply's row.
             say(&talker, the_caller_says("and tomorrow")).await;
-            await_frames(&sent, 2, "their words to land").await;
+            await_frames(&sent, 3, "their words to land").await;
             // The talker was still composing, and the turn end reports the lot.
             say(&talker, the_talker_is_saying(" three emails.")).await;
             say(&talker, the_talker_says("Two meetings and three emails.")).await;
-            await_frames(&sent, 3, "the reply to end").await;
+            await_frames(&sent, 4, "the reply to end").await;
             hang_up(&from_caller).await;
         }
     );
@@ -2023,6 +2453,7 @@ async fn a_partial_the_caller_got_in_over_a_reply_reads_below_it() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2088,6 +2519,7 @@ async fn a_cut_the_provider_reports_late_writes_no_second_row() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2096,8 +2528,12 @@ async fn a_cut_the_provider_reports_late_writes_no_second_row() {
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A call opens silent, so the floor opens before the talker
+            // says anything anybody hears (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            await_frames(&sent, 1, "the caller's first word").await;
             say(&talker, the_talker_is_saying("Two meetings and")).await;
-            await_frames(&sent, 1, "the talker to take the floor").await;
+            await_frames(&sent, 2, "the talker to take the floor").await;
             cut_in(&from_caller).await;
             until("the talker to be cancelled", || {
                 log.lock().unwrap().cancels == 1
@@ -2105,11 +2541,11 @@ async fn a_cut_the_provider_reports_late_writes_no_second_row() {
             .await;
             // Their words close the cut reply's row.
             say(&talker, the_caller_says("and tomorrow")).await;
-            await_frames(&sent, 2, "their words to land").await;
+            await_frames(&sent, 3, "their words to land").await;
             // Only now does the provider say what the caller already did.
             say(&talker, VoiceEvent::Interrupted).await;
             say(&talker, the_talker_says("Two meetings and three emails.")).await;
-            await_frames(&sent, 4, "the reply to end").await;
+            await_frames(&sent, 5, "the reply to end").await;
             hang_up(&from_caller).await;
         }
     );
@@ -2146,6 +2582,7 @@ async fn the_teardown_writes_no_second_row_for_a_cut_reply() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2154,15 +2591,19 @@ async fn the_teardown_writes_no_second_row_for_a_cut_reply() {
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A call opens silent, so the floor opens before the talker
+            // says anything anybody hears (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            await_frames(&sent, 1, "the caller's first word").await;
             say(&talker, the_talker_is_saying("Two meetings and")).await;
-            await_frames(&sent, 1, "the talker to take the floor").await;
+            await_frames(&sent, 2, "the talker to take the floor").await;
             cut_in(&from_caller).await;
             until("the talker to be cancelled", || {
                 log.lock().unwrap().cancels == 1
             })
             .await;
             say(&talker, the_caller_says("and tomorrow")).await;
-            await_frames(&sent, 2, "their words to land").await;
+            await_frames(&sent, 3, "their words to land").await;
             hang_up(&from_caller).await;
         }
     );
@@ -2204,6 +2645,7 @@ async fn a_caller_still_talking_over_the_goodbye_keeps_the_call() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2284,6 +2726,7 @@ async fn a_reply_the_caller_cuts_into(
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2292,9 +2735,13 @@ async fn a_reply_the_caller_cuts_into(
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A reply nobody can hear cannot be cut into, so the floor opens
+            // first (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            await_frames(&sent, 1, "the caller's first word").await;
             if !quiet {
                 say(&talker, the_talker_is_saying("A traveler finds a tiny key")).await;
-                await_frames(&sent, 1, "the talker to take the floor").await;
+                await_frames(&sent, 2, "the talker to take the floor").await;
             }
 
             for _ in 0..barge_ins.max(1) {
@@ -2322,7 +2769,7 @@ async fn a_reply_the_caller_cuts_into(
                 the_talker_says("A traveler finds a tiny key and doesn't know what it opens"),
             )
             .await;
-            await_frames(&sent, 2, "the reply to end").await;
+            await_frames(&sent, 3, "the reply to end").await;
             hang_up(&from_caller).await;
         }
     );
@@ -2377,7 +2824,10 @@ async fn a_reply_the_caller_rang_off_inside_is_marked_cut_off() {
         thread_id,
         uuid::Uuid::new_v4(),
         // Words, and no pause after them.
-        vec![the_talker_is_saying("Two things are ru")],
+        vec![
+            the_caller_opens_the_floor(),
+            the_talker_is_saying("Two things are ru"),
+        ],
     )
     .await;
 
@@ -2512,6 +2962,7 @@ async fn a_refused_utterance_is_written_down_and_said_out_loud() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, session_id),
         ),
@@ -2784,6 +3235,7 @@ async fn every_ask_is_acknowledged() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2838,6 +3290,7 @@ async fn a_call_that_drops_mid_utterance_loses_nothing() {
             &mut caller,
             &RecordingTurns::default(),
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         )
@@ -2906,6 +3359,7 @@ async fn a_call_that_drops_mid_reply_keeps_what_the_caller_heard() {
             &mut caller,
             &RecordingTurns::default(),
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         )
@@ -2951,6 +3405,7 @@ async fn a_call_that_drops_before_a_word_writes_no_reply() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2988,6 +3443,7 @@ async fn a_finished_reply_is_not_written_twice_by_the_teardown() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -3123,6 +3579,7 @@ async fn a_duplicate_ask_leaves_the_caller_owed_an_answer() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3198,6 +3655,7 @@ async fn the_doers_answer_is_spoken_and_progress_is_not() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3311,6 +3769,7 @@ async fn a_question_is_put_to_the_caller_out_loud() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3390,6 +3849,7 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3513,6 +3973,7 @@ async fn a_permission_card_is_put_to_the_caller_out_loud_in_every_lane() {
                 &mut caller,
                 &turns,
                 free_doer(),
+                nobody_names(),
                 opening(),
                 subject(thread_id, uuid::Uuid::new_v4()),
             ),
@@ -3580,6 +4041,7 @@ async fn a_permission_settled_mid_call_is_appended_and_never_asked_again() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3750,12 +4212,20 @@ async fn the_talker_is_not_asked_to_speak_over_itself() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
         async {
             until("the session to open", || {
                 log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            // A call opens silent, so the floor opens before anything the
+            // talker says reaches a soul (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            until("the caller's first word", || {
+                sent.lock().unwrap().len() >= 2
             })
             .await;
 
@@ -3866,6 +4336,7 @@ async fn an_answer_spoken_after(
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3875,9 +4346,18 @@ async fn an_answer_spoken_after(
             })
             .await;
 
+            // A call opens silent, and this is about the TALKER's floor
+            // rather than that one (ADR 0211). So the caller speaks first,
+            // which costs one delivery.
+            say(&talker, the_caller_opens_the_floor()).await;
+            until("the caller's first word", || {
+                *delivered.lock().unwrap() >= 2
+            })
+            .await;
+
             talker.send(output).await.expect("the talker is listening");
             until("the talker's output to reach the caller", || {
-                *delivered.lock().unwrap() >= 2
+                *delivered.lock().unwrap() >= 3
             })
             .await;
 
@@ -3966,11 +4446,15 @@ async fn a_spoken_reply_is_written_down_under_the_talkers_name() {
     let thread_id = a_chat_thread(&pool).await;
     let session_id = uuid::Uuid::new_v4();
 
-    let provider = MockVoiceProvider::new(vec![VoiceEvent::TalkerTurnEnded {
-        transcript: "Two things are running.".to_string(),
-        usage: usage(),
-    }]);
-    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_opens_the_floor(),
+        VoiceEvent::TalkerTurnEnded {
+            transcript: "Two things are running.".to_string(),
+            usage: usage(),
+        },
+    ]);
+    // SessionStarted, the caller's own turn, then the talker's turn end.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
 
     run_call(
         &bus,
@@ -3978,6 +4462,7 @@ async fn a_spoken_reply_is_written_down_under_the_talkers_name() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -4008,14 +4493,16 @@ async fn an_interrupted_reply_says_so() {
     let thread_id = a_chat_thread(&pool).await;
 
     let provider = MockVoiceProvider::new(vec![
+        the_caller_opens_the_floor(),
         VoiceEvent::Interrupted,
         VoiceEvent::TalkerTurnEnded {
             transcript: "Two things are".to_string(),
             usage: usage(),
         },
     ]);
-    // SessionStarted, the interrupted frame, then the turn end.
-    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
+    // SessionStarted, the caller's own turn, the interrupted frame, then the
+    // turn end.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(4);
 
     run_call(
         &bus,
@@ -4023,6 +4510,7 @@ async fn an_interrupted_reply_says_so() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4061,6 +4549,7 @@ async fn a_reply_with_no_words_is_not_written_down() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4141,6 +4630,7 @@ async fn a_stopped_turn_tells_the_caller_it_is_not_coming() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4193,6 +4683,7 @@ async fn a_turn_superseded_by_the_next_utterance_says_nothing() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4297,10 +4788,14 @@ async fn the_talkers_own_words_are_offered_to_a_running_round() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = a_chat_thread(&pool).await;
 
-    let provider = MockVoiceProvider::new(vec![the_talker_says("Still on it.")]);
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_opens_the_floor(),
+        the_talker_says("Still on it."),
+    ]);
     let turns = RecordingTurns::default();
     let overheard = turns.overheard();
-    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+    // SessionStarted, the caller's own turn, then the talker's turn end.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
 
     run_call(
         &bus,
@@ -4308,6 +4803,7 @@ async fn the_talkers_own_words_are_offered_to_a_running_round() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4341,6 +4837,7 @@ async fn an_answer_the_talker_relayed_is_not_offered_back() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4349,6 +4846,9 @@ async fn an_answer_the_talker_relayed_is_not_offered_back() {
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A call opens silent, so a turn of the talker's OWN reaches
+            // nobody until the caller has spoken (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
             a_turn_starts(&bus, thread_id).await;
             seed_thread_event(
                 &bus,
@@ -4422,6 +4922,7 @@ async fn a_relayed_answer_writes_the_question_before_the_stall() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4510,6 +5011,7 @@ async fn words_the_caller_finished_over_a_stall_read_above_it() {
             &mut caller,
             &turns,
             free_doer(),
+            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4518,14 +5020,18 @@ async fn words_the_caller_finished_over_a_stall_read_above_it() {
                 log.lock().unwrap().openings.len() == 1
             })
             .await;
+            // A call opens silent, so the floor opens before anything the
+            // talker says reaches a soul (ADR 0211).
+            say(&talker, the_caller_opens_the_floor()).await;
+            await_frames(&sent, 1, "the caller's first word").await;
             // A stall with nothing of the caller's held behind it.
             say(&talker, the_talker_is_saying("Let me check")).await;
-            await_frames(&sent, 1, "the talker to take the floor").await;
+            await_frames(&sent, 2, "the talker to take the floor").await;
             // They talk over it, and never cut it off.
             say(&talker, the_caller_says("and quickly")).await;
-            await_frames(&sent, 2, "their words to land").await;
+            await_frames(&sent, 3, "their words to land").await;
             say(&talker, the_talker_says("Let me check.")).await;
-            await_frames(&sent, 3, "the stall to pause").await;
+            await_frames(&sent, 4, "the stall to pause").await;
 
             a_turn_starts(&bus, thread_id).await;
             seed_thread_event(
@@ -4550,7 +5056,11 @@ async fn words_the_caller_finished_over_a_stall_read_above_it() {
     let events = thread_events(&pool, thread_id).await;
     assert_eq!(
         spoken_kinds(&events),
-        vec!["SpokenMessageReceived", "SpokenReplyGenerated"],
+        vec![
+            "SpokenMessageReceived",
+            "SpokenMessageReceived",
+            "SpokenReplyGenerated"
+        ],
         "{:?}",
         spoken_kinds(&events)
     );
@@ -4642,6 +5152,7 @@ async fn a_call_driven_by(
         &mut caller,
         &turns,
         decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4774,6 +5285,7 @@ async fn words_spent_on_an_answer_are_still_written_down_as_speech() {
         &mut caller,
         &RecordingTurns::default(),
         &decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4861,6 +5373,7 @@ async fn a_delegation_is_refused_while_the_doer_is_parked() {
         &mut caller,
         &turns,
         &NoDecisions::parked(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4913,6 +5426,7 @@ async fn a_delegation_goes_through_when_nothing_is_waiting() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4964,6 +5478,7 @@ async fn a_talker_with_no_answering_tool_settles_a_question_with_the_callers_wor
         &mut caller,
         &turns,
         &decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5050,6 +5565,7 @@ async fn a_permission_card_is_not_settled_by_an_ask_and_the_note_names_the_scree
         &mut caller,
         &turns,
         &decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5153,6 +5669,7 @@ async fn the_talker_can_ring_off_when_the_caller_says_they_are_done() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -5219,6 +5736,7 @@ async fn a_caller_who_cuts_in_over_the_goodbye_keeps_the_call() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5267,6 +5785,7 @@ async fn an_ask_waiting_on_words_an_answer_spent_never_pairs_with_a_later_one() 
         &mut caller,
         &turns,
         &decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5317,6 +5836,7 @@ async fn a_held_answer_gives_up_rather_than_claiming_a_later_sentence() {
         &mut caller,
         &RecordingTurns::default(),
         &decisions,
+        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5468,6 +5988,7 @@ async fn a_caller_nobody_answers_reaches_the_doer_and_is_told_so() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -5541,6 +6062,7 @@ async fn words_the_session_was_still_holding_reach_the_row() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -5632,6 +6154,7 @@ async fn blank_talker_deltas_do_not_hold_the_bound_off() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -5686,6 +6209,7 @@ async fn words_the_bound_spends_are_not_written_twice() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -5745,6 +6269,7 @@ async fn a_parked_doer_is_not_woken_by_the_bound_and_the_caller_is_told() {
         &mut caller,
         &turns,
         &parked,
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -5799,6 +6324,7 @@ async fn an_ask_whose_words_never_came_tells_the_caller() {
         &mut caller,
         &turns,
         free_doer(),
+        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -5828,6 +6354,801 @@ async fn an_ask_whose_words_never_came_tells_the_caller() {
         rows.is_empty(),
         "a turn was claimed with nothing behind it: {:?}",
         rows
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+// A call opens silent (ADR 0211).
+
+/// The defect, scripted: a talker that answers its own opening block.
+///
+/// The caller says nothing, and the talker says five things at them. Nothing
+/// it says may be played, framed, written down or offered to a running round.
+#[tokio::test]
+async fn a_talker_that_speaks_before_the_caller_reaches_nobody() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        VoiceEvent::Audio(vec![7; 960]),
+        the_talker_is_saying("Yeah, on it"),
+        VoiceEvent::Audio(vec![7; 960]),
+        the_talker_says("Yeah, on it"),
+    ]);
+    let turns = RecordingTurns::default();
+    let overheard = turns.overheard();
+    // SessionStarted, then the turn end, which is a frame whatever the
+    // floor did with the words. Ringing off on the opening frame alone would
+    // pass this without the script ever running.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(*audio_out.lock().unwrap(), 0, "the caller heard it");
+    let frames = sent.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, ServerFrame::TalkerTranscript { .. })),
+        "{:?}",
+        frames
+    );
+    let events = thread_events(&pool, thread_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _)| kind == "SpokenReplyGenerated"),
+        "{:?}",
+        events
+    );
+    assert!(overheard.lock().unwrap().is_empty());
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The other side of it: once they have spoken, the reply lands as it always
+/// did.
+#[tokio::test]
+async fn the_callers_first_word_opens_the_floor() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("what have I got running"),
+        the_talker_is_saying("Two threads"),
+        VoiceEvent::Audio(vec![7; 480]),
+        the_talker_says("Two threads"),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(5);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(*audio_out.lock().unwrap(), 480);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "Two threads");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Their first PARTIAL opens it, not their full stop.
+///
+/// A caller mid-sentence is already somebody to answer, and a reply held until
+/// they finish is one the shut floor would have eaten.
+#[tokio::test]
+async fn a_partial_is_enough_to_open_the_floor() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_is_saying("what have"),
+        the_talker_is_saying("Checking"),
+        the_talker_says("Checking"),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(4);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A blank partial is the provider's silence, not the caller's word.
+#[tokio::test]
+async fn a_blank_partial_leaves_the_floor_shut() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_is_saying("   "),
+        the_talker_is_saying("Yeah, on it"),
+        the_talker_says("Yeah, on it"),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let events = thread_events(&pool, thread_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _)| kind == "SpokenReplyGenerated"),
+        "{:?}",
+        events
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Wordless audio decides no turn, so it cannot latch a call silent.
+///
+/// A Live talker streams audio between turns. Read as a turn, the stream would
+/// be decided at call open and never decided again (ADR 0187).
+#[tokio::test]
+async fn audio_before_the_caller_speaks_latches_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        VoiceEvent::Audio(vec![7; 960]),
+        VoiceEvent::Audio(vec![7; 960]),
+        the_caller_says("what have I got running"),
+        the_talker_is_saying("Two threads"),
+        VoiceEvent::Audio(vec![1; 320]),
+        the_talker_says("Two threads"),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(5);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    // The two chunks before their word are dropped, and the one after is not.
+    assert_eq!(*audio_out.lock().unwrap(), 320);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A card parked on the caller is put to them, and that reply IS heard.
+///
+/// The carve-out the shut floor turns on. Nothing else is coming for them,
+/// because the turn behind the card is parked on a person (ADR 0185). A gate
+/// that swallowed this would leave a silent caller waiting forever.
+#[tokio::test]
+async fn a_turn_the_engine_asked_for_is_heard_on_a_silent_call() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let turns = RecordingTurns::default();
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            a_turn_starts(&bus, thread_id).await;
+            seed_thread_event(&bus, thread_id, asks_the_caller()).await;
+            until("the question to be handed to the talker", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+            say(&talker, the_talker_is_saying("There's one waiting for you")).await;
+            say(&talker, VoiceEvent::Audio(vec![3; 240])).await;
+            say(&talker, the_talker_says("There's one waiting for you")).await;
+            await_frames(&sent, 2, "the relayed reply to end").await;
+            hang_up.notify_one();
+        }
+    );
+
+    assert_eq!(*audio_out.lock().unwrap(), 240);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "There's one waiting for you");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A turn that began unheard stays unheard for the whole of its length.
+///
+/// Decided once, by its first word. Re-asked per delta, the caller would hear
+/// the back half of a sentence whose front half was dropped.
+#[tokio::test]
+async fn a_turn_decided_unheard_does_not_resume_when_the_caller_speaks() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let turns = RecordingTurns::default();
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let (mut caller, from_caller) = ScriptedCaller::driven();
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            say(&talker, the_talker_is_saying("You're on that thread")).await;
+            say(&talker, the_caller_says("hold on")).await;
+            await_frames(&sent, 1, "the caller's own turn to land").await;
+            // Said after their word, and still part of the turn before it.
+            say(&talker, the_talker_is_saying(" now.")).await;
+            say(&talker, VoiceEvent::Audio(vec![5; 160])).await;
+            say(&talker, the_talker_says("You're on that thread now.")).await;
+            await_frames(&sent, 2, "the unheard turn to end").await;
+            hang_up(&from_caller).await;
+        }
+    );
+
+    assert_eq!(*audio_out.lock().unwrap(), 0, "the caller heard the tail");
+    let frames = sent.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, ServerFrame::TalkerTranscript { .. })),
+        "{:?}",
+        frames
+    );
+    let events = thread_events(&pool, thread_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _)| kind == "SpokenReplyGenerated"),
+        "{:?}",
+        events
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// An unheard turn answered nobody, so the caller is still owed one.
+///
+/// The bound is what sends them to the doer instead. Read as an answer, a
+/// babble the caller never heard would disarm it and leave them in silence
+/// until they hang up (ADR 0185).
+///
+/// It waits out the real bound, like every other case about that number.
+#[tokio::test]
+async fn an_unheard_turn_leaves_the_caller_still_owed_an_answer() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let (mut caller, from_caller) = ScriptedCaller::driven();
+    let sent = Arc::clone(&caller.sent);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            say(&talker, the_talker_is_saying("Yeah, on it")).await;
+            say(&talker, the_caller_says("why is the build red")).await;
+            await_frames(&sent, 1, "the caller's own turn to land").await;
+            say(&talker, the_talker_says("Yeah, on it")).await;
+            until("the doer to be woken with nobody having answered", || {
+                !woken.lock().unwrap().is_empty()
+            })
+            .await;
+            hang_up(&from_caller).await;
+        }
+    );
+
+    assert_eq!(
+        woken.lock().unwrap().clone(),
+        vec!["why is the build red".to_string()]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A relayed answer gets its row even when the provider streamed no delta.
+///
+/// The regression the floor nearly introduced. `Call::say` spends its relay
+/// flag at the turn end, and a turn with no delta never latched an audience of
+/// its own. Asked again at the row, such a turn read as unheard, so the caller
+/// heard the answer and the thread kept no record of it.
+#[tokio::test]
+async fn a_relayed_turn_with_no_delta_still_gets_its_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+    let sent = Arc::clone(&caller.sent);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            // Nobody has spoken, so the relay is the only thing opening the
+            // floor for this turn.
+            a_turn_starts(&bus, thread_id).await;
+            seed_thread_event(&bus, thread_id, asks_the_caller()).await;
+            until("the question to be handed to the talker", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+            // The provider reports the whole turn at its end, having streamed
+            // nothing. That is what `last_turn_transcript` stands in for.
+            say(&talker, the_talker_says("There's one waiting for you")).await;
+            await_frames(&sent, 1, "the relayed reply to end").await;
+            hang_up.notify_one();
+        }
+    );
+
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "the relayed answer reached no row");
+    assert_eq!(replies[0].0["text"], "There's one waiting for you");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A relayed answer survives the pause in the middle of it.
+///
+/// The floor is STICKY, and this is why. A Live turn ends at every 700 ms hole
+/// in the talker's words, so one answer spans several. Spent per turn, the
+/// engine's own answer went audible for one sentence and then cut out on a
+/// caller who had said nothing.
+#[tokio::test]
+async fn a_relayed_answer_stays_audible_across_the_pause_in_it() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            // Nobody has spoken. The card is what opens the floor.
+            a_turn_starts(&bus, thread_id).await;
+            seed_thread_event(&bus, thread_id, asks_the_caller()).await;
+            until("the question to be handed to the talker", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+
+            // The first breath of the answer.
+            say(&talker, the_talker_is_saying("There's one waiting")).await;
+            say(&talker, the_talker_says("There's one waiting")).await;
+            await_frames(&sent, 2, "the first breath to end").await;
+
+            // The hole in the words ended that turn, and the same answer
+            // carries on into the next one.
+            say(&talker, the_talker_is_saying("Run the tail, or leave it?")).await;
+            say(&talker, VoiceEvent::Audio(vec![9; 128])).await;
+            say(&talker, the_talker_says("Run the tail, or leave it?")).await;
+            await_frames(&sent, 4, "the rest of the answer to end").await;
+            hang_up.notify_one();
+        }
+    );
+
+    assert_eq!(*audio_out.lock().unwrap(), 128, "the rest went unheard");
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    let said: Vec<&str> = replies
+        .iter()
+        .map(|(payload, _)| payload["text"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        said,
+        vec!["There's one waiting", "Run the tail, or leave it?"]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The provider hearing the caller start is enough, with no transcript at all.
+///
+/// The opener a transcriber cannot withhold. `whisper-1` streams no partials,
+/// and its completed frame is asynchronous, so it can land after the reply it
+/// prompted. Waiting for one drops the answer to the caller's first sentence.
+#[tokio::test]
+async fn the_caller_starting_to_speak_opens_the_floor_with_no_transcript() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        VoiceEvent::CallerStartedSpeaking,
+        the_talker_is_saying("Two threads"),
+        VoiceEvent::Audio(vec![4; 256]),
+        the_talker_says("Two threads"),
+    ]);
+    // SessionStarted, the delta, then the turn end. The speech signal draws
+    // the caller nothing, so it is no delivery.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(4);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+    let sent = Arc::clone(&caller.sent);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(*audio_out.lock().unwrap(), 256);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "Two threads");
+    // It says the caller started, and the client already draws that off its
+    // own microphone. A frame here would be telling it what it knows.
+    let frames = sent.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, ServerFrame::UserTranscript { .. })),
+        "{:?}",
+        frames
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+// One opener buys one answer (ADR 0213).
+
+/// The talker's own words for the recitation test, one per turn.
+///
+/// Distinct, so an assertion says WHICH turn fell off the end rather than how
+/// many did. They are the reported call's lines, shortened.
+const RECITED: &[&str] = &[
+    "I'm good, but I'm waiting on you.",
+    "I'm still waiting for your answer.",
+    "I do hand things over when you ask.",
+    "On it! I'm opening it up again.",
+    "Checking.",
+    "Ah. It's because it's waiting for your answer.",
+    "Sure, checking.",
+    "Right, it was in the trigger's own thread.",
+    "And now I see why.",
+    "Okay, checking that.",
+    "Right, that one's to do with the MCP server.",
+];
+
+/// The defect, scripted: one hello and then a monologue.
+///
+/// The reported call ran like this. The caller said one thing, the floor
+/// opened, and the talker recited the thread's own history at them for
+/// forty-nine seconds. A held floor licensed every word of it.
+///
+/// The bound is what ends it. The turns it bought are heard in full, and the
+/// rest reach no ear and no row.
+#[tokio::test]
+async fn a_run_of_turns_on_one_opener_is_cut_off_at_the_bound() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let bound = super::TURNS_ONE_OPENER_BUYS as usize;
+    assert!(RECITED.len() > bound, "the script must outrun the bound");
+    let mut script = vec![the_caller_says("okay, how are we")];
+    script.extend(RECITED.iter().map(|line| the_talker_says(line)));
+
+    let did = a_call_that_hears(&pool, &bus, thread_id, uuid::Uuid::new_v4(), script).await;
+
+    let said: Vec<String> = replies(&did.events)
+        .iter()
+        .map(|reply| reply["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let heard_in_full: Vec<String> = RECITED[..bound].iter().map(|s| s.to_string()).collect();
+    assert_eq!(said, heard_in_full, "{:?}", said);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A caller who speaks again buys the next answer.
+///
+/// The bound silences a monologue, never the conversation. One word from them
+/// hands the talker a whole budget back, which is why a working call never
+/// meets the bound at all.
+#[tokio::test]
+async fn the_caller_speaking_again_buys_another_answer() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let bound = super::TURNS_ONE_OPENER_BUYS as usize;
+    let mut script = vec![the_caller_says("okay, how are we")];
+    script.extend(RECITED.iter().take(bound).map(|line| the_talker_says(line)));
+    // Spent. Nothing the talker says now is heard, until this lands.
+    script.push(the_talker_says("nobody hears this one"));
+    script.push(the_caller_says("stop, listen to me"));
+    script.push(the_talker_says("Sorry. Go on."));
+
+    let did = a_call_that_hears(&pool, &bus, thread_id, uuid::Uuid::new_v4(), script).await;
+
+    let said: Vec<String> = replies(&did.events)
+        .iter()
+        .map(|reply| reply["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(said.len(), bound + 1, "{:?}", said);
+    assert_eq!(said.last().map(String::as_str), Some("Sorry. Go on."));
+    assert!(
+        !said.iter().any(|text| text == "nobody hears this one"),
+        "{:?}",
+        said
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A turn the bound muted is still billed, and still owes the caller.
+///
+/// We were billed for it whoever heard it, so its usage is recorded exactly as
+/// an opening babble's is (ADR 0211). And it answered nobody, so the doer is
+/// never told the caller was told anything.
+#[tokio::test]
+async fn a_turn_the_bound_muted_is_still_billed_and_reaches_no_round() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let bound = super::TURNS_ONE_OPENER_BUYS as usize;
+    let mut script = vec![the_caller_says("okay, how are we")];
+    script.extend(RECITED.iter().map(|line| the_talker_says(line)));
+
+    let did = a_call_that_hears(&pool, &bus, thread_id, uuid::Uuid::new_v4(), script).await;
+
+    assert_eq!(
+        voice_captures(&did.events),
+        RECITED.len(),
+        "a muted turn went unbilled"
+    );
+    let overheard = did.overheard.len();
+    assert_eq!(overheard, bound, "a muted turn was offered to a round");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A turn with no words in it takes nothing off the budget.
+///
+/// A wordless turn is the provider's silence, not an answer. Counted, a mute
+/// talker would exhaust the budget and silence the real answer behind it.
+#[tokio::test]
+async fn a_wordless_turn_spends_nothing_off_the_budget() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let bound = super::TURNS_ONE_OPENER_BUYS as usize;
+    let mut script = vec![the_caller_says("what have I got running")];
+    script.extend((0..bound + 2).map(|_| the_talker_says("")));
+    script.push(the_talker_says("Two threads."));
+
+    let did = a_call_that_hears(&pool, &bus, thread_id, uuid::Uuid::new_v4(), script).await;
+
+    let said: Vec<String> = replies(&did.events)
+        .iter()
+        .map(|reply| reply["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(said, vec!["Two threads.".to_string()], "{:?}", said);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The engine's own answer reopens a floor the talker spent.
+///
+/// The third opener, and the one that is not the caller. A card parked on a
+/// silent caller is still put to them. So an answer landing after a monologue
+/// is heard, whatever the talker did with the budget before it.
+#[tokio::test]
+async fn an_engine_relay_reopens_a_spent_floor() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let bound = super::TURNS_ONE_OPENER_BUYS as usize;
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+    let sent = Arc::clone(&caller.sent);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+
+            // One word, then the whole budget, then one turn past it.
+            say(&talker, the_caller_says("okay, how are we")).await;
+            for line in RECITED.iter().take(bound) {
+                say(&talker, the_talker_says(line)).await;
+            }
+            say(&talker, the_talker_says("nobody hears this one")).await;
+            // SessionStarted, the caller's turn end, and one frame per talker
+            // turn end, which lands whatever the floor did with the words.
+            await_frames(&sent, bound + 2, "the budget to be spent").await;
+
+            // The caller has still said nothing more. The card is what opens
+            // the floor again.
+            a_turn_starts(&bus, thread_id).await;
+            seed_thread_event(&bus, thread_id, asks_the_caller()).await;
+            until("the question to be handed to the talker", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+            say(&talker, the_talker_says("There's one waiting.")).await;
+            await_frames(&sent, bound + 3, "the relayed answer to end").await;
+            hang_up.notify_one();
+        }
+    );
+
+    let said: Vec<String> = rows_of(&pool, thread_id, "SpokenReplyGenerated")
+        .await
+        .iter()
+        .map(|(payload, _)| payload["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(said.len(), bound + 1, "{:?}", said);
+    assert_eq!(
+        said.last().map(String::as_str),
+        Some("There's one waiting.")
+    );
+    assert!(
+        !said.iter().any(|text| text == "nobody hears this one"),
+        "{:?}",
+        said
     );
 
     teardown_test_db(&db_name).await;

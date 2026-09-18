@@ -108,11 +108,22 @@ h4, h5, h6 { font-size: var(--font-size-md); }
 /* Off-screen but still rendered — for inputs we trigger programmatically.
    iOS WebKit (especially in standalone PWA mode) drops the `change` event
    on `display:none` / `visibility:hidden` file inputs after the picker
-   dismisses; keeping the element in the layout makes events deliver. */
+   dismisses; keeping the element in the layout makes events deliver.
+
+   IT MUST CLIP ITS OWN TEXT. A zero-width box still LAYS ITS TEXT OUT, and
+   with no room the line breaks after every character. That column of line
+   boxes is scrollable overflow, `overflow: visible` carries it up to the
+   nearest scroll container, and no element's rect shows it. A ten-character
+   label under the transcript's newest voice row therefore let the reader
+   scroll 135px past where the conversation ended, which reads as a hole above
+   the composer. `nowrap` stops the column forming and `hidden` clips whatever
+   still spills. See docs/plans/2026-09-17-a-hidden-label-stops-inflating-the-transcript.md */
 .visually-hidden {
     position: absolute;
     width: 0;
     height: 0;
+    overflow: hidden;
+    white-space: nowrap;
     opacity: 0;
     pointer-events: none;
 }

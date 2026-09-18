@@ -26,6 +26,26 @@ struct SpokenTail {
     /// next: nothing between them reaches `messages`, so adjacency alone reads
     /// them as neighbours.
     session: Option<String>,
+    /// Rows written after a CALLER row that are a note about what they said.
+    /// Not more of the conversation, so the row is still growable.
+    ///
+    /// One row qualifies: the talker's delegation. It says why the talker
+    /// asked for the turn, and it lands within milliseconds of the fragment
+    /// that prompted it. That is mid-sentence whenever the speaker is still
+    /// talking. Counting it as a neighbour split `Just spawn the coding agent`
+    /// from `, please` here, while the transcript joined them.
+    ///
+    /// **The caller's rule only, which is the transcript's split too.** A reply
+    /// is judged on timing instead (ADR 0206): the talker had stopped, so a row
+    /// in the silence after its words does separate them. Exempting it here
+    /// merged two replies the transcript draws apart.
+    ///
+    /// **A DOER step between two fragments still merges here.** The transcript
+    /// splits there, and that gap predates this field. A step reaches
+    /// `pending_steps`, never `messages`, so no count of rows can see it.
+    /// Closing it means asking what the reader met, at every record site, and
+    /// proving the two alike through the fixture.
+    notes_after: usize,
 }
 
 /// The call a spoken row belongs to, as its payload names it.
@@ -43,9 +63,10 @@ fn session_of(event: &EventRow) -> Option<String> {
 /// One breath is several rows (ADR 0201), and the doer must read the sentence
 /// rather than the pieces. The rule is [`super::spoken_merge`]; this places it.
 ///
-/// **Only a row still at the very end folds.** Anything else reaching
-/// `messages` between the two means they are not neighbours, however close
-/// their clocks are.
+/// **Only a row still at the end folds.** Another turn reaching `messages`
+/// between the two means they are not neighbours, however close their clocks
+/// are. The talker's own note about the words is not another turn: see
+/// [`SpokenTail::notes_after`].
 fn push_spoken(
     messages: &mut Vec<SessionMessage>,
     tail: &mut Option<SpokenTail>,
@@ -60,7 +81,7 @@ fn push_spoken(
     let from_caller = matches!(side, SpokenSide::Caller);
     let session = session_of(event);
     if let Some(prev) = tail.as_mut() {
-        let adjacent = prev.index + 1 == messages.len();
+        let adjacent = prev.index + 1 + prev.notes_after == messages.len();
         let gap = (event.created - prev.created).num_milliseconds() as f64 / 1000.0;
         let same_speaker = prev.from_caller == from_caller && prev.session == session;
         if adjacent && is_one_utterance(gap, same_speaker) {
@@ -103,6 +124,7 @@ fn push_spoken(
         from_caller,
         created: event.created,
         session,
+        notes_after: 0,
     });
 }
 
@@ -980,6 +1002,14 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                         agent: authoring_agent(event),
                     });
+                    // A note about what the CALLER said, not more of the
+                    // conversation, so their sentence can still grow. Never
+                    // the talker's own row: see `SpokenTail::notes_after`.
+                    if let Some(tail) = spoken_tail.as_mut() {
+                        if tail.from_caller {
+                            tail.notes_after += 1;
+                        }
+                    }
                 }
             }
             _ => {}

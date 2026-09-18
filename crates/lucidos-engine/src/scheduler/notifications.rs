@@ -26,9 +26,10 @@ use crate::engine::thread_events::MessageOrigin;
 /// - `{"kind":"modal"}`
 /// - `{"kind":"navigate","to":{"target":"app","app_id":"habit-tracker"}}`
 ///
-/// Required sub-fields on `NavigateUi.to` (e.g. `app_id` for `target=app`,
-/// `id` for `target=thread`) are validated by the page-side router, not by
-/// this Rust type — the LLM tool definition documents them.
+/// Required sub-fields on `NavigateUi.to` (e.g. `app_id` for `target=app`) are
+/// validated by the page-side router, not by this type: the LLM tool definition
+/// documents them. The ONE exception is a thread target's `id`, which every
+/// producer settles through [`resolve_thread_tap_id`] before the write.
 ///
 /// # Strict — no tolerance for the legacy four-string form
 ///
@@ -128,6 +129,10 @@ pub struct NavigateUi {
     /// single line. Only meaningful alongside `line`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_end: Option<u32>,
+    /// The thread or trigger to open. A thread's is settled to a uuid at the
+    /// producer by [`resolve_thread_tap_id`]. The page dereferences it later,
+    /// with no way to ask what was meant. Decoding stays permissive, so a row
+    /// written before that guard is still readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +200,43 @@ pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
         },
         _ => Tap::Modal,
     }
+}
+
+/// Settle a thread-targeted tap's `id` before the notification is written.
+///
+/// A notification is persisted AND pushed, so a tap naming no real thread is
+/// already wrong by the time anyone can see it: the OS banner carries it to a
+/// device that cannot repair anything, and the reader meets it as
+/// `Thread "<id>" no longer exists`. So this runs at every producer, and the
+/// notification is refused rather than written with a dead target.
+///
+/// `caller` is the thread the producer is working in. It resolves the
+/// `current` / `this` alias an agent reaches for, because the sibling `events`
+/// tool takes it. `None` refuses the alias; [`crate::api::resolve_thread_id_arg`]
+/// says why a surface with no ambient thread must not guess one.
+///
+/// Scoped to [`NavigateTarget::Thread`], the one target whose id the alias can
+/// mean. An ABSENT id is refused too, unlike the transient navigate event's:
+/// this one is stored and pushed, so leaving it to the page-side router means
+/// the reader meets `Navigation target missing thread id` on a banner instead.
+/// Reading stays untouched, since rows written before this guard have to stay
+/// readable to be repaired
+/// (`docs/plans/2026-09-18-notification-tap-thread-id-is-a-uuid.md`).
+pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), String> {
+    let Tap::Navigate { to } = tap else {
+        return Ok(());
+    };
+    if to.target != NavigateTarget::Thread {
+        return Ok(());
+    }
+    let Some(raw) = to.id.as_deref() else {
+        return Err(
+            "a tap on a thread needs that thread's id in `to.id`, and this one has none."
+                .to_string(),
+        );
+    };
+    to.id = Some(crate::api::resolve_thread_id_arg(raw, caller)?.to_string());
+    Ok(())
 }
 
 /// A tap that deep-links to one Settings sub-section, the same way the LLM's
@@ -560,6 +602,7 @@ impl NotificationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
 
     #[test]
     fn tap_modal_serializes_with_kind_only() {
@@ -792,5 +835,279 @@ mod tests {
         assert_eq!(default_tap(Some(id), None), Tap::Modal);
         assert_eq!(default_tap(None, Some(id)), Tap::Modal);
         assert_eq!(default_tap(None, None), Tap::Modal);
+    }
+
+    fn thread_tap(id: &str) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(id.into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn tap_id(tap: &Tap) -> Option<&str> {
+        match tap {
+            Tap::Navigate { to } => to.id.as_deref(),
+            Tap::Modal => None,
+        }
+    }
+
+    /// The alias is what an agent already writes for the `events` tool. So it
+    /// resolves here too, rather than being stored as a dead deep link.
+    #[test]
+    fn the_alias_resolves_to_the_calling_thread() {
+        let caller = Uuid::new_v4();
+        for alias in ["current", "this", "  Current  ", "THIS"] {
+            let mut tap = thread_tap(alias);
+            resolve_thread_tap_id(&mut tap, Some(caller))
+                .unwrap_or_else(|e| panic!("{alias} must resolve, got: {e}"));
+            assert_eq!(tap_id(&tap), Some(caller.to_string().as_str()));
+        }
+    }
+
+    /// A script POSTing to `/api/v1/notifications` has no thread of its own, so
+    /// an alias there would name whichever one the engine happened to serve.
+    #[test]
+    fn the_alias_is_refused_without_a_calling_thread() {
+        let mut tap = thread_tap("current");
+        let err = resolve_thread_tap_id(&mut tap, None).expect_err("must refuse");
+        assert!(err.contains("current"), "must name the value, got: {err}");
+        assert_eq!(tap_id(&tap), Some("current"), "refused means unchanged");
+    }
+
+    #[test]
+    fn a_non_uuid_thread_id_is_refused_at_the_producer() {
+        for (caller, bad) in [
+            (Some(Uuid::new_v4()), "t-9"),
+            (Some(Uuid::new_v4()), "currently"),
+            (Some(Uuid::new_v4()), ""),
+            (None, "the one we discussed"),
+        ] {
+            let mut tap = thread_tap(bad);
+            let err = resolve_thread_tap_id(&mut tap, caller)
+                .expect_err("a non-uuid must be refused, not stored");
+            assert!(
+                err.contains("is not a uuid"),
+                "{bad} must say why, got: {err}"
+            );
+        }
+    }
+
+    /// The advice fits the surface. Only a caller with a thread of its own can
+    /// spend the alias, so offering it to one that cannot is a second dead end.
+    #[test]
+    fn only_a_thread_bound_caller_is_offered_the_alias() {
+        let with_caller =
+            resolve_thread_tap_id(&mut thread_tap("nope"), Some(Uuid::new_v4())).unwrap_err();
+        assert!(with_caller.contains("'current'"), "got: {with_caller}");
+        let without = resolve_thread_tap_id(&mut thread_tap("nope"), None).unwrap_err();
+        assert!(!without.contains("'current'"), "got: {without}");
+    }
+
+    #[test]
+    fn a_real_uuid_survives_untouched() {
+        let id = Uuid::new_v4().to_string();
+        let mut tap = thread_tap(&id);
+        resolve_thread_tap_id(&mut tap, Some(Uuid::new_v4())).unwrap();
+        assert_eq!(tap_id(&tap), Some(id.as_str()));
+    }
+
+    /// Only a thread target names a thread. A modal carries no id, and an app
+    /// id is a directory name.
+    #[test]
+    fn every_other_target_is_left_alone() {
+        let mut modal = Tap::Modal;
+        resolve_thread_tap_id(&mut modal, None).unwrap();
+        assert_eq!(modal, Tap::Modal);
+
+        let mut app = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::App,
+                app_id: Some("habit-tracker".into()),
+                id: Some("not-a-uuid".into()),
+                ..Default::default()
+            }),
+        };
+        resolve_thread_tap_id(&mut app, None).unwrap();
+        assert_eq!(tap_id(&app), Some("not-a-uuid"));
+    }
+
+    /// A thread tap with no id at all is as dead as one with a bad id, and this
+    /// row is stored and pushed. Leaving it to the page-side router puts
+    /// `Navigation target missing thread id` on a banner nobody can repair.
+    #[test]
+    fn a_thread_tap_with_no_id_is_refused_too() {
+        let mut idless = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                ..Default::default()
+            }),
+        };
+        let err = resolve_thread_tap_id(&mut idless, Some(Uuid::new_v4())).expect_err("refused");
+        assert!(err.contains("has none"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 20260918051213_repair_alias_notification_tap_thread_ids.sql
+    // -----------------------------------------------------------------------
+
+    /// The shipped file, so there is no second copy that can drift.
+    const REPAIR_ALIAS_TAPS: &str = include_str!(
+        "../../migrations/20260918051213_repair_alias_notification_tap_thread_ids.sql"
+    );
+
+    async fn seed_notification(
+        pool: &PgPool,
+        thread_id: Option<Uuid>,
+        tap: serde_json::Value,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO notifications (id, thread_id, title, message, read, created_at, tap) \
+             VALUES ($1, $2, 'seeded', 'seeded', false, NOW(), $3)",
+        )
+        .bind(id)
+        .bind(thread_id)
+        .bind(sqlx::types::Json(tap))
+        .execute(pool)
+        .await
+        .expect("seed notification");
+        id
+    }
+
+    async fn tap_of(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT tap FROM notifications WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// The rows the old producers wrote are already in every inbox, and the
+    /// engine-side guard cannot reach back for them. Each one's own `thread_id`
+    /// is the value its tap should have carried, so the repair is not a guess.
+    ///
+    /// The last two rows are why the predicate matches the ALIAS rather than
+    /// "fails a uuid regex". Each holds a real uuid in a form `Uuid::parse_str`
+    /// takes and a hyphen-only regex does not. A broader predicate would
+    /// re-point a working deep link at a different thread.
+    #[tokio::test]
+    async fn the_migration_repairs_the_alias_and_destroys_nothing_else() {
+        let (pool, db) = setup_test_db().await;
+
+        let owner = Uuid::new_v4();
+        let aliased = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": "current"}}),
+        )
+        .await;
+        let shouty = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": " THIS "}}),
+        )
+        .await;
+        let orphan = seed_notification(
+            &pool,
+            None,
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": "current"}}),
+        )
+        .await;
+        let healthy_id = Uuid::new_v4();
+        let healthy = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": healthy_id.to_string(), "event_id": "keep-me"}
+            }),
+        )
+        .await;
+        let app = seed_notification(
+            &pool,
+            None,
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "app", "app_id": "habit-tracker", "id": "not-a-uuid"}
+            }),
+        )
+        .await;
+        let simple_id = Uuid::new_v4();
+        let unhyphenated = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": simple_id.simple().to_string()}
+            }),
+        )
+        .await;
+        let padded_id = Uuid::new_v4();
+        let padded = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": format!(" {padded_id} ")}
+            }),
+        )
+        .await;
+
+        sqlx::raw_sql(REPAIR_ALIAS_TAPS)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for (id, what) in [(aliased, "current"), (shouty, " THIS ")] {
+            assert_eq!(
+                tap_of(&pool, id).await["to"]["id"],
+                serde_json::json!(owner.to_string()),
+                "{what} must take the row's own thread"
+            );
+        }
+        assert_eq!(
+            tap_of(&pool, orphan).await,
+            serde_json::json!({"kind": "modal"}),
+            "with no thread to fall back on, the card is the honest landing"
+        );
+        let kept = tap_of(&pool, healthy).await;
+        assert_eq!(kept["to"]["id"], serde_json::json!(healthy_id.to_string()));
+        assert_eq!(
+            kept["to"]["event_id"],
+            serde_json::json!("keep-me"),
+            "a healthy tap keeps every sibling field"
+        );
+        assert_eq!(
+            tap_of(&pool, app).await["to"]["id"],
+            serde_json::json!("not-a-uuid"),
+            "only a thread target names a thread"
+        );
+        assert_eq!(
+            tap_of(&pool, unhyphenated).await["to"]["id"],
+            serde_json::json!(simple_id.simple().to_string()),
+            "a uuid the parser accepts is not ours to rewrite"
+        );
+        assert_eq!(
+            tap_of(&pool, padded).await["to"]["id"],
+            serde_json::json!(format!(" {padded_id} ")),
+            "neither is a padded one"
+        );
+
+        // Every repaired row must still decode, or the inbox 500s on exactly
+        // the rows the migration touched. It must also need no caller, which is
+        // what says the alias is gone rather than merely rewritten.
+        let repaired: Tap = serde_json::from_value(tap_of(&pool, aliased).await).expect("decodes");
+        let mut settled = repaired.clone();
+        resolve_thread_tap_id(&mut settled, None).expect("a repaired tap needs no caller");
+        assert_eq!(settled, repaired);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
     }
 }

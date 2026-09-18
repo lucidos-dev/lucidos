@@ -12,6 +12,11 @@
 //! Deliberately not a queue: whoever samples a freed slot first takes it.
 //! Arrival order is an explicit non-goal, because ticket state is exactly the
 //! stale state this design removes.
+//!
+//! A granted slot also SHAPES the build it admits, at a lower scheduling
+//! priority and with a share of the host's cores ([`BuildLimits`]). Counting
+//! builds alone is not enough: the count is derived from RAM, and three
+//! holders on one 18-core host ran three full-core clippy trees.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,7 +37,27 @@ pub const ENV_HELD: &str = "LUCIDOS_BUILD_SLOT_HELD";
 /// `$HOME`. Tests must never touch the real machine-wide pool.
 pub const ENV_POOL_DIR: &str = "LUCIDOS_BUILD_SLOT_DIR";
 
+/// Overrides the nice increment a granted build runs at. `0` opts out, which
+/// is what a foreground build wants.
+pub const ENV_NICE: &str = "LUCIDOS_BUILD_SLOT_NICE";
+
+/// The cargo variable the core share is exported as. Read as well as written:
+/// a value the caller already set always wins.
+pub const ENV_CARGO_JOBS: &str = "CARGO_BUILD_JOBS";
+
 const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Nice increment applied to a granted build.
+///
+/// Ten is the conventional background value: a bare `nice <cmd>` means exactly
+/// this on macOS and on GNU coreutils. An idle host pays nothing, because nice
+/// only bites under contention. Every holder gets the same increment, so it
+/// never changes how two builds compete with each other. What it buys is a
+/// usable machine while they run.
+const DEFAULT_NICE: i32 = 10;
+
+/// Highest increment honoured. The kernel clamps above this anyway.
+const MAX_NICE: i32 = 19;
 
 /// Gibibytes of host RAM we assume one heavy build needs.
 const GIB_PER_BUILD: u64 = 16;
@@ -167,6 +192,70 @@ pub fn inherited_slot() -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// What the broker imposes on a build it has just granted a slot to.
+///
+/// Both halves reach the whole compile tree from one act at the broker. A nice
+/// value survives fork and exec, and the job count is an environment variable
+/// every `cargo` under it reads.
+///
+/// A non-root process cannot lower a nice increment again, so the broker
+/// applies it once, at the grant. A nested acquisition therefore imposes
+/// [`BuildLimits::NONE`] rather than a second increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildLimits {
+    /// Nice increment for the process that spawns the build. `0` leaves the
+    /// priority alone.
+    pub nice: i32,
+    /// Cores to allow the build, exported as [`ENV_CARGO_JOBS`]. `None` means
+    /// export nothing, because the caller set it or the host would not say.
+    pub jobs: Option<usize>,
+}
+
+impl BuildLimits {
+    /// Impose nothing. What a nested acquisition uses, and what an ungoverned
+    /// build gets when there is no pool to grant anything.
+    pub const NONE: Self = Self {
+        nice: 0,
+        jobs: None,
+    };
+}
+
+/// The nice increment for a granted build, from [`ENV_NICE`] or the default.
+///
+/// Junk falls back rather than failing: a limiter that cannot read its own
+/// setting must still let the build run. A negative value resolves to zero,
+/// because raising a build's priority needs privilege we do not have and is
+/// not what this exists for.
+pub fn resolve_nice(raw: Option<&str>) -> i32 {
+    let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+        return DEFAULT_NICE;
+    };
+    text.parse::<i32>()
+        .map(|n| n.clamp(0, MAX_NICE))
+        .unwrap_or(DEFAULT_NICE)
+}
+
+/// Cores this build may use, given how many slots are held right now.
+///
+/// `holders` counts this build's own slot, so a solo build divides by one and
+/// keeps the whole host. The common case must not pay for contention that is
+/// not happening. At full contention every holder sits at the guaranteed
+/// `ncpu / capacity`, and 1 is the floor under that, for a host with fewer
+/// cores than slots.
+pub fn cpu_share(ncpu: usize, holders: usize, capacity: usize) -> usize {
+    let guaranteed = (ncpu / capacity.max(1)).max(1);
+    let allocated = ncpu / holders.max(1);
+    allocated.max(guaranteed)
+}
+
+/// Cores this host reports, or `None` when it will not say.
+///
+/// `None` is not a failure to report. The broker exports no job count, and the
+/// build runs at cargo's own default, as it did before a slot governed cores.
+pub fn host_ncpu() -> Option<usize> {
+    std::thread::available_parallelism().ok().map(|n| n.get())
 }
 
 /// The machine-wide pool of build slots.
@@ -348,6 +437,52 @@ impl BuildSlotPool {
                 holder: self.probe_holder(index),
             })
             .collect()
+    }
+
+    /// How many entries of a status snapshot are occupied.
+    pub fn count_held(states: &[SlotState]) -> usize {
+        states.iter().filter(|s| s.holder.is_some()).count()
+    }
+
+    /// Slots held right now, this process's own included.
+    ///
+    /// Reuses the [`status`](Self::status) walk rather than adding a second
+    /// one, so asking how busy the host is still takes no slot. Our own lock
+    /// counts because the probe opens its own descriptor, and `flock` denies
+    /// that one even to the process already holding the file.
+    pub fn held_slots(&self) -> usize {
+        Self::count_held(&self.status())
+    }
+
+    /// What to impose on the build this slot was just granted to.
+    ///
+    /// Call it AFTER taking the slot, because the share counts this holder and
+    /// the walk has to see our own lock. Counting at that point also narrows
+    /// the race two simultaneous acquirers run: each already holds a distinct
+    /// slot, so only the window before the other's lock lands is open. A build
+    /// keeps the allocation it took, and nothing rebalances it.
+    ///
+    /// `caller_jobs` is whatever [`ENV_CARGO_JOBS`] already held. An explicit
+    /// value always wins and the broker exports nothing: `scripts/lib/e2e.sh`
+    /// caps its release build at half the cores, and that number is the
+    /// caller's to choose. Blank is not a value, which is how that script
+    /// reads it too.
+    pub fn granted_limits(
+        &self,
+        ncpu: Option<usize>,
+        caller_jobs: Option<&str>,
+        nice_raw: Option<&str>,
+    ) -> BuildLimits {
+        let caller_set = caller_jobs.map(str::trim).is_some_and(|v| !v.is_empty());
+        let jobs = if caller_set {
+            None
+        } else {
+            ncpu.map(|n| cpu_share(n, self.held_slots(), self.capacity.value))
+        };
+        BuildLimits {
+            nice: resolve_nice(nice_raw),
+            jobs,
+        }
     }
 
     fn probe_holder(&self, index: usize) -> Option<SlotHolder> {

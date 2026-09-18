@@ -112,25 +112,32 @@ describe('a reader who stopped the motion still sees four phases', () => {
   });
 
   /** Colour alone is a thin distinction, and it is no distinction at all for a
-   *  reader who cannot separate green from grey. */
-  it('tells the transitional phases apart by shape as well as by colour', () => {
-    const ring = (phase: string): boolean =>
-      forPhase(phase).some((r) => r.selector.includes('::after'));
-    expect(ring('connecting'), 'a call being placed draws no ring').toBe(true);
-    expect(ring('ending'), 'a call running down draws one').toBe(false);
+   *  reader who cannot separate green from grey. Brightness carries it, since
+   *  a drawn mark is ruled out (ADR 0207). */
+  it('tells the transitional phases apart by brightness as well as by colour', () => {
+    for (const phase of ['connecting', 'ending']) {
+      expect(stillLook(phase), `${phase} rests at the same brightness as a live call`)
+        .toContain('opacity');
+    }
+    // And not at the SAME brightness, or the two collapse into each other.
+    const rest = (phase: string): string | undefined =>
+      forPhase(phase).find((r) => r.props.has('opacity'))?.props.get('opacity');
+    expect(rest('connecting')).not.toBe(rest('ending'));
   });
 
-  it('closes the connecting ring once the sweep stops', () => {
-    // A sweep frozen part-way round reads as a glitch. A complete circle reads
-    // as a deliberate outline, which is the shape above.
-    const still = stillRules('connecting').find((r) => r.selector.includes('::after'));
-    expect(still?.props.get('border-color')).toBe('currentColor');
+  it('draws no ring around the handset, which ADR 0207 settled', () => {
+    // The owner refused one twice, so the control itself pulses instead. A
+    // pseudo-element under this selector is how a ring comes back.
+    const drawn = rules.filter(
+      (r) => r.selector.includes('call-toggle') && r.selector.includes('::'),
+    );
+    expect(drawn.map((r) => r.selector)).toEqual([]);
   });
 
   it('turns off every animation it declares', () => {
     for (const phase of PHASES) {
       // A rule that already says `none` has nothing to turn off: the dwelt
-      // connect stops its own sweep, whatever the system setting says.
+      // connect stops its own pulse, whatever the system setting says.
       const animated = movingRules(phase).filter(
         (r) => (r.props.get('animation') ?? 'none') !== 'none',
       );
@@ -175,17 +182,21 @@ describe('a connect that dwells stops claiming progress', () => {
     expect(dwelt.length, 'the dwell changes the copy and nothing else').toBeGreaterThan(0);
   });
 
-  it('stops the sweep, because we are waiting on the reader', () => {
-    const ring = dwelt.filter((r) => r.selector.includes('::after'));
-    expect(ring.length).toBe(1);
-    expect(ring[0].props.get('animation')).toBe('none');
+  it('stops the pulse, because we are waiting on the reader', () => {
+    const glyph = dwelt.filter((r) => r.selector.includes('svg'));
+    expect(glyph.length).toBe(1);
+    expect(glyph[0].props.get('animation')).toBe('none');
   });
 
-  /** A still ring is the plain connect's reduced-motion shape, so the dwelt one
-   *  needs a second difference or the two collapse for that reader. */
-  it('leaves the ring a different shape from the one still being drawn', () => {
-    const ring = dwelt.find((r) => r.selector.includes('::after'));
-    expect(ring?.props.get('border-style')).toBe('dashed');
+  /** A still glyph is the plain connect's reduced-motion look too, so the dwelt
+   *  one needs a second difference or the two collapse for that reader. */
+  it('holds the glyph brighter than the pulse rests it', () => {
+    const dwelling = dwelt.find((r) => r.selector.includes('svg'))?.props.get('opacity');
+    const connecting = movingRules('connecting')
+      .find((r) => r.selector.includes('svg'))
+      ?.props.get('opacity');
+    expect(dwelling, 'the dwelt glyph names no brightness').toBeDefined();
+    expect(Number(dwelling)).toBeGreaterThan(Number(connecting));
   });
 
   it('takes the waiting tone, not the caution one', () => {
@@ -198,15 +209,77 @@ describe('a connect that dwells stops claiming progress', () => {
     }
   });
 
-  it('keeps that tone under the pointer', () => {
-    const hovered = dwelt.filter((r) => r.selector.includes(':hover'));
-    expect(hovered.length, 'the connect hover hands the green back').toBe(1);
-    expect(hovered[0].props.get('color')).toContain('--accent-notable');
+  it('names no hover of its own, so the pointer keeps its one promise', () => {
+    // A press here cancels the call, as it ends one in every other live
+    // phase. So the dwell takes the shared red hover below (ADR 0209).
+    expect(dwelt.filter((r) => r.selector.includes(':hover'))).toEqual([]);
+  });
+});
+
+describe('the colour says what is happening, the pointer what a press does', () => {
+  /** The live paint every non-idle phase starts from. */
+  const live = rules.find(
+    (r) => r.selector.endsWith('.active[data-role="call-toggle"]') && r.props.has('color'),
+  );
+
+  /** Every hover rule the call toggle declares, in source order. */
+  const hovers = rules.filter(
+    (r) => r.selector.includes('call-toggle') && r.selector.includes(':hover'),
+  );
+
+  it('paints a call that is up green, the whole way through', () => {
+    expect(live?.props.get('color'), 'the live paint names no colour').toContain('--accent-green');
+    expect(live?.props.get('background')).toContain('--accent-green');
+  });
+
+  it('keeps red off every resting phase', () => {
+    // Red is the hang-up, and a call that is up is not a failure. A resting
+    // rule reaching for it is what this test catches.
+    const resting = rules.filter(
+      (r) => r.selector.includes('call-toggle') && !r.selector.includes(':hover'),
+    );
+    for (const rule of resting) {
+      for (const [prop, value] of rule.props) {
+        expect(value, `${rule.selector} rests on red (${prop})`).not.toContain('--accent-red');
+      }
+    }
+  });
+
+  it('promises the hang-up under the pointer, and nowhere else', () => {
+    // Every hover but the spent control's is red: a press there ends the call.
+    const dead = hovers.find((r) => r.selector.includes('"ending"'));
+    const living = hovers.filter((r) => !r.selector.includes('"ending"'));
+    expect(living.length, 'no live phase answers the pointer').toBeGreaterThan(0);
+    for (const rule of living) {
+      const paint = [...rule.props.values()].join(' ');
+      expect(paint, `${rule.selector} offers no hang-up`).toContain('--accent-red');
+    }
+    expect(dead?.props.get('color'), 'the spent control promises a hang-up').toContain(
+      '--text-muted',
+    );
+  });
+
+  it('declares the shared hover after every phase it has to beat', () => {
+    // Same specificity, so source order decides. Declared earlier, the promise
+    // would lose to the connect's and the dwell's own tones.
+    const shared = hovers.find((r) => !r.selector.includes('data-call-'));
+    // The rules it has to beat are the ones that PAINT a phase at rest. The
+    // reduced-motion block below it only takes motion away.
+    const painted = rules.filter(
+      (r) =>
+        r.selector.includes('call-toggle') &&
+        r.selector.includes('data-call-') &&
+        !r.selector.includes(':hover') &&
+        (r.props.has('color') || r.props.has('background')),
+    );
+    expect(shared, 'no shared hover rule at all').toBeDefined();
+    expect(painted.length, 'no phase paints itself').toBeGreaterThan(0);
+    expect(rules.indexOf(shared!)).toBeGreaterThan(rules.indexOf(painted[painted.length - 1]));
   });
 });
 
 describe('the ending control looks as dead as it behaves', () => {
-  it('drops the live red for the muted tone', () => {
+  it('drops the live colour for the muted tone', () => {
     const tinted = forPhase('ending').filter((r) => r.props.has('color'));
     expect(tinted.length, 'ending never restates its colour').toBeGreaterThan(0);
     for (const rule of tinted) {

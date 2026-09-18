@@ -1399,6 +1399,29 @@ function isCallOnly(exchange: Exchange): boolean {
   return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
 }
 
+/** True when this card holds speech and nothing else: a *speech-only turn*.
+ *
+ *  It decides one thing: this card draws no turn header. Two people talking is
+ *  a turn nobody executed. So a "Lucidos Agent" row between two speech bubbles
+ *  names an actor the reader knows and dates a sentence they just heard.
+ *
+ *  Three halves, and each drops a real card out. `tookTheTurn` is the
+ *  delegation: the doer is working under that card, and the reader is owed the
+ *  header that says so. `isCallOnly` is the rest of the work, so the doer's
+ *  first tool call hands the card back to the ordinary machinery. A LIVE row
+ *  is in because it wears its persisted type and reads the same way. The
+ *  caller's pulse is the boundary neither of the other two sees, being a bare
+ *  `MessageReceived` with no `voice_session_id`.
+ *
+ *  **Not `exchangeHoldsNoTurn`, which is narrower in both directions.** That
+ *  one asks whose status a card reports and so reads no steps. It also misses
+ *  the talker's live row and the legacy caller row. */
+export function isSpeechOnlyTurn(exchange: Exchange): boolean {
+  if (exchange.tookTheTurn) return false;
+  if (isLiveCallRow(exchange.userEvent)) return true;
+  return isCallOnly(exchange);
+}
+
 /** True when this stretch of a call has been answered, so nothing is pending.
  *
  *  A caller's utterance the talker fielded itself is answered by the reply it

@@ -689,7 +689,7 @@ The `parent_thread_id` field on a spawned thread's first `MessageReceived` (proj
 ### Call phase
 Where a live *voice session* is, as the client models it: `idle` | `connecting` | `listening` | `speaking` | `ending` (`voice/callState.ts`). `listening` and `speaking` are both live and differ only in who has the floor. The speech gate runs whoever holds it. An opening edge is a *barge-in* or a *live utterance*, and the phase is half of what decides which.
 
-**A call draws two surfaces, and neither is a caption.** Everything said lands in the transcript as thread events, and the *live utterance* row below is the only one the phase paints there. The other surface is the *call toggle*, which wears the phase: green while `connecting`, red while live, deeper red while `speaking`, and muted grey while `ending`. A ring sweeps the two transitional phases, and `ending` carries `aria-disabled` because `ringOff` already ignores a press there. Under `prefers-reduced-motion` the movement goes, and colour and shape carry the four apart.
+**A call draws two surfaces, and neither is a caption.** Everything said lands in the transcript as thread events, and the *live utterance* row below is the only one the phase paints there. The other surface is the *call toggle*, which wears the phase: green for the whole call, deeper while `speaking`, muted grey while `ending`. Red is the pointer's promise rather than a state, appearing on hover wherever a press would end the call (ADR 0209). The handset pulses while `connecting` and again while `ending`, each at a resting brightness of its own, with no ring around it (ADR 0207). `ending` carries `aria-disabled` because `ringOff` already ignores a press, and under `prefers-reduced-motion` colour and brightness carry the four apart.
 
 The toggle also carries the call's one `role="status"` region, empty at `idle`, so each state a call arrives at is spoken as well as drawn. Ringing off is the button's own announcement, since emptying a live region says nothing. The transcript deliberately is not a live region either, because announcing every delta of a reply being spoken aloud would talk over it.
 
@@ -710,7 +710,21 @@ The caller TAKING the floor back from the *talker*, and one of the two signals a
 **The engine is what makes the cut real.** A Live *talker* has no cancel, so it keeps speaking. `Call::the_caller_cut_in` drops the rest of that reply: no audio to the caller, no delta into its row, and the row says `interrupted`. The client silencing its speaker alone is a hole, because the talker resumes into it.
 
 One barge-in cancels once, and one with nobody speaking cancels nothing. A cancel for a response that does not exist is refused, and on the Realtime path that refusal reads as the session dying.
-See also: *call phase*, *live utterance*, *talker*, ADR 0170, ADR 0200.
+See also: *call phase*, *live utterance*, *playback lead*, *talker*, ADR 0170, ADR 0200.
+
+### Playback lead
+How far ahead of now the client starts a chunk of talker audio when its queue has drained. It is the whole jitter buffer a call has. `Playback.lead` in `voice/schedule.ts`, applied by `placeChunk` and spent by `ports.ts`. A **playback gap** is the hole heard when it was not enough: the queue emptied with more of a reply still to come.
+
+**The depth is the lead and nothing more, because a Live *talker* paces its audio at the speed a person hears it.** That stream runs continuously, silence included, so the client is handed no depth of its own. A Realtime talker sends a reply in a burst instead, and builds depth on top of the lead. That is why 80 ms went unnoticed until a workspace pinned a Live model.
+
+**So every stall longer than the lead is audible, wherever it happened.** The engine's call loop is the usual source: `Call::drive` forwards audio and awaits its Postgres writes on one task, so a row costs the audio path a transaction. A caller therefore hears the first exchange of a call worst, when the thread's first rows, its name and its title all land at once.
+
+**A drained queue grows the lead to cover what it just lost, and never shrinks it.** Shrinking would re-earn the same hole, and the state dies with the call anyway. A drain past `QUIET_STREAM_SECONDS` is read as the talker stopping rather than as a fault. Otherwise every Realtime turn boundary would grow the lead to its cap.
+
+**Audio still queued is never re-led.** A chunk whose cursor sits ahead of now butts against it, however thin the lead has worn. So the rule cannot manufacture the hole it exists to absorb.
+
+`AudioDevice.playbackGaps` tallies the holes, and `voice/call.ts` logs the count once as the call comes down. Nothing acts on it: the caller heard them, and the lead has already grown.
+See also: *barge-in*, *talker*, *voice provider*.
 
 ### Live utterance
 The caller's utterance before the engine's own row for it exists, and the row the transcript draws for it meanwhile. `CallState.utterance` (`voice/callState.ts`) carries it through four values. `none` is nothing heard and `live` is the speech gate open. `landing` is the gate shut with the provider still silent, and `transcribed` is the provider reporting the words.
@@ -749,7 +763,15 @@ See also: *call phase*, *live reply*, *transcript marker*, ADR 0174, `docs/plans
 ### Spoken merge
 The rule that reads two spoken rows back as the one thing said. A voice provider ends a speaker's turn after a fraction of a second of silence, so it cuts a sentence wherever the speaker breathes. Every turn is its own row (ADR 0201).
 
-Two rows merge when they are ADJACENT, from the same speaker, and no further apart than `MERGE_GAP_SECS` (five seconds). Adjacency does most of the work: anything between them means the speaker said two things. The words join with one space, or with none before a clitic, so `Status` and `, please` read as one sentence.
+Two rows merge when they are ADJACENT, from the same speaker, and no further apart than `MERGE_GAP_SECS` (five seconds). Adjacency does most of the work: another turn between them means the speaker said two things. The words join with one space, or with none before a clitic, so `Status` and `, please` read as one sentence.
+
+**In the transcript, a step that landed WHILE the first row was being said is not "between" them** (ADR 0206). The talker never stopped, so it separated nothing, and `spokenRowToGrow` reads past it. A step in the silence after those words is time passing and does separate them.
+
+**For the CALLER, the talker's own note is not "between" them either.** A delegation says why the talker asked for the turn. It lands within milliseconds of the fragment that prompted it, so it routinely arrives mid-sentence. The transcript draws no row for it at all: `DRAWS_NO_ROW` and `readerMetNothing`, both in `exchange-grouping.ts`. The doer's history counts it as a note rather than a turn: `SpokenTail::notes_after`. The two must answer alike, or a bubble reads as one message the model never saw as one.
+
+**A reply takes the timing rule instead, so a delegation DOES separate two of them.** The talker had stopped speaking, which puts the note in the silence after the words. That is the paragraph above, and it is why the exemption is the caller's alone.
+
+**One case still answers differently, and it predates the exemption**: a doer step between two caller fragments splits the transcript and merges the history. A step reaches `pending_steps` and never `messages`, so the history's row count cannot see it. Closing it means asking what the reader met at every record site, and proving the two alike through the fixture.
 
 It has two implementations and one definition. `core/store/messages/spoken_merge.rs` serves the agent's conversation history and generates `spoken-merge-fixture.json`; `store/thread-events/spokenMerge.ts` serves the transcript and replays that fixture. A bound could not decide a turn's END (ADR 0187, ADR 0188), because that question is asked live. This one is asked afterwards, holding both timestamps.
 
@@ -770,7 +792,9 @@ The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past
 
 **The live row is drawn INSIDE the block its persisted row will land in**, as a step rather than a boundary. `withLiveCallRows` and `callRowTarget` share `liveReplyTargetIndex`, so the two cannot drift. Appended as its own exchange it drew a second Lucidos Agent header between the speech bubbles. That header then came and went as each persisted row landed.
 
-**Both rows read where their own `created` puts them** (ADR 0201). A reply goes down at its own turn end, so that stamp IS when the words stopped. `callRowIndex` files the row by it, with no second clock to consult. The live row goes through the same rule on its own `created`, which is the moment the bridge drew it.
+**Both rows read where the WORDS BEGAN** (ADR 0206). A reply goes down at its own turn end, so `created` is when the words stopped. `spoken_secs_before` says how long it had been speaking by then. `happenedAt` subtracts the one from the other and `callRowIndex` files the row there, reading every step it walks past the same way. The live row goes through that rule on its own `created`, the moment the bridge drew it, so the swap moves the bubble nowhere. A row with no age reads at `created`, which is where a deltaless reply and every pre-ADR-0206 row still read.
+
+**A step that landed mid-sentence does not split the bubble.** The merge wants the two fragments ADJACENT, and a row now spans time, so a step stamped inside the first one separated nothing: the talker never stopped. `spokenRowToGrow` reads it that way and the merged row keeps its place, its age grown to span both fragments. A step in the SILENCE between them is time passing, and there the reader meets two bubbles.
 
 **The exchange republishes the live row's words as `liveReplyText`.** It is a step, so its text moves under a stable seq, and the memo's step fingerprint cannot see that. Without the field the bubble stops on whatever prefix the first render caught.
 See also: *live utterance*, *live speech mark*, *call phase*, ADR 0174.
@@ -1033,6 +1057,10 @@ That consumer is the platform-scroll correction in the *standing follow*, and wh
 
 ### Standing follow
 The reader's request to ride the *live edge* of a transcript, the bottom of the newest content. It is held as one explicit flag in `components/chat/scrollState.ts`, and stands until they say otherwise.
+
+**BELOW ONE PAGE, NOTHING MOVES.** A transcript shorter than its pane flows its turns from the top and leaves them where they were drawn. The space under the newest turn is unused VIEWPORT, and it is accepted rather than closed. The follow has nothing to do there: it writes `liveEdgeTop`, which is 0 on a transcript that does not overflow. ADR 0212.
+
+That case spent one day resting its turns on the BOTTOM instead, to close the space. Bottom-anchored, the block of turns grew upward, so every new turn pushed already-read content up the screen before there was a page of it. Reverted the same day, and pinned against by `styles/__tests__/a-short-transcript-holds-still.test.ts`. A separate gap, on a transcript that DOES scroll, is what was originally reported and is still open.
 
 WHERE THE READER IS decides what it does for them. A reader still ON the live edge is kept there whatever the thread is doing (`keepTheLiveEdge`). Three events can slide the edge out from under someone who never left it, and that rule covers all three. A reader who has SCROLLED AWAY is carried back only while a LIVE SOURCE is producing rows (`followIsCarrying`). A quiet thread has nothing to be carried toward, and they went looking for something further up.
 
@@ -1943,11 +1971,13 @@ The archive the in-app auto-updater installs: `Lucidos.app.tar.gz` plus its deta
 The gateway's hourly poll of `https://lucidos.dev/api/update-check`, and the answer it announces on `GET /~/api/v1/control/gateway/status` as `release_check`. One per install rather than one per open window, because a refresh re-polls only when the gateway's answer is older than the interval. It is fail closed, running only when `LUCIDOS_PACKAGED=1` is set and the executable resolves outside a source checkout, so a dev tree never polls. The request carries platform, arch, version and the caller's IP; `enabled` in `~/.lucidos/updates.toml` defaults true and is its one preference gate (ADR 0139). Distinct from *gateway binary check*, which asks whether a newer gateway binary sits on disk. It never installs: the client does that, via `install_app_update_and_restart` on macOS or a re-run of `install.sh` elsewhere (ADR 0108).
 
 ### Update route
-What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Four values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no offer yet, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
+What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Four values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no newer release known, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
 
 `desktop` is a mobile client, decided FIRST because none of the other three can be reached from a phone. Lucidos ships no mobile client, so `install` is already out. A check there ends at "up to date" or at this same sentence, and `guide` spends a page load to say it. Following it shows a toast naming the machine that runs the workspace, and navigates nowhere. A phone also raises no offer toast, and no update half of the *System attention badge*. Both of those clear on an install it can never run (ADR 0190).
 
-Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button, which is install-or-check because it is where `guide` lands. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. `guide` and `desktop` share their words, because the reader's question is the same and only the answer's medium differs. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
+Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. `guide` and `desktop` share their words, because the reader's question is the same and only the answer's medium differs. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
+
+**A surface that has already named the release passes that fact in, so `check` never appears on it.** What's New does, by listing the published changelog. Offering a check there sends the reader to confirm what the `Newer` chip beside it just said. Overview's own button stays install-or-check, because it names no release and is where `guide` lands.
 
 ### Release notice cursor
 The `release_notice_cursor` preference: the id of the last *release notice* this workspace answered. Everything after it in `release-notices.toml`, and at or before the running release, is still owed. One scalar is the whole of the ordering and the one-time-ness, because the authored file is an ordered append-only sequence.
@@ -2473,12 +2503,22 @@ The name is kept as a retired entry rather than deleted. The word is still live
 elsewhere in this glossary for the *cache seam*, and several ADRs use it for a
 generic code boundary.
 
+### Speech-only turn
+A transcript card holding speech and nothing else, which draws **no turn header** on either half: no executor chip, no *turn controls*, no status badge, no timestamp. `isSpeechOnlyTurn` (`store/thread-events/exchange-render.ts`) is the decision, and it reaches both panels: the response panel takes `headerless`, and the initiator panel joins the chipless set beside a user message and a change turn.
+
+Two people talking is a turn nobody executed. A "Lucidos Agent" row between two speech bubbles therefore names an actor the reader knows, and dates a sentence they just heard. Every card of a call the *talker* fields alone is one: the caller's utterance in either spelling (a `SpokenMessageReceived`, or a `MessageReceived` with `voice_session_id`), the talker's greeting, and either side's *live utterance* / *live reply* row. Attribution is still on the page: the left-aligned spoken-reply row against the reader's own right-aligned bubble. Both marks name the ACT in their accessible names.
+
+**The card the *doer* is working under keeps its header**, which is `Exchange.tookTheTurn`: the talker delegated, work is running here, and the Working badge is what says so. The doer's first tool call takes the card out of this by the other half, `isCallOnly`. So a call that delegates reads as speech until it asks for something, and as an ordinary turn from there.
+
+**A status badge has only the header to sit on.** So a card still waiting on its reply draws no response panel at all, rather than an empty box under the bubble (`speechOnlyHasWords` in `ChatExchange.tsx`). It carries no fold either, in either panel or from the keyboard: the collapse control is in the row that went, so a fold would leave a `⋯` stub nothing could clear.
+See also: *turn controls*, *live reply*, *transcript marker*, ADR 0148, ADR 0201.
+
 ### Turn controls
-The three controls every response turn carries. They are icon buttons in the **response header**, immediately right of the executor label (`turnControls` in `components/chat/chat-exchange-parts.tsx`, `.turn-controls` in `styles/chat/input-messages.css`). The run's rules live beside the actor/executor chip rule both headers share, because every measurement in them is taken against that chip. They split by **scope**: the first two change every turn in the transcript, the third changes only the turn it sits on. The split is carried by the third one's label and by its moving glyph, not by the spacing, which is uniform across all three.
+The three controls every response turn carries, a *speech-only turn* excepted: that one draws no response header, so it has nowhere to put them. They are icon buttons in the **response header**, immediately right of the executor label (`turnControls` in `components/chat/chat-exchange-parts.tsx`, `.turn-controls` in `styles/chat/input-messages.css`). The run's rules live beside the actor/executor chip rule both headers share, because every measurement in them is taken against that chip. They split by **scope**: the first two change every turn in the transcript, the third changes only the turn it sits on. The split is carried by the third one's label and by its moving glyph, not by the spacing, which is uniform across all three.
 
 The third of them, the collapse control, is the one the **initiator header** carries too, drawn by the same `collapseControl`. A turn's two headers are read as one widget. A fold announced by an icon on the reply and by a bare cursor on the message above was two answers to one question. The initiator header renders it only where there is a body to fold. That panel's body comes from its event rather than streaming in, so a control it cannot light up now it will never light up. The response's run keeps a disabled one instead (below).
 
-**ONE slot: immediately right of the actor chip**, which is the response header's own slot. It never leads a bare row, because the two chipless initiator turns carry no fold at all. A **user message** and a **change turn** are both exempt, dropped on report. One is the reader's own text; the other is a summary with a file list. Either way the control cost a row of chrome to fold a few short lines. A fold survives where the body can run long and is not yours, such as a forwarded agent message (`canCollapseInitiator` in `ChatExchange.tsx`).
+**ONE slot: immediately right of the actor chip**, which is the response header's own slot. It never leads a bare row, because every chipless initiator turn carries no fold at all. A **user message**, a **change turn** and a **speech-only turn** are exempt, each dropped on report. One is the reader's own text, one a summary with a file list, one a sentence somebody said. In every case the control cost a row of chrome to fold a few short lines. A fold survives where the body can run long and is not yours, such as a forwarded agent message (`canCollapseInitiator` in `ChatExchange.tsx`).
 
 - The **full-response control** (a single chevron, `detailsExpanded`) keeps every prose block of a turn, leaving only the final answer when off. Which turns actually have such prose is `hidesEarlierProse`.
 - The **steps control** (a leader-dot log glyph, `stepsExpanded`) shows *step mechanics*, and hides nothing else when off (see *transcript marker*).
@@ -2486,7 +2526,7 @@ The third of them, the collapse control, is the one the **initiator header** car
 
 **Both transcript-wide controls default ON**, so a reader who has never touched either sees the whole of every turn, work included, and turning one off is the deliberate act. They were off by default until 2026-08-11. Flipping the seed was not enough on its own: the persisting effect writes its signal on every load, clicked or not, so every browser that had opened the app already held `false` under `lucidos-steps-expanded` / `lucidos-details-expanded`, recording the old default rather than anyone's intent. The seeds read `-v2` keys instead and the old pair is cleared at load. What stops the same trap being re-set for the next reader is that storage now holds only the DEVIATION: `persistTurnControl` (`store.ts`, beside `seedTurnControl`) removes the key when a control is on and writes it only when one is off, so an absent key means ON and a stored value always says the reader turned something off.
 
-The first two are per-user global signals rather than per-turn state, so flipping one on any turn flips it on every turn. That is why all three **render on every turn** regardless of what that turn holds, collapsed included. The reader is setting how turns read, from wherever they happen to be looking. A turn with no steps of its own is still a turn where "show steps" means something. Hiding the group on a folded turn would take away the only thing that unfolds it.
+The first two are per-user global signals rather than per-turn state, so flipping one on any turn flips it on every turn. That is why all three **render on every turn that has a header** regardless of what that turn holds, collapsed included. The reader is setting how turns read, from wherever they happen to be looking. A turn with no steps of its own is still a turn where "show steps" means something. Hiding the group on a folded turn would take away the only thing that unfolds it. The one turn without a header, the *speech-only turn*, drops the run with it and cannot fold either.
 
 Two things mark the scope split for the reader: the collapse control's label, and how each states its state (below). The label names the turn, where the other two name what they reveal. A third mark, an extra 0.3125rem of gap ahead of the collapse control, was removed on 2026-08-10. Two different gaps inside a run of three icons is a claim the eye reads before it reads any tooltip. A 2+1 break lands as "two things and a stray" rather than as a scope split. The run's even spacing must stay clear of the executor label, which is why `.turn-controls` keeps a lead gap of double the intra-run one.
 
@@ -2548,6 +2588,12 @@ A **Live** talker holds **none** (ADR 0181). Its API declares no tools under cli
 **It settles a question card anyway, through the frame it does have** (ADR 0205). A delegation while the doer is parked on one is read as the caller's answer, and sends their transcript through the card's own free-text choice. So the engine matches nothing, and the caller reaches the same act typing reaches. A permission card takes a decision rather than words, so that one is a tap, and so is ringing off. `VoiceProvider::holds_the_answer_tool` is what `call.rs` asks, never a provider name.
 
 **Both synthesized boundaries read WORDS, never an output stream** (ADR 0185, ADR 0187). The caller's turn ends when the talker says something, and the talker's when it stops. Audio and blank deltas decide neither, because this provider sends both between turns.
+
+**A call opens with the floor shut, and nothing it says before the caller's first word is heard** (ADR 0211). Not played, not framed, not written down, and not offered to a running round. Decided per turn by that turn's first word, so one that began unheard stays unheard. The gate is `Audience` in `voice/call.rs`, above the seam, because a provider quiet at open is quiet by accident of its protocol.
+
+**Three things open that floor, and each buys one answer** (ADR 0213). The caller saying anything. The provider reporting they started speaking, which reaches the seam as `CallerStartedSpeaking` and is the one opener no transcriber can withhold: `whisper-1` streams no partials at all. And the engine asking for the turn through `Call::say`, which is how a card parked on a silent caller still reaches them. Each hands back a whole budget of `TURNS_ONE_OPENER_BUYS` heard turns, so a caller who keeps talking keeps buying answers.
+
+**An answer is several turns, and a call is not.** The budget exists because a Live turn ends at every hole in the talker's words, so one spoken answer spans several of them: spent per turn, the engine's own answer went audible for one sentence and then cut out. Held for the whole call instead, the caller's first hello licensed a forty-nine-second recitation of the thread's own history. A heard turn carrying words spends one, at the turn END and after its row. So the turn that spends the last one is still heard whole. Counted in turns rather than seconds because the recitation's longest silence was 2.3s and a real answer on the same thread paused for eighteen.
 
 What it can answer with no wait is whatever was loaded at session open, the *resident block*. It can look nothing up mid-sentence, so for anything else it delegates, stalls truthfully while the doer works, then says what it was handed MEANS. It may not state a fact it did not receive.
 
@@ -2847,6 +2893,10 @@ The half of a chat turn's prompt that is sized by what the USER put in their wor
 ### Resident block
 What a *voice session* opens knowing. The talker holds no tools (ADR 0149), so this block plus the conversation is the whole of what voice can answer with no wait. It enters the session as its FIRST history item, never as instructions, which is what lets a refresh append beside it rather than rewrite it. Rewriting would invalidate the cached prefix behind it, and one such deletion was measured to triple full-price input for that turn.
 
+**Never as instructions on a Live session either, and that took a defect to settle** (ADR 0211). That provider has no history, so the block rides `session.thinking.append`, its quiet channel. Sent on the steering channel instead, it read as new orders arriving after the session started, ending in a line of the reader's own conversation. The talker answered that line aloud, to a caller who had not spoken yet.
+
+**The conversation inside it is a FENCED record, and nothing follows its last turn** (ADR 0213). A line above says what the record is and which of `Them` and `You` is which. A line below says it ends there, that every line in it was already heard, and that none of it is to be said again. The quiet channel was not enough on its own: a talker on it recited a whole earlier call back out, in order, turn by turn. The closing line is the half that matters, because the defect is the record's last line reading as a turn nobody answered.
+
 Built from a registry of named **resident sections** (`voice::sections::SECTIONS`), each an id, a title and a builder that runs at session open. So a section reports the workspace as it is now, and adding one is a single entry plus its builder. What is in it is a product decision, not tuning: it bounds what voice answers instantly.
 
 **What is WAITING on the reader is in it, in two places.** `this-thread` carries the question this thread is parked on, in full, with its choices. `workspace-shape` names every other thread stopped waiting on an answer. Neither is a new section id on purpose: a workspace that already wrote `voice_resident_sections` gets exactly what that row lists, so a new id would reach the readers who need it least.
@@ -2878,6 +2928,19 @@ The seam a talker sits behind (`voice::provider`). `VoiceProvider` opens a `Voic
 **It has no tool field, deliberately.** The talker's three tools are named in `voice/mod.rs` (ADR 0170). A field nobody can set beats a field every implementation must remember to fill the same way. The seam's acknowledgement member is `resolve_tool_call`, one for all three.
 
 **It does carry one CAPABILITY, `holds_the_answer_tool`.** A talker with no channel to hand a choice id back settles a question card another way (ADR 0205). So `call.rs` has to know which it is talking to. A boolean rather than a name, so nothing above the seam learns which provider answered. It defaults to true, which is what every provider was before one answered false.
+
+### Call naming
+Giving the thread a call runs on a title, from the call's own *spoken exchange* rather than from one utterance (ADR 0208). Same path as the chat titler otherwise: the same model selection, the same validator, the same `ThreadTitleGenerated`, the same projection.
+
+**The exchange is both voices**, the caller's `SpokenMessageReceived` rows and the talker's `SpokenReplyGenerated` rows, oldest first and capped at 40 turns. The talker's half is often where the subject is: in one reported call the caller only ever said "Yeah, please check". `EventStore::get_thread_spoken_exchange` reads it and `chat::title::spoken_exchange_as_title_input` renders it, naming each speaker.
+
+**It fires at the first caller utterance that FOLLOWS a talker reply.** An opening "hey" names nothing, and what a caller says after an answer is about something. That signal doubles as the floor. A call with only one voice in it is never named here. It is handed back to the chat titler, so words typed on that thread later still name it.
+
+Three sites ask, and they differ only in when: `call.rs` through the `ThreadNamer` seam (`voice/naming.rs`), `api::voice` once the call is over, and the chat titler on a delegated turn. All three reach `LucidosEngine::spawn_call_title_generation`, which decides everything and answers whether there is a call here to name.
+
+**Guarded twice, because `thread_has_title` alone cannot hold it.** A name takes a model call, so two askers a second apart both read "no name yet". The call loop asks once per call, and every titler takes a per-thread naming slot (`threads_being_named`), the chat one included.
+
+See also: *talker*, *spoken merge*, *voice session*, ADR 0208.
 
 ## When to add a term
 

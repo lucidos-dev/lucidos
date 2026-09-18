@@ -683,6 +683,143 @@ async fn an_explicit_tap_survives_the_derivation() {
     assert_eq!(row["tap"]["kind"], "modal", "tap was {}", row["tap"]);
 }
 
+/// POST a notification expected to be refused, and answer with the status and
+/// the engine's reason. Nothing is created, so there is no row to read back.
+async fn create_expecting_refusal(body: serde_json::Value) -> (u16, String) {
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/notifications", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("create notification request");
+    let status = resp.status().as_u16();
+    let reason = resp.text().await.expect("read refusal body");
+    (status, reason)
+}
+
+/// A tap whose thread id names no thread is a dead deep link. The reader meets
+/// it as `Thread "<id>" no longer exists`, on a device that cannot repair
+/// anything. Refuse the write instead, while the caller can still fix it.
+#[tokio::test]
+async fn a_tap_thread_id_that_is_not_a_uuid_is_refused() {
+    for bad in ["t-9", "current", "the release thread"] {
+        let (status, reason) = create_expecting_refusal(serde_json::json!({
+            "title": unique_marker("bad-tap-thread-id"),
+            "message": "should never be stored",
+            "tap": { "kind": "navigate", "to": { "target": "thread", "id": bad } },
+        }))
+        .await;
+        assert_eq!(status, 400, "{bad} must be refused, got {reason}");
+        assert!(
+            reason.contains("is not a uuid") || reason.contains("surface has none"),
+            "{bad} must say why, got: {reason}"
+        );
+    }
+}
+
+/// `current` is an agent's word for "the thread I am in". A script POSTing here
+/// has no such thread, so resolving it would name whichever one the engine
+/// happened to serve. It is refused rather than guessed.
+#[tokio::test]
+async fn the_current_alias_has_no_meaning_over_http() {
+    let (status, reason) = create_expecting_refusal(serde_json::json!({
+        "title": unique_marker("http-alias"),
+        "message": "should never be stored",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+        "tap": { "kind": "navigate", "to": { "target": "thread", "id": "current" } },
+    }))
+    .await;
+    assert_eq!(status, 400, "got {reason}");
+    assert!(
+        reason.contains("surface has none"),
+        "the refusal must say why the alias cannot resolve, got: {reason}"
+    );
+}
+
+/// A thread tap with no id at all is the same dead banner, with a different
+/// error string. This row is stored and pushed before anyone sees it.
+#[tokio::test]
+async fn a_thread_tap_with_no_id_is_refused() {
+    let (status, reason) = create_expecting_refusal(serde_json::json!({
+        "title": unique_marker("idless-thread-tap"),
+        "message": "should never be stored",
+        "tap": { "kind": "navigate", "to": { "target": "thread" } },
+    }))
+    .await;
+    assert_eq!(status, 400, "got {reason}");
+    assert!(reason.contains("has none"), "got: {reason}");
+}
+
+/// `POST /api/v1/ui/navigate` is the SDK's `lucidos.ui.navigate`, and it emits
+/// the same NavigationRequested payload the `navigate_ui` tool does. An app has
+/// no thread of its own, so the alias is refused here like any other non-uuid.
+#[tokio::test]
+async fn the_sdk_navigate_bridge_refuses_a_thread_id_that_names_nothing() {
+    for bad in serde_json::json!(["current", "t-9", 7]).as_array().unwrap() {
+        let resp = user_client()
+            .await
+            .post(format!("{}/api/v1/ui/navigate", base_url()))
+            .json(&serde_json::json!({ "target": "thread", "params": { "id": bad } }))
+            .send()
+            .await
+            .expect("ui navigate request");
+        let status = resp.status().as_u16();
+        let reason = resp.text().await.expect("read refusal body");
+        assert_eq!(status, 400, "{bad} must be refused, got {reason}");
+        assert!(
+            reason.contains("is not a uuid")
+                || reason.contains("surface has none")
+                || reason.contains("must be a string"),
+            "{bad} must say why, got: {reason}"
+        );
+    }
+}
+
+/// The same bridge still passes a real thread id, and every other target.
+#[tokio::test]
+async fn the_sdk_navigate_bridge_still_passes_a_real_target() {
+    for params in [
+        serde_json::json!({ "id": uuid::Uuid::new_v4().to_string() }),
+        serde_json::json!({ "app_id": "habit-tracker" }),
+    ] {
+        let target = if params.get("id").is_some() {
+            "thread"
+        } else {
+            "app"
+        };
+        let resp = user_client()
+            .await
+            .post(format!("{}/api/v1/ui/navigate", base_url()))
+            .json(&serde_json::json!({ "target": target, "params": params }))
+            .send()
+            .await
+            .expect("ui navigate request");
+        assert_eq!(resp.status(), 200, "{target} must still navigate");
+    }
+}
+
+/// The guard is scoped to a thread target. An app id is a directory name and a
+/// panel target carries no id at all.
+#[tokio::test]
+async fn a_tap_that_names_no_thread_is_untouched() {
+    let row = create_and_read_back(serde_json::json!({
+        "title": unique_marker("app-tap"),
+        "message": "opens the app",
+        "tap": { "kind": "navigate", "to": { "target": "app", "app_id": "habit-tracker" } },
+    }))
+    .await;
+    assert_eq!(row["tap"]["to"]["app_id"], "habit-tracker");
+
+    let row = create_and_read_back(serde_json::json!({
+        "title": unique_marker("panel-tap"),
+        "message": "opens the panel",
+        "tap": { "kind": "navigate", "to": { "target": "changes" } },
+    }))
+    .await;
+    assert_eq!(row["tap"]["to"]["target"], "changes");
+}
+
 /// Pull `data.notification_id` out of an SSE `data: {json}` line. Returns None
 /// if the line isn't JSON or lacks the field.
 fn extract_notification_id(line: &str) -> Option<String> {

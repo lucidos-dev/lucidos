@@ -99,7 +99,9 @@ describe('turn header gutter', () => {
   // of the composer. Both panel kinds are covered, because a turn whose
   // response has not started ends on its initiator panel.
   it('drops the feed rhythm below the last turn, where nothing follows it', () => {
-    const re = /\.thread-content > \.chat-exchange:last-child > ([^{]*)\{([^}]*)\}/;
+    // `.thread-feed`, the box the turns live in. It is what rests them on the
+    // bottom, so it is also what "last turn" is scoped to.
+    const re = /\.thread-feed > \.chat-exchange:last-child > ([^{]*)\{([^}]*)\}/;
     const [, selectorTail, block] = inputCss.match(re) ?? [];
     expect(block, 'no last-turn rule').toBeTruthy();
     expect(declarationValue(block!, 'padding-bottom')).toBe('0');

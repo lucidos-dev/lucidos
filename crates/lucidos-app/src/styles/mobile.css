@@ -1020,6 +1020,12 @@
         display: flex;
         flex-direction: column;
     }
+    /* NO FLOOR ON `.thread-feed` HERE, and none in the base sheet either
+       (ADR 0212). A percentage floor on this scroller has to subtract the
+       chrome above the feed, the header spacer and the sticky title row. Get
+       that by a pixel and every short thread scrolls by a chrome's worth of
+       nothing. */
+
     .mobile-swipe-pane .thread-content {
         padding-top: 0;
         /* Matches the desktop base rule: reserve room past the prompt dissolve

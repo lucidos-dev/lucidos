@@ -1039,15 +1039,22 @@ await fetch(lucidos.apiUrl('/notifications'), {
 });
 
 // Navigate to a thread, optionally scroll-and-pulse a specific event row.
+// Both ids are uuids, and the engine refuses anything else with a 400: a tap
+// the page cannot resolve is a dead deep link the reader meets as
+// `Thread "<id>" no longer exists`. The agent-only `current` alias means "the
+// thread I am working in", which an app does not have, so it is refused here
+// too. Take the ids from whatever you are notifying about.
+const threadId = '4f1c2e8a-9d3b-4c17-8a55-0b6e2f7d1c93';
+const eventId = 'b7e04a12-5f6c-4d29-9e31-8c2a6d4b70f5';
 await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     title: 'Coding agent is asking',
     message: 'Permission needed.',
-    thread_id: 't-9',
-    event_id: 'e-7',
-    tap: { kind: 'navigate', to: { target: 'thread', id: 't-9', event_id: 'e-7' } },
+    thread_id: threadId,
+    event_id: eventId,
+    tap: { kind: 'navigate', to: { target: 'thread', id: threadId, event_id: eventId } },
   }),
 });
 

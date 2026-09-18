@@ -1348,6 +1348,19 @@ pub enum ThreadEvent {
         /// reply is not one: the talker jumps in on a mid-sentence pause, and
         /// the rest of their breath cuts nothing off (ADR 0200).
         interrupted: bool,
+        /// How long the talker had been saying these words when the row was
+        /// written, so the transcript can read the row where they BEGAN.
+        ///
+        /// `created` is when the words stopped, and a step beside them is an
+        /// instant. Placed by the end alone, a reply reads under every step it
+        /// was said over (ADR 0206).
+        ///
+        /// An age rather than an instant, because `created` is Postgres's clock
+        /// and this is read off the monotonic one (ADR 0053). Absent on a reply
+        /// that streamed no deltas, and on every row written before the field:
+        /// both read at `created`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spoken_secs_before: Option<f64>,
     },
 
     /// The caller said something on a call.

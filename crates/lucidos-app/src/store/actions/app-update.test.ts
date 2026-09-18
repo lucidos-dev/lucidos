@@ -1060,11 +1060,23 @@ describe('updateRoute', () => {
     expect(updateRoute()).toBe('guide');
   });
 
-  // The client-check path holds the offer before the signals it would be
-  // re-derived from have settled, so it says so rather than being re-read.
-  it('takes the word of a caller already holding an offer', () => {
+  // Two callers know before the signals do. The client-check path holds the
+  // offer before they settle, and What's New reads a changelog that names
+  // releases the hourly poll has not reached.
+  it('takes the word of a caller that already knows', () => {
     storeSignals.releaseCheck.value = releaseCheckOf(null);
     expect(updateRoute(true)).toBe('install');
+  });
+
+  // The check is for a surface that does NOT know. Told the release exists, the
+  // route acts on it. A session that cannot install is sent to the page
+  // answering for its install shape.
+  it('never checks for a release the caller has already named', () => {
+    mocks.isTauri.mockReturnValue(false);
+    for (const check of [null, releaseCheckOf(null), releaseCheckOf(null, { supported: false })]) {
+      storeSignals.releaseCheck.value = check;
+      expect(updateRoute(true), `${check?.supported}`).toBe('guide');
+    }
   });
 
   // A phone is never the machine an install lands on, so every state it can be

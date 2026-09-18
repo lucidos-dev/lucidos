@@ -155,6 +155,53 @@ impl EventStore {
         Ok(Some((text, image_desc, image_count)))
     }
 
+    /// What was said out loud on this thread, oldest first, both voices.
+    ///
+    /// The titler's input. One utterance names a call badly, because a spoken
+    /// sentence leans on the one before it: "Yeah, please check" is the whole
+    /// request and none of the subject. The exchange carries the subject.
+    ///
+    /// **The talker's replies are in it.** They are half the conversation, and
+    /// often the half naming the thing. Dropping them costs more than the
+    /// tokens they spend.
+    ///
+    /// Oldest first and capped from the START, so a long call is titled by how
+    /// it opened rather than by where it drifted to.
+    pub async fn get_thread_spoken_exchange(
+        &self,
+        thread_id: uuid::Uuid,
+        limit: i64,
+    ) -> Result<Vec<SpokenTurn>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT event_type, payload->>'text'
+            FROM events
+            WHERE thread_id = $1
+              AND event_type IN ('SpokenMessageReceived', 'SpokenReplyGenerated')
+            ORDER BY created ASC, sequence ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(thread_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(event_type, text)| {
+                let text = text?;
+                if text.trim().is_empty() {
+                    return None;
+                }
+                Some(SpokenTurn {
+                    from_caller: event_type == "SpokenMessageReceived",
+                    text,
+                })
+            })
+            .collect())
+    }
+
     /// Returns recent `MessageReceived` / `ResponseGenerated` events from a thread,
     /// formatted as oldest-first labeled lines for use as Gemini extraction context.
     ///

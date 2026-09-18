@@ -70,6 +70,7 @@ async fn the_talker_says(bus: &EventBus, thread_id: Uuid, text: &str) {
             session_id: Uuid::new_v4(),
             text: text.into(),
             interrupted: false,
+            spoken_secs_before: None,
         },
         meta: EventMeta::NONE,
     })
@@ -390,6 +391,7 @@ async fn a_spoken_turn_keeps_the_threads_recency_current() {
             session_id: Uuid::new_v4(),
             text: "Nothing urgent.".into(),
             interrupted: false,
+            spoken_secs_before: None,
         },
         meta: EventMeta::NONE,
     })

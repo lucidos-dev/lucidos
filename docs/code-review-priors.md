@@ -2561,6 +2561,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   open and 120 ms of speech. It costs one pulse vanishing a second early.
   Re-flag only if a call gains a client-visible identity.
 
+- **The dead-press rescue's `activated` line records a dispatch, and every path
+  that could eat that dispatch is closed by the time it fires.** A reviewer
+  reads `face.el.click()` followed by an `activated` line and a toast saying the
+  action ran. They object that a swallowed click makes both a lie. The objection
+  is right in the abstract and unreachable here.
+
+  Three things could eat it, and each is already spent. An overlay's paired
+  swallow is a one-shot disarmed by the next primary `pointerdown`, which the
+  dead tap itself supplied. `touchActivated`'s twin suppression is per button
+  and lasts 500 ms. The dead press reached no button, so the commit face's own
+  timestamp is stale by the 600 ms grace. A cover is asked about at the moment
+  of firing, and refuses with `covered`.
+
+  Proving it positively would mean writing `notePressOutcome` from the CLICK
+  path of `touchActivated`, app-wide. That slot is a single consuming global,
+  read against a settling press's own age. A foreign click inside that window
+  would be misread as the press being served, and a logging nicety is not worth
+  it. Re-flag if any of the three bounds above changes.
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though

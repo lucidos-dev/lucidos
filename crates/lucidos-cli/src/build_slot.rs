@@ -1,8 +1,9 @@
 //! `lucidos build-slot`: run a heavy build under a *build slot*.
 //!
 //! The pool itself lives in `lucidos-build-slot`; this is its user-facing
-//! door. Wrap a command and it waits for a free slot, then runs it as a child.
-//! The slot frees when the child exits, or when this process dies.
+//! door. Wrap a command and it waits for a free slot. The build then runs as a
+//! child, at a lower priority and with a share of the host's cores. The slot
+//! frees when the child exits, or when this process dies.
 //!
 //! Everything here fails OPEN. A pool that cannot be opened, an engine that is
 //! down, an announcement that does not send: none of them may be the reason a
@@ -11,7 +12,10 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use lucidos_build_slot::{inherited_slot, BuildSlotPool, SlotState, ENV_HELD};
+use lucidos_build_slot::{
+    host_ncpu, inherited_slot, BuildLimits, BuildSlotPool, SlotState, ENV_CARGO_JOBS, ENV_HELD,
+    ENV_NICE,
+};
 
 use crate::workspace::{resolve_from_env, BoxError, Workspace};
 
@@ -69,7 +73,7 @@ fn cmd_status() -> Result<u8, BoxError> {
     let pool = BuildSlotPool::open()?;
     let capacity = pool.capacity();
     let states = pool.status();
-    let held = states.iter().filter(|s| s.holder.is_some()).count();
+    let held = BuildSlotPool::count_held(&states);
 
     println!(
         "build slots: {}/{} held, capacity from {}",
@@ -126,15 +130,20 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     // Already inside a wrapped build: run straight through. Without this a
     // `make test` that wraps, calling a script that also wraps, would wait for
     // a slot it is already holding.
+    //
+    // It imposes NOTHING either. The outer wrapper already niced this tree and
+    // already divided its cores. Doing it again would halve an inner `make
+    // test`'s share a second time, and stack a nice increment no non-root
+    // process can take back.
     if let Some(index) = inherited_slot() {
-        return spawn_child(&args.command, Some(&index));
+        return spawn_child(&args.command, Some(&index), BuildLimits::NONE);
     }
 
     let pool = match BuildSlotPool::open() {
         Ok(pool) => pool,
         Err(e) => {
             eprintln!("lucidos build-slot: no pool ({e}), running the build unrestricted");
-            return spawn_child(&args.command, None);
+            return spawn_child(&args.command, None, BuildLimits::NONE);
         }
     };
 
@@ -147,7 +156,16 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     };
 
     let index = guard.index().to_string();
-    let code = spawn_child(&args.command, Some(&index));
+    // Decided with the slot already in hand, so the share counts this holder.
+    let caller_jobs = std::env::var(ENV_CARGO_JOBS).ok();
+    let nice_raw = std::env::var(ENV_NICE).ok();
+    let limits = pool.granted_limits(host_ncpu(), caller_jobs.as_deref(), nice_raw.as_deref());
+    eprintln!(
+        "{}",
+        describe_limits(&index, pool.capacity().value, &limits)
+    );
+    lower_own_priority(limits.nice);
+    let code = spawn_child(&args.command, Some(&index), limits);
 
     // Free the slot BEFORE announcing, so a waiter woken by the event finds it
     // already available rather than racing the drop.
@@ -225,8 +243,53 @@ fn wait_for_slot(
     }
 }
 
+/// One line saying what the slot imposed, so a build that is slower than the
+/// last one says why rather than reading as a mystery.
+fn describe_limits(index: &str, capacity: usize, limits: &BuildLimits) -> String {
+    let priority = match limits.nice {
+        0 => "priority unchanged".to_string(),
+        n => format!("nice +{n}"),
+    };
+    let cores = match limits.jobs {
+        Some(n) => format!("{n} cores"),
+        None => "cores unchanged".to_string(),
+    };
+    format!("lucidos build-slot: slot {index} of {capacity}, {priority}, {cores}")
+}
+
+/// Lower this process's scheduling priority, so the build it is about to spawn
+/// inherits it.
+///
+/// On OURSELVES rather than through a `pre_exec` hook on the child. A nice
+/// value survives fork and exec, so inheritance covers every `rustc` in the
+/// tree either way. A `pre_exec` closure would also cost std's fast
+/// `posix_spawn` path, and this process only waits for the child afterwards.
+///
+/// `nice(2)` adds to the current value and a non-root process cannot subtract
+/// again. So the increment lands once, at the grant, and a caller who already
+/// lowered this tree keeps that on top. The result is ignored, like every
+/// other failure here: a limiter must never be the reason a build does not
+/// run.
+#[cfg(unix)]
+fn lower_own_priority(increment: i32) {
+    if increment <= 0 {
+        return;
+    }
+    // SAFETY: a bare syscall on this process, with no pointer arguments.
+    unsafe {
+        libc::nice(increment);
+    }
+}
+
+#[cfg(not(unix))]
+fn lower_own_priority(_increment: i32) {}
+
 /// Run the wrapped command with the slot marked in its environment, inheriting
 /// stdio so the build looks exactly as it would unwrapped.
+///
+/// The core share goes in the same way, and only when the slot granted one:
+/// [`BuildLimits::NONE`] leaves `CARGO_BUILD_JOBS` exactly as the caller left
+/// it, which is what an explicit value and a nested run both resolve to.
 ///
 /// Deliberately NOT in a process group of its own. Staying in ours is what
 /// makes a group signal reach the build too: a terminal Ctrl-C, and the
@@ -234,7 +297,11 @@ fn wait_for_slot(
 /// coalesces an Apply. Calling `process_group` here would orphan the build.
 /// It would then compile on with its slot already freed (ADR 0070, and the
 /// "orphaned build outlives its wrapper" row in `docs/code-review-priors.md`).
-fn spawn_child(command: &[String], slot: Option<&str>) -> Result<u8, BoxError> {
+fn spawn_child(
+    command: &[String],
+    slot: Option<&str>,
+    limits: BuildLimits,
+) -> Result<u8, BoxError> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
         .stdin(Stdio::inherit())
@@ -242,6 +309,9 @@ fn spawn_child(command: &[String], slot: Option<&str>) -> Result<u8, BoxError> {
         .stderr(Stdio::inherit());
     if let Some(index) = slot {
         cmd.env(ENV_HELD, index);
+    }
+    if let Some(jobs) = limits.jobs {
+        cmd.env(ENV_CARGO_JOBS, jobs.to_string());
     }
     let status = cmd
         .status()
@@ -340,6 +410,30 @@ mod tests {
         });
         assert!(held.contains("HELD"), "{held}");
         assert!(held.contains("pid ?"), "{held}");
+    }
+
+    #[test]
+    fn the_granted_limits_are_reported_in_one_line() {
+        let shaped = describe_limits(
+            "1",
+            3,
+            &BuildLimits {
+                nice: 10,
+                jobs: Some(9),
+            },
+        );
+        assert!(shaped.contains("slot 1 of 3"), "{shaped}");
+        assert!(shaped.contains("nice +10"), "{shaped}");
+        assert!(shaped.contains("9 cores"), "{shaped}");
+    }
+
+    #[test]
+    fn imposing_nothing_says_so_rather_than_claiming_a_limit() {
+        // What an opted-out priority and a caller-set `CARGO_BUILD_JOBS` both
+        // produce. Reading "nice +0, 0 cores" would be a lie in both halves.
+        let inert = describe_limits("0", 1, &BuildLimits::NONE);
+        assert!(inert.contains("priority unchanged"), "{inert}");
+        assert!(inert.contains("cores unchanged"), "{inert}");
     }
 
     #[test]

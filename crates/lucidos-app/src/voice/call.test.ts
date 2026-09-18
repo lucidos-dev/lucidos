@@ -16,7 +16,7 @@ import {
   type CallState,
 } from './callState';
 import { CAPTURE_FRAME_SAMPLES, floatToPcm16 } from './pcm';
-import type { AudioDevice, CallPorts, SocketHandlers } from './ports';
+import type { AudioDevice, CallPorts, PlaybackGaps, SocketHandlers } from './ports';
 import {
   CALL_REFUSED,
   CallSetupError,
@@ -83,6 +83,10 @@ class FakeDevice implements AudioDevice {
 
   stopPlayback(): void {
     this.stops++;
+  }
+
+  playbackGaps(): PlaybackGaps {
+    return { count: 0, seconds: 0 };
   }
 
   close(): Promise<void> {

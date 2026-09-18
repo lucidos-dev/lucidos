@@ -96,7 +96,7 @@ describe('what is NOT one thing said', () => {
     expect(exchanges.map(starterText)).toEqual(['Status, please']);
   });
 
-  it('never joins across a step, however close the clock', () => {
+  it('never joins across a step the reader saw, however close the clock', () => {
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
       ev(2, {
@@ -116,6 +116,17 @@ describe('what is NOT one thing said', () => {
       'SpokenMessageReceived',
       'SpokenMessageReceived',
     ]);
+  });
+
+  /** The talker answering is something the reader met, so it splits. */
+  it('never joins across the answer to the first half', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
+      heard(10, 'Status'),
+      said(11, 'One moment.'),
+      heard(12, ', please'),
+    ]));
+    expect(exchanges.map(starterText)).toEqual(['Status', ', please']);
   });
 
   /** The gap is between NEIGHBOURS, never against the sentence's first word.
@@ -144,5 +155,39 @@ describe('what is NOT one thing said', () => {
     expect(exchanges.map(e => e.userEvent.type)).toEqual(['SpokenMessageReceived']);
     expect(starterText(exchanges[0])).toBe("What's the status");
     expect(spokenSteps(exchanges[0])).toEqual(['Nothing is waiting.']);
+  });
+});
+
+/** A step the reader never met separated nothing.
+ *
+ *  Reported from a call. `Just spawn the coding agent` and `, please` arrived
+ *  0.6s apart, and the talker's delegation landed in the 16ms between them.
+ *  That marker draws no row, so the reader met one sentence and the transcript
+ *  drew two bubbles under two headers. The same split cut `So, spawn a coding
+ *  agent on` from `that` half a minute earlier in the same call.
+ *
+ *  `push_spoken` (core/store/messages/build.rs) answers the same question for
+ *  the doer, and `a_delegation_mid_sentence_leaves_one_message` pins it there.
+ *  The two must agree: see `docs/glossary.md` § Spoken merge.
+ */
+describe('what the reader never saw does not cut a sentence', () => {
+  function delegatedMidSentence(): Exchange[] {
+    return groupIntoExchanges(new Map([
+      ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
+      heard(10, 'Just spawn the coding agent'),
+      ev(11, { type: 'WorkDelegated', session_id: 'sess-1', reason: '' }),
+      heard(12, ', please'),
+    ]));
+  }
+
+  it('joins across the delegation the talker left behind', () => {
+    expect(delegatedMidSentence().map(starterText))
+      .toEqual(['Just spawn the coding agent, please']);
+  });
+
+  it('keeps the delegation on the sentence that prompted it', () => {
+    const [utterance] = delegatedMidSentence();
+    expect(utterance.steps.map(s => s.event.type)).toEqual(['WorkDelegated']);
+    expect(utterance.tookTheTurn).toBe(true);
   });
 });

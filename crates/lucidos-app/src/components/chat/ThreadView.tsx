@@ -1209,6 +1209,9 @@ export function ThreadView() {
 
     const threadTitle = threadDisplayTitle(eventThread);
     const visualStatus = threadVisualStatus(eventThread);
+    // Is there a feed to draw? The empty state is the other branch, and it
+    // centres itself rather than flowing from the top.
+    const hasFeed = exchanges.length > 0;
     return (
         <div class="thread-view">
             <div class="thread-view-header">
@@ -1235,10 +1238,19 @@ export function ThreadView() {
                 <div class="thread-content visible" key="content" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript">
                     <MobileThreadTitleBar />
 
-                    {exchanges.length === 0 ? (
-                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
+                    {hasFeed ? (
+                        // THE FEED IS ITS OWN BOX, so the turns can be addressed
+                        // as a group. The scroll container cannot stand in for
+                        // it: on mobile that also holds the header spacer and
+                        // the sticky title. Two things select through this box,
+                        // the last-turn padding rule and the reading position.
+                        // It carries no alignment and no floor, and
+                        // `.thread-feed` in chat/input-messages.css says why.
+                        <div class="thread-feed" key="feed">
+                            {renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden)}
+                        </div>
                     ) : (
-                        renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden)
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
                     )}
                 </div>
                 <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />

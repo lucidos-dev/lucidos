@@ -66,7 +66,15 @@ class FakeAudioContext {
 
   createGain(): unknown {
     this.live();
-    return { gain: { value: 1 }, ...graphNode() };
+    // The automation the speaker's fade schedules. What it ramps to is
+    // `a-cut-fades-rather-than-clicks.test.ts`, not this file.
+    const gain = {
+      value: 1,
+      cancelScheduledValues: NOTHING,
+      setValueAtTime: NOTHING,
+      linearRampToValueAtTime: NOTHING,
+    };
+    return { gain, ...graphNode() };
   }
 
   createBuffer(): unknown {

@@ -330,6 +330,141 @@ fn holder_metadata_parses_and_tolerates_gaps() {
     assert_eq!(partial.held_secs(), None);
 }
 
+// ── the share of the host a slot carries ────────────────────────────────
+
+/// Pinned rather than read from the machine, so every expectation below is an
+/// exact number on any host that runs the suite.
+const TEST_NCPU: usize = 18;
+
+#[test]
+fn the_share_is_the_host_divided_by_its_holders() {
+    // The reported case: 18 cores, capacity 3. Solo keeps the machine, a
+    // second build gets half, and the third sits at the guaranteed share.
+    assert_eq!(cpu_share(TEST_NCPU, 1, 3), 18);
+    assert_eq!(cpu_share(TEST_NCPU, 2, 3), 9);
+    assert_eq!(cpu_share(TEST_NCPU, 3, 3), 6);
+}
+
+#[test]
+fn the_guaranteed_share_is_a_floor_a_holder_never_drops_below() {
+    // Holders are counted out of the pool's own slots, so the allocation can
+    // never fall under the guarantee on its own. The clamp is what keeps that
+    // true if a caller ever counts differently.
+    assert_eq!(cpu_share(TEST_NCPU, 9, 3), 6);
+}
+
+#[test]
+fn the_share_never_drops_below_one_core() {
+    // More holders than cores: the division floors to zero, and cargo rejects
+    // a job count of zero outright.
+    assert_eq!(cpu_share(2, 3, 4), 1);
+    assert_eq!(cpu_share(1, 1, 8), 1);
+    assert_eq!(cpu_share(0, 0, 0), 1);
+}
+
+#[test]
+fn a_solo_build_keeps_every_core_and_the_share_falls_as_the_pool_fills() {
+    // Against real locks, which is also what proves a holder counts itself:
+    // the probe opens its own descriptor, so `flock` reports our own slot as
+    // taken rather than free.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+
+    let first = p.try_acquire("first").expect("first slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None).jobs,
+        Some(18),
+        "a lone build must not pay for contention that is not happening"
+    );
+
+    let second = p.try_acquire("second").expect("second slot");
+    assert_eq!(p.granted_limits(Some(TEST_NCPU), None, None).jobs, Some(9));
+
+    let third = p.try_acquire("third").expect("third slot");
+    assert_eq!(p.granted_limits(Some(TEST_NCPU), None, None).jobs, Some(6));
+
+    drop(third);
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None).jobs,
+        Some(9),
+        "a freed slot widens the share the next build is granted"
+    );
+    drop(second);
+    drop(first);
+}
+
+#[test]
+fn an_explicit_caller_value_is_left_alone() {
+    // `scripts/lib/e2e.sh` caps its release build at half the cores, after a
+    // host hang. That number is the caller's, so the broker exports nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("e2e release build").expect("slot");
+
+    let limits = p.granted_limits(Some(TEST_NCPU), Some("9"), None);
+    assert_eq!(limits.jobs, None, "the caller's value stands untouched");
+    assert!(
+        limits.nice > 0,
+        "opting out of the share is not opting out of the priority"
+    );
+
+    // Blank is not a value. `e2e.sh` reads its own variable the same way.
+    let blank = p.granted_limits(Some(TEST_NCPU), Some("  "), None);
+    assert_eq!(blank.jobs, Some(18));
+}
+
+#[test]
+fn an_unreadable_core_count_exports_nothing() {
+    // Fail open. The build then runs at cargo's own default, exactly as it did
+    // before a slot governed cores at all.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("holder").expect("slot");
+    assert_eq!(p.granted_limits(None, None, None).jobs, None);
+}
+
+#[test]
+fn a_nested_acquisition_is_left_alone() {
+    // `test-engine.sh` runs inside `make test`'s slot. The outer wrapper
+    // already niced that tree and already divided its cores. A second pass
+    // would halve the share again and stack an increment nothing can undo.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("make test").expect("slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None).jobs,
+        Some(18),
+        "the outer build is the one that shapes the tree"
+    );
+
+    assert_eq!(
+        BuildLimits::NONE.jobs,
+        None,
+        "a nested run exports no share"
+    );
+    assert_eq!(BuildLimits::NONE.nice, 0, "and adds no second increment");
+}
+
+#[test]
+fn the_nice_increment_falls_back_rather_than_failing() {
+    assert_eq!(resolve_nice(None), DEFAULT_NICE);
+    assert_eq!(resolve_nice(Some(" 3 ")), 3);
+    assert_eq!(
+        resolve_nice(Some("0")),
+        0,
+        "zero is how a foreground build opts out"
+    );
+    assert_eq!(resolve_nice(Some("99")), MAX_NICE);
+    assert_eq!(
+        resolve_nice(Some("-5")),
+        0,
+        "raising a build's priority needs privilege we do not have"
+    );
+    for bad in ["", "   ", "low", "3.5"] {
+        assert_eq!(resolve_nice(Some(bad)), DEFAULT_NICE, "{bad:?}");
+    }
+}
+
 // ── re-entrancy and pool location ───────────────────────────────────────
 
 #[test]

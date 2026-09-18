@@ -241,7 +241,7 @@ enum Command {
     CodingAgentDiffHook,
     /// POST a new chat or coding-agent thread to another (or this same) Lucidos
     /// workspace. Defaults caller_* fields from $LUCIDOS_WORKSPACE,
-    /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--parent`, emits
+    /// $LUCIDOS_THREAD_ID, $LUCIDOS_EVENT_ID. With `--relation child`, emits
     /// parent_thread_id/spawning_event_id instead (same-workspace callback).
     /// `--repo <name>` defaults from $LUCIDOS_REPO so a coding-agent subprocess
     /// inherits the calling thread's repo without callers passing it explicitly.
@@ -867,14 +867,8 @@ pub(crate) struct SpawnThreadArgs {
     /// accepted as a back-compat alias for `child`. When omitted,
     /// defaults to `top` so existing cross-workspace recipes keep their
     /// fire-and-forget behavior.
-    #[arg(long, value_enum, conflicts_with = "parent")]
+    #[arg(long, value_enum)]
     pub(crate) relation: Option<CliRelation>,
-    /// DEPRECATED — alias for `--relation child`. Same-workspace
-    /// parent-with-callback spawn. Will be removed in a future release.
-    // TEMPORARY MEASURE — sunset deprecation; tracked in
-    // docs/temporary-measures.md § "lucidos spawn-thread --parent deprecated alias".
-    #[arg(long)]
-    pub(crate) parent: bool,
     /// Use `http://` instead of `https://`. Test-only. Hidden from --help.
     #[arg(long, hide = true)]
     pub(crate) insecure_http: bool,

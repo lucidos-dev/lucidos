@@ -661,6 +661,191 @@ fn the_pieces_of_one_breath_read_back_as_one_message() {
     assert_eq!(msgs[0].content, "So what I wanted to ask you is this.");
 }
 
+/// The talker's own note does not cut the sentence it was taken from.
+///
+/// A delegation lands within milliseconds of the fragment that prompted it,
+/// so it routinely arrives mid-sentence. The transcript joins the pieces
+/// either side of it, and the doer has to read the same message: a bubble the
+/// model never saw as one message is the failure this pins.
+///
+/// Plan: `docs/plans/2026-09-16-the-clock-is-the-only-order.md`.
+#[test]
+fn a_delegation_mid_sentence_leaves_one_message() {
+    let events = vec![
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Just spawn the coding agent"
+            }),
+            0,
+        ),
+        make_event(
+            "WorkDelegated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "reason": "they want a coding agent spawned"
+            }),
+            0,
+        ),
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": ", please"
+            }),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let said: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        vec!["Just spawn the coding agent, please"],
+        "{:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m.content.contains("[Asked for you]")),
+        "the ask went missing: {:?}",
+        msgs
+    );
+}
+
+/// The talker's own two replies are judged on timing, not on the note.
+///
+/// A reply goes down when the words stopped, so a delegation after it landed
+/// in the silence and does separate (ADR 0206). `spokenRowToGrow` splits them
+/// in the transcript, and this side has to agree.
+#[test]
+fn a_delegation_between_two_replies_still_cuts_them() {
+    let events = vec![
+        make_event(
+            "SpokenReplyGenerated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "One moment.",
+                "interrupted": false
+            }),
+            0,
+        ),
+        make_event(
+            "WorkDelegated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "reason": "they want the release checked"
+            }),
+            0,
+        ),
+        make_event(
+            "SpokenReplyGenerated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Still on it.",
+                "interrupted": false
+            }),
+            2,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let spoken: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.content != "[Asked for you] they want the release checked")
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(spoken, vec!["One moment.", "Still on it."], "{:?}", msgs);
+}
+
+/// A real turn AFTER the note still cuts the fragments apart.
+///
+/// The exemption counts the delegation's own row and nothing else, so a turn
+/// landing beside it must still put the count out.
+#[test]
+fn a_turn_after_the_note_still_cuts_the_fragments() {
+    let events = vec![
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Status"
+            }),
+            0,
+        ),
+        make_event(
+            "WorkDelegated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "reason": "they want the status"
+            }),
+            0,
+        ),
+        make_event("MessageReceived", json!({"text": "watch the build"}), 0),
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": ", please"
+            }),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let said: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        vec!["Status", "watch the build", ", please"],
+        "{:?}",
+        msgs
+    );
+}
+
+/// A real turn between two fragments still cuts them apart.
+///
+/// The exemption above is for a note about the words. Anything the doer reads
+/// as another turn means the speaker said two things.
+#[test]
+fn a_turn_between_two_fragments_still_cuts_them() {
+    let events = vec![
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Status"
+            }),
+            0,
+        ),
+        make_event("MessageReceived", json!({"text": "watch the build"}), 0),
+        make_event(
+            "SpokenMessageReceived",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": ", please"
+            }),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let said: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        vec!["Status", "watch the build", ", please"],
+        "{:?}",
+        msgs
+    );
+}
+
 /// A dropped line redialled inside the bound is still two calls.
 ///
 /// Nothing between them reaches the message list, so adjacency alone reads

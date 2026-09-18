@@ -14,9 +14,8 @@
 //! of `caller_*` fields, for same-workspace parent-with-callback spawns. The
 //! target workspace basename must match `$LUCIDOS_WORKSPACE` basename in
 //! `child` mode (else error). `--relation top` (the default) emits caller_*
-//! and never gets a callback. `--parent` is a deprecated alias for
-//! `--relation child` and prints a stderr warning. `sub` is also accepted
-//! as a back-compat alias for `child`.
+//! and never gets a callback. `sub` is also accepted as a back-compat alias
+//! for `child`.
 //!
 //! The CLI generates the new thread's UUID up front and includes it in the
 //! request body so it can print a `[title](thread:workspace/uuid)` markdown
@@ -74,23 +73,9 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    // Resolve relation: explicit `--relation` wins; `--parent` is a
-    // deprecated alias for `--relation child` (warn once on stderr); otherwise
-    // default to `top` so existing cross-workspace recipes keep their
-    // fire-and-forget behavior.
-    // TEMPORARY MEASURE — sunset deprecation (removable; see
-    // docs/temporary-measures.md § "lucidos spawn-thread --parent deprecated
-    // alias", governed by .claude/rules/temporary-measures.md). Remove the
-    // `--parent` arm one release after the warning shipped, once callers have
-    // migrated to `--relation child`.
-    let relation = match (args.relation, args.parent) {
-        (Some(r), _) => r,
-        (None, true) => {
-            eprintln!("warning: --parent is deprecated; use --relation child");
-            CliRelation::Child
-        }
-        (None, false) => CliRelation::Top,
-    };
+    // Resolve relation: explicit `--relation` wins; otherwise default to `top`
+    // so existing cross-workspace recipes keep their fire-and-forget behavior.
+    let relation = args.relation.unwrap_or(CliRelation::Top);
 
     if matches!(relation, CliRelation::Child) {
         let caller_basename = caller_workspace.as_deref().unwrap_or("");

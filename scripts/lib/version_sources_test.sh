@@ -30,6 +30,11 @@ pass() { echo "  ok:   $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 
 RELEASE_VERSION="$(tr -d '[:space:]' < RELEASE 2>/dev/null)"
+# The scans below match this version as a REGEX, so its dots must be literal.
+# Unescaped, 0.38.2 reads as "0, any char, 38, any char, 2" and matched the
+# SVG path data `-2.0238 2.044-` in docs/images/readme-banner.html, failing the
+# release on a file that carries no version at all. Escape once, here.
+RELEASE_VERSION_RE="$(printf '%s' "$RELEASE_VERSION" | sed 's/\./\\./g')"
 
 echo "test: RELEASE is the single source and is well-formed"
 if [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -123,14 +128,14 @@ if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
 elif [ ! -f "$HITS_FILE".all ]; then
   fail "the version scan could not run — treating that as a failure, not a clean tree"
 fi
-grep -wE "$RELEASE_VERSION" "$HITS_FILE".all > "$HITS_FILE".raw 2>/dev/null || true
+grep -wE "$RELEASE_VERSION_RE" "$HITS_FILE".all > "$HITS_FILE".raw 2>/dev/null || true
 # A dependency RANGE in a package manifest is someone else's version, the same
 # class as .github/dependabot.yml above. "esbuild": "^0.25.0" collided with the
 # 0.25.0 release, and nothing about that range tracks ours. Only the caret and
 # tilde forms are dropped, and only in a package.json, so a BARE literal is
 # still caught: a manifest's own "version" field, an exact dependency pin, and
 # the number written anywhere else in the tree all still fail this test.
-grep -vE '^[^:]*package\.json:[0-9]+:.*"[~^]'"$RELEASE_VERSION"'"' \
+grep -vE '^[^:]*package\.json:[0-9]+:.*"[~^]'"$RELEASE_VERSION_RE"'"' \
     "$HITS_FILE".raw > "$HITS_FILE" 2>/dev/null || true
 hit_count="$(wc -l < "$HITS_FILE" | tr -d '[:space:]')"
 if [ "$hit_count" -eq 0 ]; then

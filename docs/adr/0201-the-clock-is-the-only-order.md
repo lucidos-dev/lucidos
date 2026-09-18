@@ -1,6 +1,7 @@
 # 0201: The transcript orders every row by when it happened, and a call writes each turn down as it ends
 
 - **Status**: Accepted
+- **Amended by**: [0206: A spoken reply covers a stretch of time](0206-a-spoken-row-is-an-interval.md), which restores `spoken_secs_before`. The write stays at the turn end and `created` stays the one append order.
 - **Date**: 2026-09-16
 
 ## Context
@@ -79,9 +80,10 @@ exists.
 - The gap bound (`MERGE_GAP_SECS`, five seconds) is a number, so a speaker who
   pauses exactly there gets two bubbles where they meant one. Survivable: it
   decides grouping only, and no words are lost either way.
-- Rows written before this change keep their late `created` and read there. The
-  client no longer applies `spoken_secs_before`, so one historical call reads as
-  it did before ADR 0194.
+- Rows written before this change keep their late `created` and read there.
+  **Amended by ADR 0206**: the client applies `spoken_secs_before` again, so a
+  row from the ADR 0194 window reads where it was said rather than at its late
+  stamp.
 - Supersedes ADR 0188, ADR 0191 and ADR 0194, which together built the late
   write and the second clock it needed.
 

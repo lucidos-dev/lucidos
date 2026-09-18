@@ -7,8 +7,9 @@
 //! exercises bus paths.
 
 use super::{
-    merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid, parse_source_arg,
-    parse_status_arg, query_events_impl, status_filter_arg, BACKUP_SETTINGS_NAVIGATED,
+    merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
+    parse_send_notification_args, parse_source_arg, parse_status_arg, query_events_impl,
+    status_filter_arg, BACKUP_SETTINGS_NAVIGATED,
 };
 use crate::core::store::{EventStore, StatusFilter};
 use crate::engine::thread_lifecycle::ThreadStatus;
@@ -528,6 +529,93 @@ async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
 
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+// ============================================================================
+// `send_notification`: the tap's thread id
+//
+// A notification is written AND pushed. So a tap naming no real thread is a
+// dead deep link on a device that cannot ask what was meant. The reader meets
+// it as `Thread "<id>" no longer exists`, which is how the alias bug surfaced.
+// ============================================================================
+
+fn tap_thread_id(args: &serde_json::Value, caller: Uuid) -> Option<String> {
+    let parsed = parse_send_notification_args(args, caller).expect("args must parse");
+    match parsed.tap {
+        crate::scheduler::notifications::Tap::Navigate { to } => to.id,
+        crate::scheduler::notifications::Tap::Modal => None,
+    }
+}
+
+fn notify_args(tap_id: &str) -> serde_json::Value {
+    json!({
+        "title": "Nightly release prep: skipped",
+        "message": "Pre-flight stopped on deletion drift.",
+        "tap": {"kind": "navigate", "to": {"target": "thread", "id": tap_id}}
+    })
+}
+
+/// The model reaches for `current` because the sibling `events` tool takes it.
+/// The slot used to store the word, so the tap pointed at no thread at all.
+#[test]
+fn a_tap_naming_the_current_thread_stores_its_uuid() {
+    let caller = Uuid::new_v4();
+    for alias in ["current", "this", "  Current  "] {
+        assert_eq!(
+            tap_thread_id(&notify_args(alias), caller),
+            Some(caller.to_string()),
+            "{alias} must resolve to the calling thread"
+        );
+    }
+}
+
+/// The resolved tap and the row's own `thread_id` column must be the same
+/// thread. The column drives the inbox card's "Open thread" button, so a tap
+/// resolving elsewhere would send the two buttons to different places.
+#[test]
+fn the_resolved_tap_matches_the_notification_s_own_thread() {
+    let caller = Uuid::new_v4();
+    let parsed = parse_send_notification_args(&notify_args("current"), caller).expect("parses");
+    assert_eq!(parsed.link_thread, caller);
+    assert_eq!(
+        tap_thread_id(&notify_args("current"), caller),
+        Some(parsed.link_thread.to_string())
+    );
+}
+
+/// Anything that is neither the alias nor a uuid is refused, so the model can
+/// correct it in the same turn. Storing it means the user finds out by tapping.
+#[test]
+fn a_tap_thread_id_that_names_nothing_is_refused() {
+    let caller = Uuid::new_v4();
+    for bad in ["t-9", "the release thread", "currently", ""] {
+        let out = parse_send_notification_args(&notify_args(bad), caller);
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not a uuid") && msg.contains("'current'")),
+            "{bad} must be refused and point at the alias"
+        );
+    }
+}
+
+/// The unset tap derives from engine-stamped uuids, so the guard must not have
+/// made the ordinary notification refusable.
+#[test]
+fn the_derived_tap_still_passes_the_guard() {
+    let caller = Uuid::new_v4();
+    let event = Uuid::new_v4();
+    let args = json!({
+        "title": "Lucidos is asking",
+        "message": "Permission needed.",
+        "event_id": event.to_string()
+    });
+    assert_eq!(tap_thread_id(&args, caller), Some(caller.to_string()));
+
+    let bare = json!({"title": "Daily summary", "message": "Here it is."});
+    assert_eq!(
+        tap_thread_id(&bare, caller),
+        None,
+        "no event means the card"
+    );
 }
 
 // ============================================================================

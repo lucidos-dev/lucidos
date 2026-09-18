@@ -17,6 +17,7 @@ pub mod decision;
 pub mod doer;
 pub mod language;
 pub mod live;
+pub mod naming;
 pub mod provider;
 pub mod realtime;
 pub mod recovery;

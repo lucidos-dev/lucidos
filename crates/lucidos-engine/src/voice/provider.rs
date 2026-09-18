@@ -86,6 +86,16 @@ pub enum VoiceEvent {
     /// A transcriber that streams none is ordinary, not a failure. The bubble
     /// then pulses until the turn ends, exactly as it did before.
     UserTranscript { text: String },
+    /// The provider heard the caller open their mouth. No words yet.
+    ///
+    /// **The one signal that does not wait on a transcriber** (ADR 0211). It is
+    /// what opens a call's shut floor when the configured transcriber streams
+    /// no partials, and `whisper-1` is one such: it sends only the completed
+    /// frame, which is asynchronous and can land after the reply it prompted.
+    ///
+    /// It carries nothing and is written nowhere. A provider whose partials are
+    /// reliable may leave it unemitted.
+    CallerStartedSpeaking,
     /// The provider decided the caller stopped talking. Semantic or
     /// audio-native, never a silence timer we wrote (parent plan, decision 11).
     UserTurnEnded { transcript: String },

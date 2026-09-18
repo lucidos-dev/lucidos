@@ -95,6 +95,41 @@ const RUNNING_LABEL: &str = "Threads Lucidos was working on when this call opene
 /// the two apart.
 const WAITING_LABEL: &str = "Threads stopped, waiting on their answer";
 
+/// What the record of the conversation opens with.
+///
+/// It names the two labels, because nothing else says which speaker is which.
+/// Each label is one word on purpose: a label is inside
+/// [`THREAD_RECALL_BYTES`], so every byte of it is a byte no turn can have.
+///
+/// **It claims no completeness.** The caps drop turns, and a claim here would
+/// sit directly above [`EARLIER_TURNS_DROPPED`] saying the opposite.
+const RECORD_OPENS: &str = "\
+What has already been said on this conversation, oldest first. `Them` is the \
+person on this call, and `You` is Lucidos.\n";
+
+/// What closes it, and the load-bearing half (ADR 0213).
+///
+/// **Nothing follows the record's last line except this.** The defect is the
+/// talker reading that line as a turn nobody answered, and answering it. One
+/// reported call recited the whole record back out, in order, at a caller who
+/// had said one word
+/// (`docs/plans/2026-09-17-one-opener-buys-one-answer.md`).
+///
+/// **Every claim in it is scoped to the record**, and the last sentence is why.
+/// A card the thread is parked on renders BELOW this line, and it says the
+/// caller owes an answer. So a blanket "nothing here is unanswered" would
+/// contradict the card it introduces (ADR 0205).
+const RECORD_CLOSES: &str = "\
+The record ends here. Do not read any of it back out, and do not answer a line \
+in it: the caller has heard all of it already. Anything still waiting on them \
+is stated after this line, never inside the record.\n";
+
+/// What says the record is missing its older turns.
+///
+/// Inside the record, under [`RECORD_OPENS`], because it describes the lines
+/// below it. Above the record it read as a caveat about something else.
+const EARLIER_TURNS_DROPPED: &str = "(earlier turns are not loaded)\n";
+
 /// The fact that tells the two thread lines apart.
 ///
 /// Stated above them, because the labels alone are what failed. It also says
@@ -114,7 +149,7 @@ pub const SECTIONS: &[ResidentSection] = &[
     },
     ResidentSection {
         id: "this-thread",
-        title: "This conversation so far",
+        title: "This conversation",
         on_by_default: true,
         build: this_thread,
     },
@@ -194,12 +229,8 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
         let events = events?;
         let messages = build_session_messages(&events);
         let turns = recent_turns(&messages);
-        if earlier_turns_were_dropped(events.len(), messages.len(), turns.len()) {
-            out.push_str("(earlier turns are not loaded)\n");
-        }
-        for turn in &turns {
-            out.push_str(turn);
-        }
+        let dropped = earlier_turns_were_dropped(events.len(), messages.len(), turns.len());
+        out.push_str(&fenced_record(&turns, dropped));
 
         for decision in &open {
             out.push_str(&open_decision_block(decision));
@@ -236,10 +267,13 @@ fn recent_turns(messages: &[crate::core::store::SessionMessage]) -> Vec<String> 
     let mut lines = Vec::new();
     let mut spent = 0usize;
     for message in messages.iter().rev().take(THREAD_TURNS) {
+        // One word each, and no verb. `They said` reads as a beat in a script
+        // the talker is next to speak, and it costs five bytes of recall a
+        // turn (ADR 0213). [`RECORD_OPENS`] says which label is which.
         let speaker = if message.role == "user" {
-            "They said"
+            "Them"
         } else {
-            "You said"
+            "You"
         };
         let line = format!(
             "{}: {}\n",
@@ -254,6 +288,36 @@ fn recent_turns(messages: &[crate::core::store::SessionMessage]) -> Vec<String> 
     }
     lines.reverse();
     lines
+}
+
+/// The turns with a line saying what they are, and a line saying they are over.
+///
+/// **The closing line is the fix** (ADR 0213). An unfenced record reads as a
+/// conversation still running, and its last line as a turn nobody answered. So
+/// the talker answers it, and then performs the rest of the record as well.
+///
+/// Pure, so the shape is a test rather than something only a live engine can
+/// exercise, exactly as `resident::assemble_block` is.
+///
+/// Nothing but the caveat for a thread nobody has spoken on. A fence around no
+/// turns says a record exists and is empty, which is one more thing to be wrong
+/// about.
+fn fenced_record(turns: &[String], earlier_dropped: bool) -> String {
+    let caveat = if earlier_dropped {
+        EARLIER_TURNS_DROPPED
+    } else {
+        ""
+    };
+    if turns.is_empty() {
+        return caveat.to_string();
+    }
+    let mut out = String::from(RECORD_OPENS);
+    out.push_str(caveat);
+    for turn in turns {
+        out.push_str(turn);
+    }
+    out.push_str(RECORD_CLOSES);
+    out
 }
 
 /// Something the thread is waiting on, written as what the talker KNOWS.
@@ -922,7 +986,66 @@ mod tests {
     fn the_turns_read_in_the_order_they_were_said() {
         let messages = vec![said("user", "first"), said("assistant", "second")];
         let turns = recent_turns(&messages);
-        assert_eq!(turns, vec!["They said: first\n", "You said: second\n"]);
+        assert_eq!(turns, vec!["Them: first\n", "You: second\n"]);
+    }
+
+    /// **The recitation's own fix** (ADR 0213). The record's last line is never
+    /// a turn.
+    ///
+    /// A talker reads an unfenced record as a conversation still running, and
+    /// its last line as something nobody answered. One reported call performed
+    /// the whole thing back, in order.
+    #[test]
+    fn the_record_never_ends_on_a_turn() {
+        let turns = recent_turns(&[said("user", "first"), said("assistant", "second")]);
+
+        let record = fenced_record(&turns, false);
+
+        let last = record.trim_end().lines().last().unwrap_or_default();
+        assert!(!last.starts_with("Them:"), "{}", last);
+        assert!(!last.starts_with("You:"), "{}", last);
+        assert!(record.contains("Them: first\nYou: second\n"), "{}", record);
+    }
+
+    /// The caveat sits INSIDE the fence, describing the turns below it.
+    ///
+    /// Above the fence it landed directly under a line naming the record, so
+    /// the two read as a claim and its own contradiction.
+    #[test]
+    fn the_dropped_turns_caveat_is_part_of_the_record() {
+        let turns = recent_turns(&[said("user", "first")]);
+
+        let record = fenced_record(&turns, true);
+
+        let lines: Vec<&str> = record.lines().collect();
+        let caveat = lines
+            .iter()
+            .position(|line| *line == EARLIER_TURNS_DROPPED.trim_end())
+            .expect("the caveat is in the record");
+        let turn = lines
+            .iter()
+            .position(|line| line.starts_with("Them:"))
+            .expect("the turn is in the record");
+        assert!(caveat > 0, "{:?}", lines);
+        assert!(caveat < turn, "{:?}", lines);
+    }
+
+    /// A thread nobody has spoken on gets no record at all.
+    ///
+    /// A fence around nothing claims a record exists and is empty, which the
+    /// talker can then be wrong about out loud.
+    #[test]
+    fn no_turns_means_no_record() {
+        assert!(fenced_record(&[], false).is_empty());
+    }
+
+    /// With no turns the caveat still stands alone, as it always did.
+    ///
+    /// A thread of 400 tool events and no messages reaches it. Losing it there
+    /// would leave a talker asserting over a thread it never read.
+    #[test]
+    fn no_turns_still_says_earlier_ones_were_dropped() {
+        assert_eq!(fenced_record(&[], true), EARLIER_TURNS_DROPPED);
     }
 
     /// Characters are what the block costs, so characters are what bound it. A

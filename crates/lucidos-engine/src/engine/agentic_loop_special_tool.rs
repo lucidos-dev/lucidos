@@ -489,29 +489,16 @@ impl LucidosEngine {
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
 
-                // `folder` is the new canonical parameter; `repo` is the
-                // deprecated alias kept for one release (temporary measure —
-                // registered in docs/temporary-measures.md § "`repo` → `folder`
-                // deprecated alias on `run_coding_agent`"). Passing both is an
-                // error so callers don't silently get the resolution of one
-                // when they meant the other.
-                let folder_param = tool_args
+                // `folder` is the canonical parameter; `repo` was a deprecated
+                // alias, now removed (see `removed_repo_alias_error`).
+                if let Some(err) = removed_repo_alias_error(tool_args) {
+                    return Some(err.to_string());
+                }
+                let folder_input = tool_args
                     .get("folder")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let repo_param = tool_args
-                    .get("repo")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                if folder_param.is_some() && repo_param.is_some() {
-                    return Some(
-                        "Error: pass `folder` (preferred) or `repo` (deprecated alias), not both."
-                            .to_string(),
-                    );
-                }
-                let folder_input = folder_param.or(repo_param);
                 // Omitting `folder` MEANS "edit Lucidos itself" — which only
                 // exists on an install launched from a source checkout. Refuse
                 // here, synchronously, so the model learns it in the same turn
@@ -861,18 +848,15 @@ impl LucidosEngine {
             .get("title")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let repo = tool_args
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+        // `repo` was a deprecated alias for `folder`, now removed (see
+        // `removed_repo_alias_error`).
+        if let Some(err) = removed_repo_alias_error(tool_args) {
+            return err.to_string();
+        }
         let folder = tool_args
             .get("folder")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        if folder.is_some() && repo.is_some() {
-            return "Error: pass `folder` (preferred) or `repo` (deprecated alias), not both."
-                .to_string();
-        }
         // Validate the pins HERE too. This path returns before the local
         // spawn's validation, and the receiving engine cannot do it for us: it
         // sees an ordinary `ChatRequest` and would apply its own default for an
@@ -902,7 +886,6 @@ impl LucidosEngine {
         let spawn = crate::engine::http::workspace_client::CrossWorkspaceSpawn {
             prompt,
             title,
-            repo,
             folder,
             coding_agent: Some(coding_agent),
             model: model.as_deref(),
@@ -1259,10 +1242,37 @@ fn intent_narration_to_surface(content: Option<&str>) -> Option<&str> {
     content.filter(|text| !text.trim().is_empty())
 }
 
+/// `repo` was a deprecated alias for `folder` on `run_coding_agent`, now
+/// removed. A straggler still passing `repo` must fail loud with a rename
+/// error. A bare drop would read a `repo`-only call as "folder omitted", which
+/// on a source checkout silently edits Lucidos itself. Permanent guard, not a
+/// temporary measure. Returns `Some(error)` when a non-empty `repo` is present.
+fn removed_repo_alias_error(tool_args: &serde_json::Value) -> Option<&'static str> {
+    tool_args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|_| "Error: `repo` was renamed to `folder`. Pass `folder` instead.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `repo` was removed as an alias for `folder`. A straggler still passing
+    /// it must get a loud rename error, never a silent misroute.
+    #[test]
+    fn a_removed_repo_alias_is_rejected_with_a_rename_error() {
+        assert_eq!(
+            removed_repo_alias_error(&json!({ "repo": "Lucidos" })),
+            Some("Error: `repo` was renamed to `folder`. Pass `folder` instead.")
+        );
+        // Absent, empty, or whitespace-only `repo` is not the alias: no error.
+        assert!(removed_repo_alias_error(&json!({ "folder": "data/apps/x" })).is_none());
+        assert!(removed_repo_alias_error(&json!({ "repo": "" })).is_none());
+        assert!(removed_repo_alias_error(&json!({ "repo": "  " })).is_none());
+    }
 
     /// The summary is persisted into the event payload and broadcast over SSE.
     /// A connection string in a tool argument was written down in the clear.

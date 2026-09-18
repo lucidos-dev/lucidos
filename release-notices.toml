@@ -49,3 +49,22 @@ Worth doing now, and worth doing again after any release that moves a lot.
 """
 action_label = "Audit my workspace"
 action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "deprecated-spawn-aliases-removed"
+since = "0.38.1"
+title = "Two deprecated spawn aliases were removed"
+body = """
+Two long-deprecated shortcuts are gone. `run_coding_agent` no longer accepts \
+`repo` (use `folder`), and `lucidos spawn-thread` no longer accepts `--parent` \
+(use `--relation child`). Both had carried a deprecation warning for a while.
+
+Almost every workspace already uses the new forms and needs nothing. But a \
+recipe, trigger or script that still passes an old form will now fail with a \
+clear rename error instead of running.
+
+A workspace audit finds any such straggler on disk and tells you the one-line \
+fix. Worth running once now.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."

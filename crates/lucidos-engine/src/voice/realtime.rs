@@ -372,6 +372,15 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
                 _ => vec![],
             }
         }
+        // The caller opened their mouth, which is all this says and all the
+        // floor needs (ADR 0211). It is read here and NOT as an interruption:
+        // see [`done_events`], which explains why mapping it to one would
+        // report a cut on every turn.
+        //
+        // Load-bearing for `whisper-1`, which streams no partials at all. Its
+        // completed frame is asynchronous, so waiting for one drops the reply
+        // to the caller's very first sentence.
+        "input_audio_buffer.speech_started" => vec![VoiceEvent::CallerStartedSpeaking],
         "conversation.item.input_audio_transcription.completed" => {
             match value.get("transcript").and_then(Value::as_str) {
                 Some(transcript) => vec![VoiceEvent::UserTurnEnded {

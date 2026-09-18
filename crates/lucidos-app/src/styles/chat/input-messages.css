@@ -333,25 +333,20 @@
 /* CALL: a third shape, and the only one in this row that is not blue.
  *
  * The two above are modes the reader arms and forgets. A call is neither: it
- * holds the microphone open, it is spending money, and pressing the button
- * again ENDS it. Red is what a hang-up is on every phone ever made, so the
- * on-state says what the next press does rather than only that a mode is on.
+ * holds the microphone open and it is spending money, so it says so for as long
+ * as it runs.
  *
- * Framed, like the WIP toggle, because a call is temporary and wants the box.
- * The hover override IS needed here: `.icon-btn:hover`'s background would
- * otherwise replace the tinted one, which reads as the frame vanishing under
- * the pointer at the exact moment the reader is aiming at it. */
+ * GREEN is a call that is up, the whole way through, which is what every
+ * presence light means. RED is the hang-up. It appears under the POINTER only,
+ * where it is a promise about the press rather than a claim about the call
+ * (ADR 0209). The hover rules sit at the end of the phase group below, so one
+ * promise beats every phase's own paint.
+ *
+ * Framed, like the WIP toggle, because a call is temporary and wants the box. */
 .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"] {
-    color: var(--accent-red);
-    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
     border-radius: 0.375rem;
-}
-
-@media (hover: hover) {
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"]:hover {
-        color: var(--accent-red);
-        background: color-mix(in srgb, var(--accent-red) 25%, transparent);
-    }
 }
 
 /* CALL PHASES. The rule above is the LIVE paint, and it was the only one a
@@ -362,12 +357,14 @@
  * So each phase paints itself, off the `data-call-phase` the toggle carries.
  * Three rules hold across all of them.
  *
- * The BOX never moves. Every phase paints colour, a pseudo-element or a
- * transform, so a floor flip reflows no part of the prompt actions row.
+ * The BOX never moves. Every phase paints colour, opacity or a transform, so a
+ * floor flip reflows no part of the prompt actions row. No phase draws a ring
+ * or any other mark of its own, and that is settled: see ADR 0207 before
+ * proposing one.
  *
  * MOTION is the honest signal for work, and it is never the only one. Each
- * transitional phase is told apart by colour and by shape as well, so the
- * reduced-motion block at the end of this group takes the movement away and
+ * transitional phase rests at a brightness of its own as well as a colour, so
+ * the reduced-motion block at the end of this group takes the movement away and
  * leaves the state legible.
  *
  * The glyph moves, never the button. An animation on the button would take its
@@ -375,30 +372,24 @@
  * the ring fade in and out (the same call as the todo indicator's waiting
  * pulse, chat/todo-list.css). */
 
-/* CONNECTING: arriving, and green, which is the colour a call is placed in on
- * every phone. An arc sweeps the control while the microphone opens and the
- * session comes up, so the wait reads as work. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="connecting"] {
-    color: var(--accent-green);
-    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
-}
-
-/* The sweep, on a ring that clears the glyph. Out of flow, so it costs the row
- * no width and the button no box.
+/* CONNECTING: arriving. It names no colour of its own, because the live paint
+ * above is already the green a call is placed in on every phone. What it adds
+ * is the pulse, so the wait reads as work while the microphone opens and the
+ * session comes up.
  *
- * The stroke stays in px like every border (.claude/rules/frontend-css.md).
- * Nothing derives from it: it is the ring's own line and no calc reads it. */
-.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"]::after {
-    content: '';
-    position: absolute;
-    inset: 0.3125rem;
-    border: 2px solid transparent;
-    border-top-color: currentColor;
-    border-radius: 50%;
+ * A fade with a breath of swell behind it, gentle enough to read as the handset
+ * breathing rather than as a glyph blinking.
+ *
+ * The 0.7 is the RESTING look, which shows whenever the animation is off: the
+ * reduced-motion reader, and the dwelt connect below. It sits here rather than
+ * in the reduced-motion block so the dwelt rule can beat it on source order and
+ * hand the glyph back at full. */
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
+    opacity: 0.7;
     /* Indefinite, so it carries a literal duration and no `--duration-*`
        token: an activity indicator does not ride the animation-speed scale.
        See .claude/rules/frontend-css.md. */
-    animation: call-toggle-sweep 0.9s linear infinite;
+    animation: call-toggle-connect-pulse 1.2s ease-in-out infinite;
 }
 
 /* CONNECTING, DWELT: the connect has run long enough that the browser is
@@ -410,17 +401,16 @@
  * not a caution, and the todo indicator made the same call beside this row
  * (chat/todo-list.css).
  *
- * The sweep stops and the ring closes as a DASHED circle: a line with gaps in
- * it reads as unfinished without moving, which is what tells this from the
- * plain connect once the motion is gone. */
+ * The pulse stops and the glyph comes up to FULL, where the pulsing connect
+ * rests dim. A control at full and holding still is not mid-progress, and that
+ * is what tells this from the plain connect once the motion is gone. */
 .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait] {
     color: var(--accent-notable);
     background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
 }
 
-.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-wait]::after {
-    border-color: currentColor;
-    border-style: dashed;
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-wait] svg {
+    opacity: 1;
     animation: none;
 }
 
@@ -432,7 +422,7 @@
  * live phases apart with the motion taken away. LISTENING adds nothing at all:
  * the caller has the floor, and a control at rest is what says so. */
 .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"] {
-    background: color-mix(in srgb, var(--accent-red) 35%, transparent);
+    background: color-mix(in srgb, var(--accent-green) 35%, transparent);
 }
 
 .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
@@ -441,15 +431,16 @@
 }
 
 /* ENDING: leaving, and the one phase with no press left in it. `ringOff`
- * returns the state unchanged, so the control reads as spent: the red drains
+ * returns the state unchanged, so the control reads as spent: the green drains
  * to the muted grey, the frame fades with it, and the glyph pulses on the
  * app's own waiting keyframes.
  *
- * No ring here, which is what tells it from CONNECTING once the motion is
- * gone. One is being drawn, the other is running down. */
+ * It rests DIMMER than the connect, and the frame all but drains away, which is
+ * what tells the two apart once the motion is gone. One is being placed, the
+ * other is running down. */
 .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"] {
     color: var(--text-muted);
-    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    background: color-mix(in srgb, var(--accent-green) 8%, transparent);
     cursor: default;
 }
 
@@ -458,35 +449,51 @@
     animation: progress-pulse 2s ease-in-out infinite;
 }
 
+/* THE POINTER SAYS WHAT A PRESS DOES, and it says the same thing in every phase
+   a press can end: red, the hang-up colour on every phone ever made. The call
+   itself stays green throughout, so red is never a claim that anything is wrong
+   (ADR 0209).
+
+   This block sits after every phase above, because the tie is settled on
+   source order: a phase's own paint carries the same weight as the shared
+   hover. Declared earlier, the promise would lose to the connect's and the
+   dwell's tones, and it would hold in some phases and not others.
+
+   The hover also has to override `.icon-btn:hover`'s own background. Left to
+   that rule, the tinted frame vanishes under the pointer at the moment the
+   reader is aiming at it. */
 @media (hover: hover) {
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="connecting"]:hover {
-        color: var(--accent-green);
-        background: color-mix(in srgb, var(--accent-green) 25%, transparent);
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"]:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 25%, transparent);
     }
 
-    /* After the connect one above, so the dwelt state keeps its own tone under
-       the pointer instead of taking the green back. */
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait]:hover {
-        color: var(--accent-notable);
-        background: color-mix(in srgb, var(--accent-notable) 25%, transparent);
-    }
-
+    /* Deeper, so the floor still reads under the pointer. */
     .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"]:hover {
-        background: color-mix(in srgb, var(--accent-red) 45%, transparent);
+        background: color-mix(in srgb, var(--accent-red) 40%, transparent);
     }
 
-    /* A dead control brightens under the pointer for nobody. The base hover
-       above would hand it the live red back, which is the one thing this phase
-       must not offer. */
+    /* A dead control brightens under the pointer for nobody, and it must not
+       promise a hang-up it will not perform. So ENDING keeps its resting paint
+       and takes no red at all. */
     .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"]:hover {
         color: var(--text-muted);
-        background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+        background: color-mix(in srgb, var(--accent-green) 8%, transparent);
     }
 }
 
-@keyframes call-toggle-sweep {
-    to {
-        transform: rotate(1turn);
+/* A fade with a breath of swell behind it. The swell is small on purpose: it is
+ * what keeps this from reading as the plain fade ENDING runs, and any more of
+ * it would read as the SPEAKING swell in another colour. */
+@keyframes call-toggle-connect-pulse {
+    0%, 100% {
+        opacity: 0.45;
+        transform: scale(1);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1.06);
     }
 }
 
@@ -500,14 +507,13 @@
     }
 }
 
-/* Still says the same thing, and says it without moving. CONNECTING keeps its
- * ring and closes it, so an arriving call is a green control inside a complete
- * circle. ENDING keeps no ring at all and rests at the dimmed glyph the pulse
- * would have carried it to. SPEAKING keeps its deeper fill, which was never
- * the animation's to give. */
+/* Still says the same thing, and says it without moving. Each phase rests at a
+ * brightness of its own: CONNECTING at the 0.7 its own rule declares, ENDING
+ * dimmer still at the 0.55 its pulse would have carried it to, and the two live
+ * phases at full. SPEAKING keeps its deeper fill, which was never the
+ * animation's to give. */
 @media (prefers-reduced-motion: reduce) {
-    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"]::after {
-        border-color: currentColor;
+    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
         animation: none;
     }
 
@@ -956,6 +962,16 @@
     display: block;
 }
 
+/* THE FEED IS A PLAIN BOX ROUND THE TURNS, and it has no rule of its own on
+   purpose. It exists so the turns can be addressed apart from the mobile chrome
+   sharing their scroller: the last-turn padding rule below selects through it,
+   and the reading position resolves a turn inside it.
+
+   NOTHING MAY ALIGN IT OR FLOOR IT. Below one page of content the turns flow
+   from the top and hold still, and a rest plus a percentage floor is how that
+   was broken (ADR 0212). Pinned by
+   styles/__tests__/a-short-transcript-holds-still.test.ts. */
+
 /* The transcript is a keyboard-focusable scroll region (tabindex=0) so Arrow/Page
    keys scroll it. It never shows a focus outline: a whole-pane ring around the
    entire conversation while arrow-scrolling reads as chrome, not affordance. The
@@ -1374,8 +1390,8 @@ html[data-theme="dark"] .thread-status-question-badge::after {
    to remove, and its margin hand-back would stop netting to zero. The
    WHOLE-TURN marker needs no such yield: its own rule already zeroes the last
    panel's padding-bottom, so the two agree. */
-.thread-content > .chat-exchange:last-child > .initiator-panel:last-child:not(.nav-focus-stuck),
-.thread-content > .chat-exchange:last-child > .response-panel:last-child:not(.nav-focus-stuck) {
+.thread-feed > .chat-exchange:last-child > .initiator-panel:last-child:not(.nav-focus-stuck),
+.thread-feed > .chat-exchange:last-child > .response-panel:last-child:not(.nav-focus-stuck) {
     padding-bottom: 0;
 }
 

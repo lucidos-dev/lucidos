@@ -55,7 +55,16 @@ export interface ScrollAnchor {
  *  positive `relTop`. Answering null there would record the top of a re-seeded
  *  window as "no position", which is not where they were. */
 export function readScrollAnchor(el: HTMLElement): ScrollAnchor | null {
-  const kids = el.children;
+  // THE TURNS, wherever they are parented. The transcript keeps them in a feed
+  // box of its own, which is what rests them on the bottom of the pane
+  // (`.thread-feed` in styles/chat/input-messages.css). The scroller's own
+  // children are then that one box, which carries no id. So the reader's
+  // position went unrecorded, and a reload landed on the window's top.
+  // Every other container that anchors has no feed and is unaffected.
+  //
+  // `top` stays the SCROLLER's, since `relTop` is measured from the scrollport.
+  const feed = typeof el.querySelector === 'function' ? el.querySelector('.thread-feed') : null;
+  const kids = (feed ?? el).children;
   if (!kids || typeof el.getBoundingClientRect !== 'function') return null;
   const top = el.getBoundingClientRect().top;
   const relTopOf = (i: number): number | null => {

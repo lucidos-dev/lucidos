@@ -50,7 +50,9 @@ describe('Empty Continued-below panel is hidden entirely', () => {
     expect(partsSource).toMatch(/interface ResponsePanelProps[\s\S]*?hasBody:\s*boolean/);
     const fnMatch = partsSource.match(/function ResponsePanel\(\{[\s\S]*?\n\}\n/);
     expect(fnMatch, 'ResponsePanel function not found').not.toBeNull();
-    expect(fnMatch![0]).toMatch(/hasBody\s*&&\s*!collapsed[\s\S]*?class="response-body"/);
+    // `folded` and not `collapsed`: a headerless panel keeps no fold, having
+    // dropped the row the collapse control sits in.
+    expect(fnMatch![0]).toMatch(/hasBody\s*&&\s*!folded[\s\S]*?class="response-body"/);
   });
 
   it('ChatExchange passes a real content test to ResponsePanel, not a constant', () => {

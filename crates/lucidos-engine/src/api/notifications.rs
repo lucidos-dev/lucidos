@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::scheduler::notifications::{default_tap, Tap};
+use crate::scheduler::notifications::{default_tap, resolve_thread_tap_id, Tap};
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
 
 /// Body for `POST /api/v1/notifications` — used by the `lucidos notify` CLI
@@ -64,9 +64,16 @@ pub(super) async fn create_notification(
     // decode above already rejected malformed shapes with 400. Omitting it
     // takes the derived default: the source event when this notification names
     // one, the card otherwise.
-    let tap = body
+    let mut tap = body
         .tap
         .unwrap_or_else(|| default_tap(link_thread_id, link_event_id));
+
+    // The one sub-field we DO enforce. The page dereferences it as a thread,
+    // and reports the failure to whoever taps the banner rather than to the
+    // script that wrote it. `None` for the caller: a script has no ambient
+    // thread, so `current` is refused here rather than resolved.
+    resolve_thread_tap_id(&mut tap, None)
+        .map_err(|e| ApiError::bad_request(format!("invalid tap: {e}")))?;
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 

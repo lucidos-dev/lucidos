@@ -181,6 +181,18 @@ Don't enumerate user content. Per `system-knowhow/best-practices.md`:
 - Broken references: missing `knowhow:` ID, missing script path, manifest pointing at a deleted asset.
 - Duplicated content: same knowhow text in two files, same script copied between apps.
 - Patterns the source-of-truth files explicitly mark deprecated — grep for the old form, point at the doc that flags it.
+- **Removed CLI flags and tool args still passed by workspace code.** Some
+  shortcuts were removed after a deprecation window. A recipe still passing one
+  now fails with a rename error instead of running. Grep each removed form across
+  `data/knowhow/**/*.md` fenced code blocks, `data/scripts/**`, each trigger's
+  `scripts/`, and `data/apps/**`, and recommend the replacement. Severity:
+  **broken** (the call errors on next use). Currently removed:
+  - `lucidos spawn-thread --parent` → `--relation child` (a same-workspace
+    parent-with-callback spawn). Do NOT flag `threads list --parent <uuid>` or
+    `threads count --parent <uuid>`, which are current, unrelated filters.
+  - `repo` passed to the `run_coding_agent` tool → `folder` (which also accepts a
+    registered repo name). Do NOT flag the current `lucidos spawn-thread --repo`
+    flag, which is a different, live argument.
 
 ## Output
 
@@ -272,3 +284,5 @@ Each run gets its own timestamped directory. Don't overwrite previous reports �
 ## Maintenance
 
 When a referenced source-of-truth file changes (new SDK call, new convention, deprecation), this audit's checks may go stale. The reverse is also true: a check here that references a section heading or filename will break silently if the upstream renames it. See the `Maintaining workspace-audit` section in the repo's `.claude/rules/system-knowhow.md` for the rule that governs when this file must be updated alongside changes to its sources. `./scripts/check-knowhow-refs.sh` catches the mechanical half of that in `/harden`.
+
+When a deprecated CLI flag or tool arg is fully removed, add it to check 7's "Removed CLI flags and tool args" list. Include its replacement and any live same-named flag to exclude. The source is `docs/temporary-measures.md` § sunset deprecations.

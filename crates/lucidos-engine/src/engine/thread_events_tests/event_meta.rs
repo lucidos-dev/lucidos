@@ -111,10 +111,12 @@ fn indexable_text_returns_content_for_chat_events() {
     assert_eq!(canceled.indexable_text(), Some("partial"));
 }
 
-/// An old row still carries `spoken_secs_before`, which the variant no
-/// longer has. Serde ignores an unknown field by default, and this pins
-/// that: a deny-unknown-fields attribute would make every call written
-/// before ADR 0201 unreadable.
+/// An old row carries `spoken_secs_before`, and its meaning never changed:
+/// how long before the row the talker began those words.
+///
+/// ADR 0201 dropped the field and ADR 0206 restored it, so such a row is read
+/// again rather than ignored. It reads where it was said, as it did when it
+/// was written.
 #[test]
 fn a_reply_row_written_before_adr_0201_still_reads() {
     let legacy = serde_json::json!({
@@ -127,8 +129,13 @@ fn a_reply_row_written_before_adr_0201_still_reads() {
     let event: ThreadEvent =
         serde_json::from_value(legacy).expect("a legacy reply row deserializes");
     match event {
-        ThreadEvent::SpokenReplyGenerated { text, .. } => {
+        ThreadEvent::SpokenReplyGenerated {
+            text,
+            spoken_secs_before,
+            ..
+        } => {
             assert_eq!(text, "I'm on it, give me a sec.");
+            assert_eq!(spoken_secs_before, Some(49.7));
         }
         other => panic!("wrong variant: {:?}", other),
     }

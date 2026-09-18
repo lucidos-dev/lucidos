@@ -17,7 +17,8 @@ import type { ToastItem } from '../../store/types';
  *     than to pre-arm Enter on a footgun. The button stays reachable via Tab.
  *
  *  Pure (no DOM) so the selection is unit-tested; the caller resolves the
- *  returned slot to a real element and focuses it. */
+ *  returned slot to a real element and focuses it. The caller holds DOM gates of
+ *  its own, one of which stands down for a focused text field. */
 export function toastAutofocusTarget(
   t: Pick<ToastItem, 'action' | 'secondaryAction' | 'dismissable' | 'noAutofocus'>,
 ): 'primary' | 'secondary' | 'close' | null {

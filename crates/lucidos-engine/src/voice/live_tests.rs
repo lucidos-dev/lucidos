@@ -229,15 +229,60 @@ fn every_append_names_itself() {
     assert_eq!(frame["event_id"], "lucidos-7");
 }
 
-/// Three kinds, and which one is used decides whether the caller hears it.
+/// The block is what the session KNOWS, so it rides the quiet channel.
+///
+/// Sent as steering it was new orders landing after the session started, and
+/// the talker answered them aloud before the caller had spoken (ADR 0211).
+#[test]
+fn the_resident_block_opens_on_the_quiet_channel() {
+    let frames = opening_appends(&opening().resident_block);
+    assert_eq!(frames.len(), 1, "{:?}", frames);
+    assert_eq!(frames[0]["type"], THINKING);
+    assert!(frames[0]["delegation_id"].is_null(), "{}", frames[0]);
+    assert_eq!(frames[0]["event_id"], "resident-0");
+    assert!(
+        frames[0]["content"]
+            .as_str()
+            .expect("content is a string")
+            .contains("Workspace: dev"),
+        "{}",
+        frames[0]
+    );
+}
+
+/// Every section switched off is a real state, and it opens no append at all.
+#[test]
+fn a_block_with_nothing_in_it_opens_no_append() {
+    for blank in ["", "   ", "\n\n"] {
+        assert!(
+            opening_appends(blank).is_empty(),
+            "{:?} sent a frame",
+            blank
+        );
+    }
+}
+
+/// A block over the cap arrives whole, and every piece names itself so a
+/// refusal can say which one it refused.
+#[test]
+fn a_long_block_opens_as_several_quiet_appends() {
+    let frames = opening_appends(&"alpha bravo ".repeat(400));
+    assert!(frames.len() > 1, "a 4800-char block stayed one append");
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame["type"], THINKING);
+        assert_eq!(frame["event_id"], format!("resident-{}", index));
+    }
+}
+
+/// Two kinds, and which one is used decides whether the caller hears it.
+///
+/// The provider has a third, `session.instructions.append`. This module sends
+/// none, because steering is not what either of the two things it says is
+/// (ADR 0211).
 #[test]
 fn each_append_kind_is_the_one_its_seam_member_promises() {
     assert_eq!(append_frame(COMMENTARY, "e", None, "x")["type"], COMMENTARY);
     assert_eq!(append_frame(THINKING, "e", None, "x")["type"], THINKING);
-    assert_eq!(
-        append_frame(INSTRUCTIONS, "e", None, "x")["type"],
-        INSTRUCTIONS
-    );
 }
 
 /// A note inside the cap is one append, whole and unchanged.

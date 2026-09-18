@@ -43,6 +43,7 @@ function device(): AudioDevice {
     note: null,
     play: () => undefined,
     stopPlayback: () => undefined,
+    playbackGaps: () => ({ count: 0, seconds: 0 }),
     close: () => Promise.resolve(),
   };
 }

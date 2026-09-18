@@ -304,7 +304,7 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
  *  That is what What's New did for every release the updater had not offered.
  *
  *  - `install`: take it here. A Tauri client fronting a bundle.
- *  - `check`: no offer yet, and this session has a check it can run.
+ *  - `check`: no newer release known, and this session has a check it can run.
  *  - `guide`: the answer is on Settings, System, Overview. It carries the
  *    installer command for a headless install, and the rebuild for a source
  *    checkout.
@@ -345,19 +345,27 @@ export function canCheckForUpdatesHere(): boolean {
 
 /** Which route this session takes to a newer release.
  *
- *  `offered` says whether there is an offer to act on. It defaults to the
- *  updater's own answer, and a caller holding an offer already passes `true`.
- *  That matters on the client-check path, where the offer is in hand before the
- *  signals it would be re-derived from have settled.
+ *  `hasNewerRelease` says whether one is KNOWN, which is what decides between
+ *  acting and asking. It defaults to the updater's offer, and a caller holding
+ *  the fact from somewhere else passes `true`. Two do. The client-check path has
+ *  the offer in hand before the signals it would be re-derived from have
+ *  settled. And What's New reads the published changelog, which names releases
+ *  the hourly poll has not reached yet.
+ *
+ *  So `check` is for a surface that does NOT know: Settings, System, whose
+ *  button is a plain maintenance control. A surface that has just told the
+ *  reader a release is newer must not then offer to go and find out.
  *
  *  **A mobile client gets one answer, whatever the state.** It is decided first
  *  because none of the branches below can reach a different one: Lucidos ships
  *  no mobile client, so `isTauri()` is false and `install` is already out. What
  *  it takes away is `check`, whose only outcomes on a phone are "up to date"
  *  and this same sentence. And `guide`, which spends a page load to say it. */
-export function updateRoute(offered: boolean = packagedUpdateVersion() !== null): UpdateRoute {
+export function updateRoute(
+  hasNewerRelease: boolean = packagedUpdateVersion() !== null,
+): UpdateRoute {
   if (thisDeviceIsMobile()) return 'desktop';
-  if (offered) return sessionCanInstall() ? 'install' : 'guide';
+  if (hasNewerRelease) return sessionCanInstall() ? 'install' : 'guide';
   return canCheckForUpdatesHere() ? 'check' : 'guide';
 }
 

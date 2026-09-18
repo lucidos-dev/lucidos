@@ -89,11 +89,12 @@ const COMMENTARY: &str = "session.commentary.append";
 
 /// Quiet state. It reaches the talker and is not spoken on arrival, which is
 /// what the seam's `append_context` promises.
+///
+/// **Also what the resident block rides** (ADR 0211). The provider's third
+/// kind, `session.instructions.append`, is session-level steering, and this
+/// module sends none: the two things it has to say are what the talker knows
+/// and what it should say, which are these two.
 const THINKING: &str = "session.thinking.append";
-
-/// Session-level steering, the one append the provider documents with no
-/// delegation behind it.
-const INSTRUCTIONS: &str = "session.instructions.append";
 
 /// The provider's terminal frame. It carries the session's final usage, so it
 /// arrives while the socket is still open and the reader has to act on it.
@@ -146,18 +147,8 @@ impl VoiceProvider for LiveProvider {
             .await?;
         await_session_started(&mut reader).await?;
 
-        // The resident block is the dynamic half, and it lands beside the
-        // persona rather than inside it (the parent plan's decision 16).
-        //
-        // A workspace can turn every section off, and then there is nothing to
-        // append. An empty one would be a frame the provider has to refuse.
-        for (index, chunk) in appendable(&opening.resident_block).iter().enumerate() {
-            let id = format!("resident-{}", index);
-            writer
-                .send(Message::Text(
-                    append_frame(INSTRUCTIONS, &id, None, chunk).to_string(),
-                ))
-                .await?;
+        for frame in opening_appends(&opening.resident_block) {
+            writer.send(Message::Text(frame.to_string())).await?;
         }
 
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
@@ -369,6 +360,30 @@ pub fn session_start(model: &str, opening: &SessionOpening) -> Value {
 /// [`DELEGATION_POLICY`]).
 fn instructions_for_a_tool_less_talker(instructions: &str) -> String {
     format!("{}\n\n{}", instructions, DELEGATION_POLICY)
+}
+
+/// The frames a session opens its resident block with, in order.
+///
+/// The block is the dynamic half, and it lands beside the persona rather than
+/// inside it (the parent plan's decision 16).
+///
+/// **Quiet, never steering, and the two are not interchangeable here** (ADR
+/// 0211). The block is what this session KNOWS, which is the one thing
+/// [`THINKING`] means. On the steering kind it read as new orders arriving
+/// after the session started, ending in a line of somebody else's
+/// conversation. The talker answered that line aloud, to a caller who had not
+/// spoken yet.
+///
+/// A workspace can turn every section off, and then there is nothing to send.
+/// An empty append would be a frame the provider has to refuse.
+///
+/// Pure, so the kind is a test rather than something only a live socket shows.
+pub fn opening_appends(resident_block: &str) -> Vec<Value> {
+    appendable(resident_block)
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| append_frame(THINKING, &format!("resident-{}", index), None, chunk))
+        .collect()
 }
 
 /// One append, of whichever kind the caller named.

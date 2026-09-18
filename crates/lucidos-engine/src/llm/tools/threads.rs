@@ -121,12 +121,6 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "What to edit, which also picks the spawn kind: `data/apps/<id>`, or a registered repository name or UUID from `manage_repositories`. Omit to edit Lucidos source, which works only on an install launched from a Lucidos source checkout; otherwise a `folder`-less call is refused unless it carries `workspace`."
                     },
-                    // Temporary measure — registered in docs/temporary-measures.md
-                    // § "`repo` → `folder` deprecated alias on `run_coding_agent`".
-                    "repo": {
-                        "type": "string",
-                        "description": "DEPRECATED alias of `folder`; both is an error"
-                    },
                     "workspace": {
                         "type": "string",
                         "description": "Target workspace basename. Omit for this one. Another needs `relation=\"top\"` and resolves `folder` there."

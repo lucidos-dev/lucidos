@@ -115,6 +115,11 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                     "type": "integer",
                     "description": "Last line of the range, inclusive. Omit to highlight only 'line'. 'file' only."
                 },
+                // A thread's id takes the `current` alias or a uuid, and the
+                // handler refuses anything else. The refusal is what says so,
+                // not this description, which the always-loaded budget bills on
+                // every request. See
+                // docs/plans/2026-09-18-notification-tap-thread-id-is-a-uuid.md
                 "id": {
                     "type": "string",
                     "description": "Required when target is 'thread' or 'trigger'."

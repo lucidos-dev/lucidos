@@ -16,10 +16,14 @@ import {
   underFingerReason,
   distanceOutside,
   nearestFaceMiss,
+  missVector,
   screenOffset,
   bounceHeight,
   morphStateOf,
   faceName,
+  rescueStandDown,
+  clickClaimedPress,
+  shouldNudgeUntouched,
   type FaceHitTestFacts,
   type LandingFacts,
   type ProbeViewport,
@@ -377,9 +381,9 @@ describe('nearestFaceMiss: how far the finger fell outside a face', () => {
 
   it('picks the face the finger came closest to', () => {
     expect(nearestFaceMiss([DIFF, SEND], { x: 382, y: 420 }))
-      .toEqual({ face: SEND, px: 8 });
+      .toEqual({ face: SEND, px: 8, dx: 8, dy: 0 });
     expect(nearestFaceMiss([DIFF, SEND], { x: 320, y: 420 }))
-      .toEqual({ face: DIFF, px: 10 });
+      .toEqual({ face: DIFF, px: 10, dx: 10, dy: 0 });
   });
 
   // The caller's own entry comes back, not a copy of its name, because the
@@ -660,5 +664,137 @@ describe('the probe consumes no gesture', () => {
     // dismissed. Unlatched, a wedged row buries the screen in copies.
     expect(code).toMatch(/reportedUnreachable\.has\(name\)\) continue/);
     expect(code).toMatch(/reportedUnreachable\.delete\(name\)/);
+  });
+});
+
+describe('the rescue rules a dropped press in one place', () => {
+  // Three bounds used to sit at three sites, and two of them refused in
+  // silence. The whole engine ledger holds no rescue, so the reading that
+  // would say which bound refused never existed.
+  const dead = { movedPx: 0, claimed: false, covered: false, hasCommitFace: true };
+
+  it('runs a stationary press that reached nothing, with a live face', () => {
+    // Note what is NOT an input here: where in the row the finger landed. The
+    // reporter refused a bound on it, and the composer takes no tap anywhere
+    // during an episode.
+    expect(rescueStandDown(dead)).toBeNull();
+  });
+
+  it('refuses a gesture the platform took', () => {
+    expect(rescueStandDown({ ...dead, movedPx: 9 })).toBe('traveled');
+  });
+
+  it('refuses a press something else claimed', () => {
+    expect(rescueStandDown({ ...dead, claimed: true })).toBe('claimed');
+  });
+
+  it('refuses one under a cover the app raised', () => {
+    expect(rescueStandDown({ ...dead, covered: true })).toBe('covered');
+  });
+
+  it('has nothing to run without a commit face, which is most taps', () => {
+    expect(rescueStandDown({ ...dead, hasCommitFace: false })).toBe('no-face');
+  });
+
+  it('names travel first, since the platform settles it hardest', () => {
+    expect(rescueStandDown({ movedPx: 9, claimed: true, covered: true, hasCommitFace: false }))
+      .toBe('traveled');
+  });
+});
+
+describe('a click stands the rescue down only if something could take it', () => {
+  it('ignores the dead press\u2019s own twin, which lands on the row', () => {
+    // The fourteenth episode turns on this. A tap on the row dispatches a
+    // click on the row, and reading that as an answer killed every rescue.
+    expect(clickClaimedPress({ onButton: false, inRow: true })).toBe(false);
+  });
+
+  it('stands down for a click a button took', () => {
+    expect(clickClaimedPress({ onButton: true, inRow: true })).toBe(true);
+  });
+
+  it('stands down for a click that landed outside the row', () => {
+    expect(clickClaimedPress({ onButton: false, inRow: false })).toBe(true);
+  });
+});
+
+describe('missVector: the signed miss, which a scalar cannot express', () => {
+  // The one extra reading round 14 asked for. `screenOff` reads {0,0} on every
+  // ledger line, healthy or dead. So nothing else separates a finger that
+  // landed off a face from a page hit-testing at an offset.
+  const RECT = { left: 289, right: 357, top: 807, bottom: 832 };
+
+  it('is zero on both axes inside the face', () => {
+    expect(missVector(RECT, { x: 321, y: 819 })).toEqual({ dx: 0, dy: 0 });
+  });
+
+  it('signs a press ABOVE the face negative, as the caught one was', () => {
+    expect(missVector(RECT, { x: 321, y: 798 })).toEqual({ dx: 0, dy: -9 });
+  });
+
+  it('signs a press below the face positive', () => {
+    expect(missVector(RECT, { x: 321, y: 841 })).toEqual({ dx: 0, dy: 9 });
+  });
+
+  it('signs the horizontal axis the same way, and both at once', () => {
+    expect(missVector(RECT, { x: 280, y: 798 })).toEqual({ dx: -9, dy: -9 });
+    expect(missVector(RECT, { x: 366, y: 841 })).toEqual({ dx: 9, dy: 9 });
+  });
+
+  it('agrees with the scalar distance it replaced', () => {
+    expect(distanceOutside(RECT, { x: 321, y: 798 })).toBe(9);
+    expect(distanceOutside(RECT, { x: 280, y: 798 })).toBe(13);
+  });
+});
+
+describe('nearestFaceMiss carries the vector to the face it names', () => {
+  it('reports the signed miss beside the distance', () => {
+    const face = { name: 'Submit answer', rect: { left: 289, right: 357, top: 807, bottom: 832 } };
+    expect(nearestFaceMiss([face], { x: 321, y: 798 }))
+      .toEqual({ face, px: 9, dx: 0, dy: -9 });
+  });
+});
+
+describe('shouldNudgeUntouched: the recovery with no gesture behind it', () => {
+  // The fourteenth PWA episode took no touch and no click for 18.5 seconds.
+  // Both of ADR 0183's answers wait to be touched, so this is the one state
+  // neither can reach. Typing is what arms it instead.
+  const waiting = {
+    hasCommitFace: true,
+    typedSinceLastInput: true,
+    msSinceKeystroke: 4000,
+  };
+
+  it('runs for a typed draft the page has taken no touch since', () => {
+    expect(shouldNudgeUntouched(waiting)).toBe(true);
+  });
+
+  it('stays out of a healthy send, where the tap follows the typing at once', () => {
+    expect(shouldNudgeUntouched({ ...waiting, msSinceKeystroke: 800 })).toBe(false);
+  });
+
+  it('has nothing to protect with no commit face in the row', () => {
+    expect(shouldNudgeUntouched({ ...waiting, hasCommitFace: false })).toBe(false);
+  });
+
+  it('stands down once a touch did reach the page after the typing', () => {
+    expect(shouldNudgeUntouched({ ...waiting, typedSinceLastInput: false })).toBe(false);
+  });
+
+  it('never fires before the user has typed at all', () => {
+    // `msSinceKeystroke` is 0 with no keystroke on record, which the elapsed
+    // gate already refuses. Both gates say no, and neither alone should.
+    expect(shouldNudgeUntouched({
+      ...waiting, typedSinceLastInput: false, msSinceKeystroke: 0,
+    })).toBe(false);
+  });
+
+  it('stops once the user has plainly put the phone down', () => {
+    // A COUNT cannot bound this, and the wedge is why: it delivers no touch and
+    // no click, so nothing it allows would ever reset one. A user re-reading a
+    // draft would spend the budget before the first tap.
+    expect(shouldNudgeUntouched({ ...waiting, msSinceKeystroke: 59_000 })).toBe(true);
+    expect(shouldNudgeUntouched({ ...waiting, msSinceKeystroke: 61_000 })).toBe(false);
+    expect(shouldNudgeUntouched({ ...waiting, msSinceKeystroke: 600_000 })).toBe(false);
   });
 });

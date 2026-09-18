@@ -1808,6 +1808,10 @@ export type ThreadEvent =
        *  doer's own answer is in the thread in full either way.
        *  Full reasoning is on the Rust variant. */
       interrupted: boolean;
+      /** How long the talker had been saying these words when the row was
+       *  written, so the transcript can read the row where they BEGAN.
+       *  Full reasoning is on the Rust variant. */
+      spoken_secs_before?: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

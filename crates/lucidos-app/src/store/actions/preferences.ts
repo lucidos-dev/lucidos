@@ -1389,7 +1389,7 @@ export const VOICE_RESIDENT_SECTIONS: readonly {
   onByDefault: boolean;
 }[] = [
   { id: 'who-and-where', title: 'Who you are talking to, and when', onByDefault: true },
-  { id: 'this-thread', title: 'This conversation so far', onByDefault: true },
+  { id: 'this-thread', title: 'This conversation', onByDefault: true },
   { id: 'workspace-shape', title: 'What this workspace has', onByDefault: true },
 ];
 

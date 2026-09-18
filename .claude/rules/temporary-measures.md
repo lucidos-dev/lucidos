@@ -38,6 +38,9 @@ never on its own evidence that a crutch is removable.
   it's removable and why.
 - **State a concrete removal condition.** Exactly what has to be true to drop it,
   and how to verify that is safe. "Eventually" is not a condition.
+- **The condition must be checkable, never a scan of user data.** Verify it from
+  the tree, a release counter, or a per-workspace audit. A fleet-wide "nobody
+  uses it" is a negative over private data that never resolves.
 - **Don't reach for a measure first.** Prefer making the right thing discoverable
   (docs, prompt, types). Only add a crutch when guidance has already failed, and
   say so in the entry.

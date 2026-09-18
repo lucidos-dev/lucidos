@@ -71,7 +71,7 @@ function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[
       // Cloned, never mutated: the fold's result is memoized, and splicing
       // into its array would make the live row permanent.
       const steps = [...out[at].steps];
-      steps.splice(callRowIndex(steps, instantMicros(userEvent._displayCreated)), 0, {
+      steps.splice(callRowIndex(steps, happenedAt(userEvent)), 0, {
         seq,
         event: userEvent,
       });
@@ -87,15 +87,40 @@ function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[
 }
 
 /**
- * Where a call row belongs among an exchange's steps, given its own `created`.
+ * When a row HAPPENED, which for speech is when the words began.
+ *
+ * `created` is when a row was written. For a step that is the same instant,
+ * and for a spoken reply it is when the talker STOPPED. Those words covered a
+ * stretch of time and the reader heard them start. So the row carries how long
+ * it had been speaking, and this subtracts it (ADR 0206).
+ *
+ * A LIVE row has no `created` at all, nothing having written it down. Its
+ * `_displayCreated` is the moment the bridge drew it, which answers the same
+ * question on the browser's clock.
+ *
+ * `null` for a row with no timestamp to read, which no caller may order.
+ */
+function happenedAt(event: StoredEvent): number | null {
+  const landed = instantMicros(event.created ?? event._displayCreated);
+  const secs = event.type === 'SpokenReplyGenerated' ? event.spoken_secs_before : undefined;
+  if (landed === null || secs === undefined) return landed;
+  return landed - secs * 1_000_000;
+}
+
+/**
+ * Where a call row belongs among an exchange's steps.
  *
  * The row goes to the BOTTOM exchange rather than to `current`, so that
  * exchange can already hold steps stamped after the words (ADR 0201). This
  * walks to the first step that followed them.
  *
- * The END for a row with no stamp, and a step with no `created` is stepped
- * over rather than compared. A session mark was never said, and a legacy row
- * cannot say when it was, so both keep the placement they have always had.
+ * **Every step is read by `happenedAt` too**, the rule the row itself is
+ * placed by. A spoken row already filed is then not a wall at its own write
+ * time.
+ *
+ * The END for a row with no stamp, and a step with none is stepped over rather
+ * than compared. A session mark was never said, and a legacy row cannot say
+ * when it was, so both keep the placement they have always had.
  *
  * **Never INSIDE a run of streamed text**, which the renderer merges only
  * while adjacent: a row dropped mid-run cuts one answer in two.
@@ -104,13 +129,49 @@ function callRowIndex(steps: SequencedEvent[], saidAt: number | null): number {
   if (saidAt === null) return steps.length;
   let at = steps.length;
   for (let i = 0; i < steps.length; i++) {
-    const landed = instantMicros(steps[i].event.created);
+    const landed = happenedAt(steps[i].event);
     if (landed !== null && landed > saidAt) {
       at = i;
       break;
     }
   }
   return runStartBefore(steps, at, steps[at]?.event);
+}
+
+/** The spoken row a new one continues, or undefined. `at` is where the new row
+ *  would otherwise land.
+ *
+ *  Normally the row directly above it. Anything between two fragments means
+ *  the reader met something in between, so they are two things said.
+ *
+ *  **Unless it landed while the first one was still being said.** A spoken row
+ *  covers a stretch of time (ADR 0206), so a step stamped inside it separated
+ *  nothing: the talker never stopped. Splitting there draws one sentence as
+ *  two bubbles around a step. It also splits the live bubble in two as the
+ *  rows land, which is the jump this all exists to end.
+ *
+ *  The walk stops at the first spoken row either way, and only a call row pays
+ *  for it. */
+function spokenRowToGrow(
+  steps: SequencedEvent[],
+  at: number,
+): SequencedEvent | undefined {
+  const between: SequencedEvent[] = [];
+  for (let i = at - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (step.event.type !== 'SpokenReplyGenerated') {
+      between.push(step);
+      continue;
+    }
+    const stopped = instantMicros(step.event.created);
+    return between.every(other => {
+      const landed = happenedAt(other.event);
+      return stopped !== null && landed !== null && landed <= stopped;
+    })
+      ? step
+      : undefined;
+  }
+  return undefined;
 }
 
 /** Back out to the start of a run of streamed text, when the row would land
@@ -778,6 +839,10 @@ export function toolUseIdOf(event: { type: string }): string | undefined {
  *  the two readers split it differently. The shared fixture cannot see that:
  *  it pins the rule, and this is the caller.
  *
+ *  **The AGE grows to span both**, so the merged row still reads where the
+ *  first fragment began (ADR 0206). `created` moved, so an age left alone
+ *  would slide the bubble down as its own tail arrived.
+ *
  *  Adjacency is the caller's job too: anything between two fragments means
  *  they are two things said. */
 function grownSpokenRow(prev: StoredEvent, next: StoredEvent): StoredEvent | null {
@@ -793,10 +858,19 @@ function grownSpokenRow(prev: StoredEvent, next: StoredEvent): StoredEvent | nul
   const text = joinSpoken((prev as { text?: string }).text ?? '', (next as { text?: string }).text ?? '');
   // `interrupted` describes how the row ENDED, so the newest piece owns it.
   const interrupted = (next as { interrupted?: boolean }).interrupted;
+  // Measured from where the merged row now reads back to where the first
+  // fragment began. A fragment with no age of its own began at its `created`,
+  // so the sum holds whether either piece carries one. Only a reply wears the
+  // field: the caller's row is a boundary, ordered by `created` alone.
+  const began = happenedAt(prev) ?? from;
+  const age = prev.type === 'SpokenReplyGenerated'
+    ? { spoken_secs_before: (to - began) / 1_000_000 }
+    : {};
   return {
     ...prev,
     text,
     created: next.created,
+    ...age,
     ...(interrupted === undefined ? {} : { interrupted }),
   } as StoredEvent;
 }
@@ -1057,6 +1131,34 @@ export const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
   'VoiceSessionEnded',
   'WorkDelegated',
 ]);
+
+/** Steps a call leaves in an exchange that draw no row at all.
+ *
+ *  `VOICE_ONLY_STEP_TYPES` without the spoken reply, and that gap is the
+ *  point. A reply is what the reader sees, so it separates the words either
+ *  side of it. The rest is the talker's own bookkeeping.
+ *
+ *  An explicit list, not a clever predicate. Nothing in an event's shape says
+ *  whether the renderer draws it, so it is stated per type. The same choice
+ *  `UNANCHORABLE_ASYNC_EVENTS` makes below. */
+const DRAWS_NO_ROW: ReadonlySet<string> = new Set([
+  'VoiceSessionStarted',
+  'VoiceSessionEnded',
+  'WorkDelegated',
+]);
+
+/** Did the reader meet anything inside this exchange?
+ *
+ *  Asked of the bubble a new spoken fragment might grow. The transcriber cuts
+ *  a sentence wherever the speaker breathes, and the talker files its own
+ *  bookkeeping in that gap. A delegation lands within milliseconds of the
+ *  words that prompted it.
+ *
+ *  Reading that marker as a separator cut one sentence into two bubbles under
+ *  two headers. Only what the reader SAW may split them. */
+function readerMetNothing(exchange: Exchange): boolean {
+  return exchange.steps.every(({ event }) => DRAWS_NO_ROW.has(event.type));
+}
 
 /** Events that merely LANDED in a turn rather than being produced by it, and
  *  that render nothing of their own.
@@ -1743,14 +1845,16 @@ function foldEvent(
       // transcriber cut it into. A fragment continuing the row right above
       // grows it rather than opening a second bubble under a second header.
       //
-      // Only a STEPLESS one, and only the LAST one. Anything landing between
-      // two fragments means the caller said two things, and the reader met
-      // something in between.
+      // Only the LAST one, and only while the reader has met nothing in it.
+      // Something they SAW between two fragments means the caller said two
+      // things. The talker's own bookkeeping is not that, and reading it as a
+      // separator is what split a sentence around a delegation marker nobody
+      // could see.
       const openUtterance = exchanges[exchanges.length - 1];
       if (
         event.type === 'SpokenMessageReceived'
         && openUtterance
-        && openUtterance.steps.length === 0
+        && readerMetNothing(openUtterance)
       ) {
         const grown = grownSpokenRow(openUtterance.userEvent, event);
         if (grown) {
@@ -1948,16 +2052,14 @@ function foldEvent(
       // that: a reply took the boundary above, and a mark draws nothing, so
       // there is nothing to lose and nowhere to lose it from.
       if (callTarget) {
-        // Filed by the clock, like every other row. The target is the BOTTOM
-        // exchange rather than `current`, so it may already hold steps stamped
-        // after these words.
-        const at = callRowIndex(callTarget.steps, instantMicros(event.created));
-        // The row right above is the only one this can continue: anything
-        // between two fragments means the talker said two things.
-        const above = at > 0 ? callTarget.steps[at - 1] : undefined;
+        // Filed by the clock, like every other row, and a reply's clock is
+        // when its words BEGAN. The target is the BOTTOM exchange rather than
+        // `current`, so it may already hold steps stamped after them.
+        const at = callRowIndex(callTarget.steps, happenedAt(event));
+        const above = spokenRowToGrow(callTarget.steps, at);
         const grown = above ? grownSpokenRow(above.event, event) : null;
         if (above && grown) {
-          callTarget.steps[at - 1] = { seq: above.seq, event: grown };
+          above.event = grown;
         } else {
           callTarget.steps.splice(at, 0, { seq, event });
         }

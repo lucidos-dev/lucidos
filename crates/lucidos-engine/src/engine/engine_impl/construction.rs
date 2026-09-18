@@ -1324,6 +1324,7 @@ impl LucidosEngine {
             presence_tracker: crate::api::presence_pong::PresenceTracker::new(),
             sse_connections: crate::api::sse_connections::SseConnectionCounter::new(),
             voice_sessions: crate::voice::registry::LiveVoiceSessions::new(),
+            threads_being_named: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pool,
             proxy_token_cache: Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
             wasm_engine,

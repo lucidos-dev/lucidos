@@ -34,3 +34,23 @@ export function said(seq: number, text: string, session = 'sess-1'): readonly [n
   return ev(seq, { type: 'SpokenReplyGenerated', session_id: session, text, interrupted: false });
 }
 
+/** The same, said over `secs` seconds and written down as the words stopped.
+ *
+ *  The row lands at `seq`, so the talker began at `seq - secs`, which is where
+ *  the transcript reads it (ADR 0206). A row from `said` carries no age and
+ *  reads at its own stamp. */
+export function saidOver(
+  seq: number,
+  secs: number,
+  text: string,
+  session = 'sess-1',
+): readonly [number, StoredEvent] {
+  return ev(seq, {
+    type: 'SpokenReplyGenerated',
+    session_id: session,
+    text,
+    interrupted: false,
+    spoken_secs_before: secs,
+  });
+}
+

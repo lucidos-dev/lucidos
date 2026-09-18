@@ -1347,29 +1347,104 @@ async fn the_first_message_is_the_earliest_of_either_kind() {
     teardown_test_db(&db).await;
 }
 
-/// Who owns a thread's title. A delegated call ran a turn, so the chat path
-/// titles it; one the talker answered alone ran none.
+/// What a call is named from: both voices, in the order they were said.
+///
+/// The talker's replies are half the conversation, and often the half naming
+/// the thing. Read the caller's side alone and "Yeah, please check" is the
+/// whole input, which is how a 17-utterance call became "Request Verification
+/// and Check".
 #[tokio::test]
-async fn only_a_thread_that_ran_a_turn_reads_as_the_chat_paths() {
+async fn a_calls_exchange_reads_back_both_voices_in_order() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    insert_thread(&pool, thread_id, "").await;
+    insert_message(&pool, thread_id, "SpokenMessageReceived", "what's going on").await;
+    insert_message(
+        &pool,
+        thread_id,
+        "SpokenReplyGenerated",
+        "watching the tab-icon fix",
+    )
+    .await;
+    insert_message(
+        &pool,
+        thread_id,
+        "SpokenMessageReceived",
+        "yeah, please check",
+    )
+    .await;
+    // The typed lane is a different conversation and stays out of this one.
+    insert_message(&pool, thread_id, "MessageReceived", "typed, not spoken").await;
 
-    let spoken_only = Uuid::new_v4();
-    insert_thread(&pool, spoken_only, "").await;
-    insert_message(&pool, spoken_only, "SpokenMessageReceived", "what's up").await;
-    assert!(!store
-        .thread_has_message_received(spoken_only)
+    let exchange = store
+        .get_thread_spoken_exchange(thread_id, 40)
         .await
-        .expect("read the spoken-only thread"));
+        .expect("read the exchange");
 
-    let delegated = Uuid::new_v4();
-    insert_thread(&pool, delegated, "").await;
-    insert_message(&pool, delegated, "SpokenMessageReceived", "what's up").await;
-    insert_message(&pool, delegated, "MessageReceived", "what's up").await;
+    assert_eq!(
+        exchange
+            .iter()
+            .map(|t| (t.from_caller, t.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, "what's going on"),
+            (false, "watching the tab-icon fix"),
+            (true, "yeah, please check"),
+        ]
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The cap takes the OPENING of a call, never its tail.
+///
+/// A call is named by what it is about, and that is established early. Taking
+/// the newest rows instead would name a long call by wherever it drifted to.
+#[tokio::test]
+async fn a_long_call_is_read_from_its_opening() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    insert_thread(&pool, thread_id, "").await;
+    for n in 0..5 {
+        insert_message(
+            &pool,
+            thread_id,
+            "SpokenMessageReceived",
+            &format!("utterance {}", n),
+        )
+        .await;
+    }
+
+    let exchange = store
+        .get_thread_spoken_exchange(thread_id, 2)
+        .await
+        .expect("read the exchange");
+
+    assert_eq!(
+        exchange.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+        vec!["utterance 0", "utterance 1"]
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// A thread nobody spoke on has no exchange, which is what tells the chat
+/// titler the thread is still its own.
+#[tokio::test]
+async fn a_typed_thread_has_no_exchange() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    insert_thread(&pool, thread_id, "").await;
+    insert_message(&pool, thread_id, "MessageReceived", "fix the auth bug").await;
+
     assert!(store
-        .thread_has_message_received(delegated)
+        .get_thread_spoken_exchange(thread_id, 40)
         .await
-        .expect("read the delegated thread"));
+        .expect("read the exchange")
+        .is_empty());
 
     teardown_test_db(&db).await;
 }

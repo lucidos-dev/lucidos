@@ -66,12 +66,12 @@ describe('a turn is collapsible only while its body draws something', () => {
 });
 
 /**
- * **A change turn and a user message carry no fold.**
+ * **A chipless turn carries no fold.**
  *
- * Both were dropped on request, and for the same reason. A change turn's body
- * is a summary, a description and a file list. A user message is the reader's
- * own text, already as short as they made it. The control cost a row of chrome
- * on every one of them to fold a few lines.
+ * Three of them, all dropped on request. A change turn's body is a summary, a
+ * description and a file list. A user message is the reader's own text, already
+ * as short as they made it. A speech-only turn is a sentence somebody said. The
+ * control cost a row of chrome on every one of them to fold a few lines.
  *
  * What keeps a fold is an initiator turn whose body can run long and is not
  * yours: a forwarded agent message, a question, a permission prompt.
@@ -79,14 +79,19 @@ describe('a turn is collapsible only while its body draws something', () => {
  * The same expression also decides `isInitiatorCollapsed`, so a turn a reader
  * folded before this cannot render as a stuck `⋯` stub.
  */
-describe('the initiator fold skips a change turn and a user message', () => {
-  it('gates it on both predicates, beside the body test', () => {
+describe('the initiator fold skips every chipless turn', () => {
+  it('gates it on the chip test, beside the body test', () => {
+    // One name for the three, so a fourth chipless turn cannot gain a fold
+    // whose control has no chip to sit beside.
     expect(source).toMatch(
-      /const canCollapseInitiator = !isChangePanel && !isUserMessageBubble\s*\n?\s*&& \(!!initiator\.summary \|\| !!initiator\.details\)/,
+      /const canCollapseInitiator = !isChromeless\s*\n?\s*&& \(!!initiator\.summary \|\| !!initiator\.details\)/,
+    );
+    expect(source).toMatch(
+      /const isChromeless = isUserMessageBubble \|\| isChangePanel \|\| isSpeechOnly/,
     );
   });
 
-  for (const predicate of ['isChangePanel', 'isUserMessageBubble']) {
+  for (const predicate of ['isChangePanel', 'isUserMessageBubble', 'isSpeechOnly', 'isChromeless']) {
     it(`reads ${predicate} from above, so the gate cannot see it undefined`, () => {
       // Each is a `const`, so using one a line early is a temporal dead zone
       // throw rather than a quiet `undefined`. Order is the whole guard.

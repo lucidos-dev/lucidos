@@ -32,7 +32,12 @@ pub fn get_notification_tool() -> ToolDefinition {
                 },
                 "tap": {
                     "type": "object",
-                    "description": "Where a tap lands. Omitted: the `event_id` you passed, else the inbox card. `{\"kind\":\"modal\"}` forces the card. `{\"kind\":\"navigate\",\"to\":{…}}` takes the same router args `navigate_ui` does, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`. An app tap takes `fragment`, landing on the one item the notification is about."
+                    // The thread id clause is terse because the always-loaded
+                    // budget bills it on every request. It earns its 12 chars:
+                    // a model that guesses `current` here writes a dead deep
+                    // link to a phone. See
+                    // docs/plans/2026-09-18-notification-tap-thread-id-is-a-uuid.md
+                    "description": "Where a tap lands. Omitted: the `event_id` you passed, else the inbox card. `{\"kind\":\"modal\"}` forces the card. `{\"kind\":\"navigate\",\"to\":{…}}` takes the same router args `navigate_ui` does, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"current\"}}`, or a uuid. An app tap takes `fragment`, landing on the one item the notification is about."
                 },
                 "event_id": {
                     "type": "string",

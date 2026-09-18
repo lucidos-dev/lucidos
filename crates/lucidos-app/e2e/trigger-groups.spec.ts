@@ -12,10 +12,13 @@ import {
  *  - Deletion: an EMPTY group's delete button is enabled; clicking it +
  *    confirming removes the section.
  *  - The full lifecycle additionally pins the member-count guard: a group with
- *    a member trigger shows "(1)" and its delete button is DISABLED, and only
- *    becomes deletable once the trigger is removed. That guard is the server's
- *    409-on-non-empty rule surfaced in the UI, so it's the most important thing
- *    to keep regression-tested. */
+ *    a member trigger shows "(1)" and its delete button stays LIVE with a
+ *    "Move triggers out first" tooltip (ADR 0168: a disabled .icon-btn gets
+ *    pointer-events:none and could not show the tooltip stating the block).
+ *    Using it is refused by the server and reported as a toast; the group stays
+ *    and becomes deletable only once the trigger is removed. That guard is the
+ *    server's 409-on-non-empty rule surfaced in the UI, so it's the most
+ *    important thing to keep regression-tested. */
 
 // Every name this spec creates starts with this prefix so afterEach can find
 // and remove them — the e2e DB resets only between Playwright projects, not
@@ -143,13 +146,27 @@ test.describe('Trigger groups — create / delete', () => {
     await pickDropdownOption(page, '.trigger-group-select', groupB);
     await form.locator('.btn-save').click();
 
-    // The trigger lands under group B, the badge flips to (1), and (the guard)
-    // delete is now DISABLED (the panel mirrors the server's non-empty refusal).
+    // The trigger lands under group B and the badge flips to (1). Per ADR 0168
+    // the delete stays LIVE with a "why" tooltip. A disabled .icon-btn gets
+    // pointer-events:none, so it could not show the tooltip stating the block.
+    // The guard is the server's refusal, surfaced as a toast.
     const sectionB = groupSection(page, groupB);
     await expect(sectionB.locator('.trigger-row .list-row-name', { hasText: triggerName }))
       .toBeVisible({ timeout: 10_000 });
     await expect(sectionB.locator('.trigger-group-count')).toHaveText('(1)', { timeout: 10_000 });
-    await expect(sectionB.locator('.trigger-group-delete')).toBeDisabled();
+    const deleteWhileFull = sectionB.locator('.trigger-group-delete');
+    await expect(deleteWhileFull).toBeEnabled();
+    await expect(deleteWhileFull).toHaveAttribute('data-tooltip', 'Move triggers out first');
+
+    // Using it on a non-empty group is refused by the server and reported as a
+    // toast; the group survives with its member. This is the member-count guard.
+    await clearToasts(page);
+    await deleteWhileFull.click();
+    await confirmDialog(page);
+    await expect(page.locator('.toast', { hasText: 'Move or delete the 1 trigger' }))
+      .toBeVisible({ timeout: 10_000 });
+    await expect(sectionB).toHaveCount(1);
+    await expect(sectionB.locator('.trigger-group-count')).toHaveText('(1)');
 
     // 4. Empty the group by deleting its member trigger.
     await clearToasts(page);

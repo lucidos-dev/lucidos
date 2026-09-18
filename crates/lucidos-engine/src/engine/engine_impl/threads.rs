@@ -10,6 +10,25 @@ use crate::engine::chat::PreEmittedOrigin;
 /// cannot drift from the value.
 const STUCK_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A thread's naming slot, held while its name is being generated.
+///
+/// A guard rather than a `remove` at the end of the task, for the reason
+/// `VoiceSessionSlot` is one: a task that panicked mid-name would otherwise
+/// hold the slot for the life of the process, and that thread could never be
+/// named again.
+pub(crate) struct NamingSlot {
+    being_named: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    thread_id: uuid::Uuid,
+}
+
+impl Drop for NamingSlot {
+    fn drop(&mut self) {
+        if let Ok(mut naming) = self.being_named.lock() {
+            naming.remove(&self.thread_id);
+        }
+    }
+}
+
 impl LucidosEngine {
     /// Get a reference to the embedder for sharing with read-only handlers
     pub fn embedder(&self) -> &Arc<crate::memory::EmbedderSlot> {
@@ -506,6 +525,106 @@ impl LucidosEngine {
         // closing the inject gate, THEN sweep anything already buffered.
         drop(guard);
         Self::drain_orphaned_injections(injection_rx)
+    }
+
+    /// How many spoken turns a call's name is built from.
+    ///
+    /// A bound rather than a budget. The rendered exchange is truncated by
+    /// characters after this, like every other title input.
+    const SPOKEN_TURNS_FOR_A_NAME: i64 = 40;
+
+    /// Name a thread from the call on it, unless something already named it.
+    ///
+    /// The one entry point for every site that names a call. Three ask, and
+    /// they differ only in WHEN. The call loop asks on the first caller
+    /// utterance that followed a reply. `api::voice` asks again once the call
+    /// is over, and a delegated turn asks through `maybe_emit_titles`. What a
+    /// call is named from is decided here, so the three cannot drift.
+    ///
+    /// **Returns whether this path owns the thread's naming**, which is the
+    /// other question its callers have. A thread with no call to name is
+    /// handed back, and the chat titler names it from what it does have.
+    ///
+    /// **A call nothing answered is not named here.** One utterance with no
+    /// reply is not a conversation, and the model names it anyway: " So, yeah,
+    /// I think" became "Incomplete Conversation Opener". A title is permanent,
+    /// so declining leaves the caller's own words on screen.
+    pub async fn spawn_call_title_generation(&self, thread_id: uuid::Uuid) -> bool {
+        let turns = match self
+            .event_store
+            .get_thread_spoken_exchange(thread_id, Self::SPOKEN_TURNS_FOR_A_NAME)
+            .await
+        {
+            Ok(turns) => turns,
+            Err(e) => {
+                log!("[Title] Could not read the call on {}: {}", thread_id, e);
+                // Unreadable is not "no call". Claiming the thread keeps the
+                // chat titler off a call it would name from one utterance.
+                return true;
+            }
+        };
+        // One test for both ways out, because they mean the same thing here:
+        // there is no call to name. A thread nobody spoke on has no turns at
+        // all, and a call nothing answered has one voice in it.
+        //
+        // **Handing a one-sided call back is deliberate.** This path declines
+        // to name it, and claiming it as well would leave the thread
+        // unnameable for good: a caller who says one thing into the void and
+        // later TYPES on that thread would get no name from the words they
+        // typed either.
+        if !chat::exchange_has_both_speakers(&turns) {
+            return false;
+        }
+        // Unreadable counts as named, so a failed read never spends a title
+        // call and never overwrites a name that is already there.
+        if self
+            .event_store
+            .thread_has_title(&thread_id.to_string())
+            .await
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        let Some(ref extractor) = self.extractor else {
+            return true;
+        };
+        let call = match chat::title_call(&self.pool, extractor).await {
+            Ok(call) => call,
+            Err(e) => {
+                log!("[Title] Failed to build the provider to name a call: {}", e);
+                return true;
+            }
+        };
+        let Some(slot) = self.claim_the_naming_of(thread_id) else {
+            return true;
+        };
+        let message = chat::spoken_exchange_as_title_input(&turns);
+        let bus = self.event_bus.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            chat::emit_generated_title(&bus, &call, thread_id, &message, None, None, 0).await;
+        });
+        true
+    }
+
+    /// Take this thread's naming slot, or answer `None` because a name is
+    /// already on its way.
+    ///
+    /// The window `thread_has_title` cannot close on its own: naming takes a
+    /// model call, so two askers a second apart both read "no name yet".
+    ///
+    /// A poisoned lock takes the slot. A namer panicked mid-flight, and naming
+    /// again risks the second title this guard prevents. Refusing would leave
+    /// the thread unnameable for the life of the process.
+    pub(crate) fn claim_the_naming_of(&self, thread_id: uuid::Uuid) -> Option<NamingSlot> {
+        let taken = match self.threads_being_named.lock() {
+            Ok(mut naming) => naming.insert(thread_id),
+            Err(_) => true,
+        };
+        taken.then(|| NamingSlot {
+            being_named: Arc::clone(&self.threads_being_named),
+            thread_id,
+        })
     }
 
     /// Spawn background title generation for a thread (used when pinning).

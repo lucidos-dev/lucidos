@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.38.2 — 2026-09-18
+
+### Changed
+
+- A build slot now shapes the build it admits, not just how many run at once. A granted slot runs at nice +10 and gets a share of the cores sized to how many holders there are, so several coding-agent builds at once leave the machine usable. A solo build still gets the whole machine.
+- The call control says what is happening with colour and what a press does with the pointer. A connecting call pulses its handset glyph, every live phase sits on the same green, speaking deepens the fill, and red appears on hover wherever a press ends the call.
+- A call is named from the exchange it holds, at the first answered utterance, rather than from one thing that was said.
+
+### Fixed
+
+- A call opens silent. Nothing the talker volunteers before you speak is played, written down, or handed to running work. A question the engine parked is still put to you.
+- The talker no longer recites a finished call back at you. The conversation it is handed is fenced and marked as already heard, and one greeting buys one answer, so a recitation runs out of floor.
+- One sentence broken by a breath stays one bubble, whatever the talker did in between, and the doer reads the same sentence the transcript shows.
+- Outbound call audio no longer crackles and cuts out for the first minutes. The speaker holds a 200 ms cushion that grows to 600 ms to cover a stall it just heard.
+- A spoken reply reads at the time the talker started saying it, so a reply said over a running step stays where it belongs and stops jumping down the transcript.
+- A relayed turn keeps its row when the provider streamed no words of its own.
+- A turn that is only speech draws no Lucidos Agent header.
+- A short thread holds still. Nothing rests on the bottom of the pane, and the newest turn sits against the composer on desktop and on a phone.
+- The transcript stops scrolling past where the conversation ends. A hidden label under a spoken reply left a 136 px hole on a phone.
+- The reading position finds turns inside the feed box, so a deep link and a restored position land where they should.
+- A tap the composer never received recovers itself. The rescue was blocked three ways and had never run.
+- A toast never takes focus off a field you are typing in, so Enter still sends your message when the engine-update toast pops up mid-compose.
+- What's New takes you to the release it names. A client that can install one offers Update & Restart; every other session is sent to Settings, System.
+- A notification tap carries a real thread id or the notification is refused. Rows already written with a word instead of an id are repaired.
+
+### Removed
+
+- `run_coding_agent` no longer accepts `repo`. Use `folder`.
+- `lucidos spawn-thread` no longer accepts `--parent`. Use `--relation child`.
+
+  Both carried a deprecation warning. A recipe, trigger or script still passing an old form now fails with a rename error instead of running. A workspace audit finds any straggler on disk and names the one-line fix.
 ## v0.38.1 — 2026-09-17
 
 ### Changed

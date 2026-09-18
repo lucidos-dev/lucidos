@@ -176,14 +176,14 @@ const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends,
 ///
 /// Only those. A Lucidos-source session needs none of it: `make lint` and
 /// `make test` take a slot themselves. Every line here is paid on every
-/// request of every session that carries it. See ADR 0070.
+/// request of every session that carries it. See ADR 0070 and ADR 0210.
 const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run in parallel \
     worktrees, so N simultaneous full builds are N compilers resident on ONE machine, which \
     OOM-kills the host. Prefix a heavy build with `lucidos build-slot -- ` (e.g. `lucidos \
-    build-slot -- cargo test --release`). It waits for a free slot, then runs your command \
-    unchanged, passing its output and exit code through. Do NOT wrap cheap work such as a \
-    type-check: that holds a slot for minutes to save seconds. Nothing to release afterwards: \
-    the slot frees when your command exits, or by the kernel if it is killed.";
+    build-slot -- cargo test --release`). It waits for a free slot, then runs your command niced, \
+    on a share of the cores, passing output and exit code through. Do NOT wrap cheap work such as \
+    a type-check: that holds a slot for minutes to save seconds. Nothing to release: the slot \
+    frees when your command exits, or if the kernel kills it.";
 
 /// Tell the coding agent that background processes do NOT outlive the turn that
 /// started them.

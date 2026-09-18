@@ -144,8 +144,9 @@ export function leadAheadVersion(
  *
  * **A row the panel marks as ahead of you always gets a route** (ADR 0142).
  * That is the whole point of this function: the panel may not say a release is
- * newer and then leave the reader with no way to get it. `route` is
- * `updateRoute()`, so every install shape gets the answer that fits it.
+ * newer and then leave the reader with no way to get it. `route` is the panel's
+ * own, taken knowing a newer release exists. Every install shape gets the answer
+ * that fits it, and none of them is asked to go and look.
  *
  * Only the LEAD row carries it, for the reason {@link leadAheadVersion} gives.
  */
@@ -165,8 +166,8 @@ export function releaseRowRoute(
  * available, so an `Available` chip beside it states one fact twice.
  *
  * Every other route keeps the chip, because it states a different fact. "Newer"
- * says this release is published and you are not on it. "Check for Updates" and
- * "How to update" say what to do next, and neither implies the first.
+ * says this release is published and you are not on it. "How to Update" says
+ * what to do next, and it does not imply the first.
  */
 export function releaseRowMark(
   status: ReleaseRowStatus,
@@ -410,9 +411,15 @@ export function WhatsNewPage() {
   // newer than the running one, the offered one included.
   const offered = offeredRelease(offeredVersion, latestTauriAppNotes.value, releases);
   // What this session can do about a release ahead of the running one. One
-  // answer for the whole panel, so the control it renders is the same one
-  // Settings, System would render.
-  const route = updateRoute();
+  // answer for the whole panel, and only a row it has already marked ahead of
+  // the reader ever spends it.
+  //
+  // **So the panel KNOWS, and must not offer to go and look.** The default reads
+  // the updater's offer alone, and the changelog is the other source: a
+  // published release routinely reaches this list before the hourly poll names
+  // it. Left on the default, a `Newer` row offers "Check for Updates", which
+  // asks the reader to confirm what the chip beside it says.
+  const route = updateRoute(true);
   // The row that carries it. The offered row wins when it exists, since it sits
   // above the list and nothing published can postdate it.
   const lead = offered?.version ?? leadAheadVersion(releases, release, offeredVersion);
@@ -457,13 +464,12 @@ export function WhatsNewPage() {
     };
   }
 
-  /** The one control a row can offer. Its wording and its click are both
-   *  Settings → System's, so the two surfaces cannot disagree about what taking
-   *  the update does.
+  /** The one control a row can offer. Its wording and its click come from the
+   *  shared helpers Settings → System reads, so no surface invents either.
    *
-   *  That includes reporting a check in flight and refusing a second one. The
-   *  verdict arrives as an unkeyed toast, so a button that stayed live through
-   *  the round trip stacked one copy per press. */
+   *  A check in flight still owns it, though this panel can no longer start
+   *  one. Settings, System can, and it rewrites the very signals this control is
+   *  derived from, so acting mid-flight would act on an answer being replaced. */
   function routeButton(rowRoute: UpdateRoute): VNode {
     return (
       <button

@@ -167,11 +167,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   one cost most of a session on the tenth report. `lsof -p $(cat
   <ws>/.lucidos/engine.pid)` names the file the live engine actually writes.
 
-  Each line names the face and the verdict. The fifteen are `served`,
+  Each line names the face and the verdict. The seventeen are `served`,
   `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `no-lift`,
   `click-no-touch`, `unreachable`, `repaired`, `repair-failed`, `activated`,
-  `keyboard-touch`, `covered` and `stray-click`. It carries the travel, the row
-  and face boxes, the viewport block and the `data-keyboard-active` flag.
+  `rescue-stood-down`, `keyboard-touch`, `covered`, `stray-click` and
+  `untouched`. It carries the travel, the row and face boxes, the viewport block
+  and the `data-keyboard-active` flag.
 
   Three readings joined in the tenth round. The morph's own mode, the quiet
   window before the line, and, on a `missed`, why no watchable face took the
@@ -186,6 +187,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the scheduled checks in the preceding gap that asked nothing, because the app
   had a cover up. A run of them across a long `quiet.ms` says the composer was
   inert by our own design, not by WebKit's.
+
+  **`quiet.nudges` is the score for the typing-driven recovery.** It counts the
+  relayouts spent in the preceding gap. A press with nudges behind it and the
+  keyboard still up says the relayout worked. One with nudges behind it and the
+  keyboard down says the user recovered by hand anyway.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
@@ -288,16 +294,82 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   behind them, or WebKit delivering nothing. Only the third is the platform.
   The plan is
   [`docs/plans/2026-09-16-the-probe-says-which-silence-it-is.md`](plans/2026-09-16-the-probe-says-which-silence-it-is.md).
+- **What the fourteenth report found: the recovery had never run.** The probe
+  caught the press this time, in answer mode with a live Submit. It was
+  stationary, inside the row, reached nothing, and sat 9 px above the face. No
+  cover, and the 15 scheduled checks in the preceding 45 seconds all found that
+  face reachable at its own centre.
+
+  Those checks rule out an inert face and a cover. They cannot rule out the
+  mechanism this whole investigation chases, because they read the same layout
+  the rects read. A page hit-testing away from the glass passes all 15.
+
+  The packaged app's ledger holds 245 press lines and **zero** `activated`,
+  `repaired`, `repair-failed` and `unreachable` verdicts. So the round-12
+  recovery has never executed once. Three bounds can each stop it, and two of
+  them refused without writing a word. Only the first below is established for
+  the caught press; the other two are defects read out of the code.
+
+  `rescueCommit` wanted `data-keyboard-active`, which means a prompt textarea is
+  focused; 150 of the 158 missed presses had no focus. The click handler stood
+  the rescue down on ANY click. A tap the row drops dispatches a click on the
+  row, so the dead press killed its own recovery inside the grace window. And a
+  press whose finger travelled was dropped in silence, while its line asserted
+  `movedPx: 0` at touchdown.
+
+  The keyboard bound is gone and the click test now asks whether anything could
+  have taken the click. Every bound is judged in one place, and a refusal writes
+  a `rescue-stood-down` line where there was a face to run. **No bound on where
+  the press landed was added**: the reporter refused one.
+
+  Two readings were also lying by construction. A served line stored its rects
+  at touchdown and read the viewport and the morph 600ms later, so it described
+  two layouts at once. Those belong to the press now. `screenOff` reads `{0,0}`
+  on every line carrying it, healthy and dead alike. So the one reading meant to
+  come from outside layout decides nothing here.
+
+  One reading was added in its place: the SIGNED vector from the finger to the
+  nearest face. A displacement tends to repeat one vector across an episode,
+  where aim scatters. It narrows the two readings this episode leaves open and
+  does not settle them, because every coordinate the page can read comes from
+  one layout. Settling it needs a screen recording lined up against the logged
+  point. The plan is
+  [`docs/plans/2026-09-17-the-rescue-answers-the-press-it-was-built-for.md`](plans/2026-09-17-the-rescue-answers-the-press-it-was-built-for.md).
+- **What the fourteenth PWA report found: the page took nothing at all.** A
+  second round-14 episode, on the standalone PWA rather than the packaged app.
+  The user answered a question, typed a follow-up, and the draft sat unsent
+  until they dismissed the keyboard through the iOS Done bar.
+
+  Between those two presses the ledger is **empty**. No `missed`, no `dead`, no
+  `keyboard-touch`, no `stray-click`. The press that ended it reads
+  `quiet {ms 18489, checks 6, unreachable 0, covered 0}`. The page took no touch
+  and no click for 18.5 seconds. Six checks found the row live and reachable,
+  and none found a cover.
+
+  That settles the partition. A touch landing away from the composer writes
+  `keyboard-touch`, throttled only at 250ms, so taps seconds apart each write a
+  line. iOS delivered nothing. Meanwhile the compose PUTs ran the whole time, so
+  every keystroke reached the box.
+
+  Both of the round-12 answers wait to be touched, so neither could fire here.
+  The relayout therefore runs from the scheduled tick as well. The gate is the
+  pre-send moment: a live commit face, the user typed it, and no touch since. It
+  never commits, and `quiet.nudges` on every later line is what scores it. The
+  plan is
+  [`docs/plans/2026-09-17-the-composer-recovers-without-being-touched.md`](plans/2026-09-17-the-composer-recovers-without-being-touched.md).
 - **Status:** `active`, and now carrying a recovery as well as evidence. The
-  cause is still NOT named. So the removal condition needs a quiet period with
-  the bounce in place, or an episode whose `screenOff` names it.
+  cause is still NOT named, and the recovery has still never been seen to fire
+  in the field. So the removal condition needs a quiet period with the rescue
+  actually running, or an episode that names the mechanism.
 - **It is no longer behaviour-free, and the removal condition changes with
   that.** The module now RUNS the composer's commit face for a tap the page
   dropped, and relayouts the shell behind it. Those two are a fix rather than a
   diagnostic, so deleting the module would delete them. Removal therefore means
-  moving `rescueCommit`, `commitFace`, `ruleMissedPress`, `bounceHeight` and
-  `nudgeLayout` to a permanent home first, and dropping only the reporting
-  around them.
+  moving `liveCommitFace`, `commitFace`, `rescueStandDown`, `clickClaimedPress`,
+  `ruleMissedPress`, `shouldNudgeUntouched`, `runUntouchedNudge`, `bounceHeight`
+  and `nudgeLayout` to a permanent home first, and dropping only the reporting
+  around them. The keystroke stamp goes with them: `runUntouchedNudge` is the
+  only reader of it.
 - **Still consumes no gesture.** Every listener stays passive, and none calls
   `preventDefault` or `stopPropagation`. What it adds is an action on a press
   that reached NOTHING, which is a press no other path was going to take.
@@ -1064,6 +1136,27 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   to run instead.
 - **Status:** removed (2026-08-25)
 
+### The transcript rests on the live edge on desktop only
+
+- **Added:** 2026-09-17
+- **Lives in:** `crates/lucidos-app/src/styles/chat/input-messages.css`, the
+  `@media (min-width: 769px)` wrapper around
+  `.thread-content.visible.has-feed { align-content: safe end }`
+- **Impermanent because:** the rule fixed a hole mobile had too. Mobile was
+  excluded for a structural reason: its sticky `.mobile-thread-title-row` and
+  its `::before` header spacer share the scroll container, and `align-content`
+  carries every child of a box down together.
+- **Removal condition:** give the spare space to the feed alone, or move the
+  title row out of the scroller.
+- **Removed:** 2026-09-17, the same day, on a second report from the phone. The
+  first half of the condition was taken. The turns moved into a `.thread-feed`
+  box, and the rest went onto that box. The chrome left the aligned box, so the
+  media query is gone. `e2e/transcript-ends-where-its-content-ends.spec.ts`
+  runs on every project now, pinning the title row's place beside the air.
+  The rest itself was then reverted, hours later again, so no scope is left to
+  widen. Below one page the turns flow from the top and hold still (ADR 0212).
+- **Status:** removed (2026-09-17)
+
 ---
 
 ## 2. Model-tolerance measures
@@ -1713,27 +1806,24 @@ event that retires it.
 
 ### `lucidos spawn-thread --parent` deprecated alias
 
-- **Added:** 2026-06-30 (registered by the temporary-measures survey — the alias
-  predated this row)
-- **Lives in:** `crates/lucidos-cli/src/main.rs` (the `parent: bool` arg, marked
-  `DEPRECATED — alias for --relation child … Will be removed in a future release`)
-  + `crates/lucidos-cli/src/spawn_thread.rs` (the relation-resolution arm that maps
-  `--parent` → `CliRelation::Child` and prints the stderr deprecation warning). The
-  contract is pinned by `parent_flag_still_works_with_deprecation_warning` in
-  `crates/lucidos-cli/tests/spawn_thread_posts_body.rs`.
-- **Impermanent because:** `--parent` is a deprecated alias for `--relation child`,
-  kept only so existing recipes / scripts that still pass `--parent` keep working
-  for one release while the stderr warning nudges callers to migrate. It is NOT
-  permanent back-compat — it carries an explicit "Will be removed in a future
-  release" sunset. (The sibling `sub` alias for `child` is, by contrast, undated
-  permanent back-compat and is deliberately NOT tracked here.)
-- **Removal / resolution condition:** One release after the deprecation warning
-  shipped, once callers have had a release cycle to migrate — verify nothing in the
-  tree still passes `--parent` (grep the repo + `system-knowhow/**` and any
-  workspace recipes for `--parent`), then remove the `parent` arg, the
-  relation-resolution arm + warning in `spawn_thread.rs`, and the
-  `parent_flag_still_works_with_deprecation_warning` test.
-- **Status:** active
+- **Added:** 2026-06-30 (registered by the temporary-measures survey; the alias
+  predated this row).
+- **Removed:** 2026-09-18.
+- **Was:** a deprecated alias for `--relation child` on `lucidos spawn-thread`,
+  kept one release with a stderr warning while callers migrated. It carried an
+  explicit sunset, so it was never permanent back-compat. (The `sub` alias for
+  `child` IS permanent back-compat and stays untracked.)
+- **How removed:** deleted the `parent` clap arg, the relation-resolution arm and
+  its warning, and the `parent_flag_still_works_with_deprecation_warning` test.
+  Relation now resolves from `--relation` alone. A straggler passing `--parent`
+  gets a non-zero clap "unexpected argument" error. Use `--relation child`.
+- **Why safe to remove:** the sunset had elapsed and the tree plus
+  `system-knowhow/**` grep was clean. A fleet-wide "no recipe passes it" is
+  unverifiable, so it was NOT part of the condition. Instead the removal ships a
+  release notice whose action runs a workspace audit. The audit flags
+  `spawn-thread --parent` (`system-knowhow/workspace-audit.md`), so each install
+  catches its own stragglers.
+- **Status:** removed
 
 ### `email:`-prefixed credential fallback in `get_email_password`
 
@@ -1919,27 +2009,28 @@ event that retires it.
 
 ### `repo` → `folder` deprecated alias on `run_coding_agent`
 
-- **Added:** 2026-07-02 (registered by the /harden-project sweep — the alias
-  landed 2026-05-25/27, commits 713e33b1d/976a4a516)
-- **Lives in:** `crates/lucidos-engine/src/llm/tools/threads.rs` (the `repo` param
-  schema, marked "DEPRECATED, use `folder`. Passing both is an error"; the
-  "accepted for one release" sunset moved into this row on 2026-08-07, when the
-  schema-budget trim cut the param description back to its rule),
-  `crates/lucidos-engine/src/engine/agentic_loop_special_tool.rs`
-  (the alias-resolution arm + the both-passed error, two sites), and
-  `crates/lucidos-engine/src/engine/http/workspace_client.rs`
-  (`CrossWorkspaceSpawn.repo`).
-- **Impermanent because:** `repo` is a deprecated alias for `folder` on the
-  `run_coding_agent` LLM tool, kept for one release so existing knowhow/recipes
-  that still pass `repo` keep working while the schema description steers models
-  to `folder`. Explicit "accepted for one release" sunset — not permanent
-  back-compat. The sibling of the registered `--parent` CLI alias.
-- **Removal / resolution condition:** One release after shipping (already elapsed
-  as of v0.11.0+ — registration is late), verify no `system-knowhow/**`, workspace
-  knowhow, or recipes still pass `repo` to this tool, then drop the schema param,
-  the alias-resolution arm and both-passed error, and the
-  `CrossWorkspaceSpawn.repo` field.
-- **Status:** active
+- **Added:** 2026-07-02 (registered by the /harden-project sweep; the alias
+  landed 2026-05-25/27, commits 713e33b1d/976a4a516).
+- **Removed:** 2026-09-18.
+- **Was:** a deprecated alias for `folder` on the `run_coding_agent` LLM tool.
+  It was kept one release so existing knowhow/recipes passing `repo` kept
+  working, while the schema steered models to `folder`. It carried a sunset, so
+  it was never permanent back-compat. Sibling of the `spawn-thread --parent` alias.
+- **How removed:** dropped the `repo` schema param, the two alias-resolution
+  sites (now `removed_repo_alias_error`), and the `CrossWorkspaceSpawn.repo`
+  field with its `repo_id` body mapping. A cross-workspace repo spawn now travels
+  as `folder`; the receiver resolves a repo name from `folder` (`api/chat.rs`).
+- **A permanent guard replaces it, not a new temporary measure.** A call still
+  passing `repo` is rejected with "renamed to `folder`". This stays because a
+  bare drop would read a `repo`-only call as "folder omitted", which on a source
+  checkout silently edits Lucidos itself. Fail loud, forever.
+- **Why safe to remove:** the sunset had elapsed and the tree plus
+  `system-knowhow/**` grep was clean. A fleet-wide "no recipe passes it" is
+  unverifiable, so it was NOT part of the condition. Instead the removal ships a
+  release notice whose action runs a workspace audit. The audit flags `repo` on
+  `run_coding_agent` (`system-knowhow/workspace-audit.md`), so each install
+  catches its own stragglers.
+- **Status:** removed
 
 ### `tailscale serve` pre-1.52 positional-syntax fallback
 

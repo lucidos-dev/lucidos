@@ -76,7 +76,7 @@ const TOOLTIP: Record<CallPhase, string> = {
  * How long a connect may run before the control stops claiming progress.
  *
  * A first call after a page load pays the browser's microphone prompt, and the
- * sheet sits over our UI while a human reads it. A spinner through that says we
+ * sheet sits over our UI while a human reads it. A pulse through that says we
  * are busy when we are waiting on THEM. The grant then holds for the life of
  * the page, so a second call never reaches this dwell and reads as it always
  * did.

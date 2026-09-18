@@ -597,10 +597,16 @@ fn an_error_frame_names_what_went_wrong() {
 /// A caller starting to speak is NOT an interruption. `speech_started` fires on
 /// every utterance, including the first word of a call with nothing playing.
 /// Mapping it would report the talker cut off on every turn.
+///
+/// It is not nothing either, which is the half that changed. It says the caller
+/// opened their mouth, and that is the floor's one opener no transcriber can
+/// withhold (ADR 0211). `whisper-1` streams no partials at all, so without it
+/// the reply to the caller's first sentence is dropped whole.
 #[test]
-fn the_caller_starting_to_speak_is_not_an_interruption() {
+fn the_caller_starting_to_speak_is_its_own_event_and_not_an_interruption() {
     let frame = serde_json::json!({ "type": "input_audio_buffer.speech_started" });
-    assert!(map_event(&frame).is_empty());
+    assert_eq!(map_event(&frame), vec![VoiceEvent::CallerStartedSpeaking]);
+    assert!(!map_event(&frame).contains(&VoiceEvent::Interrupted));
 }
 
 /// A cancelled response IS one. It still reports the turn, because the tokens

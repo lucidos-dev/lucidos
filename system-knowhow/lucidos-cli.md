@@ -493,7 +493,7 @@ $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}
 ### `lucidos build-slot [--label <T>] [--max-wait <SECS>] -- <command>` / `--status` / `--set-capacity <N>`
 
 Run a heavy build under a *build slot*, so parallel *worktrees* cannot pile N
-full compiles onto one host and OOM it.
+full compiles onto one host, OOM it, or bury its cores.
 
 **Wrap anything heavy** that a coding-agent session runs: `cargo build`,
 `cargo test`, a Gradle or Xcode build, a large bundler run. The slot is taken
@@ -501,9 +501,16 @@ before the command starts and freed when it exits, or when this process dies.
 Do NOT wrap cheap work (a type-check, a unit-test run of a small package):
 it would sit in a slot for minutes to save seconds.
 
+**A granted slot also shapes the build.** It runs at `nice +10`, which the
+whole compile tree inherits, and gets a share of the cores as
+`CARGO_BUILD_JOBS`. The share is the host's cores divided by the slots held
+right now. It never falls below the fixed `cores / capacity` share, and never
+below 1. So a solo build keeps the machine, and contention divides it.
+
 ```bash
 # The normal shape. Blocks until a slot frees, then runs the build.
 $ lucidos build-slot -- cargo test --release
+lucidos build-slot: slot 0 of 3, nice +10, 18 cores
 
 # Name it for the listing, when the command line is not the useful label.
 $ lucidos build-slot --label "integration suite" -- ./gradlew test
@@ -537,9 +544,20 @@ $ lucidos await-event --on BuildSlotReleased --timeout-secs 3600 \
 Notes that matter:
 
 - **Nesting is safe.** A wrapped command that wraps again runs straight
-  through, so a script you call cannot deadlock against the slot you hold.
+  through, so a script you call cannot deadlock against the slot you hold. It
+  changes nothing either: the outer slot's priority and core share stand, and
+  are not applied a second time.
+- **A `CARGO_BUILD_JOBS` you set yourself always wins**, and nothing is
+  exported over it. That is how a build that already knows its own limit keeps
+  it.
+- **`LUCIDOS_BUILD_SLOT_NICE` overrides the increment**, and `0` opts out
+  entirely, which is what a foreground build you are waiting on wants. Note
+  that a nice increment cannot be lowered again by a non-root process, so this
+  is a choice made before the build starts.
 - **It never blocks a build it cannot govern.** No `lucidos` binary, no
-  writable pool, or no engine to announce to all mean the command just runs.
+  writable pool, or no engine to announce to all mean the command just runs. A
+  host that will not report its core count means no share is exported, and the
+  build runs at cargo's own default.
 - **The exit code is the command's**, and a signalled command reports
   `128 + signal`, so a killed build never reads as a pass.
 - **Every release is announced.** `BuildSlotReleased` fires whenever a slot
