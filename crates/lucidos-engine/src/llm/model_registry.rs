@@ -382,12 +382,17 @@ mod tests {
     fn exact_registry_hit_wins() {
         let reg = registry(&[
             ("claude-fable-5", ProviderKind::Anthropic),
+            ("claude-fable-5-1", ProviderKind::Anthropic),
             ("claude-opus-4-8@default", ProviderKind::Vertex),
             ("claude-sonnet-5", ProviderKind::Vertex),
             ("gpt-5.5", ProviderKind::OpenAi),
         ]);
         assert_eq!(
             provider_kind_for(&reg, "claude-fable-5"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-fable-5-1"),
             ProviderKind::Anthropic
         );
         assert_eq!(
@@ -419,6 +424,16 @@ mod tests {
         assert_eq!(provider_kind_for(&reg, "gpt-5.4"), ProviderKind::OpenAi);
         assert_eq!(
             provider_kind_for(&reg, "claude-fable-5[1m]"),
+            ProviderKind::Anthropic
+        );
+        // The heuristic matches `claude-fable`, so a new Fable generation
+        // reaches the direct Anthropic provider without a new arm.
+        assert_eq!(
+            provider_kind_for(&reg, "claude-fable-5-1"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-fable-5-1[1m]"),
             ProviderKind::Anthropic
         );
         assert_eq!(

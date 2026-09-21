@@ -143,100 +143,22 @@ const MUTATING: &[&str] = &["post", "put", "delete", "patch"];
 
 /// Every mutating route the `api` modules register, read off the source.
 ///
-/// The source rather than the `Router`, because axum exposes no way to walk a
-/// built one. Reading the directory rather than a file list means a new module
-/// is covered the day it is added, which is the whole point.
-fn registered_mutating_routes() -> BTreeSet<String> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
-    let mut found = BTreeSet::new();
-    let mut stack = vec![dir];
-    while let Some(next) = stack.pop() {
-        for entry in std::fs::read_dir(&next).expect("api dir is readable") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // A test module registers throwaway routes on its own router.
-            if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("source is readable");
-            collect_routes(&src, &mut found);
-        }
-    }
-    found
-}
-
-/// Pull the path out of every `.route("<path>", <methods>)` in `src` whose
-/// method list writes.
+/// The scan is shared with *route reach*, which asks a different question of
+/// the same files (`api::route_scan`). This half keeps the writes.
 ///
 /// `any(...)` counts: it answers every method, mutating ones included.
-fn collect_routes(src: &str, found: &mut BTreeSet<String>) {
-    let mut rest = src;
-    while let Some(at) = rest.find(".route(") {
-        let after = &rest[at + ".route(".len()..];
-        let Some(body) = balanced(after) else {
-            rest = after;
-            continue;
-        };
-        rest = &after[body.len()..];
-        let Some(path) = first_string_literal(body) else {
-            continue;
-        };
-        let writes = MUTATING.iter().any(|m| mentions_call(body, m)) || mentions_call(body, "any");
-        if writes {
-            found.insert(path);
-        }
-    }
-}
-
-/// The text up to the paren that closes the one just opened.
-fn balanced(after_open: &str) -> Option<&str> {
-    let mut depth = 1usize;
-    for (i, c) in after_open.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&after_open[..i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The first `"..."` in `body`, which is the route path.
-fn first_string_literal(body: &str) -> Option<String> {
-    let start = body.find('"')? + 1;
-    let end = start + body[start..].find('"')?;
-    Some(body[start..end].to_string())
-}
-
-/// Does `body` call `name(`, as a whole word rather than a suffix?
-///
-/// A leading `.` is allowed and load-bearing: axum chains its methods, so most
-/// registrations read `get(list).post(create)`. Rejecting a dotted match lost
-/// 23 routes, every one of them a chain. Only an identifier character before
-/// the name disqualifies it, which is what keeps `post` off `mcp_post`.
-fn mentions_call(body: &str, name: &str) -> bool {
-    let needle = format!("{name}(");
-    let mut from = 0;
-    while let Some(at) = body[from..].find(&needle) {
-        let abs = from + at;
-        let preceding = body[..abs].chars().next_back();
-        if !preceding.is_some_and(|c| c.is_alphanumeric() || c == '_') {
-            return true;
-        }
-        from = abs + needle.len();
-    }
-    false
+fn registered_mutating_routes() -> BTreeSet<String> {
+    crate::api::route_scan::scan_api_routes()
+        .into_iter()
+        .filter(|hit| {
+            hit.methods.contains("ANY")
+                || MUTATING
+                    .iter()
+                    .any(|m| hit.methods.contains(&m.to_uppercase()))
+        })
+        .filter(|hit| !hit.path.is_empty())
+        .map(|hit| hit.path)
+        .collect()
 }
 
 /// The scanner has to actually find routes, or every assertion below passes

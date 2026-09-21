@@ -1,4 +1,5 @@
 pub mod actor;
+pub(crate) mod app_reach;
 mod app_ui;
 mod apps;
 mod artifacts;
@@ -6,7 +7,7 @@ pub(crate) mod backup;
 pub(crate) mod base_path;
 mod blobs;
 pub(crate) mod browser_origin;
-mod changes;
+pub(crate) mod changes;
 pub(crate) mod chat;
 mod claude_code;
 mod command_checkpoint;
@@ -31,6 +32,8 @@ mod mcp_permission;
 mod memory;
 pub(crate) mod mutating_gate;
 mod notifications;
+#[cfg(test)]
+pub(crate) mod route_scan;
 
 /// Where every `/api/v1` route is mounted, as one value.
 ///
@@ -758,6 +761,14 @@ pub struct ModelsListResponse {
     pub models: Vec<ModelInfo>,
 }
 
+/// The merged *style library*, shipped rows first. Read-only: the library is
+/// written through `PUT /api/v1/preferences` on `response_styles`, so that the
+/// one write chokepoint bounds-checks every edit.
+#[derive(Serialize)]
+pub struct ResponseStylesListResponse {
+    pub styles: Vec<crate::core::response_style::Style>,
+}
+
 #[derive(Deserialize)]
 pub struct CreateModelRequest {
     pub id: String,
@@ -1361,6 +1372,11 @@ pub fn create_router(
             state.clone(),
             mutating_gate::enforce_caller_identified,
         ))
+        // Refuse a request an app stamped itself on, to a route apps may not
+        // reach (403). The host bridge already refused it, and this is the
+        // second answer: see `api::app_reach` and ADR 0231. It reads the
+        // MATCHED route, so it sits inside the nest, beside the gate above.
+        .layer(axum::middleware::from_fn(app_reach::enforce_app_reach))
         // Refuse a request that named a DIFFERENT workspace than this engine
         // serves (409). Layered here rather than per-handler because a
         // mis-aimed write is a hazard on every mutating endpoint, and a

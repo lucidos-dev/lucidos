@@ -35,7 +35,7 @@
 
 /* One section per kind of wait. The gap is what separates them, so a panel
    showing only one section is exactly the panel that shipped before the
-   sub-thread half joined it, plus its label. */
+   sub-thread half joined it. */
 .waiting-panel-section + .waiting-panel-section {
     margin-top: 0.625rem;
 }
@@ -43,7 +43,10 @@
 /* Names the section rather than heading it, so it takes the panel title's own
    treatment (`.prompt-bar-popover-title`) one step in. A real heading element
    would pick up the h1-h6 sizing from shared-components.css, which is built
-   for page content and dwarfs a popover row. */
+   for page content and dwarfs a popover row.
+
+   `waitingPanelBody` draws it only when BOTH kinds of wait are present, since
+   that is when there are two lists to tell apart. */
 .waiting-panel-section-label {
     display: block;
     margin-bottom: 0.25rem;
@@ -64,16 +67,22 @@
 
 /* The whole row is the target, so a thumb can land anywhere on it. The button
    carries the padding rather than the `li`, since the `li` is only there to
-   keep the list semantic. */
+   keep the list semantic.
+
+   Flat at rest, and tinted under a pointer or a finger. A resting fill made
+   every row a small card inside the panel's own card, which is the nesting the
+   report named. The panel is already a box, and a second one around each row
+   says nothing the gap does not. The `:active` tint is what a touch device
+   gets instead of the hover one, so a press still answers. */
 .waiting-panel-child-link {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     width: 100%;
-    padding: 0.375rem 0.5rem;
+    padding: 0.25rem;
     border: none;
     border-radius: 0.25rem;
-    background: var(--bg-tertiary, var(--bg-primary));
+    background: none;
     color: var(--text-primary);
     font-size: var(--font-size-md);
     line-height: 1.3;
@@ -83,8 +92,12 @@
 
 @media (hover: hover) {
     .waiting-panel-child-link:hover {
-        background: var(--bg-quaternary, var(--bg-tertiary));
+        background: var(--bg-tertiary, var(--bg-primary));
     }
+}
+
+.waiting-panel-child-link:active {
+    background: var(--bg-tertiary, var(--bg-primary));
 }
 
 /* One column for the status mark, so every title starts on the same x. The
@@ -106,7 +119,7 @@
    unclickable, because there is nothing to open: it is a statement about the
    list, not a row in it. */
 .waiting-panel-child-more {
-    padding: 0.25rem 0.5rem;
+    padding: 0.25rem;
     font-size: var(--font-size-sm);
     color: var(--text-muted);
 }
@@ -117,7 +130,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.375rem;
+    gap: 0.5rem;
 }
 
 /* The row STACKS rather than sitting in three columns, and that is the width
@@ -125,16 +138,25 @@
    say, but it was the only part that could shrink: the mode + countdown column
    and the Stop button were both `flex: 0 0 auto`, so on a phone they took their
    full width first and left the reason two words per line. Stacked, the reason
-   gets the whole panel and the fixed-size chrome sits under it on one line. */
+   gets the whole panel and the fixed-size chrome sits under it on one line.
+
+   It carries no fill and no padding of its own. A filled row inside the
+   popover's own filled box read as a card in a card, and on the common panel
+   holding ONE wait the inner box traced the outer one a few pixels in. The rule
+   below tells two rows apart, at the cost of a hairline instead of a surface. */
 .event-wait-item {
     display: flex;
     flex-direction: column;
-    gap: 0.375rem;
-    padding: 0.5rem;
-    border-radius: 0.25rem;
-    background: var(--bg-tertiary, var(--bg-primary));
+    gap: 0.25rem;
     font-size: var(--font-size-md);
     line-height: 1.3;
+}
+
+/* Only BETWEEN rows, so the single-wait panel (nearly every one) draws no rule
+   at all and reads as plain content under the title bar. */
+.event-wait-item + .event-wait-item {
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border-color);
 }
 
 .event-wait-main {
@@ -180,6 +202,11 @@
     font-weight: inherit;
     line-height: inherit;
     color: inherit;
+    /* The UA centres a button's text, and this one is a run of prose in the
+       middle of a sentence. A wrapped event type therefore sat centred under a
+       left-aligned reason, on its own axis. An event type is long and the panel
+       is narrow, so it wraps on almost every phone. */
+    text-align: inherit;
     cursor: pointer;
     text-decoration: underline;
     text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);

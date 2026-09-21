@@ -276,6 +276,15 @@ describe('waitingPanelBody', () => {
     expect(text).toContain('>Sub-threads<');
   });
 
+  /** A label tells two lists apart, so a lone list needs none. With one it
+   *  restated the panel's own "Waiting for" title one step in, and stacked two
+   *  uppercase labels above a single row. */
+  it('leaves a lone section unlabelled', () => {
+    expect(body()).not.toContain('waiting-panel-section-label');
+    const childrenOnly = body({ waits: [], subThreads: { threads: [thread('c1')], unresolved: 0 } });
+    expect(childrenOnly).not.toContain('waiting-panel-section-label');
+  });
+
   it('says how many children it could not name, instead of a short list', () => {
     const text = body({ waits: [], subThreads: { threads: [thread('c1')], unresolved: 2 } });
     expect(text).toContain('data-role="waiting-sub-threads-more"');

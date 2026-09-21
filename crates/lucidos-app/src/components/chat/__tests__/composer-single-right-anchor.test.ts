@@ -36,6 +36,11 @@ const composerCss = readFileSync(
   'utf-8',
 );
 const mobileCss = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf-8');
+/** The shared renderer, which is where the button's classes come from now. */
+const headerActionsSource = readFileSync(
+  resolve(here, '../../layout/headerActions.tsx'),
+  'utf-8',
+);
 
 /** Index of `needle`, or a throw naming what the file was expected to contain. */
 function at(needle: string, from = 0): number {
@@ -57,34 +62,19 @@ function textRowSpan(): string {
   return promptSource.slice(open, at('<div class={rowClass}', open));
 }
 
-/** The clear button's own JSX.
+/** The clear-draft ACTION's own source.
  *
- *  Anchored on the ELEMENT CARRYING THE CLASS, then walked outward to its tags.
- *  A single `/<button[\s\S]*?prompt-clear[\s\S]*?<\/button>/` looks equivalent
- *  and is not: it starts at the FIRST `<button` in the file and lazily runs to
- *  the first `prompt-clear` after it, so it returns a span holding every control
- *  in between. The per-attribute assertions below would then pass on some other
- *  button's markup, and this guard would keep reporting green with the attribute
- *  it exists to protect deleted.
+ *  It is a `HeaderActionSpec` now, not JSX: the row's middle folds into a ⋯
+ *  menu, and a spec is what renders either as the icon or as a menu row. So the
+ *  span runs from the push that adds it to that push's close.
  *
- *  The one-tag check is what makes that permanent rather than a property of the
- *  anchoring being right: any span reaching back past another control fails HERE,
- *  loudly, instead of quietly satisfying the assertions below from a neighbour.
- *
- *  Either attribute form matches. The class is a plain string now, since the
- *  button carries no state in it. Pinning the template-literal form would fail
- *  on the tidier spelling rather than on anything this guard protects. */
-function clearButton(): string {
-  const classAttr = /class=(\{`|")[^`"]*\bprompt-clear\b[^`"]*(`\}|")/.exec(promptSource);
-  if (!classAttr) throw new Error('nothing carries the prompt-clear class in PromptInput.tsx');
-  const open = promptSource.lastIndexOf('<button', classAttr.index);
-  if (open < 0) throw new Error('the prompt-clear element is not inside a <button>');
-  const span = promptSource.slice(open, at('</button>', classAttr.index));
-  const tags = span.match(/<button\b/g)?.length ?? 0;
-  if (tags !== 1) {
-    throw new Error(`expected exactly one <button> around the prompt-clear class, found ${tags}`);
-  }
-  return span;
+ *  Anchored on the key, and closed on a four-space `});`. A bare `'});'` search
+ *  would stop inside the handler, at `updateCompose(id, { text: '' });`, and
+ *  every assertion below would then read half a spec. */
+function clearSpec(): string {
+  const span = /foldActions\.push\(\{\n\s+key: 'prompt-clear'[\s\S]*?\n {4}\}\);/.exec(promptSource);
+  if (!span) throw new Error('no prompt-clear action is pushed onto foldActions in PromptInput.tsx');
+  return span[0];
 }
 
 /** Every `.prompt-clear` rule body in a stylesheet, media queries included.
@@ -107,42 +97,56 @@ describe('the composer has one control on its right edge', () => {
     expect(textRowSpan()).not.toMatch(/<button\b/);
   });
 
-  // Positions are taken from the button's OWN opening tag, never from the first
-  // `prompt-clear` in the file: the class is named in prose above the button
-  // too, and a prose mention would satisfy these on the strength of a comment.
-  it('renders the clear button inside .prompt-actions-row', () => {
-    expect(promptSource.indexOf(clearButton()))
-      .toBeGreaterThan(at('<div class={rowClass}'));
+  // The fold cluster sits between the row's pinned leading controls and its
+  // right-hand group. So the clear action lands in the left cluster wherever
+  // the fold puts it.
+  it('renders the fold cluster inside .prompt-actions-row', () => {
+    expect(at('<OverflowMenu')).toBeGreaterThan(at('<div class={rowClass}'));
   });
 
-  it('places the clear button ahead of the right-hand action group', () => {
-    // Last of the LEFT cluster, so the right group keeps a single anchor. The
-    // right group is `margin-left: auto`, which is what makes the reserved box
-    // trailing whitespace while the draft is empty.
-    expect(promptSource.indexOf(clearButton()))
-      .toBeLessThan(at('<div class={rightClass}>'));
+  it('places the fold cluster ahead of the right-hand action group', () => {
+    // The right group is `margin-left: auto`, and it keeps a single anchor.
+    expect(at('<OverflowMenu')).toBeLessThan(at('<div class="prompt-actions-right">'));
+  });
+
+  it('keeps the clear action last of the row\'s MIDDLE', () => {
+    // The fold takes a PREFIX, so a later member folds later. What may follow
+    // clear is the right-hand cluster and the two fixed toggles, both of which
+    // fold after it by design.
+    const spec = clearSpec();
+    const after = promptSource.slice(promptSource.indexOf(spec) + spec.length);
+    expect(after).toMatch(/const middleActions = foldActions\.slice\(\);/);
+    expect(after.slice(0, after.indexOf('const middleActions')))
+      .not.toMatch(/foldActions\.push\(/);
   });
 });
 
 describe('the clear button is one of the prompt row icons', () => {
   it('wears the same box and glyph classes as its neighbours', () => {
-    expect(clearButton()).toMatch(/class=("|\{`)icon-btn header-icon prompt-clear/);
+    // `renderHeaderAction` gives every action the shared box, and `extraClass`
+    // adds the hook the drafts e2e clicks. It reaches the ⋯ row too.
+    expect(clearSpec()).toMatch(/extraClass: 'prompt-clear'/);
+    expect(headerActionsSource).toMatch(/icon-btn header-icon\$\{a\.extraClass/);
+    expect(headerActionsSource).toMatch(/thread-overflow-item\$\{a\.extraClass/);
   });
 
-  it('is measured by the row-overflow hook', () => {
-    // useFitsInOneRow sums every [data-row-item]; a control missing the
-    // attribute lets the row overflow instead of lifting its liftable slot.
-    expect(clearButton()).toMatch(/\bdata-row-item\b/);
+  it('is measured by the fold', () => {
+    // The fold sums every [data-row-item], and a member missing the marker is
+    // room the row spends without knowing. The composer stamps one on every
+    // member and on the ⋯ trigger. The member's own name goes beside it, so a
+    // folded width can still be remembered.
+    expect(promptSource).toMatch(
+      /const foldAttrs = \(key: string\) => \(\{ 'data-row-item': 'fold', \[FOLD_KEY_ATTR\]: key \}\);/,
+    );
+    expect(promptSource).toMatch(/triggerAttrs=\{MORE_TRIGGER_ATTRS\}/);
   });
 
   // It used to render at `visibility: hidden` instead, holding a 2.25rem box in
-  // a row that had nothing to clear. On a phone that reservation is what lifted
-  // the Diff button onto a row of its own while the bottom row looked empty.
-  // Nothing on screen moves when the button arrives: it is last in the left
-  // cluster, whose next sibling has `margin-left: auto`.
+  // a row that had nothing to clear. On a phone that reservation is what pushed
+  // the Diff button off a row that could otherwise hold it.
   it('renders only while there is a draft to clear', () => {
-    expect(promptSource).toMatch(/\{hasText && \(\s*<button\s+key="prompt-clear"/);
-    expect(clearButton()).not.toMatch(/\binvisible\b/);
+    expect(promptSource).toMatch(/if \(hasText\) \{\n\s+foldActions\.push\(\{\n\s+key: 'prompt-clear'/);
+    expect(clearSpec()).not.toMatch(/\binvisible\b/);
   });
 
   it('declares no size or colour of its own, on any viewport', () => {

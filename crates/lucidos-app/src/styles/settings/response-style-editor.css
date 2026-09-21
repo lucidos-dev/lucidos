@@ -1,0 +1,174 @@
+/* Settings → Models → Response style: the Edit / Add modal.
+
+   The scrim spans the LAYOUT viewport, which iOS never shrinks for the
+   keyboard (`interactive-widget=resizes-visual` in index.html). A panel
+   centred in that lands its lower half, Save included, under the keys the user
+   is typing with. `--app-height` is the VISUAL viewport, published by
+   MobileSwipeContainer, so bounding the scrim to it centres the panel in what
+   is on screen. Desktop has no such publisher and takes the 100dvh fallback,
+   which is what `inset: 0` already gave it. */
+.modal-overlay.style-editor-overlay {
+    bottom: auto;
+    height: var(--app-height, 100dvh);
+}
+
+/* An instruction runs to 1,000 characters. So the panel takes all the width
+   bar a hairline of scrim, and all the height the visual viewport has.
+
+   A definite height rather than a max-height, the choice `.file-preview-modal`
+   makes for the same reason. A textarea's intrinsic height is its `rows`
+   attribute and never its content, so a `flex: 1` field inside a box that
+   sizes to its content rests at its minimum and leaves the room unused. */
+.style-editor-modal {
+    /* Every pixel the panel may occupy: the visible viewport, less one gutter
+       at each end. Named because the mobile rule below reuses it whole. */
+    --style-editor-room: calc(
+        var(--app-height, 100dvh) - var(--space-lg) * 2
+        - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    /* --space-lg (1rem), the gutter every settings surface shares. */
+    padding: var(--space-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    color: var(--text-primary);
+    width: min(56rem, calc(100vw - var(--space-lg)));
+    /* A desktop line holds about a hundred characters, so the whole instruction
+       is on screen well inside this. The absolute term stops a large monitor
+       from drawing an editor that is mostly empty box. */
+    height: min(34rem, var(--style-editor-room));
+    /* The last resort, for a screen too short to hold even the squeezed layout
+       below: a phone in landscape with the keyboard up leaves about 190px of
+       visual viewport. `hidden` there clipped the Save button off the bottom
+       with no way to reach it. */
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* The instruction is the ONLY part that gives up height. Every other child
+   keeps its own: a squeezed paragraph spills its text out of its box, and a
+   squeezed action row is the one thing that must never leave the screen.
+   Before `.style-editor-field-grow`, which is equally specific and reopens
+   this for the one child that does shrink. */
+.style-editor-modal > * {
+    flex-shrink: 0;
+}
+
+/* A phone fits roughly a third of those characters per line. So the same
+   instruction needs three times the lines, and the ceiling above would clip
+   it. Take the whole screen instead: that ceiling protects a big monitor, and
+   a phone has no spare height to protect. */
+@media (max-width: 768px) {
+    .style-editor-modal {
+        height: var(--style-editor-room);
+    }
+}
+
+/* The panel's own `gap` is the spacing here, so drop the heading margin
+   `shared-components.css` gives every h1 to h6. */
+.style-editor-title {
+    margin: 0;
+    font-size: var(--font-size-xl);
+    font-weight: 600;
+}
+
+.style-editor-intro {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+/* Label above its control, never beside it: a text field wants the whole row
+   to show what was typed. `.settings-row:has(> .settings-text-input)` stacks
+   for the same reason. */
+.style-editor-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    min-width: 0;
+}
+
+/* The instruction takes every pixel the panel has left over, and gives them
+   back when the screen shrinks. `min-height: 0` lets it shrink below its own
+   content, which is what gives the field inside a definite box to scroll in. */
+.style-editor-field-grow {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.style-editor-field-label {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+/* `.settings-text-input` defends a 14rem floor when it shares a row with its
+   label. Stacked here it has the full width, so release it. */
+.style-editor-modal .settings-text-input {
+    min-width: 0;
+    width: 100%;
+}
+
+/* The field the modal exists for, and `overflow-y: auto` is what makes a long
+   instruction readable on a phone at all. No drag handle: it is unreachable
+   with a finger, and the box already takes what the viewport allows. The floor
+   is two lines, low enough that the keyboard leaves something to read. */
+.style-editor-instruction {
+    flex: 1 1 auto;
+    min-height: 3rem;
+    width: 100%;
+    resize: none;
+    overflow-y: auto;
+    /* The panel is a scroller inside a scrim; a flick reaching the end of the
+       text must not chain out to whatever is behind it. */
+    overscroll-behavior: contain;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.375rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    color: var(--text-primary);
+}
+
+.style-editor-instruction:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.style-editor-instruction::placeholder {
+    color: var(--text-muted);
+}
+
+/* Why Save is refused, in the user's own words. */
+.style-editor-problem {
+    font-size: var(--font-size-sm);
+    color: var(--accent-red);
+    line-height: 1.4;
+}
+
+/* The counter sits opposite the buttons rather than above them, so the two
+   share one row and the instruction keeps that height. */
+.style-editor-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+}
+
+.style-editor-count {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.style-editor-actions {
+    display: flex;
+    gap: 0.25rem;
+    margin-left: auto;
+}

@@ -1,102 +1,126 @@
-import { useSignal } from '@preact/signals';
-import { useRef, useState } from 'preact/hooks';
-import type { Ref } from 'preact';
+import { signal } from '@preact/signals';
+import { useRef } from 'preact/hooks';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { TodoItem, TodoStatus } from '../../store/thread-events';
+import type { HeaderActionSpec } from '../layout/headerActions';
 import { CloseIcon, TodoListIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 
-export function todoListIndicatorBody({
-  items,
-  notes,
-  onClick,
-  buttonRef,
-}: {
-  items: TodoItem[] | null;
-  notes?: string | null;
-  onClick: () => void;
-  buttonRef?: Ref<HTMLButtonElement>;
-}) {
-  // *Todo notes* can outlive the items: under ADR 0085's context mode an agent
-  // that finished its plan still writes `todos: []` with a pointer worth
-  // keeping. Hiding the indicator there would make the block the whole mode
-  // rests on the one thing the user cannot see.
+/** What the panel is positioned against, or null while it is closed.
+ *
+ *  Module-level, and one signal for both ways in. The indicator folds into the
+ *  composer row's ⋯ menu on a short row, so the button that opens the panel may
+ *  not exist. A press on the row button passes itself. A press on the menu row
+ *  passes the ⋯ trigger, the box the reader pressed. */
+const todoPanelAnchor = signal<HTMLElement | null>(null);
+
+/** Close the panel. Called by the composer when a fold moves controls around,
+ *  since an anchor can leave the DOM under an open panel. */
+export function closeTodoPanel(): void {
+  todoPanelAnchor.value = null;
+}
+
+/** Everything the indicator says about a list, in one place.
+ *
+ *  `null` when there is nothing to report, which is what hides the control.
+ *  *Todo notes* can outlive the items: under ADR 0085's context mode an agent
+ *  that finished its plan still writes `todos: []` with a pointer worth
+ *  keeping. Hiding the indicator there would make the block the whole mode
+ *  rests on the one thing the user cannot see.
+ *
+ *  TWO states, stamped as `data-state` and painted in todo-list.css over one
+ *  shared glyph: `in-progress` takes the accent, `idle` takes the row's
+ *  ordinary gray. That is the composer row's whole language, the one the follow
+ *  toggle and the *waiting indicator* beside it already speak: accent means
+ *  something is live right now.
+ *
+ *  A parked item and an abandoned one used to paint too, a gray pulse and a
+ *  dimmed glyph. Both are gone. An item is `waiting` only while the thread
+ *  holds a live event wait, so the pulse said what the waiting indicator
+ *  already says in accent. The dim read as a disabled button, for a fact that
+ *  is history rather than activity. Both still reach the reader in words,
+ *  below and in the panel.
+ *
+ *  The WORDS keep the fuller picture, and there waiting outranks abandoned
+ *  because it is the live fact: a list carrying both has parked items that are
+ *  still going somewhere. */
+/** The two values `data-state` can take. A union rather than `string`, so a
+ *  third one cannot be stamped without a stylesheet rule to paint it. */
+type TodoIndicatorState = 'in-progress' | 'idle';
+
+export function todoIndicatorSummary(
+  items: TodoItem[] | null,
+  notes?: string | null,
+): {
+  state: TodoIndicatorState;
+  tooltip: string;
+  ariaLabel: string;
+  menuLabel: string;
+} | null {
   if (items === null) return null;
   if (items.length === 0) {
     if (!notes) return null;
-    return (
-      <button
-        type="button"
-        class="icon-btn header-icon"
-        data-role="todo-indicator"
-        data-state="idle"
-        data-tooltip="Notes kept"
-        aria-label="Todo list: no items, notes kept. Click to expand."
-        onClick={onClick}
-        data-row-item
-        ref={buttonRef}
-      >
-        <TodoListIcon />
-      </button>
-    );
+    return {
+      state: 'idle',
+      tooltip: 'Notes kept',
+      ariaLabel: 'Todo list: no items, notes kept. Click to expand.',
+      menuLabel: 'Todo list: notes kept',
+    };
   }
   const total = items.length;
   const completed = items.filter((i) => i.status === 'completed').length;
   const waiting = items.filter((i) => i.status === 'waiting').length;
   const abandoned = items.filter((i) => i.status === 'abandoned').length;
   const inProgress = items.find((i) => i.status === 'in_progress');
-  // Four honest indicator states, stamped as `data-state` and distinguished by
-  // COLOR (and, for waiting, MOTION) in todo-list.css, over one shared
-  // ticked-checkbox glyph:
-  //   - in-progress: the agent is actively working an item (accent)
-  //   - waiting: no in-progress item AND at least one item is parked on a live
-  //     event wait, i.e. the agent stopped on purpose and something will wake
-  //     it (the idle gray, pulsing: the app's own waiting language, as on a
-  //     drawer row's dot)
-  //   - abandoned: no in-progress item AND at least one item was abandoned (dimmed)
-  //   - idle: every non-completed item is gone (all done, or nothing pending)
-  // Waiting outranks abandoned because it is the live fact: a list carrying
-  // both has parked items that are still going somewhere.
-  const state = inProgress
-    ? 'in-progress'
-    : waiting > 0
-      ? 'waiting'
-      : abandoned > 0
-        ? 'abandoned'
-        : 'idle';
-  const tooltip = inProgress
-    ? inProgress.active_form
-    : waiting > 0
-      ? `${completed} of ${total} done, ${waiting} waiting`
-      : abandoned > 0
-        ? `${completed} of ${total} done, ${abandoned} abandoned`
-        : `${completed} of ${total} done`;
-  // The aria-label names the state, it does not just count. Color and a pulse
-  // are the ONLY visual channels carrying it now that all four states share one
-  // glyph, and neither is a channel a screen reader can report. Color is also
-  // the one forced-colors mode overwrites: there --accent and --text-secondary
-  // both collapse to the system foreground, leaving in-progress, idle and
-  // abandoned identical. The tooltip can't stand in for it either: it is
-  // desktop-hover only.
-  const ariaLabel = inProgress
-    ? `Todo list: ${inProgress.active_form}. ${completed} of ${total} done. Click to expand.`
-    : waiting > 0
-      ? `Todo list: ${completed} of ${total} done, ${waiting} waiting. Click to expand.`
-      : abandoned > 0
-        ? `Todo list: ${completed} of ${total} done, ${abandoned} abandoned. Click to expand.`
-        : `Todo list: ${completed} of ${total} done. Click to expand.`;
+  const state = inProgress ? 'in-progress' : 'idle';
+  const counted = waiting > 0
+    ? `${completed} of ${total} done, ${waiting} waiting`
+    : abandoned > 0
+      ? `${completed} of ${total} done, ${abandoned} abandoned`
+      : `${completed} of ${total} done`;
+  const tooltip = inProgress ? inProgress.active_form : counted;
+  // The aria-label names the state, it does not just count. Colour is now the
+  // ONLY visual channel carrying it, and a screen reader cannot read colour.
+  // Forced-colors mode overwrites it outright: there --accent collapses to the
+  // system foreground, so in-progress and idle paint identically. The tooltip
+  // cannot stand in either, being desktop-hover only.
+  const said = inProgress ? `${inProgress.active_form}. ${completed} of ${total} done` : counted;
+  return {
+    state,
+    tooltip,
+    ariaLabel: `Todo list: ${said}. Click to expand.`,
+    // The menu row's words. A folded indicator has no paint at all, so this is
+    // the whole of what it reports.
+    menuLabel: `Todo list: ${said}`,
+  };
+}
+
+export function todoListIndicatorBody({
+  items,
+  notes,
+  onClick,
+  attrs,
+}: {
+  items: TodoItem[] | null;
+  notes?: string | null;
+  onClick: (e: MouseEvent) => void;
+  /** The row attributes the composer's fold cluster stamps on every member. */
+  attrs?: Record<string, string>;
+}) {
+  const summary = todoIndicatorSummary(items, notes);
+  if (!summary) return null;
   return (
     <button
+      {...attrs}
       type="button"
       class="icon-btn header-icon"
       data-role="todo-indicator"
-      data-state={state}
-      data-tooltip={tooltip}
-      aria-label={ariaLabel}
+      data-state={summary.state}
+      data-tooltip={summary.tooltip}
+      aria-label={summary.ariaLabel}
       onClick={onClick}
       data-row-item
-      ref={buttonRef}
     >
       <TodoListIcon />
     </button>
@@ -199,70 +223,88 @@ export function todoListPanelBody({
   );
 }
 
-/** Symmetric to `CodingAgentControlMenu`: mounted in the prompt-bar actions row,
- *  hidden when the chat agent hasn't written a list. Reads from
- *  `meta.latestTodoList` (projected in `handleEvent`) so the render path
- *  is O(1) — no walk of the events Map per threadMap flush. */
-export function TodoListIndicator() {
-  const open = useSignal(false);
-  // useState (not useRef) so the dismiss hook re-runs once the button mounts
-  // and we have a real anchor to exclude from the outside-click test.
-  const [anchorEl, setAnchorEl] = useState<HTMLButtonElement | null>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-
+/** The todo indicator, as one of the composer row's foldable actions.
+ *
+ *  `null` when the chat agent has written nothing to show. Reads
+ *  `meta.latestTodoList` (projected in `handleEvent`) so the render path is
+ *  O(1), with no walk of the events Map per `threadMap` flush.
+ *
+ *  Folded, the row button is gone and the menu row is the whole control. It
+ *  carries the same words the button's accessible name does, which is the only
+ *  channel a menu row has: colour and a pulse do not survive the fold. */
+export function todoIndicatorAction(): HeaderActionSpec | null {
   const id = focusedThreadId.value;
   const meta = id ? threadMap.value.get(id)?.meta : undefined;
   const items = meta?.latestTodoList ?? null;
   const notes = meta?.latestTodoNotes ?? null;
-  const isOpen = open.value && !!items && (items.length > 0 || !!notes);
-  const pos = useAnchoredPosition(isOpen ? anchorEl : null, panelRef, '.thread-pane');
+  const summary = todoIndicatorSummary(items, notes);
+  if (!summary) return null;
+  return {
+    key: 'todo-indicator',
+    dataRole: 'todo-indicator',
+    label: summary.menuLabel,
+    tooltip: summary.tooltip,
+    icon: () => <TodoListIcon />,
+    render: (attrs) => todoListIndicatorBody({
+      items,
+      notes,
+      attrs,
+      // Re-pressing the button closes, which is the toggle the anchor exemption
+      // in <Overlay> leaves to the control's own handler.
+      onClick: (e) => {
+        const self = e.currentTarget as HTMLElement;
+        todoPanelAnchor.value = todoPanelAnchor.value ? null : self;
+      },
+    }),
+    onMenuClick: (anchor) => { todoPanelAnchor.value = anchor; },
+  };
+}
+
+/** The panel itself, mounted by the composer rather than by the control.
+ *
+ *  It has to outlive the fold: the control it belongs to moves between the row
+ *  and the ⋯ menu, and neither is a place a panel can live. Portaled anyway, so
+ *  where it sits in the tree decides nothing.
+ *
+ *  The Overlay panel IS the `.todo-panel` box, placed by `useAnchoredPosition`
+ *  rather than by CSS, and portaled because the composer's ancestors animate
+ *  `transform`. Same wiring as the waiting panel beside it; the dismiss
+ *  contract lives in <Overlay>. */
+export function TodoPanelHost() {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const id = focusedThreadId.value;
+  const meta = id ? threadMap.value.get(id)?.meta : undefined;
+  const items = meta?.latestTodoList ?? null;
+  const notes = meta?.latestTodoNotes ?? null;
+  const anchor = todoPanelAnchor.value;
+  const isOpen = anchor !== null && !!items && (items.length > 0 || !!notes);
+  const pos = useAnchoredPosition(isOpen ? anchor : null, panelRef, '.thread-pane');
 
   return (
-    <>
-      {todoListIndicatorBody({
-        items,
-        notes,
-        onClick: () => (open.value = !open.value),
-        buttonRef: setAnchorEl,
-      })}
-      {/* The Overlay panel IS the `.todo-panel` box now, placed by
-          `useAnchoredPosition` rather than by CSS, and portaled because the
-          composer's ancestors animate `transform`. Anchor is the indicator
-          button. Same wiring as the subscription popover beside it; the
-          contract lives in <Overlay>. */}
-      <Overlay
-        open={isOpen}
-        onClose={() => {
-          open.value = false;
-        }}
-        anchor={anchorEl}
-        backdrop={false}
-        portal
-        panelClass="prompt-bar-popover todo-panel"
-        // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
-        // the hook clamped this panel's position into (see WaitingPanel).
-        panelStyle={pos
-          ? {
-              top: `${pos.top}px`,
-              left: `${pos.left}px`,
-              '--prompt-bar-popover-fit': `${pos.maxWidth}px`,
-            }
-          : { visibility: 'hidden' }}
-        panelRole="dialog"
-        panelProps={{ 'aria-label': 'Current todo list' }}
-        dataRole="todo-panel"
-        panelRef={panelRef}
-      >
-        {items &&
-          (items.length > 0 || notes) &&
-          todoListPanelBody({
-            items,
-            notes,
-            onClose: () => {
-              open.value = false;
-            },
-          })}
-      </Overlay>
-    </>
+    <Overlay
+      open={isOpen}
+      onClose={closeTodoPanel}
+      anchor={anchor}
+      backdrop={false}
+      portal
+      panelClass="prompt-bar-popover todo-panel"
+      // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
+      // the hook clamped this panel's position into (see WaitingPanel).
+      panelStyle={pos
+        ? {
+            top: `${pos.top}px`,
+            left: `${pos.left}px`,
+            '--prompt-bar-popover-fit': `${pos.maxWidth}px`,
+          }
+        : { visibility: 'hidden' }}
+      panelRole="dialog"
+      panelProps={{ 'aria-label': 'Current todo list' }}
+      dataRole="todo-panel"
+      panelRef={panelRef}
+    >
+      {items
+        && (items.length > 0 || notes)
+        && todoListPanelBody({ items, notes, onClose: closeTodoPanel })}
+    </Overlay>
   );
 }

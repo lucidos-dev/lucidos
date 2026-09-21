@@ -41,7 +41,7 @@ What each piece does — include only what you need:
 | Tag | Provides | Skip if |
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
-| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); and the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
@@ -57,6 +57,47 @@ served `<head>` when your HTML names no icon of its own. Ship a
 `<link rel="icon" href="…">` (or `rel="shortcut icon"`) and yours is kept
 untouched. Inside the host shell the app runs in an iframe, which has no tab, so
 this changes nothing there.
+
+**Reach the engine through the SDK, never through a bare `fetch`.** Inside the
+host shell an app runs in its own renderer process, so an app that pegs its main
+thread slows itself and nothing else. That isolation gives the frame an opaque
+origin: a direct `fetch('/api/v1/…')` is refused by CORS, `new EventSource(…)`
+with it, and `localStorage` throws. `lucidos.*` carries the first two over a
+bridge to the host, so every call in this document works unchanged. An app that
+goes around the SDK loses its network instead.
+
+An endpoint with no namespace is reached through `lucidos.request`, over the
+same bridge. Not every endpoint: the engine says which ones an app may call,
+and refuses the rest. See § `lucidos.request`. Storage has no replacement yet,
+so keep per-device state out of an app or hold it in `lucidos.data`, which is
+workspace-wide.
+
+**Inline your own CSS and JS, rather than shipping them as separate files.** The
+opaque origin costs your frame the device credential on every subresource, and
+the gateway in front of the engine asks for it. So your own
+`<script src="app.js">`, `<link href="style.css">`, `<img src>` and
+`lucidos.data.url(path)` all come back **401** where a gateway is in front. That
+is every packaged install and every remote-access URL.
+
+The four `/api/v1` assets in the table above are exempt and always load. So is
+anything under `lucidos.apiUrl('/static/…')`, and a `data:` URL works from any
+frame. This is a break rather than a design. It is registered in
+`docs/temporary-measures.md`, and the inlining advice comes out when it is
+fixed.
+
+Popups, OAuth and fullscreen are untouched. Opened in its own browser tab an app
+is a top-level document, not a frame, so it keeps every direct path.
+
+**One link shape needs `sdk.js` specifically:** `<a href="report.pdf" download>`
+on one of your own bundled files. A browser ignores the `download` attribute on
+a cross-origin link, and your files are cross-origin to the frame. The click
+would navigate the frame to the file. `sdk.js` intercepts it and asks the engine
+for the file as an attachment. Without the SDK, use a `blob:` or `data:` URL,
+which download from any frame.
+
+Behind a gateway that interception is refused too. It asks for
+`/<slug>/app/<id>/<file>?download=1`, which is one of your own files, so the
+paragraph above applies. Use a `blob:` or `data:` URL there.
 
 ### Theme variables
 
@@ -355,6 +396,8 @@ const src = lucidos.data.url('artifacts/screenshots/latest.png');
 
 One other special case: a `system-knowhow/...` path is routed through the engine's `/api/v1/data/...` endpoint (these files live in the engine repo, not the workspace, so the static `/data` mount can't serve them).
 
+Behind a gateway, a URL this returns is refused from inside an app frame: it is a subresource, and the frame sends no device credential. Use a `data:` URL, or read the bytes with `lucidos.data.read` and build one. See § Setup.
+
 ## lucidos.events — Event Store
 
 Emit domain events, and query the workspace's event store.
@@ -483,7 +526,7 @@ This is the preferred way for app UIs to talk to external HTTP APIs. Direct `fet
 - **Mixed content** — apps load over HTTPS, so `fetch('http://localhost:5005/...')` is blocked by the browser.
 - **CORS** — the upstream rarely whitelists the engine's origin, so cross-origin XHR fails.
 
-`lucidos.proxy` sidesteps both: the request goes to the same-origin engine, which forwards server-side.
+`lucidos.proxy` sidesteps both: the request reaches the engine, which forwards it server-side. From an app frame it travels over the host bridge, and from a standalone app tab it goes direct. Either way the upstream call is made by the engine.
 
 ```ts
 lucidos.proxy(name: string): ProxyClient
@@ -494,6 +537,8 @@ interface ProxyClient {
 ```
 
 `fetch` returns the raw `Response` so the caller picks how to read the body (`.json()`, `.text()`, `.blob()`, …). The auth header is added server-side; do not set `Authorization` from the iframe.
+
+**A response is buffered when the call travels the bridge, so it does not stream.** From an app frame the host makes the upstream call and hands the whole body back at the end. A token stream therefore arrives complete rather than arriving as it is generated, and a stream that never ends fails at the 120s deadline. Render the finished answer from a frame, or open the app in its own tab, where the response streams as usual.
 
 ### Configure the backend (one-time)
 
@@ -529,7 +574,7 @@ const data = await res.json();
 
 ### Built-in model-provider proxies (no `apis.json` entry needed)
 
-The engine already holds working credentials + routing for every model provider in the model registry (Settings → Models). Those are exposed as **built-in provider proxies** under the SAME route, so an app can call an LLM / image provider without the workspace re-entering the credential in `apis.json`. When `<name>` matches a model-registry provider and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
+The engine already holds working credentials + routing for every model provider in the model registry (Settings → Models), plus TypeSafe. Those are exposed as **built-in provider proxies** under the SAME route. An app can then call an LLM / image / judgment provider without the workspace re-entering the credential in `apis.json`. When `<name>` matches one of them and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
 
 | `proxy(name)` | Base URL | Injected server-side | You send |
 |---|---|---|---|
@@ -539,6 +584,7 @@ The engine already holds working credentials + routing for every model provider 
 | `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages` — set your own `anthropic-version` header |
 | `local` | your configured local base (Ollama default `http://localhost:11434/v1`) | `Authorization: Bearer <key>` (omitted if keyless) | path as-is, e.g. `/chat/completions` |
 | `vertex` | `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>` (engine-owned prefix) | `Authorization: Bearer <access-token>` (minted + refreshed server-side) | ONLY the suffix, e.g. `/publishers/anthropic/models/claude-opus-4-8@default:rawPredict` |
+| `typesafe` | `https://api.typesafe.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/systemone` |
 
 - **Only the credential is injected.** The layer adds just the auth header (the secret the iframe must never see). `Content-Type`, `anthropic-version`, and any attribution headers stay yours to set in `init`.
 - **`apis.json` overrides the builtin.** An entry with the same name in `data/config/apis.json` is used instead — so you can still point `openai` at a mock/gateway or add extra auth layers.
@@ -566,9 +612,9 @@ const res = await lucidos.proxy('vertex').fetch(
 |---|---|
 | Read/write workspace files | `lucidos.data.*` |
 | Emit a domain event, or query the event store (domain AND engine events) | `lucidos.events.*` |
-| Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'xai' \| 'anthropic' \| 'local').fetch(...)`, no `apis.json` needed |
+| Call a model provider the engine already has (LLM / image / judgment) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'xai' \| 'anthropic' \| 'local' \| 'typesafe').fetch(...)`, no `apis.json` needed |
 | Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
-| Hit an engine endpoint no SDK method covers | `fetch(lucidos.apiUrl('/<suffix>'))`. Same origin, no proxy needed, but the URL **must** be built with `apiUrl`: a hand-written `/api/v1/…` is a 404. See § `lucidos.apiUrl` directly below. |
+| Hit an engine endpoint no SDK method covers | `lucidos.request('/<suffix>', init)`. It travels the same bridge, and the engine decides which routes an app may reach. See § `lucidos.request`. |
 
 If the iframe needs a model provider the engine already has, use its built-in proxy name above — no config. For any other external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
 
@@ -583,18 +629,23 @@ Builds an absolute URL onto the engine's `/api/v1` surface, carrying the
 Pass the path *after* `/api/v1`.
 
 ```js
-// The endpoint has no SDK method, so build the URL rather than writing one.
-const res = await fetch(lucidos.apiUrl('/notifications'), {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ title: 'Done', message: 'Import finished.' }),
-});
+// A subresource loads from an app frame, and this is the URL it needs.
+img.src = lucidos.apiUrl('/static/some-asset.png');
 ```
 
-**Reach for it only when no SDK method covers the endpoint.** `lucidos.data.*`,
-`lucidos.events.*`, `lucidos.threads.*` and the rest already resolve the prefix,
-and they carry the timeout, error shape and response parsing this raw `fetch`
-does not.
+**A `fetch` of what this returns does NOT work inside the host shell.** The
+frame's origin is opaque, so the engine is cross-origin to it and CORS refuses
+the answer. WebKit reports that as `Load failed` and Chromium as a `TypeError`,
+neither of which names the cause. What still works is a URL the browser fetches
+for you: a `src`, an `href`, a stylesheet.
+
+**So this builds URLs, and never makes calls.** For an endpoint with no SDK
+method, use `lucidos.request` below: it travels the bridge and works in both
+realms.
+
+**For everything else, use the SDK method.** `lucidos.data.*`, `lucidos.events.*`
+and the rest resolve the prefix and travel over the bridge. They also carry the
+timeout, error shape and response parsing a raw `fetch` does not.
 
 ### Why a hand-written `/api/v1/…` does not work
 
@@ -606,6 +657,12 @@ first resolve somewhere else:
 |---|---|---|
 | `new URL('api/v1/events/query', document.baseURI)` | `/<workspace>/app/<app-id>/api/v1/events/query` | `404` |
 | `fetch('/api/v1/events/query')` | `/api/v1/events/query` | `404 unknown workspace 'api'` |
+
+**Inside the host shell the call fails before it gets that far.** An app frame
+has an opaque origin, so every request it makes to the engine is cross-origin,
+and the engine grants no CORS. The `fetch` rejects with a `TypeError` and your
+code never sees a status. The addresses above are what a standalone app tab, a
+top-level document on the engine's own origin, still resolves.
 
 The relative form fails because **an app iframe has no `<base href>`**. The SPA
 shell gets one stamped in (`<base href="/<workspace>/">`), an app page does not,
@@ -628,12 +685,101 @@ the path. Don't re-derive it in app code, and never hardcode a slug: the
 workspace name is not the app's to know. (`lucidos.configure({ baseUrl })` is
 the one override, for an app hosted outside the engine.)
 
-**The failure mode is silence.** A wrong URL is a plain 404, so an app that
-wraps the call in a `try` / `catch`, warns to the console and falls back to a
-second data source goes on looking healthy: it renders plausible, stale numbers
+**The failure mode is silence.** Neither failure names itself: a wrong URL is a
+plain 404, and a refused one is `Load failed` on WebKit or a `TypeError` on
+Chromium. An app that catches it, warns to the console and falls back to a
+second data source goes on looking healthy. It renders plausible, stale numbers
 and nothing on screen changes. That is how this survived weeks in a real app.
 If a fetch of yours has a fallback path, surface the failure in the UI as well
 as the console.
+
+## lucidos.request: an endpoint no namespace covers
+
+```ts
+lucidos.request<T>(suffix: string, init?: RequestInit): Promise<T>
+```
+
+Call the engine's `/api/v1` surface directly. Pass the path *after* `/api/v1`,
+and an optional `init` of the shape `fetch` takes. The answer is parsed as JSON,
+a non-2xx raises `SdkError`, and an empty body resolves to `null`. Same 10s
+deadline and `TimeoutError` as every other method.
+
+From an app frame it travels the host bridge, so it works where a raw
+`fetch(lucidos.apiUrl(...))` is refused. From an app opened in its own browser
+tab it goes direct. Same call, same contract, both realms.
+
+```js
+// Read the workspace's environment variables. They are NOT secret: every app
+// can read them, and a value appears in logs and events. Use a credential for
+// an API key, a token or a password.
+const { env_vars } = await lucidos.request('/env-vars');
+
+// The engine refuses a write. An env var reaches every command the agent runs,
+// so a name the interpreter loads from would be host code execution. Store an
+// app's own setting with lucidos.preferences or lucidos.data instead.
+
+// Emit a workspace event.
+await lucidos.request('/events/emit', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ event_type: 'ReportOpened', payload: { summary: 'x' } }),
+});
+
+// Turn a model id into the label the user sees.
+const { models } = await lucidos.request('/models');
+```
+
+### Not every endpoint is reachable
+
+The engine classifies every route, and an app frame reaches only the ones marked
+app-reachable. Anything else answers `SdkError` with a 403, whichever realm the
+app runs in. The whole reachable set, with the methods each opens:
+
+| Route | Methods |
+|---|---|
+| `/data`, `/data/*path` | GET, and PUT plus DELETE on a path |
+| `/data/edit`, `/data/upload` | POST |
+| `/events/query`, `/events/count`, `/events/types` | GET |
+| `/events/emit` | POST |
+| `/triggers` | GET, POST, PUT, DELETE |
+| `/triggers/run` | POST |
+| `/triggers/historical`, `/trigger-groups` | GET |
+| `/preferences` | GET, PUT |
+| `/notifications` | GET, POST |
+| `/notification`, `/notifications/before` | GET |
+| `/notification/read`, `/notifications/read-all` | POST |
+| `/apps`, `/app` | GET |
+| `/threads/list`, `/threads/count` | GET |
+| `/oauth/:provider/access-token` | GET |
+| `/proxy/:name/*path` | any method |
+| `/ui/navigate` | POST |
+| `/env-vars` | GET |
+| `/models`, `/knowhow`, `/knowhow/read`, `/health` | GET |
+
+Most of those have a namespace of their own, which is the better way to call
+them. The generated `packages/lucidos-sdk/src/generated/app-reach.ts` is the
+exact list, and it cannot drift: the engine writes it.
+
+Denied, and each for a reason worth knowing:
+
+| Denied | Why |
+|---|---|
+| credentials, backup keys, OAuth accounts, the email account | the secret never enters the iframe, which is what `lucidos.proxy` exists for |
+| `/chat/stream`, thread creation, follow-ups, compose | `lucidos.ui.startThread()` prefills and never submits, so the user always sends their own prompt |
+| answering a question, every consent route, the `/internal/` tree | an app never answers as the user |
+| applying a change, restarting, rebuilding, installing a plugin | an app does not change the platform under the user |
+| writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
+| message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
+| repositories, `/browse-directories`, `/workspaces` | outside the workspace |
+
+If your app needs a denied route, say so rather than working around it. The
+answer lives in `crates/lucidos-engine/src/api/app_reach.rs`, and opening one is
+a deliberate decision recorded in ADR 0231.
+
+**Prefer a namespace where one exists.** `lucidos.data.read` gives you text
+rather than JSON, `lucidos.triggers.create` validates the cron before it sends,
+and `lucidos.proxy` handles a non-JSON body. This is the hatch, not the front
+door.
 
 ## lucidos.oauth — OAuth Token Access
 
@@ -895,11 +1041,13 @@ lucidos.preferences.get(deviceId?: string | null): Promise<Preferences>
 lucidos.preferences.set(key: string, value: string, deviceId?: string): Promise<void>
 ```
 
-`get()` defaults to the parent device id, so iframes see the same merged view as
-the parent UI. The device id is per-workspace (each workspace has its own device
-identity); the SDK reads it from the workspace-scoped `lucidos-device-id`
-(`ws:<slug>:lucidos-device-id`) so the iframe and the parent agree. Pass `null`
-to fetch only globally-scoped preferences.
+`get()` defaults to the device the app is running on, so it sees the same merged
+view as the shell around it. That matters because theme, font and scale are
+device-scoped: a read naming no device gets only the global rows. The device id
+is per-workspace, and an app never handles it. An app frame names the device it
+is in, and the host substitutes the id. A standalone app tab reads the id
+itself, from the workspace-scoped `ws:<slug>:lucidos-device-id`. Pass `null` to
+fetch only globally-scoped preferences.
 
 ### Types
 
@@ -975,8 +1123,11 @@ interface NavigateUi {
 /** What a notification tap does. `modal` (default) opens the inbox detail
  *  showing the message body. `navigate` delegates to the same router the
  *  `navigate_ui` LLM tool uses; `to` is its arg shape. Both mark the source
- *  notification read on tap. Every notification is openable — the old passive
- *  `none` kind is retired; a historical `{kind:'none'}` is coerced to `modal`. */
+ *  notification read on tap. Every notification is openable: the old passive
+ *  `none` kind is retired, and a historical `{kind:'none'}` is coerced to
+ *  `modal`. The field was once a bare string (`'modal'`, `'open_app'`,
+ *  `'open_thread'`, `'none'`), and the engine now answers those with 400. To
+ *  sweep a workspace for leftovers, run `system-knowhow/workspace-audit.md`. */
 type Tap =
   | { kind: 'modal' }
   | { kind: 'navigate'; to: NavigateUi };
@@ -1010,14 +1161,16 @@ interface NotificationListResult {
 
 ### Tap shapes — examples
 
-The SDK only exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating a notification from app code goes through the engine HTTP API directly (`POST /api/v1/notifications`, the same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce). This is the ordinary case for § `lucidos.apiUrl`: build the URL with it rather than writing `/api/v1/notifications` into the `fetch`, which 404s from an app iframe.
+The SDK exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating one goes through `lucidos.request('/notifications', …)`, the same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce.
+
+The examples below run from an app frame and from a standalone app tab alike. Each `body` is the wire shape, so the CLI and the tool take the same fields.
 
 ```js
 // Default: open the inbox detail showing the message body. Use this for any
 // info-only notification too ("OAuth completed", "Build succeeded") — every
 // notification is openable; there is no separate passive kind. For ephemeral
 // status that should NOT land in the inbox at all, use a plain `showToast`.
-await fetch(lucidos.apiUrl('/notifications'), {
+await lucidos.request('/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -1028,7 +1181,7 @@ await fetch(lucidos.apiUrl('/notifications'), {
 });
 
 // Navigate to a panel.
-await fetch(lucidos.apiUrl('/notifications'), {
+await lucidos.request('/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -1046,7 +1199,7 @@ await fetch(lucidos.apiUrl('/notifications'), {
 // too. Take the ids from whatever you are notifying about.
 const threadId = '4f1c2e8a-9d3b-4c17-8a55-0b6e2f7d1c93';
 const eventId = 'b7e04a12-5f6c-4d29-9e31-8c2a6d4b70f5';
-await fetch(lucidos.apiUrl('/notifications'), {
+await lucidos.request('/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -1060,7 +1213,7 @@ await fetch(lucidos.apiUrl('/notifications'), {
 
 // Navigate to an app's UI, at the one place the notification is about.
 // `fragment` arrives as the app's location.hash (§ Navigation targets).
-await fetch(lucidos.apiUrl('/notifications'), {
+await lucidos.request('/notifications', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -1225,7 +1378,7 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 lucidos.ui.disableTooltips(): void
 ```
 
-`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors. For each setting it prefers the server value, then the value the synchronous `sdk-prefs.js` script already applied from the parent shell's `localStorage`, and only then a default — so a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
+`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance: don't hardcode colors. For each setting it prefers the server value, then whatever the synchronous `sdk-prefs.js` script already put on `<html>`, and only then a default. So a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
 
 `applyPreferences()` also applies the user's **style overrides**: the
 `style_overrides` preference holds a map of CSS custom property to value, which
@@ -1806,14 +1959,14 @@ lucidos.sse.on(eventType: string, callback: (data: unknown, raw: SseEvent) => vo
 
 `connect()` is idempotent, and every `on()` listener in your app is fanned out from one connection. Ten subscriptions cost one stream.
 
-The connection is also shared **across documents**. Where the browser has `SharedWorker`, every document of a workspace attaches to one holder: the Lucidos shell, each app iframe, and each app opened in its own tab. So opening more apps does not open more connections.
+The connection is also shared **across documents**, by one of two routes. An app frame has an opaque origin. It can open neither an `EventSource` nor a `SharedWorker` port, so the host relays every frame off the connection it already holds. A document that is not a frame attaches to the `SharedWorker` holder directly: the Lucidos shell, and each app opened in its own tab. Either way, opening more apps does not open more connections.
 
 You do not opt in, and there is nothing to configure. Two things follow for an app author:
 
 - **A frame is identical either way.** A relayed frame is the same payload a private connection would deliver, so nothing in your handler changes.
 - **`disconnect()` detaches this document only.** It never takes the stream from another app or from the shell.
 
-Where `SharedWorker` is missing (Chromium on Android, and Android WebView), the SDK opens a private `EventSource` instead. Same events, same order, one connection per document. Nothing to handle.
+Where `SharedWorker` is missing (Chromium on Android, and Android WebView), a document that is not an app frame opens a private `EventSource` instead. Same events, same order, one connection per document. Nothing to handle.
 
 ### Types
 

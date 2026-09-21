@@ -2,6 +2,14 @@
 //! semantics: each call's `items` become the new truth and any prior list is
 //! implicitly dropped. The empty list clears the panel.
 //!
+//! **The list reads back.** Every call answers with the resulting list, and
+//! `action: "read"` asks for it without writing. Before that the tool answered
+//! with a count, so the list existed only in the user's prompt bar. The agent
+//! could not see the settle below rewrite its items, and a long thread drifted
+//! with nothing in context to contradict it. The turn-start `[TODO LIST]` block
+//! closes the same gap from the other side. See
+//! `docs/plans/2026-09-20-the-agent-can-read-its-own-todo-list.md`.
+//!
 //! Also hosts [`settle_open_todos`], the engine-side hook that runs whenever a
 //! thread stops working the list: at response termination, and at the one
 //! unpark no response follows (`todo_consumer` has both triggers and says which
@@ -38,17 +46,178 @@ use uuid::Uuid;
 /// are a bug indicator, not a feature.
 pub(crate) const MAX_TODO_ITEMS: usize = 50;
 
+/// The tool's default action, and what nearly every call does.
+const ACTION_WRITE: &str = "write";
+/// The action that answers with the list and changes nothing.
+const ACTION_READ: &str = "read";
+
 /// Standalone handler so tests can drive validation branches without a full
 /// engine boot — `LucidosEngine::execute_todo_write` is the thin wrapper.
 /// Pattern mirrors `query_events_impl` in `tools/mod.rs`.
-pub(crate) async fn todo_write_impl(
+///
+/// Two actions on one tool rather than two tools, because a second registry
+/// entry is billed on every request of every thread. The reasoning, and why
+/// the tool keeps a name that says `write`, are in
+/// `docs/plans/2026-09-20-the-agent-can-read-its-own-todo-list.md`.
+pub(crate) async fn todo_tool_impl(
+    event_bus: &EventBus,
+    pool: &PgPool,
+    args: &serde_json::Value,
+    thread_id: uuid::Uuid,
+) -> ToolOutcome {
+    // A wrong-typed or unknown action is refused rather than read as the
+    // default, matching `notes` below. Falling through to the write branch
+    // would answer a misspelt `read` by clearing the list.
+    //
+    // Explicit `null` is ABSENT, not a type error. That is the reading `notes`
+    // gives it, and the shape several SDKs serialise an omitted optional field
+    // into. It is safe because `action` is a verb selector, not an interlock: a
+    // call says what it destroys in `todos`, and a caller passing no verb asked
+    // for the default.
+    let action = match args.get("action") {
+        None | Some(serde_json::Value::Null) => ACTION_WRITE,
+        Some(serde_json::Value::String(raw)) => raw.as_str(),
+        Some(_) => {
+            return Err(format!(
+                "Error: `action` must be a string: `{ACTION_WRITE}` (the default) or \
+                 `{ACTION_READ}`"
+            ))
+        }
+    };
+    match action {
+        ACTION_WRITE => todo_write(event_bus, args, thread_id).await,
+        // A read carrying a list is refused rather than half-honoured. The two
+        // readings of it contradict each other, and the one where the model
+        // meant to write is the one silence gets wrong: nothing would reach the
+        // panel, and the answer would hand back the OLD list as if it were new.
+        ACTION_READ if args.get("todos").is_some() => Err(format!(
+            "Error: `action: \"{ACTION_READ}\"` takes no `todos`. Omit them to read the list, \
+             or drop `action` to write the ones you passed."
+        )),
+        ACTION_READ => todo_read(pool, thread_id).await,
+        other => Err(format!(
+            "Error: unknown `action` `{other}`; use `{ACTION_WRITE}` (the default) or \
+             `{ACTION_READ}`"
+        )),
+    }
+}
+
+/// Answer with the thread's current list, writing nothing.
+///
+/// The read exists because the list is otherwise invisible to its own author:
+/// it renders to the USER in the prompt bar, and the settle rewrites it after
+/// the agent has stopped looking. A failed query is reported as a failure, so
+/// the agent never reads one as an empty list.
+async fn todo_read(pool: &PgPool, thread_id: uuid::Uuid) -> ToolOutcome {
+    let snapshot = latest_todo_list(pool, thread_id)
+        .await
+        .map_err(|e| format!("Error: could not read the todo list: {}", e))?;
+    let Some(list) = snapshot else {
+        return Ok("No todo list on this thread yet.".to_string());
+    };
+    if list.items.is_empty() {
+        return Ok(match list.notes.as_deref() {
+            Some(notes) => format!("Todo list is empty.\nNotes: {notes}"),
+            None => "Todo list is empty.".to_string(),
+        });
+    }
+    Ok(format!(
+        "Todo list, {} items:\n{}",
+        list.items.len(),
+        render_todo_list(&list.items, list.notes.as_deref()),
+    ))
+}
+
+/// The list as the agent must see it to rewrite it: one line per item, carrying
+/// all three of its fields.
+///
+/// **One renderer, every surface.** The tool result, the read action and the
+/// turn-start block all come through here, so the three cannot describe the
+/// same list differently. `active_form` rides beside `content` because the next
+/// call replaces the WHOLE list. An item the agent half sees is one it half
+/// rewrites.
+///
+/// The closing line is only written when the engine has put a status on this
+/// list. It is the whole point of the read: `waiting` and `abandoned` are the
+/// settle's, and nothing else tells the agent they landed.
+fn render_todo_list(items: &[TodoItem], notes: Option<&str>) -> String {
+    let mut out = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. [{}] {} ({})\n",
+            idx + 1,
+            item.status.as_str(),
+            item.content,
+            item.active_form,
+        ));
+    }
+    if let Some(notes) = notes {
+        out.push_str(&format!("Notes: {notes}\n"));
+    }
+    if items
+        .iter()
+        .any(|item| matches!(item.status, TodoStatus::Waiting | TodoStatus::Abandoned))
+    {
+        out.push_str(
+            "`waiting` and `abandoned` are the engine's: it settles whatever you left \
+             unfinished when a response ended. Write the list again to correct anything you \
+             have since finished or dropped.\n",
+        );
+    }
+    out
+}
+
+/// The `[TODO LIST]` block a turn opens with, or the empty string.
+///
+/// Rendered ONLY when the list still says something the agent might need to
+/// correct, which is any item that is not `completed`. A thread that never
+/// wrote a list, one that cleared it, and one that finished everything each pay
+/// nothing. See [`TodoSnapshot::all_completed`] for why the gate is not
+/// `TodoStatus::is_open`.
+///
+/// Nothing at all under *self-curated context mode*, which renders the same
+/// checklist inside the working understanding at the tail of every round. A
+/// second copy there would be the cost bug twice over.
+///
+/// It lives here rather than beside the other turn blocks. Every rendering of
+/// the list then sits in one file with the tool that writes it.
+pub(crate) fn turn_start_block(
+    mode: crate::engine::chat::process::context_mode::ContextMode,
+    snapshot: Option<&TodoSnapshot>,
+) -> String {
+    if mode.is_on() {
+        return String::new();
+    }
+    let Some(list) = snapshot else {
+        return String::new();
+    };
+    if list.items.is_empty() || list.all_completed() {
+        return String::new();
+    }
+    format!(
+        "[TODO LIST]\nYour list, as the user sees it in the prompt bar right now:\n{}\
+         [END TODO LIST]",
+        render_todo_list(&list.items, list.notes.as_deref()),
+    )
+}
+
+/// Replace the whole list with `todos`, and answer with what the user now sees.
+async fn todo_write(
     event_bus: &EventBus,
     args: &serde_json::Value,
     thread_id: uuid::Uuid,
 ) -> ToolOutcome {
+    // `todos` is not in the schema's `required` array, because `read` takes no
+    // list. So this is the only gate on it, and it names the action that would
+    // have made the field optional.
     let raw_items = match args.get("todos").and_then(|v| v.as_array()) {
         Some(items) => items,
-        None if args.get("todos").is_none() => return Err("Error: `todos` is required".to_string()),
+        None if args.get("todos").is_none() => {
+            return Err(format!(
+                "Error: `todos` is required to {ACTION_WRITE} the list (pass `[]` to clear it). \
+                 Only `action: \"{ACTION_READ}\"` may omit it."
+            ))
+        }
         None => return Err("Error: `todos` must be an array".to_string()),
     };
 
@@ -134,8 +303,23 @@ pub(crate) async fn todo_write_impl(
         Some(_) => return Err("Error: `notes` must be a string".to_string()),
     };
 
-    let count = items.len();
-    let noted = notes.is_some();
+    // Rendered BEFORE the emit moves the items, and from the validated list
+    // rather than from a re-read. The settle runs at the terminator, so nothing
+    // rewrites this list between the emit and the answer. A second query would
+    // only be a slower way to the same bytes.
+    let answer = if items.is_empty() {
+        match notes.as_deref() {
+            Some(notes) => format!("Todo list cleared.\nNotes: {notes}"),
+            None => "Todo list cleared.".to_string(),
+        }
+    } else {
+        format!(
+            "Todo list updated, {} items:\n{}",
+            items.len(),
+            render_todo_list(&items, notes.as_deref()),
+        )
+    };
+
     event_bus
         .emit(BusEvent::Thread {
             thread_id,
@@ -145,11 +329,7 @@ pub(crate) async fn todo_write_impl(
         .await
         .map_err(|e| format!("Error: failed to emit TodoListWritten: {}", e))?;
 
-    Ok(format!(
-        "Todo list updated ({} items{})",
-        count,
-        if noted { ", notes kept" } else { "" }
-    ))
+    Ok(answer)
 }
 
 /// Was this thread holding an unresolved *event wait* as of `as_of_seq`?
@@ -208,6 +388,25 @@ pub(crate) struct TodoSnapshot {
     pub(crate) items: Vec<TodoItem>,
     pub(crate) notes: Option<String>,
     pub(crate) sequence: i64,
+}
+
+impl TodoSnapshot {
+    /// Is every item `completed`, so there is nothing left to reconcile?
+    ///
+    /// The gate on [`turn_start_block`], and deliberately NOT
+    /// `TodoStatus::is_open`. That predicate answers a different question, one
+    /// the settle asks: may a terminator still rewrite this row? `Abandoned` is
+    /// terminal to the settle, which is exactly why it is the status most worth
+    /// showing the agent. Nothing but the agent writing the list again can
+    /// correct it.
+    ///
+    /// An empty list is vacuously all-completed, and the caller drops it
+    /// either way.
+    fn all_completed(&self) -> bool {
+        self.items
+            .iter()
+            .all(|item| item.status == TodoStatus::Completed)
+    }
 }
 
 /// The thread's newest todo list, or `None` when there is nothing to read.
@@ -485,6 +684,7 @@ async fn settle_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::chat::process::context_mode::ContextMode;
     use crate::engine::event_bus::EmittedEvent;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use serde_json::json;
@@ -525,7 +725,7 @@ mod tests {
             ]
         });
 
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Ok(s) if s.contains("3 items")),
             "got: {:?}",
@@ -542,6 +742,324 @@ mod tests {
 
         pool.close().await;
         teardown_test_db(&db).await;
+    }
+
+    // ---- Reading the list back: the tool result, the read action, the block.
+
+    /// The whole reason the tool stopped answering with a count. The agent
+    /// rewrites the WHOLE list next call, so all three fields of every item
+    /// have to come back.
+    #[tokio::test]
+    async fn a_write_answers_with_the_resulting_list() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let args = json!({
+            "todos": [
+                { "content": "Read code",  "active_form": "Reading code",  "status": "completed" },
+                { "content": "Write tests","active_form": "Writing tests", "status": "in_progress" },
+            ]
+        });
+        let answer = todo_tool_impl(&bus, &pool, &args, thread_id)
+            .await
+            .expect("the write succeeds");
+
+        for expected in [
+            "Read code",
+            "Reading code",
+            "completed",
+            "Write tests",
+            "Writing tests",
+            "in_progress",
+        ] {
+            assert!(
+                answer.contains(expected),
+                "the answer dropped `{expected}`: {answer}"
+            );
+        }
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A read must be a read. Emitting anything here would rewrite the user's
+    /// panel and move the sequence the settle's race check is scoped to.
+    #[tokio::test]
+    async fn a_read_answers_with_the_list_and_writes_nothing() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, &pool, thread_id, &["in_progress", "pending"]).await;
+        let before = latest_todo_list(&pool, thread_id)
+            .await
+            .expect("the list reads")
+            .expect("a list was written");
+        drain_todo_events_for(&mut rx, thread_id).await;
+
+        let answer = todo_tool_impl(&bus, &pool, &json!({ "action": "read" }), thread_id)
+            .await
+            .expect("the read succeeds");
+        assert!(answer.contains("item 0"), "got: {answer}");
+        assert!(answer.contains("in_progress"), "got: {answer}");
+
+        assert_no_todo_cleanup(&mut rx, thread_id).await;
+        let after = latest_todo_list(&pool, thread_id)
+            .await
+            .expect("the list reads")
+            .expect("a list is still there");
+        assert_eq!(before, after, "the read moved the stored list");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The reported bug, from the agent's side. The settle wrote `abandoned`
+    /// over work the agent believes it finished, and until now nothing could
+    /// tell it so.
+    #[tokio::test]
+    async fn a_read_reports_the_statuses_the_engine_assigned() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, &pool, thread_id, &["completed", "in_progress"]).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
+        drain_todo_events_for(&mut rx, thread_id).await;
+
+        let answer = todo_tool_impl(&bus, &pool, &json!({ "action": "read" }), thread_id)
+            .await
+            .expect("the read succeeds");
+        assert!(answer.contains("abandoned"), "got: {answer}");
+        assert!(
+            answer.contains("are the engine's"),
+            "the read has to say whose status that is: {answer}"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Two shapes of nothing, and neither reads as a failure. A thread that
+    /// cleared its list is distinguishable from one that never had one.
+    #[tokio::test]
+    async fn a_read_of_no_list_says_so() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let never = todo_tool_impl(&bus, &pool, &json!({ "action": "read" }), thread_id)
+            .await
+            .expect("the read succeeds");
+        assert!(never.contains("No todo list"), "got: {never}");
+
+        todo_tool_impl(&bus, &pool, &json!({ "todos": [] }), thread_id)
+            .await
+            .expect("clear");
+        let cleared = todo_tool_impl(&bus, &pool, &json!({ "action": "read" }), thread_id)
+            .await
+            .expect("the read succeeds");
+        assert!(cleared.contains("empty"), "got: {cleared}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An action the handler does not know is refused, never read as the
+    /// default. Falling through would answer a misspelt `read` by clearing the
+    /// list, which is the one outcome nothing can walk back.
+    #[tokio::test]
+    async fn an_unknown_or_wrong_typed_action_is_refused() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, &pool, thread_id, &["in_progress"]).await;
+
+        for bad in [json!("reed"), json!("delete"), json!(42), json!(["read"])] {
+            let out = todo_tool_impl(&bus, &pool, &json!({ "action": bad }), thread_id).await;
+            assert!(
+                matches!(&out, Err(msg) if msg.contains("write") && msg.contains("read")),
+                "got: {:?}",
+                out,
+            );
+        }
+
+        let list = latest_todo_list(&pool, thread_id)
+            .await
+            .expect("the list reads")
+            .expect("a list is still there");
+        assert_eq!(list.items.len(), 1, "a refused call wrote something");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An explicit `null` action is absent, and absent is the write default.
+    /// Several SDKs serialise an omitted optional field that way, so refusing
+    /// it would cost a round and buy nothing: what a call destroys it says in
+    /// `todos`, never in `action`.
+    #[tokio::test]
+    async fn a_null_action_is_the_write_default() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let args = json!({
+            "action": null,
+            "todos": [
+                { "content": "a", "active_form": "doing a", "status": "pending" },
+            ]
+        });
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
+        assert!(
+            matches!(&out, Ok(s) if s.contains("Todo list updated")),
+            "got: {:?}",
+            out,
+        );
+
+        let list = latest_todo_list(&pool, thread_id)
+            .await
+            .expect("the list reads")
+            .expect("the write landed");
+        assert_eq!(list.items[0].content, "a");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A read carrying a list says two contradictory things, and honouring
+    /// either half silently is worse than refusing. Taking the read would leave
+    /// the panel untouched while handing back the OLD list, which is the drift
+    /// this whole surface exists to end.
+    #[tokio::test]
+    async fn a_read_carrying_a_list_is_refused() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, &pool, thread_id, &["in_progress"]).await;
+        let args = json!({
+            "action": "read",
+            "todos": [
+                { "content": "b", "active_form": "doing b", "status": "completed" },
+            ]
+        });
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("takes no `todos`")),
+            "got: {:?}",
+            out,
+        );
+
+        let list = latest_todo_list(&pool, thread_id)
+            .await
+            .expect("the list reads")
+            .expect("a list is still there");
+        assert_eq!(list.items[0].content, "item 0", "the refusal wrote nothing");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Each thread reads its own list and no other. `latest_todo_list` is the
+    /// only source, and it is scoped by `thread_id`.
+    #[tokio::test]
+    async fn a_read_sees_only_its_own_threads_list() {
+        let (bus, _rx, pool, db) = setup().await;
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+
+        todo_tool_impl(
+            &bus,
+            &pool,
+            &json!({"todos": [
+                { "content": "mine", "active_form": "doing mine", "status": "pending" },
+            ]}),
+            mine,
+        )
+        .await
+        .expect("write mine");
+        todo_tool_impl(
+            &bus,
+            &pool,
+            &json!({"todos": [
+                { "content": "theirs", "active_form": "doing theirs", "status": "pending" },
+            ]}),
+            theirs,
+        )
+        .await
+        .expect("write theirs");
+
+        let answer = todo_tool_impl(&bus, &pool, &json!({ "action": "read" }), mine)
+            .await
+            .expect("the read succeeds");
+        assert!(answer.contains("mine"), "got: {answer}");
+        assert!(!answer.contains("theirs"), "leaked another list: {answer}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    fn snapshot(statuses: &[TodoStatus]) -> TodoSnapshot {
+        TodoSnapshot {
+            items: statuses
+                .iter()
+                .enumerate()
+                .map(|(i, status)| TodoItem {
+                    content: format!("item {i}"),
+                    active_form: format!("doing item {i}"),
+                    status: *status,
+                })
+                .collect(),
+            notes: None,
+            sequence: 1,
+        }
+    }
+
+    /// A turn on a thread with nothing to reconcile pays nothing. Three shapes
+    /// qualify, and the all-completed one is the reason this is not
+    /// `TodoStatus::is_open`: a finished list has no drift to correct.
+    #[test]
+    fn the_turn_start_block_is_empty_when_there_is_nothing_to_reconcile() {
+        assert_eq!(turn_start_block(ContextMode::Off, None), "");
+        assert_eq!(turn_start_block(ContextMode::Off, Some(&snapshot(&[]))), "");
+        assert_eq!(
+            turn_start_block(
+                ContextMode::Off,
+                Some(&snapshot(&[TodoStatus::Completed, TodoStatus::Completed]))
+            ),
+            ""
+        );
+    }
+
+    /// Under the mode the checklist already renders inside the working
+    /// understanding, at the tail of every round. This block there would be a
+    /// second surface for one list, and a second thing to keep in step.
+    #[test]
+    fn the_turn_start_block_is_empty_under_the_context_mode() {
+        let unfinished = snapshot(&[TodoStatus::Abandoned]);
+        assert!(!turn_start_block(ContextMode::Off, Some(&unfinished)).is_empty());
+        assert_eq!(turn_start_block(ContextMode::On, Some(&unfinished)), "");
+    }
+
+    /// `Abandoned` is terminal to the settle, so it is the status the agent is
+    /// likeliest to be carrying wrongly. The block exists for it.
+    #[test]
+    fn the_turn_start_block_carries_a_settled_list() {
+        let block = turn_start_block(
+            ContextMode::Off,
+            Some(&snapshot(&[TodoStatus::Completed, TodoStatus::Abandoned])),
+        );
+        assert!(block.starts_with("[TODO LIST]"), "got: {block}");
+        assert!(block.ends_with("[END TODO LIST]"), "got: {block}");
+        assert!(block.contains("abandoned"), "got: {block}");
+        assert!(block.contains("are the engine's"), "got: {block}");
+        assert!(block.contains("doing item 1"), "got: {block}");
+    }
+
+    /// A list the agent is still working, with no engine status on it, needs no
+    /// explanation of statuses the engine never wrote.
+    #[test]
+    fn the_settle_note_appears_only_on_a_settled_list() {
+        let untouched = render_todo_list(&snapshot(&[TodoStatus::Pending]).items, None);
+        assert!(!untouched.contains("are the engine's"), "got: {untouched}");
+        let parked = render_todo_list(&snapshot(&[TodoStatus::Waiting]).items, None);
+        assert!(parked.contains("are the engine's"), "got: {parked}");
     }
 
     /// Read the notes off the newest list, which is what the prompt block does.
@@ -565,10 +1083,10 @@ mod tests {
             ],
             "notes": "collect.sh needs bash 5, /opt/homebrew/bin/bash works",
         });
-        let out = todo_write_impl(&bus, &with_notes, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &with_notes, thread_id).await;
         assert!(
-            matches!(&out, Ok(s) if s.contains("notes kept")),
-            "got: {:?}",
+            matches!(&out, Ok(s) if s.contains("Notes: collect.sh needs bash 5")),
+            "the answer carries the notes back, got: {:?}",
             out
         );
         assert_eq!(
@@ -584,7 +1102,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "completed" },
             ]
         });
-        todo_write_impl(&bus, &without, thread_id)
+        todo_tool_impl(&bus, &pool, &without, thread_id)
             .await
             .expect("second write");
         assert_eq!(latest_notes(&pool, thread_id).await, None);
@@ -601,9 +1119,9 @@ mod tests {
         let thread_id = Uuid::new_v4();
 
         let args = json!({ "todos": [], "notes": "   \n  " });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
-            matches!(&out, Ok(s) if !s.contains("notes kept")),
+            matches!(&out, Ok(s) if !s.contains("Notes:")),
             "got: {:?}",
             out
         );
@@ -623,12 +1141,18 @@ mod tests {
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        todo_write_impl(&bus, &json!({"todos": [], "notes": "kept"}), thread_id)
-            .await
-            .expect("seed write");
+        todo_tool_impl(
+            &bus,
+            &pool,
+            &json!({"todos": [], "notes": "kept"}),
+            thread_id,
+        )
+        .await
+        .expect("seed write");
 
         for bad in [json!(42), json!(["a"]), json!({"text": "a"}), json!(true)] {
-            let out = todo_write_impl(&bus, &json!({"todos": [], "notes": bad}), thread_id).await;
+            let out =
+                todo_tool_impl(&bus, &pool, &json!({"todos": [], "notes": bad}), thread_id).await;
             assert!(
                 matches!(&out, Err(msg) if msg.contains("`notes` must be a string")),
                 "got: {:?}",
@@ -642,7 +1166,7 @@ mod tests {
         );
 
         // Explicit null is the model saying "no notes", not a type error.
-        todo_write_impl(&bus, &json!({"todos": [], "notes": null}), thread_id)
+        todo_tool_impl(&bus, &pool, &json!({"todos": [], "notes": null}), thread_id)
             .await
             .expect("null clears");
         assert_eq!(latest_notes(&pool, thread_id).await, None);
@@ -665,7 +1189,7 @@ mod tests {
             ],
             "notes": "the report is at artifacts/reports/week.md",
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -688,9 +1212,9 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        let out = todo_write_impl(&bus, &json!({"todos": []}), thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &json!({"todos": []}), thread_id).await;
         assert!(
-            matches!(&out, Ok(s) if s.contains("0 items")),
+            matches!(&out, Ok(s) if s.contains("cleared")),
             "got: {:?}",
             out
         );
@@ -702,17 +1226,24 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    /// `todos` left the schema's `required` array so `read` can omit it, which
+    /// makes the handler the only gate on it. The refusal names the one action
+    /// that may leave it out. Otherwise a model that dropped it by accident
+    /// reads the error as "this tool no longer takes a list".
     #[tokio::test]
     async fn todo_write_rejects_missing_todos_field() {
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        let out = todo_write_impl(&bus, &json!({}), thread_id).await;
-        assert!(
-            matches!(&out, Err(msg) if msg.contains("`todos` is required")),
-            "got: {:?}",
-            out,
-        );
+        for args in [json!({}), json!({ "action": "write" })] {
+            let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
+            assert!(
+                matches!(&out, Err(msg) if msg.contains("`todos` is required")
+                    && msg.contains("read")),
+                "got: {:?}",
+                out,
+            );
+        }
 
         pool.close().await;
         teardown_test_db(&db).await;
@@ -723,7 +1254,7 @@ mod tests {
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        let out = todo_write_impl(&bus, &json!({"todos": "nope"}), thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &json!({"todos": "nope"}), thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("must be an array")),
             "got: {:?}",
@@ -747,7 +1278,7 @@ mod tests {
                 "status": "pending",
             }));
         }
-        let out = todo_write_impl(&bus, &json!({"todos": items}), thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &json!({"todos": items}), thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("too many") && msg.contains("max is 50")),
             "got: {:?}",
@@ -769,7 +1300,7 @@ mod tests {
                 { "content": "b", "active_form": "doing b", "status": "in_progress" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("at most one") && msg.contains("in_progress")),
             "got: {:?}",
@@ -790,7 +1321,7 @@ mod tests {
                 { "content": "   ", "active_form": "doing a", "status": "pending" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("empty `content`")),
             "got: {:?}",
@@ -811,7 +1342,7 @@ mod tests {
                 { "content": "a", "active_form": "", "status": "pending" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("empty `active_form`")),
             "got: {:?}",
@@ -832,7 +1363,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "blocked" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("invalid") || msg.contains("status")),
             "got: {:?}",
@@ -918,7 +1449,7 @@ mod tests {
                 { "content": "b", "active_form": "doing b", "status": "completed" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -935,7 +1466,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        todo_write_impl(&bus, &json!({"todos": []}), thread_id)
+        todo_tool_impl(&bus, &pool, &json!({"todos": []}), thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -959,7 +1490,7 @@ mod tests {
                 { "content": "c", "active_form": "doing c", "status": "pending" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -994,7 +1525,7 @@ mod tests {
                 { "content": "b", "active_form": "doing b", "status": "pending" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -1024,7 +1555,7 @@ mod tests {
                 { "content": "b", "active_form": "doing b", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -1053,7 +1584,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &stale, thread_id)
+        todo_tool_impl(&bus, &pool, &stale, thread_id)
             .await
             .expect("seed stale");
 
@@ -1062,7 +1593,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "completed" },
             ]
         });
-        todo_write_impl(&bus, &fresh, thread_id)
+        todo_tool_impl(&bus, &pool, &fresh, thread_id)
             .await
             .expect("seed fresh");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -1089,7 +1620,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &stale, thread_id)
+        todo_tool_impl(&bus, &pool, &stale, thread_id)
             .await
             .expect("seed stale");
 
@@ -1111,7 +1642,7 @@ mod tests {
                 { "content": "c", "active_form": "doing c", "status": "pending" },
             ]
         });
-        todo_write_impl(&bus, &fresh, thread_id)
+        todo_tool_impl(&bus, &pool, &fresh, thread_id)
             .await
             .expect("seed fresh");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -1135,7 +1666,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "abandoned" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("abandoned") && msg.contains("engine-only")),
             "got: {:?}",
@@ -1159,7 +1690,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "waiting" },
             ]
         });
-        let out = todo_write_impl(&bus, &args, thread_id).await;
+        let out = todo_tool_impl(&bus, &pool, &args, thread_id).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("waiting") && msg.contains("engine-only")),
             "got: {:?}",
@@ -1236,7 +1767,7 @@ mod tests {
                 { "content": "c", "active_form": "doing c", "status": "pending" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         seed_event_wait(&bus, thread_id).await;
@@ -1278,7 +1809,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         let wait_id = seed_event_wait(&bus, thread_id).await;
@@ -1318,7 +1849,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         let wait_id = seed_event_wait(&bus, thread_id).await;
@@ -1357,7 +1888,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         seed_event_wait(&bus, thread_id).await;
@@ -1386,7 +1917,7 @@ mod tests {
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(&bus, &args, thread_id)
+        todo_tool_impl(&bus, &pool, &args, thread_id)
             .await
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
@@ -1407,7 +1938,7 @@ mod tests {
 
     // ---- The wake check's half of the question: how much is still open.
 
-    async fn seed_list(bus: &EventBus, thread_id: Uuid, statuses: &[&str]) {
+    async fn seed_list(bus: &EventBus, pool: &sqlx::PgPool, thread_id: Uuid, statuses: &[&str]) {
         let todos: Vec<_> = statuses
             .iter()
             .enumerate()
@@ -1419,7 +1950,7 @@ mod tests {
                 })
             })
             .collect();
-        todo_write_impl(bus, &json!({ "todos": todos }), thread_id)
+        todo_tool_impl(bus, pool, &json!({ "todos": todos }), thread_id)
             .await
             .expect("seed write");
     }
@@ -1440,17 +1971,17 @@ mod tests {
         assert_eq!(count_open(&pool, never_wrote).await, 0, "no list ever");
 
         let cleared = Uuid::new_v4();
-        seed_list(&bus, cleared, &[]).await;
+        seed_list(&bus, &pool, cleared, &[]).await;
         assert_eq!(count_open(&pool, cleared).await, 0, "list cleared");
 
         let finished = Uuid::new_v4();
-        seed_list(&bus, finished, &["completed", "completed"]).await;
+        seed_list(&bus, &pool, finished, &["completed", "completed"]).await;
         assert_eq!(count_open(&pool, finished).await, 0, "all completed");
 
         // Already settled by an earlier terminator. `Abandoned` is terminal, so
         // it must not re-trigger the check on every later turn of the thread.
         let walked_away = Uuid::new_v4();
-        seed_list(&bus, walked_away, &["completed", "in_progress"]).await;
+        seed_list(&bus, &pool, walked_away, &["completed", "in_progress"]).await;
         settle_open_todos(&bus, &pool, walked_away, i64::MAX, false).await;
         assert_eq!(count_open(&pool, walked_away).await, 0, "already abandoned");
 
@@ -1465,6 +1996,7 @@ mod tests {
 
         seed_list(
             &bus,
+            &pool,
             thread_id,
             &["completed", "in_progress", "pending", "pending"],
         )
@@ -1486,7 +2018,7 @@ mod tests {
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_list(&bus, thread_id, &["completed", "in_progress"]).await;
+        seed_list(&bus, &pool, thread_id, &["completed", "in_progress"]).await;
         seed_event_wait(&bus, thread_id).await;
         settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
 
@@ -1504,8 +2036,14 @@ mod tests {
         let (bus, _rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_list(&bus, thread_id, &["in_progress", "pending", "pending"]).await;
-        seed_list(&bus, thread_id, &["completed"]).await;
+        seed_list(
+            &bus,
+            &pool,
+            thread_id,
+            &["in_progress", "pending", "pending"],
+        )
+        .await;
+        seed_list(&bus, &pool, thread_id, &["completed"]).await;
 
         assert_eq!(count_open(&pool, thread_id).await, 0);
 

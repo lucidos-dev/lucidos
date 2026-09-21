@@ -1,7 +1,7 @@
-import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, enginePendingCommits, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
-import { initiateEngineRestart } from './chat-changes';
+import { confirmAndRestartEngine } from './chat-changes';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
 import { syncBackgroundActivityToast } from './backgroundActivity';
 import { errorDetail } from '../../utils/errorDetail';
@@ -44,8 +44,17 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
  *
  *  `anchoredAt` is stamped HERE, from the client clock, right as the response
  *  lands: the counter then advances as `elapsedMs + (now - anchoredAt)` and never
- *  subtracts an engine timestamp from a browser one. */
-function setEngineBuilding(building: boolean, status?: EngineVersionStatus): void {
+ *  subtracts an engine timestamp from a browser one.
+ *
+ *  `commits` is passed in rather than re-derived from `status`, so the range the
+ *  toast narrates is literally the one the poll already published to
+ *  `enginePendingCommits`. Deriving one payload twice is how two copies of it
+ *  drift apart. */
+function setEngineBuilding(
+  building: boolean,
+  status?: EngineVersionStatus,
+  commits: PendingCommits | null = null,
+): void {
   engineBuilding.value = building;
   if (!building) {
     engineBuildDetail.value = null;
@@ -54,15 +63,15 @@ function setEngineBuilding(building: boolean, status?: EngineVersionStatus): voi
   engineBuildDetail.value = {
     elapsedMs: status?.build_elapsed_ms ?? null,
     anchoredAt: Date.now(),
-    pendingCommits: groupedCommits(status?.pending_commits),
+    pendingCommits: commits,
   };
 }
 
 /** The wire's pending-commits payload, or `null` when this engine cannot speak
  *  the grouped shape.
  *
- *  This is the ONE place a version-status response becomes store state, so it is
- *  where a cross-version payload has to be caught. A new frontend against an OLD
+ *  Every store write of this payload goes through here, so it is the one place a
+ *  cross-version response has to be caught. A new frontend against an OLD
  *  engine is not a race here, it is the ordinary state of the very window this
  *  toast narrates: an Apply rebuilds and republishes `dist/` in seconds while
  *  the engine binary keeps serving the old version until the user clicks
@@ -118,7 +127,9 @@ type VersionAnnouncement = 'ready' | 'pending' | 'wedged';
  *  worth distinguishing:
  *
  *  - **ready**: a built version is waiting, so offer the Switch, and a "Later"
- *    that defers it.
+ *    that defers it. The Switch opens the confirm rather than restarting on the
+ *    spot, so the version can be read before it is taken. Same pattern as
+ *    Settings' own Restart Engine button, and the same dialog.
  *  - **pending**: new code exists with no version behind it, so offer the
  *    Rebuild that produces one, and the same "Later".
  *  - **wedged**: the same as pending except a rebuild has already been proved
@@ -141,7 +152,7 @@ function renderVersionToast(shape: VersionAnnouncement): void {
       secondaryAction: later,
       action: {
         label: 'Switch to new version',
-        onClick: () => { void initiateEngineRestart(); },
+        onClick: () => { void confirmAndRestartEngine(); },
       },
     });
     return;
@@ -336,6 +347,13 @@ async function pollEngineVersion(): Promise<void> {
     console.warn('[engine-update] version-status poll failed; will retry', e);
     return;
   }
+  // The ONE write of the pending range, before every branch below, so no exit
+  // path can leave yesterday's range standing. A packaged engine reports none,
+  // which clears it here rather than needing its own line in the branch that
+  // follows. A poll that THREW is deliberately not here: it says nothing about
+  // the range, and the next one four seconds later corrects it.
+  const pendingCommits = groupedCommits(status.pending_commits);
+  enginePendingCommits.value = pendingCommits;
   // Packaged builds never run a background rebuild — the spinning-build badge is
   // a dev-only affordance.
   if (status.packaged) {
@@ -472,6 +490,7 @@ async function pollEngineVersion(): Promise<void> {
         !status.update_available &&
         status.build_state === 'idle'),
     status,
+    pendingCommits,
   );
 }
 
@@ -529,6 +548,12 @@ export interface FrontendUpdateStrandedPayload {
    *  file it reads. Present, it is the actual answer to "why did nothing
    *  appear", so it replaces the guess. */
   build_error?: string;
+  /** Whether the build-watch is positively known to have STOPPED, from its
+   *  pidfile. The status file cannot say: it records the last COMPLETED build,
+   *  so a watch that died leaves a healthy one behind and the engine reads no
+   *  error at all. Optional because an older engine paired with this client
+   *  never sends it, and false-or-absent both mean "not claiming that". */
+  build_watch_stopped?: boolean;
   /** Engine wall-clock (ms) at emit time. Drives the freshness gate. */
   sent_at_ms: number;
 }
@@ -599,15 +624,24 @@ export function handleFrontendUpdateDeferred(payload: FrontendUpdateDeferredPayl
  *  the stack was already fixed shouldn't raise a now-false alarm. */
 /** Pure: what to tell the user about a stranded frontend Apply.
  *
- *  Three cases, and the order matters. A worktree-pinned stack is permanent and
- *  keeps its own advice. A reported build failure is the actual answer, so it
- *  replaces the guess rather than being appended to it. Everything else keeps
- *  the recoverable wording, which must not claim the change is lost.
+ *  Four cases, and the order matters. A worktree-pinned stack is permanent and
+ *  keeps its own advice, whatever the build-watch is doing. A STOPPED watch
+ *  comes next: it is retrying nothing, so the reason it last recorded describes
+ *  a build nobody will repeat. A reported build failure is then the actual
+ *  answer, so it replaces the guess rather than being appended to it.
+ *  Everything else keeps the recoverable wording, which must not claim the
+ *  change is lost.
  *
- *  Exported so all three are testable without a toast. */
+ *  Only the last of the four may promise the change arrives on its own. Saying
+ *  that over a stopped watch is what made the incident a five-hour puzzle.
+ *
+ *  Exported so all four are testable without a toast. */
 export function strandedMessage(payload: FrontendUpdateStrandedPayload): string {
   if (payload.served_in_worktree) {
     return `Frontend change applied but it will not appear: the engine is serving a coding-agent worktree (${payload.served_dir}), which the build-watch never rebuilds. Relaunch the stack from the real checkout.`;
+  }
+  if (payload.build_watch_stopped) {
+    return `Frontend change applied but nothing is rebuilding: the build-watch is not running, so ${payload.served_dir} will stay as it is. Relaunch the stack to restart it.`;
   }
   const failure = payload.build_error?.trim();
   if (failure) {

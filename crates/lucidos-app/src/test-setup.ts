@@ -142,6 +142,14 @@ if (typeof globalThis.matchMedia === 'undefined') {
     dispatchEvent: () => false,
   });
 }
+// jsdom implements no layout, so `Element.scrollIntoView` is missing outright
+// rather than being a no-op. Any component keeping a highlighted row in view
+// then throws instead of rendering, which is a crash about nothing: there is no
+// viewport to scroll. The model-selection picker is the worked example.
+if (typeof (globalThis as any).Element !== 'undefined'
+  && typeof (globalThis as any).Element.prototype.scrollIntoView !== 'function') {
+  (globalThis as any).Element.prototype.scrollIntoView = () => {};
+}
 if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
   (globalThis as any).cancelAnimationFrame = () => {};

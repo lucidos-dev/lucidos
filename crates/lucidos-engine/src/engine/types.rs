@@ -322,9 +322,17 @@ pub enum ContextPurpose {
     /// inferring it from payload size.
     ///
     /// Standing invariant: **one purpose per auxiliary model preference**. This
-    /// one owns `model_conversation_summary`; `Memory` keeps the other two
-    /// jobs, which still share `model_memory`.
+    /// one owns `model_conversation_summary`, and `Memory` is fact extraction
+    /// alone now that [`Self::QueryClassification`] has its own key too.
     ConversationSummary,
+    /// The three yes/no questions in front of memory retrieval.
+    ///
+    /// It owns `model_query_classification`, which falls back to `model_memory`
+    /// while unset. Split out for the reason the summariser was, plus one of its
+    /// own. The user can point it at a different BACKEND
+    /// (`judgment_query_classification`, ADR 0220), and a backend is chosen in
+    /// the same control the model is.
+    QueryClassification,
     ImageGen,
     /// One reply from a voice session's rented *talker* (ADR 0149).
     ///
@@ -351,6 +359,7 @@ impl ContextPurpose {
             Self::ImageDescribe => "Image Description Request",
             Self::Memory => "Memory Request",
             Self::ConversationSummary => "Conversation Summary Request",
+            Self::QueryClassification => "Query Classification Request",
             Self::ImageGen => "Image Generation Request",
             Self::Voice => "Voice Reply",
         }

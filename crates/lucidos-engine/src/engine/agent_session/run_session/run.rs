@@ -2692,6 +2692,19 @@ pub(super) struct ResumeSpawnContext<'a> {
     pub session_branch: Option<&'a str>,
 }
 
+/// Closing line of the resume-note block, between the notes and the user's
+/// message.
+///
+/// The notes quote commit subjects, branch names and file paths. They land in
+/// the topic position, right before a message that is often a few words leaning
+/// on a pronoun. Those nouns then compete for the pronoun and win. After the
+/// Diff-button change applied, a request for more height bound to the note's
+/// "composer's Diff". The agent grew the composer rather than the glyph.
+pub(super) const RESUME_NOTE_REFERENT_GUARD: &str =
+    "[The lines above are engine status, not the topic. The user's message follows. \
+     Resolve its pronouns against the conversation you have already had, not against \
+     anything named above.]";
+
 /// Build the text handed to the resumed agent's input channel: the user's
 /// message, optionally prefixed with up to three resume-time notes that
 /// reconcile what changed while the agent was idle:
@@ -2708,6 +2721,9 @@ pub(super) struct ResumeSpawnContext<'a> {
 /// and the edit detector cannot tell the difference. The turn-gap note states
 /// the real cause, so it passes `explains_worktree_reset` down and the edit
 /// note drops that one line.
+///
+/// A non-empty block closes with [`RESUME_NOTE_REFERENT_GUARD`], so the notes
+/// cannot be read as the subject of the message they precede.
 ///
 /// An empty `user_message` passes through untouched: notes only ride on a real
 /// turn, so they cannot trigger an otherwise-empty LLM call.
@@ -2774,7 +2790,7 @@ pub(super) async fn build_resume_prompt_text(
         thread_id,
         block.len()
     );
-    format!("{}\n\n{}", block, user_message)
+    format!("{block}\n{RESUME_NOTE_REFERENT_GUARD}\n\n{user_message}")
 }
 
 #[cfg(test)]

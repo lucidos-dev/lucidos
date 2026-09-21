@@ -31,6 +31,7 @@ pub mod plugins;
 pub mod preference_catalog;
 pub mod preferences;
 pub mod repositories;
+pub mod response_style;
 pub mod shell;
 pub mod slug;
 pub mod store;
@@ -40,6 +41,7 @@ pub mod user_path;
 pub mod webhook_deliveries;
 pub mod webhook_ingress;
 pub mod webhook_probe_token;
+pub mod webhook_refusal;
 pub mod webhooks;
 
 use std::borrow::Cow;
@@ -208,6 +210,40 @@ pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
         }
     }
     out
+}
+
+/// The secret VALUES among a spawned tool's injected environment, ready for
+/// [`redact_secret_values`].
+///
+/// `build_script_env_vars` injects every credential and OAuth token into a
+/// child whose output becomes a tool result, a persisted event, or a trigger
+/// summary. So this is where `system-knowhow/best-practices.md`'s promise that
+/// a credential is "kept out of the event log" is won or lost. A verbose curl
+/// and `env` both echo it. Selecting by value covers a credential's custom
+/// env-var alias for free, since the alias carries the same string.
+///
+/// Every caller handing a child's output on masks with this, except
+/// `api::proxy_script_runner`, which builds its own wider list. Masking by
+/// value has three holes, none closable here. A token can split across two
+/// drain windows, or be cut by `Stream::push` trimming its front. And
+/// `runtime::python` writes a raw copy under `.lucidos/exhaust/` first.
+///
+/// A `CRED_*_USERNAME`, an `OAUTH_*_EMAIL` and `PGPASSWORD` are deliberately
+/// not secrets. Masking by value is safe only while the value is unique, and
+/// every dev workspace's Postgres password is the literal `lucidos`: also the
+/// user, the database and every path. [`redact_postgres_secrets`] covers that.
+pub fn injected_secret_values(env_vars: &[(String, String)]) -> Vec<String> {
+    env_vars
+        .iter()
+        .filter(|(key, _)| {
+            (key.starts_with("CRED_") && !key.ends_with("_USERNAME"))
+                || (key.starts_with("OAUTH_") && key.ends_with("_ACCESS_TOKEN"))
+                // Engine-minted, thread-bound, and accepted on every mutating
+                // route, so it is a credential in the sense that matters here.
+                || key == "LUCIDOS_AGENT_ORIGIN_TOKEN"
+        })
+        .map(|(_, value)| value.clone())
+        .collect()
 }
 
 /// Directory structure within workspace/data/
@@ -433,16 +469,18 @@ pub use preferences::{
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_VERTEX_REGION, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL,
     PREF_CHAT_REASONING_EFFORT, PREF_CODING_AGENT_CLAUDE_PATH,
     PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE, PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL,
-    PREF_LOCAL_BASE_URL, PREF_MAX_TOOL_CALLS, PREF_MODEL_COMMAND_JUDGE,
-    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
+    PREF_JUDGMENT_COMMAND_GUARD, PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL,
+    PREF_MAX_TOOL_CALLS, PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY,
+    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION,
     PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER, PREF_MODEL_VOICE_TRANSCRIBER,
     PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC, PREF_PROVIDER_ENABLED_LOCAL,
-    PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER, PREF_PROVIDER_ENABLED_VERTEX,
-    PREF_PROVIDER_ENABLED_XAI, PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
-    PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_TITLE,
-    PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS, PREF_SELF_CURATED_CONTEXT_MODE,
-    PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS, PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS,
-    PREF_VOICE_TALKER_VOICE,
+    PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER, PREF_PROVIDER_ENABLED_TYPESAFE,
+    PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI, PREF_REASONING_COMMAND_JUDGE,
+    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
+    PREF_REASONING_QUERY_CLASSIFICATION, PREF_REASONING_TITLE, PREF_RESPONSE_STYLE,
+    PREF_RESPONSE_STYLES, PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
+    PREF_SELF_CURATED_CONTEXT_MODE, PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
+    PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
@@ -1660,9 +1698,19 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some(true) => "Stopping every subscription on this thread...".to_string(),
             _ => "Stopping a subscription...".to_string(),
         },
+        // The read action writes nothing, so the row must not claim it did.
+        "todo_write" if args["action"] == "read" => "Reading todo list...".to_string(),
         "todo_write" => match args["todos"].as_array() {
             Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
             _ => "Updating todo list...".to_string(),
+        },
+        // The count, because the whole shape of this tool is one call carrying
+        // many questions. A label naming the state instead would report a
+        // fifty-question batch the same way it reports one.
+        "judge" => match args["questions"].as_object().map(|q| q.len()) {
+            Some(1) => "Judging 1 question...".to_string(),
+            Some(n) => format!("Judging {} questions...", n),
+            None => "Judging...".to_string(),
         },
         "save_thread_image" => format!(
             "Saving image to {}...",

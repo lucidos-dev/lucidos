@@ -141,12 +141,20 @@ message when a matching event lands, or tells you the deadline passed. Wraps
 `POST /api/v1/threads/<id>/event-waits`; `$LUCIDOS_THREAD_ID` names the thread.
 
 ```bash
-# Spawn a sidequest, subscribe to its completion, and STOP.
-$ lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
-    --title "Run the e2e suite" --message "Run ./scripts/e2e.sh and report."
-$ lucidos await-event --on ChildThreadCompleted --timeout-secs 5400 \
-    --reason "the e2e sidequest to report"
+# Watch a session ANOTHER thread spawned, then STOP.
+$ lucidos await-event --on ChildThreadCompleted \
+    --condition '{"child_thread_id": "<uuid>"}' --timeout-secs 5400 \
+    --reason "the e2e session to report"
+
+# A session nobody spawned emits no completion. Watch its turn boundary.
+$ lucidos await-event --on CodingAgentIdled \
+    --condition '{"thread_id": "<uuid>"}' --timeout-secs 5400 \
+    --reason "the e2e session to go idle"
 ```
+
+**Never await your own child.** A `--relation child` spawn already re-opens this
+thread with the child's result, so the wait buys nothing. Its timeout also wakes
+you a second time, for nothing.
 
 `--reason` names **what** you await, not the fact that you await it. The
 transcript labels it `Set up an event wait: <reason>`, so a reason opening with

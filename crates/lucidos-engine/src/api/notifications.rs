@@ -292,6 +292,16 @@ pub(super) async fn push_subscribe(
     headers: HeaderMap,
     Json(request): Json<PushSubscribeRequest>,
 ) -> Json<ApiResult> {
+    // Refused BEFORE the store runs, because `subscribe` deletes the device's
+    // existing row before inserting: an endpoint we would not deliver to must
+    // not be able to take the real subscription down with it.
+    if !push_endpoint_is_deliverable(&request.endpoint) {
+        return ApiResult::err(
+            "A push endpoint must be an https URL on a public host. \
+             This one is not, so nothing was stored."
+                .to_string(),
+        );
+    }
     let scope_url = sanitize_push_scope_url(request.scope_url, &headers);
     let sub = PushSubscription {
         endpoint: request.endpoint,
@@ -304,6 +314,46 @@ pub(super) async fn push_subscribe(
         Ok(()) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to store subscription: {}", e)),
     }
+}
+
+/// Can the engine deliver to this push endpoint at all?
+///
+/// The endpoint is the address every notification for the device is POSTed to
+/// (`fan_out_to_web_push`), and it arrived in a request body. Stored unchecked,
+/// it is two things at once: an exfiltration channel for every notification
+/// title and body, and an outbound-request primitive aimed wherever the caller
+/// likes. A real push service is always an https URL on a public host, so
+/// nothing legitimate is lost by saying so.
+///
+/// Deliberately a shape check rather than a host allow-list. The set of push
+/// services is not ours to freeze, and a stale allow-list breaks the browsers
+/// we never heard of.
+fn push_endpoint_is_deliverable(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    // `domain()` is `None` for an IPv4 or IPv6 literal, which is how loopback,
+    // the private ranges and link-local metadata are reached. A bare IP is
+    // never a push service. Letting the parser make that call is shorter and
+    // more correct than re-deriving it from `host_str`.
+    let Some(domain) = url.domain() else {
+        return false;
+    };
+    // A fully-qualified name keeps its root dot, and `localhost.` resolves
+    // exactly where `localhost` does. Drop it before comparing, or every
+    // reserved name below is bypassed by typing one more character.
+    let host = domain.trim_end_matches('.').to_ascii_lowercase();
+    // A name still has to look routable. A single label, `localhost`, and the
+    // reserved suffixes below all resolve inside the host's own network, which
+    // is the SSRF half of the same hole.
+    host.contains('.')
+        && host != "localhost"
+        && !host.ends_with(".localhost")
+        && !host.ends_with(".local")
+        && !host.ends_with(".internal")
 }
 
 fn sanitize_push_scope_url(raw: Option<String>, headers: &HeaderMap) -> Option<String> {
@@ -451,6 +501,81 @@ mod tests {
             h.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
         }
         h
+    }
+
+    /// This file with its test module cut off. Uncut, the scan below matches
+    /// its own fixture strings and passes while the handler has lost the gate.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("api/notifications.rs"),
+        )
+    }
+
+    /// The refusal runs BEFORE the store, because storing deletes first.
+    ///
+    /// `PushSubscriptionStore::subscribe` drops every row for the device id
+    /// and then inserts. Checking after the call would still silence the
+    /// phone, which is half the harm.
+    #[test]
+    fn push_subscribe_refuses_the_endpoint_before_it_reaches_the_store() {
+        let src = production_src();
+        let at = src
+            .find("pub(super) async fn push_subscribe")
+            .expect("push_subscribe is still here");
+        let body = &src[at..];
+        let guard = body
+            .find("push_endpoint_is_deliverable(&request.endpoint)")
+            .expect("push_subscribe must check the endpoint it is handed");
+        let store = body
+            .find("PushSubscriptionStore::subscribe")
+            .expect("push_subscribe still writes through the store");
+        assert!(
+            guard < store,
+            "the refusal must precede the delete-then-insert"
+        );
+    }
+
+    #[test]
+    fn push_endpoint_is_deliverable_accepts_the_real_push_services() {
+        for endpoint in [
+            "https://fcm.googleapis.com/fcm/send/abc123",
+            "https://web.push.apple.com/QAbc-123",
+            "https://updates.push.services.mozilla.com/wpush/v2/gAA",
+        ] {
+            assert!(push_endpoint_is_deliverable(endpoint), "{endpoint}");
+        }
+    }
+
+    /// The endpoint is where every notification for the device is POSTed, so a
+    /// caller-chosen one is both an exfiltration channel and an outbound-request
+    /// primitive. Storing it also DELETES the device's real subscription.
+    #[test]
+    fn push_endpoint_is_deliverable_refuses_a_redirected_or_internal_target() {
+        for endpoint in [
+            // Plain http, so the payload is readable in transit too.
+            "http://fcm.googleapis.com/fcm/send/abc",
+            // A bare IP reaches loopback, the private ranges and link-local.
+            "https://127.0.0.1:8080/p",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/p",
+            // Names that resolve inside the host's own network.
+            "https://localhost/p",
+            "https://engine.local/p",
+            "https://metadata.internal/p",
+            // The same names fully qualified. A root dot resolves identically,
+            // so a check that compares the raw host is bypassed by one keystroke.
+            "https://localhost./p",
+            "https://engine.local./p",
+            "https://metadata.internal./p",
+            // A single-label name is not routable on the public internet.
+            "https://intranet/p",
+            // Not a URL, and a scheme that is not a fetch at all.
+            "file:///etc/passwd",
+            "not a url",
+            "",
+        ] {
+            assert!(!push_endpoint_is_deliverable(endpoint), "{endpoint}");
+        }
     }
 
     #[test]

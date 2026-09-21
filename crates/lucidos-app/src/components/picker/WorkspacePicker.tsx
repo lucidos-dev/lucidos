@@ -37,7 +37,7 @@ import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { isInteractiveTarget } from '../../utils/dom';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
-import { pushTrafficLightOffset } from '../../store/actions/trafficLights';
+import { watchTitlebarBand } from '../../store/actions/trafficLights';
 import { applyAppBadge } from '../../store/actions/app-badge';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import {
@@ -848,15 +848,10 @@ export function WorkspacePicker() {
   useWindowDragRegion(pickerRef, { canStart: pickerCanDragStart });
 
   // Packaged macOS: tell the shell where THIS surface's title-bar band ends, so
-  // it centres the traffic lights on a bar the picker actually has. Nothing else
-  // pushes here: `pushTrafficLightOffset` otherwise rides `applyUiScale`, which
-  // only the app shell's preferences load reaches. Once, because the band is a
-  // fixed rem height and the picker never changes its root font size. So a
-  // failed push is not retried here, unlike in the app shell: the shell keeps
-  // its seed, and the lights are a few points off until the next launch.
-  useEffect(() => {
-    if (pickerEl) pushTrafficLightOffset();
-  }, [pickerEl]);
+  // it centres the traffic lights on a bar the picker actually has. Keyed on the
+  // picker element, since the band is mounted by the same render and there is
+  // nothing to observe before it. See `watchTitlebarBand`.
+  useEffect(() => (pickerEl ? watchTitlebarBand() : undefined), [pickerEl]);
 
   // Smart-root auto-open in progress: render nothing so the inline boot splash
   // (index.html, kept up by the effect above) stays the only thing on screen —

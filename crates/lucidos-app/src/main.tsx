@@ -25,6 +25,7 @@ import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
 import { takePairingCodeFromUrl } from './utils/pairingCodeSeed';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
+import { installMainThreadStallProbe } from './utils/mainThreadStall';
 import './styles/global.css';
 import './styles/picker.css';
 import './styles/header.css';
@@ -243,8 +244,13 @@ async function boot() {
     // next time (see lastWorkspace.ts).
     if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
     // Permanent, not dev-only, and quiet until something crosses a threshold
-    // (utils/perfProbe.ts).
-    if (!IS_PICKER) startPerfProbe();
+    // (utils/perfProbe.ts). The stall probe is its WebKit half, where neither
+    // longtask nor Long Animation Frames exists; it schedules nothing until perf
+    // recording is switched on (utils/mainThreadStall.ts).
+    if (!IS_PICKER) {
+      startPerfProbe();
+      installMainThreadStallProbe();
+    }
     render(
       IS_PICKER ? (
         // The picker shell is the one surface the gateway serves without a

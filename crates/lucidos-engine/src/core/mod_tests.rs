@@ -173,6 +173,96 @@ fn redact_secret_values_leaves_text_without_secrets_alone() {
 }
 
 #[test]
+fn injected_secret_values_picks_the_secret_bearing_names_only() {
+    let env = vec![
+        ("CRED_GITHUB".to_string(), "ghp_tokenvalue".to_string()),
+        ("GITHUB_TOKEN".to_string(), "ghp_tokenvalue".to_string()),
+        ("CRED_DB_USERNAME".to_string(), "reporter".to_string()),
+        ("CRED_DB_PASSWORD".to_string(), "hunter2pw".to_string()),
+        (
+            "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
+            "ya29.opaque".to_string(),
+        ),
+        (
+            "OAUTH_GOOGLE_EMAIL".to_string(),
+            "user@example.com".to_string(),
+        ),
+        (
+            "LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(),
+            "aa11bb22cc33dd44".to_string(),
+        ),
+        ("LUCIDOS_WORKSPACE".to_string(), "/Users/me/ws".to_string()),
+    ];
+    let mut picked = injected_secret_values(&env);
+    picked.sort();
+    assert_eq!(
+        picked,
+        vec![
+            "aa11bb22cc33dd44".to_string(),
+            "ghp_tokenvalue".to_string(),
+            "hunter2pw".to_string(),
+            "ya29.opaque".to_string(),
+        ],
+        "a username, an OAuth email and the workspace path are not secrets"
+    );
+}
+
+/// The redaction must never rewrite a word the tool output legitimately uses.
+///
+/// Masking by value is safe only while the value is unique to the secret. Every
+/// dev and e2e workspace uses the literal Postgres password `lucidos`. So does
+/// the user, the database, the binary and every path. Masking it turned
+/// `ls ~/workspaces/dev` into a listing of `[REDACTED]`.
+#[test]
+fn injected_secret_values_leaves_the_postgres_password_alone() {
+    let env = vec![
+        ("PGUSER".to_string(), "lucidos".to_string()),
+        ("PGPASSWORD".to_string(), "lucidos".to_string()),
+        ("PGDATABASE".to_string(), "lucidos_dev".to_string()),
+        ("CRED_REAL".to_string(), "ghp_uniquevalue".to_string()),
+    ];
+    assert_eq!(
+        injected_secret_values(&env),
+        vec!["ghp_uniquevalue".to_string()],
+        "PGPASSWORD is out of the families entirely"
+    );
+    let result = "ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev";
+    assert_eq!(
+        redact_secret_values(result, &injected_secret_values(&env)),
+        result,
+        "ordinary output must survive untouched"
+    );
+}
+
+/// The whole point: a tool result that echoed an injected secret must not reach
+/// the event store carrying it. `curl -v`, `env` and `set -x` all do this.
+#[test]
+fn an_echoed_credential_does_not_survive_into_the_tool_result() {
+    let env = vec![
+        ("CRED_GITHUB".to_string(), "ghp_tokenvalue".to_string()),
+        ("GITHUB_TOKEN".to_string(), "ghp_tokenvalue".to_string()),
+        (
+            "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
+            "ya29.opaque".to_string(),
+        ),
+        (
+            "OAUTH_GOOGLE_EMAIL".to_string(),
+            "user@example.com".to_string(),
+        ),
+    ];
+    let result = "> Authorization: Bearer ghp_tokenvalue\n[stderr]\nGITHUB_TOKEN=ghp_tokenvalue\nya29.opaque";
+    let redacted = redact_secret_values(result, &injected_secret_values(&env));
+    assert!(!redacted.contains("ghp_tokenvalue"), "{redacted}");
+    assert!(!redacted.contains("ya29.opaque"), "{redacted}");
+    // The custom alias shares its value with the canonical name, so masking by
+    // value covers it without the selector having to know the alias.
+    assert_eq!(redacted.matches("[REDACTED]").count(), 3);
+    // A non-secret injected value is left alone: masking it would corrupt
+    // output the script legitimately printed.
+    assert!(redacted.contains("GITHUB_TOKEN="));
+}
+
+#[test]
 fn redact_postgres_secrets_in_json_walks_nested_strings() {
     let mut v = serde_json::json!({
         "command": "psql postgres://lucidos:lucidos@localhost:5432/lucidos -c 'select 1'",
@@ -317,6 +407,13 @@ fn test_describe_tool_todo_write() {
     assert_eq!(
         describe_tool("todo_write", &clearing),
         "Clearing todo list..."
+    );
+    // The read action writes nothing. A row saying "Updating" would tell the
+    // user their list just changed when it did not.
+    let reading = serde_json::json!({ "action": "read" });
+    assert_eq!(
+        describe_tool("todo_write", &reading),
+        "Reading todo list..."
     );
 }
 

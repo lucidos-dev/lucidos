@@ -80,7 +80,7 @@ test.describe('Answer Submit with the mobile keyboard up', () => {
 
       const submit = page.locator('button[aria-label="Submit answer"]:visible').first();
       await expect(submit).toBeVisible({ timeout: 10_000 });
-      await expect(page.locator('.prompt-actions-row button:has-text("Diff")').first())
+      await expect(page.locator('.prompt-actions-row button[data-role="thread-diff"]').first())
         .toBeVisible({ timeout: 10_000 });
 
       // Is the row settled, or is the fit check flipping it between its two

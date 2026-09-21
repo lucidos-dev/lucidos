@@ -42,14 +42,28 @@ export const WINDOW_STEP = 20;
 export const STEP_BUDGET = 160;
 
 /** Distance (px) from the top of the scroll container at which to grow the
- *  window — a buffer so older exchanges are ready before the user reaches the
- *  very top. */
-export const WINDOW_EXPAND_MARGIN_PX = 600;
+ *  window: a buffer so older exchanges are ready before the reader reaches the
+ *  very top.
+ *
+ *  600 was under one screen on the device this was measured on (752px), and a
+ *  grow is a main-thread commit of up to `ROW_BUDGET` rows. A margin shorter
+ *  than the pane means the reader is already looking at the top when that
+ *  commit runs, so they watch it happen.
+ *
+ *  A CONSTANT at roughly two of those screens, not derived. Deriving it would
+ *  mean measuring the transcript, and this module does no layout read. Being
+ *  early costs only an earlier grow, so a pane taller than 1600px is the case
+ *  it serves least well and harms not at all.
+ *
+ *  Early is safe for a second reason. The grow's own scroll correction goes
+ *  through `markAnchorScroll`, so landing back inside this band cannot read as
+ *  a fresh request for older turns. */
+export const WINDOW_EXPAND_MARGIN_PX = 1600;
 
 /** How much overflow (px) a container must have before anybody can scroll it. A
  *  hair from a border or a rounded line height does not count.
  *
- *  ONE definition, read by `windowNeedsFill` below and by
+ *  ONE definition, read by `transcriptScrolls` below and by
  *  `scrollState.isScrollable`, which asks the same question for the up chevron.
  *  The fill grows the window until the transcript scrolls, so the two must mean
  *  the same thing by the number. A matching literal in each is not that. It
@@ -69,6 +83,17 @@ export const SCROLLABLE_SLACK_PX = 10;
  *  height. Four bounds that at a few times the seed's own cost. Reaching it
  *  leaves the up chevron, which renders the whole thread in one press. */
 export const MAX_FILL_EXPANSIONS = 4;
+
+/** Most pages of history one thread's FILL may fetch. A backstop, not a budget.
+ *
+ *  A render round costs a fold; this costs a request. What ends the loop is the
+ *  transcript overflowing, or the thread reaching its first event. Both arrive
+ *  within a page or two of any real thread.
+ *
+ *  This covers the shape where neither does: a page whose events all draw no
+ *  height, against a pane no page can fill. Reaching the cap leaves the up
+ *  chevron, which loads the whole thread in one press. */
+export const MAX_FILL_BACKFILLS = 4;
 
 /** One exchange's share of the budget: its steps plus its own user bubble. */
 export function exchangeRenderCost(exchange: { steps: readonly unknown[] }): number {
@@ -308,12 +333,53 @@ export function expandRenderCount(costs: readonly number[], renderCount: number)
   return Math.min(total, shown + countWithinBudget(costs, total - shown, STEP_BUDGET, WINDOW_STEP));
 }
 
-/** Must the window grow because the reader cannot REACH what it left out?
+/** Can the reader scroll this transcript at all?
  *
- *  The scroll-up expansion is the only way older exchanges enter the window,
- *  and only a scroll event fires it. A slice shorter than the pane produces no
- *  scroll event. So the transcript freezes on whatever the seed took, and the
- *  rest of the thread is unreachable.
+ *  The same question `scrollState.isScrollable` asks for the up chevron, by the
+ *  same slack, and the reason they must agree is on `SCROLLABLE_SLACK_PX`. */
+export function transcriptScrolls(view: { scrollHeight: number; clientHeight: number }): boolean {
+  return view.scrollHeight > view.clientHeight + SCROLLABLE_SLACK_PX;
+}
+
+/** A scroll container reports fractional offsets on a scaled display, and it
+ *  never resolves to a clean zero there. So "pinned at the top" is a rounding
+ *  question, not an equality one.
+ *
+ *  Keep it tight. It must stay false wherever a scroll event can still fire.
+ *  That is what makes a GESTURE the reader's last way to ask for history. */
+const AT_TOP_SLACK_PX = 1;
+
+/** Keys that move a focused container UPWARD, toward older history.
+ *
+ *  A subset of `scrollState`'s `SCROLL_KEYS`, which stamps a reader gesture
+ *  and so takes both directions. This one decides whether to ask for history,
+ *  which only an upward key does. */
+export const UPWARD_SCROLL_KEYS: ReadonlySet<string> = new Set([
+  'ArrowUp', 'PageUp', 'Home',
+]);
+
+/** Is the reader hard against the top, with nowhere further to scroll?
+ *
+ *  A container already there fires no more scroll events however hard they
+ *  gesture, which is why the transcript listens for the gesture itself. */
+export function atScrollTop(view: { scrollTop: number }): boolean {
+  return view.scrollTop <= AT_TOP_SLACK_PX;
+}
+
+/** What a transcript owes the reader before they can reach the rest of it.
+ *
+ *  - `'grow'`: render more of what this client already holds.
+ *  - `'page'`: fetch the history behind it. Nothing loaded is left to render.
+ *  - `'none'`: the transcript scrolls, or there is nothing above at all.
+ */
+export type FillAction = 'none' | 'grow' | 'page';
+
+/** Which of the three the reader is owed right now.
+ *
+ *  The scroll-up expansion is the only way older content enters the window, and
+ *  only a scroll event fires it. A transcript shorter than the pane produces no
+ *  scroll event. So it freezes on whatever the seed took, and the rest of the
+ *  thread is unreachable.
  *
  *  The seed cannot prevent that, because it budgets STEPS and steps are a poor
  *  proxy for height. A coding-agent thread ends on a small `ChangeApplied`
@@ -321,14 +387,65 @@ export function expandRenderCount(costs: readonly number[], renderCount: number)
  *  boundary, the turn behind it blows the budget, and one card draws. Both
  *  reported threads are exactly that shape (see `threadWindow.test.ts`).
  *
- *  So measure. ThreadView grows the window until this answers false, which is
- *  either a transcript that scrolls or a thread rendered whole. */
-export function windowNeedsFill(
+ *  **`'page'` is the arm paging added**, and leaving it out stuck a reported
+ *  thread for good. The window held every turn this client had, so there was
+ *  nothing to grow. Meanwhile 662 events sat on the server, behind a scroll
+ *  event that could not fire.
+ *
+ *  So measure. ThreadView acts until this answers `'none'`, which is either a
+ *  transcript that scrolls or a thread rendered whole to its first event. */
+export function fillAction(
   view: { scrollHeight: number; clientHeight: number },
   edge: WindowEdge,
+  hasOlderEvents: boolean,
+): FillAction {
+  if (transcriptScrolls(view)) return 'none';
+  if (edgeHasMoreAbove(edge)) return 'grow';
+  return hasOlderEvents ? 'page' : 'none';
+}
+
+/** Is there anything above the reader, anywhere in the thread?
+ *
+ *  What the up chevron offers itself on. Three terms, and none of them stands
+ *  in for another. `scrolledDown` is where the reader is. The edge is what the
+ *  window left out of the DOM. `hasOlderEvents` is the server's own answer, and
+ *  it is the one paging added.
+ *
+ *  A reported thread had all three false while 662 events sat on the server. It
+ *  could not be scrolled and drew no chevron, so there was no way back at all.
+ *  See docs/plans/2026-09-20-a-paged-transcript-the-reader-can-reach.md. */
+export function anythingAbove(
+  scrolledDown: boolean,
+  edge: WindowEdge,
+  hasOlderEvents: boolean,
 ): boolean {
-  if (!edgeHasMoreAbove(edge)) return false;
-  return view.scrollHeight <= view.clientHeight + SCROLLABLE_SLACK_PX;
+  return scrolledDown || edgeHasMoreAbove(edge) || hasOlderEvents;
+}
+
+/** Must a FRESH open of this thread throw away the window it left behind?
+ *
+ *  Only for a render-all, and only one the current visit did not ask for.
+ *
+ *  A render-all is a claim a NAVIGATION makes: a deep link to an old event, or
+ *  the up chevron. It is right for the visit that made it, and it outlived the
+ *  visit. The edge is module-scoped, and nothing narrowed it again, so one tap
+ *  bought every later open of that thread a full render. One reported thread
+ *  paid 4,069 rows an open, against the 37 its window would have drawn.
+ *
+ *  The reader still lands where they were. A *reading position* names a turn.
+ *  `reachAnchor` walks the window up to it a budgeted round per frame, which is
+ *  the chunked way to the same place (ADR 0152).
+ *
+ *  A PARTIAL edge is kept, and that is the other half of the rule. The reader
+ *  grew it by scrolling, it describes where they actually are, and re-seeding
+ *  it would make them walk back up on every return. Only the claim goes. */
+export function reseedOnReopen(
+  stored: WindowEdge | undefined,
+  deepLinkClaimedThisVisit: boolean,
+): boolean {
+  if (deepLinkClaimedThisVisit) return false;
+  if (!stored) return false;
+  return !edgeHasMoreAbove(stored);
 }
 
 /** Whether a "scroll to top" must render the FULL thread before scrolling.
@@ -346,7 +463,11 @@ export function windowNeedsFill(
  *
  *  A clamped floor turn counts as "more above" too. One smooth scroll can no
  *  more reach its head than it can reach an older turn, and the true top is
- *  that turn's first row. */
-export function scrollToTopNeedsRenderAll(edge: WindowEdge): boolean {
-  return edgeHasMoreAbove(edge);
+ *  that turn's first row.
+ *
+ *  So does history the server still holds. The window can be drawing every
+ *  loaded turn while the thread starts pages back. A glide would then stop at
+ *  the oldest turn loaded, so the chevron's handler fetches the rest. */
+export function scrollToTopNeedsRenderAll(edge: WindowEdge, hasOlderEvents = false): boolean {
+  return edgeHasMoreAbove(edge) || hasOlderEvents;
 }

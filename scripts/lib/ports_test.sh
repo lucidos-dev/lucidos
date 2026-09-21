@@ -11,7 +11,7 @@
 #     override (env + lucidos.toml), precedence, collision walk-forward,
 #     validation, --engine-only short-circuit.
 #
-# `port_is_free`, `docker` and `lsof` are stubbed for the WHOLE file so it can
+# `port_is_free`, `docker`, `lsof` and `curl` are stubbed for the WHOLE file so it can
 # run anywhere without touching real ports or resolving real pids — stubbing
 # `lsof` per test is what let this suite kill the machine's live dev engine
 # twice on 2026-07-28 (ADR 0025). The is_protected_host_pid tests use a real
@@ -28,7 +28,14 @@ SANDBOX="$(mktemp -d)"
 # runs kill_unprotected_pids on the right-hand side of a pipe, so a variable
 # assigned inside the shim would be written in a subshell and lost.
 KILL_SHIM_LOG="$(mktemp "${TMPDIR:-/tmp}/lucidos_ports_test_kills.XXXXXX")"
-trap 'rm -rf "$SANDBOX"; rm -f "$KILL_SHIM_LOG"; kill $LIVE_PID 2>/dev/null || true' EXIT
+# Every lethal signal the shim SAW, refused or not. The refusal log above answers
+# "did a stub go missing"; this one answers "was anything signalled at all",
+# which is what an adopt-rather-than-kill test has to assert. The synthetic
+# occupier pid is test-owned, so a kill of it is allowed and logs no refusal.
+KILL_ATTEMPT_LOG="$(mktemp "${TMPDIR:-/tmp}/lucidos_ports_test_attempts.XXXXXX")"
+# What the curl shim was asked for, so a test can pin the bounded probe.
+CURL_LOG="$(mktemp "${TMPDIR:-/tmp}/lucidos_ports_test_curl.XXXXXX")"
+trap 'rm -rf "$SANDBOX"; rm -f "$KILL_SHIM_LOG" "$KILL_ATTEMPT_LOG" "$CURL_LOG"; kill $LIVE_PID 2>/dev/null || true' EXIT
 export HOME="$SANDBOX"
 
 # ── host safety: this file must not be able to signal the machine ───────
@@ -55,6 +62,9 @@ own_pid() { TEST_OWNED_PIDS="$TEST_OWNED_PIDS $1"; }
 kill_shim_violations() { tr '\n' ' ' < "$KILL_SHIM_LOG" 2>/dev/null; }
 clear_kill_shim_violations() { : > "$KILL_SHIM_LOG"; }
 
+kill_attempts() { tr '\n' ' ' < "$KILL_ATTEMPT_LOG" 2>/dev/null; }
+clear_kill_attempts() { : > "$KILL_ATTEMPT_LOG"; }
+
 kill() {
     local arg sig="" pids="" pid
     for arg in "$@"; do
@@ -68,6 +78,9 @@ kill() {
         command kill "$@"
         return $?
     fi
+    for pid in $pids; do
+        printf '%s\n' "${sig:--TERM}:$pid" >> "$KILL_ATTEMPT_LOG"
+    done
     for pid in $pids; do
         case " $TEST_OWNED_PIDS " in
             *" $pid "*) ;;
@@ -96,6 +109,18 @@ own_pid "$LIVE_PID"
 
 # shellcheck source=ports.sh
 source "$SCRIPT_DIR/ports.sh"
+
+# Two tests below replace the reclaim helper to drive allocate_ports' branches.
+# `unset -f` does NOT put the library's version back: bash keeps no stack of
+# definitions, so an unset leaves every LATER test calling a name that no longer
+# exists. That returns 127, which reads exactly like a refusal, and it made a
+# whole suite of reclaim tests pass without running a line of the code they
+# name. Capture the real one here and restore it by name instead.
+SAVED_RECLAIM_FN="$(declare -f _try_reclaim_stale_lucidos_on_port)"
+restore_reclaim_fn() {
+    unset -f _try_reclaim_stale_lucidos_on_port
+    eval "$SAVED_RECLAIM_FN"
+}
 
 PASS=0
 FAIL=0
@@ -146,6 +171,44 @@ lsof() {
     return 1
 }
 
+# Stub `curl` for the WHOLE file, for the same reason `lsof` is stubbed. ports.sh
+# now asks a port's occupant which workspace it serves before calling it stale,
+# and an unstubbed probe would reach whatever is really listening on this machine.
+#
+# HEALTH_PORT and HEALTH_WORKSPACE drive it: that one port answers /api/v1/health
+# with that workspace path, and every other URL fails the way a closed socket
+# does (curl exit 7). HEALTH_SCHEME defaults to http, so the default case walks
+# the https-then-http fallback rather than short-circuiting on the first try.
+#
+# CURL_TIMEOUT_FIRST makes the first N calls exit 28 instead, which is how a
+# loaded host looks: something accepted the connection and then said nothing.
+# `ports.sh` must not read that as a dead engine.
+#
+# The call is counted off CURL_LOG rather than a variable. ports.sh probes inside
+# a command substitution, so a counter decremented here would be decremented in a
+# subshell and every call would look like the first.
+HEALTH_PORT=""
+HEALTH_WORKSPACE=""
+HEALTH_SCHEME="http"
+CURL_TIMEOUT_FIRST=0
+curl() {
+    local arg url="" calls
+    printf '%s\n' "$*" >> "$CURL_LOG"
+    calls="$(wc -l < "$CURL_LOG" | tr -d '[:space:]')"
+    if [ "$calls" -le "$CURL_TIMEOUT_FIRST" ]; then
+        return 28
+    fi
+    for arg in "$@"; do
+        case "$arg" in http://*|https://*) url="$arg" ;; esac
+    done
+    [ -n "$HEALTH_PORT" ] || return 7
+    case "$url" in
+        "$HEALTH_SCHEME://localhost:$HEALTH_PORT/api/v1/health") ;;
+        *) return 7 ;;
+    esac
+    printf '{"status":"ok","workspace":"ws","workspace_path":"%s"}' "$HEALTH_WORKSPACE"
+}
+
 # ── helpers ────────────────────────────────────────────────────────────
 reset_env() {
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
@@ -170,6 +233,12 @@ reset_state() {
     rm -rf "${SANDBOX:?}"/* 2>/dev/null || true
     rm -rf "${SANDBOX:?}"/.lucidos 2>/dev/null || true
     OCCUPIED_PORTS=""
+    HEALTH_PORT=""
+    HEALTH_WORKSPACE=""
+    HEALTH_SCHEME="http"
+    CURL_TIMEOUT_FIRST=0
+    clear_kill_attempts
+    : > "$CURL_LOG"
     unset LUCIDOS_VITE_PORT VITE_PORT_OVERRIDE 2>/dev/null || true
     export ENGINE_ONLY=""
     unset API_PORT VITE_PORT PG_PORT 2>/dev/null || true
@@ -911,7 +980,7 @@ test_stale_lucidos_engine_reclaimed_no_drift() {
 
     allocate_ports "$ws" > /dev/null 2>&1
 
-    unset -f _try_reclaim_stale_lucidos_on_port
+    restore_reclaim_fn
 
     if [ "$VITE_PORT" = "5173" ]; then
         pass "reclaim succeeded, stayed on offset 0 (VITE_PORT=$VITE_PORT)"
@@ -937,12 +1006,221 @@ test_foreign_occupier_still_walks_after_reclaim_refuses() {
 
     allocate_ports "$ws" > /dev/null 2>&1
 
-    unset -f _try_reclaim_stale_lucidos_on_port
+    restore_reclaim_fn
 
     if [ "$VITE_PORT" -ge "5174" ]; then
         pass "walked past foreign occupier: VITE_PORT=$VITE_PORT"
     else
         fail "expected VITE_PORT≥5174, got $VITE_PORT"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Suite 3: a launch never tears down a healthy engine
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The incident these pin: a plain `tauri-dev.sh -w dev` SIGUSR1'd the healthy
+# engine serving the pinned port, one second into the launch, and every
+# in-flight thread settled as an unattributed abort. `engine.pid` named a pid
+# that had died, so both pidfile arms read the live engine as an orphan.
+# See docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
+#
+# The authority is the engine: /api/v1/health carries `workspace_path`.
+
+# Start a background process whose command line contains `lucidos-engine`, so
+# the reclaim's cmdline gate passes and the health gate is what decides. The pid
+# lands in FAKE_ENGINE_PID, registered with the kill shim as test-owned.
+#
+# A global rather than a return value, because `own_pid` inside a command
+# substitution would record the ownership in a subshell and lose it. Output goes
+# to /dev/null for the same family of reason: a background child holding the
+# captured pipe open hangs its caller for as long as it lives.
+FAKE_ENGINE_PID=""
+spawn_fake_engine() {
+    mkdir -p "$SANDBOX/bin"
+    printf '#!/bin/bash\nsleep 600\n' > "$SANDBOX/bin/lucidos-engine"
+    chmod +x "$SANDBOX/bin/lucidos-engine"
+    "$SANDBOX/bin/lucidos-engine" >/dev/null 2>&1 &
+    FAKE_ENGINE_PID=$!
+    disown "$FAKE_ENGINE_PID" 2>/dev/null || true
+    own_pid "$FAKE_ENGINE_PID"
+    # Wait for the exec. Between the fork and it, `ps` reports the PARENT's
+    # command line, which names this test file rather than an engine. A reclaim
+    # test that sampled the gap would pass on the cmdline gate refusing, never
+    # reaching the health gate it means to exercise.
+    local _i
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        case "$(ps -p "$FAKE_ENGINE_PID" -o command= 2>/dev/null)" in
+            *lucidos-engine*) return 0 ;;
+        esac
+        sleep 0.1
+    done
+    fail "the fake engine never showed its own command line"
+}
+
+test_a_stale_engine_pidfile_does_not_expose_a_live_engine() {
+    reset_state
+    echo "test: a stale engine.pid does not make our own live engine look foreign"
+    local ws
+    ws="$(make_workspace "$SANDBOX/ws-live-engine")"
+    # The incident shape: the pidfile names a pid that died, while the healthy
+    # engine keeps serving the port.
+    echo "999998" > "$ws/.lucidos/engine.pid"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$ws"
+
+    if _port_is_ours_or_free 5173 "$ws"; then
+        pass "the port reads as ours"
+    else
+        fail "a live engine serving this workspace read as a foreign occupier"
+    fi
+    if [ -z "$OCCUPIER_PID" ]; then
+        pass "no occupier is reported, so no caller can signal one"
+    else
+        fail "OCCUPIER_PID=$OCCUPIER_PID for our own live engine"
+    fi
+    if [ -z "$(kill_attempts)" ]; then
+        pass "nothing was signalled"
+    else
+        fail "signalled a healthy engine: $(kill_attempts)"
+    fi
+}
+
+test_a_reclaim_leaves_an_answering_listener_alone() {
+    reset_state
+    echo "test: the reclaim refuses a listener that answers health"
+    local pid
+    spawn_fake_engine; pid="$FAKE_ENGINE_PID"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$SANDBOX/ws-someone-else"
+
+    if _try_reclaim_stale_lucidos_on_port 5173 "$pid" 2>/dev/null; then
+        fail "reported the port reclaimed while the engine still answers"
+    else
+        pass "refuses the port rather than stopping a live engine"
+    fi
+    if [ -z "$(kill_attempts)" ]; then
+        pass "no signal reached it"
+    else
+        fail "signalled an answering engine: $(kill_attempts)"
+    fi
+    command kill "$pid" 2>/dev/null || true
+}
+
+test_a_silent_listener_is_still_reclaimed() {
+    reset_state
+    echo "test: a listener that answers nothing is still reclaimed"
+    local pid
+    spawn_fake_engine; pid="$FAKE_ENGINE_PID"
+    # Nothing answers, and the port reads free right after the signal, so the
+    # escalation ladder is never entered.
+    OCCUPIED_PORTS=""
+
+    if _try_reclaim_stale_lucidos_on_port 5173 "$pid" 2>/dev/null; then
+        pass "an orphaned engine is still cleaned up"
+    else
+        fail "refused to reclaim a port nothing answers on"
+    fi
+    case "$(kill_attempts)" in
+        *"-USR1:$pid"*) pass "stopped with SIGUSR1, the engine's stop signal" ;;
+        *) fail "expected a SIGUSR1 to $pid, saw '$(kill_attempts)'" ;;
+    esac
+    command kill "$pid" 2>/dev/null || true
+}
+
+test_the_health_probe_is_bounded() {
+    reset_state
+    echo "test: the health probe cannot hang a launch"
+    probe_engine_on_port 5173 || true
+    if grep -q -- "--max-time" "$CURL_LOG"; then
+        pass "every probe carries --max-time"
+    else
+        fail "an unbounded probe would block the whole launch"
+    fi
+    # The FIRST line, not a grep of the whole log: two independent greps pass
+    # just as happily on an implementation that probed http first.
+    case "$(head -1 "$CURL_LOG")" in
+        *"https://localhost:5173/api/v1/health"*) pass "https is tried first" ;;
+        *) fail "expected https first, first probe was: $(head -1 "$CURL_LOG")" ;;
+    esac
+    case "$(sed -n '2p' "$CURL_LOG")" in
+        *"http://localhost:5173/api/v1/health"*) pass "http is the fallback" ;;
+        *) fail "expected http second, saw: $(sed -n '2p' "$CURL_LOG")" ;;
+    esac
+}
+
+test_a_timing_out_probe_is_not_a_dead_engine() {
+    reset_state
+    echo "test: one slow probe does not condemn a live engine"
+    local pid
+    spawn_fake_engine; pid="$FAKE_ENGINE_PID"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$SANDBOX/ws-loaded-host"
+    # The whole first attempt times out, both schemes. Nothing refused the
+    # connection, so the answer settles nothing and the reclaim must ask again.
+    CURL_TIMEOUT_FIRST=2
+
+    if _try_reclaim_stale_lucidos_on_port 5173 "$pid" 2>/dev/null; then
+        fail "a single 2s stall was read as a dead engine"
+    else
+        pass "asked again, and the second answer saved the engine"
+    fi
+    if [ -z "$(kill_attempts)" ]; then
+        pass "no signal reached it"
+    else
+        fail "signalled an engine that was merely slow: $(kill_attempts)"
+    fi
+    command kill "$pid" 2>/dev/null || true
+}
+
+test_a_pinned_port_keeps_its_live_engine() {
+    reset_state
+    echo "test: a pinned port with our engine on it is adopted, not swept"
+    local ws
+    ws="$(make_workspace "$SANDBOX/ws-pinned-live")"
+    printf '[ports]\nvite = 5173\n' > "$ws/lucidos.toml"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$ws"
+
+    if allocate_ports "$ws" >/dev/null 2>&1; then
+        pass "the pinned launch succeeds"
+    else
+        fail "refused a pinned port its own engine is serving"
+    fi
+    if [ "${VITE_PORT:-}" = "5173" ]; then
+        pass "stayed on the pin (VITE_PORT=$VITE_PORT)"
+    else
+        fail "expected VITE_PORT=5173, got ${VITE_PORT:-unset}"
+    fi
+    if [ -z "$(kill_attempts)" ]; then
+        pass "the sweep skipped the port its own engine holds"
+    else
+        fail "the pinned sweep signalled: $(kill_attempts)"
+    fi
+}
+
+test_another_workspaces_engine_is_neither_adopted_nor_killed() {
+    reset_state
+    echo "test: a live engine serving a DIFFERENT workspace is left alone"
+    local ws
+    ws="$(make_workspace "$SANDBOX/ws-asking")"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$SANDBOX/ws-neighbour"
+
+    if _port_is_ours_or_free 5173 "$ws" 2>/dev/null; then
+        fail "adopted a port another workspace's engine is serving"
+    else
+        pass "the port is not ours"
+    fi
+    if [ -z "$(kill_attempts)" ]; then
+        pass "and it is not ours to stop either"
+    else
+        fail "signalled a neighbour's engine: $(kill_attempts)"
     fi
 }
 
@@ -1255,6 +1533,13 @@ test_out_of_range_env_var_is_rejected
 test_bogus_toml_value_is_rejected
 test_stale_lucidos_engine_reclaimed_no_drift
 test_foreign_occupier_still_walks_after_reclaim_refuses
+test_a_stale_engine_pidfile_does_not_expose_a_live_engine
+test_a_reclaim_leaves_an_answering_listener_alone
+test_a_silent_listener_is_still_reclaimed
+test_a_timing_out_probe_is_not_a_dead_engine
+test_the_health_probe_is_bounded
+test_a_pinned_port_keeps_its_live_engine
+test_another_workspaces_engine_is_neither_adopted_nor_killed
 test_allocate_ports_engine_only_short_circuits
 test_ports_file_records_user_facing_port
 test_ports_file_correct_in_engine_only_mode

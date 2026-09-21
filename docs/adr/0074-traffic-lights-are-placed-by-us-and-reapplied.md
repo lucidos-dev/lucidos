@@ -53,6 +53,18 @@ that retunes the titlebar keeps the cluster centred instead of drifting.
   `windowDidExitFullscreen:`, after AppKit has moved the buttons back out of
   the fullscreen overlay titlebar. That one is late by construction, and late
   is right for it.
+- **That arm re-applies on `Moved` too**, which is about reverts rather than
+  about the value: a move never changes the height the placement is computed
+  from. It is the net for a revert no probe reproduces, and the gesture a user
+  reaches for when the cluster is wrong. The write is idempotent, and its cost
+  is PER MOVE EVENT, so a drag pays about fifteen ObjC message sends a frame.
+  That is weighed against the AppKit drag loop it rides in, and against the
+  alternative of a wrong cluster that nothing corrects.
+
+  It sits against the rule ADR 0180 set, that guarding a transition the probe
+  holds is dead code. The difference is where the uncertainty is. Those four
+  transitions had a reported symptom the probe then explained, and this one has
+  a reported symptom no probe explains yet.
 - Observers are keyed by Tauri window label and removed on `Destroyed`. A dead
   window's address can be reused, and a stale registration would then place
   lights on somebody else's window.

@@ -184,25 +184,29 @@ fn normalize_cc_model_id_preserves_unknown() {
 }
 
 #[test]
-fn fable_5_round_trips_through_cc_model_helpers() {
-    // Fable 5 is a full model id present in cc_menu_options.json, so it passes
-    // through normalize unchanged, and the 1M variant reconciles like the others.
-    assert_eq!(normalize_cc_model_id("claude-fable-5"), "claude-fable-5");
-    assert_eq!(
-        normalize_cc_model_id("claude-fable-5[1m]"),
-        "claude-fable-5[1m]"
-    );
-    assert_eq!(
-        reconcile_cc_model(Some("claude-fable-5[1m]"), "claude-fable-5"),
-        "claude-fable-5[1m]"
-    );
-    // The /model picker offers Fable 5 (and its 1M variant).
+fn every_fable_generation_round_trips_through_cc_model_helpers() {
+    // Each Fable id is a full model id present in cc_menu_options.json, so it
+    // passes through normalize unchanged, and the 1M variant reconciles like
+    // the others. Fable 5.1 is the trap: `claude-fable-5` is a prefix of it,
+    // so a prefix-shaped fold would rewrite one generation into the other.
+    for base in ["claude-fable-5", "claude-fable-5-1"] {
+        let one_m = format!("{base}[1m]");
+        assert_eq!(normalize_cc_model_id(base), base);
+        assert_eq!(normalize_cc_model_id(&one_m), one_m);
+        assert_eq!(reconcile_cc_model(Some(&one_m), base), one_m);
+    }
+    // The /model picker offers both generations, each with its 1M variant.
     let defs = cc_command_definitions();
     assert_command_options(
         &defs,
         "set_model",
         "model",
-        &["claude-fable-5", "claude-fable-5[1m]"],
+        &[
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+        ],
     );
 }
 

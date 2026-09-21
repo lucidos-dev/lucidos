@@ -36,6 +36,7 @@ import {
 } from '../../store/pendingUploads';
 import { uploadThreadBlob } from '../../api/client';
 import { awaitThreadStarted } from '../../store/actions/compose';
+import { removeAttachedImage, _resetSessionBlobUrlsForTesting } from './pastedImages';
 
 function makeFakeFile(name: string, type: string): File {
   // `attachImageToActiveDraft` snapshots the bytes via `arrayBuffer()` before
@@ -477,5 +478,97 @@ describe('attachImageToActiveDraft refuses bytes the server would refuse', () =>
     expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
     expect(uploaded!.type).toBe('image/png');
     expect(getDraft('t-1').image_hashes).toEqual(['sha-real-png']);
+  });
+});
+
+/** Regression: one paste put the same screenshot in the message twice. A blob
+ *  address IS the bytes, so a draft holding one hash twice is two references to
+ *  one image: the strip drew two identical thumbnails, and we sent the model
+ *  the picture twice.
+ *
+ *  A second attach can come from a repeated Cmd+V, a drop of a file already
+ *  pasted, or the picker. Whichever it was, the draft holds each blob once. And
+ *  a paste that attaches nothing owes the user a word, or it reads as a dead
+ *  gesture. */
+describe('a draft holds each image once', () => {
+  /** Both attaches upload the same bytes, so the server answers one hash. */
+  const HASH = 'sha256-of-the-screenshot';
+
+  function pngSource(name: string): File {
+    return {
+      name,
+      type: 'image/png',
+      arrayBuffer: async () =>
+        new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer,
+    } as unknown as File;
+  }
+
+  beforeEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    _resetSessionBlobUrlsForTesting();
+    vi.mocked(uploadThreadBlob).mockReset();
+    vi.mocked(uploadThreadBlob).mockImplementation(async (_threadId: string, file: File) => ({
+      hash: HASH,
+      mime: file.type,
+      byte_size: 8,
+    }));
+    vi.mocked(awaitThreadStarted).mockImplementation(async () => {});
+  });
+
+  afterEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    _resetSessionBlobUrlsForTesting();
+  });
+
+  it('attaches the same bytes once, and says why the second went nowhere', async () => {
+    await attachImageToActiveDraft(pngSource('shot.png'));
+    expect(getDraft('t-1').image_hashes).toEqual([HASH]);
+    expect(toasts.value).toEqual([]);
+
+    await attachImageToActiveDraft(pngSource('shot.png'));
+
+    expect(getDraft('t-1').image_hashes).toEqual([HASH]);
+    expect(pendingUploads.value.get('t-1')).toBeUndefined();
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('already attached');
+  });
+
+  it('holds one hash when both pastes land together', async () => {
+    // The double-fire shape: neither attach can see the other's hash, because
+    // both uploads are in flight when the first commits.
+    await Promise.all([
+      attachImageToActiveDraft(pngSource('shot.png')),
+      attachImageToActiveDraft(pngSource('shot.png')),
+    ]);
+
+    expect(getDraft('t-1').image_hashes).toEqual([HASH]);
+    expect(pendingUploads.value.get('t-1')).toBeUndefined();
+  });
+
+  it('still attaches a second, different image', async () => {
+    await attachImageToActiveDraft(pngSource('first.png'));
+    vi.mocked(uploadThreadBlob).mockImplementation(async (_threadId: string, file: File) => ({
+      hash: 'sha256-of-another-shot',
+      mime: file.type,
+      byte_size: 8,
+    }));
+
+    await attachImageToActiveDraft(pngSource('second.png'));
+
+    expect(getDraft('t-1').image_hashes).toEqual([HASH, 'sha256-of-another-shot']);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('takes the image back after the user removed it', async () => {
+    await attachImageToActiveDraft(pngSource('shot.png'));
+    removeAttachedImage('t-1', 0);
+    expect(getDraft('t-1').image_hashes).toEqual([]);
+
+    await attachImageToActiveDraft(pngSource('shot.png'));
+
+    expect(getDraft('t-1').image_hashes).toEqual([HASH]);
+    expect(toasts.value).toEqual([]);
   });
 });

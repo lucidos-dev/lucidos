@@ -54,6 +54,13 @@ export interface SplitButtonProps {
   caretClassName: string;
   caretAriaLabel: string;
   menuItems: SplitButtonMenuItem[];
+  /** Attributes for the root box, from a host whose row is MEASURED.
+   *
+   *  The root always carries `data-row-item`, because every split button this
+   *  app draws sits in the composer row and the measurement has to see it. A
+   *  host spreads these AFTER it, so a foldable one can overwrite the marker
+   *  with its own fold key. */
+  attrs?: Record<string, string>;
 }
 
 export function SplitButton(props: SplitButtonProps) {
@@ -67,8 +74,9 @@ export function SplitButton(props: SplitButtonProps) {
     () => props.onPrimary(),
     !!props.primaryTouchActivate && !props.primaryDisabled,
   );
+  const { attrs } = props;
   return (
-    <div class={`split-button${open.value ? ' open' : ''}`} data-row-item>
+    <div data-row-item {...attrs} class={`split-button${open.value ? ' open' : ''}`}>
       <button
         class={`${props.primaryClassName} split-button-primary`}
         data-tooltip={props.primaryTooltip}

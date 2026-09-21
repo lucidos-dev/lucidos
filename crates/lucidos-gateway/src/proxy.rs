@@ -249,9 +249,13 @@ pub async fn proxy(
     // two topologies take one code path, and safe to send either way: the
     // engine is a co-located process that could read the same file.
     //
-    // This is the gateway vouching for a hop it has ALREADY authorized, not the
-    // caller's own credential. `enforce` ran as a router layer, so an unpaired
-    // request never reaches here (ADR 0094).
+    // This is the gateway vouching for the hop, not the caller's own
+    // credential. `enforce` ran as a router layer, so all but one shape of
+    // request arrives already authorized (ADR 0094). The exception is an app
+    // frame's own tags. `auth_api::is_public_app_asset` exempts those, so they
+    // arrive unauthenticated and are forwarded with this token. They carry
+    // nothing it unlocks, and the dot-segment guard beside that list is what
+    // keeps the set from widening under a normalizing URL parser.
     if let Some(value) = crate::auth::sensitive_credential(local_token) {
         builder = builder.header(crate::auth::HEADER_LOCAL_TOKEN, value);
     }

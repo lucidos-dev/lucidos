@@ -1,10 +1,20 @@
 import { API, json } from './_core';
-import type { ApiResult, ModelsListResponse } from '../types';
+import type { ApiResult, ModelsListResponse, ResponseStylesListResponse } from '../types';
 
 // --- Model registry (Settings → Models) ---
 
 export function listModels(): Promise<ModelsListResponse> {
   return json(`${API}/models`);
+}
+
+// --- Response styles (Settings -> Models -> Response style) ---
+
+/** The merged *style library*. Read-only on purpose: an edit is a
+ *  `response_styles` preference write, which is where the engine bounds-checks
+ *  the document. This exists so the shipped instructions have one home, in the
+ *  engine, rather than a copy here that drifts on the next reword. */
+export function listResponseStyles(): Promise<ResponseStylesListResponse> {
+  return json(`${API}/response-styles`);
 }
 
 export function createModel(body: {

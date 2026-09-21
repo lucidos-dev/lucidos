@@ -367,3 +367,52 @@ describe('incremental grouping ≡ full grouping', () => {
     replay(events);
   });
 });
+
+/** A paged thread opens mid-turn, so the fold holds its leading steps in a
+ *  continuation fragment. The cache resumes across every append, and the
+ *  fragment is a live exchange like any other. */
+describe('incremental grouping over a paged thread', () => {
+  /** The paged reference, which is a different fold from the default one. */
+  function expectMatchesPagedFull(thread: ThreadState): void {
+    const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
+    const reference = groupIntoExchanges(new Map(thread.events), true)
+      .map(({ revision: _r, ...rest }) => rest);
+    expect(incremental).toEqual(reference);
+  }
+
+  function pagedThread(): { thread: ThreadState; map: Map<string, ThreadState> } {
+    const thread = makeThreadState();
+    thread.meta.channel = 'claude_code';
+    thread.hasOlderEvents = true;
+    return { thread, map: new Map([['thread-1', thread]]) };
+  }
+
+  it('grows the fragment on every streamed step', () => {
+    const { thread, map } = pagedThread();
+    for (let i = 0; i < 8; i++) {
+      handleEvent(map, 'thread-1', i + 1, {
+        type: 'CodingAgentTextStreamed', text: `tok${i} `, coding_agent: 'claude-code',
+      } as ThreadEvent, at(i + 1), `evt-${i + 1}`);
+      expectMatchesPagedFull(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].continuationFragment).toBe(true);
+    expect(exchanges[0].steps).toHaveLength(8);
+  });
+
+  /** The last page lands, and the answer the fold branches on flips under an
+   *  unchanged events Map. A resumed fold would keep serving the fragment. */
+  it('rebuilds when the thread stops being paged', () => {
+    const { thread, map } = pagedThread();
+    handleEvent(map, 'thread-1', 1, {
+      type: 'CodingAgentTextStreamed', text: 'orphan', coding_agent: 'claude-code',
+    } as ThreadEvent, at(1), 'evt-1');
+    expect(computeExchanges(thread)[0].continuationFragment).toBe(true);
+
+    thread.hasOlderEvents = false;
+
+    // Nothing older explains the missing boundary now, so it reads as corrupt.
+    expect(computeExchanges(thread)).toHaveLength(0);
+  });
+});

@@ -43,6 +43,22 @@ impl TodoStatus {
             TodoStatus::Completed | TodoStatus::Abandoned => false,
         }
     }
+
+    /// The status as the wire spells it, which is also how `todo_write` reads
+    /// one back to the agent.
+    ///
+    /// The same word on both sides is the point: the agent writes `in_progress`
+    /// and must see `in_progress`. `status_word_matches_the_wire_spelling`
+    /// pins it against the serde rename, so the two cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "pending",
+            TodoStatus::InProgress => "in_progress",
+            TodoStatus::Completed => "completed",
+            TodoStatus::Waiting => "waiting",
+            TodoStatus::Abandoned => "abandoned",
+        }
+    }
 }
 
 /// One row of a *Todo list*. `content` is the imperative form ("Run tests");

@@ -205,6 +205,29 @@ export interface ModelsListResponse {
   models: ModelInfo[];
 }
 
+/** One row of the *style library*, merged by the engine from what it ships and
+ *  what the user saved. `source` is what decides between Reset and Delete. */
+export interface ResponseStyle {
+  id: string;
+  label: string;
+  /** The one line the picker shows. Shipped styles carry their own; a user's
+   *  own derives it from the first line of the instruction. */
+  description: string;
+  /** What gets injected, verbatim, under the engine's own heading. Empty for
+   *  `standard`, the off switch. */
+  instruction: string;
+  /** `builtin` ships untouched, `overridden` ships with the user's text on
+   *  top, `user` is theirs alone. */
+  source: 'builtin' | 'overridden' | 'user';
+  /** False for `standard` alone. Sent by the engine rather than derived here,
+   *  so the client holds no second copy of the rule. */
+  editable: boolean;
+}
+
+export interface ResponseStylesListResponse {
+  styles: ResponseStyle[];
+}
+
 /** The engine's read-back on a trigger's cron after a create or update. Present
  *  only on the trigger write endpoints. */
 export interface CronPreview {

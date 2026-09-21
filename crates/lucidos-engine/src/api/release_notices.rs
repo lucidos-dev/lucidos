@@ -27,10 +27,11 @@ use crate::engine::release_notices;
 /// answer.
 ///
 /// Read here rather than taken from the request. A client could otherwise name
-/// a release it is not on, and be handed a notice that has not shipped.
+/// a release it is not on, and be handed a notice that has not shipped. The
+/// rule itself is `release_notices::running_release`, shared with the startup
+/// stamp so the two cannot disagree about which notices exist.
 fn running_release() -> Result<semver::Version, ApiError> {
-    semver::Version::parse(crate::LUCIDOS_RELEASE)
-        .map_err(|e| ApiError::internal(format!("{} is not semver: {e}", crate::LUCIDOS_RELEASE)))
+    release_notices::running_release().map_err(ApiError::internal)
 }
 
 /// `GET /api/v1/release-notices`.

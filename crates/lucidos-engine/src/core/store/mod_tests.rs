@@ -527,3 +527,255 @@ async fn distinct_event_types_returns_empty_on_an_empty_table() {
 
     teardown_test_db(&db).await;
 }
+
+/// Insert a thread event at an explicit `sequence`, so a test can put the
+/// sequence order and the clock order deliberately at odds.
+async fn insert_thread_event_at_seq(
+    pool: &PgPool,
+    id: Uuid,
+    created: DateTime<Utc>,
+    thread_id: Uuid,
+    sequence: i64,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, thread_id, sequence) \
+         VALUES ($1, 'TextStreamed', $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(json!({ "summary": "fixture" }))
+    .bind(created)
+    .bind(thread_id)
+    .bind(sequence)
+    .execute(pool)
+    .await
+    .expect("insert thread event at seq");
+}
+
+/// A page is the NEWEST rows, handed back oldest-first, and it reports that
+/// older ones remain. Oldest-first is what every other read path returns, so a
+/// client prepends a page rather than reversing it.
+#[tokio::test]
+async fn thread_events_page_returns_the_newest_rows_oldest_first() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    for i in 0..10i64 {
+        insert_thread_event_at_seq(
+            &pool,
+            Uuid::new_v4(),
+            base + chrono::Duration::seconds(i),
+            thread,
+            1000 + i,
+        )
+        .await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 4)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![1006, 1007, 1008, 1009], "newest four, ascending");
+    assert!(page.has_more, "six older events remain");
+
+    teardown_test_db(&db).await;
+}
+
+/// A thread shorter than the page is served whole and says nothing remains.
+/// That is the invariant protecting the median thread, which is 198 events.
+#[tokio::test]
+async fn thread_events_page_serves_a_short_thread_whole() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    for i in 0..3i64 {
+        insert_thread_event_at_seq(
+            &pool,
+            Uuid::new_v4(),
+            base + chrono::Duration::seconds(i),
+            thread,
+            1000 + i,
+        )
+        .await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 50)
+        .await
+        .expect("page");
+    assert_eq!(page.events.len(), 3, "the whole thread fits");
+    assert!(!page.has_more, "nothing older to fetch");
+
+    teardown_test_db(&db).await;
+}
+
+/// Walking the cursor backwards covers the thread exactly once. An overlap
+/// would duplicate a turn in the transcript; a gap would lose one.
+#[tokio::test]
+async fn thread_events_page_walks_backwards_without_overlap_or_gap() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    for i in 0..10i64 {
+        insert_thread_event_at_seq(
+            &pool,
+            Uuid::new_v4(),
+            base + chrono::Duration::seconds(i),
+            thread,
+            1000 + i,
+        )
+        .await;
+    }
+
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor: Option<(DateTime<Utc>, i64)> = None;
+    loop {
+        let page = store
+            .get_thread_events_page(thread, cursor, 3)
+            .await
+            .expect("page");
+        let first = page.events.first().expect("a non-empty page");
+        cursor = Some((first.created, first.sequence));
+        let mut seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+        seqs.append(&mut seen);
+        seen = seqs;
+        if !page.has_more {
+            break;
+        }
+    }
+
+    let expected: Vec<i64> = (1000..1010).collect();
+    assert_eq!(seen, expected, "every event once, in order");
+
+    teardown_test_db(&db).await;
+}
+
+/// The cursor is the `(created, sequence)` PAIR, and this is why. A sequence is
+/// allocated globally, so within one thread it can run against the clock. Here
+/// the oldest row carries the highest sequence: paging on the sequence alone
+/// would drop rows at the page edge.
+#[tokio::test]
+async fn thread_events_page_is_correct_when_sequence_runs_against_the_clock() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    // Clock ascending, sequence DESCENDING: the render order is the clock.
+    for i in 0..6i64 {
+        insert_thread_event_at_seq(
+            &pool,
+            Uuid::new_v4(),
+            base + chrono::Duration::seconds(i),
+            thread,
+            2000 - i,
+        )
+        .await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 2)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![1996, 1995], "the two newest BY CLOCK");
+
+    let first = page.events.first().unwrap();
+    let older = store
+        .get_thread_events_page(thread, Some((first.created, first.sequence)), 2)
+        .await
+        .expect("older page");
+    let older_seqs: Vec<i64> = older.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(older_seqs, vec![1998, 1997], "the next two back, no gap");
+
+    teardown_test_db(&db).await;
+}
+
+/// One thread's page never carries another's rows.
+#[tokio::test]
+async fn thread_events_page_is_scoped_to_its_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    for i in 0..4i64 {
+        insert_thread_event_at_seq(&pool, Uuid::new_v4(), base, mine, 1000 + i).await;
+        insert_thread_event_at_seq(&pool, Uuid::new_v4(), base, theirs, 2000 + i).await;
+    }
+
+    let page = store
+        .get_thread_events_page(mine, None, 10)
+        .await
+        .expect("page");
+    assert_eq!(page.events.len(), 4, "only this thread's events");
+    assert!(
+        page.events.iter().all(|e| e.sequence < 2000),
+        "no rows from the sibling thread"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// A page reports the thread's TRUE highest sequence, which it cannot contain.
+///
+/// A sequence is allocated globally and can run against the clock, so the
+/// newest row by clock often does not hold the highest one. The client guards
+/// its forward delta with this, and deriving it from the page would make the
+/// next refresh refetch history.
+#[tokio::test]
+async fn thread_events_page_reports_the_threads_true_max_sequence() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    // Clock ascending, sequence DESCENDING: the OLDEST row holds the highest.
+    for i in 0..6i64 {
+        insert_thread_event_at_seq(
+            &pool,
+            Uuid::new_v4(),
+            base + chrono::Duration::seconds(i),
+            thread,
+            2000 - i,
+        )
+        .await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 2)
+        .await
+        .expect("page");
+    let in_page = page.events.iter().map(|e| e.sequence).max().unwrap();
+    assert_eq!(in_page, 1996, "the page's own highest");
+    assert_eq!(
+        page.max_sequence,
+        Some(2000),
+        "the thread's highest, which the page does not hold"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// An empty thread has no maximum, rather than a zero that would read as one.
+#[tokio::test]
+async fn thread_events_page_reports_no_max_sequence_for_an_empty_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let page = store
+        .get_thread_events_page(Uuid::new_v4(), None, 10)
+        .await
+        .expect("page");
+    assert!(page.events.is_empty());
+    assert_eq!(page.max_sequence, None);
+
+    teardown_test_db(&db).await;
+}

@@ -123,6 +123,104 @@ pub(crate) async fn repo_entries(repo_root: &Path) -> Result<Vec<(String, PathBu
     Ok(entries)
 }
 
+/// The live file a requested path is a dead copy of, or `None` to go ahead.
+///
+/// A repo carries gitignored DUPLICATES of its own tracked files: build
+/// staging under `crates/lucidos-app/bundle-resources/`, and every abandoned
+/// coding-agent worktree. Each is frozen at the commit that produced it, and
+/// nothing on disk says so. A caller that reaches one by path reads the tree as
+/// it was weeks ago and cannot tell.
+///
+/// Not hypothetical. A workspace audit ran `find . -name workspace-audit.md |
+/// head -1`, got the five-week-old staged copy, and reported against checks the
+/// recipe no longer has.
+///
+/// A search never lands here, because [`repo_entries`] enumerates through
+/// `git ls-files`. Only a path a caller names itself can, which is why the
+/// guard belongs on resolution rather than on the walk.
+pub(crate) async fn shadowed_tracked_path(repo_root: &Path, relative: &str) -> Option<String> {
+    use crate::engine::git_ops::git_answer;
+
+    // Every arm falls to ALLOW when git cannot answer. A probe that could not
+    // run must not cost the caller the read: a stale read is recoverable, and a
+    // tool that refuses everything whenever git is slow is not.
+    if git_answer(&["ls-files", "--error-unmatch", "--", relative], repo_root)
+        .await
+        .or_unknown(true)
+    {
+        return None;
+    }
+    // Untracked and not ignored is an ordinary new file, which is fine to read.
+    if !git_answer(&["check-ignore", "-q", "--", relative], repo_root)
+        .await
+        .or_unknown(false)
+    {
+        return None;
+    }
+    // Ignored. A dead copy repeats the live path under a staging or worktree
+    // prefix, so drop leading components until one names a tracked file.
+    //
+    // A BARE BASENAME never counts. `staging/postgres/README.md` would
+    // otherwise be refused as a copy of the repo's own `README.md`, and a
+    // refusal on a file nobody duplicated is a dead tool. A duplicate of a
+    // top-level file goes unflagged, which is the side worth being wrong on.
+    let mut rest = relative;
+    while let Some((_, tail)) = rest.split_once('/') {
+        rest = tail;
+        if !tail.contains('/') {
+            break;
+        }
+        if git_answer(&["ls-files", "--error-unmatch", "--", tail], repo_root)
+            .await
+            .or_unknown(false)
+        {
+            let prefix = &relative[..relative.len() - tail.len()];
+            if prefix_holds_a_copy(repo_root, prefix, tail).await {
+                return Some(tail.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Does `prefix` hold a COPY of the directory `tail` lives in, rather than a
+/// path that merely ends the same way?
+///
+/// A shared suffix alone is not evidence. `node_modules/<pkg>/src/index.ts`
+/// ends like a tracked `src/index.ts` and is a different file entirely.
+/// Refusing to read a dependency's own source would be a worse bug than the one
+/// this guards. A real copy carries the DIRECTORY, so one more of that
+/// directory's tracked files under the same prefix settles it.
+///
+/// Unknown falls to "no copy", allowing the read, for the same reason as every
+/// other arm above.
+async fn prefix_holds_a_copy(repo_root: &Path, prefix: &str, tail: &str) -> bool {
+    let Some(dir) = tail.rsplit_once('/').map(|(d, _)| d) else {
+        return false;
+    };
+    let Ok(output) =
+        crate::engine::git_ops::git_cmd(&["ls-files", "-z", "--", dir], repo_root).await
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty() && *p != tail)
+        // The first sibling found ends it, and the cap bounds the walk over a
+        // directory holding thousands.
+        .take(50)
+        .any(|sibling| repo_root.join(format!("{prefix}{sibling}")).exists())
+}
+
+/// What the caller is told, naming the live path rather than just refusing.
+pub(crate) fn stale_copy_refusal(requested: &str, live: &str) -> String {
+    format!(
+        "'{requested}' is a dead copy: git ignores it, and '{live}' is the live file. \
+         Read that instead. A gitignored duplicate is build staging or an abandoned \
+         worktree, frozen at whatever commit produced it."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +418,130 @@ mod tests {
             .collect();
 
         assert_eq!(rels, vec!["keep.rs".to_string()]);
+    }
+
+    /// The incident this guard exists for: a stale staged copy of a doc the
+    /// repo also tracks, reached by a path a caller typed.
+    #[tokio::test]
+    async fn a_gitignored_duplicate_names_the_live_file() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "system-knowhow/recipe.md", "live");
+        write(repo.path(), "system-knowhow/other.md", "live sibling");
+        write(repo.path(), ".gitignore", "staging/\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        // Staging carries the directory, which is what tells a copy from a
+        // path that merely ends the same way.
+        write(
+            repo.path(),
+            "staging/system-knowhow/recipe.md",
+            "five weeks old",
+        );
+        write(repo.path(), "staging/system-knowhow/other.md", "also stale");
+
+        let live = shadowed_tracked_path(repo.path(), "staging/system-knowhow/recipe.md").await;
+        assert_eq!(live.as_deref(), Some("system-knowhow/recipe.md"));
+    }
+
+    /// A shared suffix is not a duplicate. A dependency's own source ends like
+    /// the repo's, and refusing to read it would be the worse bug.
+    #[tokio::test]
+    async fn a_suffix_that_shares_no_directory_is_allowed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/index.ts", "ours");
+        write(repo.path(), "src/helper.ts", "ours too");
+        write(repo.path(), ".gitignore", "node_modules/\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        // The dependency has an `src/index.ts` and nothing else of ours.
+        write(repo.path(), "node_modules/dep/src/index.ts", "theirs");
+
+        assert!(
+            shadowed_tracked_path(repo.path(), "node_modules/dep/src/index.ts")
+                .await
+                .is_none()
+        );
+    }
+
+    /// Build output with no tracked twin stays readable. A session debugging a
+    /// packaged build has to be able to read what the build staged.
+    #[tokio::test]
+    async fn an_ignored_file_that_shadows_nothing_is_allowed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "src/main.rs", "fn main() {}");
+        write(repo.path(), ".gitignore", "staging/\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        write(repo.path(), "staging/lucidos-engine", "a binary");
+
+        assert!(shadowed_tracked_path(repo.path(), "staging/lucidos-engine")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_tracked_file_itself_is_allowed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "system-knowhow/recipe.md", "live");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert!(
+            shadowed_tracked_path(repo.path(), "system-knowhow/recipe.md")
+                .await
+                .is_none()
+        );
+    }
+
+    /// A file the caller just wrote is untracked and unignored, and nothing
+    /// about it is stale.
+    #[tokio::test]
+    async fn a_brand_new_untracked_file_is_allowed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "seed.txt", "x");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        write(repo.path(), "notes.md", "fresh");
+
+        assert!(shadowed_tracked_path(repo.path(), "notes.md")
+            .await
+            .is_none());
+    }
+
+    /// A shared basename is not a duplicate. Refusing a staged `README.md`
+    /// because the repo root has one would be a dead tool, not a guard.
+    #[tokio::test]
+    async fn a_bare_basename_match_is_not_enough() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        write(repo.path(), "README.md", "the real one");
+        write(repo.path(), ".gitignore", "staging/\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        write(
+            repo.path(),
+            "staging/postgres/README.md",
+            "shipped with postgres",
+        );
+
+        assert!(
+            shadowed_tracked_path(repo.path(), "staging/postgres/README.md")
+                .await
+                .is_none()
+        );
+    }
+
+    /// The refusal has to carry the live path, or the caller just retries the
+    /// dead one.
+    #[test]
+    fn the_refusal_names_where_to_read_instead() {
+        let msg = stale_copy_refusal("staging/a/recipe.md", "a/recipe.md");
+        assert!(msg.contains("staging/a/recipe.md"));
+        assert!(msg.contains("'a/recipe.md' is the live file"));
     }
 }

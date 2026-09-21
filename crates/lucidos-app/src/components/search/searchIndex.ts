@@ -131,10 +131,12 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // rather than on the top of a page they then have to scan.
   { id: 'models:opencode-free', label: 'OpenCode Free (keyless)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:opencode-free', keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
   { id: 'models:chat-model', label: 'Model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
+  { id: 'models:response-style', label: 'Response style', subview: 'models', path: 'Settings → Models', anchor: 'models:response-style', keywords: 'response style brevity verbose verbosity concise minimal short shorter terse length yapping waffle rambling output style tone instruction custom' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
   { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
+  { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev judgment' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
   // Lands on the Vertex header, not on the Region row itself. That row sits
   // inside the provider's block, which renders only while Vertex is switched
@@ -180,7 +182,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
-  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku' },
+  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev judgment backend' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
   { id: 'permissions:mcp', label: 'MCP tool permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:mcp', keywords: 'mcp model context protocol server tool permissions allowlist always allow' },

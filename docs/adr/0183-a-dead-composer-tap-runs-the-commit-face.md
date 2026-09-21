@@ -1,7 +1,17 @@
 # 0183: A dead composer tap runs the commit face itself, then the bounce
 
-- **Status**: Accepted
+- **Status**: Accepted, Send half reversed by
+  [0225](0225-composer-never-sends-by-itself.md)
 - **Date**: 2026-09-12
+
+**The title is no longer true, and the reversal is the whole of ADR 0225.** A
+dead composer tap runs nothing. The seventeenth report caught this decision
+sending a draft on a tap 138 px from Send. Read 0225 before acting on anything
+below about the Send half.
+
+Everything else here still stands: the relayout and its downward bounce, the
+typing-driven trigger, the commit-face definition, every instrument on the
+ledger, and the rejection of return-to-send on mobile.
 
 ## Context
 
@@ -123,6 +133,50 @@ evidence that the user reached for the button, and a silence is not. And
 already implies, so this trigger does not rebuild the bound the rescue just
 lost.
 
+**The fifteenth episode caught the rescue refusing, and its own twin click is
+what refused it.** A stationary tap landed on the row, reached nothing, and the
+Send morph was live beside it. The line said `standDown: claimed` and nothing
+more. The plan is
+[`docs/plans/2026-09-19-the-rescue-names-what-refused-it.md`](../plans/2026-09-19-the-rescue-names-what-refused-it.md).
+
+That the twin did it is provable rather than inferred. The next press line's
+`quiet.ms` puts the last input at the missed touch. A click with a touch behind
+it does not reopen that window, so nothing else reached the document inside the
+grace window.
+
+Three things were wrong, and each is the same mistake at a different scale.
+
+- **A claim belongs to one gesture, and this one belonged to none.** The flag
+  was a boolean any click in the window could set. The press path had already
+  solved that, by taking its outcome a task after its own lift. A click is now
+  the miss's claim only where that miss's own touch is behind it.
+- **"Outside the row" was never a claim either.** The bound is now a click that
+  landed on an activatable control. The composer is `.prompt-box`, and its
+  textarea sits two pixels above the row: a click there moves a caret and
+  commits nothing. Reading it as an answer repeats the error the inert row
+  taught, one element over.
+- **A refusal named its bound and not its evidence.** The line carries what the
+  claiming click hit, written by the same `describe` that writes
+  `elementAtPoint`. So the two compare directly, and a twin resolving somewhere
+  the touch did not can be read off one pair of lines.
+
+**The untouched trigger disarmed on the wrong thing, for the same reason.** It
+asked whether a touch had reached the PAGE since the last keystroke. The
+fifteenth ledger holds two that did, on the transcript and on the textarea,
+while the composer still could not be sent from. A live page is not a live
+composer, which is the partition `keyboard-touch` exists to deny. The gate now
+reads a touch or a click that reached the composer, and nothing else.
+
+**The sixteenth report is the first confirmed fire.** A stationary tap died on
+the composer, the rescue ran Send, and the message went. The reporter's one
+complaint was the wait: the click grace window is 600ms, and it is felt.
+
+The reporter chose to keep both halves rather than tune them. The toast stays,
+because it is still the only on-screen sign that the wedge is happening. One
+successful rescue is not a fixed platform. The 600ms stays, because it is what
+tells a dead press apart from a slow one. That reading is the evidence this
+investigation runs on.
+
 The bounce goes DOWN, though the keyboard's goes up. Growing the shell shrinks
 every scroller in it. The browser clamps their scroll offsets at that layout,
 and restoring the height does not restore the offsets. A transcript at the live
@@ -168,6 +222,13 @@ before it. A press arriving with a nudge behind it and the composer still
 focused says the relayout cleared the wedge. One arriving after the user
 dismissed the keyboard by hand says it did not, and retires the relayout as a
 candidate.
+
+**Read `nudgesSinceKeystroke` for that, not `quiet.nudges`.** The fifteenth
+episode came back unscoreable, because a quiet window closes on any touch: the
+send that finally worked carried `nudges: 0` while two relayouts had run. The
+second count is reset by a keystroke rather than by a touch, so it spans the
+whole pre-send moment the criterion is about. Both ride every line, since every
+earlier ledger is read against the first.
 
 That trigger also runs during ordinary composing, whenever a draft waits more
 than a few seconds for its press. It costs two forced layouts per pause, silent

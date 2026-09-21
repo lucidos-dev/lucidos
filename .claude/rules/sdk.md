@@ -10,7 +10,11 @@ paths:
 
 ## Before adding a method
 
-1. **Check it doesn't already exist.** Each top-level namespace has a sibling source file (`data.ts`, `events.ts`, `proxy.ts`, `preferences.ts`, `notifications.ts`, `apps.ts`, `threads.ts`, `triggers.ts`, `ui.ts`, `sse.ts`, `utils.ts`, `capture.ts`). `Grep pattern: 'lucidos\\.<methodname>'` over the repo (or just look for the matching `## lucidos.<namespace>` heading in `system-knowhow/js-sdk.md`). The existing helper may be lower-level than the new spec wants — say so explicitly to the user instead of silently shipping a duplicate.
+1. **Check it doesn't already exist.** Each top-level namespace has a sibling source file (`data.ts`, `events.ts`, `proxy.ts`, `preferences.ts`, `notifications.ts`, `apps.ts`, `threads.ts`, `triggers.ts`, `ui.ts`, `sse.ts`, `utils.ts`, `capture.ts`, `request.ts`).
+
+   `Grep pattern: 'lucidos\\.<methodname>'` over the repo (or just look for the matching `## lucidos.<namespace>` heading in `system-knowhow/js-sdk.md`). The existing helper may be lower-level than the new spec wants: say so explicitly to the user instead of silently shipping a duplicate.
+
+   **A new namespace is rarely the answer.** `lucidos.request(suffix, init)` already reaches any route the engine marks app-reachable (ADR 0231), so a thin JSON wrapper over one endpoint earns nothing. Add a namespace for a typed shape, validation, or a non-JSON body. Otherwise open the route in `crates/lucidos-engine/src/api/app_reach.rs` and document it there.
 2. **Read the matching `## lucidos.<namespace>` section in `system-knowhow/js-sdk.md`.** It documents the existing signature, examples, and "When to use which" tables that callers already rely on.
 
 ## When you change the surface

@@ -5,13 +5,14 @@
 //! app document? Does a live one-shot token come with it? And is the read on
 //! the record?
 //!
-//! # No header authenticates the Settings page against a same-origin app
+//! # No header authenticates the Settings page against an app document
 //!
-//! Apps load at `/app/<id>/` on the engine's own origin, in an iframe carrying
-//! `allow-same-origin`. App JavaScript therefore reaches `window.top.fetch` and
-//! runs in the shell's own realm. Every browser-set signal then reads as the
-//! shell's. ADR 0117 states that model, and ADR 0144 records why it is
-//! permanent rather than a gap awaiting a fix.
+//! An app frame inside the shell is isolated (ADR 0227) and reaches no part of
+//! the shell's realm. A standalone app tab still loads at `/app/<id>/` on the
+//! engine's own origin. Every browser-set signal then reads as the shell's, and
+//! such a page picks its own same-origin `referrer`. ADR 0117 states that
+//! model, and ADR 0144 records why it is permanent rather than a gap awaiting a
+//! fix.
 //!
 //! So the origin half is defense in depth. The guard buys three narrower
 //! things. No plaintext is one bare GET away. A leaked capability is worth

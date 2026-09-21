@@ -39,6 +39,13 @@ import {
   setFollowLiveEdge,
   stopFollowingBottom,
 } from '../scrollState';
+import { postClientLog } from '../../../utils/clientLog';
+
+/** The ride's breadcrumb is ASSERTED here rather than posted. `clientLog` is a
+ *  leaf module, so mocking it reaches `scrollState`'s own import and nothing
+ *  else. The module's only other caller is the deep link's outcome line, which
+ *  no test in this file exercises. */
+vi.mock('../../../utils/clientLog', () => ({ postClientLog: vi.fn() }));
 
 /** The follow toggle is a STANDING ask: take me to the live edge and keep me
  *  there until I say otherwise. This file pins its duration (growth honours it,
@@ -1114,6 +1121,255 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
   });
 });
 
+describe('a carrying ride verifies its own landing', () => {
+  beforeEach(() => {
+    resetFollow();
+    vi.useFakeTimers();
+    vi.mocked(postClientLog).mockClear();
+  });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** An armed reader riding a live thread, settled ON the live edge with the
+   *  anchor snapshot taken. The same shape as the platform block's helper, and
+   *  for the same reason: the glide's own trailing event is what records the
+   *  reader on the edge. */
+  function riding() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setAgentLive(true);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    observers.onScroll();
+    expect(el.scrollTop).toBe(2500);
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  /** ONE GROWTH ROUND THAT COMES TO REST SHORT. The ride measures the edge
+   *  inside the ResizeObserver callback and writes it. The container's real
+   *  extent turns out taller afterwards, and NOTHING fires to say so.
+   *
+   *  That is the shape the report came from. iOS is where it happens: this
+   *  module's neighbours already carry a permanent compositor layer and a
+   *  repaint burst for WebKit deferring this kind of update.
+   *
+   *  `drawn` is the extent the round measured, `real` the one it settles at. */
+  function growsAndLandsShort(el: any, onResize: () => void, drawn: number, real: number) {
+    el.scrollHeight = drawn;
+    onResize();
+    el.scrollHeight = real;
+  }
+
+  it('writes again on the next frame when its own write came to rest short', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    expect(el.scrollTop).toBe(3500);   // 600px short of the settled edge
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(4100);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('settles the chevron with it, so nothing is lit over a ride that landed', () => {
+    // The round itself measures against the extent it wrote against, so it
+    // leaves the chevron dark. The reader sees it light on the next scroll,
+    // which is the state the report was screenshotted in.
+    const { el, onScroll, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    onScroll();
+    expect(awayFromBottom.value).toBe(true);
+
+    vi.advanceTimersByTime(20);
+
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('writes nothing more when the round landed where it aimed', () => {
+    const { el, onResize } = riding();
+
+    el.scrollHeight = 4000;
+    onResize();
+    const writes = el.writes;
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.writes).toBe(writes);
+    expect(el.scrollTop).toBe(3500);
+  });
+
+  it('corrects once and polls for nothing after that', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    vi.advanceTimersByTime(20);
+    expect(el.scrollTop).toBe(4100);
+
+    el.scrollHeight = 5200;   // the extent grows again, with no round to say so
+    const writes = el.writes;
+    vi.advanceTimersByTime(200);
+
+    expect(el.writes).toBe(writes);
+  });
+
+  it('checks a TURN CONTROL press too, which has no re-assert of its own', () => {
+    // The second site with nothing after it. `withScrollAnchor` skips its
+    // next-frame re-assert for a CARRIED reader on purpose, so the snap in
+    // `honourAnchoredMutation` is that press's one and only write.
+    const { el } = riding();
+
+    el.scrollHeight = 4600;
+    el._scrollTop = 3500;      // the freeze left them here, short of 4100
+    honourAnchoredMutation(el);
+    expect(el.scrollTop).toBe(4100);
+
+    // And the snap itself is checked, for a press whose own write falls short.
+    el.scrollHeight = 5200;
+    el._scrollTop = 4100;
+    honourAnchoredMutation(el);
+    el.scrollHeight = 5800;    // the extent settles taller, silently
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(5300);
+  });
+
+  it('stands down when the reader takes over between the write and the frame', () => {
+    const { el, onScroll, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    readerScrollsTo(el, 1200, onScroll);
+    const writes = el.writes;
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(1200);
+    expect(el.writes).toBe(writes);
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('stands down when anything else has moved the container since', () => {
+    // The stamp is the whole term. A container away from where the ride left it
+    // belongs to somebody else. That holds whatever moved it, and whether or
+    // not its own scroll event has arrived yet.
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    el._scrollTop = 1200;
+    const writes = el.writes;
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(1200);
+    expect(el.writes).toBe(writes);
+  });
+
+  it('stands down once the ride is retired', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    stopFollowingBottom();
+    const writes = el.writes;
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(3500);
+    expect(el.writes).toBe(writes);
+  });
+
+  it('stands down when the thread stops being live before the frame', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    setAgentLive(false);
+    const writes = el.writes;
+
+    vi.advanceTimersByTime(20);
+
+    expect(el.scrollTop).toBe(3500);
+    expect(el.writes).toBe(writes);
+  });
+
+  it('says so ONCE for the ride, however many rounds land short', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    vi.advanceTimersByTime(20);
+    expect(postClientLog).toHaveBeenCalledTimes(1);
+
+    growsAndLandsShort(el, onResize, 5200, 5800);
+    vi.advanceTimersByTime(20);
+
+    expect(postClientLog).toHaveBeenCalledTimes(1);
+  });
+
+  it('says nothing at all when every round lands where it aimed', () => {
+    const { el, onResize } = riding();
+
+    el.scrollHeight = 4000;
+    onResize();
+    vi.advanceTimersByTime(20);
+
+    expect(postClientLog).not.toHaveBeenCalled();
+  });
+
+  it('names the shortfall and carries nothing of the reader\'s', () => {
+    const { el, onResize } = riding();
+
+    growsAndLandsShort(el, onResize, 4000, 4600);
+    vi.advanceTimersByTime(20);
+
+    expect(postClientLog).toHaveBeenCalledWith('follow', 'short', {
+      short: 600, edge: 4100, view: 500,
+    });
+  });
+
+  it('puts a CARRYING rider back after a round that declined the correction', () => {
+    // The hole this closes. An anchor write moves the reader and the correction
+    // stands down for it, correctly. That same round clears the held claim and
+    // records the anchor off the edge. Those are BOTH of the readings
+    // `keepTheLiveEdge` had. Every later scroll then found them false and wrote
+    // nothing, for the rest of the thread.
+    //
+    // A ride that is CARRYING needs neither reading. It owns the position
+    // wherever the reader is parked, exactly as the growth branch already has
+    // it (`followIsCarrying`).
+    const { el, onScroll } = riding();
+
+    markAnchorScroll(el, 900);
+    onScroll();
+    expect(el.scrollTop).toBe(900);
+    expect(followingLiveEdge.value).toBe(true);
+
+    vi.advanceTimersByTime(200);   // past the navigation window
+    el.scrollTop = 800;            // the platform, with no gesture behind it
+    onScroll();
+
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('leaves an ARMED reader on a QUIET thread where the same round left them', () => {
+    // The position term still answers for everyone the ride is not carrying.
+    // An idle thread has nothing arriving to be carried toward (ADR 0064).
+    const { el, onScroll } = riding();
+    setAgentLive(false);
+
+    markAnchorScroll(el, 900);
+    onScroll();
+
+    vi.advanceTimersByTime(200);
+    el.scrollTop = 800;
+    onScroll();
+
+    expect(el.scrollTop).toBe(800);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+});
+
 describe('scrolling an IDLE thread keeps the follow', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
@@ -1403,18 +1659,25 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
     // Now put the container somewhere the follow did not, with NO gesture
     // behind it: the iOS keyboard / app-resume case the follow survives. The
     // setup's own scroll is retired first, or its coast would still count as
-    // the reader's. Armed, live, and off the stamp is the state a re-asserting
-    // signal would trample.
+    // the reader's.
+    //
+    // The correction puts a CARRYING rider back, which is the platform block's
+    // own rule reaching this setup. It used to decline here, both of its
+    // position readings having gone false together. That silent decline is the
+    // strand this file's landing block is about. So the reader ends this scroll
+    // ON the edge, and the write counter below is what still catches a
+    // re-assert: the fake counts every write, a redundant one included.
     readerGestureForTest(null, false);
     el.scrollTop = 1200;
     onScroll();
     expect(followingLiveEdge.value).toBe(true);
+    expect(el.scrollTop).toBe(2500);
     el.writes = 0;
 
     setAgentLive(true);        // the same answer again, from a later render
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(1200);
+    expect(el.scrollTop).toBe(2500);
   });
 
   it('carries them for a SUBMIT before any status says the thread is live', () => {

@@ -453,13 +453,14 @@ export function documentDeclaresBase(html: string): boolean {
   return DECLARED_BASE_RE.test(html);
 }
 
-/** Stamp `<base href>` into an artifact's HTML so the srcdoc document stops
- *  inheriting the host page's URL. A document that already declares its own
- *  `<base>` is returned untouched (only the first one counts per the HTML spec,
- *  and an artifact that set one meant it). */
-export function withPreviewBase(html: string, baseHref: string): string {
-  if (documentDeclaresBase(html)) return html;
-  const tag = `<base href="${escapeHtmlAttr(baseHref)}">`;
+/** Put `tag` at the start of the previewed document's head, whatever shape the
+ *  artifact was written in. Shared by the two things the preview stamps, so
+ *  there is one answer to "where does an injected tag go".
+ *
+ *  Each branch stamps EARLY rather than late. A `<base>` has to precede the
+ *  relative URLs it governs. Both tags have to precede the artifact's own
+ *  styles, so the artifact can still override them. */
+function injectAtHeadStart(html: string, tag: string): string {
   const headOpen = /<head(\s[^>]*)?>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -470,12 +471,50 @@ export function withPreviewBase(html: string, baseHref: string): string {
     const at = htmlOpen.index + htmlOpen[0].length;
     return `${html.slice(0, at)}<head>${tag}</head>${html.slice(at)}`;
   }
-  // No <head>/<html>: the parser builds them implicitly and a leading <base>
-  // lands in the implicit head. It must still come AFTER any doctype, or the
-  // doctype stops being a doctype and the document renders in quirks mode.
+  // No <head>/<html>: the parser builds them implicitly and a leading tag lands
+  // in the implicit head. It must still come AFTER any doctype, or the doctype
+  // stops being a doctype and the document renders in quirks mode.
   const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
   if (doctype) {
     return html.slice(0, doctype[0].length) + tag + html.slice(doctype[0].length);
   }
   return tag + html;
+}
+
+/** Stamp `<base href>` into an artifact's HTML so the srcdoc document stops
+ *  inheriting the host page's URL. A document that already declares its own
+ *  `<base>` comes back untouched. Only the first one counts per the HTML spec,
+ *  and an artifact that set one meant it. */
+export function withPreviewBase(html: string, baseHref: string): string {
+  if (documentDeclaresBase(html)) return html;
+  return injectAtHeadStart(html, `<base href="${escapeHtmlAttr(baseHref)}">`);
+}
+
+/** Stamp the user's UI scale into an artifact as `zoom` on its root, so the
+ *  previewed document grows with the shell around it.
+ *
+ *  A srcdoc document is its own realm and inherits nothing from the host, whose
+ *  root font-size is `var(--user-ui-scale)`. An artifact is sized in px against
+ *  the browser's 16px default, so at any scale but 100% it reads visibly smaller
+ *  than everything framing it.
+ *
+ *  `zoom` INSIDE the document rather than on the iframe element, which is the
+ *  obvious form and is wrong. WebKit leaves the inner viewport unzoomed and
+ *  paints the scaled content into it, clipping the overflow. Chromium narrows
+ *  the viewport as real browser zoom does. The two engines agree exactly on this
+ *  form instead. See ADR 0217 for the measurements.
+ *
+ *  `scalePercent` is the preference's own unit (`currentUiScale`), so 100 is the
+ *  identity and stamps nothing at all. A non-finite or non-positive value is one
+ *  too, rather than an error: an unreadable preference must never cost the
+ *  reader the document. */
+export function withPreviewScale(html: string, scalePercent: number): string {
+  if (!Number.isFinite(scalePercent) || scalePercent <= 0) return html;
+  // One decimal covers the 12.5% preference grid, and rounding here is what
+  // keeps a stray float out of the stylesheet in exponent notation.
+  const pct = Math.round(scalePercent * 10) / 10;
+  if (pct === 100) return html;
+  // `:root` rather than `html`, so an artifact's own `html { … }` rule does not
+  // outrank it on specificity.
+  return injectAtHeadStart(html, `<style>:root{zoom:${pct}%}</style>`);
 }

@@ -6,6 +6,7 @@
 # without printing the install command — install on Y, exit on N for required tools.
 # The Docker DAEMON check follows the same shape (offer the remedy, don't just
 # name it) and lives in scripts/lib/docker.sh, shared with the provisioning half.
+# It is the one check `check_prereqs build-only` skips; see the function.
 
 PREFLIGHT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/docker.sh
@@ -67,7 +68,19 @@ _check_or_install() {
     echo "  Skipping (recommended only)."
 }
 
+# $1: "build-only" to skip the Docker DAEMON check at the end, or empty for the
+# full launch preflight. A build-only caller (web-dev.sh --engine-build) compiles
+# a binary and exits; it opens no database, so a stopped Docker Desktop must not
+# fail it. Every TOOL check still runs: cargo, node and cmake are exactly what
+# the compile needs. Any other value is the full check, so a typo fails closed.
 check_prereqs() {
+    # Decided once, read by both arms below, so the two daemon checks cannot
+    # drift apart. Anything that is not exactly "build-only" takes the full path.
+    local want_docker_daemon=1
+    if [ "${1:-}" = "build-only" ]; then
+        want_docker_daemon=""
+    fi
+
     if [[ "$OSTYPE" != "darwin"* ]]; then
         # Linux/Windows: no auto-install, but warn on missing required tools.
         local t
@@ -79,7 +92,9 @@ check_prereqs() {
         # a minute later. Non-Darwin gets the same hard check as macOS (report and
         # exit), just without the offer to start it, since there is no `open -a`
         # equivalent to offer.
-        ensure_docker_daemon
+        if [ -n "$want_docker_daemon" ]; then
+            ensure_docker_daemon
+        fi
         return 0
     fi
 
@@ -111,7 +126,13 @@ check_prereqs() {
     # check from the `_check_or_install docker` above it. See docker.sh: it
     # offers to start Docker Desktop rather than telling the user to go do it
     # and start the launch over.
-    ensure_docker_daemon
+    #
+    # An `if` rather than a `&&` list, and that matters here: this is the
+    # function's last statement, so a skipped `&&` would return 1 and `set -e`
+    # would abort the caller's launch.
+    if [ -n "$want_docker_daemon" ]; then
+        ensure_docker_daemon
+    fi
 }
 
 # Tauri CLI (`cargo tauri`) — only tauri-dev.sh needs it, so it lives outside

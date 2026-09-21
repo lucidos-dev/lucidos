@@ -32,6 +32,35 @@ source "$SCRIPT_DIR/workspace.sh"
 # eight tests measure the wrong thing. Add one only alongside a test that can
 # reach a signal.
 
+# ── process-table seam (stubbed for the WHOLE file) ────────────────────
+# ADR 0025: a synthetic feed is the entire answer, never a fall-back to the
+# real host. Overriding the two functions outright is what guarantees that, so
+# the teardown's verdict can never depend on what is running on this machine.
+#
+# The default is an empty table read successfully, which means "no engine
+# serves this checkout" and lets a teardown proceed. Each test that cares sets
+# its own feed and restores this one.
+SYNTHETIC_PS_LISTING=""
+SYNTHETIC_PS_RC=0
+SYNTHETIC_PROC_ENV=""
+
+_build_watch_ps_listing() {
+    printf '%s' "$SYNTHETIC_PS_LISTING"
+    return "$SYNTHETIC_PS_RC"
+}
+
+# One `<pid>|<ps -E line>` record per feed line.
+_build_watch_proc_env() {
+    printf '%s\n' "$SYNTHETIC_PROC_ENV" |
+        awk -F'|' -v want="$1" '$1 == want { print substr($0, index($0, "|") + 1) }'
+}
+
+reset_process_table() {
+    SYNTHETIC_PS_LISTING=""
+    SYNTHETIC_PS_RC=0
+    SYNTHETIC_PROC_ENV=""
+}
+
 # ── fixture helpers ────────────────────────────────────────────────────
 make_pkg_dir() {
     # Creates a package dir with a package.json and (optionally) a node_modules.
@@ -687,6 +716,262 @@ test_kills_shared_build_watch_when_no_workspace_serves() {
     else
         pass "build-watch pidfile removed"
     fi
+}
+
+# ── the teardown asks what is RUNNING, not what a marker file says ──────
+# ADR 0219's principle, applied to the shared build-watch. `frontend.pid` is
+# written only by start_frontend_built, so an engine the gateway spawned is
+# invisible to the marker scan. Every fixture below therefore writes NO marker
+# at all: the engine query is the only thing that can spare the watch.
+
+# Stand up a sandboxed checkout with a live fake build-watch and no markers.
+# Sets BW_PID; the caller owns killing it.
+#
+# Deliberately NOT echoing the pid: a `$(...)` call would hold the command
+# substitution's pipe open through the backgrounded child and hang the suite.
+# The sibling tests background inline for the same reason.
+BW_PID=""
+arrange_markerless_checkout() {
+    local project="$1"
+    mkdir -p "$project/crates/lucidos-app/.build-watch" "$project/crates/lucidos-app/dist"
+    rm -rf "${HOME:?}/workspaces"
+    ( exec sleep 30 ) &
+    BW_PID=$!
+    disown "$BW_PID" 2>/dev/null || true
+    echo "$BW_PID" > "$project/crates/lucidos-app/.build-watch/pid"
+}
+
+# Did the teardown spare the watch? Waits out the kill the way the sibling
+# tests do, so a slow signal cannot read as a survival.
+build_watch_survived() {
+    local pid="$1" waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
+    kill -0 "$pid" 2>/dev/null
+}
+
+test_a_gateway_spawned_engine_keeps_the_build_watch() {
+    echo "test: an engine with no frontend.pid still keeps the shared build-watch"
+
+    # The incident. This engine was spawned by the gateway, so no marker names
+    # it, and the old ref-count read the checkout as idle while it was serving.
+    local PROJECT_DIR="$SANDBOX/proj-bw-gateway"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    SYNTHETIC_PS_LISTING=" 4242 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4242|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+
+    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
+
+    if build_watch_survived "$bw_pid"; then
+        pass "the watch survives an engine that carries no marker"
+    else
+        fail "killed the watch out from under a live engine (the incident)"
+    fi
+    if [ -f "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid" ]; then
+        pass "the pidfile is left in place"
+    else
+        fail "removed the pidfile while an engine was serving"
+    fi
+    case "$out" in
+        *"Keeping"*4242*) pass "it says which engine spared the watch" ;;
+        *) fail "a silent refusal is what made this take hours: $out" ;;
+    esac
+
+    kill "$bw_pid" 2>/dev/null || true
+    reset_process_table
+}
+
+test_a_dist_that_does_not_resolve_still_keeps_the_build_watch() {
+    echo "test: an engine whose dist/ will not resolve still keeps the watch"
+
+    # The atomic publish renames dist.staging onto dist/, so the directory is
+    # briefly absent. Dropping the engine there would open a window in which a
+    # concurrent stop tears the watch down, which is the bug in miniature.
+    local PROJECT_DIR="$SANDBOX/proj-bw-midpublish"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    rmdir "$PROJECT_DIR/crates/lucidos-app/dist"
+    SYNTHETIC_PS_LISTING=" 4545 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4545|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        pass "an unresolvable dist/ is compared lexically, not dropped"
+    else
+        fail "a mid-publish rename opened a teardown window"
+    fi
+
+    kill "$bw_pid" 2>/dev/null || true
+    reset_process_table
+}
+
+test_an_unreadable_process_table_keeps_the_build_watch() {
+    echo "test: a process table that could not be read leaves the watch alone"
+
+    # Unknown is not "no". A wrong "still serving" leaks one node process; a
+    # wrong "nothing serving" is the incident above.
+    local PROJECT_DIR="$SANDBOX/proj-bw-unknown"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    SYNTHETIC_PS_RC=1
+
+    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
+
+    if build_watch_survived "$bw_pid"; then
+        pass "an unreadable table does not authorize the kill"
+    else
+        fail "killed the watch on a probe that never ran"
+    fi
+    case "$out" in
+        *"could not read the process table"*) pass "it names the unknown" ;;
+        *) fail "the refusal should say the probe failed: $out" ;;
+    esac
+
+    kill "$bw_pid" 2>/dev/null || true
+    reset_process_table
+}
+
+test_the_engine_being_stopped_does_not_spare_the_build_watch() {
+    echo "test: the workspace on its way out casts neither vote"
+
+    # The shape stop.sh actually has. It SIGUSR1s the engine and reaches the
+    # teardown milliseconds later, while a graceful drain still has seconds to
+    # run, so the engine it just stopped is still in the process table. Counting
+    # it makes the teardown a permanent no-op at its primary call site, and the
+    # watch leaks on every stop. The marker vote already excludes the stopping
+    # workspace (release_frontend_marker runs first); this is its counterpart.
+    local PROJECT_DIR="$SANDBOX/proj-bw-draining"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    SYNTHETIC_PS_LISTING=" 4848 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4848|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+
+    teardown_shared_build_watch_if_idle 4848 >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        fail "the draining engine spared the watch, so a stop never tears it down"
+        kill "$bw_pid" 2>/dev/null || true
+    else
+        pass "the excluded engine does not keep the watch alive"
+    fi
+
+    # And the exclusion is narrow: a DIFFERENT live engine still spares it.
+    arrange_markerless_checkout "$PROJECT_DIR"; bw_pid="$BW_PID"
+    SYNTHETIC_PS_LISTING=" 4848 /repo/.launch/debug/plain/lucidos-engine
+ 4949 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4848|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin
+4949|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+
+    teardown_shared_build_watch_if_idle 4848 >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        pass "a peer engine still spares the watch"
+    else
+        fail "excluding the stopped engine also dropped a live peer"
+    fi
+
+    kill "$bw_pid" 2>/dev/null || true
+    reset_process_table
+}
+
+test_an_engine_whose_environment_will_not_read_keeps_the_build_watch() {
+    echo "test: a live engine we cannot characterize is unknown, not idle"
+
+    # The listing is one probe and the per-engine environment read is another.
+    # Guarding only the first put the bug back one level down: a live engine
+    # whose environment `ps -E` will not hand over read as "not serving".
+    local PROJECT_DIR="$SANDBOX/proj-bw-blindenv"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    SYNTHETIC_PS_LISTING=" 4646 /repo/.launch/debug/plain/lucidos-engine"
+    # argv only, no environment pairs: what `ps -E` prints when it may not read
+    # the environment of a process that is nonetheless alive.
+    SYNTHETIC_PROC_ENV="4646|/repo/.launch/debug/plain/lucidos-engine"
+
+    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
+
+    if build_watch_survived "$bw_pid"; then
+        pass "an unreadable environment does not authorize the kill"
+    else
+        fail "killed the watch over an engine it simply could not read"
+    fi
+    case "$out" in
+        *"could not read the process table"*) pass "it names the unknown" ;;
+        *) fail "the refusal should say the probe failed: $out" ;;
+    esac
+
+    kill "$bw_pid" 2>/dev/null || true
+    reset_process_table
+}
+
+test_an_engine_that_serves_no_dist_does_not_keep_the_build_watch() {
+    echo "test: a readable environment with no LUCIDOS_STATIC_DIR is a real answer"
+
+    # The counterpart to the test above, and the reason the two are told apart
+    # by PATH rather than by the static dir being absent. This engine serves no
+    # dist at all, which is an answer, not a gap.
+    local PROJECT_DIR="$SANDBOX/proj-bw-nodist"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    SYNTHETIC_PS_LISTING=" 4747 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4747|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_WORKSPACE=/w/other PATH=/bin"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        fail "an engine serving no dist wrongly spared the watch"
+        kill "$bw_pid" 2>/dev/null || true
+    else
+        pass "a readable environment without the var lets the teardown run"
+    fi
+
+    reset_process_table
+}
+
+test_an_engine_of_another_checkout_does_not_keep_the_build_watch() {
+    echo "test: an engine serving a DIFFERENT checkout lets the teardown run"
+
+    # Without this the teardown becomes a blanket no-op and the watch leaks on
+    # every stop. A worktree's own dist/ is the case that matters in practice.
+    local PROJECT_DIR="$SANDBOX/proj-bw-sibling"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    local other="$SANDBOX/proj-bw-sibling-elsewhere"
+    mkdir -p "$other/crates/lucidos-app/dist"
+    SYNTHETIC_PS_LISTING=" 4343 /repo/.launch/debug/plain/lucidos-engine"
+    SYNTHETIC_PROC_ENV="4343|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$other/crates/lucidos-app/dist PATH=/bin"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        fail "a foreign checkout's engine wrongly spared the watch"
+        kill "$bw_pid" 2>/dev/null || true
+    else
+        pass "the watch is torn down when nothing serves THIS checkout"
+    fi
+
+    reset_process_table
+}
+
+test_a_coding_agent_session_is_not_an_engine() {
+    echo "test: a session that merely INHERITS the engine's env is not an engine"
+
+    # Not hypothetical, and not merely the ADR 0025 rule restated. A coding-agent
+    # session is forked BY an engine, so LUCIDOS_STATIC_DIR really is in its
+    # environment, and it carries the thread transcript in a ~22 KB argument.
+    # Matching the whole command line would count every such session as an
+    # engine and the watch would then never be torn down at all.
+    local PROJECT_DIR="$SANDBOX/proj-bw-ccsession"
+    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
+    local dist="$PROJECT_DIR/crates/lucidos-app/dist"
+    mkdir -p "$dist"
+    SYNTHETIC_PS_LISTING=" 4444 /home/u/.local/bin/claude --append-system-prompt the build-watch republishes $dist and lucidos-engine serves it"
+    SYNTHETIC_PROC_ENV="4444|/home/u/.local/bin/claude --append-system-prompt … LUCIDOS_STATIC_DIR=$dist PATH=/bin"
+
+    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+
+    if build_watch_survived "$bw_pid"; then
+        fail "a coding-agent session was counted as an engine"
+        kill "$bw_pid" 2>/dev/null || true
+    else
+        pass "selection is on argv[0], so a mention is not a match"
+    fi
+
+    reset_process_table
 }
 
 test_shared_pg_sql_quoting() {
@@ -1628,6 +1913,14 @@ time.sleep(10)
 test_pid_is_live_rejects_a_zombie
 test_keeps_shared_build_watch_when_a_workspace_still_serves
 test_kills_shared_build_watch_when_no_workspace_serves
+test_a_gateway_spawned_engine_keeps_the_build_watch
+test_a_dist_that_does_not_resolve_still_keeps_the_build_watch
+test_an_unreadable_process_table_keeps_the_build_watch
+test_the_engine_being_stopped_does_not_spare_the_build_watch
+test_an_engine_whose_environment_will_not_read_keeps_the_build_watch
+test_an_engine_that_serves_no_dist_does_not_keep_the_build_watch
+test_an_engine_of_another_checkout_does_not_keep_the_build_watch
+test_a_coding_agent_session_is_not_an_engine
 test_launch_bin_dir_is_per_profile_and_variant
 test_launch_dir_is_outside_cargo_target
 test_worktree_refusal_still_sees_a_worktree_launch_dir
@@ -2024,6 +2317,290 @@ test_stop_status_says_000_when_nothing_answers() {
 test_stop_status_reports_the_first_scheme_that_answers
 test_stop_status_falls_back_to_http
 test_stop_status_says_000_when_nothing_answers
+
+# ── desktop_window_url: the door the Tauri window loads ────────────────
+#
+# The bug this pins: tauri-dev.sh pointed its window at its own engine on the
+# workspace port while the gateway already owned that port, so the launcher
+# spawned a second engine and it died with AddrInUse.
+#
+# Pure string building, no host call, so the suite stays hermetic.
+
+test_gateway_mode_window_goes_through_the_gateway() {
+    echo "test: desktop_window_url uses the gateway and the workspace prefix"
+    local got
+    got="$(desktop_window_url 1 https 5251 dev 5173)"
+    if [ "$got" = "https://localhost:5251/dev/" ]; then
+        pass "gateway mode reaches the workspace at /<slug>/"
+    else
+        fail "want https://localhost:5251/dev/, got '$got'"
+    fi
+
+    # The trailing slash is load-bearing: the gateway resolves the first path
+    # segment as the slug, and the engine stamps <base href> from the prefix.
+    case "$got" in
+        */dev/) pass "the prefix keeps its trailing slash" ;;
+        *) fail "want a trailing slash on the prefix, got '$got'" ;;
+    esac
+}
+
+test_legacy_mode_window_goes_to_the_engine_root() {
+    echo "test: desktop_window_url uses the engine root without a gateway"
+    local got
+    got="$(desktop_window_url "" https 5251 "" 5173)"
+    if [ "$got" = "https://localhost:5173" ]; then
+        pass "LUCIDOS_NO_GATEWAY keeps the engine as the front door"
+    else
+        fail "want https://localhost:5173, got '$got'"
+    fi
+
+    got="$(desktop_window_url "" http 5251 "" 5273)"
+    if [ "$got" = "http://localhost:5273" ]; then
+        pass "the scheme and port both come from the caller"
+    else
+        fail "want http://localhost:5273, got '$got'"
+    fi
+}
+
+test_a_half_set_gateway_mode_never_builds_a_prefix() {
+    echo "test: desktop_window_url needs BOTH gateway signals"
+    # show_banner requires GATEWAY_MODE and GATEWAY_WS_ID together. Either one
+    # alone would build `/…//` or a prefix for a gateway that is not running,
+    # and the window would load a URL nothing serves.
+    local got
+    got="$(desktop_window_url 1 https 5251 "" 5173)"
+    if [ "$got" = "https://localhost:5173" ]; then
+        pass "mode without a workspace id falls back to the engine root"
+    else
+        fail "want the engine root when the workspace id is empty, got '$got'"
+    fi
+
+    got="$(desktop_window_url "" https 5251 dev 5173)"
+    if [ "$got" = "https://localhost:5173" ]; then
+        pass "a workspace id without gateway mode falls back too"
+    else
+        fail "want the engine root when gateway mode is off, got '$got'"
+    fi
+}
+
+test_gateway_mode_window_goes_through_the_gateway
+test_legacy_mode_window_goes_to_the_engine_root
+test_a_half_set_gateway_mode_never_builds_a_prefix
+
+# ── engine_health_scheme: probe the scheme, never assume it ────────────
+#
+# `curl` is shadowed in a subshell and answers exit codes from a queue, so the
+# https-then-http fallback is pinned rather than assumed. No request leaves this
+# process. Same shape as the gateway_stop_status stub above.
+
+# Run engine_health_scheme with `curl` exiting with the queued codes in $1.
+# The subshell runs under `set -e`, as start_engine does.
+health_scheme_with() {
+    printf '%s' "$1" >"$SANDBOX/curl-queue"
+    (
+        set -e
+        # shellcheck disable=SC2317 # called by engine_health_scheme
+        curl() {
+            local seq head rest
+            seq="$(cat "$SANDBOX/curl-queue")"
+            head="${seq%% *}"
+            rest="${seq#* }"
+            [ "$rest" = "$seq" ] && rest=""
+            printf '%s' "$rest" >"$SANDBOX/curl-queue"
+            return "${head:-7}"
+        }
+        engine_health_scheme 5173
+    )
+}
+
+test_health_scheme_reports_https_when_tls_answers() {
+    echo "test: engine_health_scheme reports the scheme that answered"
+    local got
+    got="$(health_scheme_with "0 0")"
+    if [ "$got" = "https" ]; then
+        pass "https answered, so http is never tried"
+    else
+        fail "want https, got '$got'"
+    fi
+}
+
+test_health_scheme_falls_back_to_http() {
+    echo "test: engine_health_scheme falls back to http when TLS refuses"
+    # The gateway-spawned engine case: dev certs make detect_tls pick https,
+    # but the engine behind the gateway serves plain http. Reading it as dead
+    # is what spawned a second engine onto the held port.
+    local got
+    got="$(health_scheme_with "35 0")"
+    if [ "$got" = "http" ]; then
+        pass "a plain-http engine is found, not read as dead"
+    else
+        fail "want http, got '$got'"
+    fi
+}
+
+test_health_scheme_is_empty_and_succeeds_when_nothing_answers() {
+    echo "test: engine_health_scheme is empty when no engine answers"
+    local got rc
+    got="$(health_scheme_with "7 7")"
+    rc=$?
+    if [ -z "$got" ]; then
+        pass "no answer on either scheme reads as empty"
+    else
+        fail "want an empty scheme, got '$got'"
+    fi
+    # Pins the exit status the caller depends on: start_engine assigns this
+    # into a variable under `set -e`, so a non-zero status aborts the launch.
+    # Both the `if` with no `else` and the explicit `return 0` produce it, so
+    # this guards a restructure rather than one line.
+    if [ "$rc" -eq 0 ]; then
+        pass "an absent engine still exits 0, so the caller survives set -e"
+    else
+        fail "want exit 0 when nothing answers, got $rc"
+    fi
+}
+
+test_health_scheme_reports_https_when_tls_answers
+test_health_scheme_falls_back_to_http
+test_health_scheme_is_empty_and_succeeds_when_nothing_answers
+
+# ── adopt_engine_scheme: the running engine owns its scheme ────────────
+
+test_adopting_a_matching_scheme_changes_nothing() {
+    echo "test: adopt_engine_scheme is silent when the scheme already matches"
+    local out
+    WORKSPACE="$SANDBOX/ws-adopt-match"
+    ENGINE_PORT=5173
+    PROTO=https
+    mkdir -p "$WORKSPACE/.lucidos"
+    out="$(adopt_engine_scheme https)"
+    if [ -z "$out" ] && [ "$PROTO" = "https" ]; then
+        pass "a matching scheme is a no-op"
+    else
+        fail "want silence and https, got output '$out' and PROTO '$PROTO'"
+    fi
+}
+
+test_adopting_a_different_scheme_rewrites_the_ports_file() {
+    echo "test: adopt_engine_scheme takes the scheme the engine really serves"
+    WORKSPACE="$SANDBOX/ws-adopt-differ"
+    ENGINE_PORT=5173
+    PROTO=https
+    mkdir -p "$WORKSPACE/.lucidos"
+    printf 'API_PORT=5173\nPROTO=https\n' >"$WORKSPACE/.lucidos/ports"
+    adopt_engine_scheme http >/dev/null
+    if [ "$PROTO" = "http" ]; then
+        pass "PROTO follows the live engine"
+    else
+        fail "want PROTO http, got '$PROTO'"
+    fi
+    # Every CLI caller reads the scheme back out of this file, so an adopted
+    # scheme that only lived in this shell would strand them on the old one.
+    if grep -qx 'PROTO=http' "$WORKSPACE/.lucidos/ports"; then
+        pass "the ports file records the adopted scheme"
+    else
+        fail "ports file did not record it: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+    if grep -qx 'API_PORT=5173' "$WORKSPACE/.lucidos/ports"; then
+        pass "the other keys survive the rewrite"
+    else
+        fail "API_PORT was lost: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+}
+
+test_adopting_a_matching_scheme_changes_nothing
+test_adopting_a_different_scheme_rewrites_the_ports_file
+
+# ── workspace_engine_restart_is_needed: adopt, don't restart ───────────
+#
+# The bug this pins: a plain launch POSTed the gateway's restart control even
+# with the engine already up, so every in-flight thread settled as an
+# unattributed abort. A script carries no device, so those do not auto-resume.
+# See docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
+#
+# Pure, so it runs with no gateway and no engine.
+
+test_a_running_engine_is_adopted_not_restarted() {
+    echo "test: a plain launch adopts the engine already serving"
+    if workspace_engine_restart_is_needed "" 1; then
+        fail "restarted an engine this launch had no reason to replace"
+    else
+        pass "the restart POST is skipped"
+    fi
+}
+
+test_a_stopped_engine_is_started() {
+    echo "test: a launch still starts an engine that is not running"
+    # The POST is why it exists: a new workspace defaults to autostart off, so
+    # the gateway's own boot spawns nothing. A `-b` lands here too, with its
+    # engine already reaped by kill_stale_processes.
+    if workspace_engine_restart_is_needed "" ""; then
+        pass "the POST starts it"
+    else
+        fail "a launch with no engine running would start nothing"
+    fi
+}
+
+test_the_apply_switch_always_respawns() {
+    echo "test: --engine-only respawns even though the engine is healthy"
+    # That is the whole job of the switch: move onto the freshly built binary.
+    if workspace_engine_restart_is_needed 1 1; then
+        pass "the Apply switch still restarts"
+    else
+        fail "a Switch would leave the old engine serving"
+    fi
+}
+
+test_a_running_engine_is_adopted_not_restarted
+test_a_stopped_engine_is_started
+test_the_apply_switch_always_respawns
+
+# ── gateway_lists_workspace: adopting must not skip the registry sync ──
+#
+# The restart POST is the only thing that makes a running gateway re-read
+# `workspaces.json` (`sync_registry_from_disk`), and `adopt_running_engines`
+# walks the in-memory list. So an engine answering for a slug the gateway has
+# never heard of must still take the POST, or the window loads a route nothing
+# serves. `curl` is shadowed in a subshell, so no request leaves this process.
+lists_workspace_with() { # <body> <ws-id>
+    printf '%s' "$1" >"$SANDBOX/gateway-body"
+    (
+        set -e
+        PROTO=https; GATEWAY_PORT=5251; GATEWAY_WS_ID="$2"
+        # shellcheck disable=SC2317 # called by gateway_lists_workspace
+        curl() { cat "$SANDBOX/gateway-body"; }
+        gateway_lists_workspace && echo yes || echo no
+    )
+}
+
+test_a_listed_workspace_is_adoptable() {
+    echo "test: gateway_lists_workspace finds the slug in the control listing"
+    local body='{"workspaces":[{"id":"other","port":5273},{"id":"dev","port":5173}]}'
+    if [ "$(lists_workspace_with "$body" dev)" = "yes" ]; then
+        pass "a listed workspace reads as known"
+    else
+        fail "the gateway lists 'dev' and the probe missed it"
+    fi
+}
+
+test_an_unlisted_workspace_still_takes_the_post() {
+    echo "test: a slug the gateway never heard of is not adoptable"
+    local body='{"workspaces":[{"id":"other","port":5273}]}'
+    if [ "$(lists_workspace_with "$body" dev)" = "no" ]; then
+        pass "an unlisted workspace still asks for the restart"
+    else
+        fail "adopted a slug with no registry entry, so nothing would route"
+    fi
+    # An unreachable gateway answers nothing, and guessing "known" there would
+    # strand the launch on the same dead route.
+    if [ "$(lists_workspace_with "" dev)" = "no" ]; then
+        pass "an unreachable gateway falls back to the POST"
+    else
+        fail "an empty answer read as a known workspace"
+    fi
+}
+
+test_a_listed_workspace_is_adoptable
+test_an_unlisted_workspace_still_takes_the_post
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

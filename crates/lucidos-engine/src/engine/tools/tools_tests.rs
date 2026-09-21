@@ -836,6 +836,54 @@ fn apply_change_accepts_valid_uuid_trimming_whitespace() {
     assert_eq!(out.expect("valid padded UUID must parse"), id);
 }
 
+// ============================================================================
+// `apply_refusal_message`: what the `changes` tool says when the shared gate
+// refuses an Apply. The rule itself lives in `api::changes`; this is only the
+// wording, and the wording decides whether the agent does the right next thing.
+// ============================================================================
+
+/// A working thread gets pointed at the standing apply. The panel calls that
+/// affordance "Apply as it settles". It is the one answer that lands the
+/// user's change without the agent asking again.
+#[test]
+fn a_refusal_for_a_working_thread_names_apply_when_settled() {
+    use crate::api::changes::ChangeActionRefusal;
+    use crate::engine::tools::apply_refusal_message;
+
+    let msg = apply_refusal_message(ChangeActionRefusal::ThreadWorking);
+    assert!(msg.starts_with("Error:"), "{msg}");
+    assert!(
+        msg.contains("apply_when_settled"),
+        "the refusal must name the way forward: {msg}"
+    );
+}
+
+/// The other three refusals must NOT name it, not even to forbid it.
+///
+/// A parked thread is the one that bites: it reads as unsettled, so a
+/// bool-shaped gate pointed at a standing apply there. `standing_verdict`
+/// drops the arm on its first look, which costs the user a report and applies
+/// nothing. The bare absence is the assertion on purpose. A model reading
+/// "do NOT use X" still has X in front of it.
+#[test]
+fn a_refusal_that_waiting_cannot_fix_does_not_name_apply_when_settled() {
+    use crate::api::changes::ChangeActionRefusal;
+    use crate::engine::tools::apply_refusal_message;
+
+    for refusal in [
+        ChangeActionRefusal::NoFilesLeft,
+        ChangeActionRefusal::ThreadParked,
+        ChangeActionRefusal::ActionUnavailable,
+    ] {
+        let msg = apply_refusal_message(refusal);
+        assert!(msg.starts_with("Error:"), "{msg}");
+        assert!(
+            !msg.contains("apply_when_settled"),
+            "{refusal:?} cannot be waited out, so the message must not suggest it: {msg}"
+        );
+    }
+}
+
 #[test]
 fn thread_queue_policy_patch_merges_with_current_policy() {
     let current = CapacityPolicy {

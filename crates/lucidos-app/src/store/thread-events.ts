@@ -10,3 +10,4 @@ export * from './thread-events/event-waits';
 export * from './thread-events/exchange';
 export * from './thread-events/exchange-render';
 export * from './thread-events/exchange-grouping';
+export * from './thread-events/render-order';

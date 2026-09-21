@@ -8,7 +8,7 @@ import {
   _resetThreadOpenMarksForTesting,
 } from './threadOpenMarks';
 
-const base = (start: number) => ({ start, md: 0, link: 0 });
+const base = (start: number, warm = false) => ({ start, md: 0, link: 0, warm });
 
 describe('threadOpenMarks', () => {
   beforeEach(() => _resetThreadOpenMarksForTesting());
@@ -28,6 +28,13 @@ describe('threadOpenMarks', () => {
     markThreadOpenStart('t2', base(100));
     markThreadOpenStart('t2', base(500));
     expect(takeThreadOpenStart('t2')?.start).toBe(500);
+  });
+
+  it('carries whether the open was warm, so the two kinds stay legible apart', () => {
+    markThreadOpenStart('cold', base(1, false));
+    markThreadOpenStart('warm', base(2, true));
+    expect(takeThreadOpenStart('cold')?.warm).toBe(false);
+    expect(takeThreadOpenStart('warm')?.warm).toBe(true);
   });
 
   it('keeps open marks independent per thread', () => {

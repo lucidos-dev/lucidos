@@ -432,7 +432,7 @@ THINKING vs RESPONSE:
 CONVERSATION STYLE:
 - Vary your openings, and NEVER start with "Okay" or "Sure": answer directly.
 - When the user shares what they're working on, acknowledge it and ask ONE follow-up. Don't interrogate.
-- Create artifacts as the conversation progresses, not all at once.
+- Create artifacts as the conversation progresses, not all at once.__RESPONSE_STYLE_RULE__
 
 COPYABLE TEXT: wrap text the user will want to copy (a command, a URL, a key, an id, instructions for another session) in <copy>...</copy> and the UI adds a one-click copy button. Not for prose, explanations or headings, and not for code blocks, which have their own.
 
@@ -565,10 +565,17 @@ __REPEATED_ACTION_RULE__"#;
 ///
 /// `mode` is here for the same reason. The mode withdraws `todo_write`, so a
 /// body that cannot vary orders a call the tools array does not offer.
+///
+/// `response_style` is the rendered *response style* section, empty on
+/// Standard. It is a parameter rather than a read, so this stays pure and the
+/// budget meter can bill the widest shipped one. It sits INSIDE the cached
+/// system tier because it is a function of workspace preferences alone, which
+/// is what ADR 0084 admits there.
 fn static_prompt_body(
     has_lucidos_source: bool,
     max_tool_calls: usize,
     mode: super::context_mode::ContextMode,
+    response_style: &str,
 ) -> String {
     let apply_verify_rule = if has_lucidos_source {
         format!("{}{}", APPLY_VERIFY_RULE, APPLY_VERIFY_DEV_ADDENDUM)
@@ -601,7 +608,12 @@ fn static_prompt_body(
         .replace(
             "__MAX_CHILDREN_PER_THREAD__",
             &super::super::recursion_guard::MAX_CHILDREN_PER_THREAD.to_string(),
-        );
+        )
+        // LAST, and that is the point. Every substitution above is engine text,
+        // and this one is the user's. Splice it earlier and the passes that
+        // follow rewrite it: an instruction naming `__MAX_TOOL_CALLS__` would
+        // expand, so "injected verbatim" would stop being true.
+        .replace("__RESPONSE_STYLE_RULE__", response_style);
 
     format!("{}{}", body, coding_surface_section(has_lucidos_source))
 }
@@ -706,10 +718,21 @@ impl LucidosEngine {
         // name says plainly that the two are the same mode.
         let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
 
+        // Resolved here, ABOVE the trigger branch, so a trigger fire and a chat
+        // turn cannot take different arms: the workspace's chosen style is the
+        // workspace's chosen style either way. Empty on Standard, which leaves
+        // the body byte-identical to a build that never had this setting.
+        let response_style = crate::core::response_style::resolve(&self.pool).await;
+
         let system_prompt = format!(
             "{}{}",
             system_prompt,
-            static_prompt_body(has_lucidos_source, max_tool_calls, context_mode)
+            static_prompt_body(
+                has_lucidos_source,
+                max_tool_calls,
+                context_mode,
+                &response_style
+            )
         );
 
         // Whether the user has restarted onto the newest build is a FACT the
@@ -1131,7 +1154,48 @@ mod tests {
     /// serving a provider's API host and its git host was stored twice, under
     /// two service names, with two places to rotate it. Knowhow cannot carry
     /// it: the argument is what the model writes.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 117_530;
+    /// Raised by 382 to a measured 117,912 for the *response style*, billed at
+    /// its widest shipped section: the wrapper, the instruction, and the floor
+    /// that keeps a warning in an answer however short the style asks for.
+    ///
+    /// It buys back more than it spends, on the turns that matter. Two users on
+    /// the packaged build were switching models by hand to escape the default's
+    /// length, and one was drifting off the default model entirely. A style that
+    /// trims a reply pays for these characters in the first answer it shortens.
+    ///
+    /// The meter bills the SHIPPED text only. A style the user wrote is
+    /// workspace content, the same class as `user_profile.md`, and this ratchet
+    /// measures the engine-authored surface. Standard, the default, is billed
+    /// here and injects nothing at all.
+    ///
+    /// Raised by 65 to a measured 117,977 for a todo list the agent can read.
+    /// The `todo_write` schema itself grew 367, from 1,063 to 1,430. It buys
+    /// the `action` enum and a description saying the call answers with the
+    /// resulting list.
+    ///
+    /// The ceiling moves by 65 rather than 367, because it was carrying 302
+    /// characters of slack. This change spends them. That is the silent spend
+    /// the rule above warns about, recorded here rather than left unsaid.
+    ///
+    /// What it buys pays for itself on a long thread. The engine settles every
+    /// unfinished item at each response terminator, and nothing carried that
+    /// rewrite back. Items the agent had landed went on reading `waiting` for
+    /// hours. A count cannot correct that, and the list can.
+    ///
+    /// Raised by 42 to a measured 118,019 for Claude Fable 5.1 in the
+    /// coding-agent pickers. The `run_coding_agent` `model` enum is the union
+    /// of both backends' picker values, so every new row is billed on every
+    /// chat request. Two rows here, the pinned id and its 1M variant.
+    ///
+    /// Not offering the model is the only way to avoid the cost:
+    /// `validate_coding_agent_model` refuses an id no picker carries, so an
+    /// enum the user's picker has outgrown just makes the tool call fail.
+    ///
+    /// Raised by 66 to a measured 118,085 for the `changes` apply summary,
+    /// which now says the call is refused while its thread is unsettled. The
+    /// refusal was the bug (ADR 0233). An agent that learns it only by trying
+    /// has already asked to merge a branch somebody is still writing to.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 118_085;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1141,10 +1205,15 @@ mod tests {
     /// configured). The grouped manifest tools are billed separately because
     /// they have a different owner, `crate::capability_manifest`.
     ///
-    /// **Every capability gate is resolved OPEN here except the image one**,
-    /// which is the same set this measured before ADR 0088 gated anything.
-    /// The meter is the engine-authored surface, not one workspace's array, so
-    /// a gate closing somewhere reclaims nothing this ratchet may spend.
+    /// **Every capability gate is resolved OPEN here except two**, which is
+    /// the same set this measured before ADR 0088 gated anything. The meter is
+    /// the engine-authored surface, not one workspace's array, so a gate
+    /// closing somewhere reclaims nothing this ratchet may spend.
+    ///
+    /// The two are the image provider and the judgment provider. Both open on
+    /// a third-party credential almost no workspace holds, and neither was in
+    /// the measured set. Billing them would spend the ratchet on prose the
+    /// common workspace is never sent.
     ///
     /// The context mode is the exception, and it is that same rule applied.
     /// The mode CLOSES a family rather than opening one: it takes `todo_write`
@@ -1155,6 +1224,7 @@ mod tests {
             email_account: true,
             intent: true,
             image_provider: false,
+            judgment_provider: false,
             context_mode: false,
         };
         let mut flat = crate::llm::tools::get_default_tools(&billed);
@@ -1181,11 +1251,16 @@ mod tests {
         // off: that is the configuration almost every workspace runs. Its
         // todo rule is 31 chars longer, against a `todo_write` schema of
         // nearly a thousand that a mode-on workspace does not pay at all.
+        // The *response style* is billed at its widest SHIPPED section, the
+        // same worst-case rule the source variant takes. A style the user wrote
+        // is workspace content, like `user_profile.md`, and this meter measures
+        // the engine-authored surface.
+        let widest_style = crate::core::response_style::widest_shipped_section();
         let body = std::cmp::max(
-            static_prompt_body(true, 500, ContextMode::Off)
+            static_prompt_body(true, 500, ContextMode::Off, &widest_style)
                 .chars()
                 .count(),
-            static_prompt_body(false, 500, ContextMode::Off)
+            static_prompt_body(false, 500, ContextMode::Off, &widest_style)
                 .chars()
                 .count(),
         );
@@ -1554,6 +1629,7 @@ mod tests {
                     email_account: false,
                     intent: false,
                     image_provider: true,
+                    judgment_provider: false,
                     context_mode: false,
                 },
             ),
@@ -1683,9 +1759,9 @@ mod tests {
 
         let mut haystack = format!(
             "{}{}{}",
-            static_prompt_body(true, 500, ContextMode::Off),
-            static_prompt_body(false, 500, ContextMode::Off),
-            static_prompt_body(true, 500, ContextMode::On)
+            static_prompt_body(true, 500, ContextMode::Off, ""),
+            static_prompt_body(false, 500, ContextMode::Off, ""),
+            static_prompt_body(true, 500, ContextMode::On, "")
         );
         let mut tools = flat_chat_tools();
         tools.extend(crate::capability_manifest::llm_tools());
@@ -1764,6 +1840,73 @@ mod tests {
         );
     }
 
+    /// Standard costs the prompt nothing, to the character.
+    ///
+    /// This is the promise the whole setting rests on: a workspace that never
+    /// opens it reads exactly what it read before. So the placeholder sits at
+    /// the END of a line rather than on one of its own. Resolving it to `""`
+    /// then leaves no orphan newline behind.
+    #[test]
+    fn the_standard_body_is_byte_identical_to_a_build_with_no_style() {
+        let standard = static_prompt_body(false, 500, ContextMode::Off, "");
+
+        assert!(!standard.contains("RESPONSE STYLE:"));
+        assert!(!standard.contains("__RESPONSE_STYLE_RULE__"));
+        assert!(standard.contains(
+            "- Create artifacts as the conversation progresses, not all at once.\n\nCOPYABLE TEXT:"
+        ));
+    }
+
+    /// A chosen style adds its section and NOTHING else. Equal lengths would
+    /// not prove that, so this pins where the text lands as well as its size.
+    #[test]
+    fn a_chosen_style_adds_exactly_its_own_section() {
+        let section = crate::core::response_style::widest_shipped_section();
+        let standard = static_prompt_body(false, 500, ContextMode::Off, "");
+        let styled = static_prompt_body(false, 500, ContextMode::Off, &section);
+
+        assert_eq!(styled.len(), standard.len() + section.len());
+        assert!(styled.contains("RESPONSE STYLE:"));
+        // Directly after the conversation-style bullets, which is the rule it
+        // overrides. Separated, and the two contradict each other in place.
+        assert!(styled.contains(&format!(
+            "- Create artifacts as the conversation progresses, not all at once.{section}"
+        )));
+    }
+
+    /// Whatever the user selects, the section is the one the library rendered.
+    /// Nothing here re-derives it, so a reworded style cannot land half-applied.
+    #[test]
+    fn each_shipped_style_splices_its_own_block_and_no_others() {
+        use crate::core::response_style;
+
+        let library = response_style::merge(&[]);
+        for style in &library {
+            let section = response_style::section_for(&library, &style.id);
+            let body = static_prompt_body(false, 500, ContextMode::Off, &section);
+            if style.id == response_style::STANDARD_ID {
+                assert!(!body.contains("RESPONSE STYLE:"));
+                continue;
+            }
+            assert!(
+                body.contains(&style.instruction),
+                "{} did not reach the prompt",
+                style.id
+            );
+            for other in &library {
+                if other.id == style.id || other.instruction.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !body.contains(&other.instruction),
+                    "{} leaked into the {} prompt",
+                    other.id,
+                    style.id
+                );
+            }
+        }
+    }
+
     /// The prompt never orders a tool call the mode has withdrawn.
     ///
     /// `todo_write` is absent from the mode-on tools array, so the base body's
@@ -1771,8 +1914,8 @@ mod tests {
     /// mode-on turn. The list lives under a `[TODO]` heading instead.
     #[test]
     fn the_mode_on_body_points_at_the_todo_heading_rather_than_the_tool() {
-        let off = static_prompt_body(false, 500, ContextMode::Off);
-        let on = static_prompt_body(false, 500, ContextMode::On);
+        let off = static_prompt_body(false, 500, ContextMode::Off, "");
+        let on = static_prompt_body(false, 500, ContextMode::On, "");
 
         assert!(
             off.contains("todo_write"),

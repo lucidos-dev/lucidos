@@ -429,6 +429,7 @@ pub async fn run_call(
         told_the_caller: false,
         floor: Floor::Shut,
         audience: Audience::Undecided,
+        mute_held_for: 0,
     };
     let reason = call.drive(&mut *session, transport).await;
     // Closed FIRST, and that ordering is the whole of it. A provider with no
@@ -480,6 +481,8 @@ enum Step {
     Nothing,
     CallerAudio(Vec<u8>),
     BargeIn,
+    /// The caller opened their mouth, measured on their own device.
+    CallerStartedSpeaking,
     Undecodable,
     Talker(VoiceEvent),
     /// The talker closed the session on its own side.
@@ -692,8 +695,19 @@ struct Call<'a> {
     /// Who the turn the talker is speaking now is for.
     ///
     /// Decided by that turn's first WORD, and back to [`Audience::Undecided`]
-    /// at its end.
+    /// at its end. A mute mid-sentence is the exception: see
+    /// [`Call::mute_held_for`].
     audience: Audience,
+    /// How many turns running an unheard sentence has held the mute.
+    ///
+    /// **A mute covers a sentence, and a Live turn is smaller than one.** So
+    /// the latch survives a turn end while the words are unfinished. See
+    /// [`the_sentence_is_unfinished`] for why, and for what it reads.
+    ///
+    /// Counted so a talker that never punctuates cannot mute the rest of the
+    /// call. `TURNS_ONE_OPENER_BUYS` is the length ADR 0213 measured one answer
+    /// at, and a mute has no business outlasting the answer it covers.
+    mute_held_for: u8,
 }
 
 /// Whether the talker may be heard at all, and for how much longer.
@@ -737,11 +751,16 @@ impl Floor {
 /// history read back out
 /// (`docs/plans/2026-09-17-a-call-opens-silent-until-the-caller-speaks.md`).
 ///
-/// **Decided per TURN, by its first word.** Half a babbled sentence must not
-/// start playing because the caller spoke over the other half. Words alone
+/// **Decided per SENTENCE, by its first word.** Half a babbled sentence must
+/// not start playing because the caller spoke over the other half. Words alone
 /// decide it, never audio. A Live talker streams audio between turns, so a
 /// turn read off the stream is decided at call open and never again (ADR
 /// 0187).
+///
+/// Per turn was the first shape, and a turn is the wrong unit. A Live one ends
+/// at every 700 ms hole in the words. So the latch expired mid-sentence, and
+/// the caller heard the back half of a dropped one (ADR 0218). See
+/// [`the_sentence_is_unfinished`] and [`Call::mute_held_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Audience {
     /// No turn is running, so the next word decides.
@@ -752,6 +771,31 @@ enum Audience {
     /// The caller, which is every turn once they have spoken, and every turn
     /// the engine asked for.
     TheCaller,
+}
+
+/// Whether these words stop mid-sentence, so more of them is coming.
+///
+/// **What a mute has to cover is a sentence** (ADR 0218). A Live turn ends at
+/// every 700 ms hole in the words (ADR 0187), so one sentence spans several of
+/// them. Ended per turn, a mute lets the caller hear the back half of a
+/// sentence whose front half was dropped. ADR 0211 named that outcome when it
+/// rejected re-asking per delta, and the per-turn latch produced it anyway.
+///
+/// **The words decide, and nothing else may.** ADR 0213 measured that no
+/// silence window separates a recitation from a real answer, so no clock,
+/// duration or frame count belongs here.
+///
+/// Closing quotes and brackets come off first, so a quoted sentence ends where
+/// its full stop is. Nothing said finishes nothing, which leaves a wordless
+/// turn deciding no mute either way.
+fn the_sentence_is_unfinished(transcript: &str) -> bool {
+    let words = transcript.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '}' | '»' | '”' | '’')
+    });
+    match words.chars().next_back() {
+        None => false,
+        Some(last) => !matches!(last, '.' | '!' | '?' | '…'),
+    }
 }
 
 /// What the caller did to the reply the talker is speaking now.
@@ -839,6 +883,14 @@ impl Call<'_> {
                     }
                 }
                 Step::BargeIn => self.the_caller_cut_in(session).await,
+                // The floor and nothing else, exactly as the provider's own
+                // signal does. It says the caller opened their mouth, which no
+                // transcriber can withhold (ADR 0211).
+                //
+                // The device measured it, so it reaches every provider. The
+                // Live one states no such frame, and its talker answers the
+                // caller before its transcriber reports them.
+                Step::CallerStartedSpeaking => self.open_the_floor(),
                 Step::Undecodable => {
                     let _ = transport
                         .send_frame(ServerFrame::Error {
@@ -1087,6 +1139,20 @@ impl Call<'_> {
                 // Read here, and made undecided again only once the row is
                 // past: `write_down_the_reply` asks the same question.
                 let heard = self.the_caller_hears_this();
+                // An unheard sentence is not done, so the mute outlives this
+                // turn. Bounded, so a talker that never punctuates cannot mute
+                // the rest of the call. See [`Call::mute_held_for`].
+                //
+                // **Only over an OPEN floor**, which is the case the hold is
+                // for: the caller spoke mid-sentence, and the rest of it is not
+                // theirs to hear. Over a shut one the mute is already total, so
+                // holding it would only delay the answer their next word buys
+                // (ADR 0213).
+                let holding = !heard
+                    && self.floor.is_open()
+                    && self.mute_held_for < TURNS_ONE_OPENER_BUYS
+                    && the_sentence_is_unfinished(&transcript);
+                self.mute_held_for = if holding { self.mute_held_for + 1 } else { 0 };
                 if !heard {
                     // Loud, because a caller who hears nothing has no other
                     // trace to be found by. Their transcript failing is one way
@@ -1096,8 +1162,16 @@ impl Call<'_> {
                     // now two. A call that never opened one, and a monologue
                     // that spent its budget, which `the_talker_spent_a_turn`
                     // announces once when it happens.
+                    //
+                    // A held run says so, so the turn that resumes a sentence
+                    // nobody heard is greppable beside the one that began it.
                     log!(
-                        "[Voice] The floor was shut, so nobody heard the talker: {}",
+                        "[Voice] The floor was shut, so nobody heard the talker{}: {}",
+                        if holding {
+                            ", and its sentence is held"
+                        } else {
+                            ""
+                        },
                         super::clip(transcript.trim(), super::READ_ALOUD_CHARS)
                     );
                 }
@@ -1150,8 +1224,14 @@ impl Call<'_> {
                 if heard && !transcript.trim().is_empty() {
                     self.the_talker_spent_a_turn();
                 }
-                // The row is past, so the next word decides afresh.
-                self.audience = Audience::Undecided;
+                // The row is past, so the next word decides afresh. Unless the
+                // sentence is held: a mute covers the whole of one, never a
+                // 700 ms turn of it.
+                self.audience = if holding {
+                    Audience::Nobody
+                } else {
+                    Audience::Undecided
+                };
                 // The reply is over, so its cut is spent with it. Cleared here
                 // rather than with the row, because a cut that wrote no row
                 // would otherwise mark the next reply.
@@ -2038,6 +2118,11 @@ impl Call<'_> {
         // fresh budget either way, so an answer handed over after a monologue
         // spent the last one is still heard (ADR 0213).
         self.open_the_floor();
+        // A run the engine handed over is a new one, whatever the talker was
+        // half way through saying to nobody. Left held, the mute would eat the
+        // one answer we asked for.
+        self.audience = Audience::Undecided;
+        self.mute_held_for = 0;
     }
 
     /// Release the next queued answer, now that the talker has stopped.
@@ -2129,6 +2214,9 @@ impl From<CallerFrame> for Step {
         match frame {
             CallerFrame::Audio(pcm) => Step::CallerAudio(pcm),
             CallerFrame::Control(ClientControl::BargeIn) => Step::BargeIn,
+            CallerFrame::Control(ClientControl::CallerStartedSpeaking) => {
+                Step::CallerStartedSpeaking
+            }
             CallerFrame::Control(ClientControl::HangUp) => {
                 Step::Ended(VoiceSessionEndReason::Hangup)
             }

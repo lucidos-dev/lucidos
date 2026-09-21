@@ -221,10 +221,14 @@ mod tests {
             );
         }
         // Fable is served by the direct Anthropic provider, and is adaptive.
-        assert_eq!(
-            supported_efforts(ProviderKind::Anthropic, "claude-fable-5"),
-            ALL_TIERS
-        );
+        // Every generation of it, since the adaptive gate matches the family.
+        for fable in ["claude-fable-5", "claude-fable-5-1", "claude-fable-5-1[1m]"] {
+            assert_eq!(
+                supported_efforts(ProviderKind::Anthropic, fable),
+                ALL_TIERS,
+                "{fable} accepts every tier through output_config.effort"
+            );
+        }
     }
 
     /// A non-`claude` Vertex id is a Gemini id as far as `VertexProvider` is
@@ -437,6 +441,7 @@ mod tests {
             (ProviderKind::Vertex, "claude-sonnet-4-6"),
             (ProviderKind::Vertex, "gemini-3.1-pro-preview"),
             (ProviderKind::Anthropic, "claude-fable-5"),
+            (ProviderKind::Anthropic, "claude-fable-5-1"),
             (ProviderKind::OpenAi, "gpt-5.6-sol"),
             (ProviderKind::OpenAi, GPT_6_ASTRA),
             (ProviderKind::OpenAi, "gpt-5.4"),

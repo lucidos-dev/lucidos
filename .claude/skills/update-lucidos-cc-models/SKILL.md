@@ -42,10 +42,17 @@ The JSON file also carries the `reasoning_efforts` list (`/effort` picker entrie
 ## Known Aliases
 
 CC accepts these short aliases for `set_model` control requests:
-- `default` — tier default
-- `sonnet` — latest Sonnet
-- `opus` — latest Opus
-- `haiku` — latest Haiku
+- `default`: tier default
+- `fable`: the Fable model for the provider, for the hardest tasks
+- `best`: what `fable` resolves to where Fable is available, else `opus`
+- `sonnet`: latest Sonnet
+- `opus`: latest Opus
+- `haiku`: latest Haiku
+
+**The picker carries no `fable` or `best` row yet.** It pins
+`claude-fable-5-1` and `claude-fable-5` instead. Adding either alias is a real
+follow-up, and it needs a version-free label plus round-trip handling, the same
+as `opus`.
 
 **An alias resolves per provider, and it moves.** On the Anthropic API (what
 Lucidos spawns against) `sonnet` resolves to **Sonnet 5** and `opus` to **Opus 5**

@@ -1,10 +1,10 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
-import { SCROLLABLE_SLACK_PX } from './threadWindow';
+import { transcriptScrolls } from './threadWindow';
 import { prefersReducedMotion } from '../../utils/platform';
 // The LEAF breadcrumb module, not `utils/liveness`, which re-exports it behind
 // a `store` import this module deliberately avoids (see `parseNavigatedTurn`).
 import { postClientLog } from '../../utils/clientLog';
-import { USER_SCROLL_WINDOW_MS } from '../../utils/scrollActivity';
+import { USER_SCROLL_WINDOW_MS, nowMs } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 
@@ -169,6 +169,9 @@ function endScrollAnim() {
 function cancelScrollAnim() {
   if (_scrollAnimRaf !== null) cancelAnimationFrame(_scrollAnimRaf);
   endScrollAnim();
+  // The ride's settle check is our own motion toward the same place, and every
+  // caller here is taking the position over. See `settleTheRide`.
+  cancelRideSettle();
 }
 
 /** When one of our own navigations last wrote `scrollTop`, and to WHICH element.
@@ -210,12 +213,6 @@ let _navScrollKind: NavScrollKind = 'placement';
  *  fires it at the next rendering opportunity. Four 60Hz frames, matching
  *  `NUDGE_EVENT_WINDOW_MS` for the identical problem. */
 const NAV_SCROLL_EVENT_WINDOW_MS = 64;
-
-function nowMs(): number {
-  return typeof performance !== 'undefined' && typeof performance.now === 'function'
-    ? performance.now()
-    : Date.now();
-}
 
 /** Write `top` to `el` and record it as OURS, so the scroll event it fires a
  *  frame later is not mistaken for the reader's (see `isNavigationScroll`).
@@ -826,14 +823,15 @@ function isAtLiveEdge(el: HTMLElement): boolean {
  *  transcript with a hair of overflow, from a border or a rounded line height,
  *  then answers the same for both. That is what the slack absorbs.
  *
- *  The slack comes from `threadWindow`, whose `windowNeedsFill` grows the render
- *  window until this is true. A literal here and another there would let the
- *  fill stop short of a transcript the chevron still calls unscrollable.
+ *  The PREDICATE comes from `threadWindow`, whose `fillAction` grows the render
+ *  window until it is true. A second body here, however faithful, would let the
+ *  fill stop short of a transcript the chevron still calls unscrollable. This
+ *  is the chevron's name for the same question.
  *
  *  The DOWN chevron deliberately asks something else, `isAtLiveEdge`'s 2px. It
  *  describes where the reader IS, not whether the thread can move at all. */
 function isScrollable(el: HTMLElement): boolean {
-  return el.scrollHeight > el.clientHeight + SCROLLABLE_SLACK_PX;
+  return transcriptScrolls(el);
 }
 
 /* ── Held scrolls, and how the reader's gesture is told from ours ────────────
@@ -893,6 +891,11 @@ function markHeldScroll(el: HTMLElement, top: number) {
   markNavigationScroll(el, top);
   _navScrollKind = 'held';
   holdPosition(el);
+  // EVERY held write asks whether it landed, because every one of them is the
+  // app aiming a reader at the live edge. Asking here rather than at the five
+  // call sites is what keeps a new one from forgetting. `settleTheRide` holds
+  // the terms, and answers nothing for a write that was not a carrying ride's.
+  rideSettlesOnTheEdge();
 }
 
 /** Arm the standing follow at the position the caller's own scroll just reached,
@@ -912,6 +915,8 @@ function armFollowOn(el: HTMLElement | null) {
   const wasArmed = _followingBottom.value;
   _followingBottom.value = true;
   holdPosition(el);
+  // A fresh ride has said nothing yet. See `_rideShortReported`.
+  _rideShortReported = false;
   // A pending landing and an armed follow are mutually exclusive by
   // construction, and this is the line that makes it so: a submit never arms, so
   // the only way to arm over a waiting landing is the reader pressing the
@@ -1119,6 +1124,8 @@ function scrollRetiresTheRide(atEdge: boolean, tookOver: boolean, gesture: boole
  *  retirement here. See `scrollToSelectorAndPulse`, which owns that call, and
  *  ADR 0064. */
 export function stopFollowingBottom() {
+  // The settle check serves the ride and nothing else, so it goes with it.
+  cancelRideSettle();
   // Both of the things that hold a reader are OUR motion, so both stop here.
   // Without it the reader who just scrolled away is dragged back for the rest
   // of the tween. A thread opened mid-glide is scrolled with the previous
@@ -2072,6 +2079,93 @@ function honourGrowth(el: HTMLElement, keepEdge?: () => boolean): void {
     return;
   }
   keepEdge?.();
+}
+
+/** The frame a carrying ride has pending, or null. One at a time: a second
+ *  round supersedes the first's question rather than adding to it. */
+let _rideSettleRaf: number | null = null;
+
+/** Has this ride already said it landed short? Cleared by `armFollowOn`, so the
+ *  breadcrumb is once per RIDE rather than once per round. A settling
+ *  transcript takes a round per frame, and one line each would drown the signal
+ *  in its own noise. */
+let _rideShortReported = false;
+
+function cancelRideSettle(): void {
+  if (_rideSettleRaf !== null) cancelAnimationFrame(_rideSettleRaf);
+  _rideSettleRaf = null;
+}
+
+/** THE RIDE CHECKS THAT ITS OWN WRITE LANDED, on the next frame.
+ *
+ *  Nothing read a held write's result back until this. `holdPosition` stamps
+ *  from the same measurement the write used. So a write that came to rest SHORT
+ *  recorded itself as a landing on the edge, and nothing corrected it.
+ *
+ *  The next growth round would, and on a turn that spends sixteen seconds
+ *  inside one tool call there is no next round. That is the reported strand:
+ *  armed, live, off the edge, with both the toggle and the down chevron lit
+ *  (ADR 0222, docs/adr/).
+ *
+ *  It hangs off `markHeldScroll` rather than off the growth round alone,
+ *  because two of the five write sites have nothing after them. A turn
+ *  control's press takes `honourAnchoredMutation`, whose own re-assert stands
+ *  down for a carried reader by design (`withScrollAnchor`). A ride's glide
+ *  ends on its last frame.
+ *
+ *  Not a poll and not a loop. The check's own write cancels the frame it would
+ *  otherwise schedule. The guard covers the DOM-free unit environment this
+ *  module is deliberately importable from, which has no frames to ask on. */
+function rideSettlesOnTheEdge(): void {
+  if (typeof requestAnimationFrame !== 'function') return;
+  cancelRideSettle();
+  _rideSettleRaf = requestAnimationFrame(settleTheRide);
+}
+
+/** THE ANSWER. Write the edge again where the ride's own write fell short, and
+ *  nothing at all in every other case.
+ *
+ *  **The stamp is what makes this safe.** `isWhereWeHeldIt` says the container
+ *  is still exactly where the ride left it a frame ago. Anything that moved it
+ *  since fails that term. So this can no more fight the reader than it can
+ *  fight a navigation, and neither needs a term of its own. It is the same
+ *  reading the disarm takes for the same question.
+ *
+ *  It asks the four owners too. Each is going somewhere on purpose and none of
+ *  them is the ride: a tween, a submit's landing, a deep-link claim, and the
+ *  ride no longer carrying anybody. */
+function settleTheRide(): void {
+  _rideSettleRaf = null;
+  const el = resolveTarget();
+  if (!el || isAtLiveEdge(el)) return;
+  if (!followIsCarrying()) return;
+  if (_scrollAnimRaf !== null || _pendingLanding || hasPendingEventScroll()) return;
+  if (!isWhereWeHeldIt(el)) return;
+  const edge = liveEdgeTop(el);
+  const short = Math.round(edge - el.scrollTop);
+  markHeldScroll(el, edge);
+  // ONE correction, never a loop. The write above asked the question again on
+  // its way through `markHeldScroll`, and the check's own write is not a site
+  // this exists for.
+  cancelRideSettle();
+  syncAwayFromBottom();
+  reportRideLandedShort(short, edge, el.clientHeight);
+}
+
+/** Say ONCE per ride that a write came to rest short, and by how much.
+ *
+ *  A diagnostic, registered in `docs/temporary-measures.md`. The strand it
+ *  chases has been reported three times, and its trigger is still not measured
+ *  on the device it happens on. The correction above hides it from the reader.
+ *  Without this line a fourth round would start from nothing again.
+ *
+ *  Best-effort telemetry (`.claude/rules/frontend.md`). It runs without user
+ *  intent, the reader is already served by the write above, and
+ *  `postClientLog` is fire-and-forget. Three numbers and no user content. */
+function reportRideLandedShort(short: number, edge: number, view: number): void {
+  if (_rideShortReported) return;
+  _rideShortReported = true;
+  postClientLog('follow', 'short', { short, edge, view });
 }
 
 /** rAF easeOutCubic scroll of the active container toward a target, shared by
@@ -3358,7 +3452,18 @@ export function makeScrollObservers(el: HTMLElement) {
    *  reads the return.
    *
    *  TWO terms here. ARMED, because a position is not a request. And AT THE LIVE
-   *  EDGE before the event, which has TWO sources and needs either.
+   *  EDGE before the event, which has THREE sources and needs any one.
+   *
+   *  A ride that is CARRYING is the first, and it needs no position at all. It
+   *  owns where the reader is, parked in history or resting on the end alike,
+   *  which is how `honourGrowth`'s own carrying arm already reads it. The other
+   *  two describe where the reader WAS, and one round that declined a
+   *  correction clears both together: the disarm's `forgetHeldLiveEdge` takes
+   *  the claim and `recordAnchor` re-takes the measurement off the edge. The
+   *  ride could then never write again, which is the reported strand (ADR 0222,
+   *  docs/adr/). It answers for nobody else: an armed reader on a QUIET thread
+   *  keeps both readings, since nothing is arriving for them to be carried
+   *  toward.
    *
    *  `anchorAtLiveEdge` is the MEASUREMENT, taken by `recordAnchor` at the end
    *  of every round. `heldOnTheLiveEdge` is the app's own PLACEMENT, and it is
@@ -3392,7 +3497,7 @@ export function makeScrollObservers(el: HTMLElement) {
    *  narrow question is safe where the wide one is not. */
   function keepTheLiveEdge(): boolean {
     if (!_followingBottom.value) return false;
-    if (!anchorAtLiveEdge && !heldOnTheLiveEdge(el)) return false;
+    if (!followIsCarrying() && !anchorAtLiveEdge && !heldOnTheLiveEdge(el)) return false;
     if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
     if (isAnchorScroll(el)) return false;
     markHeldScroll(el, liveEdgeTop(el));

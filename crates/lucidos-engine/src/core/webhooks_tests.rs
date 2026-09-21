@@ -3,6 +3,7 @@
 //! cover.
 
 use super::*;
+use crate::core::webhook_refusal::RefusalCause;
 
 fn hook_with(token: Option<&str>, hmac: Option<HmacConfig>) -> Webhook {
     Webhook {
@@ -19,6 +20,7 @@ fn hook_with(token: Option<&str>, hmac: Option<HmacConfig>) -> Webhook {
         last_accepted_at: None,
         last_refused_at: None,
         last_refusal_reason: None,
+        refusal_run: RefusalRun::default(),
     }
 }
 
@@ -779,6 +781,142 @@ async fn a_webhook_with_no_verifier_at_all_cannot_be_stored() {
     .execute(&pool)
     .await;
     assert!(result.is_err(), "a verifier-less webhook must be refused");
+
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+/// Every arm carries both its words and its key, and the two never swap.
+///
+/// The key is stored JSON and reaches the wire, so it is frozen. The reason is
+/// prose on a page and may be reworded. A test that let them share one string
+/// would make the next rewording a silent schema change.
+#[test]
+fn every_refusal_has_a_stable_key_and_its_own_words() {
+    let mut keys = std::collections::HashSet::new();
+    let mut words = std::collections::HashSet::new();
+    for refusal in DeliveryRefusal::ALL {
+        assert!(keys.insert(refusal.key()), "duplicate key {:?}", refusal);
+        assert!(
+            words.insert(refusal.reason()),
+            "duplicate words {:?}",
+            refusal
+        );
+        assert_eq!(DeliveryRefusal::from_key(refusal.key()), Some(refusal));
+        assert!(
+            !refusal.key().contains(' '),
+            "a key is a wire value, not prose: {:?}",
+            refusal
+        );
+    }
+    assert_eq!(DeliveryRefusal::from_key("from-the-future"), None);
+
+    // Exactly one arm examined nothing, and that is what earns it its own
+    // words in `core::webhook_refusal`.
+    let unexamined: Vec<&str> = DeliveryRefusal::ALL
+        .into_iter()
+        .filter(|r| !r.examined_the_delivery())
+        .map(|r| r.key())
+        .collect();
+    assert_eq!(unexamined, vec!["disabled"]);
+}
+
+/// The evidence a real outage leaves must survive a diagnostic probe.
+///
+/// `last_refusal_reason` holds only the last one, so a hand-run `curl` while
+/// investigating overwrites exactly the field you came to read. The run is
+/// what makes that harmless.
+#[tokio::test]
+async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let (hook, _) = WebhookStore::create(
+        &pool,
+        &bus,
+        "github",
+        "GithubWorkflowRunStateChanged",
+        WebhookConfig::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    async fn read(pool: &PgPool, id: Uuid) -> Webhook {
+        WebhookStore::get(pool, id).await.unwrap().unwrap()
+    }
+
+    let fresh = read(&pool, hook.id).await.refusal_run;
+    assert!(!fresh.is_running(), "a fresh hook is not refusing anything");
+    assert_eq!(fresh.cause, None);
+    assert!(fresh.since.is_none());
+
+    for _ in 0..40 {
+        WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::SignatureMismatch)
+            .await
+            .unwrap();
+    }
+    let run = read(&pool, hook.id).await.refusal_run;
+    assert_eq!(run.refusals, 40);
+    assert_eq!(run.reasons.get("signature-mismatch"), Some(&40));
+    assert_eq!(run.cause, Some(RefusalCause::Verification));
+    let started = run.since.expect("a run knows when it started");
+    assert!(
+        run.run_secs.is_some_and(|secs| secs >= 0),
+        "the database measures the age, so it is never absent on a live run"
+    );
+
+    // The investigator's own unsigned probe, against the same live hook. It
+    // lands as its own reason, and the forty behind it are untouched.
+    WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::SignatureMissing)
+        .await
+        .unwrap();
+    let after = read(&pool, hook.id).await;
+    assert_eq!(after.refusal_run.refusals, 41);
+    assert_eq!(
+        after.refusal_run.reasons.get("signature-mismatch"),
+        Some(&40)
+    );
+    assert_eq!(after.refusal_run.reasons.get("signature-missing"), Some(&1));
+    assert_eq!(
+        after.refusal_run.since,
+        Some(started),
+        "the run keeps its start, or it could never age past the window"
+    );
+    assert_eq!(
+        after.last_refusal_reason.as_deref(),
+        Some(DeliveryRefusal::SignatureMissing.reason()),
+        "the old column still names the last one, which is what it is for"
+    );
+
+    // A refusal of the OTHER cause restarts the run, so the count and the
+    // tally never describe two faults at once. Reachable only by the user
+    // switching the hook off, since a live hook cannot answer `disabled`.
+    WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::Disabled)
+        .await
+        .unwrap();
+    let switched = read(&pool, hook.id).await;
+    assert_eq!(switched.refusal_run.refusals, 1);
+    assert_eq!(switched.refusal_run.cause, Some(RefusalCause::Disabled));
+    assert_eq!(
+        switched.refusal_run.reasons,
+        std::collections::BTreeMap::from([("disabled".to_string(), 1)]),
+        "the verification tally would otherwise be read as thrown away unread"
+    );
+    assert_ne!(switched.refusal_run.since, Some(started));
+
+    // One delivery that verified ends the run whole. That is the positive
+    // evidence a recovery rests on.
+    WebhookStore::record_accepted(&pool, hook.id).await.unwrap();
+    let accepted = read(&pool, hook.id).await;
+    assert!(!accepted.refusal_run.is_running());
+    assert_eq!(accepted.refusal_run.refusals, 0);
+    assert_eq!(accepted.refusal_run.since, None);
+    assert_eq!(accepted.refusal_run.cause, None);
+    assert!(accepted.refusal_run.reasons.is_empty());
+    assert!(accepted.last_accepted_at.is_some());
+    assert!(
+        accepted.last_refused_at.is_some(),
+        "the stamps are a history, so an acceptance does not erase the refusal"
+    );
 
     crate::test_support::teardown_test_db(&db).await;
 }

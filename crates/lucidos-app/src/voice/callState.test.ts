@@ -65,6 +65,17 @@ function sent(effects: CallEffect[]): string[] {
   return effects.flatMap((e) => (e.kind === 'send' ? [e.control.type] : []));
 }
 
+/**
+ * What a barge-in case is about, which is the cut and not the floor.
+ *
+ * `caller_started_speaking` rides every opening edge, so it lands in most of
+ * these and says nothing about whether the talker was cut off. Cases about the
+ * opener itself read {@link sent} whole.
+ */
+function cuts(effects: CallEffect[]): string[] {
+  return sent(effects).filter((type) => type !== 'caller_started_speaking');
+}
+
 describe('placing a call', () => {
   it('opens a socket on the pressed thread', () => {
     const { state, effects } = drive([PRESS]);
@@ -308,7 +319,7 @@ describe('barge-in', () => {
   it('stops playback and tells the engine, while the talker is speaking', () => {
     const { state, effects } = drive([SPOKE], talking());
     expect(state.phase).toBe('listening');
-    expect(sent(effects)).toEqual(['barge_in']);
+    expect(cuts(effects)).toEqual(['barge_in']);
     expect(has(effects, 'stop-playback')).toBe(true);
   });
 
@@ -316,7 +327,7 @@ describe('barge-in', () => {
    *  for the same one. The floor it just handed back is the second guard. */
   it('cuts the talker off once, however long the caller keeps talking', () => {
     const { effects } = drive([SPOKE, HUSHED, SPOKE], talking());
-    expect(sent(effects)).toEqual(['barge_in']);
+    expect(cuts(effects)).toEqual(['barge_in']);
   });
 
   it('says nothing when nobody is on a call', () => {
@@ -337,7 +348,7 @@ describe('barge-in', () => {
    *  so the caller heard "Still" ... their own words ... "in it." */
   it('leaves the talker speaking when the caller finishes their sentence', () => {
     const { state, effects } = drive([RESUMED], talking());
-    expect(sent(effects)).toEqual([]);
+    expect(cuts(effects)).toEqual([]);
     expect(has(effects, 'stop-playback')).toBe(false);
     expect(state.phase).toBe('speaking');
   });
@@ -354,7 +365,7 @@ describe('barge-in', () => {
    *  been quiet through a reply is taking the floor back. */
   it('cuts the talker off for a caller who gave the floor up', () => {
     const { state, effects } = drive([SPOKE], talking());
-    expect(sent(effects)).toEqual(['barge_in']);
+    expect(cuts(effects)).toEqual(['barge_in']);
     expect(state.phase).toBe('listening');
   });
 
@@ -362,7 +373,7 @@ describe('barge-in', () => {
    *  interruption is one cut, whatever the gate does after it. */
   it('cuts once however many breaths the caller takes over it', () => {
     const { effects } = drive([SPOKE, HUSHED, RESUMED, HUSHED, SPOKE], talking());
-    expect(sent(effects)).toEqual(['barge_in']);
+    expect(cuts(effects)).toEqual(['barge_in']);
     expect(effects.filter((e) => e.kind === 'stop-playback')).toHaveLength(1);
   });
 });
@@ -372,7 +383,29 @@ describe('the caller speaking', () => {
     const { state, effects } = drive([SPOKE], live());
     expect(state.utterance).toBe('live');
     expect(state.utteranceCount).toBe(1);
-    expect(effects).toEqual([]);
+    expect(cuts(effects)).toEqual([]);
+    expect(has(effects, 'stop-playback')).toBe(false);
+  });
+
+  /**
+   * The engine's floor opens on this, and on nothing a transcriber withholds.
+   *
+   * The Live provider states no such frame, and its talker answers the caller
+   * before its own transcriber reports them (ADR 0211). So their first sentence
+   * was answered into a muted line.
+   */
+  it('tells the engine they opened their mouth, on every edge', () => {
+    expect(sent(drive([SPOKE], live()).effects)).toEqual(['caller_started_speaking']);
+    expect(sent(drive([RESUMED], talking()).effects)).toEqual(['caller_started_speaking']);
+    expect(sent(drive([SPOKE], talking()).effects)).toEqual([
+      'caller_started_speaking',
+      'barge_in',
+    ]);
+  });
+
+  /** Nothing to say it on yet. The handshake carries it, with the held audio. */
+  it('holds it back until there is a socket', () => {
+    expect(sent(drive([SPOKE], drive([PRESS]).state).effects)).toEqual([]);
   });
 
   /** The barge-in hands the floor straight back, so the caller is using it
@@ -425,6 +458,31 @@ describe('the caller speaking', () => {
     );
     expect(state.phase).toBe('listening');
     expect(state.utterance).toBe('live');
+    // The floor opener rides up with the audio it belongs to. Their opening
+    // edge came before there was a socket, and it is the one the floor most
+    // needs to hear about.
+    expect(effects).toEqual([
+      { kind: 'flush-audio' },
+      { kind: 'send', control: { type: 'caller_started_speaking' } },
+    ]);
+  });
+
+  /**
+   * A short first sentence fits inside the connect window, gate shut and all.
+   *
+   * Its reply is exactly the one a shut floor eats, so `landing` owes the
+   * opener as much as `live` does.
+   */
+  it('still carries the opener for a sentence that ended before the session', () => {
+    const finished = drive([SPOKE, HUSHED], drive([PRESS]).state).state;
+    expect(finished.utterance).toBe('landing');
+    const { effects } = drive([STARTED], finished);
+    expect(sent(effects)).toEqual(['caller_started_speaking']);
+  });
+
+  /** A caller who was quiet through the handshake says nothing on it. */
+  it('opens the session without a floor opener when nobody was speaking', () => {
+    const { effects } = drive([STARTED], drive([PRESS]).state);
     expect(effects).toEqual([{ kind: 'flush-audio' }]);
   });
 

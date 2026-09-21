@@ -353,6 +353,15 @@ export type ThreadEventRow = {
 export type ThreadEventsSnapshot = {
   events: ThreadEventRow[];
   currentAggregate: ThreadAggregate | null;
+  /** Older events remain behind `events[0]`. Absent on an unpaged read, which
+   *  by definition carries them all. */
+  hasMore?: boolean;
+  /** The highest `sequence` the whole thread holds, sent only for a PAGE.
+   *
+   *  A page cannot supply it: a sequence is allocated globally and can run
+   *  against the clock, so the newest row by clock often does not hold the
+   *  highest one. Absent on an unpaged read, whose own rows are the watermark. */
+  maxSequence?: number;
 };
 
 export interface FetchThreadEventsOptions {
@@ -361,6 +370,12 @@ export interface FetchThreadEventsOptions {
    *  false — the strip is on so heavy threads load fast. `exportThread.ts`
    *  passes true so bug-report dumps stay complete. */
   includeContext?: boolean;
+  /** Serve only the newest N events. Omitted means the whole history, which is
+   *  what the export path wants and what a short thread gets either way. */
+  limit?: number;
+  /** Page backwards from this event. Both halves travel together, because the
+   *  server orders rows by the pair. Take them from the oldest row you hold. */
+  before?: { created: string; sequence: number };
 }
 
 export async function fetchThreadEvents(
@@ -375,6 +390,11 @@ export async function fetchThreadEvents(
   const params = new URLSearchParams();
   if (opts.afterSeq !== undefined) params.set('after', String(opts.afterSeq));
   if (opts.includeContext) params.set('include_context', 'true');
+  if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+  if (opts.before) {
+    params.set('before_created', opts.before.created);
+    params.set('before_seq', String(opts.before.sequence));
+  }
   const query = params.toString() ? `?${params.toString()}` : '';
   return json(`${API}/threads/${encodeURIComponent(threadId)}/events${query}`);
 }

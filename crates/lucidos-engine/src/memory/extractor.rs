@@ -1,9 +1,12 @@
 use crate::engine::aux_purpose::AuxCall;
+use crate::engine::ApiUsage;
+use crate::llm::judgment::{jev_for, JudgmentProvider, JudgmentSite, JEV_DEFAULT_MODEL};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
 use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
-use crate::memory::RETRIEVAL_MIN_IMPORTANCE;
+use crate::memory::{query_judgment, RETRIEVAL_MIN_IMPORTANCE};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,6 +127,25 @@ Example (memory needed): {"needs_memory": true, "needs_file_list": false, "needs
 Example (referencing past content): {"needs_memory": true, "needs_file_list": true, "needs_credentials": false, "sub_queries": ["Example Org", "Example Org company analysis"]}
 Example (asking for a judgement): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction"]}
 Example (no memory): {"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
+
+/// Decomposition alone, for the Jev path.
+///
+/// Jev answers the three booleans, so this prompt asks for the one thing it
+/// cannot produce. It repeats the query-writing guidance from
+/// [`QUERY_CLASSIFICATION_PROMPT`] because that prompt stays byte-for-byte as
+/// it was: it is the default path, and rebuilding it out of shared fragments
+/// would risk the very change this split exists to avoid. Edit the two
+/// together.
+const SUB_QUERY_PROMPT: &str = r#"Turn this user message into search queries over the user's long-term memory.
+You will receive the current message and optionally a summary of the recent conversation for context.
+Use the conversation context to understand the TOPIC being discussed, not just the latest message in isolation.
+
+Write queries about the TOPIC or CONTENT being referenced, NOT about the action being requested. Strip away action verbs like "save", "summarize", "write" and focus on the subject matter. For example, "save research about Example Org" → ["Example Org", "Example Org company analysis"].
+
+A BARE SUBJECT NAME IS A BAD QUERY when the workspace is largely about that subject: it matches thousands of entries equally and the results come back arbitrary. So when the message asks for a JUDGEMENT, an OPINION, a COMPARISON or ADVICE about something, query that subject's STATE and OUTCOME (progress, results, adoption, recent milestones, setbacks, what happened lately), never the name on its own. "should I give up on Example Project and do something else?" → ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction", "Example Project setbacks"], NOT ["Example Project"]. Queries about the decision itself ("job application", "career change") retrieve nothing useful: the facts that answer such a question are facts about how the subject is going.
+
+Return ONLY a JSON array of strings, no markdown fences, no extra text. Return [] when no useful query exists.
+Example: ["habit tracker progress", "weekly exercise routine"]"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryClassification {
@@ -355,7 +377,143 @@ impl MemoryExtractor {
     /// classifier can understand the topic (e.g. a follow-up "try again" in an API
     /// conversation still needs credentials).
     /// `call` carries the resolved *model selection* and the call's budget.
+    ///
+    /// `judgment_query_classification` picks the path. It is `chat` unless the
+    /// user set it, so the default is the one prompt below and nothing else.
+    /// A Jev call that fails falls through to that same prompt, because a
+    /// working path is a better answer than the all-true default.
     pub(crate) async fn classify_query(
+        &self,
+        pool: &PgPool,
+        query: &str,
+        conversation_context: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
+    ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(jev) = jev_for(
+            pool,
+            JudgmentSite::QueryClassification,
+            call.attempt_timeout(),
+        )
+        .await
+        {
+            match self
+                .classify_on_jev(&jev, query, conversation_context, call, capture)
+                .await
+            {
+                Ok(classification) => return Ok(classification),
+                Err(e) => log!(
+                    "[Memory] Jev query classification failed: {}. Using the chat path",
+                    e
+                ),
+            }
+        }
+        self.classify_on_chat(query, conversation_context, call, capture)
+            .await
+    }
+
+    /// The three booleans from Jev, then decomposition on the chat model when
+    /// memory is wanted.
+    ///
+    /// A message needing no memory costs one judgment and no chat call at all,
+    /// which is most greetings and most bare tool commands.
+    ///
+    /// **A message that does need memory costs two sequential calls, inside
+    /// the ONE deadline the caller wraps this in.** Each attempt is bounded,
+    /// but two of them can exceed that deadline where one would not. The
+    /// caller then reads `QueryClassification::default()`, which loads
+    /// everything, so the overrun costs latency rather than context.
+    async fn classify_on_jev(
+        &self,
+        jev: &dyn JudgmentProvider,
+        query: &str,
+        conversation_context: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
+    ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
+        let state = query_judgment::state(query, conversation_context);
+        let request_chars = state.to_string().chars().count();
+        let judgment = jev.ask(state, query_judgment::questions()).await?;
+        if let Some(capture) = capture {
+            capture
+                .record_usage(
+                    JEV_DEFAULT_MODEL,
+                    request_chars,
+                    Some(ApiUsage {
+                        input_tokens: judgment.usage.input_tokens,
+                        output_tokens: judgment.usage.output_tokens,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+
+        let mut classification = query_judgment::read(&judgment.answers);
+        if classification.needs_memory {
+            classification.sub_queries = self
+                .decompose_query(query, conversation_context, call, capture)
+                .await;
+        }
+        Ok(classification)
+    }
+
+    /// Search queries for one message, or none when the model could not give
+    /// any.
+    ///
+    /// Total on purpose. An empty list makes the retriever search the raw
+    /// message, which is what a workspace without decomposition already does.
+    /// Losing the turn over it would be the worse trade.
+    async fn decompose_query(
+        &self,
+        query: &str,
+        conversation_context: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
+    ) -> Vec<String> {
+        let system = match conversation_context {
+            Some(ctx) if !ctx.is_empty() => {
+                format!(
+                    "{}\n\nConversation context (recent messages): {}",
+                    SUB_QUERY_PROMPT, ctx
+                )
+            }
+            _ => SUB_QUERY_PROMPT.to_string(),
+        };
+        let provider = match self.provider_for_model(call.model(), call.attempt_timeout()) {
+            Ok(p) => p,
+            Err(e) => {
+                log!("[Memory] Sub-query decomposition has no provider: {}", e);
+                return vec![];
+            }
+        };
+        let response = match Self::chat_with_provider(
+            provider.as_ref(),
+            &system,
+            query,
+            call.reasoning(),
+            capture,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log!("[Memory] Sub-query decomposition failed: {}", e);
+                return vec![];
+            }
+        };
+        let cleaned = strip_code_fences(&response.content.unwrap_or_default());
+        serde_json::from_str::<Vec<String>>(&cleaned).unwrap_or_else(|e| {
+            log!(
+                "[Memory] Could not read the sub-queries ({}): {}",
+                e,
+                cleaned
+            );
+            vec![]
+        })
+    }
+
+    /// The prompt-and-parse path, unchanged and still the default.
+    async fn classify_on_chat(
         &self,
         query: &str,
         conversation_context: Option<&str>,

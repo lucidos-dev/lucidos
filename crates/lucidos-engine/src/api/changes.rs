@@ -172,64 +172,121 @@ pub(super) async fn revert_change(
     }
 }
 
-/// Reject a single-change action when the availability selector doesn't grant
-/// it for the change's thread (server-side mirror of the UI gate). Unknown
-/// change ids fall through so the engine returns its own "Change not found".
-/// Internal apply paths (Apply All driver, conflict recovery) call
-/// `engine.apply_change` directly and are intentionally NOT gated here.
+/// Why a single-change action is refused right now. See
+/// [`change_action_refusal`], which owns the rule.
 ///
-/// The thread-state gate only applies while the change is still `pending`.
-/// A change that's already in a terminal state (`applied` / `discarded`)
-/// falls through to the engine, which is idempotent: a re-apply returns
-/// `Noop` (200) echoing the original merge SHAs, a re-discard returns success.
-/// Gating those would convert an idempotent retry into a spurious 409 — the
-/// thread's `coding_agent_proposed` flag is cleared by `ChangeApplied` /
-/// `ChangeDiscarded`, so `available_thread_actions_for` no longer offers
-/// Apply/Discard once the change has resolved.
+/// The three thread-state variants stay apart because only ONE of them can be
+/// waited out with a *standing apply*. `standing_verdict` waits through
+/// `running` and `paused`, and drops on a parked thread at rest. Collapse the
+/// two and a surface points the caller at a control that ends the moment it is
+/// pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeActionRefusal {
+    /// A pending change whose branch left nothing to merge. Apply only.
+    NoFilesLeft,
+    /// The thread is still *working*: running or paused. It will settle, and a
+    /// *standing apply* is what waits for that.
+    ThreadWorking,
+    /// The thread is *parked*: on a question, an event wait, or a sub-thread.
+    /// It wakes on the delivery and may commit again, so the change is not
+    /// final. A standing apply cannot wait this out.
+    ThreadParked,
+    /// The selector withholds the action for a reason no wait resolves.
+    ActionUnavailable,
+}
+
+/// Why the availability selector refuses `action` on this change, or `None`.
+///
+/// **The single definition of the per-change gate.** Two surfaces ask it and
+/// write their own sentence: the HTTP handlers as a 409, the `changes` LLM
+/// tool as a tool error. The reason is typed because a 409 body and a message
+/// an agent reads want different words. ADR 0106 turned down a frontend-only
+/// hide for splitting one rule in two, and a tool with no gate was that split
+/// again. See
+/// `docs/plans/2026-09-20-an-apply-the-agent-asks-for-takes-the-same-gate.md`.
+///
+/// Internal apply paths are intentionally NOT gated. They run while the thread
+/// legitimately reads running: the Apply All driver, `apply_now`, the
+/// post-hardening auto-apply, the standing-apply resolver.
+/// `change_ops_tests.rs` enrolls every one of them.
+///
+/// Three rows fall through to the engine, which answers them better: an
+/// unknown id, a threadless change, and a resolved one. Gating a terminal row
+/// would turn an idempotent retry into a spurious 409.
+pub(crate) async fn change_action_refusal(
+    pool: &sqlx::PgPool,
+    change_id: Uuid,
+    action: crate::engine::thread_lifecycle::Action,
+) -> Result<Option<ChangeActionRefusal>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, String, i32)> =
+        sqlx::query_as("SELECT thread_id, status, file_count FROM changes WHERE id = $1")
+            .bind(change_id)
+            .fetch_optional(pool)
+            .await?;
+    // A pending change with no files left has nothing to apply. Merging it only
+    // pushes no-op commits, and can spend a harden-at-apply session on an empty
+    // diff. Refused before the thread-state gate so the message names the real
+    // reason, and only for Apply: Discard is how the user resolves one. See
+    // `core::changes::is_empty_pending_change`.
+    if let Some((_, status, file_count)) = row.as_ref() {
+        if status == "pending"
+            && *file_count == 0
+            && action == crate::engine::thread_lifecycle::Action::Apply
+        {
+            return Ok(Some(ChangeActionRefusal::NoFilesLeft));
+        }
+    }
+    let Some((Some(thread_id), status, _)) = row else {
+        return Ok(None);
+    };
+    if status != "pending" {
+        return Ok(None);
+    }
+    let actions = crate::api::threads::available_thread_actions_for(pool, thread_id).await?;
+    if actions.contains(&action) {
+        return Ok(None);
+    }
+    // Two extra reads, on the refusal path only. They ask the two canonical
+    // predicates rather than a third copy of their SQL, which is the drift this
+    // whole function exists to stop. `working` is asked first because a running
+    // thread is also unsettled, and working is the stronger, actionable answer.
+    if crate::engine::standing_apply::working_thread_ids(pool, std::iter::once(thread_id))
+        .await?
+        .contains(&thread_id)
+    {
+        return Ok(Some(ChangeActionRefusal::ThreadWorking));
+    }
+    if crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
+        .await?
+        .contains(&thread_id)
+    {
+        return Ok(Some(ChangeActionRefusal::ThreadParked));
+    }
+    Ok(Some(ChangeActionRefusal::ActionUnavailable))
+}
+
+/// Reject a single-change action the selector does not grant, as a 409. The
+/// HTTP rendering of [`change_action_refusal`].
 async fn guard_change_action(
     state: &AppState,
     change_id: Uuid,
     action: crate::engine::thread_lifecycle::Action,
     reject_msg: &str,
 ) -> Result<(), ApiError> {
-    let row: Option<(Option<Uuid>, String, i32)> =
-        sqlx::query_as("SELECT thread_id, status, file_count FROM changes WHERE id = $1")
-            .bind(change_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(ApiError::db)?;
-    // A pending change with no files left has nothing to apply — merging it
-    // only pushes no-op commits and can spend a harden-at-apply session on an
-    // empty diff. Refused before the thread-state gate so the message names the
-    // real reason, and only for Apply: Discard is how the user resolves one.
-    // See `core::changes::is_empty_pending_change`.
-    if let Some((_, status, file_count)) = row.as_ref() {
-        if status == "pending"
-            && *file_count == 0
-            && action == crate::engine::thread_lifecycle::Action::Apply
-        {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "This change has no file changes left — discard it instead",
-            ));
-        }
-    }
-    // Unknown change id, change with no thread, or an already-resolved change:
-    // defer to the engine (it returns "Change not found" or handles the
-    // idempotent terminal-state retry).
-    let Some((Some(thread_id), status, _)) = row else {
-        return Ok(());
-    };
-    if status != "pending" {
-        return Ok(());
-    }
-    let actions = crate::api::threads::available_thread_actions_for(&state.pool, thread_id)
+    let refusal = change_action_refusal(&state.pool, change_id, action)
         .await
         .map_err(ApiError::db)?;
-    if !actions.contains(&action) {
-        return Err(ApiError::new(StatusCode::CONFLICT, reject_msg));
-    }
-    Ok(())
+    let msg = match refusal {
+        None => return Ok(()),
+        Some(ChangeActionRefusal::NoFilesLeft) => {
+            "This change has no file changes left. Discard it instead."
+        }
+        // The three thread-state refusals are one 409 here. The panel already
+        // draws the difference, and the caller's sentence has always said
+        // "in the thread's current state".
+        Some(_) => reject_msg,
+    };
+    Err(ApiError::new(StatusCode::CONFLICT, msg))
 }
 
 /// POST /api/v1/changes/:id/apply — apply a single change
@@ -774,5 +831,260 @@ mod tests {
             "noop must not pretend to have a SHA"
         );
         assert!(json.get("previous_commit").is_none());
+    }
+
+    // ── the one per-change gate ──
+    //
+    // `change_action_refusal` is the whole rule. Both surfaces render it, so a
+    // hole here is a hole in the Apply button AND in the `changes` LLM tool.
+
+    /// Seed a coding-agent thread row in one state.
+    async fn seed_cc_thread(
+        pool: &sqlx::PgPool,
+        thread_id: Uuid,
+        status: &str,
+        live_event_waits: i32,
+        active_children: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO thread_summaries
+                (thread_id, is_coding_agent, status, coding_agent_proposed,
+                 live_event_wait_count, active_children_count)
+             VALUES ($1, true, $2, true, $3, $4)",
+        )
+        .bind(thread_id)
+        .bind(status)
+        .bind(live_event_waits)
+        .bind(active_children)
+        .execute(pool)
+        .await
+        .expect("seed thread_summaries");
+    }
+
+    /// Seed a change row owned by `thread_id`.
+    async fn seed_change(
+        pool: &sqlx::PgPool,
+        change_id: Uuid,
+        thread_id: Option<Uuid>,
+        status: &str,
+        file_count: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO changes
+                (id, request_id, branch_name, repo_root, thread_id, status, file_count, files)
+             VALUES ($1, $2, $3, '/tmp/repo', $4, $5, $6, $7)",
+        )
+        .bind(change_id)
+        .bind(Uuid::new_v4())
+        .bind(format!("branch-{}", change_id.as_simple()))
+        .bind(thread_id)
+        .bind(status)
+        .bind(file_count)
+        .bind(vec!["a.rs".to_string(); file_count.max(0) as usize])
+        .execute(pool)
+        .await
+        .expect("seed changes");
+    }
+
+    /// Every unsettled thread is refused Apply, and the reason tells working
+    /// from parked.
+    ///
+    /// The split is the whole point. `standing_verdict` waits through
+    /// `running`. It drops on each parked state at rest. So one shared reason
+    /// would send the caller to a control that ends on its first look.
+    #[tokio::test]
+    async fn an_unsettled_thread_is_refused_and_working_is_told_from_parked() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+
+        // Mid-turn, parked on an event wait, parked on a sub-thread, and
+        // parked on a question. All four wake and may commit again.
+        for (status, waits, children, expected) in [
+            ("running", 0, 0, ChangeActionRefusal::ThreadWorking),
+            ("idle", 1, 0, ChangeActionRefusal::ThreadParked),
+            ("idle", 0, 1, ChangeActionRefusal::ThreadParked),
+            (
+                "waiting_for_user_answer",
+                0,
+                0,
+                ChangeActionRefusal::ThreadParked,
+            ),
+        ] {
+            let thread_id = Uuid::new_v4();
+            let change_id = Uuid::new_v4();
+            seed_cc_thread(&pool, thread_id, status, waits, children).await;
+            seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+
+            let refusal = change_action_refusal(&pool, change_id, Action::Apply)
+                .await
+                .expect("ask the gate");
+            assert_eq!(
+                refusal,
+                Some(expected),
+                "status={status} waits={waits} children={children} refused for the wrong reason"
+            );
+        }
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The reported reason and `standing_verdict` agree about who can be waited
+    /// out. Only `ThreadWorking` may be answered with a standing apply.
+    #[test]
+    fn only_the_working_reason_is_one_a_standing_apply_waits_through() {
+        use crate::engine::standing_apply::{
+            standing_verdict, ArmedChange, SettleFacts, StandingVerdict,
+        };
+
+        let facts = |status: &str, waits: bool, children: bool| SettleFacts {
+            status: status.to_string(),
+            live_event_waits: waits,
+            active_children: children,
+            has_diff: true,
+            armed_change: ArmedChange::Ready(Uuid::new_v4()),
+        };
+        let waits_it_out = |f: SettleFacts| matches!(standing_verdict(&f), StandingVerdict::Wait);
+        // The state behind ThreadWorking. The arm keeps its place.
+        assert!(
+            waits_it_out(facts("running", false, false)),
+            "a running thread is what a standing apply waits through",
+        );
+        // The three behind ThreadParked. Each ends the arm on its first look.
+        for (status, waits, children) in [
+            ("idle", true, false),
+            ("idle", false, true),
+            ("waiting_for_user_answer", false, false),
+        ] {
+            assert!(
+                !waits_it_out(facts(status, waits, children)),
+                "a parked thread ({status}) drops the arm, so it must not read as working",
+            );
+        }
+    }
+
+    /// The control: a settled coding-agent thread with a real diff applies.
+    /// Without this, a gate that refused everything would look correct.
+    #[tokio::test]
+    async fn a_settled_thread_is_not_refused() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
+        seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            None,
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A thread that withholds Apply for a reason no wait resolves reports
+    /// `ActionUnavailable`. A chat thread is the plain case. Telling an agent
+    /// to arm `apply_when_settled` here would arm a wait that never ends.
+    #[tokio::test]
+    async fn a_thread_that_will_never_offer_apply_says_so() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO thread_summaries (thread_id, is_coding_agent, status)
+             VALUES ($1, false, 'idle')",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .expect("seed a chat thread");
+        seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            Some(ChangeActionRefusal::ActionUnavailable),
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// An empty pending change is refused for Apply before the thread-state
+    /// question, and Discard stays the way out of it.
+    #[tokio::test]
+    async fn an_empty_pending_change_is_refused_for_apply_only() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
+        seed_change(&pool, change_id, Some(thread_id), "pending", 0).await;
+
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            Some(ChangeActionRefusal::NoFilesLeft),
+        );
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::Discard)
+                .await
+                .expect("ask the gate"),
+            None,
+            "discard is how an empty change is resolved",
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Three rows the engine answers better than the gate does. Refusing them
+    /// here would turn an idempotent retry into a 409.
+    #[tokio::test]
+    async fn unknown_threadless_and_resolved_rows_fall_through() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            change_action_refusal(&pool, unknown, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            None,
+            "an unknown id is the engine's 'Change not found'",
+        );
+
+        let threadless = Uuid::new_v4();
+        seed_change(&pool, threadless, None, "pending", 2).await;
+        assert_eq!(
+            change_action_refusal(&pool, threadless, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            None,
+        );
+
+        // Already applied, on a thread that is mid-turn again. The thread state
+        // must not reach a retry of a resolved change.
+        let thread_id = Uuid::new_v4();
+        let resolved = Uuid::new_v4();
+        seed_cc_thread(&pool, thread_id, "running", 0, 0).await;
+        seed_change(&pool, resolved, Some(thread_id), "applied", 2).await;
+        assert_eq!(
+            change_action_refusal(&pool, resolved, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            None,
+        );
+
+        teardown_test_db(&db_name).await;
     }
 }

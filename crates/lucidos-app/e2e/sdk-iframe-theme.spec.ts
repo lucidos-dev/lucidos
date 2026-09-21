@@ -97,11 +97,10 @@ waitForLucidos();
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme', 'light', { timeout: 5000 });
   });
 
-  test('opt-in /api/v1/sdk-prefs.js serves a static localStorage-driven script', async ({ request }) => {
-    // The endpoint no longer consults the device-id cookie or the DB — it
-    // returns a script that reads localStorage at execution time. Iframes
-    // share the parent's localStorage (same-origin, allow-same-origin), so
-    // the script's first paint matches whatever the parent shell has stored.
+  test('opt-in /api/v1/sdk-prefs.js serves the boot script, and seeds it per device', async ({ request }) => {
+    // With no `?device=`, the body is the shared bundle and stays cacheable.
+    // An app frame is isolated and reads none of the shell's storage, so the
+    // engine resolves that device's appearance and prepends it (ADR 0227).
     const res = await request.get('/api/v1/sdk-prefs.js');
     expect(res.status()).toBe(200);
     expect(res.headers()['content-type']).toContain('application/javascript');
@@ -112,13 +111,16 @@ waitForLucidos();
     // cannot drift. It is bundled to a self-contained IIFE with no imports.
     expect(js).toContain('GENERATED from packages/lucidos-sdk/src/boot/');
     expect(js).toContain('(() => {');
-    // Storage keys are workspace-scoped through the SDK's _storage helper
-    // (mirrors workspaceStorage.ts); the engine-side guard in sdk_prefs.rs
-    // forbids any raw, unscoped access.
-    expect(js).toContain('wsLocalGet("lucidos-theme")');
-    expect(js).toContain('wsLocalGet("lucidos-font-family")');
+    // Two sources in order: the engine's seed, then storage. The storage keys
+    // are workspace-scoped through the SDK's _storage helper (mirrors
+    // workspaceStorage.ts); the guard in sdk_prefs.rs forbids raw access.
+    expect(js).toContain('seeded(served, "theme", "lucidos-theme")');
+    expect(js).toContain('seeded(served, "font-family", "lucidos-font-family")');
     expect(js).toContain('wsLocalGet("lucidos-ui-scale")');
+    expect(js).toContain('globalThis.__lucidosPrefs');
     expect(js).not.toContain('localStorage.getItem("lucidos-theme")');
+    // No device named, so nothing is prepended and the body stays shared.
+    expect(js).not.toContain('window.__lucidosPrefs=');
     // `system` defers to matchMedia at execution time so light-OS browsers
     // don't FOUC dark-then-light.
     expect(js).toContain('matchMedia("(prefers-color-scheme: light)")');

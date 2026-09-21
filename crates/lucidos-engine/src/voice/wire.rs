@@ -41,6 +41,19 @@ impl From<AudioFormat> for AudioSpec {
 pub enum ClientControl {
     /// The caller started speaking over the talker. Stop it mid-word.
     BargeIn,
+    /// The caller opened their mouth. No words yet, and nothing is cut off.
+    ///
+    /// **The one floor opener a transcriber cannot withhold** (ADR 0218). The
+    /// Realtime provider states it itself, and the Live one does not: its
+    /// talker hears the caller's audio and starts composing before its own
+    /// transcriber reports a word. So the caller's first sentence was answered
+    /// into a muted line. The client measures the same edge for its own bubble
+    /// (`voice/speechGate.ts`), and this is that edge.
+    ///
+    /// **Not an interruption.** It fires on the first word of a call with
+    /// nothing playing, so reading it as a cut would report one on every turn.
+    /// [`Self::BargeIn`] is the cut, and it keeps its own quiet-time condition.
+    CallerStartedSpeaking,
     /// The caller rang off. The ordinary end of a call.
     HangUp,
 }
@@ -139,9 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn the_client_can_only_say_two_things() {
+    fn the_client_can_only_say_three_things() {
         let barge: ClientControl = serde_json::from_str(r#"{"type":"barge_in"}"#).unwrap();
         assert_eq!(barge, ClientControl::BargeIn);
+        let started: ClientControl =
+            serde_json::from_str(r#"{"type":"caller_started_speaking"}"#).unwrap();
+        assert_eq!(started, ClientControl::CallerStartedSpeaking);
         let hang: ClientControl = serde_json::from_str(r#"{"type":"hang_up"}"#).unwrap();
         assert_eq!(hang, ClientControl::HangUp);
         assert!(serde_json::from_str::<ClientControl>(r#"{"type":"open"}"#).is_err());

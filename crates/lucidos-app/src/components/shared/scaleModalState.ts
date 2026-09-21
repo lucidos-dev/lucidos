@@ -71,8 +71,14 @@ function armLinger() {
 
 /** Push the deadline out for a panel already counting down, and do nothing for
  *  one that is not. That second half is what stops a zoom step inside the
- *  Settings modal starting a countdown on it. */
-function renewLinger() {
+ *  Settings modal starting a countdown on it.
+ *
+ *  Exported for the wheel path, the one caller that asks WITHOUT changing the
+ *  scale. A pinch banks distance and spends it a notch at a time
+ *  (`scaleWheel.ts`), so a slow one is the user working a still value. Left to
+ *  count down, the panel dissolves mid-gesture and takes its wheel listener
+ *  with it. The rest of the pinch then falls through to the browser's zoom. */
+export function renewScaleModalLinger() {
   if (lingerTimeout !== undefined) armLinger();
 }
 
@@ -127,12 +133,12 @@ function applyScaleChange(next: number) {
     // A step onto the value already shown is the user holding the shortcut down
     // against the clamp. Still them using it, so keep the panel up rather than
     // pulling it out from under them.
-    renewLinger();
+    renewScaleModalLinger();
     return;
   }
   previewScale.value = next;
   applyUiScale(next);
-  if (scaleModalOpen.value) renewLinger();
+  if (scaleModalOpen.value) renewScaleModalLinger();
   else {
     scaleModalOpen.value = true;
     armLinger();

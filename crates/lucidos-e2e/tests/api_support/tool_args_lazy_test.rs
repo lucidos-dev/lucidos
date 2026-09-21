@@ -191,10 +191,12 @@ async fn tool_args_endpoint_returns_null_when_no_args_were_recorded() {
     assert_eq!(body["args"], Value::Null);
 }
 
-/// The chat channel's own `ToolCalled` is not stripped, so the endpoint must
-/// refuse it rather than leak an arbitrary payload through a second door.
+/// The chat channel's own `ToolCalled` is stripped too, so the endpoint serves
+/// it. The two sides ask one predicate for exactly this reason: a strip whose
+/// fetch does not recognise the type it stripped serves a 404 where the modal
+/// expects the command line.
 #[tokio::test]
-async fn tool_args_endpoint_rejects_a_non_coding_agent_call() {
+async fn tool_args_endpoint_serves_a_chat_tool_call() {
     let pool = pool().await;
     let thread_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
@@ -210,6 +212,38 @@ async fn tool_args_endpoint_rejects_a_non_coding_agent_call() {
     .execute(&pool)
     .await
     .expect("seed chat ToolCalled");
+
+    let client = http_client();
+    let url = format!("{}/api/v1/events/{}/tool-args", base_url(), event_id);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("tool-args request failed");
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.expect("invalid JSON");
+    assert_eq!(body["args"]["path"], Value::String(format!("{marker}.md")));
+}
+
+/// An event that is not a tool call at all is still refused, so the endpoint
+/// cannot become a second door onto an arbitrary payload.
+#[tokio::test]
+async fn tool_args_endpoint_rejects_an_event_that_is_not_a_tool_call() {
+    let pool = pool().await;
+    let thread_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate, thread_id) \
+         VALUES ($1, 'MessageReceived', $2, NOW(), $3::text, 'thread', $3)",
+    )
+    .bind(event_id)
+    .bind(serde_json::json!({ "text": "not a tool call", "channel": "chat" }))
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed MessageReceived");
 
     let client = http_client();
     let url = format!("{}/api/v1/events/{}/tool-args", base_url(), event_id);

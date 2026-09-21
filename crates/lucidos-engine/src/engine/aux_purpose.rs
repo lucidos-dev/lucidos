@@ -23,8 +23,9 @@ use sqlx::PgPool;
 
 use crate::core::{
     PreferenceStore, PREF_IMAGE_MODEL, PREF_MODEL_CONVERSATION_SUMMARY,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
-    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
+    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION,
+    PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER, PREF_REASONING_CONVERSATION_SUMMARY,
+    PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_QUERY_CLASSIFICATION,
     PREF_REASONING_TITLE,
 };
 use crate::engine::ContextPurpose;
@@ -32,8 +33,17 @@ use crate::engine::ContextPurpose;
 /// The reasoning half of a purpose's *model selection*.
 pub(crate) struct AuxReasoningPref {
     pub(crate) key: &'static str,
-    /// Used when the key is unset. Each is the literal its call site hardcoded
-    /// before the preference existed, so the split changed nothing.
+    /// Consulted when `key` is unset, before the default. Only query
+    /// classification has one, and it is the other half of its model fallback:
+    /// the split must not quietly drop a workspace that raised
+    /// `reasoning_memory`.
+    ///
+    /// The conversation summary deliberately has none. Its default is `low`,
+    /// which is what its call site ran at, and inheriting `reasoning_memory`
+    /// would LOWER it.
+    pub(crate) fallback_key: Option<&'static str>,
+    /// Used when neither key is set. Each is the literal its call site
+    /// hardcoded before the preference existed, so the split changed nothing.
     ///
     /// Image description is the one exception. It passed no effort at all,
     /// which `gemini_generation_config` reads as `high`, so a caption was
@@ -45,9 +55,10 @@ pub(crate) struct AuxReasoningPref {
 /// The preference pair one auxiliary purpose reads.
 pub(crate) struct AuxModelPrefs {
     pub(crate) model_key: &'static str,
-    /// Consulted when `model_key` is unset. Only the conversation summary has
-    /// one: it was split out of `model_memory`, and a workspace that pinned a
-    /// model there must keep summarising on it.
+    /// Consulted when `model_key` is unset. Both keys split out of
+    /// `model_memory` have one, the conversation summary and query
+    /// classification: a workspace that pinned a model there must keep running
+    /// all three jobs on it.
     pub(crate) model_fallback_key: Option<&'static str>,
     /// `None` for a purpose whose models offer no reasoning tiers, which is
     /// image generation. The tier set decides, so there is no key to store.
@@ -72,6 +83,7 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
             model_fallback_key: None,
             reasoning: Some(AuxReasoningPref {
                 key: PREF_REASONING_TITLE,
+                fallback_key: None,
                 default: "none",
             }),
         },
@@ -80,6 +92,7 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
             model_fallback_key: None,
             reasoning: Some(AuxReasoningPref {
                 key: PREF_REASONING_IMAGE_DESCRIPTION,
+                fallback_key: None,
                 default: "none",
             }),
         },
@@ -88,6 +101,7 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
             model_fallback_key: None,
             reasoning: Some(AuxReasoningPref {
                 key: PREF_REASONING_MEMORY,
+                fallback_key: None,
                 default: "none",
             }),
         },
@@ -96,7 +110,17 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
             model_fallback_key: Some(PREF_MODEL_MEMORY),
             reasoning: Some(AuxReasoningPref {
                 key: PREF_REASONING_CONVERSATION_SUMMARY,
+                fallback_key: None,
                 default: "low",
+            }),
+        },
+        ContextPurpose::QueryClassification => AuxModelPrefs {
+            model_key: PREF_MODEL_QUERY_CLASSIFICATION,
+            model_fallback_key: Some(PREF_MODEL_MEMORY),
+            reasoning: Some(AuxReasoningPref {
+                key: PREF_REASONING_QUERY_CLASSIFICATION,
+                fallback_key: Some(PREF_REASONING_MEMORY),
+                default: "none",
             }),
         },
         ContextPurpose::ImageGen => AuxModelPrefs {
@@ -138,11 +162,15 @@ pub(crate) async fn resolve_selection(pool: &PgPool, purpose: ContextPurpose) ->
         }
     }
     let reasoning = match &prefs.reasoning {
-        Some(pref) => Some(
-            read_set(pool, pref.key)
-                .await
-                .unwrap_or_else(|| pref.default.to_string()),
-        ),
+        Some(pref) => {
+            let mut effort = read_set(pool, pref.key).await;
+            if effort.is_none() {
+                if let Some(fallback) = pref.fallback_key {
+                    effort = read_set(pool, fallback).await;
+                }
+            }
+            Some(effort.unwrap_or_else(|| pref.default.to_string()))
+        }
         None => None,
     };
     AuxSelection {
@@ -304,6 +332,7 @@ const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::ImageDescribe,
     ContextPurpose::Memory,
     ContextPurpose::ConversationSummary,
+    ContextPurpose::QueryClassification,
     ContextPurpose::ImageGen,
     ContextPurpose::Voice,
 ];
@@ -324,11 +353,12 @@ mod tests {
                 | ContextPurpose::ImageDescribe
                 | ContextPurpose::Memory
                 | ContextPurpose::ConversationSummary
+                | ContextPurpose::QueryClassification
                 | ContextPurpose::ImageGen
                 | ContextPurpose::Voice => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 7);
+        assert_eq!(ALL_PURPOSES.len(), 8);
     }
 
     /// The invariant this module exists for. Two purposes sharing one model
@@ -401,6 +431,72 @@ mod tests {
         let prefs = model_prefs(ContextPurpose::ConversationSummary).expect("prefs");
         assert_eq!(prefs.model_key, PREF_MODEL_CONVERSATION_SUMMARY);
         assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_MEMORY));
+    }
+
+    /// Same promise as the summariser's, for the same reason. Every existing
+    /// workspace has a `model_memory` value and no
+    /// `model_query_classification`, so the split must leave it classifying on
+    /// the model it already used.
+    #[test]
+    fn query_classification_falls_back_to_the_memory_model() {
+        let prefs = model_prefs(ContextPurpose::QueryClassification).expect("prefs");
+        assert_eq!(prefs.model_key, PREF_MODEL_QUERY_CLASSIFICATION);
+        assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_MEMORY));
+    }
+
+    /// Fact extraction keeps `model_memory` outright. The split moved
+    /// classification only, and a fallback here would mean the key moved.
+    #[test]
+    fn fact_extraction_still_owns_the_memory_model() {
+        let prefs = model_prefs(ContextPurpose::Memory).expect("prefs");
+        assert_eq!(prefs.model_key, PREF_MODEL_MEMORY);
+        assert_eq!(prefs.model_fallback_key, None);
+    }
+
+    /// Both halves inherit, or the split is only half invisible. A workspace
+    /// that raised `reasoning_memory` was classifying at that effort, and
+    /// falling straight to the default would quietly lower it.
+    #[test]
+    fn query_classification_inherits_the_memory_effort_too() {
+        let reasoning = model_prefs(ContextPurpose::QueryClassification)
+            .and_then(|p| p.reasoning)
+            .expect("query classification has a reasoning half");
+        assert_eq!(reasoning.key, PREF_REASONING_QUERY_CLASSIFICATION);
+        assert_eq!(reasoning.fallback_key, Some(PREF_REASONING_MEMORY));
+    }
+
+    /// The summariser's default is `low`, which is what its call site ran at.
+    /// Inheriting `reasoning_memory` would LOWER it, so it has no fallback.
+    #[test]
+    fn the_summary_inherits_no_effort() {
+        let reasoning = model_prefs(ContextPurpose::ConversationSummary)
+            .and_then(|p| p.reasoning)
+            .expect("the summary has a reasoning half");
+        assert_eq!(reasoning.fallback_key, None);
+    }
+
+    /// An effort fallback is only ever another purpose's effort key. Pointing
+    /// one at a MODEL key would send a model id to the wire as a tier.
+    #[test]
+    fn every_effort_fallback_names_an_effort_key() {
+        let efforts: Vec<&'static str> = ALL_PURPOSES
+            .iter()
+            .filter_map(|p| model_prefs(*p).and_then(|m| m.reasoning).map(|r| r.key))
+            .collect();
+        for purpose in ALL_PURPOSES {
+            let Some(reasoning) = model_prefs(*purpose).and_then(|p| p.reasoning) else {
+                continue;
+            };
+            let Some(fallback) = reasoning.fallback_key else {
+                continue;
+            };
+            assert!(
+                efforts.contains(&fallback),
+                "{:?} falls back to {}, which is not an effort key",
+                purpose,
+                fallback
+            );
+        }
     }
 
     /// ADR 0102's measurements say `low` is not the problem, so it stays and

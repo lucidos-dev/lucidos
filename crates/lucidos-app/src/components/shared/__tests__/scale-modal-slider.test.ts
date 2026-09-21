@@ -11,6 +11,7 @@ import {
   dismissScaleModal,
   openScaleModal,
   adjustUiScale,
+  renewScaleModalLinger,
   SHORTCUT_LINGER_MS,
   _resetScaleTimersForTesting,
 } from '../scaleModalState';
@@ -300,6 +301,29 @@ describe('scale panel linger dismiss', () => {
     await settle();
     expect(setPreferenceMock).not.toHaveBeenCalled();
     expect(scaleModalOpen.value).toBe(false);
+  });
+
+  // A pinch banks distance and spends it a notch at a time, so it can steer the
+  // panel for several frames without changing the value. Only `adjustUiScale`
+  // renewed the countdown, so those frames read as idleness: the panel
+  // dissolved mid-gesture and took its wheel listener with it.
+  it('a gesture that has not yet earned a step still keeps the panel up', () => {
+    adjustUiScale(UI_SCALE_STEP);
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(SHORTCUT_LINGER_MS - 100);
+      renewScaleModalLinger();
+    }
+    expect(scaleModalOpen.value).toBe(true);
+
+    vi.advanceTimersByTime(SHORTCUT_LINGER_MS + 100);
+    expect(scaleModalOpen.value).toBe(false);
+  });
+
+  it('renewing never starts a countdown on the Settings modal', () => {
+    openScaleModal();
+    renewScaleModalLinger();
+    vi.advanceTimersByTime(SHORTCUT_LINGER_MS * 4);
+    expect(scaleModalOpen.value).toBe(true);
   });
 
   it('the Settings modal never counts itself out', () => {

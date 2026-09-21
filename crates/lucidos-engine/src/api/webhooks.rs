@@ -19,9 +19,10 @@ use super::*;
 use crate::core::credentials::{AuthType, Credential};
 use crate::core::webhook_deliveries::{Claim, DeliveryLedger, MAX_WINDOW_SECS};
 use crate::core::webhook_ingress::{AddressProbe, Family};
+use crate::core::webhook_refusal::{self, RefusalCause};
 use crate::core::webhooks::{
-    self, DedupeConfig, HmacChange, HmacConfig, PresentedDelivery, Webhook, WebhookConfig,
-    WebhookPatch, WebhookStore,
+    self, DedupeConfig, DeliveryRefusal, HmacChange, HmacConfig, PresentedDelivery, RefusalRun,
+    Webhook, WebhookConfig, WebhookPatch, WebhookStore,
 };
 use crate::core::{webhook_probe_token, CredentialStore};
 use crate::engine::thread_events::MessageOrigin;
@@ -49,6 +50,13 @@ struct WebhookRow {
     /// Why that refusal happened, in the words the log uses. Shown to the
     /// workspace owner, and never returned to a sender.
     last_refusal_reason: Option<String>,
+    /// Every refusal since the last acceptance, or `null` when none stands.
+    ///
+    /// The whole evidence rather than the last line of it, so one diagnostic
+    /// probe cannot erase what a real outage left behind. `lucidos webhooks
+    /// list` prints this route verbatim, which is where a diagnosis starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_run: Option<RefusalRun>,
     /// Path a sender posts to, under whatever host the hook socket is exposed
     /// on. The engine knows no public hostname, so it states the path alone.
     delivery_path: String,
@@ -70,6 +78,7 @@ impl WebhookRow {
             last_accepted_at: hook.last_accepted_at.map(|t| t.to_rfc3339()),
             last_refused_at: hook.last_refused_at.map(|t| t.to_rfc3339()),
             last_refusal_reason: hook.last_refusal_reason,
+            refusal_run: hook.refusal_run.is_running().then_some(hook.refusal_run),
         }
     }
 }
@@ -643,19 +652,38 @@ fn refused() -> Response {
         .into_response()
 }
 
+/// Is this delivery the ingress probe's own knock?
+///
+/// The probe POSTs to a real hook with a bearer this engine minted for the
+/// current cycle, and expects to be turned away (ADR 0143). Left counted, it
+/// would stamp a refusal every 15 minutes on a healthy workspace and bury the
+/// one signal those columns exist to expose.
+///
+/// Pure, so the guard is testable without a database or a socket. It is the
+/// only thing standing between the probe and the refusal run, so it is checked
+/// in exactly one place.
+fn is_probe_delivery(headers: &HeaderMap) -> bool {
+    webhooks::presented_bearer(header_str(headers, "authorization"))
+        .is_some_and(webhook_probe_token::is_probe_token)
+}
+
 /// Record that a delivery arrived and was turned away, and why.
 ///
-/// Two deliveries are deliberately not stamped. The ingress probe presents a
-/// token this engine minted, so stamping it would report a refusal every 15
-/// minutes on a healthy workspace (ADR 0143). And a stamp that fails is logged
-/// and dropped: the sender's delivery already happened, and losing an
-/// observation must never turn into a refusal the sender has to retry.
-async fn stamp_refused(state: &AppState, hook: &Webhook, headers: &HeaderMap, reason: &str) {
-    let bearer = webhooks::presented_bearer(header_str(headers, "authorization"));
-    if bearer.is_some_and(webhook_probe_token::is_probe_token) {
+/// Two deliveries are deliberately not stamped. The probe's own refusal is
+/// skipped by [`is_probe_delivery`], so neither the stamps nor the refusal run
+/// move for it. And a stamp that fails is logged and dropped: the sender's
+/// delivery already happened, and losing an observation must never turn into a
+/// refusal the sender has to retry.
+async fn stamp_refused(
+    state: &AppState,
+    hook: &Webhook,
+    headers: &HeaderMap,
+    refusal: DeliveryRefusal,
+) {
+    if is_probe_delivery(headers) {
         return;
     }
-    if let Err(e) = WebhookStore::record_refused(&state.pool, hook.id, reason).await {
+    if let Err(e) = WebhookStore::record_refused(&state.pool, hook.id, refusal).await {
         crate::log!("[Webhook] '{}' could not stamp a refusal: {e}", hook.name);
     }
 }
@@ -705,8 +733,10 @@ async fn deliver(
     };
     if !hook.enabled {
         // Worth a stamp: a sender still delivering to a hook somebody switched
-        // off is exactly what the page should show, rather than silence.
-        stamp_refused(&state, &hook, &headers, "the webhook is disabled").await;
+        // off is exactly what the page should show, rather than silence. It is
+        // also the one refusal that examined nothing, which is what earns it
+        // its own words in `core::webhook_refusal`.
+        stamp_refused(&state, &hook, &headers, DeliveryRefusal::Disabled).await;
         return refused();
     }
 
@@ -715,7 +745,7 @@ async fn deliver(
     // otherwise change what gets verified.
     let Ok(body_str) = std::str::from_utf8(&body) else {
         crate::log!("[Webhook] '{}' refused: body is not UTF-8", hook.name);
-        stamp_refused(&state, &hook, &headers, "the body is not UTF-8").await;
+        stamp_refused(&state, &hook, &headers, DeliveryRefusal::BodyNotUtf8).await;
         return refused();
     };
 
@@ -747,7 +777,7 @@ async fn deliver(
 
     if let Err(refusal) = webhooks::verify(&hook, &presented, secret.as_deref()) {
         crate::log!("[Webhook] '{}' refused: {}", hook.name, refusal.reason());
-        stamp_refused(&state, &hook, &headers, refusal.reason()).await;
+        stamp_refused(&state, &hook, &headers, refusal).await;
         return refused();
     }
 
@@ -1013,11 +1043,91 @@ async fn ingress_status(State(state): State<AppState>) -> Result<Json<IngressSta
     }))
 }
 
+/// Which webhooks are turning their deliveries away, for a cold page load.
+///
+/// The verification-layer sibling of [`IngressStatus`]. SSE carries the two
+/// `WebhookDeliveries*` events while the app is open. This is what a client
+/// that just started reads instead of replaying the timeline.
+#[derive(Serialize)]
+struct RefusalStatus {
+    /// One entry per hook with a standing declaration. Per hook, unlike the
+    /// ingress outage, because the fault belongs to the hook rather than to
+    /// the path in front of all of them.
+    refusing: Vec<WebhookRefusal>,
+}
+
+/// One webhook that is throwing its deliveries away.
+#[derive(Serialize)]
+struct WebhookRefusal {
+    webhook_id: String,
+    webhook_name: String,
+    /// Whether the hook is switched on right now. The one-click recovery for
+    /// a `disabled` cause is to turn it back on, so the page needs it.
+    enabled: bool,
+    cause: RefusalCause,
+    /// How many deliveries have been turned away since one last verified.
+    refusals: i64,
+    /// The run's breakdown by reason. The evidence, not the last line of it.
+    reasons: std::collections::BTreeMap<String, i64>,
+    refusing_since: String,
+    refusing_secs: i64,
+}
+
+/// What the refusal check last declared, for the hooks it still holds for.
+///
+/// **Gated on the declaration and described from the live row.** The engine
+/// having said so is what raises the bar, so a fault no cycle has declared yet
+/// draws nothing. What the bar then SAYS comes from the row, which is fresher:
+/// a user who re-enabled a hook a moment ago must not read that it is off.
+///
+/// `judge` is pure and deterministic over that row, so this route and the
+/// scheduler cannot disagree about whether a fault still stands.
+async fn refusal_status(State(state): State<AppState>) -> Result<Json<RefusalStatus>, ApiError> {
+    let declared = crate::scheduler::webhook_refusal::declared_refusals(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if declared.is_empty() {
+        return Ok(Json(RefusalStatus {
+            refusing: Vec::new(),
+        }));
+    }
+
+    let hooks = WebhookStore::list(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let refusing = hooks
+        .into_iter()
+        .filter(|hook| declared.contains_key(&hook.id.to_string()))
+        .filter_map(|hook| match webhook_refusal::judge(&hook) {
+            // Over, or the row no longer supports it. The next cycle retracts
+            // it on the timeline; showing it here meanwhile would be a claim
+            // the page's own numbers contradict.
+            webhook_refusal::RefusalVerdict::Clear => None,
+            webhook_refusal::RefusalVerdict::Refusing(cause) => Some(WebhookRefusal {
+                webhook_id: hook.id.to_string(),
+                webhook_name: hook.name.clone(),
+                enabled: hook.enabled,
+                cause,
+                refusals: hook.refusal_run.refusals,
+                refusing_since: hook
+                    .refusal_run
+                    .since
+                    .map(|at| at.to_rfc3339())
+                    .unwrap_or_default(),
+                refusing_secs: webhook_refusal::refusing_secs(&hook.refusal_run),
+                reasons: hook.refusal_run.reasons,
+            }),
+        })
+        .collect();
+    Ok(Json(RefusalStatus { refusing }))
+}
+
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/webhooks", get(list_webhooks).post(create_webhook))
         // Static before the param sibling, as `changes.rs` does for `/applied`.
         .route("/webhooks/ingress", get(ingress_status))
+        .route("/webhooks/refusals", get(refusal_status))
         .route("/webhooks/:id", put(update_webhook).delete(delete_webhook))
         .route("/webhooks/:id/deliver", post(deliver))
 }
@@ -1375,6 +1485,43 @@ mod tests {
             ..ok
         })
         .is_ok());
+    }
+
+    /// The probe's own refusal never counts, and nothing else is exempt.
+    ///
+    /// The probe POSTs an unsigned body to a real hook every 15 minutes and
+    /// expects a 401. Counted, it would advance the refusal run four times an
+    /// hour on a perfectly healthy workspace and bury the signal the run
+    /// exists to carry.
+    ///
+    /// Serial, because the minted token lives in a process-wide slot.
+    #[test]
+    fn only_the_engines_own_probe_is_exempt_from_the_run() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let token = webhook_probe_token::mint().expect("mint");
+        let bearer = |value: &str| header_map(&[("authorization", value)]);
+
+        assert!(is_probe_delivery(&bearer(&format!("Bearer {token}"))));
+        assert!(
+            is_probe_delivery(&bearer(&format!("bearer {token}"))),
+            "the scheme is matched case-insensitively, as HTTP says"
+        );
+
+        // Everything a real sender could present. GitHub attaches no bearer at
+        // all, which is the common case and must be counted.
+        assert!(!is_probe_delivery(&HeaderMap::new()));
+        assert!(!is_probe_delivery(&bearer("Bearer some-other-token")));
+        assert!(!is_probe_delivery(&bearer("Bearer ")));
+        assert!(!is_probe_delivery(&bearer(&token)), "no scheme, no match");
+
+        // A superseded token stops matching, so one leak cannot silence the
+        // run for as long as the engine runs.
+        webhook_probe_token::mint().expect("mint again");
+        assert!(!is_probe_delivery(&bearer(&format!("Bearer {token}"))));
+
+        webhook_probe_token::clear();
     }
 
     #[test]

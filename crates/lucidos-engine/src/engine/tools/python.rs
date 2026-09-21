@@ -24,16 +24,27 @@ impl LucidosEngine {
         }
 
         let env_vars = self.build_tool_env_vars(thread_id).await;
+        // Captured before the env is moved into the run. Both the output and
+        // the error below reach the `ToolResult` event verbatim. A script that
+        // echoes an injected credential would put it there for good. See
+        // `core::injected_secret_values`.
+        let secrets = crate::core::injected_secret_values(&env_vars);
         let run_id = uuid::Uuid::new_v4().to_string();
         let staging_dir = self.workspace_path().join(".lucidos/staging").join(&run_id);
 
-        let output = execute_staged_and_clean_up_on_failure(
+        let output = match execute_staged_and_clean_up_on_failure(
             &self.python_runtime,
             code,
             env_vars,
             &staging_dir,
         )
-        .await?;
+        .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(crate::core::redact_secret_values(&e.to_string(), &secrets).into())
+            }
+        };
 
         let data_staging = staging_dir.join("data");
         let mut created = Vec::new();
@@ -123,7 +134,7 @@ impl LucidosEngine {
             }
         }
 
-        Ok(response)
+        Ok(crate::core::redact_secret_values(&response, &secrets))
     }
 
     /// `run_python_background(code, packages?, timeout_secs?)` — install
@@ -436,6 +447,39 @@ mod tests {
     };
     use crate::core::shell::TaskOutcome;
     use crate::engine::tools::bash_background::BackgroundBashRegistry;
+
+    /// This file with its test module cut off, through the shared reader.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/tools/python.rs"),
+        )
+    }
+
+    /// Both exits leave through the redaction, not around one of them.
+    ///
+    /// The Ok path returns the script's stdout, and the Err path returns its
+    /// stderr. Both are persisted verbatim in `ToolResult`, and every
+    /// credential and OAuth token is in this child's environment. The
+    /// composition is covered in `core::mod_tests`; this is the wiring.
+    #[test]
+    fn both_python_tool_exits_leave_through_the_secret_redaction() {
+        let src = production_src();
+        let at = src
+            .find("pub(crate) async fn execute_python_tool")
+            .expect("execute_python_tool is still here");
+        let end = src[at..]
+            .find("\n    /// `run_python_background(")
+            .expect("execute_python_tool is still followed by the background tool");
+        let body = &src[at..at + end];
+        assert_eq!(
+            body.matches("redact_secret_values(").count(),
+            2,
+            "both the Ok and the Err exit of execute_python_tool must go through \
+             `core::redact_secret_values`. A traceback carries the script's stderr, \
+             which is where an echoed credential lands."
+        );
+        assert!(body.contains("injected_secret_values(&env_vars)"));
+    }
     use crate::runtime::python::PythonRuntime;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -730,6 +774,13 @@ mod tests {
     /// refactor that drops the `&env` arg from the spawn call breaks this
     /// test instead of silently shipping a tool whose scripts can't reach
     /// their secrets.
+    ///
+    /// The `CRED_TEST` assertion carries BOTH halves of that contract. The
+    /// script prints `<missing>` when the variable never arrived, so a
+    /// redacted value proves the child could read it. The drain then masks
+    /// it, which is what keeps the credential out of the model's context and
+    /// out of `BackgroundBashCompleted`. Asserting the raw value here would
+    /// pin the leak instead.
     #[tokio::test]
     async fn python_via_bash_background_inherits_provided_env_vars() {
         let dir = tempdir().unwrap();
@@ -775,8 +826,13 @@ mod tests {
             snap.stderr
         );
         assert!(
-            snap.stdout.contains("CRED_TEST=secret-value"),
-            "stdout did not see CRED_TEST: {}",
+            snap.stdout.contains("CRED_TEST=[REDACTED]"),
+            "the child must receive CRED_TEST and the drain must mask it: {}",
+            snap.stdout
+        );
+        assert!(
+            !snap.stdout.contains("secret-value"),
+            "the drain handed the model a live credential: {}",
             snap.stdout
         );
         assert!(

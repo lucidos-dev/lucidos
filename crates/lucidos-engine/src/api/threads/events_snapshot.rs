@@ -28,7 +28,26 @@ pub struct ThreadEventsQuery {
     /// bug-report dumps stay complete.
     #[serde(default)]
     pub include_context: bool,
+    /// Serve only the newest `limit` events. Absent means the whole history,
+    /// which is what every caller got before paging existed and what the
+    /// export path still asks for.
+    ///
+    /// A thread shorter than one page is unaffected: it fits, so the response
+    /// is what it always was, with `has_more` false.
+    pub limit: Option<i64>,
+    /// Page backwards from here, as `created` plus `sequence`. Both halves are
+    /// required together, because rows are ordered by the pair.
+    pub before_created: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_seq: Option<i64>,
 }
+
+/// Largest page a caller may ask for, so one request cannot re-create the
+/// unbounded read paging exists to end.
+const MAX_EVENTS_PAGE: i64 = 2_000;
+
+/// The one tool whose args the INLINE render reads, so the args strip spares
+/// it. See `strip_tool_call_args`.
+const GENERATE_IMAGE_TOOL: &str = "generate_image";
 
 /// Response shape for `GET /api/v1/threads/:thread_id/events`. Wraps the event
 /// rows with a `current_aggregate` snapshot of `thread_summaries` so the
@@ -39,6 +58,23 @@ pub struct ThreadEventsSnapshot {
     pub events: Vec<ThreadEventRow>,
     #[serde(rename = "currentAggregate")]
     pub current_aggregate: Option<crate::core::store::ThreadAggregate>,
+    /// Whether older events remain behind `events[0]`. Always false for an
+    /// unpaged read, which by definition carries them all.
+    #[serde(
+        rename = "hasMore",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub has_more: bool,
+    /// The highest `sequence` the whole thread holds, sent only for a PAGE.
+    ///
+    /// A page cannot supply it. A sequence is allocated globally and can run
+    /// against the clock, so the newest row by clock often does not hold the
+    /// highest one. Half the threads on this workspace are like that.
+    /// Deriving the forward watermark from the page would make the next delta
+    /// refetch history and replay it through the live path.
+    #[serde(rename = "maxSequence", skip_serializing_if = "Option::is_none")]
+    pub max_sequence: Option<i64>,
 }
 
 /// GET /api/v1/threads/:thread_id/events — snapshot of persisted thread events,
@@ -51,16 +87,43 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
 
+    // A page and a delta are different questions, so asking both is a caller
+    // bug rather than a combination to resolve. `after` walks forward from what
+    // the client already holds; `limit` walks backward from the newest.
+    if query.limit.is_some() && query.after.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "after and limit are mutually exclusive".to_string(),
+        ));
+    }
+    let before = match (query.before_created, query.before_seq) {
+        (Some(created), Some(seq)) => Some((created, seq)),
+        (None, None) => None,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "before_created and before_seq must be given together".to_string(),
+            ))
+        }
+    };
+    // A cursor says where to start, and not how much to take. The unpaged read
+    // would ignore it and serve the whole history, which is the opposite of
+    // what such a caller asked for. Refusing is how they find out.
+    if before.is_some() && query.limit.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "before_created requires limit".to_string(),
+        ));
+    }
+
     // Independent fetches against the same pool — run in parallel.
     let pool = state.engine.pool();
     let (events_res, aggregate_res) = tokio::join!(
-        state
-            .event_store
-            .get_thread_events_by_seq(thread_uuid, query.after),
+        read_events(&state, thread_uuid, &query, before),
         crate::core::store::fetch_thread_aggregate(pool, thread_uuid),
     );
 
-    let mut events = events_res.map_err(|e| {
+    let (mut events, has_more, max_sequence) = events_res.map_err(|e| {
         log!("[API] Failed to get thread events: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -102,7 +165,36 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     Ok(Json(ThreadEventsSnapshot {
         events,
         current_aggregate,
+        has_more,
+        max_sequence,
     }))
+}
+
+/// The events half of the snapshot, paged or whole.
+///
+/// Split out so the unpaged path keeps calling the query it always called. A
+/// `limit` of none is not a page of everything: it is the original read, which
+/// is what keeps a short thread's response identical.
+async fn read_events(
+    state: &AppState,
+    thread_uuid: Uuid,
+    query: &ThreadEventsQuery,
+    before: Option<(chrono::DateTime<chrono::Utc>, i64)>,
+) -> Result<(Vec<ThreadEventRow>, bool, Option<i64>), sqlx::Error> {
+    let Some(limit) = query.limit else {
+        let events = state
+            .event_store
+            .get_thread_events_by_seq(thread_uuid, query.after)
+            .await?;
+        // An unpaged read carries every row, so its own rows ARE the watermark.
+        return Ok((events, false, None));
+    };
+    let limit = limit.clamp(1, MAX_EVENTS_PAGE);
+    let page = state
+        .event_store
+        .get_thread_events_page(thread_uuid, before, limit)
+        .await?;
+    Ok((page.events, page.has_more, page.max_sequence))
 }
 
 /// The two event types carrying a tool's OUTPUT, one per channel. Every read
@@ -115,11 +207,18 @@ pub(super) fn is_tool_result_event(event_type: &str) -> bool {
     matches!(event_type, "ToolResult" | "CodingAgentToolResult")
 }
 
-/// The event type carrying a coding agent's tool INPUT. Its chat-channel
-/// sibling `ToolCalled` is deliberately absent: those args are small, and
-/// `thread-sync.ts` reads the write target straight off them.
+/// The event types carrying a tool's INPUT, one per channel.
+///
+/// `ToolCalled` was excluded on the reading that a chat tool's args are small.
+/// Measured on a reported thread they are its single largest share: 2,689 calls
+/// and 3.15 MB, a median of 711 bytes against a p90 of 2,273, because a `bash`
+/// call inlines its whole script.
+///
+/// `thread-sync.ts` does read the write target off `ToolCalled.args`, and that
+/// still works. It runs from `handleTransientSideEffects`, which only the live
+/// SSE dispatcher calls, and a live event is never stripped.
 pub(super) fn is_tool_call_event(event_type: &str) -> bool {
-    event_type == "CodingAgentToolCalled"
+    matches!(event_type, "CodingAgentToolCalled" | "ToolCalled")
 }
 
 /// Rewrite a tool result's `result` in place when `strip` recognises its
@@ -317,14 +416,14 @@ pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     obj.insert("result_stripped".to_string(), serde_json::Value::Bool(true));
 }
 
-/// Drop `args` from a coding agent's tool call on the snapshot path. Stamp an
+/// Drop `args` from a tool call on the snapshot path. Stamp an
 /// `args_stripped: true` marker, so the frontend lazy-fetches via
 /// `GET /events/:event_id/tool-args` when the user opens the step-detail modal.
 ///
-/// `args` is the single heaviest thing a coding-agent snapshot carries: an
-/// `Edit`'s two versions of a hunk, a `Write`'s whole file. Nothing inline
-/// renders it. The modal's un-elided command line is its only reader
-/// (`fullCommandForCCTool` in `exchange.ts`).
+/// `args` is the single heaviest thing a snapshot carries, on both channels: an
+/// `Edit`'s two versions of a hunk, a `Write`'s whole file, a `bash` call's
+/// inlined script. Nothing inline renders it. The modal's un-elided command
+/// line is its only reader (`fullCommandForCCTool` in `exchange.ts`).
 ///
 /// **`description` is filled first, and that ordering is the whole trick.**
 /// The inline label reads `description || describeCCTool(name, args)`, so
@@ -341,6 +440,14 @@ pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // ONE tool's args are read by the inline render, so they stay.
+    // `generate_image` puts its bytes in the ToolResult, and the rendered image
+    // takes its tooltip and alt text from the call's prompt. Dropping it leaves
+    // a generated image undescribed after a reload. A prompt is a sentence, so
+    // there is nothing here worth the accessibility.
+    if name == GENERATE_IMAGE_TOOL {
+        return;
+    }
     let described = row
         .payload
         .get("description")
@@ -352,7 +459,15 @@ pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
             .get("args")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        crate::core::describe_cc_tool(&name, &args)
+        // The CHANNEL picks the describer, and the client's own fallback splits
+        // the same way. A chat tool named through the coding-agent describer
+        // gets a label for a tool it is not. The args are gone a line later, so
+        // nothing can repair it.
+        if row.event_type == "ToolCalled" {
+            crate::core::describe_tool(&name, &args)
+        } else {
+            crate::core::describe_cc_tool(&name, &args)
+        }
     });
     let Some(obj) = row.payload.as_object_mut() else {
         return;
@@ -461,7 +576,7 @@ pub(in crate::api) async fn get_tool_args(
     if !is_tool_call_event(&row.event_type) {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Event {} is not a coding-agent tool call", event_uuid),
+            format!("Event {} is not a tool call", event_uuid),
         ));
     }
 

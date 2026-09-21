@@ -20,7 +20,9 @@
 use serde_json::Value;
 
 use crate::engine::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
+use crate::engine::command_judge_questions;
 use crate::engine::LucidosEngine;
+use crate::llm::judgment::JudgmentProvider;
 use crate::llm::provider::{LlmProvider, Message, MessageContent};
 use crate::llm::tool_names as tn;
 
@@ -70,7 +72,7 @@ impl JudgeVerdict {
     /// read as a lane — err toward *ask* (the design's tie-break). An
     /// unclassifiable irreversible command is [`SideEffectCategory::Other`], so
     /// an unattended trigger blocks it unless it granted `other`.
-    fn uncertain() -> Self {
+    pub(crate) fn uncertain() -> Self {
         Self {
             lane: RiskLane::IrreversibleDanger,
             category: Some(SideEffectCategory::Other),
@@ -157,7 +159,7 @@ pub fn parse_judge_response(raw: &str) -> JudgeVerdict {
 /// Map the judge's `category` string to a [`SideEffectCategory`], erring toward
 /// [`SideEffectCategory::Other`] on any unrecognized value. Only consulted for
 /// the irreversible lane.
-fn parse_category(s: &str) -> SideEffectCategory {
+pub(crate) fn parse_category(s: &str) -> SideEffectCategory {
     match s.trim().to_ascii_lowercase().as_str() {
         "email" => SideEffectCategory::Email,
         "external_api" | "externalapi" | "http" => SideEffectCategory::ExternalApi,
@@ -252,6 +254,26 @@ pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
     Ok(parse_judge_response(&raw))
 }
 
+/// Run one judge classification as two typed Choice questions.
+///
+/// The counterpart of [`judge_with_provider`], and split out for the same
+/// reason: a stubbed provider exercises it offline. There is no unclear
+/// response to tolerate here, because the answers are typed. What replaces it
+/// is [`command_judge_questions::read`], which resolves a weak distribution to
+/// *ask*.
+pub(crate) async fn judge_with_jev<J: JudgmentProvider + ?Sized>(
+    jev: &J,
+    input: &JudgeInput,
+) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
+    let judgment = jev
+        .ask(
+            command_judge_questions::state(input),
+            command_judge_questions::questions(),
+        )
+        .await?;
+    Ok(command_judge_questions::read(&judgment.answers))
+}
+
 impl LucidosEngine {
     /// Ask the configured judge model to classify one ambiguous command.
     ///
@@ -259,15 +281,45 @@ impl LucidosEngine {
     /// provider can't be built for `model`, the call errors, or the response is
     /// empty — so the caller falls back to the static "dangerous" list. A
     /// non-empty but unclear response is `Ok(JudgeVerdict::uncertain())` (ask).
+    ///
+    /// `judgment_command_guard` picks the path, and is `chat` unless the user
+    /// set it. A Jev call that fails falls through to the rubric prompt, which
+    /// is a better answer than the static list. Both paths end at the same
+    /// `Err`, so the caller's fallback is unchanged either way.
     pub(crate) async fn judge_command(
         &self,
         model: &str,
         input: &JudgeInput,
     ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
+        let budget = crate::engine::aux_purpose::UNCAPTURED_CALL_BUDGET;
+        if let Some(jev) = crate::llm::judgment::jev_for(
+            &self.pool,
+            crate::llm::judgment::JudgmentSite::CommandGuard,
+            budget.attempt_timeout,
+        )
+        .await
+        {
+            // A failure falls through to the rubric prompt, because it costs
+            // little and answers better than the static list. A TIMEOUT does
+            // not: a user is waiting on the permission card, and a second
+            // full deadline behind the first is worse than the static answer.
+            match tokio::time::timeout(budget.deadline, judge_with_jev(&jev, input)).await {
+                Ok(Ok(verdict)) => return Ok(verdict),
+                Ok(Err(e)) => log!(
+                    "[CommandGuard] Jev judge failed: {}. Using the chat path",
+                    e
+                ),
+                Err(_) => {
+                    return Err(
+                        format!("Jev command judge timed out after {:?}", budget.deadline).into(),
+                    )
+                }
+            }
+        }
+
         let Some(extractor) = self.extractor.as_ref() else {
             return Err("command judge unavailable: no LLM provider configured".into());
         };
-        let budget = crate::engine::aux_purpose::UNCAPTURED_CALL_BUDGET;
         let provider = extractor.provider_for_model(model, budget.attempt_timeout)?;
         let effort = crate::core::PreferenceStore::command_judge_reasoning(&self.pool).await;
         // Under the budget's whole-call deadline. A user waits on the
@@ -287,6 +339,7 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, Question};
     use crate::llm::provider::{LlmResponse, ToolDefinition};
     use crate::llm::TokenCallback;
 
@@ -532,5 +585,136 @@ mod tests {
         let p = build_judge_user_prompt(&ji(tn::RUN_PYTHON, "requests.post(u)", false));
         assert!(p.contains("Python code"));
         assert!(!p.contains("OUTSIDE the workspace"));
+    }
+
+    /// A stubbed [`JudgmentProvider`] that records what it was asked, so the
+    /// Jev glue is exercised offline the way `StubProvider` does the chat one.
+    struct StubJudge {
+        answers: Answers,
+        asked: std::sync::Mutex<Vec<AskedCall>>,
+    }
+
+    /// One recorded call: the state and the questions the glue sent.
+    type AskedCall = (serde_json::Value, Vec<(String, Question)>);
+
+    #[async_trait::async_trait]
+    impl JudgmentProvider for StubJudge {
+        async fn ask(
+            &self,
+            state: serde_json::Value,
+            questions: Vec<(String, Question)>,
+        ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+            self.asked.lock().unwrap().push((state, questions));
+            Ok(Judgment {
+                answers: self.answers.clone(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    fn choice(id: &str, probabilities: &[(&str, f64)]) -> (String, Answer) {
+        let probabilities: std::collections::HashMap<String, f64> = probabilities
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let choice = probabilities
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
+        (
+            id.to_string(),
+            Answer::Choice(ChoiceAnswer {
+                choice,
+                probabilities,
+                confidence: 0.9,
+            }),
+        )
+    }
+
+    fn stub_judge(answers: Vec<(String, Answer)>) -> StubJudge {
+        StubJudge {
+            answers: Answers::new(answers.into_iter().collect()),
+            asked: std::sync::Mutex::new(vec![]),
+        }
+    }
+
+    #[tokio::test]
+    async fn stubbed_jev_judge_classifies_and_categorises() {
+        let jev = stub_judge(vec![
+            choice(
+                command_judge_questions::LANE,
+                &[("safe", 0.02), ("reversible", 0.03), ("irreversible", 0.95)],
+            ),
+            choice(command_judge_questions::CATEGORY, &[("external_api", 0.96)]),
+        ]);
+        let v = judge_with_jev(
+            &jev,
+            &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
+        assert_eq!(v.category, Some(SideEffectCategory::ExternalApi));
+        assert!(v.summary.contains("mutating HTTP request"), "{}", v.summary);
+    }
+
+    /// One request carries the state and both questions, and the command
+    /// inside it is already redacted.
+    #[tokio::test]
+    async fn stubbed_jev_judge_sends_one_redacted_request() {
+        let jev = stub_judge(vec![choice(
+            command_judge_questions::LANE,
+            &[("safe", 0.99)],
+        )]);
+        let v = judge_with_jev(
+            &jev,
+            &ji(
+                tn::RUN_BASH,
+                "psql postgresql://lucidos:hunter2@db.example.com:5432/app -c 'select 1'",
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.lane, RiskLane::Safe);
+
+        let asked = jev.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "both questions ride in one request");
+        let (state, questions) = &asked[0];
+        assert_eq!(questions.len(), 2);
+        let body = serde_json::to_string(state).unwrap();
+        assert!(!body.contains("hunter2"), "{body}");
+        assert!(body.contains("select 1"), "{body}");
+    }
+
+    /// The same contract the chat path has: an infra failure is `Err`, so the
+    /// caller falls back to the static dangerous list.
+    #[tokio::test]
+    async fn a_failing_jev_call_is_an_infra_error() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl JudgmentProvider for Failing {
+            async fn ask(
+                &self,
+                _state: serde_json::Value,
+                _questions: Vec<(String, Question)>,
+            ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+                Err("TypeSafe returned 429".into())
+            }
+        }
+        assert!(judge_with_jev(&Failing, &ji(tn::RUN_BASH, "ls", false))
+            .await
+            .is_err());
+    }
+
+    /// An empty answer set is *ask*, not an error. The typed path has no
+    /// "unclear response" to detect, so this is where that tolerance lives.
+    #[tokio::test]
+    async fn a_jev_answer_with_no_lane_asks() {
+        let v = judge_with_jev(&stub_judge(vec![]), &ji(tn::RUN_BASH, "ls", false))
+            .await
+            .unwrap();
+        assert_eq!(v, JudgeVerdict::uncertain());
     }
 }

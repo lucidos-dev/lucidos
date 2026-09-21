@@ -146,6 +146,11 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
             "claude-opus-5@default",
             vec!["none", "low", "medium", "high", "xhigh", "max"],
         ),
+        // The same answer on the direct Anthropic provider, not just Vertex.
+        (
+            "claude-fable-5-1",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
         // The Claude budget path deliberately omits xhigh.
         (
             "claude-sonnet-4-6",
@@ -411,6 +416,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
     // these rows DO request 1M mode, so the declaration matches the request and
     // Settings can show a real value instead of "inferred".
     for id in [
+        "claude-fable-5-1[1m]",
         "claude-fable-5[1m]",
         "claude-opus-5@default[1m]",
         "claude-opus-4-8@default[1m]",
@@ -441,6 +447,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
     // `builtin_accepts_context_window_but_keeps_its_identity` mutates, and these
     // tests share one database within a run.)
     for id in [
+        "claude-fable-5-1",
         "claude-fable-5",
         "claude-opus-5@default",
         "claude-opus-4-8@default",

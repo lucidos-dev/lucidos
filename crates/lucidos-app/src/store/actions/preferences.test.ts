@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -713,7 +713,7 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
 
   it('dismissWelcomeSuggestions writes the preference when not yet dismissed', async () => {
     preferences.value = { status: 'loaded', data: {} };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await dismissWelcomeSuggestions();
 
@@ -723,7 +723,7 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
 
   it('dismissWelcomeSuggestions is idempotent — skips the write when already dismissed', async () => {
     preferences.value = { status: 'loaded', data: { welcome_suggestions_dismissed: 'true' } };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await dismissWelcomeSuggestions();
 
@@ -841,7 +841,7 @@ describe('backup reminder: is backup actually on?', () => {
 
   it('dismissBackupReminder writes the instant, then forever', async () => {
     preferences.value = { status: 'loaded', data: {} };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await dismissBackupReminder(T0);
     expect(spy).toHaveBeenCalledWith('backup_reminder_dismissed', new Date(T0).toISOString(), undefined);
@@ -854,7 +854,7 @@ describe('backup reminder: is backup actually on?', () => {
 
   it('dismissBackupReminder is a no-op while preferences are unloaded', async () => {
     preferences.value = { status: 'not-loaded' };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await dismissBackupReminder(T0);
 
@@ -892,7 +892,7 @@ describe('currentInAppBrowser — experimental in-app browser, off by default', 
 
   it('setInAppBrowser persists the boolean as a string preference', async () => {
     preferences.value = { status: 'loaded', data: {} };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await setInAppBrowser(true);
 
@@ -984,7 +984,7 @@ describe('currentExternalLinkTarget: safari unless the user chose otherwise', ()
 
   it('setExternalLinkTarget persists the chosen mode', async () => {
     preferences.value = { status: 'loaded', data: {} };
-    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await setExternalLinkTarget('ask');
 
@@ -1059,12 +1059,34 @@ describe('preference writes survive an iOS PWA suspend', () => {
   it('retries once immediately and stays quiet when the second attempt lands', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference')
       .mockRejectedValueOnce(cancelled())
-      .mockResolvedValueOnce(undefined as never);
+      .mockResolvedValueOnce({ success: true });
 
     await savePreference('theme', 'light');
 
     expect(spy).toHaveBeenCalledTimes(2);
     expect(toasts.value).toHaveLength(0);
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('speaks up when the engine refuses, rather than retrying or parking', async () => {
+    // What the client hands up for a refusal. `PUT /preferences` answers one
+    // with `200 {success: false, error}` rather than a 4xx, and `setPreference`
+    // turns that into this throw. Before it did, every refusal the engine
+    // issued read here as a save that worked.
+    const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(
+      new Error("'response_styles' holds at most 20 styles (got 21)"),
+    );
+
+    await savePreference('response_styles', '[]');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    // No retry: a verdict is not a transient failure.
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('at most 20 styles');
+    // The engine's reason, not an HTTP code in front of it. A refusal arrives
+    // on a 200, so stamping one would read as a success code on an error.
+    expect(toasts.value[0].message).not.toContain('200');
+    // Answered, so the key is no longer owed a re-send.
     expect(_pendingPreferenceKeysForTesting()).toEqual([]);
   });
 
@@ -1082,7 +1104,7 @@ describe('preference writes survive an iOS PWA suspend', () => {
     await savePreference('ui-scale', '125', undefined, true);
     expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
 
-    spy.mockResolvedValue(undefined as never);
+    spy.mockResolvedValue({ success: true });
     await flushPendingPreferenceWrites();
 
     expect(spy).toHaveBeenLastCalledWith('ui-scale', '125', expect.any(String));
@@ -1096,7 +1118,7 @@ describe('preference writes survive an iOS PWA suspend', () => {
     expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
 
     spy.mockReset();
-    spy.mockResolvedValue(undefined as never);
+    spy.mockResolvedValue({ success: true });
     await flushPendingPreferenceWrites();
 
     expect(spy).toHaveBeenCalledTimes(1);
@@ -1145,7 +1167,7 @@ describe('preference writes survive an iOS PWA suspend', () => {
     await savePreference('ui-scale', '125', undefined, true);
     expect(toasts.value).toHaveLength(1);
 
-    spy.mockResolvedValue(undefined as never);
+    spy.mockResolvedValue({ success: true });
     await flushPendingPreferenceWrites();
 
     expect(_pendingPreferenceKeysForTesting()).toEqual([]);
@@ -1433,6 +1455,53 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
  * they pick one, which is the whole reason there is no maximum: the number is
  * theirs to choose, so it has to be legible. Coarse on purpose.
  */
+/**
+ * Two keys were split out of `model_memory`, and both inherit it while unset.
+ * The engine resolves the same fallback in `aux_purpose`; a Settings row that
+ * resolved it differently would name a model the engine is not running.
+ */
+describe('the keys split out of model_memory inherit it', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('follows a pinned memory model until its own key is set', () => {
+    preferences.value = { status: 'loaded', data: { model_memory: 'claude-haiku-4-5' } };
+    expect(currentBackgroundModel('model_query_classification')).toBe('claude-haiku-4-5');
+    expect(currentBackgroundModel('model_conversation_summary')).toBe('claude-haiku-4-5');
+  });
+
+  it('prefers its own key once set', () => {
+    preferences.value = {
+      status: 'loaded',
+      data: { model_memory: 'claude-haiku-4-5', model_query_classification: 'gpt-5.4-mini' },
+    };
+    expect(currentBackgroundModel('model_query_classification')).toBe('gpt-5.4-mini');
+    expect(currentBackgroundModel('model_conversation_summary')).toBe('claude-haiku-4-5');
+  });
+
+  /** Query classification alone inherits the EFFORT too, because it ran at
+   *  `reasoning_memory` before the split. The summary keeps `low`, which is
+   *  higher, so inheriting would lower it. */
+  it('follows a raised memory effort for classification only', () => {
+    preferences.value = { status: 'loaded', data: { reasoning_memory: 'high' } };
+    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('high');
+    expect(currentBackgroundReasoning('reasoning_conversation_summary')).toBe('low');
+  });
+
+  it('prefers its own effort key once set', () => {
+    preferences.value = {
+      status: 'loaded',
+      data: { reasoning_memory: 'high', reasoning_query_classification: 'none' },
+    };
+    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('none');
+  });
+
+  it('spends nothing when neither key is set', () => {
+    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('none');
+  });
+});
+
 describe('estimateTurnDuration', () => {
   it('scales from minutes through hours to days', () => {
     expect(estimateTurnDuration(50)).toBe('13 min');

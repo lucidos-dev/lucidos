@@ -1,5 +1,6 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, workingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, workingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
+import { restartConfirmCopy } from '../restartConfirmCopy';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
@@ -209,13 +210,22 @@ export async function initiateEngineRestart(): Promise<void> {
   }
 }
 
-/** Confirm, then restart. The single confirm-then-restart entry point behind
- *  every Settings restart control, so the dev "Rebuild & Restart" (System >
- *  Overview) and the packaged "Restart Engine" (System > Debugging) cannot drift
- *  on what the dialog says or offers. The dialog lists the applied changes this
- *  restart activates, and on the desktop app offers restarting the GUI client as
- *  a second, lighter action: `restart_app` re-execs the window shell only and
- *  leaves the always-on service (and therefore every running thread) alone. */
+/** Confirm, then restart. The single confirm-then-restart entry point, so no
+ *  surface offering a restart can drift on what the dialog says. Four reach it:
+ *  Settings' two restart controls, the Lucidos menu's Restart row while a new
+ *  version waits, and the version toast's own button.
+ *
+ *  It takes two shapes, and `restartConfirmCopy` owns both. With a new version
+ *  ready it says what the switch brings, from the range the engine measured.
+ *  Otherwise it asks the short question and lists the applied changes this
+ *  restart activates.
+ *
+ *  On the desktop app it also offers restarting the GUI client as a second,
+ *  lighter action: `restart_app` re-execs the window shell only and leaves the
+ *  always-on service (and therefore every running thread) alone.
+ *
+ *  Declining does nothing at all. It is not a dismissal, so the version toast
+ *  stays up and this build is not remembered as deferred. */
 export async function confirmAndRestartEngine(): Promise<void> {
   const extraAction = isTauri()
     ? {
@@ -227,14 +237,21 @@ export async function confirmAndRestartEngine(): Promise<void> {
         },
       }
     : undefined;
-  const groups = restartGroups.value;
-  const details = groups.length > 0
-    ? {
-        intro: 'These changes will be applied:',
-        groups: groups.map(g => ({ header: g.threadTitle, items: g.commits })),
-      }
-    : undefined;
-  if (await showConfirm('Restart engine?', 'Restart', { extraAction, variant: 'default', details })) {
+  // The SAME predicate the badge and the progress dialog read, so the three
+  // cannot disagree about whether this is a switch or a plain restart.
+  const copy = restartConfirmCopy(
+    engineNewVersionReady(),
+    enginePendingCommits.value,
+    restartGroups.value,
+  );
+  const confirmed = await showConfirm(copy.message, copy.okLabel, {
+    title: copy.title,
+    cancelLabel: copy.cancelLabel,
+    extraAction,
+    variant: 'default',
+    details: copy.details,
+  });
+  if (confirmed) {
     await initiateEngineRestart();
   }
 }

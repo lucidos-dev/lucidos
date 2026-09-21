@@ -11,6 +11,65 @@ fn install_lucidos_cli_skill_writes_file() {
     assert!(content.starts_with("---"));
 }
 
+/// The two shipped docs that teach `lucidos await-event` to a coding agent:
+/// the skill the engine embeds and writes into every CC worktree, and the
+/// knowhow the workspace LLM loads. Read from the repo so the guards below
+/// cover the source a reader actually edits.
+fn cli_docs() -> [(&'static str, String); 2] {
+    let knowhow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../system-knowhow/lucidos-cli.md");
+    [
+        (
+            ".claude/skills/lucidos-cli/SKILL.md",
+            LUCIDOS_CLI_SKILL.to_string(),
+        ),
+        (
+            "system-knowhow/lucidos-cli.md",
+            std::fs::read_to_string(&knowhow)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", knowhow.display())),
+        ),
+    ]
+}
+
+/// A `--relation child` spawn already re-opens the calling thread with the
+/// child's result. So a wait on that completion is a duplicate wake, plus a
+/// second clock that can expire for nothing. The skill shipped an example
+/// pairing the two, and an agent followed it and subscribed twice. The guard
+/// is per fenced block rather than per file: both docs discuss both commands
+/// in prose, and it is the recipe that misleads.
+#[test]
+fn no_cli_doc_recipe_awaits_its_own_child() {
+    for (name, doc) in cli_docs() {
+        for (i, block) in doc.split("```").skip(1).step_by(2).enumerate() {
+            assert!(
+                !(block.contains("--relation child") && block.contains("await-event")),
+                "{name} code block {i} spawns a child and then awaits its completion. \
+                 The child's own callback already re-opens this thread, so the wait \
+                 buys nothing and adds a clock that expires for nothing.\n{block}"
+            );
+        }
+    }
+}
+
+/// The exclusion above reads as redundancy only when the doc also shows the
+/// shapes that ARE legitimate. Otherwise it reads as "a cross-thread wait
+/// might not fire". Both shapes carry a condition, because an unconditioned
+/// `ChildThreadCompleted` matches workspace-wide and would catch your own.
+/// The idle needle opens the JSON brace on purpose: a bare `thread_id` is a
+/// substring of `child_thread_id`, so it would pass on the first shape alone.
+#[test]
+fn cli_docs_name_the_two_legitimate_completion_waits() {
+    for (name, doc) in cli_docs() {
+        for needle in ["\"child_thread_id\"", "CodingAgentIdled", "{\"thread_id\""] {
+            assert!(
+                doc.contains(needle),
+                "{name} must keep naming how to await a completion that is not your \
+                 own child's (missing: {needle:?})"
+            );
+        }
+    }
+}
+
 #[test]
 fn install_lucidos_cli_skill_skips_when_no_cli_dir() {
     let tmp = tempfile::tempdir().unwrap();

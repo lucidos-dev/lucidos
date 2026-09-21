@@ -50,6 +50,20 @@ export function opensSoftwareKeyboard(el: EventTarget | Element | null): boolean
   return KEYBOARD_INPUT_TYPES.has((el as HTMLInputElement).type);
 }
 
+/** How much shorter the VISUAL viewport must be than the LAYOUT one before the
+ *  software keyboard is the only plausible explanation. iOS never shrinks the
+ *  layout viewport for it, and browser chrome moves by far less than this. */
+const KEYBOARD_SHRINK_MIN_PX = 100;
+
+/** Is the software keyboard taking room off the foot of the screen?
+ *
+ *  Says nothing about focus, so a caller that needs both asks
+ *  `opensSoftwareKeyboard` separately. Takes both heights as arguments rather
+ *  than reading `window`, so the decision is testable without a viewport. */
+export function viewportIsKeyboardShrunk(vvHeight: number, innerHeight: number): boolean {
+  return vvHeight < innerHeight - KEYBOARD_SHRINK_MIN_PX;
+}
+
 /** Pixels per CSS rem at the document root. Mobile uses 112.5% (18px) base;
  *  the 16 fallback covers SSR/JSDOM where getComputedStyle returns ''. */
 export function getRemPx(): number {

@@ -13,6 +13,8 @@ import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sect
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
+import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
+import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { errorDetail } from '../../utils/errorDetail';
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,24 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
   // it exclusively. Manual resets cause the chevron to vanish when no scroll
   // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).
+
+  // Perf: stamp the open-start for the `thread-render` mark. This is the WARM
+  // half; `loadThreadEvents` owns the cold half, under its `eventsLoaded`
+  // return. A warm thread fetches nothing. So without this, a thread visited
+  // once this session was never measured again, and back / forward between
+  // visited threads left no sample at all.
+  //
+  // `!wasFocused` is what makes it an OPEN rather than any call that happens
+  // to name the focused thread. A re-tap of the thread already on screen
+  // renders nothing. The next streamed event would take the mark instead, and
+  // report a render lasting as long as the reader sat still.
+  // Fire-and-forget telemetry; see utils/threadOpenMarks.ts.
+  if (!wasFocused) {
+    markThreadOpenStart(threadId, {
+      ...currentPerfBaseline(),
+      warm: threadMap.value.get(threadId)?.eventsLoaded ?? false,
+    });
+  }
 
   // Lazy-load events for this thread if not already loaded
   loadThreadEvents(threadId);

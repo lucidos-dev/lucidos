@@ -13,6 +13,7 @@ export function ModelSelectionRow({
   anchor,
   nested,
   explainer,
+  detail,
   models,
   vocabulary,
   model,
@@ -28,6 +29,10 @@ export function ModelSelectionRow({
   /** An `<Explainer>` beside the label, for a row whose choices differ in
    *  something the model names cannot say. */
   explainer?: ComponentChildren;
+  /** A sentence under the label, for something true of the CURRENT selection
+   *  rather than of the choices. An explainer is folded away behind a tap, so
+   *  it cannot carry a caveat the user has to see. */
+  detail?: ComponentChildren;
   models: readonly ModelChoice[];
   vocabulary: readonly TierChoice[];
   model: string;
@@ -40,6 +45,7 @@ export function ModelSelectionRow({
       <span class="settings-row-label">
         {label}
         {explainer}
+        {detail && <span class="list-row-details list-row-details-prose">{detail}</span>}
       </span>
       <ModelSelectionField
         label={label}

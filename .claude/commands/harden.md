@@ -191,7 +191,24 @@ If you launched a background Codex review in Phase 1, join it now with `TaskOutp
 
 - **Completed:** fold Codex's findings into the validation set below. Treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs": record that outcome and move on.
 - **Still running:** give it a bounded wait with `TaskOutput` `block: true`, until it completes or until ~5 minutes have elapsed *since it was launched in Phase 1* (usually it is already done, since Phases 1 to 2 ran in parallel with it). Remember the probe loop can hold the task for up to a minute before the review even starts.
+- **Ran but returned nothing:** the JSON carries `"status": 1` and `"stdout": "Reviewer failed to output a response."` That is the reviewer starting, and its model call failing. Report it as a failure with that reason, never as "unavailable". It is still advisory, so proceed.
 - **Failed / unavailable / plugin not installed:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
+
+**A reviewer that returns nothing is configuration, not weather.** The companion
+discards the real cause. It survives only in Codex's own log, so read the newest
+entry:
+
+```bash
+sqlite3 -readonly "file:$(ls -t "$HOME"/.codex/logs_*.sqlite | head -1)?mode=ro" \
+  "select datetime(ts,'unixepoch','localtime'),
+          substr(feedback_log_body, instr(feedback_log_body,'sampling_error='), 200)
+   from logs where feedback_log_body like '%sampling_error=%' order by id desc limit 1"
+```
+
+This has bitten once. The CLI moved its default model to one the local login
+could not reach. Every review then 403'd, and each run wrote it off as a blip.
+`codex login status` names the login, and a reachable `model` in
+`~/.codex/config.toml` fixes it.
 
 Then validate every finding (Codex's included) per the rest of this phase.
 

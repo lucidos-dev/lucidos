@@ -2,6 +2,7 @@ import { showToast } from '../../store/store';
 import { isMobile, isTouchDevice } from '../../utils/viewport';
 import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
+import { relayoutShell, keyboardCloseState } from '../layout/keyboardCloseRelayout';
 import { readViewport, type ProbeViewport } from './probeViewport';
 
 // Re-exported so this module stays the one import for a press report's types.
@@ -11,17 +12,28 @@ export type { ProbeViewport };
 /** Reports a tap on a composer action button that produced nothing.
  *
  *  A DIAGNOSTIC, registered in `docs/temporary-measures.md` § 1 and removed once
- *  a report names the cause. The bug behind it has been reported fourteen times and
- *  nobody can reproduce it: it strikes now and then on an iOS PWA and kills the
- *  composer's buttons wherever the finger presses. No emulator reproduces it, so
- *  the app has to be the one that says what happened.
+ *  a report names the cause. The bug behind it has been reported eighteen times
+ *  and nobody can reproduce it: it strikes now and then on an iOS PWA and kills
+ *  the composer's buttons wherever the finger presses. No emulator reproduces
+ *  it, so the app has to be the one that says what happened.
  *
- *  The eighth episode was SILENT, and that is what this round is shaped by. The
+ *  The eighth episode was SILENT, and that is what this module is shaped by. The
  *  probe used to arm only from a `touchstart` it could attribute to the row. A
  *  gesture the page never received therefore left no trace at all. It now
- *  partitions the four ways a press can go missing, and the plan behind that
+ *  partitions the ways a press can go missing, and the plan behind that
  *  partition is
  *  `docs/plans/2026-08-29-the-composer-says-when-send-is-unreachable.md`.
+ *
+ *  EVIDENCE, plus one recovery. The relayout that answers a keyboard close is a
+ *  fix and lives outside this module, in `layout/keyboardCloseRelayout.ts`, so
+ *  deleting the probe cannot delete it. What stays here is the ledger and the
+ *  typing-driven relayout the ledger scores.
+ *
+ *  Two apparatuses were cut with the eighteenth report. The machinery that
+ *  decided whether to press Send went with the commit ADR 0225 retired. The
+ *  reachability repair went because it answered healthy through every episode
+ *  it was built for. Both removals are named in
+ *  `docs/plans/2026-09-20-the-composer-recovers-when-the-keyboard-closes.md`.
  *
  *  The decisions are pure functions of what was measured, so they test without a
  *  DOM. `installDeadPressProbe` is the shell that measures.
@@ -62,6 +74,29 @@ export interface LandingFacts {
   viewport: ProbeViewport;
 }
 
+/** How many contacts the glass held across one press.
+ *
+ *  `fingers` is the most `TouchEvent.touches` ever reported while the press was
+ *  armed, so a finger joining halfway through still counts. `fingersAtLift` is
+ *  what remained down when this press ended, which is zero for a press nobody
+ *  shared. */
+export interface PressFingers {
+  fingers: number;
+  fingersAtLift: number;
+}
+
+/** Was this press the only contact on the glass, start to finish?
+ *
+ *  WebKit synthesises no click for a multi-finger gesture, so a press sharing
+ *  the glass produces exactly what a dead one does: a `touchstart`, a `touchend`
+ *  and nothing else. The seventeenth report is where that cost a false alarm.
+ *  An Archive press was called dead with `quiet.ms` of 13, which places a second
+ *  contact 13ms in front of it. Every report below is therefore silent unless
+ *  the press was alone. */
+export function pressWasAlone(f: PressFingers): boolean {
+  return f.fingers <= 1 && f.fingersAtLift === 0;
+}
+
 export interface DeadPressFacts {
   face: string;
   /** How far the finger travelled, in screen px. */
@@ -73,6 +108,8 @@ export interface DeadPressFacts {
   /** Who claimed the press, from `takePressOutcome`. Null when nobody did,
    *  which is the dead press this module exists for. */
   outcome: PressOutcome | null;
+  /** See `pressWasAlone`. */
+  alone: boolean;
   viewport: ProbeViewport;
 }
 
@@ -101,39 +138,6 @@ export function landingReport(f: LandingFacts): string | null {
     + viewportSuffix(f.viewport);
 }
 
-/** Is the button where the browser thinks it is? Asked of the face's OWN centre,
- *  so the finger plays no part in the answer.
- *
- *  The landing check above needs the touch point to fall inside a painted rect.
- *  A coordinate space out of step with layout misses every rect, and the probe
- *  then said nothing about the very state it was built for. This one is immune:
- *  it compares where the row is PAINTED with what the page answers there, and
- *  both readings come from the browser at the same instant.
- *
- *  Immune, but for two rounds it was asked only AFTER a gate that the same fault
- *  defeats. `installDeadPressProbe` now asks it in front of that gate. */
-export interface FaceHitTestFacts {
-  face: string;
-  centre: { x: number; y: number };
-  /** `elementFromPoint` at the centre answered with the face, or something
-   *  inside it. Anything else means the face is not reachable where it is drawn:
-   *  an ancestor means the face itself takes no pointer, and an unrelated
-   *  element means something is over it or the hit-test tree is stale. */
-  answeredWithFace: boolean;
-  elementAtCentre: string | null;
-  pointerEventsAtCentre: string | null;
-  viewport: ProbeViewport;
-}
-
-export function faceHitTestReport(f: FaceHitTestFacts): string | null {
-  if (f.answeredWithFace) return null;
-  return `${f.face} is not reachable where it is drawn: at its own centre `
-    + `(${Math.round(f.centre.x)}, ${Math.round(f.centre.y)}) the page answers `
-    + `${f.elementAtCentre ?? 'nothing'} `
-    + `(pointer-events ${f.pointerEventsAtCentre ?? 'unknown'}). `
-    + viewportSuffix(f.viewport);
-}
-
 /** The press reached the button and no path took it. Three shapes, ordered by
  *  how much they settle.
  *
@@ -153,9 +157,12 @@ export function faceHitTestReport(f: FaceHitTestFacts): string | null {
  *  contract: a tap that dismisses a popover must not also press what was under
  *  it, and Send is a thing that can be under it. So neither toasts. Both still
  *  reach the log, which is where a run of swallowed Sends with no popover open
- *  would name its own cause. */
+ *  would name its own cause.
+ *
+ *  Null too for a press that shared the glass. See `pressWasAlone`. */
 export function deadPressReport(f: DeadPressFacts): string | null {
   if (f.outcome !== null) return null;
+  if (!f.alone) return null;
   if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
   const tail = ` ${viewportSuffix(f.viewport)}`;
   if (!f.connectedAtLift) {
@@ -174,12 +181,15 @@ export function deadPressReport(f: DeadPressFacts): string | null {
  *
  *  Silent when the finger moved, because a cancelled scroll is the platform
  *  working. Only a stationary press that the system still took is the fault
- *  being chased. */
+ *  being chased. Silent too when the press shared the glass, on the same
+ *  grounds: a pinch is a gesture the system is entitled to take. */
 export function canceledPressReport(f: {
   face: string;
   movedPx: number;
+  alone: boolean;
   viewport: ProbeViewport;
 }): string | null {
+  if (!f.alone) return null;
   if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
   return `${f.face} did not register: the system cancelled the touch after `
     + `${Math.round(f.movedPx)}px. ${viewportSuffix(f.viewport)}`;
@@ -195,12 +205,15 @@ export function canceledPressReport(f: {
  *
  *  Null for a finger that travelled, on the same threshold as every other
  *  report here: a gesture the page handed to a scroller is the platform
- *  working. */
+ *  working. Null for a press that shared the glass, where only the count at the
+ *  press is known: the lift that would have given the other half never came. */
 export function noLiftReport(f: {
   face: string;
   movedPx: number;
+  alone: boolean;
   viewport: ProbeViewport;
 }): string | null {
+  if (!f.alone) return null;
   if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
   return `${f.face} did not register: the touch began on the button and the `
     + `lift never arrived. ${viewportSuffix(f.viewport)}`;
@@ -223,31 +236,24 @@ const TOUCH_BEHIND_CLICK_MS = 1500;
  *
  *  `no-lift` and `click-no-touch` are the two halves of a touch pipeline that
  *  stopped: a gesture that began and never finished, and a click arriving with
- *  no gesture behind it at all. */
+ *  no gesture behind it at all.
+ *
+ *  `multi-touch` is a press that shared the glass, which is `dead` without the
+ *  fault. */
 type PressVerdict =
   | PressOutcome
   | 'dead'
+  | 'multi-touch'
   | 'clicked'
   | 'canceled'
   | 'missed'
   | 'no-lift'
   | 'click-no-touch'
-  | 'unreachable'
-  | 'repaired'
-  | 'repair-failed'
-  | 'activated'
-  | 'rescue-stood-down'
   | 'keyboard-touch'
   | 'covered'
   | 'stray-click'
-  | 'untouched';
-
-/** How often the reachability question may be asked.
- *
- *  It costs a hit test and a style read per face, and it is now asked for
- *  touches that never reach the composer. A wedge persists, so asking on every
- *  touch buys nothing that the user's second tap does not. */
-const REACHABILITY_THROTTLE_MS = 400;
+  | 'untouched'
+  | 'silent-since-keyboard';
 
 /** How often a touch that reached nowhere near the composer may be logged.
  *
@@ -282,14 +288,13 @@ function roundRect(rect: ProbeRect | null): ProbeRect | null {
  *  and no click while the composer sat dead. A probe that must be touched
  *  cannot report that, so the recovery input has to carry it instead.
  *
- *  Every line therefore says how long the page had been silent beforehand. It
- *  says how many scheduled checks ran in that silence, and how many found the
- *  row unreachable. Those three read together bracket an episode. Riding on
- *  lines that are written anyway costs no new noise. */
+ *  Every line therefore says how long the page had been silent beforehand, and
+ *  how many scheduled checks ran in that silence. The two read together
+ *  bracket an episode. Riding on lines that are written anyway costs no new
+ *  noise. */
 interface QuietWindow {
   ms: number;
   checks: number;
-  unreachable: number;
   /** Checks that asked nothing, because the app's own cover was up.
    *
    *  The thirteenth episode is why. A cover makes every reading here decline,
@@ -304,13 +309,21 @@ interface QuietWindow {
    *  still focused. If it does not, the press arrives after the user dismissed
    *  the keyboard by hand, exactly as it does today. See `shouldNudgeUntouched`. */
   nudges: number;
+  /** Keyboard closes in this silence, each of which spent a relayout.
+   *
+   *  The transition-driven recovery's score, kept apart from `nudges` so that
+   *  count keeps meaning exactly what every earlier ledger reads it as. A
+   *  silence with a close in it had the fix run inside it. */
+  closes: number;
 }
 
 let lastInputAt: number | null = null;
 let checksSinceInput = 0;
-let unreachableSinceInput = 0;
 let coveredSinceInput = 0;
 let nudgesSinceInput = 0;
+/** The running close total as the current silence opened. `quiet.closes` is the
+ *  difference, so the probe needs no callback from the relayout. */
+let closesAtInput = 0;
 let quiet: QuietWindow | null = null;
 
 /** When the composer's textarea last took a character.
@@ -320,21 +333,38 @@ let quiet: QuietWindow | null = null;
  *  silence it brackets. This stamp is separate so the two never mix. */
 let lastKeystrokeAt: number | null = null;
 
+/** When a touch or a click last reached the COMPOSER, rather than the page.
+ *
+ *  What arms the typing-driven recovery, in place of `lastInputAt`. A touch
+ *  landing elsewhere says nothing about whether the composer can be pressed,
+ *  and round 15's ledger holds two of them inside one episode. See
+ *  `COMPOSER_SELECTOR`. */
+let lastComposerInputAt: number | null = null;
+
+/** Relayouts the typing-driven recovery has spent since the last keystroke.
+ *
+ *  `quiet.nudges` cannot carry this, because it resets on every touch. The
+ *  press that finally lands then reports zero whenever anything reached the
+ *  page in between, which left round 15 unable to score the relayout. This
+ *  count survives a touch, and rides every line beside the other. */
+let nudgesSinceKeystroke = 0;
+
 /** Close the running quiet window and open a fresh one. Called for every
  *  `touchstart` and every `click` the document sees, wherever they land. */
 function noteInput(now: number): void {
+  const { closes } = keyboardCloseState();
   if (lastInputAt !== null) {
     quiet = {
       ms: Math.round(now - lastInputAt),
       checks: checksSinceInput,
-      unreachable: unreachableSinceInput,
       covered: coveredSinceInput,
       nudges: nudgesSinceInput,
+      closes: closes - closesAtInput,
     };
   }
+  closesAtInput = closes;
   lastInputAt = now;
   checksSinceInput = 0;
-  unreachableSinceInput = 0;
   coveredSinceInput = 0;
   nudgesSinceInput = 0;
 }
@@ -353,6 +383,9 @@ function noteInput(now: number): void {
 interface PressContext {
   morph: MorphState;
   quiet: QuietWindow | null;
+  /** See `nudgesSinceKeystroke`. Beside `quiet.nudges`, never replacing it:
+   *  every past ledger is read against that field. */
+  nudgesSinceKeystroke: number;
   viewport: ProbeViewport;
 }
 
@@ -362,6 +395,7 @@ function pressContext(): PressContext {
     // a claim about this, and no line has ever carried it.
     morph: readMorphState(),
     quiet,
+    nudgesSinceKeystroke,
     viewport: readViewport(),
   };
 }
@@ -410,14 +444,19 @@ function recordPress({ at, ...facts }: {
   cover?: string;
   /** Written with no user input behind it, by the scheduled check. */
   scheduled?: boolean;
-  /** Whether the relayout actually ran. A `repair-failed` that never nudged
-   *  rules nothing out, unlike one that nudged and did not help. */
+  /** How long ago the keyboard closed. Only `silent-since-keyboard` fills it. */
+  sinceKeyboardMs?: number;
+  /** How long ago the document last took a touch or a click, and null when it
+   *  has taken none at all. Read AGAINST `sinceKeyboardMs`: a smaller number
+   *  means an input arrived after the close, and no other line named it. */
+  sinceInputMs?: number | null;
+  /** Whether the relayout actually ran. A line that never nudged rules the
+   *  recovery out, rather than scoring it. */
   nudged?: boolean;
-  /** Whether the face was still in the document when the repair was judged.
-   *  A row that re-rendered answers nothing, and that is not a failure. */
-  connected?: boolean;
-  /** Why the rescue refused this press. Only `rescue-stood-down` fills it. */
-  standDown?: RescueStandDown;
+  /** How many contacts the glass held. See `PressFingers`. A line with no lift
+   *  behind it carries the first alone. */
+  fingers?: number;
+  fingersAtLift?: number;
   /** The press's own context, for a line written after the press. Absent means
    *  NOW is the press, which is true of every line written inside a handler. */
   at?: PressContext;
@@ -593,83 +632,51 @@ function readMorphState(el = morphElement()): MorphState {
  *  does for a typed message. The mode says what the morph WOULD show, and the
  *  choice above is what decides whether it is drawn at all.
  *
- *  NOTHING else in the row. A destructive face must never run on a tap nobody
- *  saw land, and Apply wears the same confirm styling while merging a change
- *  nobody approved.
- *
- *  The thirteenth episode is what this widening is for. It was in answer mode,
- *  where the rescue below had no face to run and did nothing but relayout. */
-interface CommitFace {
-  el: HTMLButtonElement;
-  /** What the toast calls the action. The accessible name reads as a label
-   *  rather than a verb, and this sentence needs the verb. */
-  action: string;
-}
-
-function commitFace(): CommitFace | null {
+ *  NOTHING else in the row, and nothing here is pressed. It is what says the
+ *  composer has something to send, which is the state the recovery and the
+ *  silence verdict both need. Widening it would put Apply and Discard into a
+ *  ledger that is about the composer's send. */
+function commitFace(): HTMLButtonElement | null {
   const morph = morphElement();
-  if (morph) return readMorphState(morph) === 'send' ? { el: morph, action: 'Send' } : null;
-  const submit = document.querySelector<HTMLButtonElement>(
+  if (morph) return readMorphState(morph) === 'send' ? morph : null;
+  return document.querySelector<HTMLButtonElement>(
     `${ROW_SELECTOR} [aria-label="Submit answer"]`,
   );
-  return submit ? { el: submit, action: 'Submit' } : null;
 }
 
-/** The commit face a press could be run on RIGHT NOW, or null.
+/** The commit face as the row holds it RIGHT NOW, or null.
  *
- *  Re-read at the moment of firing, never at the press. A second tap that got
- *  through has already moved the row off a commit face, and a settling Submit
- *  is held disabled on purpose. */
-function liveCommitFace(): CommitFace | null {
+ *  Read at the moment it is asked about, never stored. A tap that got through
+ *  has already moved the row off a commit face, and a settling Submit is held
+ *  disabled on purpose. */
+function liveCommitFace(): HTMLButtonElement | null {
   const face = commitFace();
-  if (!face || face.el.disabled || !face.el.isConnected) return null;
+  if (!face || face.disabled || !face.isConnected) return null;
   return face;
-}
-
-/** Why the rescue refused a press the page dropped, or null to run it.
- *
- *  ONE decision point. The bounds used to sit at three sites, and two of them
- *  refused in silence, so the ledger could not say which had. Structural, so it
- *  tests without a DOM.
- *
- *  The order is by how much each settles. Travel means the platform took the
- *  gesture and is entitled to. A claim means something else acted on it. A
- *  cover means the composer is unreachable by design. */
-export type RescueStandDown = 'traveled' | 'claimed' | 'covered' | 'no-face';
-
-export function rescueStandDown(f: {
-  movedPx: number;
-  claimed: boolean;
-  covered: boolean;
-  hasCommitFace: boolean;
-}): RescueStandDown | null {
-  if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return 'traveled';
-  if (f.claimed) return 'claimed';
-  if (f.covered) return 'covered';
-  if (!f.hasCommitFace) return 'no-face';
-  return null;
-}
-
-/** Did this click go somewhere that could have acted on it?
- *
- *  A button is an answer: something took the gesture. So is a target outside
- *  the row, which says the gesture went somewhere else entirely. The row itself
- *  is neither. A press the row drops dispatches a click ON the row, an inert
- *  `div`. Reading that as an answer kills the rescue it belongs to.
- *
- *  ADR 0183 carries why this bound was drawn wrongly the first time. */
-export function clickClaimedPress(f: { onButton: boolean; inRow: boolean }): boolean {
-  return f.onButton || !f.inRow;
 }
 
 /** The composer's action row, and the faces inside it a press may activate.
  *
- *  `.action-btn` reaches all of them, the morph included: it carries the class
- *  alongside `.send-cancel-morph`. Naming ONE face is what blinded the previous
- *  probe. It watched the morph, and the row was in answer mode, where that node
- *  is not rendered at all. */
+ *  `.action-btn` reaches every pill the row draws, the morph included: it
+ *  carries the class alongside `.send-cancel-morph`. Naming ONE face is what
+ *  blinded the previous probe. It watched the morph, and the row was in answer
+ *  mode, where that node is not rendered at all.
+ *
+ *  It deliberately reaches no `.icon-btn`, so the row's Diff and standing apply
+ *  are outside the census. `underFingerReason` reads a press on either as
+ *  `other-button`, the bucket it puts an icon in. Widening to them would buy a
+ *  name in the log and nothing else. The wedge these checks hunt covers the
+ *  whole row, so a pill still reports it. */
 const ROW_SELECTOR = '.prompt-actions-row';
 const FACE_SELECTOR = '.action-btn';
+
+/** The whole composer: the textarea, the image strip and the action row.
+ *
+ *  What a touch has to reach to say anything about whether the composer can be
+ *  pressed. Round 15's episode delivered two touches elsewhere on the page,
+ *  while the composer could not be sent from. Either one used to disarm the
+ *  typing-driven recovery for the rest of the episode. */
+const COMPOSER_SELECTOR = '.prompt-box';
 
 /** Why a face cannot take a press, or that it can. Two exclusions, each a press
  *  the app drops on purpose: a `morph-placeholder` is invisible and inert,
@@ -757,8 +764,8 @@ export function distanceOutside(rect: ProbeRect, p: { x: number; y: number }): n
  *  finger nowhere near one. The second is the wedge. It is what a page
  *  hit-testing somewhere other than the glass produces.
  *
- *  Returns the caller's own entry, so the lift can repair the face the finger
- *  was reaching for. Null for a row holding no face at all. */
+ *  Returns the caller's own entry, so a line can name the face the finger was
+ *  reaching for. Null for a row holding no face at all. */
 export function nearestFaceMiss<T extends { name: string; rect: ProbeRect }>(
   faces: T[],
   p: { x: number; y: number },
@@ -837,15 +844,6 @@ function watchableFaces(): HTMLButtonElement[] {
   return allFaces().filter((btn) => exclusionOf(btn) === 'watchable');
 }
 
-/** Can the document hit-test this point at all? `elementFromPoint` answers null
- *  outside the viewport, which is indistinguishable from a covered element. */
-function onScreen(p: { x: number; y: number }): boolean {
-  const vv = window.visualViewport;
-  const height = vv?.height ?? window.innerHeight;
-  const width = vv?.width ?? window.innerWidth;
-  return p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height;
-}
-
 function describe(el: Element | null): string | null {
   if (!el) return null;
   const cls = el.classList.item(0);
@@ -872,21 +870,11 @@ function watchableRow(): HTMLElement | null {
   return null;
 }
 
-/** Faces already reported unreachable. This check runs on EVERY touch while the
- *  composer is focused, and its toast holds until dismissed. Without the latch,
- *  one wedged state buries the screen in copies of itself. A face is forgotten
- *  the moment it answers again, so a state that returns reports again. */
-const reportedUnreachable = new Set<string>();
-
 /** Which cover the app has raised over the row, or the empty string for none.
  *
  *  An open overlay inerts the shell behind it, and a client refresh dims and
  *  locks the whole page until the reload lands. A face under either is
- *  unreachable BY DESIGN. Calling that a wedge is a false alarm, and the
- *  episode's one repair then goes on a layout nobody is waiting for.
- *
- *  The refresh half was missing, so a user got the wedge report naming
- *  `div.ui-blocking-overlay`, stacked over the app's own "Refreshing" status.
+ *  unreachable BY DESIGN, so no reading taken under one means anything.
  *
  *  It answers with a NAME rather than a flag, because declining to judge is not
  *  a reason to say nothing. A press the probe refused under a cover writes a
@@ -905,211 +893,11 @@ function coveredOnPurpose(): boolean {
   return coverOverShell() !== '';
 }
 
-/** The first watchable face the browser does not answer with at its own centre,
- *  as a ready report. Null when every face is reachable, which is the healthy
- *  case and the usual one.
+/** How often the composer is asked about with no gesture behind it.
  *
- *  Silent under a cover the app raised itself, which `coveredOnPurpose` names.
- *  Silent too for a face with no box, which is a row mid-layout rather than a
- *  fault. */
-interface RepairTarget {
-  face: string;
-  el: HTMLButtonElement;
-  rect: ProbeRect;
-}
-
-interface UnreachableFace extends RepairTarget {
-  report: string;
-}
-
-function firstUnreachableFace(faces: HTMLButtonElement[]): UnreachableFace | null {
-  if (coveredOnPurpose()) return null;
-  let fresh: UnreachableFace | null = null;
-  for (const face of faces) {
-    const rect = face.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) continue;
-    const centre = { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
-    // `elementFromPoint` answers null for any point outside the viewport, so a
-    // face parked off-screen would read as unreachable on every touch. The
-    // mobile swipe track is 300% wide and keeps all three panes laid out. The
-    // composer therefore sits off-screen whenever the user is on another pane,
-    // and a point the document cannot hit-test answers no question.
-    if (!onScreen(centre)) continue;
-    const at = document.elementFromPoint(centre.x, centre.y);
-    const name = nameOf(face);
-    const report = faceHitTestReport({
-      face: name,
-      centre,
-      answeredWithFace: !!at && face.contains(at),
-      elementAtCentre: describe(at),
-      pointerEventsAtCentre: pointerEventsOf(at),
-      viewport: readViewport(),
-    });
-    if (!report) {
-      // The face answers again, so the episode is over. Both latches are
-      // forgotten together, or a state that returns would go unreported and
-      // unrepaired.
-      reportedUnreachable.delete(name);
-      repairAttempted.delete(name);
-      continue;
-    }
-    if (reportedUnreachable.has(name)) continue;
-    reportedUnreachable.add(name);
-    fresh ??= { face: name, el: face, report, rect: roundRect(rect) as ProbeRect };
-  }
-  return fresh;
-}
-
-/** Does the page answer with this face at its own painted centre? The bare
- *  question `firstUnreachableFace` wraps, asked again after a repair with no
- *  latch and no report in the way. */
-function faceAnswersAtCentre(face: HTMLButtonElement): boolean {
-  const rect = face.getBoundingClientRect();
-  if (rect.width === 0 || rect.height === 0) return false;
-  const centre = { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
-  if (!onScreen(centre)) return false;
-  const at = document.elementFromPoint(centre.x, centre.y);
-  return !!at && face.contains(at);
-}
-
-/** How often the row is asked whether it can still be reached.
- *
- *  Slow on purpose. The check costs a hit test and a style read per face, and a
- *  wedge persists, so a faster tick buys nothing. */
+ *  Slow on purpose. A wedge persists, so a faster tick buys nothing, and this
+ *  runs for the whole life of the page on a phone. */
 const SCHEDULED_CHECK_MS = 3000;
-
-/** How long the repair is given before the face is asked again. Past a frame,
- *  and short enough that the answer still belongs to the nudge. */
-const REPAIR_SETTLE_MS = 50;
-
-/** Faces a repair has already been spent on, cleared the moment the face
- *  answers again. One attempt per episode: a nudge that did not work will not
- *  work on the next tick either. */
-const repairAttempted = new Set<string>();
-
-/** The height to relayout the shell at before putting it back.
- *
- *  The AMPLITUDE of the user's own recovery: the keyboard's own span, which is
- *  the layout viewport less the shell's current height. A 1px wobble relaid the
- *  same boxes out at the same size and moved nothing else.
- *
- *  DOWNWARD, though the keyboard bounce goes up, and that is deliberate.
- *  Growing the shell shrinks every scroller in it. The browser clamps their
- *  scroll offsets at that layout, and putting the height back does NOT put the
- *  offsets back. A transcript at the live edge would jump most of a screen on
- *  every dead tap. Shrinking cannot clamp anything: it only makes room, and the
- *  restore returns to geometry those offsets were already valid in.
- *
- *  Floored at 1px, since a shell of zero height is not a layout. */
-export function bounceHeight(current: number, layoutViewport: number): number {
-  const keyboard = Math.round(layoutViewport - current);
-  const span = keyboard > 0 ? keyboard : 1;
-  return Math.max(1, Math.round(current - span));
-}
-
-/** Force the shell to relayout, which is what the user's own recovery does.
- *
- *  Closing and reopening the keyboard rewrites the visual viewport, and the app
- *  answers by rewriting `--app-height`. So nudging that property and putting it
- *  straight back reproduces the effect, without touching focus, the caret or
- *  the keyboard. Blurring the textarea would dismiss the keyboard, and iOS
- *  refuses to reopen it outside a user gesture.
- *
- *  Both writes happen in one task, so nothing is painted in between and the
- *  nudge is invisible. Reading `offsetHeight` between them is what makes each
- *  write a real layout rather than a coalesced no-op.
- *
- *  False when the property is not set, which is a shell the probe does not own
- *  and must not start writing. */
-function nudgeLayout(): boolean {
-  const root = document.documentElement;
-  const prior = root.style.getPropertyValue('--app-height');
-  // A px length, not merely something starting with a number. Writing `99px`
-  // over a `100%` would change the unit for the instant before the restore.
-  if (!/^-?[\d.]+px$/.test(prior.trim())) return false;
-  const px = Number.parseFloat(prior);
-  if (!Number.isFinite(px)) return false;
-  const inner = window.innerHeight;
-  const away = Number.isFinite(inner) && inner > 0 ? bounceHeight(px, inner) : Math.max(1, px - 1);
-  root.style.setProperty('--app-height', `${away}px`);
-  void root.offsetHeight;
-  root.style.setProperty('--app-height', prior);
-  void root.offsetHeight;
-  // Recompute the layout viewport too. A no-op scroll, since it asks for the
-  // offset the page already holds.
-  if (typeof window.scrollTo === 'function') window.scrollTo(0, window.scrollY);
-  return true;
-}
-
-/** Repair a face the page will not answer with, then say whether it worked.
- *
- *  The outcome is the point. `repaired` says a stale layout was the cause and
- *  the user has their composer back. `repair-failed` rules that out, which is
- *  the reading ten reports have not produced.
- *
- *  Only `repaired` toasts, and only where the face had actually stopped
- *  answering. The user pressed something that did nothing, and the message
- *  tells them it is worth pressing again. A failed repair changes nothing they
- *  can see or act on.
- *
- *  `announce` is false for the DEAD-TAP caller, whose face answers at its own
- *  centre throughout. The hit test cannot score that repair, so a toast there
- *  would claim a fix on every stray tap on empty row space. It runs the same
- *  recovery and says so only in the log. */
-function attemptRepair(found: RepairTarget, scheduled: boolean, announce = true): void {
-  if (repairAttempted.has(found.face)) return;
-  repairAttempted.add(found.face);
-  if (!nudgeLayout()) {
-    recordPress({
-      face: found.face,
-      verdict: 'repair-failed',
-      movedPx: 0,
-      scheduled,
-      nudged: false,
-      faceRect: found.rect,
-    });
-    return;
-  }
-  setTimeout(() => {
-    // A face the row replaced under us answers nothing, and calling that a
-    // failed repair would poison the very split this exists to read. The
-    // episode ended by re-render, so forget it and let the next check ask.
-    if (!found.el.isConnected) {
-      recordPress({
-        face: found.face,
-        verdict: 'repair-failed',
-        movedPx: 0,
-        scheduled,
-        nudged: true,
-        connected: false,
-        faceRect: found.rect,
-      });
-      reportedUnreachable.delete(found.face);
-      repairAttempted.delete(found.face);
-      return;
-    }
-    const ok = faceAnswersAtCentre(found.el);
-    recordPress({
-      face: found.face,
-      verdict: ok ? 'repaired' : 'repair-failed',
-      movedPx: 0,
-      scheduled,
-      nudged: true,
-      connected: true,
-      toasted: ok && announce,
-      faceRect: roundRect(found.el.getBoundingClientRect()),
-    });
-    if (!ok) return;
-    // The episode is over, so let a later one report and repair itself.
-    reportedUnreachable.delete(found.face);
-    repairAttempted.delete(found.face);
-    if (!announce) return;
-    showToast(
-      `${found.face} had stopped taking taps and has been reset. Try again.`,
-      'warning',
-    );
-  }, REPAIR_SETTLE_MS);
-}
 
 /** How long after the last keystroke the composer counts as waiting for a press.
  *
@@ -1138,7 +926,12 @@ const UNTOUCHED_WINDOW_MS = 60_000;
  *
  *  Typing is the one channel that survives that state, so it is what arms this.
  *  The gate is the pre-send moment and nothing else: something to commit, the
- *  user typed it, and no touch has reached the page since.
+ *  user typed it, and no touch has reached THE COMPOSER since.
+ *
+ *  The composer, rather than the page, and round 15 is why. A touch the page
+ *  took elsewhere used to disarm this for the rest of an episode. That reads a
+ *  live page as a live composer, which is the partition `keyboard-touch` exists
+ *  to deny.
  *
  *  Deliberately NO keyboard bound. `data-keyboard-active` means a prompt
  *  textarea is focused, which typing already implies, and ADR 0183 records what
@@ -1148,42 +941,117 @@ const UNTOUCHED_WINDOW_MS = 60_000;
  *  here. One decision point per bound, as the rescue now has. */
 export function shouldNudgeUntouched(f: {
   hasCommitFace: boolean;
-  typedSinceLastInput: boolean;
+  typedSinceComposerInput: boolean;
   msSinceKeystroke: number;
 }): boolean {
   if (!f.hasCommitFace) return false;
-  if (!f.typedSinceLastInput) return false;
+  if (!f.typedSinceComposerInput) return false;
   return f.msSinceKeystroke >= UNTOUCHED_QUIET_MS
     && f.msSinceKeystroke <= UNTOUCHED_WINDOW_MS;
 }
 
 /** Spend the recovery on a composer nobody has been able to touch.
  *
- *  The relayout only, never the commit. A press the page dropped is evidence
- *  that the user reached for the button. A silence is not, so nothing may be
- *  sent from here.
+ *  The relayout only. That was once this trigger's own rule, and it is now the
+ *  module's: nothing here presses anything.
  *
  *  The line is what the next episode reads. `nudged` says whether the shell was
  *  relaid out, and the count rides on every later press as `quiet.nudges`. */
-function runUntouchedNudge(): void {
-  const face = liveCommitFace();
+function runUntouchedNudge(face: HTMLButtonElement | null): void {
   const typed = lastKeystrokeAt !== null
-    && (lastInputAt === null || lastKeystrokeAt > lastInputAt);
+    && (lastComposerInputAt === null || lastKeystrokeAt > lastComposerInputAt);
   const run = shouldNudgeUntouched({
     hasCommitFace: !!face,
-    typedSinceLastInput: typed,
+    typedSinceComposerInput: typed,
     msSinceKeystroke: lastKeystrokeAt === null ? 0 : Date.now() - lastKeystrokeAt,
   });
   if (!face || !run) return;
   nudgesSinceInput += 1;
-  const nudged = nudgeLayout();
+  nudgesSinceKeystroke += 1;
+  const nudged = relayoutShell();
   recordPress({
-    face: nameOf(face.el),
+    face: nameOf(face),
     verdict: 'untouched',
     movedPx: 0,
     scheduled: true,
     nudged,
-    faceRect: roundRect(face.el.getBoundingClientRect()),
+    faceRect: roundRect(face.getBoundingClientRect()),
+  });
+}
+
+/** How long the page must have taken nothing for the silence to be worth a line.
+ *
+ *  One scheduled tick, so the line lands on the first or second check after the
+ *  keyboard goes. A user who closes the keyboard and taps straight away never
+ *  reaches it. */
+const SILENCE_QUIET_MS = 3000;
+
+/** Should the ledger name a silence that followed a keyboard close?
+ *
+ *  The verdict the probe could never write. "No line" has meant two opposite
+ *  things at once: the page took no touch, and nothing was tapped. Every other
+ *  reading here waits to be touched, so none of them can tell those apart.
+ *
+ *  The scheduled check can. It runs through the silence, and it knows when the
+ *  keyboard last went. So the line says: checks are running, the keyboard has
+ *  closed, and nothing has reached the document since.
+ *
+ *  The silence runs from whichever came LAST, the close or the final input. An
+ *  input landing just after a close is exactly what the eighteenth episode had,
+ *  and anchoring on the close alone would have refused it.
+ *
+ *  A live commit face is the one bound that keeps this rare. It says the
+ *  composer has something to send, which is the state a user taps at. Without
+ *  it every idle phone would write a line.
+ *
+ *  The cover, mobile and visibility bounds live at the caller, as they do for
+ *  the typing-driven recovery. One decision point per bound. */
+export function shouldReportSilence(f: {
+  hasCommitFace: boolean;
+  /** Since the keyboard closed. Null when no close has been seen. */
+  msSinceKeyboardClose: number | null;
+  /** Since the document last took a touch or a click. Null when it has taken
+   *  none at all. */
+  msSinceInput: number | null;
+}): boolean {
+  if (!f.hasCommitFace) return false;
+  if (f.msSinceKeyboardClose === null) return false;
+  const silence = f.msSinceInput === null
+    ? f.msSinceKeyboardClose
+    : Math.min(f.msSinceKeyboardClose, f.msSinceInput);
+  return silence >= SILENCE_QUIET_MS;
+}
+
+/** The close a silence line has already been written for.
+ *
+ *  ONE line per keyboard close. The silence it describes persists, so a line
+ *  per tick would bury the reading in copies of itself. The press that ends the
+ *  silence carries `quiet.ms`, and the two bracket the episode. */
+let silenceReportedFor: number | null = null;
+
+function reportSilence(face: HTMLButtonElement | null): void {
+  const close = keyboardCloseState();
+  if (close.at === null || silenceReportedFor === close.at) return;
+  const now = Date.now();
+  const msSinceInput = lastInputAt === null ? null : now - lastInputAt;
+  const run = shouldReportSilence({
+    hasCommitFace: !!face,
+    msSinceKeyboardClose: now - close.at,
+    msSinceInput,
+  });
+  if (!face || !run) return;
+  silenceReportedFor = close.at;
+  recordPress({
+    face: nameOf(face),
+    verdict: 'silent-since-keyboard',
+    movedPx: 0,
+    scheduled: true,
+    // Whether the close's own relayout ran. False rules the recovery out for
+    // this episode, rather than scoring it.
+    nudged: close.relaidOut,
+    sinceKeyboardMs: Math.round(now - close.at),
+    sinceInputMs: msSinceInput === null ? null : Math.round(msSinceInput),
+    faceRect: roundRect(face.getBoundingClientRect()),
   });
 }
 
@@ -1206,27 +1074,13 @@ function runScheduledCheck(): void {
   // than merely silent. A cover holding for a whole quiet window is the reading
   // that separates our own bookkeeping from the platform.
   if (coveredOnPurpose()) { coveredSinceInput += 1; return; }
-  const unreachable = firstUnreachableFace(faces);
-  if (!unreachable) {
-    // A null answer has two meanings, and only the first belongs here. Every
-    // face answers where it is drawn, which is the state the wedge wears. Or a
-    // face is still unreachable and already latched, which `attemptRepair`
-    // owns and has already spent its one attempt on. Nudging over that would
-    // poison the reading both recoveries are scored by.
-    if (reportedUnreachable.size === 0) runUntouchedNudge();
-    return;
-  }
-  unreachableSinceInput += 1;
-  recordPress({
-    face: unreachable.face,
-    verdict: 'unreachable',
-    movedPx: 0,
-    scheduled: true,
-    toasted: true,
-    faceRect: unreachable.rect,
-  });
-  showToast(unreachable.report, 'warning');
-  attemptRepair(unreachable, true);
+  // ONE layout read for both. They ask the same question of the same row at
+  // the same instant, and each used to query the DOM for it.
+  const face = liveCommitFace();
+  // The reading first, then the recovery. The line then describes the state as
+  // the check found it, rather than the state the relayout left behind.
+  reportSilence(face);
+  runUntouchedNudge(face);
 }
 
 /** This event's entry for one finger, or null when another finger moved. */
@@ -1257,6 +1111,10 @@ interface ArmedPress {
   /** Taken at touchdown, since the lift's own reading would already carry any
    *  re-sync the gesture provoked. */
   screenOff: { x: number; y: number };
+  /** The most contacts the glass has held while this press was armed. A finger
+   *  joining halfway through raises it, which is why it is a running maximum
+   *  rather than the count at touchdown. See `pressWasAlone`. */
+  fingers: number;
   faceRect: ProbeRect | null;
   rowRect: ProbeRect | null;
   /** Every other reading on this press, taken at the same instant as the rects
@@ -1283,6 +1141,10 @@ interface SettlingPress {
   connectedAtLift: boolean;
   rowMutations: number;
   screenOff: { x: number; y: number };
+  /** See `PressFingers`. The first is carried over from the armed press, and the
+   *  second is what the lift found still down. */
+  fingers: number;
+  fingersAtLift: number;
   faceRect: ProbeRect | null;
   rowRect: ProbeRect | null;
   at: PressContext;
@@ -1301,18 +1163,18 @@ interface SettlingPress {
 
 /** A press that reached the composer row and no face, waiting for its lift.
  *
- *  The one press shape the module never ruled. Its line asserted `movedPx: 0`
- *  instead of measuring, so a swipe beginning on the row read exactly like a
- *  tap that died there. The two want opposite answers: one is the platform
- *  working, and the other is the wedge this module exists for. */
+ *  Its `missed` line is already written at touchdown. What the lift adds is the
+ *  TRAVEL, which is what tells a tap that died on the row from a swipe that
+ *  began there. Only the first earns a relayout. */
 interface ArmedMiss {
   touchId: number;
   startX: number;
   startY: number;
   movedPx: number;
-  /** The face the finger came nearest to, which is the one to repair. */
-  target: RepairTarget | null;
-  at: PressContext;
+  /** See `ArmedPress.fingers`. WebKit owes no click to a shared gesture, so a
+   *  press that shared the glass is not a press that died. */
+  fingers: number;
+  fingersAtLift: number;
 }
 
 let installed = false;
@@ -1321,7 +1183,11 @@ let installed = false;
  *  and a desktop click path has never been in question.
  *
  *  Every listener is passive, and none calls `preventDefault` or
- *  `stopPropagation`. A diagnostic that consumes a press becomes the bug. */
+ *  `stopPropagation`. A diagnostic that consumes a press becomes the bug.
+ *
+ *  It DISPATCHES nothing either. A dead tap used to click the commit face, and
+ *  a diagnostic that acts becomes a different bug: it sent a draft on a tap
+ *  138 px from Send. See ADR 0225. */
 export function installDeadPressProbe(): void {
   if (installed || typeof document === 'undefined') return;
   installed = true;
@@ -1329,15 +1195,6 @@ export function installDeadPressProbe(): void {
   let armed: ArmedPress | null = null;
   /** The row-missed press waiting for its lift. See `ArmedMiss`. */
   let missedPress: ArmedMiss | null = null;
-  /** Its grace window, once lifted. */
-  let missSettle: ReturnType<typeof setTimeout> | null = null;
-  /** Whether a click inside that window went somewhere that could act on it.
-   *  Recorded rather than acted on, so the settle stays the one place a
-   *  stand-down is decided and reported. See `clickClaimedPress`. */
-  let missClaimed = false;
-  /** True only while the rescue dispatches its own click. A diagnostic that
-   *  reads its own output is not measuring anything. */
-  let rescueClicking = false;
   const settling = new Set<SettlingPress>();
   /** When the document last saw ANY `touchstart`, wherever it landed.
    *
@@ -1345,8 +1202,6 @@ export function installDeadPressProbe(): void {
    *  click with nothing here behind it is a page taking clicks and no touches.
    *  An iOS standalone PWA is reported to reach that state. */
   let lastTouchStartAt: number | null = null;
-  /** When the reachability question was last asked. See its throttle. */
-  let lastReachabilityAt = Number.NEGATIVE_INFINITY;
 
   /** Rule a lifted press and write its line. Called by the grace timer, and by
    *  the click handler when a click claims the press early. */
@@ -1354,11 +1209,13 @@ export function installDeadPressProbe(): void {
     if (!settling.delete(press)) return;
     if (press.graceTimer !== null) { clearTimeout(press.graceTimer); press.graceTimer = null; }
     if (press.outcomeTimer !== null) { clearTimeout(press.outcomeTimer); press.outcomeTimer = null; }
+    const fingers = { fingers: press.fingers, fingersAtLift: press.fingersAtLift };
     if (clicked) {
       recordPress({
         face: press.face,
         verdict: 'clicked',
         movedPx: press.movedPx,
+        ...fingers,
         rowRect: press.rowRect,
         faceRect: press.faceRect,
         screenOff: press.screenOff,
@@ -1367,12 +1224,14 @@ export function installDeadPressProbe(): void {
       return;
     }
     const outcome = press.outcome;
+    const alone = pressWasAlone(fingers);
     const report = deadPressReport({
       face: press.face,
       movedPx: press.movedPx,
       connectedAtLift: press.connectedAtLift,
       rowMutations: press.rowMutations,
       outcome,
+      alone,
       // The PRESS's viewport, the same one its line carries. A toast quoting
       // the ruling's instead reports a layout the press never saw, which is
       // the split that made the served lines unreadable.
@@ -1380,10 +1239,13 @@ export function installDeadPressProbe(): void {
     });
     recordPress({
       face: press.face,
-      verdict: outcome ?? 'dead',
+      // A shared glass is `dead` without the fault behind it: WebKit owes no
+      // click to a multi-finger gesture, so nothing was lost.
+      verdict: outcome ?? (alone ? 'dead' : 'multi-touch'),
       movedPx: press.movedPx,
       connectedAtLift: press.connectedAtLift,
       rowMutations: press.rowMutations,
+      ...fingers,
       toasted: report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
@@ -1393,86 +1255,28 @@ export function installDeadPressProbe(): void {
     if (report) showToast(report, 'warning');
   };
 
-  /** Say that the rescue refused a press, and why.
-   *
-   *  Only where there WAS a commit face to run. With none there is nothing to
-   *  report, which is most taps in this row. A refusal the ledger cannot see
-   *  is what left a rescue that never ran looking like a rescue nobody
-   *  needed. */
-  const standDownRescue = (
-    miss: ArmedMiss,
-    standDown: RescueStandDown,
-    face = liveCommitFace(),
-  ) => {
-    if (!face) return;
-    recordPress({
-      face: nameOf(face.el),
-      verdict: 'rescue-stood-down',
-      movedPx: miss.movedPx,
-      standDown,
-      at: miss.at,
-    });
-  };
-
   /** Rule a press that reached the row and no face.
    *
    *  A stationary one is the wedge the user recovers by dismissing and
-   *  reopening the keyboard, and `nudgeLayout` is that recovery without the
-   *  keyboard. Running it here is what makes the SECOND tap work instead of
-   *  the tenth.
+   *  reopening the keyboard, and `relayoutShell` is that recovery without the
+   *  keyboard. It is what makes the SECOND tap work instead of the tenth.
    *
-   *  The repair is silent, because nothing here can score it. The face answers
-   *  at its own centre throughout this state, so a toast would claim a fix on
-   *  every stray tap on empty row space. A refusal is not silent: see
-   *  `standDownRescue`. */
+   *  NOTHING IS PRESSED. This path used to click the commit face, and on the
+   *  seventeenth report it sent a draft on a tap 138 px from Send (ADR 0225).
+   *
+   *  Silent, and it waits for nothing. The grace window, the claim and the
+   *  stand-down line all existed to protect a COMMIT from firing on a press
+   *  something else had taken. A relayout needs no such protection: it costs
+   *  nothing when it was not needed, and the `missed` line at touchdown has
+   *  already said the press arrived.
+   *
+   *  Null for a finger that travelled, which is a scroll the platform is
+   *  entitled to take. Null for a press that shared the glass, on the same
+   *  grounds. */
   const ruleMissedPress = (miss: ArmedMiss) => {
-    // A gesture the platform took is judged HERE, in front of the grace window.
-    // So it cannot supersede a rescue already waiting out that window for an
-    // earlier press. Tapping and then swiping is what a user does to a
-    // dead-feeling button, and the pending rescue is the thing that must fire.
-    if (miss.movedPx > TAP_MOVE_THRESHOLD_PX) { standDownRescue(miss, 'traveled'); return; }
-    // A click still on its way means the press was not dead, and running the
-    // commit face over it would send the draft twice.
-    if (missSettle !== null) clearTimeout(missSettle);
-    missClaimed = false;
-    missSettle = setTimeout(() => {
-      missSettle = null;
-      const claimed = missClaimed;
-      missClaimed = false;
-      const face = liveCommitFace();
-      const standDown = rescueStandDown({
-        movedPx: miss.movedPx,
-        claimed,
-        // A cover can go up inside the grace window, and a synthetic click
-        // ignores it. Under one the composer is unreachable by design.
-        covered: coveredOnPurpose(),
-        hasCommitFace: !!face,
-      });
-      if (face && standDown === null) {
-        // The face's click path asks its tap gate, and a gate holding no press
-        // counts as a tap: that is how a keyboard Enter activates.
-        //
-        // Flagged while it dispatches, because the probe must not read its own
-        // click as evidence. Past 900ms of finger-down the touch-behind window
-        // has expired. The click handler would then write `click-no-touch`, the
-        // verdict meaning the page takes clicks while touches are dead.
-        rescueClicking = true;
-        try { face.el.click(); } finally { rescueClicking = false; }
-        recordPress({
-          face: nameOf(face.el),
-          verdict: 'activated',
-          movedPx: miss.movedPx,
-          toasted: true,
-          at: miss.at,
-        });
-        showToast(`That tap did not register, so ${face.action} was run for you.`, 'warning');
-      } else if (face && standDown) {
-        standDownRescue(miss, standDown, face);
-      }
-      // The relayout is what the NEXT tap needs, so it runs whatever the rescue
-      // decided.
-      if (miss.target) attemptRepair(miss.target, false, false);
-    }, CLICK_GRACE_MS);
+    if (miss.movedPx > TAP_MOVE_THRESHOLD_PX) return;
+    if (!pressWasAlone(miss)) return;
+    relayoutShell();
   };
 
   /** Give up on an armed press whose lift never came, and SAY so.
@@ -1485,6 +1289,9 @@ export function installDeadPressProbe(): void {
     const report = noLiftReport({
       face: press.face,
       movedPx: press.movedPx,
+      // The lift that would have counted the other contacts never came, so the
+      // press's own running maximum is the whole reading here.
+      alone: press.fingers <= 1,
       viewport: press.at.viewport,
     });
     recordPress({
@@ -1493,6 +1300,7 @@ export function installDeadPressProbe(): void {
       movedPx: press.movedPx,
       connectedAtLift: press.el.isConnected,
       rowMutations: press.mutations,
+      fingers: press.fingers,
       toasted: toast && report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
@@ -1505,9 +1313,20 @@ export function installDeadPressProbe(): void {
   // Capture, so an inert or covered target still reports.
   document.addEventListener('touchstart', (e) => {
     // A second finger joining a live gesture is neither a new press nor a lost
-    // lift. Leave the armed press exactly as it is: its own lift still rules
-    // it. Clearing it here stranded the press with no line at all.
-    if (armed && e.touches.length > 1) return;
+    // lift. Leave the gesture exactly as it is: its own lift still rules it.
+    // Clearing it here stranded the press with no line at all.
+    //
+    // The handler COUNTS it on the way past, because WebKit owes no click to a
+    // multi-finger gesture. Without this the press reads as dead, which is the
+    // false alarm the seventeenth report opened with.
+    //
+    // A missed press is guarded too. It used to be dropped outright by the
+    // fall-through below, which threw its line away.
+    const live = armed ?? missedPress;
+    if (live && e.touches.length > 1) {
+      live.fingers = Math.max(live.fingers, e.touches.length);
+      return;
+    }
     const previous = armed;
     armed = null;
     if (previous) ruleArmedWithNoLift(previous, true);
@@ -1526,6 +1345,13 @@ export function installDeadPressProbe(): void {
     const target = e.target as Element | null;
     const onRow = !!target && !!target.closest(ROW_SELECTOR);
     const inRow = inside(rowRect, touch.clientX, touch.clientY);
+    // The reading the typing-driven recovery arms on. A touch that reached the
+    // composer says it can be reached; one that reached the page says nothing.
+    // `onRow` is not asked here: the row renders inside `.prompt-box`, so the
+    // selector already covers it. `inRow` is geometric and does not.
+    if (inRow || !!target?.closest(COMPOSER_SELECTOR)) {
+      lastComposerInputAt = lastTouchStartAt;
+    }
     // A row with no watchable face used to return here, in silence. That is a
     // real state, and a tap into it is the user pressing something that cannot
     // answer. The `missed` branch below records the census instead, so the line
@@ -1535,42 +1361,14 @@ export function installDeadPressProbe(): void {
     const pressed = faces.find((f) => !!target && (target === f || f.contains(target)));
     if (!pressed) {
       // Something is over the row on purpose, so no JUDGEMENT here means
-      // anything. The cover answers at the composer's own pixels, and both
-      // reports below would name it.
+      // anything. The cover answers at the composer's own pixels, so the
+      // landing report below would name it.
       //
       // Declining to judge is not declining to speak. A touch that reached the
       // row under a cover takes the `covered` line below, which is the state
       // round 11 left indistinguishable from silence.
       const covered = coveredOnPurpose();
-      // The reachability question comes FIRST, in front of the row-attribution
-      // gate below. It is the one check immune to a coordinate space out of
-      // step with layout. For two rounds it sat behind the very gate such a
-      // disagreement defeats, so a wedge that moved the row reported nothing.
-      //
-      // It carries its own line and its own latch, rather than widening the
-      // gate. A wedge would otherwise put a `missed` line under every touch in
-      // the app for as long as it lasted.
-      const now = Date.now();
-      if (!covered && now - lastReachabilityAt >= REACHABILITY_THROTTLE_MS) {
-        lastReachabilityAt = now;
-        const unreachable = firstUnreachableFace(faces);
-        if (unreachable) {
-          recordPress({
-            face: unreachable.face,
-            verdict: 'unreachable',
-            movedPx: 0,
-            toasted: true,
-            rowRect: roundRect(rowRect),
-            faceRect: unreachable.rect,
-          });
-          showToast(unreachable.report, 'warning');
-          // Repair from here too. This path latches the face, so leaving it to
-          // the scheduled check would strand a wedge the USER found first.
-          // Tapping is how they find it.
-          attemptRepair(unreachable, false);
-        }
-      }
-      // Past that, only the composer's own row is this module's business. A
+      // Only the composer's own row is this module's business. A
       // touch counts as the row's when it was DISPATCHED there, or when it
       // landed on the row's painted box.
       //
@@ -1643,10 +1441,11 @@ export function installDeadPressProbe(): void {
           rect: nearest.face.rect,
         },
         screenOff: screenOffset(touch),
+        fingers: e.touches.length,
         at: pressAt,
       });
       // Rule it at the lift, where the travel is known. The user recovers this
-      // state by hand, and the lift now runs the same recovery for them.
+      // state by hand, and the lift runs the same relayout for them.
       //
       // `nothing` under the finger is the whole trigger. An `other-button` tap
       // ran an icon button's action, and an excluded face is a press the app
@@ -1656,15 +1455,12 @@ export function installDeadPressProbe(): void {
         startX: touch.screenX,
         startY: touch.screenY,
         movedPx: 0,
-        target: nearest && { face: nearest.face.name, el: nearest.face.el, rect: nearest.face.rect },
-        at: pressAt,
+        fingers: e.touches.length,
+        fingersAtLift: 0,
       };
       if (report) showToast(report, 'warning');
       return;
     }
-    // The finger is on a real face now, so a rescue armed by an earlier dead
-    // tap must not fire behind this press.
-    if (missSettle !== null) { clearTimeout(missSettle); missSettle = null; }
     const press: ArmedPress = {
       el: pressed,
       face: nameOf(pressed),
@@ -1676,6 +1472,7 @@ export function installDeadPressProbe(): void {
       observer: null,
       touchId: touch.identifier,
       screenOff: screenOffset(touch),
+      fingers: e.touches.length,
       faceRect: roundRect(pressed.getBoundingClientRect()),
       rowRect: roundRect(rowRect),
       at: pressContext(),
@@ -1743,6 +1540,9 @@ export function installDeadPressProbe(): void {
     const miss = missedPress;
     if (miss && touchOf(e, miss.touchId)) {
       missedPress = null;
+      // What is still down once this contact has gone. Zero says the gesture
+      // was this finger alone. See `pressWasAlone`.
+      miss.fingersAtLift = e.touches.length;
       ruleMissedPress(miss);
     }
     const press = armed;
@@ -1759,6 +1559,8 @@ export function installDeadPressProbe(): void {
       connectedAtLift: press.el.isConnected,
       rowMutations: press.mutations,
       screenOff: press.screenOff,
+      fingers: press.fingers,
+      fingersAtLift: e.touches.length,
       faceRect: press.faceRect,
       rowRect: press.rowRect,
       at: press.at,
@@ -1795,12 +1597,15 @@ export function installDeadPressProbe(): void {
     const report = canceledPressReport({
       face: press.face,
       movedPx: press.movedPx,
+      alone: pressWasAlone({ fingers: press.fingers, fingersAtLift: e.touches.length }),
       viewport: press.at.viewport,
     });
     recordPress({
       face: press.face,
       verdict: 'canceled',
       movedPx: press.movedPx,
+      fingers: press.fingers,
+      fingersAtLift: e.touches.length,
       toasted: report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
@@ -1822,19 +1627,11 @@ export function installDeadPressProbe(): void {
   // `touchstart` behind it, the page is taking clicks while the touch pipeline
   // is dead. iOS standalone PWAs are reported to reach exactly that.
   document.addEventListener('click', (e) => {
-    // The rescue's own dispatch. Reading it would reset the quiet window and
-    // write a `click-no-touch` line about a click this module made.
-    if (rescueClicking) return;
     const target = e.target as Element | null;
     if (!target) return;
-    // A click that something could have acted on means the gesture was not
-    // dead. The dead press's OWN twin lands on the row, an inert `div`.
-    // Reading that as an answer is what kept the rescue from ever running.
-    // Recorded, not acted on: the settle rules and reports in one place.
-    if (missSettle !== null && clickClaimedPress({
-      onButton: target.closest('button') !== null,
-      inRow: target.closest(ROW_SELECTOR) !== null,
-    })) missClaimed = true;
+    // A click on the composer arms nothing. It does say the composer can be
+    // reached, which is what the typing-driven recovery waits to stop.
+    if (target.closest(COMPOSER_SELECTOR)) lastComposerInputAt = Date.now();
     // A TOUCHLESS click opens a fresh quiet window, and a paired one must not.
     // The synthetic click lands about 50ms after its own `touchstart`, and a
     // press records 600ms later still. So resetting here would hand the press
@@ -1888,6 +1685,10 @@ export function installDeadPressProbe(): void {
     const el = e.target as HTMLElement | null;
     if (el?.dataset?.role !== 'prompt-input') return;
     lastKeystrokeAt = Date.now();
+    // A fresh keystroke opens a fresh pre-send moment, so the relayouts spent
+    // in the previous one belong to it and not to this. Deliberately NOT tied
+    // to `noteInput`, whose window this must outlive.
+    nudgesSinceKeystroke = 0;
   }, { capture: true, passive: true });
 
   // The one reading that needs no gesture. Everything above waits to be

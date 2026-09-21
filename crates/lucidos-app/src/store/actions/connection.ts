@@ -9,6 +9,8 @@ import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAIL
 import { loadUnreadNotifications } from './notifications';
 import { loadThreadQueue } from './threadQueue';
 import { loadPreferences } from './preferences';
+import { loadReleaseNotices } from './releaseNotices';
+import { releaseNoticeDismissed } from '../releaseNotices';
 import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
@@ -185,6 +187,13 @@ function runResumeSync(): void {
   // `LanguageSet` / `TimezoneSet`. A resume is the only other chance to
   // recover a fetch that was cancelled at startup or during this outage.
   void loadPreferences();
+  // What this release needs the reader to do is baked into the engine BINARY,
+  // so the answer changes the moment the engine does. A page that read it just
+  // before an update restart kept the outgoing build's answer, and there is no
+  // event to correct that: `ReleaseNoticeResolved` fires when somebody ANSWERS
+  // a notice, never when a new one arrives. So an upgraded workspace showed
+  // nothing until the reader opened the What's New page by hand.
+  void loadReleaseNotices();
   // Re-send any compose draft the engine never received. Paired with the same
   // flush in `useStartup`'s onResume, and needed separately from it: this path
   // runs on a reconnect the 5s health poll notices with no wake at all (a
@@ -631,6 +640,14 @@ async function runConnectionCheck(): Promise<boolean> {
       // ChangeApplied arm) re-run this check too; this catches a rebuild that
       // already completed.
       void syncClientUpdateFromBuild();
+      // A release-notice dismissal means "not now, ask on the next open", and a
+      // restart under a live page IS the next open: the notice list is a pure
+      // function of the engine build, so the build that was dismissed against
+      // is gone. Without this the re-read below lands a notice the new build
+      // carries and the modal stays shut for the rest of the page's life.
+      // Deliberately NOT on a plain reconnect, where nothing has changed and
+      // re-raising would only nag.
+      releaseNoticeDismissed.value = false;
     }
     runResumeSync();
   } else if (connected && resumePending) {

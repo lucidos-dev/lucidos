@@ -613,3 +613,57 @@ describe('notification_toasts = false silences the pop-up', () => {
     expect(toasts.value).toHaveLength(1);
   });
 });
+
+// A read is the other end of the toast's lifetime. The unread-set watch owns
+// the reads this page can see, in `actions/notification-toast-lifetime.test.ts`.
+// These two SSE arms own the reads it cannot, and are a round trip slower.
+describe('NotificationRead / NotificationsAllRead → the toast goes', () => {
+  beforeEach(() => {
+    toasts.value = [];
+    focusedThreadId.value = null;
+    isEventInViewport.mockReset().mockReturnValue(false);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))));
+    vi.clearAllMocks();
+  });
+
+  it('drops the read row\'s toast and leaves the others', () => {
+    emitToast({ notification_id: 'n-read' });
+    emitToast({ notification_id: 'n-keep' });
+
+    handleGlobalEvent('NotificationRead', { id: 'n-read', actor: null });
+
+    expect(toasts.value.map(t => t.key)).toEqual(['notification-n-keep']);
+    // The badge still refreshes: the drop is additional, not a replacement.
+    expect(handleNotificationSSE).toHaveBeenCalled();
+  });
+
+  it('counts the overflow down when the read row was folded into it', () => {
+    for (let i = 1; i <= 6; i++) emitToast({ notification_id: `n-${i}` });
+    expect(toasts.value.find(t => t.key === 'notifications-overflow')!.message)
+      .toBe('+2 more notifications');
+
+    handleGlobalEvent('NotificationRead', { id: 'n-6', actor: null });
+
+    expect(toasts.value.find(t => t.key === 'notifications-overflow')!.message)
+      .toBe('+1 more notification');
+  });
+
+  it('clears every notification toast on an all-read', () => {
+    for (let i = 1; i <= 6; i++) emitToast({ notification_id: `n-${i}` });
+
+    handleGlobalEvent('NotificationsAllRead', { actor: null });
+
+    expect(toasts.value).toHaveLength(0);
+    expect(handleNotificationSSE).toHaveBeenCalled();
+  });
+
+  it('ignores a read frame carrying no id', () => {
+    emitToast({ notification_id: 'n-1' });
+
+    handleGlobalEvent('NotificationRead', { actor: null });
+
+    expect(toasts.value).toHaveLength(1);
+  });
+});

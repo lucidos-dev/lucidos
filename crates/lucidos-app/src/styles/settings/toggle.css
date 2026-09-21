@@ -1,9 +1,24 @@
-/* Toggle switch */
+/* Toggle switch.
+
+   The three geometry values are named here because everything else derives from
+   them: the pill's height, and the knob's travel when checked. Write those two
+   as literals and they go wrong silently. A later change to any of the three
+   leaves the knob off centre, short of the far end, or over it.
+
+   `flex-shrink: 0` is what keeps the pill the width it declares. A settings row
+   is a flex box, and a flex item shrinks on its UNWRAPPED width. So a label long
+   enough to wrap squeezes the control beside it instead. Three toggles in one
+   column came out three different widths. The narrowest one had its knob
+   hanging past the end of its own pill. */
 .toggle-switch {
+    --toggle-width: 2.25rem;
+    --toggle-knob: 0.875rem;
+    --toggle-inset: 0.1875rem;
     position: relative;
     display: inline-block;
-    width: 2.25rem;
-    height: 1.25rem;
+    flex-shrink: 0;
+    width: var(--toggle-width);
+    height: calc(var(--toggle-knob) + 2 * var(--toggle-inset));
     cursor: pointer;
 }
 
@@ -27,10 +42,10 @@
 .toggle-slider::before {
     content: '';
     position: absolute;
-    height: 0.875rem;
-    width: 0.875rem;
-    left: 0.1875rem;
-    bottom: 0.1875rem;
+    height: var(--toggle-knob);
+    width: var(--toggle-knob);
+    left: var(--toggle-inset);
+    bottom: var(--toggle-inset);
     background-color: var(--text-muted);
     border-radius: 50%;
     transition: transform var(--duration-normal), background-color var(--duration-normal);
@@ -40,8 +55,9 @@
     background-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+/* The knob lands on the far inset, mirroring where it rests when off. */
 .toggle-switch input:checked + .toggle-slider::before {
-    transform: translateX(1rem);
+    transform: translateX(calc(var(--toggle-width) - var(--toggle-knob) - 2 * var(--toggle-inset)));
     background-color: var(--accent);
 }
 

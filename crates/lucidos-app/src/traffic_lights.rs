@@ -207,8 +207,11 @@ pub(crate) fn load_persisted(app: &tauri::AppHandle) {
     SEED_BAR_HEIGHT.store(px.to_bits(), Ordering::SeqCst);
 }
 
-/// Place the lights on one window at ITS bar height. The re-apply path: called
-/// on every `Resized`, because AppKit reverts the placement on each one.
+/// Place the lights on one window at ITS bar height.
+///
+/// The re-apply path. It runs on every `Resized`, the one revert AppKit is
+/// measured to perform. It runs on every `Moved` too, as the net for a revert
+/// no probe reproduces (ADR 0074).
 pub(crate) fn place(window: &tauri::Window) {
     place_at(window, bar_height_for(window.label()));
 }

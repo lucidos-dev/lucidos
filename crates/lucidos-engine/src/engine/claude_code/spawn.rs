@@ -239,20 +239,25 @@ impl LucidosEngine {
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let wt = {
+        // Copy out and RELEASE, before anything awaits. `agent_sessions` is
+        // engine-global: every run-loop iteration, Stop, Apply and permission
+        // answer takes it. The fallback below is a full teardown. It runs
+        // several git calls, each bounded only by the 30s ceiling. Holding the
+        // guard across it freezes every coding-agent session in the workspace
+        // on one Discard click. `control.rs` drops the guard before the same
+        // call.
+        let live = {
             let guard = self.agent_sessions.lock().await;
-            if let Some(session) = guard.get(&thread_id) {
-                session
-                    .worktree_path
-                    .clone()
-                    .ok_or("No worktree for this session")?
-            } else {
-                // No live session — fall back to stale session handling.
-                // discard=true because this is the user-clicked Discard
-                // button: explicit user intent.
-                return self.end_stale_waiting_session(thread_id, true, actor).await;
-            }
+            guard.get(&thread_id).map(|s| s.worktree_path.clone())
         };
+
+        let Some(worktree_path) = live else {
+            // No live session, so fall back to stale session handling.
+            // discard=true because this is the user-clicked Discard
+            // button: explicit user intent.
+            return self.end_stale_waiting_session(thread_id, true, actor).await;
+        };
+        let wt = worktree_path.ok_or("No worktree for this session")?;
 
         self.discard_pending_for_thread(thread_id, actor).await;
 
@@ -494,5 +499,101 @@ impl LucidosEngine {
                 log!("[ClaudeCode] Failed to auto-apply: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// This file with its test module cut off, through the shared reader the
+    /// engine's other source scans use.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/claude_code/spawn.rs"),
+        )
+    }
+
+    /// No teardown here awaits while holding the `agent_sessions` guard.
+    ///
+    /// `agent_sessions` is engine-global, so one held guard blocks every live
+    /// run loop, the Stop button, Apply and every permission answer. A
+    /// `return <expr>` evaluates its expression BEFORE the enclosing block's
+    /// guard drops, which is how `discard_cc_changes` came to await a
+    /// multi-minute teardown under the lock.
+    ///
+    /// A scan, because the failure is a wall-clock stall rather than a wrong
+    /// value: nothing a unit test can assert on, and the shape is exact.
+    #[test]
+    fn no_stale_session_teardown_here_awaits_under_the_sessions_guard() {
+        let src = production_src();
+        for (at, _) in src.match_indices("end_stale_waiting_session(") {
+            let Some(lock_at) = src[..at].rfind("self.agent_sessions.lock().await") else {
+                continue;
+            };
+            if src[lock_at..at].contains("drop(guard)") {
+                continue;
+            }
+            let closed = end_of_guard_block(&src, lock_at)
+                .expect("the guard's enclosing block is brace-balanced");
+            assert!(
+                closed < at,
+                "an `end_stale_waiting_session` await in spawn.rs is still inside \
+                 the `agent_sessions` guard's block. Copy what you need out of the \
+                 map, close the block, then await. See `control.rs`, which drops \
+                 the guard before the same call."
+            );
+        }
+    }
+
+    /// Byte index just past the `}` closing the block that declares the guard.
+    ///
+    /// Braces are counted, never matched by substring. A closure in that span
+    /// satisfies a scan for `};`, so such a scan passes the shape it exists to
+    /// catch.
+    ///
+    /// It does not parse. A brace inside a string or a comment in that span
+    /// would fool it, and the span carries neither.
+    fn end_of_guard_block(src: &str, lock_at: usize) -> Option<usize> {
+        let open = src[..lock_at].rfind('{')?;
+        let mut depth = 0usize;
+        for (offset, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The guard yields the `Option<Option<PathBuf>>` that tells a missing
+    /// session from a session with no worktree.
+    ///
+    /// Flattening the two is the tempting simplification. It would send a live
+    /// session that has no worktree down the stale-session teardown, which
+    /// discards a change rather than reporting the error.
+    #[test]
+    fn discard_keeps_a_missing_session_distinct_from_a_missing_worktree() {
+        let src = production_src();
+        let at = src
+            .find("pub async fn discard_cc_changes")
+            .expect("discard_cc_changes is still here");
+        let body = &src[at..];
+        let end = body.find("\n    /// ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(".map(|s| s.worktree_path.clone())"),
+            "the read-out must keep the inner Option, so a live session with no \
+             worktree stays distinguishable from no session at all"
+        );
+        assert!(
+            body.contains(r#".ok_or("No worktree for this session")"#),
+            "a live session with no worktree must still report that error, not \
+             fall through to the stale-session teardown"
+        );
     }
 }

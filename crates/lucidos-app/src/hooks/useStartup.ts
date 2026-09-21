@@ -20,6 +20,7 @@ import { loadPreferences, flushPendingPreferenceWrites } from '../store/actions/
 import { loadPinnedApps } from '../store/actions/pinnedApps';
 import { loadReleaseNotices } from '../store/actions/releaseNotices';
 import { loadWebhookIngress } from '../store/actions/webhookIngress';
+import { loadWebhookRefusals } from '../store/actions/webhookRefusals';
 import { loadWorkspaceDisplayName } from '../store/actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
@@ -39,6 +40,7 @@ import { refreshChangesState, restoreRestartState } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { inlineMarkdownImage, openImagePopupFromGroup } from '../store/imagePopup';
+import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { clipboardOrReport } from '../utils/clipboard';
 import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
@@ -55,6 +57,7 @@ import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
 import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
 import { flushUndeliveredComposeDrafts } from '../store/actions/compose';
 import { isKnownAppFrame } from '../utils/appFrame';
+import { installAppBridge } from '../store/actions/app-bridge';
 import { handleAppToastMessage } from '../store/actions/app-toast-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../utils/devServerBundle';
@@ -109,6 +112,11 @@ export function useStartup(): void {
     // line then starts the heartbeat ticker. See utils/liveness.ts.
     reportStartupKind();
     const stopLiveness = startLivenessTracking();
+
+    // Answer isolated app frames, which cannot reach the engine or their own
+    // storage. Installed before anything mounts an app, so a frame that asks on
+    // its first line is not answered by silence. See store/actions/app-bridge.ts.
+    const stopAppBridge = installAppBridge();
 
     // Restore focused thread from localStorage (set at signal init, reinforce here).
     // setFocusedThread short-circuits when the value is unchanged, so this is a
@@ -191,6 +199,9 @@ export function useStartup(): void {
     // bar has to be able to raise itself on a cold load. The declaration it
     // reads may have been made hours ago, by a probe nothing has retracted.
     void loadWebhookIngress();
+    // And whether a hook is throwing away what DOES reach it, on the same
+    // terms. A declaration nothing has retracted is what a cold load reads.
+    void loadWebhookRefusals();
     loadAllThreads().catch(() => {
       // Retry after 3s — covers transient network failures on initial load.
       // If this also fails, the 5s health poll will keep retrying.
@@ -287,6 +298,11 @@ export function useStartup(): void {
       }
     }
     document.addEventListener('click', onGlobalClick);
+
+    // Markdown images are raw `<img>` markup, so they cannot be `<BlobImage>`
+    // and would stay half-drawn after a truncated load. One delegated listener
+    // gives every markdown surface the same self-healing retry.
+    const stopMarkdownImageRetry = installMarkdownImageRetry();
 
     // Cold-start, warm hashchange, AND resume (visibilitychange / focus /
     // pageshow) all dispatch through one shared router so iOS PWA — which
@@ -655,6 +671,8 @@ export function useStartup(): void {
       // replayed. A phone asleep through the outage would otherwise call the
       // path healthy for as long as it stayed open.
       void loadWebhookIngress();
+      // And the refusal state, whose two frames are edge-triggered too.
+      void loadWebhookRefusals();
       // And the name the user gave this workspace, which they may have changed
       // in the picker on another device while this one slept. Behind the
       // gateway the in-app switcher re-adopts on every unfold, so this is
@@ -771,6 +789,7 @@ export function useStartup(): void {
     return () => {
       unmounted = true;
       stopLiveness();
+      stopAppBridge();
       clearInterval(connectionInterval);
       clearTimeout(coldStartBounceTimer);
       swProbe.stop();
@@ -792,6 +811,7 @@ export function useStartup(): void {
       nativeTapCanceled = true;
       stopNativeTap?.();
       document.removeEventListener('click', onGlobalClick);
+      stopMarkdownImageRetry();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', onResumeCoalesced);
       window.removeEventListener('pageshow', onResumeCoalesced);

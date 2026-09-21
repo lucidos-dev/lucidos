@@ -400,7 +400,7 @@ test.describe('A notification clears once its event card has been seen', () => {
     seeded = null;
   });
 
-  test('reading the thread from the drawer drops the bell badge, with the panel never opened', async ({ page }) => {
+  test('reading the thread from the drawer drops the bell badge and the toast, with the panel never opened', async ({ page }) => {
     const short = seedShortChatThread();
     seeded = short;
     const { threadId, eventId } = short;
@@ -423,6 +423,10 @@ test.describe('A notification clears once its event card has been seen', () => {
     // Precondition: the badge is up. Without it the assertion below is vacuous.
     await expect(page.locator('.notifications-bell:visible .badge').first())
       .toHaveText('1', { timeout: 10_000 });
+    // And so is the toast, which no thread is focused to suppress. It is the
+    // other half of what a read has to clear.
+    const toast = page.locator('.toast-container .toast', { hasText: 'Seen target' });
+    await expect(toast).toHaveCount(1, { timeout: 10_000 });
 
     // Arrive the way the user does. The Notifications panel is never opened,
     // the row is never tapped, and no deep link is dispatched.
@@ -446,6 +450,10 @@ test.describe('A notification clears once its event card has been seen', () => {
     // Hold the pane past SEEN_DWELL_MS. Swiping away earlier would cancel the
     // wait, which is the anti-glimpse rule doing its job rather than a flake.
     await page.waitForTimeout(2_000);
+
+    // The toast goes with the badge. It offered to open the thing the reader
+    // is looking at, and nothing here tapped it or its X.
+    await expect(toast).toHaveCount(0, { timeout: 10_000 });
 
     // The bell lives on the content pane on mobile, so read it there.
     await ensureMobileView(page, 'content');

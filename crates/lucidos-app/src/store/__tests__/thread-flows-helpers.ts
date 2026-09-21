@@ -1,7 +1,8 @@
 // Shared scaffolding for the thread-flows integration tests, split across
 // thread-flows-*.test.ts. Pure builders plus the per-test seq counter,
 // which each split file resets in its own beforeEach via resetSeqCounter().
-import { exchangeResponseEvents, exchangeStatus, exchangeSteps, groupIntoExchanges, type Exchange, type ThreadEvent, type ThreadState } from '../thread-events';
+import { expect } from 'vitest';
+import { exchangeResponseEvents, exchangeStatus, exchangeSteps, groupIntoExchanges, renderOrderViolations, type Exchange, type StoredEvent, type ThreadEvent, type ThreadState } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
 import { statusLabel } from '../exchange-status';
 
@@ -70,10 +71,21 @@ export function insertEvents(
   }
 }
 
+/** Fold, and check the render order on the way through.
+ *
+ *  **Every flow test pays this.** The rule is `renderOrderViolations`, and a
+ *  transcript that reads out of clock order is a defect whatever else the test
+ *  was about. Checking here rather than per test is what makes the corpus the
+ *  guard: a new flow inherits it. */
+function checkedExchanges(events: Map<number, StoredEvent>): Exchange[] {
+  const exchanges = groupIntoExchanges(events);
+  expect(renderOrderViolations(exchanges)).toEqual([]);
+  return exchanges;
+}
+
 /** Run full pipeline: events map → exchanges (oldest-first) */
 export function getExchanges(map: Map<string, ThreadState>, threadId: string) {
-  const thread = map.get(threadId)!;
-  return groupIntoExchanges(thread.events);
+  return checkedExchanges(map.get(threadId)!.events);
 }
 
 /** Get the user-visible status label for an Exchange */
@@ -95,7 +107,7 @@ export function getExchangesWithPending(
 ): Exchange[] {
   const thread = map.get(threadId)!;
   if (thread.pendingUserMessages.length === 0) {
-    return groupIntoExchanges(thread.events);
+    return checkedExchanges(thread.events);
   }
   const augmented = new Map(thread.events);
   for (let i = 0; i < thread.pendingUserMessages.length; i++) {
@@ -110,7 +122,7 @@ export function getExchangesWithPending(
         : { created: pending.created }),
     } as any);
   }
-  return groupIntoExchanges(augmented);
+  return checkedExchanges(augmented);
 }
 
 /** Post-increment the shared seq counter (mirrors the old `seqCounter++`). */

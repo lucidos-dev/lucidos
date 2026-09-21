@@ -42,10 +42,14 @@ vi.mock('./notifications', () => ({
 vi.mock('./preferences', () => ({
   loadPreferences: vi.fn(),
 }));
+vi.mock('./releaseNotices', () => ({
+  loadReleaseNotices: vi.fn(),
+}));
 
 // Import after mocks are set up
 const { handleResume } = await import('./connection');
 const { loadPreferences } = await import('./preferences');
+const { loadReleaseNotices } = await import('./releaseNotices');
 
 const emailConfirmForm = {
   type: 'email-confirm' as const,
@@ -137,6 +141,24 @@ describe('handleResume reloads preferences', () => {
     await handleResume();
 
     expect(loadPreferences).toHaveBeenCalled();
+  });
+});
+
+/**
+ * A release notice is baked into the engine binary, so the list changes when
+ * the engine does. The one event over it, `ReleaseNoticeResolved`, fires when
+ * somebody ANSWERS a notice and never when a new one arrives. So a page that
+ * read the list just before an update restart keeps the outgoing build's
+ * answer, and an upgraded workspace shows nothing at all.
+ *
+ * That is the reported defect: one window read at `08:23:11` from the engine
+ * about to be replaced, and never asked the new one.
+ */
+describe('handleResume re-reads the release notices', () => {
+  it('asks the engine again, because a restart can have brought a new notice', async () => {
+    await handleResume();
+
+    expect(loadReleaseNotices).toHaveBeenCalled();
   });
 });
 

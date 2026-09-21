@@ -353,20 +353,37 @@ const APP_DOC = 'https://host.example/ws/app/notes-app/';
 describe('openApp carries an app fragment', () => {
   let origQuerySelectorAll: typeof document.querySelectorAll;
   let frameLocation: { href: string; replace: ReturnType<typeof vi.fn> };
+  let framePosts: unknown[] = [];
 
   /** One mounted app iframe whose live URL can drift, the way a real app moves
    *  itself with `history.replaceState`. */
+  /** An app frame is isolated, so the host asks it to move rather than driving
+   *  its `location`. What these cases check is therefore WHETHER a delivery was
+   *  sent. Where the frame then lands is its own arithmetic, covered in
+   *  `packages/lucidos-sdk/src/hostOps.test.ts`. */
   function mountFrame(hash: string): void {
+    framePosts = [];
     frameLocation = {
       href: `${APP_DOC}${hash}`,
       replace: vi.fn((url: string) => { frameLocation.href = url; }),
     };
     const frame = {
-      contentWindow: { location: frameLocation },
+      contentWindow: {
+        location: frameLocation,
+        postMessage: vi.fn((msg: unknown) => { framePosts.push(msg); }),
+      },
       getBoundingClientRect: () => ({ width: 800, height: 600, top: 0, left: 0, bottom: 600, right: 800 }),
       closest: () => null,
     };
     document.querySelectorAll = vi.fn().mockReturnValue([frame]);
+  }
+
+  /** The fragment of every `hash` delivery sent to the mounted frame. */
+  function deliveredFragments(): unknown[] {
+    return framePosts
+      .filter((m): m is { op: string; args: { fragment: unknown } } =>
+        typeof m === 'object' && m !== null && (m as { op?: string }).op === 'hash')
+      .map((m) => m.args.fragment);
   }
 
   beforeEach(() => {
@@ -436,7 +453,7 @@ describe('openApp carries an app fragment', () => {
     const { openApp } = await import('./apps');
     openApp(notesApp, 'pr-1645');
 
-    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1700`);
+    expect(deliveredFragments()).toEqual([]);
     expect(mockReplaceNavState).not.toHaveBeenCalled();
   });
 
@@ -449,7 +466,7 @@ describe('openApp carries an app fragment', () => {
 
     openApp(notesApp, 'pr-1645');
 
-    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1645`);
+    expect(deliveredFragments()).toEqual(['pr-1645']);
   });
 
   it('moves nobody when the second open names no target', async () => {
@@ -461,7 +478,7 @@ describe('openApp carries an app fragment', () => {
 
     openApp(notesApp);
 
-    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1700`);
+    expect(deliveredFragments()).toEqual([]);
     expect(frameLocation.replace).not.toHaveBeenCalled();
   });
 

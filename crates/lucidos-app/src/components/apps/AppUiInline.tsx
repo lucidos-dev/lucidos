@@ -1,11 +1,12 @@
 import { useRef, useLayoutEffect, useState, useEffect } from 'preact/hooks';
-import { currentApp, appPseudoFullscreen, appRefreshKey, showToast, scaledDurationMs } from '../../store/store';
+import { currentApp, appPseudoFullscreen, appRefreshKey, scaledDurationMs } from '../../store/store';
 import { appFullscreenHost, syncAppFullscreenHost } from '../../store/appFullscreenHost';
 import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
-import { navigateAppIframe, setAppFrameHash, splitFrameSrc } from './iframeNav';
+import { setAppFrameHash, splitFrameSrc } from './iframeNav';
+import { APP_FRAME_SANDBOX } from './appFrameSandbox';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
@@ -26,13 +27,13 @@ function cacheBust(url: string, key: number): string {
   return u.toString();
 }
 
-/** The iframe element, isolated so its useState resets per refresh remount.
+/** The iframe element, isolated so its useState resets per remount.
  *
- *  Freezes the JSX `src` at mount so Preact never diffs it. App switches must
- *  not let the renderer mutate `src` — that adds an entry to iOS Safari's
- *  joint session history (WebKit #9166), and the edge-swipe-back gesture in
- *  the PWA then surfaces a snapshot of a previous app state mid-swipe. App
- *  switches go through navigateAppIframe (location.replace) instead. */
+ *  Freezes the JSX `src` at mount so Preact never diffs it. A live element must
+ *  not have its `src` mutated: that adds an entry to iOS Safari's joint session
+ *  history (WebKit #9166). The PWA's edge-swipe-back gesture then surfaces a
+ *  snapshot of a previous app state mid-swipe. An app switch remounts this
+ *  component instead, and a first load adds no entry. */
 function AppFrame({ src }: { src: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [initialSrc] = useState(src);
@@ -55,34 +56,29 @@ function AppFrame({ src }: { src: string }) {
     return () => clearTimeout(fuse);
   }, [loaded]);
 
+  // A FRAGMENT change only. The caller keys this component on the document. A
+  // change of document therefore remounts it, and the new element carries the
+  // new URL as its `initialSrc`. An iframe's first load is a history REPLACE,
+  // which is the property the old imperative `location.replace` existed to
+  // keep.
+  //
+  // The mount has to do it now rather than by choice. An isolated app frame
+  // denies `contentWindow.location`, and mutating `src` on a live element is
+  // what adds the joint-history entry (WebKit #9166). Only a remount needs
+  // nothing from the app, and needing nothing matters: the SDK is opt-in, so an
+  // app may have loaded none of it.
+  //
+  // The fragment is the opposite case. Delivering it must NOT reload the app,
+  // so it goes over the bridge and the app answers it. No cover is raised: the
+  // app is on screen and stays there. An emptied fragment is not a target, so
+  // it moves nobody and the reader keeps their place.
   useLayoutEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
     if (lastSrcRef.current === src) return;
-    const previous = splitFrameSrc(lastSrcRef.current);
     const next = splitFrameSrc(src);
-    // Same document, new target: hand the frame the hash and raise NO cover.
-    // The app is already on screen and stays on screen. An emptied fragment is
-    // not a target, so it moves nobody: the reader keeps their place.
-    if (previous.doc === next.doc) {
-      if (next.fragment) setAppFrameHash(iframe, next.fragment);
-      lastSrcRef.current = src;
-      return;
-    }
-    // Skip lastSrcRef update on failure so the next render retries against a
-    // freshly-mounted iframe rather than thinking the URL is already in place.
-    // Stable key dedups the toast across rapid app switches that re-fire the
-    // effect against a still-detaching iframe — one error sticks instead of N.
-    if (!navigateAppIframe(iframe, src)) {
-      showToast('Failed to navigate app frame: iframe has no browsing context', 'error', { key: 'app-iframe-nav-failed' });
-      return;
-    }
+    if (next.fragment) setAppFrameHash(iframe, next.fragment);
     lastSrcRef.current = src;
-    // An app switch reuses this frame, so the incoming app reopens the same
-    // white-canvas gap the initial mount had: cover it again until the new
-    // document's `load`. Only after a navigation actually started, so a frame
-    // that failed to navigate keeps showing the app it still has.
-    setLoaded(false);
   }, [src]);
 
   return (
@@ -92,7 +88,7 @@ function AppFrame({ src }: { src: string }) {
         data-role="app-ui-frame"
         class="app-ui-iframe"
         src={initialSrc}
-        sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox allow-downloads"
+        sandbox={APP_FRAME_SANDBOX}
         allow="autoplay; fullscreen; encrypted-media"
         onLoad={() => setLoaded(true)}
       />
@@ -157,10 +153,11 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   const baseSrc = getAppFrameSrc();
   const frameSrc = (baseSrc && refreshKey > 0) ? cacheBust(baseSrc, refreshKey) : baseSrc;
 
-  // `key={refreshKey}` forces a fresh AppFrame on each refresh — keeping it
-  // resets useState so the new iframe mounts with the cache-busted URL as its
-  // initial src (no double-load). App switches keep the same key, so the
-  // iframe element is reused and the URL change goes through location.replace.
+  // The key carries BOTH the refresh counter and the document. Either one
+  // changing mounts a fresh iframe with the new URL as its initial src (no
+  // double-load). The document half is what an app switch rides: an isolated
+  // frame denies `contentWindow.location`, and an iframe's first load adds no
+  // history entry where mutating `src` would.
   return (
     <div
       data-role="app-ui-panel"
@@ -181,7 +178,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
           {layout === 'mobile' && <EdgeSwipeZones />}
         </>
       )}
-      {frameSrc && <AppFrame key={refreshKey} src={frameSrc} />}
+      {frameSrc && <AppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} />}
       {/* Where the host's overlay layer renders while this panel is natively
           fullscreen (OverlayLayer portals into it, found by this marker). Always
           mounted, always empty: it has no vnode children, so the portal is the

@@ -4,9 +4,14 @@
 // toast and a push can never both fire for one notification. We do NOT fire
 // from NotificationCreated (that flushes from the iOS PWA SSE queue after a
 // push tap and would leak a duplicate toast).
+//
+// It owns the toast's whole lifetime, arrival to removal. A notification toast
+// lives exactly as long as its row is unread on this page. That is what
+// `installNotificationToastLifetime` at the foot of this file enforces.
 
+import { effect, untracked } from '@preact/signals';
 import type { Tap } from '@lucidos/sdk';
-import type { ToastAction } from '../types';
+import type { Loadable, Notification, ToastAction } from '../types';
 import { markReadOptimistic, viewNotification } from './notifications';
 import { switchMenuItem } from './menu';
 // Imported from the module that DEFINES it, not from `thread-sync` (which only
@@ -21,7 +26,16 @@ import {
 } from './notification-deeplink';
 import { composeToastMessage } from '../../components/shared/toastMessage';
 import { currentNotificationToasts } from './preferences';
-import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded } from '../store';
+import {
+  dismissToast,
+  focusedThreadId,
+  removeToast,
+  showToast,
+  threadMap,
+  threadsLoaded,
+  toasts,
+  unreadNotifications,
+} from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
 import { repaintLandedContent } from '../../utils/pageResume';
@@ -30,7 +44,13 @@ import { postClientLog } from '../../utils/liveness';
 const NOTIFICATION_TOAST_PREFIX = 'notification-';
 const OVERFLOW_TOAST_KEY = 'notifications-overflow';
 const MAX_INDIVIDUAL_TOASTS = 4;
-const OVERFLOW_COUNT_PATTERN = /^\+(\d+) /;
+
+/** The key a notification's own toast carries. One speller, so the arrival
+ *  that raises the toast and the read that drops it cannot disagree about
+ *  which one they mean. Same discipline as `visitKeys.ts` for the seen rule. */
+export function notificationToastKey(id: string): string {
+  return `${NOTIFICATION_TOAST_PREFIX}${id}`;
+}
 
 /** Spec §4 row labels. Row 5 (offline) doesn't apply — we only run when
  *  an SSE event landed, meaning the page is online by definition. */
@@ -152,19 +172,11 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   const resolved = resolveDeepLink(target);
   const notifId = target.notification ?? null;
 
-  let individualCount = 0;
-  let currentOverflow = 0;
-  for (const t of toasts.value) {
-    if (t.key === OVERFLOW_TOAST_KEY) {
-      const m = t.message.match(OVERFLOW_COUNT_PATTERN);
-      currentOverflow = m ? parseInt(m[1], 10) : 0;
-    } else if (t.key?.startsWith(NOTIFICATION_TOAST_PREFIX)) {
-      individualCount++;
-    }
-  }
+  const individualCount = toasts.value
+    .filter((t) => t.key?.startsWith(NOTIFICATION_TOAST_PREFIX)).length;
 
-  if (currentOverflow > 0 || individualCount >= MAX_INDIVIDUAL_TOASTS) {
-    showOverflowToast(currentOverflow + 1);
+  if (overflowIsShowing() || individualCount >= MAX_INDIVIDUAL_TOASTS) {
+    foldIntoOverflow(notifId);
     return;
   }
 
@@ -172,7 +184,7 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   // The title is the toast's HEADING, never glued onto the body's first line —
   // see composeToastMessage for why a structured body has to start on line 2.
   const message = composeToastMessage(safeTitle, body);
-  const toastKey = notifId ? `${NOTIFICATION_TOAST_PREFIX}${notifId}` : undefined;
+  const toastKey = notifId ? notificationToastKey(notifId) : undefined;
 
   // A `modal` or `navigate` notification gets a single [Open] button (rendered
   // right / primary via the Toast component's `action`) plus the toast's built-in
@@ -266,7 +278,45 @@ export function handleNotificationToastRequested(payload: NotificationToastReque
   });
 }
 
-function showOverflowToast(count: number): void {
+/** The notifications the overflow toast stands for.
+ *
+ *  It holds ids rather than a bare count, so a read can decrement it. A number
+ *  parsed back out of the rendered message could not. Authoritative only while
+ *  that toast is showing: a fold arriving with nothing on screen starts a fresh
+ *  pile, so a count the reader has cleared never returns. */
+const foldedNotifications = new Set<string>();
+let anonymousFolds = 0;
+
+function overflowIsShowing(): boolean {
+  return toasts.value.some((t) => t.key === OVERFLOW_TOAST_KEY);
+}
+
+function foldIntoOverflow(notifId: string | null): void {
+  if (!overflowIsShowing()) foldedNotifications.clear();
+  // An id-less notification gets an unkeyed toast, so no read can ever reach
+  // it. Give it a token nothing matches; only the count needs it to be there.
+  foldedNotifications.add(notifId ?? `anonymous-${++anonymousFolds}`);
+  showOverflowToast();
+}
+
+/** Drop one notification from the pile, and the toast with the last of them. */
+function unfoldFromOverflow(id: string): void {
+  if (!overflowIsShowing()) {
+    // A cleared pile stays cleared. `showToast` RAISES a toast for a key that
+    // is not on screen, so decrementing here would put the overflow toast back
+    // up. A read that raises a toast is the inverse of the rule. The route in
+    // is the toast's own tap: it dismisses and opens the Notifications panel,
+    // where reading a folded row is the next thing the reader does.
+    foldedNotifications.clear();
+    return;
+  }
+  if (!foldedNotifications.delete(id)) return;
+  if (foldedNotifications.size === 0) removeToast(OVERFLOW_TOAST_KEY);
+  else showOverflowToast();
+}
+
+function showOverflowToast(): void {
+  const count = foldedNotifications.size;
   const noun = count === 1 ? 'notification' : 'notifications';
   let opened = false;
   showToast(`+${count} more ${noun}`, 'info', {
@@ -278,4 +328,91 @@ function showOverflowToast(count: number): void {
       switchMenuItem('notifications');
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The toast's lifetime: it lasts as long as the row is unread
+// ---------------------------------------------------------------------------
+
+/** The ids whose toasts a read has made stale: held as unread a moment ago,
+ *  not any more.
+ *
+ *  A TRANSITION, never bare absence. A toast rides `NotificationToastRequested`
+ *  while the reload `NotificationCreated` kicked off is still in flight, so a
+ *  brand-new row reads as absent too. Dropping on absence would take down the
+ *  toast for a notification nobody has seen yet. */
+export function toastsToDrop(
+  previous: readonly string[],
+  current: readonly string[],
+): string[] {
+  const live = new Set(current);
+  return previous.filter((id) => !live.has(id));
+}
+
+/** Take down one notification's toast.
+ *
+ *  Structural removal. The row was read, not deferred by the reader, so this
+ *  must record no user dismissal: see `removeToast` vs `dismissToast`. */
+export function dropNotificationToast(id: string): void {
+  removeToast(notificationToastKey(id));
+  unfoldFromOverflow(id);
+}
+
+/** Take down every notification toast, for a Mark all read. */
+export function dropAllNotificationToasts(): void {
+  for (const t of toasts.value) {
+    if (t.key?.startsWith(NOTIFICATION_TOAST_PREFIX)) removeToast(t.key);
+  }
+  foldedNotifications.clear();
+  removeToast(OVERFLOW_TOAST_KEY);
+}
+
+/** The unread set as it stood at the last sample, or null before the first. */
+let lastUnreadIds: string[] | null = null;
+
+/** Drop the toast of every notification that just left the unread set.
+ *
+ *  The bell badge, the Unread tab and the toast are three projections of one
+ *  set. A row that is no longer unread can hold no surface. Reaching a tap
+ *  target is the case that reported this: the *seen target* rule marks the row
+ *  read and the badge falls, while the toast went on offering to open what was
+ *  already on screen. See system-knowhow/notifications.md §4.
+ *
+ *  This is the page's OWN picture, so it answers on the tick the reader acts.
+ *  A read it cannot see is the `NotificationRead` arm's to report, which is
+ *  slower by a round trip and authoritative. */
+function reconcileToastsWithUnread(set: Loadable<Notification[]>): void {
+  // Not knowing the unread set is not the same as knowing it is empty. Hold the
+  // baseline through a reconnect or a workspace switch, so neither clears a
+  // live toast, and the read that follows is still a transition.
+  if (set.status !== 'loaded') return;
+  const current = set.data.map((n) => n.id);
+  const previous = lastUnreadIds;
+  lastUnreadIds = current;
+  if (previous === null) return;
+  for (const id of toastsToDrop(previous, current)) dropNotificationToast(id);
+}
+
+let lifetimeInstalled = false;
+
+/** Subscribe the toasts to the unread set. Wired from `store/effects.ts`,
+ *  beside the seen target watch that is the loudest reason it exists.
+ *
+ *  Reading the set IS the subscription, and the work runs `untracked` because
+ *  it writes `toasts` after reading it. Tracked, the first drop would make
+ *  every toast in the app re-run this, and each drop would re-enter it. */
+export function installNotificationToastLifetime(): void {
+  if (lifetimeInstalled) return;
+  lifetimeInstalled = true;
+  effect(() => {
+    const set = unreadNotifications.value;
+    untracked(() => reconcileToastsWithUnread(set));
+  });
+}
+
+/** Test-only: forget the baseline and the pile so one suite cannot leak into
+ *  the next. The installed effect is a module-level singleton and stays. */
+export function _resetToastLifetimeForTesting(): void {
+  lastUnreadIds = null;
+  foldedNotifications.clear();
 }

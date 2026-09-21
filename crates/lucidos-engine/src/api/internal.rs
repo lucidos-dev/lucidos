@@ -117,7 +117,7 @@ pub(super) async fn permission_prompt(
 /// Two refusals, both narrowing to "the gateway, on behalf of a named device":
 ///
 ///  * A request that came THROUGH the gateway proxy is rejected (403). A page on
-///    the gateway origin, including a same-origin app iframe, could otherwise
+///    the gateway origin, including an app in its own tab, could otherwise
 ///    set this engine's restart actor and so defeat the crash-loop protection in
 ///    *cause-gated resume*. See `base_path::arrived_through_gateway_proxy` for
 ///    why provenance rather than peer address is the discriminator.

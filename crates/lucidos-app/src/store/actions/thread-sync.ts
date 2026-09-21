@@ -2,8 +2,9 @@ import { API } from '../../api/client';
 import type { Change } from '../../api/client';
 import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
+import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
@@ -12,6 +13,8 @@ import { dropDeletedThreads } from './threads-delete';
 import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
 import {
+  dropAllNotificationToasts,
+  dropNotificationToast,
   handleNotificationToastRequested,
   type NotificationToastRequestedPayload,
 } from './in-app-notification-toast';
@@ -301,11 +304,16 @@ export function connectThreadEvents(): void {
       // was closed, but its queued message handler can still fire.
       if (gen !== sseGeneration) return;
       handleHostFrame(data);
+      // An isolated app frame can open no stream of its own, so it reads this
+      // one. Verbatim, and after the shell's own handling, so a slow app never
+      // delays the shell's repaint.
+      fanOutEventFrame(data);
     },
 
     onOpen: () => {
       if (gen !== sseGeneration) return;
       markEventStreamStatus('connected');
+      fanOutEventStreamStatus('open');
       // Only resync after a reconnect. On the initial connect, useStartup.ts
       // already loads thread state. Without the flag we'd double-fetch on every
       // page load.
@@ -333,6 +341,7 @@ export function connectThreadEvents(): void {
       // the next successful connect must refetch persisted state.
       needsResyncOnOpen = true;
       markEventStreamStatus('disconnected');
+      fanOutEventStreamStatus('error');
 
       // A transport that retries for itself keeps its connection: the shared
       // worker owns the one upstream, and dropping our port would take that
@@ -885,7 +894,18 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
 
     case 'NotificationRead':
+      // The authoritative half of the toast's lifetime. The unread-set watch
+      // answers a read this page can see, on the tick the reader acts. This
+      // answers the two it cannot. One is a read made on another device. The
+      // other is a read landing before the reload that carries its row, where
+      // the id was never in the set to leave it. The engine emits this only on
+      // a real unread to read flip, so a redundant write cannot double it.
+      if (typeof data.id === 'string') dropNotificationToast(data.id);
+      handleNotificationSSE();
+      break;
+
     case 'NotificationsAllRead':
+      dropAllNotificationToasts();
       handleNotificationSSE();
       break;
 
@@ -972,6 +992,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // model picker keeps offering a provider the engine has just dropped.
       if (PROVIDER_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
         refreshLlmConfigured();
+      }
+      // The *style library* the editor renders is not the stored document: the
+      // engine merges it with what it ships, and only the engine holds the
+      // shipped half. So the cache reloaded above cannot answer, and Settings
+      // has to re-read `/response-styles`. Keyed, because a theme change must
+      // not spend a request on it.
+      if (String(data.key ?? '') === 'response_styles') {
+        responseStylesVersion.value++;
       }
       break;
     // The `set_language` and `set_timezone` chat-agent tools write the

@@ -907,14 +907,10 @@ fn engine_sources() -> Vec<(String, String)> {
     out
 }
 
-/// The block that handles each `apply_change` result in `source`.
-///
-/// A call is followed either by `{ … }` (its `if let Err` / `match` arms) or by
-/// a `;` and a later block over the bound result. Both are found the same way:
-/// take the first `{` after the call and read to its match. A commented-out
-/// call is skipped, so naming the method in prose costs nothing.
-fn apply_change_result_blocks(source: &str) -> Vec<&str> {
-    let mut blocks = Vec::new();
+/// Byte offset of every live `.apply_change(` call in `source`. A
+/// commented-out call is skipped, so naming the method in prose costs nothing.
+fn apply_change_call_offsets(source: &str) -> Vec<usize> {
+    let mut calls = Vec::new();
     let mut cursor = 0;
     while let Some(hit) = source[cursor..].find(".apply_change(") {
         let call = cursor + hit;
@@ -923,6 +919,84 @@ fn apply_change_result_blocks(source: &str) -> Vec<&str> {
         if source[line_start..call].contains("//") {
             continue;
         }
+        calls.push(call);
+    }
+    calls
+}
+
+/// Every file that calls `apply_change`, and why it may.
+///
+/// Two kinds, and the difference is who asked. A **requesting** surface acts
+/// for a person or an agent, and must ask
+/// `api::changes::change_action_refusal` first. An **internal** path runs on
+/// the engine's own schedule, while the thread legitimately reads running, and
+/// must not ask. Gating those would refuse a coding agent its own Apply Now.
+const APPLY_CHANGE_CALLERS: &[(&str, &str)] = &[
+    (
+        "api/changes.rs",
+        "requesting: the Apply button, via guard_change_action",
+    ),
+    (
+        "api/chat.rs",
+        "internal: auto-apply of the change a chat turn just produced",
+    ),
+    (
+        "engine/agent_session/apply_now.rs",
+        "internal: the session's own Apply Now, mid-turn by design",
+    ),
+    (
+        "engine/apply_all_driver.rs",
+        "internal: the batch driver, which drops unsettled members up front",
+    ),
+    (
+        "engine/claude_code/spawn.rs",
+        "internal: auto-apply once hardening finishes",
+    ),
+    (
+        "engine/standing_apply.rs",
+        "internal: the resolver, which fires BECAUSE the thread settled",
+    ),
+    (
+        "engine/tools/mod.rs",
+        "requesting: the `changes` LLM tool, via change_action_refusal",
+    ),
+];
+
+/// A new `apply_change` caller cannot land unclassified.
+///
+/// The `changes` LLM tool was exactly this gap. It merged a branch whose
+/// coding agent was mid-turn, because it was a requesting surface that nobody
+/// had enrolled. Whole-tree, so the next one inherits the question.
+#[test]
+fn every_apply_change_caller_is_classified() {
+    let mut found: Vec<String> = engine_sources()
+        .into_iter()
+        .filter(|(_, source)| !apply_change_call_offsets(source).is_empty())
+        .map(|(path, _)| path)
+        .collect();
+    found.sort();
+    let mut enrolled: Vec<String> = APPLY_CHANGE_CALLERS
+        .iter()
+        .map(|(path, _)| (*path).to_string())
+        .collect();
+    enrolled.sort();
+    assert_eq!(
+        found, enrolled,
+        "the set of apply_change callers moved. Add the file to APPLY_CHANGE_CALLERS with its \
+         reason. A surface a person or an agent drives must call \
+         api::changes::change_action_refusal first, or it will merge a branch whose coding agent \
+         is still writing to it. An engine-internal path must not."
+    );
+}
+
+/// The block that handles each `apply_change` result in `source`.
+///
+/// A call is followed either by `{ … }` (its `if let Err` / `match` arms) or by
+/// a `;` and a later block over the bound result. Both are found the same way:
+/// take the first `{` after the call and read to its match.
+fn apply_change_result_blocks(source: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    for call in apply_change_call_offsets(source) {
         let Some(open) = source[call..].find('{').map(|i| call + i) else {
             continue;
         };

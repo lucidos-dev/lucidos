@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, DiffButton } from '../WaitingBanner';
+import { getBannerActions, getWaitingState, getStandaloneActions, DiffButton } from '../WaitingBanner';
+import type { HeaderActionSpec } from '../../layout/headerActions';
 import {
   threadMap,
   focusedThreadId,
@@ -133,9 +134,22 @@ function splitProps(node: ComponentChildren): SplitProps {
   return (node as VNode<SplitProps>).props;
 }
 
-describe('getBannerSlots', () => {
-  it('actions state with an Apply action keeps Diff standalone; split menu holds only the other actions', () => {
-    const slots = getBannerSlots({
+/** What the composer row stamps on each member it renders. */
+const ROW_ATTRS = { 'data-row-item': 'fold' };
+
+/** A member's ROW rendering, which is what the assertions below look at. */
+function rowOf(member: HeaderActionSpec): ComponentChildren {
+  return member.render ? member.render(ROW_ATTRS) : null;
+}
+
+/** Every member's row rendering, in fold order. */
+function rows(members: HeaderActionSpec[]): ComponentChildren[] {
+  return members.map(rowOf);
+}
+
+describe('getBannerActions', () => {
+  it('keeps Diff its own member, ahead of the change actions', () => {
+    const members = getBannerActions({
       type: 'actions',
       actions: DISCARD_APPLY,
       threadId: 'tid',
@@ -143,16 +157,17 @@ describe('getBannerSlots', () => {
       showDiff: true,
     });
 
-    // Diff lives permanently outside the Apply/Discard cluster — its own
-    // standalone button in the liftable slot, never folded into the caret menu.
-    expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
-    const props = splitProps(slots.primary);
+    // Diff folds FIRST: looking is cheaper to postpone than doing. It is never
+    // folded into the Apply caret menu, which is a different thing entirely.
+    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'change-actions']);
+    expect(buttonLabels(rowOf(members[0]))).toEqual(['Diff']);
+    const props = splitProps(rowOf(members[1]));
     expect(props.primary.kind).toBe('apply');
     expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
   });
 
-  it('actions state with an Apply action but no diff has an empty liftable slot', () => {
-    const slots = getBannerSlots({
+  it('drops the Diff member when the branch has no diff', () => {
+    const members = getBannerActions({
       type: 'actions',
       actions: DISCARD_APPLY,
       threadId: 'tid',
@@ -160,14 +175,14 @@ describe('getBannerSlots', () => {
       showDiff: false,
     });
 
-    expect(slots.liftable).toBeNull();
-    const props = splitProps(slots.primary);
+    expect(members.map((m) => m.key)).toEqual(['change-actions']);
+    const props = splitProps(rowOf(members[0]));
     expect(props.primary.kind).toBe('apply');
     expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
   });
 
-  it('actions state on a non-CC thread hides the Diff button', () => {
-    const slots = getBannerSlots({
+  it('hides the Diff member on a thread whose branch has none', () => {
+    const members = getBannerActions({
       type: 'actions',
       actions: ARCHIVE_ONLY,
       threadId: 'tid',
@@ -175,27 +190,14 @@ describe('getBannerSlots', () => {
       showDiff: false,
     });
 
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
+    expect(members.map((m) => m.key)).toEqual(['archive']);
+    expect(buttonLabels(rows(members))).toEqual(['Archive']);
   });
 
-  it('CC thread with no diff hides the Diff button entirely', () => {
-    const slots = getBannerSlots({
-      type: 'actions',
-      actions: ARCHIVE_ONLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: false,
-    });
-
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
-  });
-
-  it('no-Apply actions state with showDiff puts a clickable Diff in liftable', () => {
-    // Archive-only (no Apply) keeps the separate-button path, so the Diff lifts
-    // into its own slot instead of folding into a split menu.
-    const slots = getBannerSlots({
+  it('gives each close-set button its own member when there is no Apply', () => {
+    // Archive-only keeps the separate-button path, so the row can fold one
+    // button without the other rather than treating the set as one thing.
+    const members = getBannerActions({
       type: 'actions',
       actions: ARCHIVE_ONLY,
       threadId: 'tid',
@@ -203,50 +205,56 @@ describe('getBannerSlots', () => {
       showDiff: true,
     });
 
-    expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
-    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
-    // Diff has no disabled form: both call sites render it only when the branch
-    // has a diff to show. The component takes a thread id and nothing else.
-    expect(diffNodes(slots.liftable).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'archive']);
+    expect(buttonLabels(rows(members))).toEqual(['Diff', 'Archive']);
+    // Diff has no disabled form: every call site renders it only when the
+    // branch has a diff to show. The face takes a thread id and nothing else.
+    expect(diffNodes(rowOf(members[0])).map((v) => v.props.threadId)).toEqual(['tid']);
   });
 
-  it('archiving state puts a disabled Archive... in primary; nothing liftable', () => {
-    const slots = getBannerSlots({
+  /** A request in flight is ONE member, and it folds like any other. A busy row
+   *  is not a reason to let a button leave the box. */
+  it('gives an archiving thread a disabled Archive... member', () => {
+    const members = getBannerActions({
       type: 'actions',
       actions: [],
       threadId: 'tid',
       isArchiving: true,
       showDiff: false,
     });
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Archive...']);
-    const [btn] = buttonNodes(slots.primary);
-    expect(btn.props.disabled).toBe(true);
+    expect(members.map((m) => m.key)).toEqual(['archiving']);
+    expect(buttonLabels(rows(members))).toEqual(['Archive...']);
+    expect(buttonNodes(rowOf(members[0]))[0].props.disabled).toBe(true);
+    // `disabledTooltip` is what makes the FOLDED row aria-disabled rather than
+    // a live action.
+    expect(members[0].disabledTooltip).toBe('Archive...');
   });
 
-  it('applying state puts Apply... in primary; nothing liftable', () => {
-    const slots = getBannerSlots({ type: 'applying' });
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Apply...']);
+  it('gives an applying thread a disabled Apply... member', () => {
+    const members = getBannerActions({ type: 'applying' });
+    expect(members.map((m) => m.key)).toEqual(['applying']);
+    expect(buttonLabels(rows(members))).toEqual(['Apply...']);
   });
 
-  it('discarding state puts Discard... in primary; nothing liftable', () => {
-    const slots = getBannerSlots({ type: 'discarding' });
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Discard...']);
+  it('gives a discarding thread a disabled Discard... member', () => {
+    const members = getBannerActions({ type: 'discarding' });
+    expect(members.map((m) => m.key)).toEqual(['discarding']);
+    expect(buttonLabels(rows(members))).toEqual(['Discard...']);
   });
 
-  it('no Apply action keeps the plain button row (nothing to make a primary face)', () => {
-    const slots = getBannerSlots({
+  /** The caret's actions would go with the fold, so the composite contributes
+   *  one menu row per action rather than one for the face. */
+  it('folds the split button into a row per action', () => {
+    const members = getBannerActions({
       type: 'actions',
-      actions: ARCHIVE_ONLY,
+      actions: DISCARD_APPLY,
       threadId: 'tid',
       isArchiving: false,
       showDiff: false,
     });
-
-    expect(slots.liftable).toBeNull();
-    expect(buttonLabels(slots.primary)).toEqual(['Archive']);
+    const ctx = { open: true, openedViaKeyboard: false, run: (fn: () => void) => () => fn(), anchor: null };
+    const menu = members[0].menuRows!(ctx);
+    expect(buttonLabels(menu)).toEqual(['Apply', 'Discard']);
   });
 });
 
@@ -353,9 +361,9 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     // "show me the diff for this thread's branch", never "show me what this
     // specific Change contained". viewChangeDiff stays for ChatExchange and
     // ChangesView; the WaitingBanner does not call it anymore. Diff is the
-    // standalone liftable button on every actions path (Apply or not), so this
-    // asserts the single `renderDiffButton` onClick both paths share.
-    const slots = getBannerSlots({
+    // own member on every actions path (Apply or not), so this asserts the one
+    // `diffAction` face both paths share.
+    const members = getBannerActions({
       type: 'actions',
       actions: ARCHIVE_ONLY,
       threadId: 'tid',
@@ -365,14 +373,14 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
 
     // One face, carrying the THREAD id. What it calls with that id is asserted
     // against the rendered component in `diff-button-touch.test.tsx`.
-    expect(diffNodes(slots.liftable).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(diffNodes(rows(members)).map((v) => v.props.threadId)).toEqual(['tid']);
     expect(viewChangeDiff).not.toHaveBeenCalled();
   });
 });
 
-describe('getStandaloneCcDiffButton', () => {
-  // The standalone Diff button is rendered by PromptInput when the in-banner
-  // Diff (from getBannerSlots) is not in play — most importantly during
+describe('getStandaloneActions', () => {
+  // The standalone members are what PromptInput carries when the in-banner set
+  // (from getBannerActions) is not in play, most importantly during
   // mid-turn (waitingState='canceling'), where the banner is suppressed but
   // the branch already has commits to diff. "Branch has commits → Diff
   // visible" is the user-facing rule; the data layer already exposes that
@@ -386,9 +394,9 @@ describe('getStandaloneCcDiffButton', () => {
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
-    const node = getStandaloneCcDiffButton();
-    expect(buttonLabels(node)).toEqual(['Diff']);
-    expect(diffNodes(node).map((v) => v.props.threadId)).toEqual(['t1']);
+    const members = getStandaloneActions();
+    expect(members.map((m) => m.key)).toContain('thread-diff');
+    expect(diffNodes(rows(members)).map((v) => v.props.threadId)).toEqual(['t1']);
   });
 
   it('returns null when codingAgentHasDiff=false', () => {
@@ -399,7 +407,7 @@ describe('getStandaloneCcDiffButton', () => {
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
-    expect(getStandaloneCcDiffButton()).toBeNull();
+    expect(getStandaloneActions().map((m) => m.key)).not.toContain('thread-diff');
   });
 
   it('returns null for non-CC (chat) thread even when something thinks it has a diff', () => {
@@ -412,12 +420,12 @@ describe('getStandaloneCcDiffButton', () => {
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
-    expect(getStandaloneCcDiffButton()).toBeNull();
+    expect(getStandaloneActions().map((m) => m.key)).not.toContain('thread-diff');
   });
 
   it('returns null when no thread is focused', () => {
     focusedThreadId.value = null;
-    expect(getStandaloneCcDiffButton()).toBeNull();
+    expect(getStandaloneActions()).toEqual([]);
   });
 
   it('hands the FOCUSED thread id to the Diff face', () => {
@@ -430,7 +438,7 @@ describe('getStandaloneCcDiffButton', () => {
     threadMap.value = new Map([['tid', thread]]);
     focusedThreadId.value = 'tid';
 
-    expect(diffNodes(getStandaloneCcDiffButton()).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(diffNodes(rows(getStandaloneActions())).map((v) => v.props.threadId)).toEqual(['tid']);
     expect(viewChangeDiff).not.toHaveBeenCalled();
   });
 });

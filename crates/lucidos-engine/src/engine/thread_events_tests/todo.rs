@@ -29,6 +29,29 @@ fn todo_status_serializes_as_snake_case() {
     );
 }
 
+/// The word `todo_write` reads back to the agent is the word the agent writes.
+///
+/// A drift here would answer `in progress` for a status the schema accepts
+/// only as `in_progress`. The agent would then copy back a refused value.
+#[test]
+fn status_word_matches_the_wire_spelling() {
+    use crate::engine::thread_events::TodoStatus;
+    for status in [
+        TodoStatus::Pending,
+        TodoStatus::InProgress,
+        TodoStatus::Completed,
+        TodoStatus::Waiting,
+        TodoStatus::Abandoned,
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            json!(status.as_str()),
+            "{:?} spells itself two ways",
+            status
+        );
+    }
+}
+
 /// `Completed` and `Abandoned` are terminal; everything else a response
 /// terminator may still rewrite. `Waiting` being OPEN is what stops a parked
 /// list reading as parked forever once its wait resolves.

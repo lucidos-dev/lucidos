@@ -1,4 +1,10 @@
 import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import {
     INITIAL_WINDOW,
     MAX_FILL_EXPANSIONS,
@@ -22,7 +28,10 @@ import {
     seedRowsHidden,
     seedWindowEdge,
     scrollToTopNeedsRenderAll,
-    windowNeedsFill,
+    reseedOnReopen,
+    fillAction,
+    transcriptScrolls,
+    MAX_FILL_BACKFILLS,
     type WindowEdge,
 } from './threadWindow';
 
@@ -39,7 +48,7 @@ const REPORTED_THREAD = [23, 80, 10, 52, 47, 7, 12, 53, 11, 60, 32, 32, 53, 23, 
 /** Two more reported threads' real turn sizes, oldest first, read out of the
  *  workspace event log. Both are coding-agent threads ending on a small
  *  `ChangeApplied` boundary behind a huge working turn, which is the shape
- *  `windowNeedsFill` exists for. */
+ *  `fillAction` exists for. */
 const ARCHIVED_THREAD = [357, 1, 115, 0, 0, 2, 0, 288, 7].map(steps => steps + 1);
 const SKELETON_THREAD = [177, 1, 323, 1].map(steps => steps + 1);
 
@@ -182,19 +191,39 @@ describe('thread render windowing', () => {
         });
     });
 
-    describe('windowNeedsFill', () => {
+    describe('fillAction', () => {
+        /** A thread served whole: nothing older is coming. */
+        const whole = (v: ReturnType<typeof view>, edge: WindowEdge) => fillAction(v, edge, false);
+
         it('asks nothing once the whole thread is rendered', () => {
-            expect(windowNeedsFill(view(120), edgeOf(5, INITIAL_WINDOW))).toBe(false);
-            expect(windowNeedsFill(view(120), edgeOf(1000, Infinity))).toBe(false);
+            expect(whole(view(120), edgeOf(5, INITIAL_WINDOW))).toBe('none');
+            expect(whole(view(120), edgeOf(1000, Infinity))).toBe('none');
         });
 
-        it('is true while a windowed slice is shorter than the pane', () => {
-            expect(windowNeedsFill(view(120), edgeOf(9, 1))).toBe(true);
-            expect(windowNeedsFill(view(800 + SCROLLABLE_SLACK_PX), edgeOf(9, 1))).toBe(true);
+        it('grows while a windowed slice is shorter than the pane', () => {
+            expect(whole(view(120), edgeOf(9, 1))).toBe('grow');
+            expect(whole(view(800 + SCROLLABLE_SLACK_PX), edgeOf(9, 1))).toBe('grow');
         });
 
-        it('is false once the slice overflows by more than the slack', () => {
-            expect(windowNeedsFill(view(800 + SCROLLABLE_SLACK_PX + 1), edgeOf(9, 1))).toBe(false);
+        it('stops once the slice overflows by more than the slack', () => {
+            expect(whole(view(800 + SCROLLABLE_SLACK_PX + 1), edgeOf(9, 1))).toBe('none');
+            expect(transcriptScrolls(view(800 + SCROLLABLE_SLACK_PX + 1))).toBe(true);
+            expect(transcriptScrolls(view(800 + SCROLLABLE_SLACK_PX))).toBe(false);
+        });
+
+        /** The reported stick. Every turn this client held was already
+         *  rendered, so nothing was left to grow. Meanwhile 662 events sat on
+         *  the server, behind a scroll event a short transcript never fires. */
+        it('pages when the window is out of loaded turns and the server has more', () => {
+            expect(fillAction(view(120), WHOLE_THREAD, true)).toBe('page');
+        });
+
+        it('grows before it pages, so a page is asked for only when owed', () => {
+            expect(fillAction(view(120), edgeOf(9, 1), true)).toBe('grow');
+        });
+
+        it('never pages a transcript the reader can already scroll', () => {
+            expect(fillAction(view(4000), WHOLE_THREAD, true)).toBe('none');
         });
 
         it('seeds both reported threads to a single trailing card', () => {
@@ -205,12 +234,12 @@ describe('thread render windowing', () => {
         it('fills that card, so scrolling can take the window over', () => {
             for (const costs of [ARCHIVED_THREAD, SKELETON_THREAD]) {
                 const seeded = seedRenderCount(costs);
-                expect(windowNeedsFill(view(200), edgeOf(costs.length, seeded))).toBe(true);
+                expect(whole(view(200), edgeOf(costs.length, seeded))).toBe('grow');
                 const filled = expandRenderCount(costs, seeded);
                 // One round takes the working turn behind the boundary, which
                 // is the biggest turn in either thread.
                 expect(filled).toBe(2);
-                expect(windowNeedsFill(view(4000), edgeOf(costs.length, filled))).toBe(false);
+                expect(whole(view(4000), edgeOf(costs.length, filled))).toBe('none');
             }
         });
 
@@ -220,12 +249,57 @@ describe('thread render windowing', () => {
             const costs = flat(200, STEP_BUDGET * 2);
             let count = seedRenderCount(costs);
             let rounds = 0;
-            while (windowNeedsFill(view(0), edgeOf(costs.length, count)) && rounds < MAX_FILL_EXPANSIONS) {
+            while (whole(view(0), edgeOf(costs.length, count)) === 'grow' && rounds < MAX_FILL_EXPANSIONS) {
                 count = expandRenderCount(costs, count);
                 rounds++;
             }
             expect(rounds).toBe(MAX_FILL_EXPANSIONS);
             expect(count).toBe(1 + MAX_FILL_EXPANSIONS);
+        });
+
+        /** The page arm answers from the SERVER's watermark, so it keeps saying
+         *  `'page'` while a page draws no height. Nothing here can end that,
+         *  which is exactly why `MAX_FILL_BACKFILLS` exists in the caller. A
+         *  loop written against this function alone would only ever prove its
+         *  own counter, so the cap is asserted where it lives. */
+        it('never ends a loop of pages by itself', () => {
+            expect(fillAction(view(0), WHOLE_THREAD, true)).toBe('page');
+            expect(MAX_FILL_BACKFILLS).toBeGreaterThan(0);
+            const threadView = readFileSync(
+                resolve(dirname(fileURLToPath(import.meta.url)), 'ThreadView.tsx'), 'utf-8');
+            // BOTH halves. A guard over a counter nothing increments reads
+            // `0 >= 4` for ever, and every suite stays green while the fill
+            // pages without bound.
+            expect(threadView).toContain('if (pages >= MAX_FILL_BACKFILLS) return;');
+            expect(threadView).toContain('fillBackfillsByThread.set(threadId, pages + 1);');
+        });
+
+        it('ends the moment the server says nothing is older', () => {
+            expect(fillAction(view(0), WHOLE_THREAD, false)).toBe('none');
+        });
+    });
+
+    /** A render-all is a NAVIGATION's claim, and it used to outlive the visit
+     *  that made it. One reported thread paid 4,069 rendered rows on every open
+     *  afterwards, against the 37 its window would have drawn. */
+    describe('reseedOnReopen', () => {
+        it('drops a render-all the last visit left behind', () => {
+            expect(reseedOnReopen(WHOLE_THREAD, false)).toBe(true);
+        });
+
+        it('keeps the one THIS visit is asking for', () => {
+            expect(reseedOnReopen(WHOLE_THREAD, true)).toBe(false);
+        });
+
+        /** The reader grew this one by scrolling. It describes where they are,
+         *  and re-seeding would make them walk back up on every return. */
+        it('keeps a partial edge, whichever dimension is partial', () => {
+            expect(reseedOnReopen({ exchange: 4, rowsHidden: 0 }, false)).toBe(false);
+            expect(reseedOnReopen({ exchange: 0, rowsHidden: 40 }, false)).toBe(false);
+        });
+
+        it('leaves a thread with no stored edge to the ordinary seed', () => {
+            expect(reseedOnReopen(undefined, false)).toBe(false);
         });
     });
 
@@ -299,7 +373,7 @@ describe('thread render windowing', () => {
 
     /* The window's promise is about POSITION. `renderCountByThread` held a SIZE,
      * so appending a turn slid the window forward and dropped the oldest one out
-     * of the DOM. `windowNeedsFill` grew it back only while the transcript was
+     * of the DOM. `fillAction` grew it back only while the transcript was
      * too short to scroll, which a 375px pane leaves behind in two turns. */
     describe('a turn appended after the seed', () => {
         it('never pushes an already-rendered turn out of the window', () => {

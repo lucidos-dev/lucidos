@@ -35,7 +35,8 @@ import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
 import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
-import { loadAllThreads } from './thread-loading';
+import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
+import { loadAllThreads, loadThreadEvents } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
 
 // Mock the API module
@@ -298,6 +299,80 @@ describe('focusThread', () => {
     }
   });
 
+});
+
+// ---------------------------------------------------------------------------
+// The perf open mark
+//
+// `thread-render` is the only sample that measures a thread open, and the mark
+// is what arms it. The mark used to be stamped under `loadThreadEvents`'
+// `eventsLoaded` early return, so only a thread's FIRST open of the session
+// recorded anything. Back / forward between visited threads was invisible,
+// which is the navigation a reader is most likely to call slow.
+// ---------------------------------------------------------------------------
+
+describe('the perf open mark', () => {
+  beforeEach(() => _resetThreadOpenMarksForTesting());
+
+  function withThread(id: string, eventsLoaded: boolean) {
+    const map = new Map<string, ThreadState>();
+    map.set(id, makeThreadState(id, { eventsLoaded }));
+    threadMap.value = map;
+  }
+
+  it('stamps a WARM open, so thread-to-thread navigation is measured', () => {
+    withThread('warm', true);
+
+    focusThread('warm');
+
+    expect(takeThreadOpenStart('warm')?.warm).toBe(true);
+  });
+
+  it('stamps a COLD open, and says it is the fetching kind', () => {
+    withThread('cold', false);
+
+    focusThread('cold');
+
+    expect(takeThreadOpenStart('cold')?.warm).toBe(false);
+  });
+
+  it('leaves no mark on a thread nobody is looking at', () => {
+    // loadAllThreads eagerly loads non-focused threads. A mark left on one
+    // would be taken by a much later render and report a renderMs in minutes.
+    withThread('background', true);
+    focusedThreadId.value = 'somewhere-else';
+
+    void loadThreadEvents('background');
+
+    expect(takeThreadOpenStart('background')).toBeUndefined();
+  });
+
+  // The two below are the same failure reached two ways: a mark laid where no
+  // render follows. The next streamed event changes the exchange count and
+  // consumes it, so the sample reports however long the reader sat still as a
+  // render. Only a focus TRANSITION may stamp.
+
+  it('does not re-stamp when the reader re-taps the thread already open', () => {
+    withThread('t', true);
+    focusThread('t');
+    expect(takeThreadOpenStart('t')?.warm).toBe(true); // the real open
+
+    focusThread('t'); // re-tap: renders nothing
+
+    expect(takeThreadOpenStart('t')).toBeUndefined();
+  });
+
+  it('does not stamp when a resync reloads the focused thread', () => {
+    // loadAllThreads reloads the focused thread on every SSE reopen, Lagged
+    // and iOS PWA wake. A warm one fetches nothing, so it is not an open.
+    withThread('t', true);
+    focusThread('t');
+    takeThreadOpenStart('t'); // consume the real open's mark
+
+    void loadThreadEvents('t');
+
+    expect(takeThreadOpenStart('t')).toBeUndefined();
+  });
 });
 
 describe('unfocusThread', () => {

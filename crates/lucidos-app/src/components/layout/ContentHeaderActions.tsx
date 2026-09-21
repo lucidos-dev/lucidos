@@ -1,9 +1,12 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { lucidos } from '@lucidos/sdk';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen, repositories, workspacePath } from '../../store/store';
+import { loadedOr } from '../../store/types';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { wrapToggleAvailable } from '../../store/previewWrap';
-import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
+import { closeUrl, openLocalFile, openUrlOutsideApp, refreshFilePreview } from '../../store/actions/artifacts';
+import { previewDiskPath } from '../../utils/previewPath';
 import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch, popOutApp } from '../../store/actions/apps';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon } from '../shared/icons';
@@ -27,31 +30,90 @@ const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   anchor: '.notifications-bell',
 };
 
+/** One control that takes something out of the shell, given the sink this
+ *  platform can actually reach.
+ *
+ *  Shared by the two of them (the open app, the previewed file) because the
+ *  platform question is one question. An installed iOS PWA gets nothing: it
+ *  cannot open a same-origin link anywhere but its own inescapable in-app web
+ *  view, a limitation every WebKit-based iOS browser shares.
+ *
+ *  A browser gets a real anchor, so cmd-click, middle-click and "copy link
+ *  address" all work. The packaged desktop client gets a button, because its
+ *  WKWebView silently drops a `target="_blank"` navigation and there are no tabs
+ *  there to open one in. The caller hands it the OS opener instead. */
+function popoutSpec(
+  extraClass: string,
+  label: string,
+  sink: { href: string | null } | { onClick: () => void },
+): HeaderActionSpec | null {
+  if (isIOSPwa()) return null;
+  return { key: 'open-in-tab', icon: () => <PopOutIcon />, extraClass, label, ...sink };
+}
+
 /** The control that takes the open app out of the shell and into a top-level
  *  page of its own, or null where the platform cannot offer one.
  *
  *  Exported so the platform decision is testable without standing the header up:
  *  which of the two shapes is returned is the whole bug fix, and neither shape
  *  is observable from the rendered markup alone (a dead anchor and a live one
- *  look identical).
- *
- *  Three platforms, three answers. An installed iOS PWA gets nothing: it cannot
- *  open a same-origin link anywhere but its own inescapable in-app web view (a
- *  limitation every WebKit-based iOS browser shares). A browser gets a real
- *  anchor, so cmd-click, middle-click and "copy link address" all work. The
- *  packaged desktop client gets a button, because its WKWebView silently drops
- *  a `target="_blank"` navigation, and there are no tabs there to open one in:
- *  see `popOutApp`, which hands the URL to the OS opener instead. */
+ *  look identical). */
 export function appPopoutAction(): HeaderActionSpec | null {
-  if (isIOSPwa()) return null;
-  const spec = {
-    key: 'open-in-tab',
-    icon: () => <PopOutIcon />,
-    extraClass: 'app-open-in-tab',
-  };
   return isTauri()
-    ? { ...spec, label: 'Open in browser', onClick: () => popOutApp() }
-    : { ...spec, label: 'Open in new tab', href: getAppFrameSrc() };
+    ? popoutSpec('app-open-in-tab', 'Open in browser', { onClick: () => popOutApp() })
+    : popoutSpec('app-open-in-tab', 'Open in new tab', { href: getAppFrameSrc() });
+}
+
+/** What the packaged desktop client's control says. Not "browser", because the
+ *  OS picks the handler: a report opens in the browser, a `.png` in the image
+ *  viewer, a `.rs` in the editor. */
+const OPEN_ON_DESKTOP = 'Open in default app';
+
+/** Resolved against this document, so the gateway origin, its port and the
+ *  workspace slug prefix all survive the hop out to the OS.
+ *
+ *  `lucidos.data.url` returns a ROOT-RELATIVE path, which an anchor resolves for
+ *  free and the OS opener does not: `open /dev/data/x.html` reads it as a
+ *  filesystem path and finds nothing there. Same reason `popOutApp` does it. */
+function absoluteUrl(url: string): string {
+  try {
+    return new URL(url, location.href).href;
+  } catch {
+    return url;
+  }
+}
+
+/** The control that takes the previewed file out of the shell, or null where
+ *  this platform cannot open this locator anywhere.
+ *
+ *  The desktop client hands the REAL FILE to the OS opener, which is what the
+ *  user asked for. It is also the only route a repo file has, being read at a
+ *  git ref with no `/data/` URL of its own. What it opens is the working tree,
+ *  so a repo preview at a ref can differ from it.
+ *
+ *  Everywhere else it is the engine's `/data/` URL in a new tab, since no page
+ *  may navigate to `file://`. That leaves a repo file with no control in a
+ *  browser, which is the honest answer rather than a dead button.
+ *
+ *  An artifact that TALKS to the workspace, rather than just showing something,
+ *  belongs in an app: opened from disk it is a `file://` document and the API is
+ *  another origin from there. Apps have their own popout, right above. */
+export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | null {
+  // A repo file has no `/data/` URL at all; `previewDiskPath` covers the data
+  // paths that have no file under the workspace either.
+  const url = parseRepoPath(encoded) ? null : lucidos.data.url(encoded);
+  if (!isTauri()) {
+    return url === null ? null : popoutSpec('file-open-in-tab', 'Open in new tab', { href: url });
+  }
+  const disk = previewDiskPath(encoded, workspacePath.value, loadedOr(repositories.value, []));
+  if (disk) return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openLocalFile(disk) });
+  // No file of our own to hand over (`system-knowhow/`, or a clone we have not
+  // loaded yet). The OS opener takes the URL just as well, and resolves it to
+  // the same default browser. Absolute, or it reads as a path.
+  if (url) {
+    return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openUrlOutsideApp(absoluteUrl(url)) });
+  }
+  return null;
 }
 
 interface Props {
@@ -216,6 +278,10 @@ export function ContentHeaderActions({ layout }: Props) {
         'Refresh',
         isDiff ? 'Diff is fixed to this change' : undefined,
       ));
+      // Second, mirroring where the app header puts its own popout, so the two
+      // content views agree about where "take this out of the shell" lives.
+      const popout = filePreviewPopoutAction(overlay.path);
+      if (popout) addAction(popout);
       // Diff-only: toggle between the unified hunks and the whole file in its
       // merged end state. Orthogonal to the source/rendered toggle below. Read
       // the effective state (which carries the added-file default) so the icon

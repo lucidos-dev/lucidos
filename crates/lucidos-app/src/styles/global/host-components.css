@@ -789,6 +789,14 @@ html[data-theme="dark"] .split-button.open::before {
      * `max-content` makes offsetWidth equal the rendered content width. */
     width: max-content;
     min-width: 12rem;
+    /* And a ceiling on that, because `max-content` trusts the longest row. A
+     * row's words are usually a verb, but the composer folds two STATUS
+     * readouts in here and each says its state in words. A waiting indicator
+     * reports the model's own sentence, which made the menu wider than the
+     * phone: `computeAnchorPosition` can only clamp a panel that FITS, so it
+     * pinned to the left margin and ran off the right edge. Capped, the row
+     * wraps instead (see `.thread-overflow-item`). */
+    max-width: min(22rem, calc(100vw - 1rem));
     padding: 0.25rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
@@ -811,7 +819,26 @@ html[data-theme="dark"] .split-button.open::before {
     font-family: var(--font-ui);
     text-align: left;
     cursor: pointer;
-    white-space: nowrap;
+    /* A row wraps rather than running out of the menu. Dropping the old
+     * `nowrap` costs nothing while the menu sizes to `max-content`: a row can
+     * only wrap once the cap above binds, and there wrapping is the point.
+     * `anywhere` covers a label that is one long token, such as an event type
+     * or a path. */
+    overflow-wrap: anywhere;
+}
+
+/* A folded action's words, capped at two lines with an ellipsis. The row is
+ * flex, so the cap needs a box of its own: an anonymous flex item has nothing
+ * for `text-overflow` to act on. `min-width: 0` lets it shrink below its
+ * longest word, which is what makes the cap above bind instead of the row
+ * pushing the menu wider. */
+.thread-overflow-label {
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
 }
 
 .thread-overflow-item svg {
@@ -871,8 +898,8 @@ html[data-theme="dark"] .split-button.open::before {
 }
 
 /* A muted line under a group of overflow rows, saying something about them
- * rather than offering another action. It is the one thing in this menu that
- * wraps, so it carries its own width. */
+ * rather than offering another action. It wraps at its own width rather than
+ * at the menu's cap, because it is a sentence and the rows are labels. */
 .thread-overflow-note {
     max-width: 16rem;
     padding: 0.25rem 0.625rem 0.375rem;

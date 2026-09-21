@@ -9,6 +9,32 @@ use crate::llm::tool_names as tn;
 /// frontend `initPushSubscription()` handshake.
 const PUSH_ENABLED_REPLY: &str = "[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled for this device. Tell the user what to expect, keyed off the current request device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app — notifications arrive as native macOS notifications governed by System Settings → Notifications (macOS asks for permission on first launch; if no banner appears, allow Lucidos there); do NOT mention browser permission or site settings. Otherwise they are in a web browser or installed PWA — the browser will now ask for notification permission and they should click Allow. Note: in a development build (tauri-dev) native desktop banners don't appear at all — run Lucidos in a browser/PWA to receive notifications while developing. Either way, they'll get notifications for triggered tasks and alerts.";
 
+/// Longest stored value `get_preferences` prints in full.
+///
+/// Most preferences are an id, a tier or a boolean, so this never fires for
+/// them. The *style library* is the one key whose value is a document, and the
+/// listing prints every key on every call.
+const MAX_LISTED_VALUE_CHARS: usize = 200;
+
+/// What `get_preferences` shows for one stored value.
+///
+/// A long value is summarised rather than printed. The listing is billed on
+/// every call, and the style library alone may hold 20 instructions of 1,000
+/// characters. The summary still says the value is there and how long it is,
+/// which is what the agent needs to decide its next call.
+fn summarize_pref_value(value: &str) -> String {
+    let len = value.chars().count();
+    if len <= MAX_LISTED_VALUE_CHARS {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(MAX_LISTED_VALUE_CHARS).collect();
+    format!(
+        "{head}… (truncated here; {len} characters stored. This key REPLACES the \
+         whole value, so read it in full first with `lucidos preferences get` via \
+         run_bash, or you will overwrite what you cannot see.)"
+    )
+}
+
 /// Format a duration suffix like " (3m 12s)" from an optional start + an end
 /// time, or "" when the start time is unknown (legacy run records). Used by the
 /// `get_backup_status` surface.
@@ -331,11 +357,18 @@ impl LucidosEngine {
         let effect_note = match key {
             "chat_model" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
             "chat_reasoning_effort" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current reasoning effort (whatever it last used), so this preference change does NOT change the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
+            // A turn builds its system prompt once, at setup. So the style the
+            // user just asked for lands on their NEXT message, and claiming
+            // otherwise makes this very reply read as a broken promise.
+            "response_style" | "response_styles" => " It applies from the next message, in this thread and every other: a turn builds its prompt once at the start, so this one finishes in the style it began in. It covers triggers too, and it does NOT change coding-agent sessions.",
             _ => " Open Lucidos views pick this up automatically.",
         };
         Ok(format!(
             "[ACTION COMPLETED] {} set to '{}'{}.{}",
-            spec.label, value, scope_note, effect_note
+            spec.label,
+            summarize_pref_value(value),
+            scope_note,
+            effect_note
         ))
     }
 
@@ -355,6 +388,8 @@ impl LucidosEngine {
         let mut out = String::from(
             "Settable preferences — set with set_preference(key, value). Device-scoped keys apply to the calling device only.\n",
         );
+        // NOTE: the loop below renders one line per key, so a value that can be
+        // kilobytes has to be summarised. See `summarize_pref_value`.
         for spec in preference_catalog::CATALOG {
             // An empty stored value is named, never rendered as `(unset)` or
             // as a blank. It states the STATE, which is true of every key: the
@@ -363,9 +398,9 @@ impl LucidosEngine {
             // `voice_resident_sections`, where an empty row means no sections
             // and an absent one means the three defaults.
             let current = match effective.get(spec.key).map(String::as_str) {
-                None => "(unset)",
-                Some("") => "(empty)",
-                Some(v) => v,
+                None => "(unset)".to_string(),
+                Some("") => "(empty)".to_string(),
+                Some(v) => summarize_pref_value(v),
             };
             let scope = match spec.scope {
                 PrefScope::Device => "device",

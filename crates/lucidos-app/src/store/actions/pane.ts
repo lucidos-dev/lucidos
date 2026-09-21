@@ -3,7 +3,9 @@ import {
   DEFAULT_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
   MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView,
   focusedPane, type FocusedPane,
+  activeMenuItem, panelOverlay, settingsSubview,
 } from '../store';
+import { contentViewKey } from '../../components/layout/contentViewKey';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx, splitBounds } from '../paneMinimums';
 import { forceCloseDrawer } from '../../components/layout/Drawer';
 import {
@@ -14,6 +16,7 @@ import {
 } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
 import { focusPaneMainControl, reconcilePaneFocus } from '../../components/layout/paneFocus';
+import { markNavigationStart } from '../../utils/navigationMarks';
 
 /** Set the focused pane AND move real DOM focus into it. Used by the keyboard
  *  toggles/shortcuts so "focus pane" actually lands focus on the pane's main
@@ -43,6 +46,11 @@ export function resolveSwipePane(delta: number): MobileView | null {
  *  is handled entirely in-app via MobileSwipeContainer's touch handler
  *  and the edge swipe zones that sit above iframes. */
 export function navigateToPane(view: MobileView) {
+  // Stamped BEFORE the signal write, so the span covers the render this call is
+  // about to trigger. `MobileSwipeContainer` fires it on the next paint. A
+  // re-tap of the current pane still stamps and fires nothing, so its mark is
+  // replaced by the next navigation.
+  markNavigationStart('pane', view, performance.now());
   forceCloseDrawer();
   // Drawer can only be open on the thread pane (per the consistency invariant
   // in checkPaneConsistency). Keep it open when navigating *to* 'thread' so the
@@ -65,9 +73,23 @@ export function navigateToPane(view: MobileView) {
  *  link is never silently absorbed when the pane is closed. */
 export function revealContentPane() {
   if (isMobile()) {
+    // `navigateToPane` stamps the mark for this one. Mobile reveals ARE pane
+    // swaps, and a second stamp would only overwrite it at the same instant.
     navigateToPane('content');
     return;
   }
+  // `ContentPane`'s view-key effect fires this, and the key it must see is
+  // already in the store: every caller sets the overlay or the menu item BEFORE
+  // revealing. Naming it here is what makes a no-op reveal harmless. Expanding
+  // a collapsed pane onto the view it already holds changes no key, so no
+  // effect runs. An unrelated view change soon after then refuses the mark,
+  // rather than reporting itself from this reveal's start.
+  markNavigationStart(
+    'content',
+    'content-pane',
+    performance.now(),
+    contentViewKey(activeMenuItem.value, panelOverlay.value, settingsSubview.value),
+  );
   focusedPane.value = 'content';
   if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
   reconcilePaneFocus('content');
@@ -104,9 +126,15 @@ export function revealContentPane() {
  *  same way it is for content (see frontend.md). */
 export function revealThreadPane(): void {
   if (isMobile()) {
+    // Stamped by `navigateToPane`, for the reason `revealContentPane` states.
     navigateToPane('thread');
     return;
   }
+  // NO stamp on desktop, deliberately. Landing on a thread changes no content
+  // view key and mounts no swipe container, so neither fire point would ever
+  // take it: the mark would sit until some later content navigation read the
+  // idle gap as its own span. `thread-render` already measures this edge, and
+  // its `warm` flag is what marks thread-to-thread back and forth.
   const wasCollapsed = splitRatio.value <= 0;
   if (wasCollapsed) setSplitRatio(DEFAULT_SPLIT_RATIO);
   if (wasCollapsed || focusedPane.value === 'content') {

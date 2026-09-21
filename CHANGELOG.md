@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.39.0 — 2026-09-21
+
+### Added
+
+- Response styles. Pick how the agent writes, edit a style, or add your own, under Settings. The chosen style reaches the chat system prompt.
+- TypeSafe (Jev) as a judgment backend. It sits in the model picker as its own row with the switch every other provider row has, and it answers closed-set questions with calibrated probabilities. Query classification and the command-safety guard can each run on it, and the agent can ask for a typed judgment itself.
+- Claude Fable 5.1 in the model picker, for chat and for Claude Code sessions.
+- A bar that says webhook deliveries are being thrown away. It names the run, its cause, and how long the refusals have been going on.
+- Filter the plugin catalog by marketplace, from a dropdown that also adds one.
+- Open a previewed file outside Lucidos, in whatever your OS opens it with.
+- `lucidos.request` in the SDK. An app frame reaches the engine through a route table the engine itself publishes, and every route declares whether an app may reach it.
+
+### Changed
+
+- A long thread opens fast. A cold open loads the newest page and knows its floor; scrolling or keying past the loaded edge fetches the page behind it. A position naming a turn the loaded pages do not hold opens at the newest page rather than chasing history.
+- App frames run in their own renderer process, with a host bridge for what an isolated frame cannot do itself. An app loads its own assets with no cookie, reads its own device's preferences, and gets its first-paint appearance from the engine.
+- An app frame reads environment variables and never writes them.
+- The composer's icon row folds its middle into a menu, and the composer rests at one line on a phone.
+- The Update button says what the new version brings before you take it.
+- The todo indicator lights for one state only, the turn opens with the list when anything is unfinished, and the todo tool answers with the list it just wrote.
+- A chat tool call's arguments are stripped from the thread record, as its results already were.
+- The workspace audit runs every check in one pass, can run a single check alone, and prints a receipt for each section it scanned.
+- The composer's press log names a silence. A wedge whose only signature was an empty log now writes one line: checks are running, the keyboard has closed, and nothing has been touched since.
+
+### Fixed
+
+- The composer comes back the moment the keyboard closes, instead of after a minute of tapping. On an iPhone the page sometimes stops receiving touches entirely once the keys go, while every reading the page can take says it is healthy. The shell is relaid out at that exact moment, invisibly, which is what frees it.
+- On a phone, a focused field scrolls back above the keyboard, and the strip iOS floats its keyboard bar over is reserved.
+- Background tools and scheduled scripts redact injected credentials. A child that echoed its environment used to write live credentials into the drain you read, the persisted event, and a trigger's summary.
+- A markdown table or image in a message cannot smuggle an attribute out of a cell, forge a copy control, or splice into a tag a sanitizer guessed at. Each pass parses instead of matching.
+- The reading position follows a fold that renames the top turn, and a deep link lands on the turn it names.
+- Asking the agent to apply a change no longer merges a branch its coding agent is still writing to. It points at "apply as it settles" instead, so the change lands the moment that thread finishes.
+- A notification's toast goes when the notification does. Arriving at the thread a notification points into no longer leaves a toast offering to open what you are already looking at, on any device.
+- A refused preference write is no longer reported as saved.
+- A push subscription names a real push service or is refused.
+- Disk-usage cleanup refuses a worktree a live coding agent is using.
+- A pinch keeps the panel it is steering, and spends distance one step per frame.
+- The tray's unread count sits against the mark rather than a column out, and a toast lives as long as its row is unread.
+- A window is not moved to a desk with no monitor that could hold it, and a frame the client corrected is not recorded as the arrangement.
+- A muted voice answer is muted whole, and a sentence finished inside the connect window still opens the floor.
+- A dev build sees the release notice it is about to ship, and a restarted engine is asked again what it owes the reader.
+
+### Removed
+
+- The composer press log drops five verdicts it can no longer produce: `commit-withheld`, `rescue-stood-down`, `unreachable`, `repaired` and `repair-failed`. The first two belonged to the auto-send that was retired earlier. The last three belonged to a reachability check that answered healthy through every episode it was built for.
 ## v0.38.2 — 2026-09-18
 
 ### Changed

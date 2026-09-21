@@ -1,6 +1,6 @@
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
-import type { WebhookIngress } from '../api/client/webhooks';
+import type { WebhookIngress, WebhookRefusals } from '../api/client/webhooks';
 import type {
   AnswerKind,
   EventSubscription,
@@ -86,6 +86,17 @@ export function failedIfFresh<T>(prev: Loadable<T>, error: unknown): Loadable<T>
  *  from a browser one (ADR 0053). */
 export interface IngressReading {
   ingress: WebhookIngress;
+  receivedAt: number;
+}
+
+/** One read of which webhooks are refusing, stamped when it landed.
+ *
+ *  Same shape and same reason as `IngressReading`. The engine measures
+ *  `refusing_secs` once and sends no further frame while the fault stands. So
+ *  the age is advanced against the browser clock, never recomputed by
+ *  subtracting a server instant from a local one (ADR 0053). */
+export interface RefusalReading {
+  refusals: WebhookRefusals;
   receivedAt: number;
 }
 
@@ -222,14 +233,21 @@ export type ResponseEvent =
        *  emits also stamp it. Used as the route key for
        *  `GET /events/:event_id/tool-result`. */
       result_event_id?: string;
-      /** `true` when the source coding-agent tool call had its `args` field
-       *  stripped on the snapshot endpoint (see `strip_tool_call_args` in
+      /** `true` when the source tool call had its `args` field stripped on the
+       *  snapshot endpoint (see `strip_tool_call_args` in
        *  `api/threads/events_snapshot.rs`). Paired with `call_event_id` so the
        *  step-detail modal can lazy-fetch the un-elided command on open.
        *
        *  The step's inline label never needs the args: the strip fills
        *  `description` from the same Rust helper the write path uses. */
       args_stripped?: boolean;
+      /** Which channel's tool this was, so the modal formats the args it
+       *  fetches back the way the inline label was formatted.
+       *
+       *  Both channels strip, and each has its own command formatter. Reading
+       *  the wrong one renders a chat tool through the coding-agent shape.
+       *  Stamped beside `args_stripped`, because only the lazy path needs it. */
+      tool_channel?: 'chat' | 'coding_agent';
       /** The `_eventId` of the source tool-call event, stamped whenever the
        *  call named this step. The route key for
        *  `GET /events/:event_id/tool-args`. */

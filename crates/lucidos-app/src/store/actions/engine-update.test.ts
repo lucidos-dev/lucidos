@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/client', () => ({ engineVersionStatus: vi.fn(), rebuildEngine: vi.fn() }));
-vi.mock('./chat-changes', () => ({ initiateEngineRestart: vi.fn() }));
+vi.mock('./chat-changes', () => ({
+  initiateEngineRestart: vi.fn(),
+  confirmAndRestartEngine: vi.fn(() => Promise.resolve()),
+}));
 // The engine-version dismissal is keyed on the ANNOUNCED VERSION id: the on-disk
 // build when one is switchable, the checkout's HEAD when the version exists only
 // in source. Mock it so each test controls what has been dismissed.
@@ -17,10 +20,11 @@ vi.mock('../../hooks/sw-update', () => ({
 
 import { checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
+import { confirmAndRestartEngine, initiateEngineRestart } from './chat-changes';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
 import type { BuildFailure, PendingCommits } from '../../api/client';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed, markEngineVersionDismissed } from '../../hooks/sw-update';
-import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, enginePendingCommits, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
 const mockWasDismissed = vi.mocked(wasEngineVersionDismissed);
@@ -76,6 +80,9 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     engineRebuildWedged.value = false;
     engineBuilding.value = false;
     engineRestarting.value = false;
+    enginePendingCommits.value = null;
+    vi.mocked(confirmAndRestartEngine).mockClear();
+    vi.mocked(initiateEngineRestart).mockClear();
     // The switch dismissal is a global preference, so checkEngineVersion skips
     // until preferences load. Seed loaded so the surface-behavior tests run; the
     // gated-while-loading case has its own test below.
@@ -92,6 +99,51 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(toast?.secondaryAction?.label).toBe('Later');
     // Records the on-disk build so a later dismiss pins the right id.
     expect(mockNoteAnnounced).toHaveBeenCalledWith('disk999');
+  });
+
+  it('opens the confirm rather than restarting, so the version can be read first', async () => {
+    mockStatus.mockResolvedValue(status({ update_available: true, build_state: 'ready' }));
+    await checkEngineVersion();
+    toasts.value.find((t) => t.key === 'engine-new-version')?.action?.onClick();
+    expect(confirmAndRestartEngine).toHaveBeenCalledOnce();
+    // The confirm's own OK is the only thing that tears the engine down.
+    expect(initiateEngineRestart).not.toHaveBeenCalled();
+  });
+
+  it('holds the pending range where the confirm can read it, with no build in flight', async () => {
+    // `engineBuildDetail` is nulled the instant a build ends, which is exactly
+    // when the switch becomes available, so the confirm reads its own signal.
+    const commits: PendingCommits = {
+      total: 1,
+      groups: [{ kind: 'new', total: 1, descriptions: ['a thing'] }],
+    };
+    mockStatus.mockResolvedValue(
+      status({ update_available: true, build_state: 'ready', pending_commits: commits }),
+    );
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(false);
+    expect(engineBuildDetail.value).toBeNull();
+    expect(enginePendingCommits.value).toEqual(commits);
+  });
+
+  it('clears the pending range when the engine stops reporting one', async () => {
+    enginePendingCommits.value = { total: 4, groups: [] };
+    mockStatus.mockResolvedValue(status());
+    await checkEngineVersion();
+    expect(enginePendingCommits.value).toBeNull();
+  });
+
+  it('drops a pre-grouping payload rather than reading `groups` off it', async () => {
+    // A new frontend against an OLD engine is the ordinary state of the window
+    // this surface describes: the client is rebuilt and served seconds after an
+    // Apply, while the engine binary waits for the Switch.
+    enginePendingCommits.value = { total: 1, groups: [] };
+    mockStatus.mockResolvedValue({
+      ...status({ update_available: true, build_state: 'ready' }),
+      pending_commits: { total: 3, subjects: ['legacy'] } as unknown as PendingCommits,
+    });
+    await checkEngineVersion();
+    expect(enginePendingCommits.value).toBeNull();
   });
 
   it('does not surface a new version while a build is still in progress, even if the on-disk binary already differs', async () => {
@@ -954,5 +1006,65 @@ describe('strandedMessage: the reason, when the build-watch knows it', () => {
   it('ignores a blank reason rather than showing an empty sentence', () => {
     const message = strandedMessage({ ...base, served_in_worktree: false, build_error: '  ' });
     expect(message).toContain("hasn't rebuilt");
+  });
+});
+
+describe('strandedMessage: a stopped build-watch is not recoverable', () => {
+  const base = { served_dir: '/repo/crates/lucidos-app/dist', sent_at_ms: 0 };
+
+  it('says nothing is rebuilding, and never that it will appear on its own', () => {
+    // The incident. The watch had been dead for hours while its status file
+    // still reported the last healthy build. The engine therefore found no
+    // error and fell through to the recoverable wording.
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: false,
+      build_watch_stopped: true,
+    });
+    expect(message).toContain('nothing is rebuilding');
+    expect(message).toContain('not running');
+    expect(message).toContain('Relaunch the stack');
+    expect(message).not.toContain('appear on its own');
+  });
+
+  it('outranks a build error, which a stopped watch will never retry', () => {
+    // That error describes a build nobody is repeating. Naming it would send
+    // the reader after a Rollup import while the real fix is a relaunch.
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: false,
+      build_watch_stopped: true,
+      build_error: 'Rollup failed to resolve import "jsqr"',
+    });
+    expect(message).toContain('not running');
+    expect(message).not.toContain('jsqr');
+  });
+
+  it('still yields to the worktree case, which no watch can fix', () => {
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: true,
+      build_watch_stopped: true,
+    });
+    expect(message).toContain('will not appear');
+    expect(message).toContain('coding-agent worktree');
+  });
+
+  it('keeps the recoverable wording when the watch is running', () => {
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: false,
+      build_watch_stopped: false,
+    });
+    expect(message).toContain("hasn't rebuilt");
+    expect(message).toContain('appear on its own');
+  });
+
+  it('treats an older engine that omits the field as no claim', () => {
+    // A frontend-only Apply advances the client in-process while the engine
+    // stays put, so this client really does meet payloads without the field.
+    const message = strandedMessage({ ...base, served_in_worktree: false });
+    expect(message).toContain("hasn't rebuilt");
+    expect(message).not.toContain('undefined');
   });
 });

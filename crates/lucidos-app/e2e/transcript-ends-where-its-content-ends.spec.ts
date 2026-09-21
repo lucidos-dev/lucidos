@@ -111,6 +111,10 @@ test.describe('The transcript ends where its content ends', () => {
         overflow: el.scrollHeight - el.clientHeight,
         /** Nothing may floor the last turn's height. */
         minHeight: getComputedStyle(last).minHeight,
+        /** The last turn's own box. A turn taller than the pane cannot show
+         *  its top and keep the live edge at the fold. So the landing check
+         *  below bounds the top by what does not fit, rather than by zero. */
+        turnHeight: last.getBoundingClientRect().height,
         /** The reader's own message, and the agent status line, in the
          *  transcript's coordinates. */
         messageTop: initiator ? initiator.getBoundingClientRect().top - top : null,
@@ -230,8 +234,25 @@ test.describe('The transcript ends where its content ends', () => {
     // that survives without anything reserved: the submit brings the turn as far
     // up as the real content allows, and for a fresh turn that is the bottom of
     // the screen rather than the landing line.
+    //
+    // "As far up as the content allows" is the whole claim, so the bound is
+    // what the TURN overflows the pane by, rather than zero. A turn that fits
+    // keeps the old bound, because it overflows by nothing. A turn that does
+    // not fit sits at the live edge: its top leaves the screen by exactly what
+    // does not fit, and a pixel more would be air nobody asked for. How short
+    // the pane is depends on the composer's resting height, so a turn fits on
+    // one project and not on the next.
+    //
+    // `turnOverflow`, never `overflow`: the geometry above already calls the
+    // SCROLLER's overflow that, and these two are different lengths.
+    const turnOverflow = Math.max(
+      0, landed.turnHeight + landed.paddingBottom - landed.clientHeight);
     expect(landed.messageTop).not.toBeNull();
-    expect(landed.messageTop!, 'the sent message is above the viewport').toBeGreaterThanOrEqual(-1);
+    expect(
+      landed.messageTop!,
+      `the sent message is ${Math.round(-landed.messageTop!)}px above the viewport, `
+        + `against a turn that overflows the pane by ${Math.round(turnOverflow)}px`,
+    ).toBeGreaterThanOrEqual(-turnOverflow - 1);
     expect(landed.messageBottom!, 'the sent message is below the fold').toBeLessThanOrEqual(landed.clientHeight);
     expect(landed.statusLineBottom).not.toBeNull();
     expect(landed.statusLineBottom!, 'the status line is below the fold').toBeLessThanOrEqual(landed.clientHeight);

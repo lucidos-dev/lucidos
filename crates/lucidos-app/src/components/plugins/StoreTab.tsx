@@ -6,6 +6,7 @@ import {
   appSearchQuery,
   pluginsInstalledOnly,
   setPluginsInstalledOnly,
+  pluginsMarketplaceFilter,
   pluginScrollTarget,
 } from '../../store/store';
 import type { InstalledPlugin, Loadable, MarketplacePlugin } from '../../store/types';
@@ -28,7 +29,7 @@ import { applyNavFocus } from '../shared/focusMarker';
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
  *  nav-history entry (the same shape the navigate_ui settings deep link uses). */
-function openMarketplaceSettings() {
+export function openMarketplaceSettings() {
   openSettingsSubview('marketplaces');
 }
 
@@ -91,7 +92,7 @@ const SKELETON_PILL_WIDTHS = [
 
 /** Loading placeholder that MIRRORS the loaded layout (category-pills bar above
  *  the list) so the list rows don't jump down when the catalog lands and the
- *  real `.app-store-category-filter` appears. The pills bar is sized to a fully
+ *  real `.app-store-filter-pills` bar appears. The pills bar is sized to a fully
  *  populated catalog (~2 lines, see SKELETON_PILL_WIDTHS) because that is the
  *  height the real bar settles at — reserving only one line let the rows shift
  *  down a line on a cold reload once the real (wrapping) bar rendered. A sparse
@@ -105,7 +106,7 @@ const SKELETON_PILL_WIDTHS = [
 export function StoreTabSkeleton() {
   return (
     <div class="app-store">
-      <div class="app-store-category-filter">
+      <div class="app-store-filter-pills">
         {SKELETON_PILL_WIDTHS.map((w, i) => (
           <div class="app-store-category-pill-skeleton" style={{ width: w }} key={i} />
         ))}
@@ -144,6 +145,12 @@ function categoryLabel(category: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+/** Marks an orphan row's synthetic `marketplace_id`. The engine builds a real id
+ *  out of ASCII alphanumerics and dashes alone, so no registered marketplace can
+ *  take this shape. `orphanRow` and the marketplace filter share the constant so
+ *  the two cannot drift apart. */
+const ORPHAN_MARKETPLACE_PREFIX = 'installed:';
+
 /** An installed plugin whose marketplace is no longer registered won't appear in
  *  the marketplace catalog scan — synthesize a catalog row for it so it still
  *  lists (and stays uninstallable) under both All and Installed. It carries no
@@ -151,7 +158,7 @@ function categoryLabel(category: string): string {
  *  its name, "Installed vX" badge, content chips, file count, and Uninstall. */
 function orphanRow(p: InstalledPlugin): MarketplacePlugin {
   return {
-    marketplace_id: `installed:${p.id}`,
+    marketplace_id: `${ORPHAN_MARKETPLACE_PREFIX}${p.id}`,
     marketplace_name: p.source ?? '',
     id: p.id,
     name: p.name,
@@ -192,6 +199,88 @@ function buildRows(
   const catalogIds = new Set(catalog.map((p) => p.id));
   const orphans = installed.filter((p) => !catalogIds.has(p.id)).map(orphanRow);
   return [...catalog, ...orphans];
+}
+
+/** One entry in the marketplace filter dropdown. */
+export interface MarketplaceOption {
+  id: string;
+  name: string;
+}
+
+/** The catalog rows in scope right now, straight off the store. Both halves of
+ *  the panel need them and neither can hand them to the other: the dropdown is
+ *  in the filter bar and the list is below it. Calling this twice recomputes a
+ *  small list, which is cheaper than a shared signal written during render. */
+export function pluginRowsInScope(
+  catalog: Loadable<{ plugins: MarketplacePlugin[] }>,
+  installed: Loadable<InstalledPlugin[]>,
+  installedOnly: boolean,
+): MarketplacePlugin[] {
+  return buildRows(
+    catalog.status === 'loaded' ? catalog.data.plugins : [],
+    installed.status === 'loaded' ? installed.data : [],
+    installedOnly,
+  );
+}
+
+/** The marketplaces the current rows actually come from, deduped and sorted by
+ *  name. Reads the rows rather than the registry, so the dropdown never offers a
+ *  marketplace with nothing under the Installed-only toggle.
+ *
+ *  This skips orphan rows: their marketplace is gone, so the id is synthetic and
+ *  the name slot holds the plugin's source instead. An entry built from one would
+ *  name a marketplace the user cannot browse. Pure + exported for the unit
+ *  test. */
+export function availableMarketplaces(rows: MarketplacePlugin[]): MarketplaceOption[] {
+  const byId = new Map<string, string>();
+  for (const row of rows) {
+    if (row.marketplace_id.startsWith(ORPHAN_MARKETPLACE_PREFIX)) continue;
+    if (!byId.has(row.marketplace_id)) byId.set(row.marketplace_id, row.marketplace_name);
+  }
+  return Array.from(byId, ([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The selected marketplace, or null for All. A selection the rows no longer
+ *  offer (the toggle flipped, the marketplace was removed) resolves to All, so
+ *  the list can never silently show nothing.
+ *
+ *  Resolving rather than resetting is what keeps this safe to call during a
+ *  render. A setter there would fight the render it runs inside. Pure +
+ *  exported for the unit test. */
+export function resolveActiveMarketplace(
+  selected: string | null,
+  available: MarketplaceOption[],
+): MarketplaceOption | null {
+  return available.find((m) => m.id === selected) ?? null;
+}
+
+/** The catalog list's one filter expression: search query AND marketplace AND
+ *  category, each inactive when it is empty or null. An active marketplace drops
+ *  the orphan rows, which is right: their marketplace is no longer registered.
+ *  Pure + exported for the unit test. */
+export function matchesFilters(
+  plugin: MarketplacePlugin,
+  query: string,
+  marketplaceId: string | null,
+  category: string | null,
+): boolean {
+  return (
+    matchesQuery(plugin, query) &&
+    (!marketplaceId || plugin.marketplace_id === marketplaceId) &&
+    (!category || plugin.categories.includes(category))
+  );
+}
+
+/** Whether any filter could be hiding a deep-linked row, so a missing row does
+ *  not yet prove the plugin is gone. Each of the three narrows the list, and
+ *  giving up under one loses the notification's target for good. Pure +
+ *  exported for the unit test. */
+export function pluginDeepLinkCouldBeFiltered(
+  query: string,
+  marketplaceId: string | null,
+  category: string | null,
+): boolean {
+  return !!query.trim() || !!marketplaceId || !!category;
 }
 
 /** Whether BOTH plugin data sources have SETTLED (loaded or failed) — the gate
@@ -242,6 +331,8 @@ export function StoreTab() {
   const settled = pluginRowsSettled(catLoadable, instLoadable);
   const showLoading = useDelayedFlag(!settled);
   const [installingSource, setInstallingSource] = useState<string | null>(null);
+  // The category pills show a view of the list, not a setting, so the choice
+  // never reaches preferences. Same for the marketplace dropdown above.
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
   useEffect(() => {
@@ -262,9 +353,13 @@ export function StoreTab() {
   // Notification deep-link (navigate_ui target `plugins`): once the list has
   // rendered, scroll the targeted plugin's row into view and pulse it. The
   // target is consumed only on a successful scroll OR when the row is genuinely
-  // absent with no search filter active — so a leftover search that hides the row
-  // doesn't swallow the deep-link; clearing the filter re-runs this
-  // (appSearchQuery is a dep) and the scroll then lands.
+  // absent with EVERY filter off, so a leftover one cannot swallow the
+  // deep-link. Clearing it re-runs this (all three are deps) and the scroll then
+  // lands.
+  //
+  // All three, not just the search box. The marketplace choice is a signal, so
+  // it outlives the panel. It can already be narrowing the list on the mount the
+  // deep-link arrives at.
   useEffect(() => {
     const target = pluginScrollTarget.value;
     // Gate on `settled`, not `primary.status` — the rows (and their
@@ -279,12 +374,19 @@ export function StoreTab() {
       // (components/shared/focusMarker.ts). Same look as chat + settings.
       applyNavFocus(el);
       pluginScrollTarget.value = null;
-    } else if (!appSearchQuery.value.trim()) {
+    } else if (!pluginDeepLinkCouldBeFiltered(appSearchQuery.value, pluginsMarketplaceFilter.value, selectedCategory)) {
       // Row not in the list and nothing is filtering it out → the plugin is
       // genuinely gone (uninstalled / stale target). Give up so it can't linger.
       pluginScrollTarget.value = null;
     }
-  }, [pluginScrollTarget.value, settled, appSearchQuery.value, installedOnly]);
+  }, [
+    pluginScrollTarget.value,
+    settled,
+    appSearchQuery.value,
+    installedOnly,
+    pluginsMarketplaceFilter.value,
+    selectedCategory,
+  ]);
 
   async function stageInstall(plugin: MarketplacePlugin) {
     setInstallingSource(plugin.source);
@@ -367,7 +469,9 @@ function StoreTabLoaded({
     );
   }
 
-  const rows = buildRows(catalog?.plugins ?? [], installed, installedOnly);
+  // Through the shared helper, so the dropdown in the filter bar and this list
+  // cannot drift on what "in scope" means.
+  const rows = pluginRowsInScope(catLoadable, instLoadable, installedOnly);
 
   // Category filter — derived from the rows actually in scope (after the
   // install-state toggle) so a category with nothing under the current toggle
@@ -377,17 +481,25 @@ function StoreTabLoaded({
   const activeCategory =
     selectedCategory && availableCategories.includes(selectedCategory) ? selectedCategory : null;
 
-  const plugins = rows.filter(
-    (p) => matchesQuery(p, query) && (!activeCategory || p.categories.includes(activeCategory)),
+  // The marketplace filter is the filter bar's dropdown, and its choice arrives
+  // as a signal. Resolving it against these same rows is what keeps the two in
+  // step: a selection the rows no longer offer reads as All in both places.
+  const activeMarketplace = resolveActiveMarketplace(
+    pluginsMarketplaceFilter.value,
+    availableMarketplaces(rows),
+  );
+
+  const plugins = rows.filter((p) =>
+    matchesFilters(p, query, activeMarketplace?.id ?? null, activeCategory),
   );
 
   return (
     <div class="app-store">
       {availableCategories.length > 0 && (
-        <div class="app-store-category-filter" role="group" aria-label="Filter by category">
+        <div class="app-store-filter-pills" role="group" aria-label="Filter by category">
           <button
             type="button"
-            class={`app-store-category-pill${!activeCategory ? ' active' : ''}`}
+            class={`app-store-filter-pill${!activeCategory ? ' active' : ''}`}
             onClick={() => setSelectedCategory(null)}
           >
             All
@@ -396,7 +508,7 @@ function StoreTabLoaded({
             <button
               type="button"
               key={c}
-              class={`app-store-category-pill${activeCategory === c ? ' active' : ''}`}
+              class={`app-store-filter-pill${activeCategory === c ? ' active' : ''}`}
               onClick={() => setSelectedCategory(activeCategory === c ? null : c)}
             >
               {categoryLabel(c)}
@@ -409,6 +521,8 @@ function StoreTabLoaded({
         <div class="empty-state">
           {query ? (
             <p>No plugins match "{appSearchQuery.value.trim()}".</p>
+          ) : activeMarketplace ? (
+            <p>No plugins from {activeMarketplace.name}.</p>
           ) : activeCategory ? (
             <p>No plugins in {categoryLabel(activeCategory)}.</p>
           ) : installedOnly ? (

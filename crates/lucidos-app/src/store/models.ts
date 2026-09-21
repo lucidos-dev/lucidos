@@ -14,6 +14,8 @@ export const DEFAULT_CHAT_MODEL = 'claude-opus-5@default';
  *  MINUS whatever the disable migrations switched off, most recently
  *  `20260823080956_disable_prior_generation_builtin_models.sql`. */
 export const MODELS = [
+  { value: 'claude-fable-5-1', label: 'Fable 5.1' },
+  { value: 'claude-fable-5-1[1m]', label: 'Fable 5.1 (1M)' },
   { value: 'claude-fable-5', label: 'Fable 5' },
   { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
   { value: 'claude-opus-5@default', label: 'Opus 5' },
@@ -63,7 +65,7 @@ export const REASONING_LEVELS = [
  *    `llm::reasoning::supported_efforts` keeps the same per-family list, since
  *    a family that tops out at `xhigh` answers `max` with a 400.
  *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
- *  - Fable 5 / Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
+ *  - Fable (5 and 5.1) / Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
  *    natively supports `xhigh`). Sonnet 5 is the first Sonnet-tier model with a distinct `xhigh`;
  *    Sonnet 4.6 and older stay on the filtered set below.
  *  - Other Claude / Gemini: drops `xhigh` (not a distinct tier on those backends). */

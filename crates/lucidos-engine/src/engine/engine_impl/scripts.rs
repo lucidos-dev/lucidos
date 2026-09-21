@@ -237,7 +237,14 @@ impl LucidosEngine {
         env_vars.extend(self.build_script_env_vars(None, emitting_trigger_id).await);
         env_vars.extend(extra_env.iter().cloned());
 
-        let output = match extension {
+        // Read before the env is moved into a runtime below. A script's stdout
+        // becomes the trigger summary and its stderr becomes the failure
+        // notification, so both carry any credential the script echoed. Same
+        // treatment the synchronous `run_bash` and `run_python` tools give
+        // their own output. See `core::injected_secret_values`.
+        let secrets = crate::core::injected_secret_values(&env_vars);
+
+        let result = match extension {
             // A script runs IN PLACE, from its real on-disk path — never from
             // a copy. `__file__`-relative resolution is the whole
             // point: a trigger script reaching its sibling `../state/` dir the
@@ -252,14 +259,23 @@ impl LucidosEngine {
                 .python_runtime
                 .execute_file_with_env(&full_path, env_vars)
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
-            "sh" => self.execute_shell_script(&full_path, env_vars).await?,
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }),
+            "sh" => self.execute_shell_script(&full_path, env_vars).await,
             _ => {
                 let msg = match crate::triggers::validate_script_extension(script_path) {
                     Err(e) => e,
                     Ok(()) => format!("No runtime configured for '.{}' scripts", extension),
                 };
                 return Err(msg.into());
+            }
+        };
+
+        // Both arms, because a failure is the likelier leak: a script that dies
+        // mid-request prints the request it was making.
+        let output = match result {
+            Ok(output) => crate::core::redact_secret_values(&output, &secrets),
+            Err(e) => {
+                return Err(crate::core::redact_secret_values(&e.to_string(), &secrets).into())
             }
         };
 
@@ -390,6 +406,42 @@ async fn run_shell_script_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scheduled script's output leaves through the redaction, not around it.
+    ///
+    /// Sibling of `the_bash_tool_result_leaves_through_the_secret_redaction` in
+    /// `engine/tools/bash.rs`, and the same invariant. `execute_script` injects
+    /// every credential and OAuth token, then hands stdout to the trigger
+    /// summary and stderr to the failure notification. The scheduler persists
+    /// both.
+    ///
+    /// A source scan because driving the composition needs an engine and a
+    /// database, where the wiring is what actually regresses. `core::mod_tests`
+    /// covers the redaction itself.
+    #[test]
+    fn a_scheduled_script_result_leaves_through_the_secret_redaction() {
+        let src = crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/engine_impl/scripts.rs"),
+        );
+        let at = src
+            .find("let secrets = crate::core::injected_secret_values(&env_vars);")
+            .expect(
+                "execute_script must read the injected secrets before the env is moved \
+                 into a runtime",
+            );
+        // Bound to the end of `execute_script`, so a later redaction elsewhere
+        // in the file cannot satisfy this count and a moved one cannot hide.
+        let end = src[at..]
+            .find("// Auto-commit any files the script touched")
+            .expect("execute_script still commits dirty artifacts after the script returns");
+        let body = &src[at..at + end];
+        assert_eq!(
+            body.matches("crate::core::redact_secret_values(").count(),
+            2,
+            "both arms must redact. A script that dies mid-request prints the request it \
+             was making, so the error path is the likelier leak of the two."
+        );
+    }
 
     #[tokio::test]
     async fn shell_script_timeout_kills_child() {

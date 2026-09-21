@@ -5,7 +5,12 @@ import { Explainer } from '../shared/Explainer';
 import { backupReminderBody } from '../layout/BackupReminderBanner';
 import { connectionBannerBody } from '../layout/ConnectionBanner';
 import { ingressBannerBody } from '../layout/IngressBanner';
-import { SAMPLE_INGRESS_OUTAGE } from './communicationSamples';
+import { refusalBannerBody } from '../layout/WebhookRefusalBanner';
+import {
+  SAMPLE_INGRESS_OUTAGE,
+  SAMPLE_WEBHOOK_REFUSAL,
+  SAMPLE_WEBHOOK_VERIFICATION_REFUSAL,
+} from './communicationSamples';
 import {
   TOAST_PLACEMENT_OPTIONS,
   sampleShortToast,
@@ -115,6 +120,25 @@ export function CommunicationSurfacesPage() {
             outage: SAMPLE_INGRESS_OUTAGE,
             onOpenWebhooks: () => {},
             onDiscuss: () => {},
+          })}
+        </div>
+        {/* Both causes, because the pair is the point. The bar above reports a
+            path nobody can reach; these two report deliveries that arrived and
+            were thrown away, and they must not read alike. */}
+        <div class="surfaces-banner-preview">
+          {refusalBannerBody({
+            layout: 'desktop',
+            refusal: SAMPLE_WEBHOOK_REFUSAL,
+            others: null,
+            onOpenWebhooks: () => {},
+          })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {refusalBannerBody({
+            layout: 'desktop',
+            refusal: SAMPLE_WEBHOOK_VERIFICATION_REFUSAL,
+            others: null,
+            onOpenWebhooks: () => {},
           })}
         </div>
       </div>

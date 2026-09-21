@@ -88,6 +88,57 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   return nothing, and with the geometry test that phase adds for the winner.
 - **Status:** `active`
 
+### Angle brackets kept out of `data-label`
+
+- **Added:** 2026-09-19
+- **Lives in:** `stackLabelText` in
+  `crates/lucidos-app/src/utils/renderMarkdown.ts`, pinned by
+  `a header's angle brackets never reach the stacked-card label` in
+  `renderMarkdown.test.ts`.
+- **Impermanent because:** it compensates for a defect in another module.
+  `renderMarkdown`'s own passes parse the document now, but its OUTPUT is a
+  string that `utils/linkifyPaths.ts` re-scans with `html.split(/(<[^>]+>)/)`.
+  That splitter is not quote-aware, and the HTML fragment serializer writes
+  `<` and `>` raw inside an attribute value. So a `>` in a column header ends
+  the splitter's idea of the tag mid-attribute, and the linkifier splices an
+  `<a href=…>` into what is left. The template's own quote then closes the
+  real value, and the rest of the label parses as attribute NAMES. Verified to
+  produce a live `onmouseover` handler on the `<td>` from plain markdown.
+
+  `linkifyPaths` has the same hole for any attribute an author writes with a
+  raw `>` in it. That one predates this and is filed separately. Stripping the
+  two characters closes only the route `data-label` opened.
+- **Removal / resolution condition:** `linkifyPaths` stops recognising tags by
+  regex, so a `<` or `>` inside an attribute value cannot end a tag early.
+  Converting it to a pass over a parsed document is the shape `renderMarkdown`
+  already uses (`inDom`). Verify by searching `linkifyPaths.ts` for `<[^>]`
+  and finding nothing. Then delete `stackLabelText`'s `replace` and confirm
+  the pinning test above still passes with a header carrying `>`.
+- **Status:** `active`
+
+### Focused-field reveal probe
+
+- **Added:** 2026-09-19
+- **Lives in:** `crates/lucidos-app/src/hooks/useFocusedFieldVisible.ts`
+  (`reportEpisode`, one `postClientLog('mobile', 'focus-reveal', …)` at the end
+  of each settle window).
+- **Impermanent because:** pure telemetry chasing a bug. The keyboard reveal
+  lands correctly on some opens and wrong on others, and the behaviour cannot be
+  reproduced off-device: Playwright has no software keyboard and never shrinks
+  the visual viewport. Three theoretical fixes failed before this, which is the
+  failure `docs/plans/2026-04-02-ios-header-keyboard-fix.md` already recorded for
+  the same surface. The breadcrumb carries what a screenshot cannot: the visual
+  viewport, the published band, the container and field geometry, the offset the
+  reveal asked for, and where the container actually landed.
+- **Removal / resolution condition:** when the **keyboard-reveal placement
+  investigation** (`ios-keyboard-reveal-placement`) is closed, that is, the
+  reveal is confirmed stable on-device over a representative run of forms.
+  Verify by confirming no open work reads the `[Client/mobile] focus-reveal`
+  line, then delete `reportEpisode`, its `lastSeen` bookkeeping and the two
+  imports it needs.
+- **Status:** active
+- **Investigation:** `ios-keyboard-reveal-placement`
+
 ### Dead-press probe on the composer's action row
 
 - **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28; 2026-08-29.
@@ -167,12 +218,27 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   one cost most of a session on the tenth report. `lsof -p $(cat
   <ws>/.lucidos/engine.pid)` names the file the live engine actually writes.
 
-  Each line names the face and the verdict. The seventeen are `served`,
-  `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `no-lift`,
-  `click-no-touch`, `unreachable`, `repaired`, `repair-failed`, `activated`,
-  `rescue-stood-down`, `keyboard-touch`, `covered`, `stray-click` and
-  `untouched`. It carries the travel, the row and face boxes, the viewport block
-  and the `data-keyboard-active` flag.
+  Each line names the face and the verdict. The fourteen are `served`,
+  `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `multi-touch`,
+  `no-lift`, `click-no-touch`, `keyboard-touch`, `covered`, `stray-click`,
+  `untouched` and `silent-since-keyboard`. It carries the travel, the row and
+  face boxes, the viewport block and the `data-keyboard-active` flag.
+
+  **Six verdicts are retired and no line can carry one again.** `activated`
+  meant the probe had clicked the commit face itself, retired by
+  [ADR 0225](adr/0225-composer-never-sends-by-itself.md) after it sent a draft
+  on a tap 138 px from Send. `commit-withheld` and `rescue-stood-down` went with
+  the machinery that decided it, and `unreachable`, `repaired` and
+  `repair-failed` with the reachability repair
+  ([ADR 0228](adr/0228-composer-recovers-on-the-keyboard-close.md)). An older
+  ledger still reads: every surviving verdict and field keeps its meaning.
+
+  **`silent-since-keyboard` is the wedge whose signature is silence.** One line
+  per keyboard close, written by the scheduled check when the composer holds a
+  live commit face and the page has taken nothing since. Read `sinceInputMs`
+  against `sinceKeyboardMs`. A smaller one says an input arrived after the
+  close and no other line named it, since the stray verdicts need the keyboard
+  UP. `nudged` says whether that close's own relayout ran.
 
   Three readings joined in the tenth round. The morph's own mode, the quiet
   window before the line, and, on a `missed`, why no watchable face took the
@@ -188,10 +254,25 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   had a cover up. A run of them across a long `quiet.ms` says the composer was
   inert by our own design, not by WebKit's.
 
-  **`quiet.nudges` is the score for the typing-driven recovery.** It counts the
-  relayouts spent in the preceding gap. A press with nudges behind it and the
-  keyboard still up says the relayout worked. One with nudges behind it and the
-  keyboard down says the user recovered by hand anyway.
+  **`nudgesSinceKeystroke` is the score for the typing-driven recovery.** It
+  counts the relayouts spent since the user last typed. A press with nudges
+  behind it and the keyboard still up says the relayout worked. One with nudges
+  behind it and the keyboard down says the user recovered by hand anyway.
+
+  **`quiet.nudges` is the same count over the preceding SILENCE, so a touch
+  resets it.** Every earlier ledger is read against it, which is why both ride.
+  Prefer the first: the fifteenth episode scored zero on this one while two
+  relayouts had run, because a stray touch closed the window between them.
+
+  **`quiet.closes` is the score for the transition-driven recovery.** It counts
+  the keyboard closes in the preceding silence, each of which spent a relayout.
+  Kept apart from `nudges` so that count keeps meaning what every earlier ledger
+  reads it as.
+
+  **`fingers` and `fingersAtLift` count the contacts on the glass.** The first
+  is the running maximum while the press was armed, and the second is what was
+  still down at the lift. Anything but one and zero is a gesture WebKit owes no
+  click to, and it writes `multi-touch` rather than `dead`.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
@@ -357,22 +438,73 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   never commits, and `quiet.nudges` on every later line is what scores it. The
   plan is
   [`docs/plans/2026-09-17-the-composer-recovers-without-being-touched.md`](plans/2026-09-17-the-composer-recovers-without-being-touched.md).
-- **Status:** `active`, and now carrying a recovery as well as evidence. The
-  cause is still NOT named, and the recovery has still never been seen to fire
-  in the field. So the removal condition needs a quiet period with the rescue
-  actually running, or an episode that names the mechanism.
-- **It is no longer behaviour-free, and the removal condition changes with
-  that.** The module now RUNS the composer's commit face for a tap the page
-  dropped, and relayouts the shell behind it. Those two are a fix rather than a
-  diagnostic, so deleting the module would delete them. Removal therefore means
-  moving `liveCommitFace`, `commitFace`, `rescueStandDown`, `clickClaimedPress`,
-  `ruleMissedPress`, `shouldNudgeUntouched`, `runUntouchedNudge`, `bounceHeight`
-  and `nudgeLayout` to a permanent home first, and dropping only the reporting
+- **What the fifteenth report found: the rescue met its press and refused it.**
+  A stationary tap reached the row and no face, with a live Send morph 101 px to
+  its right. Every bound says run it, and the line reads `standDown: claimed`.
+  The morning holds 72 press lines, 16 `missed` and zero `activated`.
+
+  Its own twin click refused it, which the ledger proves rather than suggests.
+  The next line's `quiet.ms` puts the last input at the missed touch, and a
+  click with a touch behind it does not reopen that window.
+
+  Three defects sat behind that one word. The claim was a boolean set by ANY
+  click in the grace window. The press path scopes its own to the gesture that
+  earned it. "Outside `.prompt-actions-row`" counted as an answer, though the
+  composer's own textarea is two pixels above that row and commits nothing. And
+  the line named the bound without naming the target, so which arm fired had to
+  be reconstructed by arithmetic.
+
+  All three are closed. A click claims only where it landed on an activatable
+  control with the miss's own touch behind it, and the line carries what it hit.
+
+  **The untouched trigger disarmed on the wrong thing, the same way.** It asked
+  whether a touch had reached the PAGE, and this ledger holds two that did while
+  the composer stayed unsendable. It reads a touch or click on the composer now.
+  Beside it, `nudgesSinceKeystroke` scores the relayout across a touch, which
+  `quiet.nudges` cannot: the send that finally worked carried zero while two had
+  run. The plan is
+  [`docs/plans/2026-09-19-the-rescue-names-what-refused-it.md`](plans/2026-09-19-the-rescue-names-what-refused-it.md).
+- **What the sixteenth report found: the rescue ran, and the message went.** A
+  stationary tap died on the composer, the Send morph fired on its own, and the
+  toast said so. The first `activated` verdict this investigation has seen in
+  the field.
+
+  The cost the reporter felt is the 600ms click grace window. The reporter
+  weighed both halves and kept them. The toast is the only on-screen sign that
+  the wedge is happening. The window is what tells a dead press apart from a
+  slow one.
+- **What the eighteenth report found: the keyboard close is the trigger.** The
+  first episode where the ledger holds the wedge AND its recovery. The page took
+  no touch for 36 seconds after the keys went. Thirteen checks found the row
+  healthy throughout. The typing-driven relayout freed it at the last of them.
+
+  Two things followed. The relayout now fires on the `visualViewport` resize
+  that restores full height, which is the moment the wedge starts. It moved to
+  `components/layout/keyboardCloseRelayout.ts` as a FIX, so deleting the probe
+  cannot delete it. And a `silent-since-keyboard` line names the state the probe
+  could never write.
+
+  **The apparatus was cut in the same change.** The machinery that decided
+  whether to press Send went with the commit ADR 0225 retired. The reachability
+  repair went because it answered healthy through every episode it was built
+  for. The probe lost 431 lines, and the whole complex fell from 5,113 to 4,257
+  with the new module counted in. Both are named in
+  [ADR 0228](adr/0228-composer-recovers-on-the-keyboard-close.md) and in
+  [its plan](plans/2026-09-20-the-composer-recovers-when-the-keyboard-closes.md).
+- **Status:** `active`, and now carrying one recovery as well as evidence. The
+  cause is still NOT named. So the removal condition needs a quiet period with
+  the transition relayout running, or an episode that names the mechanism.
+- **It is not quite behaviour-free, and the removal condition says what that
+  costs.** The transition relayout is outside the module, so deleting the probe
+  cannot delete the fix. What remains inside is the typing-driven relayout,
+  which covers a wedge with no keyboard close in front of it. Removal therefore
+  means moving `liveCommitFace`, `commitFace`, `shouldNudgeUntouched` and
+  `runUntouchedNudge` to a permanent home first, and dropping only the reporting
   around them. The keystroke stamp goes with them: `runUntouchedNudge` is the
   only reader of it.
-- **Still consumes no gesture.** Every listener stays passive, and none calls
-  `preventDefault` or `stopPropagation`. What it adds is an action on a press
-  that reached NOTHING, which is a press no other path was going to take.
+- **Still consumes no gesture, and presses nothing.** Every listener stays
+  passive, and none calls `preventDefault` or `stopPropagation`. No path
+  dispatches a click, a tap, a pointer event or a submit.
 
 ### Dead-keystroke probe on the composer's textarea
 
@@ -1156,6 +1288,76 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   The rest itself was then reverted, hours later again, so no scope is left to
   widen. Below one page the turns flow from the top and hold still (ADR 0212).
 - **Status:** removed (2026-09-17)
+
+### The ride says when its own write landed short
+
+- **Added:** 2026-09-19
+- **Lives in:** `crates/lucidos-app/src/components/chat/scrollState.ts`,
+  `reportRideLandedShort` and the `_rideShortReported` flag beside it, plus the
+  three assertions naming it in
+  `components/chat/__tests__/scroll-follow-the-live-edge.test.ts`. It writes one
+  `[Client/follow] short` line to engine.log per ride: no event, no DB row, no
+  UI. The payload is three numbers (`short`, `edge`, `view`) and carries nothing
+  of the reader's.
+- **Impermanent because:** pure telemetry for the investigation below. The
+  *standing follow* now corrects a write that came to rest short (ADR 0222), so
+  the reader no longer sees the strand. That correction also hides the evidence.
+  The line is what says the case is still happening, and by how much. It
+  compensates for nothing in the design and changes no behaviour.
+- **Removal / resolution condition:** when the **ride lands short**
+  investigation (`follow-ride-lands-short`) is closed. That means the cause of
+  the short landing is identified, and either fixed or attributed to WebKit.
+  Verify no open work still needs the `[Client/follow]` lines. Then delete
+  `reportRideLandedShort`, its flag, its clear in `armFollowOn`, its call in
+  `settleTheRide`, and the three tests. `grep -rn 'rideShortReported' crates/lucidos-app/src`
+  must come back empty. The correction itself STAYS: it is the fix, not the
+  diagnostic.
+- **Status:** active
+- **Investigation:** `follow-ride-lands-short`
+
+### "Inline your own CSS and JS" advice to app authors
+
+- **Added:** 2026-09-20
+- **Lives in:** five doc passages.
+  - `system-knowhow/js-sdk.md` § Setup, the "Inline your own CSS and JS"
+    paragraph.
+  - `system-knowhow/js-sdk.md` § Setup, the second paragraph under the
+    `<a download>` note.
+  - `system-knowhow/js-sdk.md` § `url` and app-bundled assets, the note at the
+    end.
+  - `system-knowhow/building-an-app.md`, the "Inline `<script>` and `<style>`,
+    at any size" bullet. It REPLACED two bullets of permanent advice, about
+    splitting a script past 100 lines and about external CSS for shared design.
+  - `system-knowhow/workspace-audit.md` check 2, the "The app's own files,
+    loaded as a separate subresource" bullet, plus the exempt-asset sentence
+    above it.
+- **Impermanent because:** an app frame is opaque-origin (ADR 0227), so the
+  browser sends no device credential with any subresource of the frame's
+  document. Measured in Chromium: the frame's own document gets the cookie,
+  every subresource of it does not. A gateway fronts every packaged install,
+  and it answers a cookieless `/<slug>/app/<id>/style.css` or `/<slug>/data/…`
+  with 401. The advice compensates for that, and nothing about inlining is
+  better design. The `/api/v1` half of the same break is FIXED, in
+  `auth_api::is_public_app_asset`. These paths carry workspace content, so
+  exempting them is a security decision nobody has taken.
+- **Removal / resolution condition:** when an app frame can load its own files
+  behind a gateway again. Two routes are open, and each needs a decision rather
+  than a patch:
+  - Give the frame a real origin with its own credential, the port route ADR
+    0227 priced and rejected.
+  - Or carry a per-frame capability into the subresource URL.
+
+  Verify with an app that ships a separate `style.css`, opened through a
+  gateway URL, and confirm a 200. Then take out the five passages above and
+  drop the audit check. Restore the two bullets `building-an-app.md` lost, and
+  correct ADR 0227's § Consequences subresource bullets.
+- **Status:** active
+- **Investigation:** n/a. The cause is understood and the fix needs a design
+  decision, which
+  `docs/plans/2026-09-20-the-gateway-half-of-the-app-asset-exemption.md`
+  records. A sibling of `app-frame-escape-hatches` in § 4: the same opaque
+  origin, a third capability it took away. Tracked apart because the answer is
+  a routing decision rather than an SDK surface.
 
 ---
 
@@ -2146,6 +2348,32 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Measures referencing this investigation:** iOS-PWA liveness diagnostic (§1),
   Thread-render blank-body probe (§1) — both resolved 2026-06-30, code retained.
 
+### `ios-keyboard-reveal-placement`: the focused field lands somewhere different each time
+
+- **Opened:** 2026-09-19
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. Tapping a field on a mobile form scrolls it clear of the keyboard
+  on some opens. On others it leaves the field under the accessory bar, or
+  parks it too high. Research named the mechanism: iOS reveals a focused field
+  by scrolling its nearest scrollable ancestor, and offsets the whole viewport
+  when that ancestor cannot scroll far enough.
+
+  Two further facts make our own arithmetic unreliable. The layout viewport
+  slides with the visual one on WebKit, and iOS 26 reports
+  `visualViewport.height` and `offsetTop` wrongly after a keyboard open.
+  Sources and the reasoning:
+  `docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md`.
+- **Removal / resolution condition:** the reveal places the field clear of the
+  keyboard and its accessory bar on every open. Confirmed across a
+  representative run of mobile forms on a real device. The probe's own lines
+  are the evidence: a
+  settled episode reports `want: null`, and reports `vvOffsetTop: 0` with
+  `pageScrollY: 0`, which says iOS scrolled the container rather than the
+  viewport.
+- **Status:** open
+- **Measures referencing this investigation:** Focused-field reveal probe (§1).
+
 ### `webkit-desktop-blank-thread`: a thread opens blank in the packaged Mac app
 
 - **Opened:** 2026-08-26
@@ -2185,9 +2413,9 @@ measure now eligible for removal** — search this file for the id to find them 
   model's reasoning as a live "Thinking" step instead of a frozen "Working", per
   `docs/plans/2026-06-25-surface-coding-agent-reasoning-in-timeline.md`) is wired
   end-to-end but produces **zero events** for the current models. Anthropic's
-  `thinking.display` defaults to `"omitted"` on every current model — Fable 5 /
-  Opus 5 / Opus 4.8/4.7 / Sonnet 5 — so thinking blocks stream with EMPTY text
-  (encrypted signature only) and no `thinking_delta` arrives. **Opus 5 does not
+  `thinking.display` defaults to `"omitted"` on every current model: Fable 5.1
+  and 5, Opus 5, Opus 4.8 and 4.7, Sonnet 5. So thinking blocks stream with
+  EMPTY text (encrypted signature only) and no `thinking_delta` arrives. **Opus 5 does not
   resolve it** — re-checked 2026-07-25 against Opus 5 specifically, not CC in
   aggregate: the dev workspace has 15 CC threads whose selected model is
   `claude-opus-5*`, carrying 955 `CodingAgentTextStreamed` events and **zero**
@@ -2368,3 +2596,95 @@ measure now eligible for removal** — search this file for the id to find them 
   removal steps.
 - **Status:** open
 - **Measures referencing this investigation:** Prompt-cache wire probe (§1).
+
+### `follow-ride-lands-short`: the ride's own write comes to rest short of the edge
+
+- **Opened:** 2026-09-19
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. The *standing follow* writes `scrollTop = liveEdgeTop` from its
+  growth round, measured inside the ResizeObserver callback after layout. On
+  the iOS PWA the container is sometimes found short of that edge a frame
+  later, with nothing having moved it.
+
+  WebKit is the suspect rather than the conclusion. This transcript already
+  carries a permanent compositor layer and a repaint burst for the same engine
+  deferring updates (`utils/webkitRepaint.ts`). None of the three reports
+  reproduced on desktop.
+
+  Three candidates are open, and the numbers below tell them apart. The extent
+  settles after the callback. The write is clamped against a stale extent.
+  Something else moves the container with no event behind it. Reasoning and
+  the event history the third report came with:
+  `docs/plans/2026-09-19-a-carrying-ride-verifies-its-own-landing.md`.
+- **Removal / resolution condition:** the cause is identified, and either fixed
+  or attributed to WebKit with evidence. The discriminator is the
+  `[Client/follow] short` line's own numbers across a representative iOS-PWA
+  window. A `short` that tracks a turn's growth points at the extent settling
+  late. A constant one points at a fixed band, which names a layout. No lines
+  at all over such a window closes it the other way: the two structural holes
+  ADR 0222 fixed were the whole of it. On close, flip every measure tagged
+  `Investigation: follow-ride-lands-short` to `removed` per its own removal
+  steps.
+- **Status:** open
+- **Measures referencing this investigation:** The ride says when its own write
+  landed short (§1).
+
+### `app-frame-escape-hatches`: an isolated app reaches neither an uncovered endpoint nor its own storage
+
+- **Opened:** 2026-09-20
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. ADR 0227 gave an app frame an opaque origin, which took two things
+  away and put nothing in their place.
+
+  An app that needs an endpoint no SDK method covers had one answer,
+  `fetch(lucidos.apiUrl('/<suffix>'))`, and CORS now refuses it. That is not a
+  hypothetical: an app in this workspace reads `/trigger-groups`, for which
+  there is no SDK namespace, and another reads `/models`.
+
+  An app that wants to remember a setting had `localStorage`, which now throws.
+  `lucidos.data` replaces it for app state, but is workspace-wide and
+  asynchronous. So a per-device value has no home at all: a sound toggle, a
+  display currency.
+
+  Two shapes were measured as viable and neither was chosen at first: a bridged
+  `lucidos.request(suffix, init)`, and an SDK-installed `localStorage` shim over
+  the storage the bridge already mirrors. Both widen a surface the isolation
+  deliberately narrowed, so each is a decision rather than a fix. The
+  behaviour behind both was measured in Chromium and WebKit, against the
+  shipped sandbox string: storage throws `SecurityError`, the frame's own fetch
+  is refused at `Origin: null`, and `defineProperty` over `window.localStorage`
+  installs.
+
+  **The endpoint half is now decided and shipped.** [ADR 0231](adr/0231-app-frame-bridged-request-default-deny.md)
+  takes the first shape, with a default-deny route classification behind it:
+  `lucidos.request` travels the bridge, and every `/api/v1` route declares
+  whether an app may reach it. The storage half stays open.
+
+  **Storage is worse than `localStorage` alone.** Measured in both engines while
+  deciding the above, against the shipped sandbox string: `indexedDB.open` and
+  `caches` throw `SecurityError` with it, and `document.cookie` throws on
+  Chromium and is silently dropped on WebKit. So an app caching in IndexedDB
+  breaks the same way, and it is not covered by the key-value mirror the bridge
+  already carries.
+
+  **One more loss has no storage in it at all.** `history.pushState` and
+  `replaceState` throw `SecurityError` on **WebKit** at an opaque origin, which
+  is the iOS PWA and the packaged desktop client. Chromium allows both.
+  `location.hash` works everywhere, and is what the SDK's own app-fragment
+  delivery uses, so an app that routes on the hash is unaffected.
+- **Removal / resolution condition:** the SDK carries a documented route for
+  the storage half, or the decision is recorded that it will not. Verify from
+  the tree: `system-knowhow/js-sdk.md` covers it, and
+  `system-knowhow/workspace-audit.md` check 2 recommends that route instead of
+  reporting the finding with none. Until then the audit names the break and
+  stops there, which is the honest answer rather than a remedy that cannot run.
+  The endpoint half is already verifiable that way: § `lucidos.request` and the
+  audit's remediation both name it.
+- **Status:** open (storage half)
+- **Measures referencing this investigation:** none yet.
+- **Related:** the same opaque origin took a third thing, behind a gateway. An
+  app frame cannot load its own files as subresources, because it sends no
+  device credential. See "Inline your own CSS and JS" advice to app authors
+  (§1).

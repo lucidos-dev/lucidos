@@ -51,6 +51,22 @@ const COMMIT_CADENCE_RULE: &str = "COMMIT CADENCE: Commit completed, coherent sl
     Diff view and recovery state stay current. Avoid committing known-broken work unless you \
     are explicitly checkpointing an intermediate state and the commit message says so.";
 
+/// Lucidos-repo-only rule: a session's knowledge belongs in git, never in the
+/// coding agent's per-user memory directory. Scoped to the two Lucidos-source
+/// flavors on purpose. An external repo is somebody else's working agreement,
+/// and an app worktree is the user's own workspace git.
+///
+/// Both backends carry it, because the standard is about where the fact lands
+/// rather than which agent wrote it: a Codex session reading the repo is the
+/// reader a memory file hides the fact from.
+const NO_MEMORY_FILES_RULE: &str = "NEVER WRITE A CODING-AGENT MEMORY FILE: Do not write to \
+    your agent's per-user memory directory (for Claude Code that is \
+    `$CLAUDE_CONFIG_DIR/projects/<cwd>/memory/`, a `MEMORY.md` plus one file per fact). \
+    Nothing else reads it: not Codex, not the user, not the next session on another machine. \
+    Knowledge lives in git instead, committed in the same change so it merges. A convention \
+    for agents goes in `CLAUDE.md` or `.claude/rules/`; a workspace fact goes in the \
+    workspace's own knowhow, written with `lucidos data write knowhow/<topic>/<name>.md`.";
+
 /// Apply/restart rule shared across Lucidos-repo CC system prompts. The
 /// file-type list and the hard ban must stay in sync with
 /// `engine::git_ops::files_require_restart` (the truth) and the
@@ -785,6 +801,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          Only intentional changes should remain — stale uncommitted edits get carried into the \
          pending change and cause confusion when the user reviews it.\n\n\
          {commit_cadence}\n\n\
+         {no_memory_files}\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
@@ -808,6 +825,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         implementation_plan = IMPLEMENTATION_PLAN_RULE,
         apply_restart = APPLY_RESTART_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
+        no_memory_files = NO_MEMORY_FILES_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
@@ -909,6 +927,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          CLEAN UP BEFORE FINISHING: Before ending your session, run `git diff` to check for \
          uncommitted changes. Discard unintentional changes with `git checkout -- <file>`.\n\n\
          {commit_cadence}\n\n\
+         {no_memory_files}\n\n\
          COMMANDS: Never use /cpa — it is for the main working tree only. \
          Just commit directly with `git add <file>` + `git commit -m \"message\"`. \
          The engine pushes to remote after the user clicks Apply (which is what merges your \
@@ -927,6 +946,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         implementation_plan = IMPLEMENTATION_PLAN_RULE,
         apply_restart = APPLY_RESTART_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
+        no_memory_files = NO_MEMORY_FILES_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
@@ -1577,8 +1597,12 @@ mod tests {
     /// screenshot read into the agent's own context reaches the user on no
     /// backend and in no worktree shape.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
-        ("worktree", "claude-code", 23643),
-        ("worktree", "codex", 22102),
+        // The four Lucidos-source rows (worktree + recovery, both backends)
+        // are 549 bytes higher than they were, for `NO_MEMORY_FILES_RULE`.
+        // Only these flavors carry it: a fact about THIS repo has to land in
+        // git, where Codex and the next session on another machine read it.
+        ("worktree", "claude-code", 24192),
+        ("worktree", "codex", 22651),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
@@ -1586,8 +1610,8 @@ mod tests {
         // an instruction the session cannot use.
         ("external_repo", "claude-code", 17138),
         ("external_repo", "codex", 15597),
-        ("recovery", "claude-code", 22238),
-        ("recovery", "codex", 20697),
+        ("recovery", "claude-code", 22787),
+        ("recovery", "codex", 21246),
         ("external_repo_recovery", "claude-code", 17014),
         ("external_repo_recovery", "codex", 15473),
         ("app_worktree", "claude-code", 19779),
@@ -1723,6 +1747,43 @@ mod tests {
                         full.contains("lucidos build-slot -- "),
                         "{label} must show the wrapper's exact prefix, not just name it"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_lucidos_source_sessions_are_told_not_to_write_memory_files() {
+        // Knowledge about this repo belongs in git, where Codex and the next
+        // session on another machine can read it. That is OUR working
+        // agreement, so the rule is scoped to the two Lucidos-source flavors.
+        // An external repo has its own conventions, and an app worktree is the
+        // user's workspace git. Both backends carry it: the standard is about
+        // where the fact lands, not which agent wrote it.
+        let taught = ["worktree", "recovery"];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &all_prompt_flavors() {
+                let full = append_backend_rules(base.clone(), agent);
+                let has = full.contains("NEVER WRITE A CODING-AGENT MEMORY FILE");
+                assert_eq!(
+                    has,
+                    taught.contains(label),
+                    "{label}/{} carries the no-memory-file rule: {has}, expected the opposite",
+                    agent.as_str()
+                );
+                if has {
+                    // Naming the ban alone leaves the fact homeless, and an
+                    // agent with a fact and no home writes the memory file.
+                    for needle in ["memory/", "lucidos data write knowhow/", "`.claude/rules/`"] {
+                        assert!(
+                            full.contains(needle),
+                            "{label} must name both the banned directory and where the \
+                             fact goes instead (missing: {needle:?})"
+                        );
+                    }
                 }
             }
         }

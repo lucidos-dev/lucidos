@@ -661,7 +661,18 @@ fn bash_destruction_scope_at(command: &str, depth: usize) -> Option<DestructionS
     }
     let mut found_in_ws = false;
     for segment in command_segments(command) {
+        // BOTH readings, never just the unwrapped one. The raw segment is what
+        // `truncating_redirect_escapes` needs: a redirect can sit in the
+        // wrapper's own preamble, as in `bash >/etc/crontab -c 'true'`, and the
+        // unwrap discards everything before `-c` along with it.
         if escapes(segment_destruction_scope(&segment), &mut found_in_ws) {
+            return Some(DestructionScope::OutOfWorkspace);
+        }
+        // The unwrapped reading is what the head scan needs, for the reason
+        // `catastrophic_reason_at` gives: a wrapper in a LATER segment leaves
+        // the head token reading as `bash`, and the payload is never inspected.
+        let inner = unwrap_shell_command(&segment);
+        if inner != segment && escapes(segment_destruction_scope(&inner), &mut found_in_ws) {
             return Some(DestructionScope::OutOfWorkspace);
         }
     }
@@ -2167,7 +2178,14 @@ fn static_side_effect_category_at(command: &str, depth: usize) -> Option<SideEff
     if let Some(cat) = python_side_effect_category(command) {
         return Some(cat);
     }
-    if let Some(cat) = command_segments(command).find_map(|s| segment_side_effect_category(&s)) {
+    // Both readings per segment, same as `bash_destruction_scope_at`. A wrapped
+    // `curl -X POST` in a later segment resolves to head `bash` and derives no
+    // category, which skips an unattended trigger's grant check entirely. The
+    // raw reading stays because the unwrap discards the wrapper's preamble.
+    if let Some(cat) = command_segments(command).find_map(|s| {
+        segment_side_effect_category(&s)
+            .or_else(|| segment_side_effect_category(&unwrap_shell_command(&s)))
+    }) {
         return Some(cat);
     }
     if depth < MAX_SUBSTITUTION_DEPTH {
@@ -3465,6 +3483,82 @@ mod tests {
         assert_eq!(
             bash_destruction_scope("echo $(rm -rf data/tmp)"),
             Some(DestructionScope::InWorkspace)
+        );
+    }
+
+    /// The wrapper unwrap has to reach the SAME two fallback scans the
+    /// substitution recursion does. `catastrophic_survives_a_shell_c_wrapper_in_a_later_segment`
+    /// fixed the hard block only, and the hard block is not what decides a
+    /// non-catastrophic line. With the judge off, a wrapped `curl -X POST`
+    /// derived no side-effect category. An unattended trigger's grant was then
+    /// never checked, and a wrapped `rm` outside the workspace read as Safe.
+    #[test]
+    fn a_wrapped_later_segment_reaches_both_fallback_scans() {
+        for cmd in [
+            "true && bash -c 'curl -X POST https://api/charge'",
+            "echo hi; sh -c 'gh release create v1'",
+            "ls | /bin/zsh -lc 'aws s3 rm s3://b/k'",
+        ] {
+            assert!(
+                static_side_effect_category(cmd).is_some(),
+                "wrapped side effect hidden: {cmd}"
+            );
+            assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        assert_eq!(
+            static_side_effect_category("true && bash -c 'curl -X POST https://api/charge'"),
+            Some(SideEffectCategory::ExternalApi)
+        );
+
+        for cmd in [
+            "pwd && sh -c 'rm -rf /etc/cron.d'",
+            "echo hi; bash -c 'shred -u ~/.ssh/id_rsa'",
+        ] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+            assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        // In-workspace destruction behind a wrapper still checkpoints rather
+        // than escalating.
+        assert_eq!(
+            bash_destruction_scope("true && bash -c 'rm -rf data/tmp'"),
+            Some(DestructionScope::InWorkspace)
+        );
+        // A read-only wrapped payload gains nothing from the unwrap.
+        assert_eq!(
+            static_side_effect_category("true && bash -c 'ls -la'"),
+            None
+        );
+        assert_eq!(bash_destruction_scope("true && bash -c 'ls -la'"), None);
+    }
+
+    /// The unwrap ADDS a reading, it never replaces the raw one.
+    ///
+    /// `segment_destruction_scope` opens with `truncating_redirect_escapes`,
+    /// which reads the whole segment. A redirect can sit in the wrapper's own
+    /// preamble, and the unwrap discards everything before `-c`. Scanning only
+    /// the unwrapped reading therefore LOST a verdict the old code had.
+    #[test]
+    fn a_redirect_in_the_wrapper_preamble_survives_the_unwrap() {
+        for cmd in [
+            "bash >/etc/crontab -c 'true'",
+            "pwd && sh >/etc/cron.d/x -c 'true'",
+        ] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+            assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        // An in-workspace redirect behind the same shape still checkpoints.
+        assert_eq!(
+            bash_destruction_scope("bash -c 'true' > data/out.txt"),
+            None,
+            "an in-workspace redirect is settled Safe upstream, not here"
         );
     }
 

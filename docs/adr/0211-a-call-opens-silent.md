@@ -1,12 +1,20 @@
 # 0211: A call opens silent: the talker is not heard before the caller's first word
 
 - **Status**: Accepted, and amended by [ADR 0213](0213-one-opener-buys-one-answer.md)
+  and [ADR 0218](0218-a-mute-covers-a-sentence.md)
 - **Date**: 2026-09-17
 
 > **What 0213 changes.** "Three things open the floor, and none closes it again"
 > is superseded. Each opener now buys a bounded run of turns, because a floor
 > held for the whole call let one hello license a forty-nine-second recitation.
 > Everything else here stands, including why the floor survives a turn end.
+
+> **What 0218 changes.** Two things. "The decision is per turn" is superseded,
+> and a mute now covers a SENTENCE. A Live turn ends at every 700 ms hole, so
+> the latch expired inside the sentence it was guarding. And "A Live one has no
+> such frame, and needs none" was wrong. Its talker answers the caller's audio
+> before its own transcriber reports a word, so the caller's device sends the
+> opener instead.
 
 ## Context
 

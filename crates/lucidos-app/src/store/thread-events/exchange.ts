@@ -14,6 +14,24 @@ export type Exchange = {
    *  non-divider exchanges and on divider exchanges that have neither
    *  progression nor a matching answer yet. */
   questionOvertaken?: boolean;
+  /** True on a CONTINUATION FRAGMENT: steps whose opening boundary is not
+   *  loaded yet.
+   *
+   *  A long thread opens on its newest page, and that page routinely starts
+   *  mid-turn. Without a fragment the fold drops every step ahead of the
+   *  page's first boundary, and a page holding none draws nothing at all. The
+   *  reader is then looking at a transcript too short to scroll, which is the
+   *  only thing that fetches the page behind it.
+   *
+   *  It draws no initiator panel, because nothing loaded says who started the
+   *  turn. Its `userEvent` is its own first step, so `exchangeKey` has a real
+   *  id to key on. That id is never drawn twice: the panel the boundary would
+   *  fill is the one this exchange omits.
+   *
+   *  Opened only while the thread reports older events unloaded. A thread
+   *  served whole and missing a boundary is genuinely corrupt, and the
+   *  transcript must keep saying so. */
+  continuationFragment?: true;
   /** True once the fold handed this exchange's running turn to a LATER
    *  exchange — a `ChildThreadCompleted` card or a question / permission
    *  divider took over the request-id redirect, so every remaining event of

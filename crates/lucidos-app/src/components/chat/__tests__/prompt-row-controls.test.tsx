@@ -1,23 +1,23 @@
-/** The prompt row's leading control cluster, and the one thing in it that is
- *  NOT the backend's.
+/** The prompt row's three leading slots, and the order that is their contract.
  *
- *  A coding-agent thread arms *event waits* through `lucidos await-event` just
- *  as the Lucidos Agent arms them through the tool, and the whole
- *  `e2e-lock-wait` skill exists to make it do so. The *waiting indicator*
- *  used to be mounted inside the Lucidos arm of this branch, so such a thread
- *  showed the **Waiting** dot with nothing anywhere naming what it watched and
- *  no **Stop waiting** button. These tests pin the mount, from both sides:
- *  the indicator on every branch, the Lucidos-only controls on one. */
+ *  The control menu anchors the row, the follow toggle is second and the call
+ *  toggle third, and each keeps its slot on every thread. The follow toggle
+ *  once sat after the indicators. It was third on a Lucidos thread, second on a
+ *  coding-agent one and fourth with a subscription armed. It is the only
+ *  control here rendering in every state, so it is the one that must not move.
+ *
+ *  The two toggles DO fold, last of everything, which is the same rule seen
+ *  from the other end. A slot holds at every width that can show it, and a
+ *  glyph off the screen protects nothing.
+ *
+ *  Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`. */
 import { describe, expect, it } from 'vitest';
 import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
-import { CallToggle } from '../CallToggle';
 import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
-import { WaitingIndicator } from '../WaitingPanel';
 import { LucidosControlMenu } from '../LucidosControlMenu';
-import { PromptRowControls } from '../PromptRowControls';
-import { TodoListIndicator } from '../TodoListPanel';
+import { PromptRowControls, promptRowToggles } from '../PromptRowControls';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
@@ -48,98 +48,63 @@ const row = (codingAgent: 'claude-code' | 'codex' | null) =>
     composeThreadId: undefined,
     lucidosThreadId: codingAgent ? undefined : 'thread-1',
     composeContext: false,
+    // Nothing folded, which is the state the order contract is about.
+    toggles: promptRowToggles(codingAgent, false).row,
+    attrsFor: () => ({}),
   });
 
 const cluster = (codingAgent: 'claude-code' | 'codex' | null) => componentsIn(row(codingAgent));
 
-/** The props one component was handed, found by walking the same tree.
- *
- *  The walk above reports a vnode's TYPE, so it sees `CallToggle` whether or
- *  not the toggle draws anything. Whether it draws is a prop, so reading the
- *  prop is the only way to pin it without a DOM.
- */
-function propsOf(node: ComponentChildren, component: unknown): AnyVNode['props'] | null {
-  if (node === null || node === undefined || typeof node === 'boolean') return null;
-  if (typeof node === 'string' || typeof node === 'number') return null;
-  if (Array.isArray(node)) {
-    return node.reduce<AnyVNode['props'] | null>(
-      (found, child) => found ?? propsOf(child, component),
-      null,
-    );
-  }
-  const vnode = node as AnyVNode;
-  if (vnode.type === component) return vnode.props;
-  return propsOf(vnode.props?.children, component);
-}
-
 describe('PromptRowControls', () => {
-  it.each<['a Claude Code thread' | 'a Codex thread', 'claude-code' | 'codex']>([
-    ['a Claude Code thread', 'claude-code'],
-    ['a Codex thread', 'codex'],
-  ])('mounts the waiting indicator on %s', (_label, agent) => {
-    expect(cluster(agent)).toContain(WaitingIndicator);
-  });
-
-  it('mounts the waiting indicator on a Lucidos Agent thread', () => {
-    expect(cluster(null)).toContain(WaitingIndicator);
-  });
-
   /** The branch exists for the controls that genuinely belong to one backend.
-   *  `TodoListWritten` is the Lucidos Agent's own event, so a coding-agent
-   *  thread has no todo list to show and no Lucidos model picker to offer. */
-  it('keeps the Lucidos-only controls off a coding-agent thread', () => {
+   *  A coding-agent thread has no Lucidos model picker to offer. */
+  it('keeps the Lucidos menu off a coding-agent thread', () => {
     const codingAgent = cluster('claude-code');
     expect(codingAgent).toContain(CodingAgentControlMenu);
     expect(codingAgent).not.toContain(LucidosControlMenu);
-    expect(codingAgent).not.toContain(TodoListIndicator);
   });
 
   it('keeps the coding-agent menu off a Lucidos Agent thread', () => {
     const lucidos = cluster(null);
     expect(lucidos).toContain(LucidosControlMenu);
-    expect(lucidos).toContain(TodoListIndicator);
     expect(lucidos).not.toContain(CodingAgentControlMenu);
   });
 
   /** `.prompt-actions-row` is a flex row whose children are diffed
-   *  positionally, so the order is part of the contract, not an accident of
-   *  how the JSX reads.
+   *  positionally, so the order is part of the contract.
    *
-   *  The first three slots are FIXED and the rest float behind them: the
-   *  control menu anchors the row, the follow toggle is second and the call
-   *  toggle third. Each renders in every state. Behind the indicators the
-   *  follow toggle was third on a Lucidos Agent thread, second on a
-   *  coding-agent one, and fourth with a subscription armed, so the button
-   *  moved under the thumb depending on what the thread was doing. The follow
-   *  toggle shows up here as its ICON, the one function component inside the
-   *  `<button>` this walk can see. The call toggle is its own component, so it
-   *  shows up under its own name. */
-  it('pins the menu and the two toggles, and floats the indicators behind them', () => {
-    expect(cluster(null)).toEqual([
-      LucidosControlMenu, FollowLiveEdgeIcon, CallToggle, TodoListIndicator, WaitingIndicator,
-    ]);
-    expect(cluster('claude-code')).toEqual([
-      CodingAgentControlMenu, FollowLiveEdgeIcon, CallToggle, WaitingIndicator,
-    ]);
+   *  The follow toggle shows up here as its ICON, the one function component
+   *  inside the `<button>` this walk can see. The call toggle is its own
+   *  component, so it shows up under its own name. */
+  it('puts the menu first and the follow toggle second', () => {
+    // Voice ships off, so the call toggle draws nothing here and contributes no
+    // member. Its THIRD slot is the contract, asserted on the fold order below.
+    expect(cluster(null)).toEqual([LucidosControlMenu, FollowLiveEdgeIcon]);
+    expect(cluster('claude-code')).toEqual([CodingAgentControlMenu, FollowLiveEdgeIcon]);
   });
 
-  /** A call reaches the Lucidos Agent and nothing else (ADR 0165), so the row
-   *  tells the toggle whether this destination can take one.
-   *
-   *  The toggle stays MOUNTED and draws nothing, which is why the order test
-   *  above is unchanged. Its slot is fixed; only its contents go.
-   *
-   *  `codingAgent` is `effectiveCodingAgentBackend`, so one prop covers all
-   *  three cases: a started coding-agent thread, a composing draft, and the
-   *  fresh compose view with the destination picked and no draft yet. */
-  it.each<['a Claude Code thread' | 'a Codex thread', 'claude-code' | 'codex']>([
-    ['a Claude Code thread', 'claude-code'],
-    ['a Codex thread', 'codex'],
-  ])('tells the call toggle it is unavailable on %s', (_label, agent) => {
-    expect(propsOf(row(agent), CallToggle)?.available).toBe(false);
+});
+
+describe('the two fixed toggles', () => {
+  /** Two views of one pair, so the fold and the row cannot disagree about which
+   *  of them exists. */
+  it('are the same members in both orders', () => {
+    const { row: slots, fold } = promptRowToggles(null, false);
+    expect([...slots].sort()).toEqual([...fold].sort());
   });
 
-  it('tells the call toggle it is available on a Lucidos Agent thread', () => {
-    expect(propsOf(row(null), CallToggle)?.available).toBe(true);
+  /** The follow toggle is the only control rendering in every state, so it is
+   *  the LAST thing to leave the row. */
+  it('fold call first and follow last', () => {
+    const { fold } = promptRowToggles(null, false);
+    expect(fold[fold.length - 1].key).toBe('follow-live-edge');
+  });
+
+  /** A call reaches the Lucidos Agent and nothing else (ADR 0165). Voice ships
+   *  off, so the member is absent either way here. What this pins is that the
+   *  factory is asked, rather than the composer deciding for itself. */
+  it('offer no call member on a coding-agent thread', () => {
+    expect(promptRowToggles('claude-code', false).fold.map((a) => a.key))
+      .not.toContain('call-toggle');
   });
 });

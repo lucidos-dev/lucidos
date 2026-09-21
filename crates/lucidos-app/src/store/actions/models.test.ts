@@ -82,6 +82,16 @@ describe('chatModelOptions', () => {
     expect(MODELS).toContainEqual({ value: 'gpt-6-astra', label: 'GPT-6 Astra' });
   });
 
+  // The newest Anthropic builtin, and the top of the list: its seed carries a
+  // negative sort_order so it outranks Fable 5.
+  it('offers Fable 5.1 above Fable 5', () => {
+    expect(MODELS).toContainEqual({ value: 'claude-fable-5-1', label: 'Fable 5.1' });
+    expect(MODELS).toContainEqual({ value: 'claude-fable-5-1[1m]', label: 'Fable 5.1 (1M)' });
+    expect(MODELS.findIndex((m) => m.value === 'claude-fable-5-1')).toBeLessThan(
+      MODELS.findIndex((m) => m.value === 'claude-fable-5'),
+    );
+  });
+
   it('returns only enabled models, mapped to {value,label}, when loaded', () => {
     chatModels.value = {
       status: 'loaded',
@@ -255,6 +265,14 @@ describe('displayModelName', () => {
   it('resolves Fable 5 from the static fallback labels', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('claude-fable-5')).toBe('Fable 5');
+  });
+
+  // `claude-fable-5` is a prefix of `claude-fable-5-1`, so a lookup that was
+  // not an exact match would label a 5.1 exchange as Fable 5.
+  it('tells the two Fable generations apart', () => {
+    chatModels.value = { status: 'not-loaded' };
+    expect(displayModelName('claude-fable-5-1')).toBe('Fable 5.1');
+    expect(displayModelName('claude-fable-5-1[1m]')).toBe('Fable 5.1 (1M)');
   });
 
   it('prefers the loaded registry label for a user-added model', () => {

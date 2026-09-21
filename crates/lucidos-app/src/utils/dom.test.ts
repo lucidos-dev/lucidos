@@ -12,7 +12,7 @@ if (typeof globalThis.HTMLElement === 'undefined') {
   };
 }
 
-import { focusIfNeeded, isTextInput, opensSoftwareKeyboard } from './dom';
+import { focusIfNeeded, isTextInput, opensSoftwareKeyboard, viewportIsKeyboardShrunk } from './dom';
 
 describe('focusIfNeeded', () => {
   const realDocument = (globalThis as any).document;
@@ -104,5 +104,22 @@ describe('opensSoftwareKeyboard', () => {
     expect(opensSoftwareKeyboard(tag('div'))).toBe(false);
     expect(opensSoftwareKeyboard(tag('button'))).toBe(false);
     expect(opensSoftwareKeyboard(null)).toBe(false);
+  });
+});
+
+describe('viewportIsKeyboardShrunk', () => {
+  it('is true when the visual viewport has lost a keyboard-sized band', () => {
+    expect(viewportIsKeyboardShrunk(430, 844)).toBe(true);
+  });
+
+  it('is false for the two viewports at the same height', () => {
+    expect(viewportIsKeyboardShrunk(844, 844)).toBe(false);
+  });
+
+  it('ignores a shrink too small to be a keyboard', () => {
+    // Browser chrome and a settling safe-area inset move it by this much. iOS
+    // never shrinks the LAYOUT viewport for the keyboard, so the gap is large
+    // whenever the keys are really up.
+    expect(viewportIsKeyboardShrunk(784, 844)).toBe(false);
   });
 });

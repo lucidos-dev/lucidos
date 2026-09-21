@@ -3389,7 +3389,11 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 if rest == "manifest.json" {
                     return serve_workspace_manifest(&state, &slug);
                 }
-                if is_document_navigation(&req) {
+                // Never for an app asset, whatever it claims to accept.
+                // `auth_api::enforce` exempts those from the device gate. So an
+                // unpaired caller could otherwise send one `Accept: text/html`
+                // and start the engine the picker's Stop just shut down.
+                if is_document_navigation(&req) && !crate::auth_api::is_public_app_asset(&path) {
                     // Kick the lazy-start in the background and return the boot
                     // window at once, rather than blocking this response on a
                     // multi-second provision and spawn. The page's auto-refresh
@@ -5518,6 +5522,46 @@ mod tests {
         // leaves Booting.
         assert!(!probe_result_is_stale(true, None, None, Health::Booting));
         assert!(!probe_result_is_stale(true, None, None, Health::Healthy));
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_caller_cannot_start_a_stopped_workspace_with_an_app_asset() {
+        // An app asset is exempt from the device gate, so this request arrives
+        // with nobody behind it. `is_document_navigation` reads `Accept` when
+        // there is no fetch metadata, so a hand-written one can claim to be a
+        // page load. Starting an engine on that would undo the picker's Stop
+        // for a caller who never paired.
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .add(Workspace::gateway_provisioned(
+                "dev".into(),
+                "Dev".into(),
+                51999,
+            ))
+            .unwrap();
+
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/dev/api/v1/sdk.js")
+            .header(header::ACCEPT, "text/html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        // The header is the proof, not the status: `proxy::starting_page` is a
+        // 503 too, so the code alone cannot tell the two branches apart. Only
+        // the lazy-start branch stamps the boot splash.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get("x-lucidos-boot-splash").is_none(),
+            "an exempt path must answer 'stopped', never the starting page"
+        );
     }
 
     // ── Adopting a directory that already exists ─────────────────────────────

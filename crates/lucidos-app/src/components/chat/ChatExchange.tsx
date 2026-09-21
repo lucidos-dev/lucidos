@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, StoredEvent, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -155,6 +155,22 @@ export function liveRowDrawsNoPanel(userEvent: StoredEvent): boolean {
   if (isLiveReplyRow(userEvent)) return true;
   if (!isLiveUtteranceRow(userEvent)) return false;
   return isLivePartialRow(userEvent) || !(userEvent as { text?: string }).text;
+}
+
+/**
+ * Does this turn draw the panel naming who started it?
+ *
+ * Everything does, except a continuation fragment. Its boundary is older than
+ * the page this client holds, so nothing loaded can name it. Its `userEvent` is
+ * only its own first step, standing in for a key. Drawing that as an initiator
+ * would put a tool call where the reader expects a person.
+ *
+ * The rows themselves still draw. The head of the turn arrives with the page
+ * behind it, and the fold then merges the fragment into the real turn. See
+ * `Exchange.continuationFragment`.
+ */
+export function drawsInitiatorPanel(exchange: Exchange): boolean {
+  return exchange.continuationFragment !== true;
 }
 
 /** Which boundaries the reader owns, and so draw the right-aligned bubble.
@@ -770,9 +786,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       : canCollapseInitiator ? 'initiator' : undefined;
 
   return (
-    <div class="chat-exchange" data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}
+    <div class="chat-exchange" data-event-id={exchangeStarterId(exchange)} data-change-id={changeId || undefined}
          data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}>
+      {/* Keyed, because a fragment omits this one and both panels animate.
+          Preact does hold the slot an `&&`-guarded child leaves behind, so
+          index matching survives this particular omission on its own. The keys
+          are what keep that true if the guard ever becomes an early return of
+          a different tree (`.claude/rules/frontend.md`). */}
+      {drawsInitiatorPanel(exchange) && (
       <InitiatorPanel
+        key="initiator"
         initiator={isQueuedUserMessage
           // Appended, not replaced. A spoken message already put its own chip
           // in this slot, and both facts are true of a queued utterance.
@@ -793,9 +816,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         collapsed={isInitiatorCollapsed}
         onToggle={canCollapseInitiator ? toggleInitiator : undefined}
       />
+      )}
 
       {showResponsePanel && (
         <ResponsePanel
+          key="response"
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
           controls={turnControlsSlot}
@@ -958,6 +983,10 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   // the count and the last seq below hold across every word it gains. Without
   // this the bubble stops on whatever prefix the first render caught.
   if (a.liveReplyText !== b.liveReplyText) return false;
+  // `continuationFragment` is deliberately absent. A fragment keys off its first step, and
+  // the turn it merges into keys off its boundary. So the page that clears the
+  // flag also changes `exchangeKey` and remounts the node, and this compare
+  // could only ever answer with itself.
   if (a.questionOvertaken !== b.questionOvertaken) return false;
   if (a.continuationMoved !== b.continuationMoved) return false;
   if (a.steps.length !== b.steps.length) return false;
@@ -1229,6 +1258,13 @@ export function describeInitiator(
       status: <SpokenChip />,
     });
   }
+  // A *continuation fragment* has no starter to describe: the boundary that
+  // opened its turn is older than the loaded page, and its `userEvent` is only
+  // its own first step. Nothing draws this, `drawsInitiatorPanel` suppressing
+  // the panel, but the descriptor still reaches `isUserMessageBubble` and
+  // `canCollapseInitiator`. Falling to the default below hands an agent's turn
+  // the reader's own "You" chip, which is what those two would then read.
+  if (exchange.continuationFragment) return { variant: 'system', icon: null, label: '' };
   const summary = initiatorSummary(ev);
   switch (ev.type) {
     case 'TriggerStarted':

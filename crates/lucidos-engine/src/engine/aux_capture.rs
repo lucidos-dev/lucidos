@@ -178,6 +178,7 @@ mod tests {
             ContextPurpose::ImageDescribe,
             ContextPurpose::Memory,
             ContextPurpose::ConversationSummary,
+            ContextPurpose::QueryClassification,
             ContextPurpose::ImageGen,
         ] {
             let event = auxiliary_capture(purpose, "gemini-3-flash-preview", 100, None, false);

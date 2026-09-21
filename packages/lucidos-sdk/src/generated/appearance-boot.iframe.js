@@ -93,6 +93,26 @@
     return new RegExp(`[?&]${STYLE_RESET_PARAM}(?:[=&]|$)`).test(search);
   }
 
+  // src/_bridge.ts
+  var BRIDGE_TYPE = "lucidos:bridge";
+  var bridged = null;
+  function isBridged() {
+    if (bridged !== null) return bridged;
+    bridged = typeof window !== "undefined" && window.parent !== window && globalThis.origin === "null";
+    return bridged;
+  }
+  function hostOrigin() {
+    try {
+      return location.origin || "*";
+    } catch (e) {
+      return "*";
+    }
+  }
+  function tellHost(op, args) {
+    const message = { type: BRIDGE_TYPE, id: "", op, args };
+    window.parent.postMessage(message, hostOrigin());
+  }
+
   // src/_fetch.ts
   function computeBaseUrl() {
     var _a;
@@ -127,7 +147,20 @@
     const slug = workspaceSlug();
     return slug ? `ws:${slug}:${key}` : key;
   }
+  var mirror = /* @__PURE__ */ new Map();
+  function mirrorKey(key, session) {
+    return `${session ? "session" : "local"}:${key}`;
+  }
+  function bridgedGet(key, session) {
+    var _a;
+    return (_a = mirror.get(mirrorKey(key, session))) != null ? _a : null;
+  }
+  function bridgedRemove(key, session) {
+    mirror.delete(mirrorKey(key, session));
+    tellHost("storage.remove", { key, session });
+  }
   function wsLocalGet(key) {
+    if (isBridged()) return bridgedGet(nsKey(key), false);
     try {
       return localStorage.getItem(nsKey(key));
     } catch (e) {
@@ -135,6 +168,7 @@
     }
   }
   function wsLocalRemove(key) {
+    if (isBridged()) return bridgedRemove(nsKey(key), false);
     try {
       localStorage.removeItem(nsKey(key));
     } catch (e) {
@@ -142,9 +176,18 @@
   }
 
   // src/boot/appearanceBoot.ts
+  function servedPrefs() {
+    const served = globalThis.__lucidosPrefs;
+    return served && typeof served === "object" ? served : null;
+  }
+  function seeded(served, serverKey, storageKey) {
+    const value = served == null ? void 0 : served[serverKey];
+    return typeof value === "string" && value !== "" ? value : wsLocalGet(storageKey);
+  }
   function applyAppearanceBoot(opts) {
     const d = document.documentElement;
-    const raw = wsLocalGet("lucidos-theme");
+    const served = servedPrefs();
+    const raw = seeded(served, "theme", "lucidos-theme");
     const theme = raw && THEMES.includes(raw) ? raw : DEFAULT_THEME;
     const prefersLight = matchMedia("(prefers-color-scheme: light)").matches;
     const resolved = resolveTheme(theme, prefersLight);
@@ -152,18 +195,22 @@
     const bg = THEME_BG[resolved];
     d.style.setProperty("--bg-primary", bg);
     d.style.background = bg;
-    const fontKey = resolveFontKey(wsLocalGet("lucidos-font-family"));
+    const fontKey = resolveFontKey(seeded(served, "font-family", "lucidos-font-family"));
     d.style.setProperty("--font-ui", FONT_FAMILY_VALUES[fontKey]);
     const features = fontFeaturesFor(fontKey);
     d.style.setProperty("--font-features-text", features.text);
     d.style.setProperty("--font-features-code", features.code);
-    const scale = parseUiScale(wsLocalGet("lucidos-ui-scale"));
+    const scale = parseUiScale(
+      (served == null ? void 0 : served["ui-scale"]) || (served == null ? void 0 : served["text-size"]) || (served == null ? void 0 : served["font-size"]) || wsLocalGet("lucidos-ui-scale")
+    );
     if (scale !== null) d.style.setProperty("--user-ui-scale", `${scale}%`);
     try {
       if (opts.styleReset && styleResetRequested(location.search)) {
         wsLocalRemove(STYLE_OVERRIDES_STORAGE_KEY);
       } else {
-        const overrides = parseStyleOverrides(wsLocalGet(STYLE_OVERRIDES_STORAGE_KEY));
+        const overrides = parseStyleOverrides(
+          seeded(served, "style_overrides", STYLE_OVERRIDES_STORAGE_KEY)
+        );
         for (const name of Object.keys(overrides)) {
           d.style.setProperty(name, overrides[name]);
         }

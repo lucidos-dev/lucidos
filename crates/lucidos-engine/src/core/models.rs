@@ -337,6 +337,13 @@ mod tests {
             "Fable 5 builtin must be seeded on the anthropic provider"
         );
         assert!(
+            models.iter().any(|m| m.id == "claude-fable-5-1"
+                && m.provider == "anthropic"
+                && m.is_builtin()
+                && m.enabled),
+            "Fable 5.1 builtin must be seeded on the anthropic provider, enabled"
+        );
+        assert!(
             models
                 .iter()
                 .any(|m| m.id == "claude-opus-4-8@default" && m.provider == "vertex"),
@@ -362,9 +369,13 @@ mod tests {
                 .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin() && !m.enabled),
             "Sonnet 4.6 is still SEEDED, and switched off by the prior-generation prune"
         );
-        // Ordered by sort_order: Fable 5 (0) sorts before Opus 5 (5) before
-        // Sonnet 5 (7) before Opus 4.8 (10), grouping the current generation at
-        // the top of the picker.
+        // Ordered by sort_order, newest first: Fable 5.1 (-2), Fable 5 (0),
+        // Opus 5 (5), Sonnet 5 (7), Opus 4.8 (10). That groups the current
+        // generation at the top of the picker.
+        let fable51 = models
+            .iter()
+            .position(|m| m.id == "claude-fable-5-1")
+            .unwrap();
         let fable = models
             .iter()
             .position(|m| m.id == "claude-fable-5")
@@ -382,7 +393,7 @@ mod tests {
             .position(|m| m.id == "claude-opus-4-8@default")
             .unwrap();
         assert!(
-            fable < opus5 && opus5 < sonnet5 && sonnet5 < opus,
+            fable51 < fable && fable < opus5 && opus5 < sonnet5 && sonnet5 < opus,
             "sort_order must drive display order"
         );
         pool.close().await;
@@ -530,6 +541,7 @@ mod tests {
         // particular is `DEFAULT_CHAT_MODEL`: switch it off and a fresh install
         // resolves to a model its own picker will not show.
         for id in [
+            "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5@default",
             "claude-sonnet-5",
@@ -768,6 +780,7 @@ mod tests {
             ("gemini-3.5-flash", 1_048_576),
             ("gemini-3-flash-preview", 1_048_576),
             // Claude `[1m]` rows — these DO request 1M mode.
+            ("claude-fable-5-1[1m]", 1_000_000),
             ("claude-fable-5[1m]", 1_000_000),
             ("claude-opus-5@default[1m]", 1_000_000),
             ("claude-opus-4-8@default[1m]", 1_000_000),
@@ -798,6 +811,7 @@ mod tests {
         // Declaring 1M here is the dangerous direction: the packer would exceed
         // the API mode the request actually selected.
         for id in [
+            "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5@default",
             "claude-opus-4-8@default",

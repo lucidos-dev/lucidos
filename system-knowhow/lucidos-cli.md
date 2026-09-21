@@ -87,6 +87,8 @@ invoke them directly.
 
 For app UIs (in the browser) keep using the JS SDK (`lucidos.data.*`, `lucidos.events.*`). The CLI is for shell / subprocess contexts only.
 
+**A fact worth keeping goes in `data/`, never in the agent's own memory directory.** Claude Code writes per-user memory under `$CLAUDE_CONFIG_DIR/projects/<cwd>/memory/`, which sits outside both the worktree and the workspace. The engine never indexes it, and Codex, the user and the next session on another machine never read it. Write the fact to `knowhow/<topic>/`, or the relevant app's or plugin's knowhow, with `lucidos data write`. In the Lucidos repo itself, a convention for coding agents goes in `CLAUDE.md` or `.claude/rules/`, committed with the change.
+
 ## Subcommands
 
 ### Hidden: `lucidos coding-agent-diff-hook`
@@ -1021,6 +1023,8 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 ```
 
 > **In-thread agent:** the chat Lucidos Agent has the equivalent `apply_change` LLM tool. It calls the same engine apply pipeline **in-process** and stamps the apply as the agent (linked back to the applying thread), so the route popover never mislabels it as "You". Use `apply_change` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess (which can't call the in-process tool and would otherwise have to forward the subprocess-origin headers by hand).
+
+> **Both refusals below reach the LLM tool too.** `apply_change` asks the same gate this CLI's route asks (ADR 0233). A thread that is still working, or a change with no files left, is refused there as well. The tool error names the way forward. It offers `apply_when_settled` only for a *working* thread, because a *standing apply* drops at once on a parked one.
 
 > **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every thread still working as each one lands. Both arm the same instruction the Apply control arms from the UI. Both drop with a report if a thread parks or fails. LLM-only, with no CLI form.
 

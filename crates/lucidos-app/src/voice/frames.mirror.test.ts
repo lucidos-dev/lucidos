@@ -82,7 +82,11 @@ const SERVER_SAMPLES: ServerFrame[] = [
   { type: 'error', message: '' },
 ];
 
-const CLIENT_SAMPLES: ClientControl[] = [{ type: 'barge_in' }, { type: 'hang_up' }];
+const CLIENT_SAMPLES: ClientControl[] = [
+  { type: 'barge_in' },
+  { type: 'caller_started_speaking' },
+  { type: 'hang_up' },
+];
 
 describe('the client and the engine speak one vocabulary', () => {
   it('reads the tag the way serde writes it', () => {

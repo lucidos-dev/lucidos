@@ -2448,22 +2448,34 @@ describe('a reading position that names a turn', () => {
   }
 
   /** Observers that hand the test their callbacks, so a window GROWING can be
-   *  delivered rather than waited for. */
+   *  delivered rather than waited for.
+   *
+   *  `armed` counts the RESTORE's observers alone. The content watch outlives
+   *  the restore on purpose, so counting it here would make "the restore is
+   *  retired" unaskable. It is told apart by its `attributeFilter`, which
+   *  nothing else passes, and counted by `contentArmed`. */
   function liveObservers() {
-    const callbacks: Array<() => void> = [];
+    type Entry = { cb: () => void; content: boolean };
+    const entries: Entry[] = [];
     class Capturing {
-      cb: () => void;
-      constructor(cb: () => void) { this.cb = cb; callbacks.push(cb); }
-      observe() {}
+      entry: Entry;
+      constructor(cb: () => void) { this.entry = { cb, content: false }; entries.push(this.entry); }
+      observe(_target?: unknown, options?: MutationObserverInit) {
+        if (options?.attributeFilter) this.entry.content = true;
+      }
       disconnect() {
-        const i = callbacks.indexOf(this.cb);
-        if (i >= 0) callbacks.splice(i, 1);
+        const i = entries.indexOf(this.entry);
+        if (i >= 0) entries.splice(i, 1);
       }
       takeRecords() { return []; }
     }
     (globalThis as any).ResizeObserver = Capturing;
     (globalThis as any).MutationObserver = Capturing;
-    return { fire: () => { for (const cb of [...callbacks]) cb(); }, armed: () => callbacks.length };
+    return {
+      fire: () => { for (const e of [...entries]) e.cb(); },
+      armed: () => entries.filter(e => !e.content).length,
+      contentArmed: () => entries.filter(e => e.content).length,
+    };
   }
 
   const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
@@ -2901,6 +2913,71 @@ describe('a reading position that names a turn', () => {
 
     expect(el.scrollTop).toBe(150);
     expect(obs.armed()).toBe(0);
+    detach();
+  });
+
+  it('follows the turn at the top when the CONTENT changed under a still reader', async () => {
+    // The reported bug. The reader parks at the top of a paged thread. Its
+    // oldest loaded turn is a fragment, so it carries no id.
+    //
+    // The record therefore names the turn BELOW it. A backfill then folds that
+    // fragment into the real turn, which changes the answer with nothing
+    // moving. The record used to name the turn below for the whole visit.
+    vi.useFakeTimers();
+    try {
+      const obs = liveObservers();
+      const el = mockTranscript({ ids: IDS, renderFrom: 2, turnHeight: TURN, scrollTop: 0 });
+      const detach = attachScrollMemory(el, 'k', opts);
+      expect(obs.contentArmed()).toBe(1);
+
+      el.fireScroll();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(localStorage.getItem('k')).toBe('anchor:0:t2');
+
+      // The window reaches the older turns. `growWindowTo` leaves `scrollTop`
+      // alone, as prepending content does, so no scroll event follows.
+      el.growWindowTo(0);
+      obs.fire();
+      await vi.advanceTimersByTimeAsync(400);
+
+      expect(localStorage.getItem('k')).toBe('anchor:0:t0');
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('opens no record from content alone, so an untouched thread keeps none', async () => {
+    // The guard the branch above needs. A thread the reader has not moved in
+    // has NO reading position, and that is the one state the *follow seed*
+    // speaks for. A streaming turn must not write one on their behalf.
+    vi.useFakeTimers();
+    try {
+      const obs = liveObservers();
+      const el = mockTranscript({ ids: IDS, renderFrom: 2, turnHeight: TURN, scrollTop: 0 });
+      const detach = attachScrollMemory(el, 'k', opts);
+
+      el.growWindowTo(0);
+      obs.fire();
+      await vi.advanceTimersByTimeAsync(400);
+      detach();
+
+      expect(localStorage.getItem('k')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a container recording a bare offset watches no content', () => {
+    // Its answer IS `scrollTop`, which cannot change without a scroll event.
+    // Watching the subtree there costs a forced layout per mutation, bought
+    // for an answer that cannot have moved.
+    const obs = liveObservers();
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', { live: () => ({}), resetOnEmpty: true });
+
+    expect(obs.contentArmed()).toBe(0);
     detach();
   });
 

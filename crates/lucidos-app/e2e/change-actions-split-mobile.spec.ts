@@ -8,7 +8,7 @@ import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
  * button on every viewport — a one-tap "Apply*" primary face (the asterisk
  * marks a restart-requiring change) plus a caret that opens an upward menu
  * holding Discard. Diff lives permanently
- * OUTSIDE the split button as its own standalone top-level button. This verifies
+ * OUTSIDE the split button as its own standalone icon. This verifies
  * the split renders + works at a real mobile viewport; the desktop rendering of
  * the same control is covered by
  * change-actions-split-desktop / diff-button-branch-has-diff-desktop.
@@ -36,8 +36,8 @@ test.describe('Change actions — mobile split button', () => {
       await expect(face).toBeVisible({ timeout: 15_000 });
       await expect(face).toHaveText(/^Apply\*$/);
 
-      // Diff is a standalone top-level button — never folded into the menu.
-      await expect(page.locator('.thread-action-buttons:visible button:has-text("Diff")')).toBeVisible();
+      // Diff is a standalone top-level icon, never folded into the menu.
+      await expect(page.locator('.thread-action-buttons:visible button[data-role="thread-diff"]')).toBeVisible();
       // Discard is NOT a top-level button — it folds into the (closed) caret
       // menu, so it isn't rendered yet.
       await expect(page.locator('.thread-action-buttons:visible button.action-btn-danger')).toHaveCount(0);
@@ -46,7 +46,7 @@ test.describe('Change actions — mobile split button', () => {
       await page.locator('.thread-action-buttons:visible .split-button-caret').first().click();
       const menu = page.locator('.split-button-menu:visible');
       await expect(menu).toBeVisible();
-      await expect(menu.locator('button:has-text("Diff")')).toHaveCount(0);
+      await expect(menu.locator('button[data-role="thread-diff"]')).toHaveCount(0);
       await expect(menu.locator('button:has-text("Discard")')).toBeVisible();
 
       // Discarding via the menu drops the change from the pending list.

@@ -1,5 +1,5 @@
 use super::events_snapshot::{
-    rename_legacy_section_size, rename_legacy_section_size_in_payload,
+    is_tool_call_event, rename_legacy_section_size, rename_legacy_section_size_in_payload,
     strip_app_capture_in_tool_result, strip_context_capture_sections,
     strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_call_args,
     strip_tool_result_content,
@@ -440,11 +440,14 @@ fn tool_call_strip_is_idempotent() {
     assert_eq!(row.payload, after_first, "second call is a no-op");
 }
 
-/// The chat channel's own `ToolCalled` is left alone: its args are small, and
-/// `thread-sync.ts` reads the write target straight off them.
+/// An event that is not a tool call keeps its payload whole.
+///
+/// `ToolCalled` used to be on this list, on the reading that a chat tool's args
+/// are small. Measured, they were the largest share of a reported thread, so it
+/// is stripped now and has its own cases above.
 #[test]
-fn tool_call_strip_ignores_the_chat_channel_and_other_event_types() {
-    for event_type in ["ToolCalled", "ContextCaptured", "MessageReceived"] {
+fn tool_call_strip_ignores_other_event_types() {
+    for event_type in ["ContextCaptured", "MessageReceived", "ToolResult"] {
         let mut row = row(
             event_type,
             json!({ "name": "write_file", "args": { "path": "notes.md" } }),
@@ -595,4 +598,124 @@ async fn a_parked_thread_is_refused_apply_and_discard_server_side() {
     );
 
     teardown_test_db(&db_name).await;
+}
+
+/// The chat channel's tool call is stripped too.
+///
+/// It was excluded on the reading that those args are small. On a reported
+/// thread they were its largest share at 3.15 MB, because a `bash` call inlines
+/// its whole script.
+#[test]
+fn strips_args_from_a_chat_tool_call() {
+    let mut row = row(
+        "ToolCalled",
+        json!({
+            "name": "bash",
+            "description": "Count the trace rows",
+            "args": { "command": "python3 -c \"".to_string() + &"x".repeat(20_000) + "\"" },
+        }),
+    );
+    strip_tool_call_args(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("args"), "args must be dropped");
+    assert_eq!(obj.get("args_stripped"), Some(&json!(true)));
+    assert_eq!(obj.get("description"), Some(&json!("Count the trace rows")));
+    assert_eq!(obj.get("name"), Some(&json!("bash")));
+}
+
+/// A chat call with no description gets one BEFORE the args go. Without it the
+/// inline row would read as a bare tool name, since the label is
+/// `description || describeEngineTool(name, args)`.
+#[test]
+fn a_chat_tool_call_is_described_before_its_args_are_dropped() {
+    let mut row = row(
+        "ToolCalled",
+        json!({
+            "name": "read_file",
+            "args": { "path": "artifacts/notes.md" },
+        }),
+    );
+    strip_tool_call_args(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("args"), "args must be dropped");
+    let described = obj
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or_default();
+    assert!(
+        !described.is_empty(),
+        "a stripped row must carry a description, or the step row reads as a bare tool name"
+    );
+}
+
+/// Both channels' calls answer the SAME predicate, which is what keeps the
+/// strip and its lazy fetch in agreement. A strip whose fetch does not
+/// recognise the type it stripped serves a 404 where the modal expects text.
+#[test]
+fn the_tool_call_predicate_covers_both_channels() {
+    assert!(is_tool_call_event("ToolCalled"));
+    assert!(is_tool_call_event("CodingAgentToolCalled"));
+    assert!(!is_tool_call_event("ToolResult"));
+    assert!(!is_tool_call_event("TextStreamed"));
+}
+
+/// A chat call with no description is described by the CHAT describer.
+///
+/// The client's own fallback splits the same way. Naming a chat tool through
+/// the coding-agent describer gives it a label for a tool it is not. The args
+/// are dropped a line later, so nothing can repair it.
+#[test]
+fn a_chat_tool_call_is_described_by_the_chat_describer() {
+    let args = json!({ "path": "artifacts/notes.md" });
+    let mut row = row("ToolCalled", json!({ "name": "read_file", "args": args }));
+    strip_tool_call_args(&mut row);
+    let described = row.payload["description"].as_str().unwrap_or_default();
+    assert_eq!(
+        described,
+        crate::core::describe_tool("read_file", &json!({ "path": "artifacts/notes.md" })),
+        "the chat describer names it"
+    );
+}
+
+/// And a coding-agent call keeps the coding-agent describer.
+#[test]
+fn a_coding_agent_call_is_described_by_the_coding_agent_describer() {
+    let args = json!({ "file_path": "/a/shell.css", "content": "x" });
+    let mut row = row(
+        "CodingAgentToolCalled",
+        json!({ "name": "Write", "args": args }),
+    );
+    strip_tool_call_args(&mut row);
+    let described = row.payload["description"].as_str().unwrap_or_default();
+    assert_eq!(
+        described,
+        crate::core::describe_cc_tool(
+            "Write",
+            &json!({ "file_path": "/a/shell.css", "content": "x" })
+        ),
+        "the coding-agent describer names it"
+    );
+}
+
+/// A `generate_image` call keeps its args, alone among tool calls.
+///
+/// Its bytes land in the ToolResult, and the rendered image takes its tooltip
+/// and alt text from the call's prompt. Dropping it leaves a generated image
+/// undescribed after a reload.
+#[test]
+fn the_image_prompt_survives_the_args_strip() {
+    let mut row = row(
+        "ToolCalled",
+        json!({
+            "name": "generate_image",
+            "args": { "prompt": "a lighthouse in fog" },
+        }),
+    );
+    strip_tool_call_args(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert_eq!(obj["args"]["prompt"], json!("a lighthouse in fog"));
+    assert!(
+        !obj.contains_key("args_stripped"),
+        "nothing was stripped, so nothing may claim it was"
+    );
 }

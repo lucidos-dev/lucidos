@@ -1,4 +1,13 @@
 import { apiUrl } from './_fetch';
+import {
+  callHost,
+  fromWireResponse,
+  headersToRecord,
+  isBridged,
+  toWireBody,
+  type WireRequest,
+  type WireResponse,
+} from './_bridge';
 
 /**
  * Generic API proxy. Configure backends in `data/config/apis.json`:
@@ -32,12 +41,32 @@ export interface ProxyClient {
   fetch(path: string, init?: RequestInit): Promise<Response>;
 }
 
+/** How long the host will wait on a proxied upstream before giving up.
+ *
+ *  Generous, because the upstream is somebody else's service rather than the
+ *  engine. It exists so a hung backend cannot leave a pending entry for the
+ *  life of the frame, which a bare `fetch` never needed. */
+const PROXY_TIMEOUT_MS = 120000;
+
 export function proxy(name: string): ProxyClient {
   const safeName = encodeURIComponent(name);
   return {
-    fetch(path: string, init?: RequestInit): Promise<Response> {
+    async fetch(path: string, init?: RequestInit): Promise<Response> {
       const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-      return fetch(apiUrl(`/proxy/${safeName}${normalizedPath}`), init);
+      const suffix = `/proxy/${safeName}${normalizedPath}`;
+      if (!isBridged()) return fetch(apiUrl(suffix), init);
+      // An isolated frame's own `fetch` is CORS-blocked, so the host makes the
+      // call. The raw `Response` is rebuilt on this side, so a caller still
+      // picks its own way to read the body.
+      const wire: WireRequest = {
+        path: suffix,
+        method: init?.method ?? 'GET',
+        headers: headersToRecord(init?.headers),
+        body: toWireBody(init?.body),
+        timeoutMs: PROXY_TIMEOUT_MS,
+      };
+      const value = await callHost('fetch', wire, PROXY_TIMEOUT_MS);
+      return fromWireResponse(value as WireResponse);
     },
   };
 }

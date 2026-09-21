@@ -385,10 +385,6 @@ html[data-theme="light"] .settings-option.active {
     border-bottom: 1px solid var(--border-color);
 }
 
-.model-manager-row .toggle-switch {
-    flex-shrink: 0;
-}
-
 .model-manager-row .model-manager-info {
     flex: 1 1 14rem;
     min-width: 0;

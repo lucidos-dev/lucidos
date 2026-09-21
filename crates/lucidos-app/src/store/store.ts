@@ -31,6 +31,7 @@ import type {
   PluginUninstallRequest,
   PluginUninstallReceipt,
   IngressReading,
+  RefusalReading,
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
@@ -46,9 +47,9 @@ import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, ReleaseNoticeView } from '../api/client';
+import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView } from '../api/client';
 import type { ReleaseCheck } from '../api/client/control';
-import type { EnvironmentVariable, ModelInfo } from '../api/types';
+import type { EnvironmentVariable, ModelInfo, ResponseStyle } from '../api/types';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
@@ -1826,6 +1827,10 @@ export const environmentVariables = signal<Loadable<EnvironmentVariable[]>>({ st
 // --- Chat model registry (Settings → Models; drives the Lucidos Agent picker) ---
 export const chatModels = signal<Loadable<ModelInfo[]>>({ status: 'not-loaded' });
 
+/** The merged *style library*, as the engine reports it. Read by the response
+ *  style picker and by its editor, both in Settings. */
+export const responseStyles = signal<Loadable<ResponseStyle[]>>({ status: 'not-loaded' });
+
 // --- OAuth Accounts ---
 export const oauthAccounts = signal<Loadable<OAuthAccountInfo[]>>({ status: 'not-loaded' });
 
@@ -1982,6 +1987,15 @@ export function setPluginsInstalledOnly(next: boolean): void {
   pluginsInstalledOnly.value = next;
   localStorage.setItem(PLUGINS_INSTALLED_ONLY_KEY, String(next));
 }
+
+/** The **Plugins** panel's marketplace filter, a `marketplace_id` or `null` for
+ *  all of them. Deliberately NOT persisted: it narrows the view in front of the
+ *  user rather than setting a preference.
+ *
+ *  A signal rather than component state because the panel splits the control
+ *  from what it filters. The dropdown is in the filter bar and the catalog list
+ *  is below it, so neither owns the other. */
+export const pluginsMarketplaceFilter = signal<string | null>(null);
 /** A plugin id the Plugins panel's list should scroll to and pulse-highlight
  *  once it renders. The update-notification deep-link sets it, so a tap lands
  *  the user on the exact plugin with the pending update. Mirrors
@@ -2391,6 +2405,16 @@ export const backupPreferencesVersion = signal(0);
  *  (ADR 0118). */
 export const mcpServersVersion = signal(0);
 
+/** Bumped on every `PreferencesChanged` frame carrying `response_styles`.
+ *  Settings re-reads `/response-styles` on it.
+ *
+ *  A version counter rather than a read of the `preferences` signal, because
+ *  the library the editor renders is not the stored document: the engine
+ *  merges what it ships with what the user saved, and only the engine holds
+ *  the shipped half. So the cached preference map cannot answer, and the page
+ *  has to ask again (ADR 0118). */
+export const responseStylesVersion = signal(0);
+
 /** Bumped on every `WebhookCreated` / `WebhookUpdated` / `WebhookDeleted`
  *  frame. Settings → Webhooks re-reads its list on it. Hooks are created and
  *  disabled from the CLI as often as from this page, so the open page was
@@ -2409,6 +2433,18 @@ export const webhooksVersion = signal(0);
  *  whether the engine answers THIS browser. An ingress outage is the opposite
  *  case: the app is fine and the machine cannot be reached from outside. */
 export const webhookIngress = signal<Loadable<IngressReading>>({ status: 'not-loaded' });
+
+/** Which webhooks are turning away the deliveries that DO arrive.
+ *
+ *  The signal beside it answers whether a sender can reach the workspace. This
+ *  one answers what happened once one did, which the ingress probe cannot see:
+ *  a 401 is the healthy answer there, so a hook that refuses everything passes
+ *  it perfectly.
+ *
+ *  Read by two surfaces, exactly as its neighbour is: the app bar, and the
+ *  matching row on the Webhooks page. Loaded at startup so the bar can raise
+ *  itself, and re-read on the two `WebhookDeliveries*` frames. */
+export const webhookRefusals = signal<Loadable<RefusalReading>>({ status: 'not-loaded' });
 
 /** Bumped on every `PermissionGrantsChanged` frame. The allowlist editors in
  *  Settings → Permissions re-read their file on it, unless the user has
@@ -2469,6 +2505,18 @@ export const engineRebuildWedged = signal(false);
 // `store/backgroundActivity.ts`. One writer, `setEngineBuilding`, sets both,
 // so the boolean and the narration cannot drift apart.
 export const engineBuilding = signal(false);
+
+/** What the running engine is behind by, or `null` when git could not say.
+ *
+ *  The same grouped range `engineBuildDetail` carries, kept where the
+ *  NEW-VERSION CONFIRM can still read it. `setEngineBuilding` nulls that one
+ *  the instant a build ends, and that instant is when the switch becomes
+ *  available. So it cannot carry the range for a dialog opened afterwards.
+ *
+ *  `null` is UNKNOWN and `{ total: 0 }` is "nothing to bring". The confirm may
+ *  state the second and must never state the first as zero. Written by the one
+ *  assignment in `store/actions/engine-update.ts`, per poll. */
+export const enginePendingCommits = signal<PendingCommits | null>(null);
 
 /** Whether a new engine version is READY to switch onto. Lives here rather
  *  than in a component so the brand badge AND the restart progress-toast

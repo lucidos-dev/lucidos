@@ -144,8 +144,9 @@ describe('stampedEventIds', () => {
     );
     const stamps = [...src.matchAll(/data-event-id=\{([^}]*)\}/g)].map(m => m[1].trim());
     expect(stamps).toEqual([
-      // The turn root: the exchange STARTER.
-      'exchange.userEvent._eventId',
+      // The turn root: the exchange STARTER, and nothing for a turn with no
+      // starter loaded (see `exchangeStarterId`).
+      'exchangeStarterId(exchange)',
       // The failure card: the `ResponseFailed`'s own id (`exchangeError`).
       'error.eventId || undefined',
     ]);

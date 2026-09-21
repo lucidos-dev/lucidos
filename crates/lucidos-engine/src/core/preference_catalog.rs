@@ -157,6 +157,24 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "response_style",
+        label: "Response style",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "standard",
+        description: "How much comes back in a chat or trigger answer: the id of a style in the library. 'standard' is the default and adds nothing to the prompt, so answers come back as they always have. 'concise' and 'minimal' are shipped, and the user may edit either or add their own in Settings > Models > Response style, so the set is open and this is not a closed enum. Read 'response_styles' or GET /api/v1/response-styles for the ids that exist here. When the user asks for shorter or longer answers, SET THIS: it is what makes the request stick, where saying it in chat lasts one thread. An id nothing defines falls back to 'standard'. A change applies from the next message, because a turn builds its prompt once at the start.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "response_styles",
+        label: "Style library",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(unset: the shipped styles only)",
+        description: "The user's own response styles, as a JSON array of {id, label, instruction} objects. It holds ONLY what they changed: an entry whose id is 'concise' or 'minimal' overrides that shipped style, one with a fresh kebab-case id adds a style, and removing an entry restores the shipped text. 'standard' is the off switch and is REFUSED here. THIS KEY REPLACES THE WHOLE ARRAY, so read the current value first and send it back with your edit applied, or you will delete every style the user wrote. Bounds, all refused rather than trimmed: 40 chars of id, 40 of label, 1000 of instruction, 20 entries. The instruction is injected verbatim under a 'RESPONSE STYLE:' heading, and the engine appends a rule that keeps warnings and caveats in whatever the style asks for.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "image_model",
         label: "Image model",
         scope: PrefScope::Global,
@@ -207,7 +225,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "gemini-3-flash-preview",
-        description: "Background model for the two memory calls every turn makes: extracting facts, and classifying what the turn needs retrieved. It no longer writes the conversation summary, which has its own model_conversation_summary; that key falls back to this one while it is unset.",
+        description: "Background model that extracts facts from a turn for long-term memory. It no longer writes the conversation summary or classifies the query: those have model_conversation_summary and model_query_classification, and both fall back to this key while unset.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -216,7 +234,25 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Enum(REASONING_EFFORTS),
         default: "none",
-        description: "Thinking budget for fact extraction and query classification. Both return short JSON and run on every turn, so the default spends nothing.",
+        description: "Thinking budget for fact extraction. It returns short JSON and runs on every turn, so the default spends nothing.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "model_query_classification",
+        label: "Query-classification model",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(the model_memory model)",
+        description: "Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Split out of model_memory, so it inherits that value until you set this one. Settings offers TypeSafe (Jev) in the same control, which writes judgment_query_classification instead.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "reasoning_query_classification",
+        label: "Query-classification reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "(the reasoning_memory value, else none)",
+        description: "Thinking budget for query classification. It answers three yes/no questions in front of every turn, so the default spends nothing. Split out of reasoning_memory, so it inherits that value until you set this one.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -512,6 +548,8 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("command_guard", "the command guard is the safety gate over the agent's own bash/python — toggle it in Settings → Permissions, not via set_preference"),
     ("command_guard_judge", "managed in Settings → Permissions (Command safety)"),
     ("model_command_judge", "managed in Settings → Permissions (Command safety)"),
+    ("judgment_command_guard", "which backend classifies the agent's own commands (chat or jev) is part of the command guard, so it is managed in Settings → Permissions (Command safety), not via set_preference"),
+    ("judgment_query_classification", "which backend decides whether a message needs memory (chat or jev): infrastructure routing over your own retrieval, managed in Settings → Models (Background tasks), not via set_preference"),
     ("reasoning_command_judge", "the judge's thinking budget is part of the command guard, so it is managed in Settings → Permissions (Command safety), not via set_preference"),
     ("max_tool_calls", "the per-turn tool-call cap is the backstop over your own agentic loop, so you must not raise your own limit; the user changes it in Settings → Models → Chat & triggers"),
     ("capture_context", "a debug-only context-capture toggle; change it in Settings if you really need to"),
@@ -533,6 +571,11 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("provider_enabled_openrouter", "whether the OpenRouter provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
     ("provider_enabled_xai", "whether the xAI provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
     ("provider_enabled_local", "whether the local OpenAI-compatible provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    // The seventh switch, and internal for a different reason. Jev answers no
+    // chat turn, so switching it off cannot leave the workspace unable to
+    // answer. It is here because it turns the command guard's backend back to
+    // chat, and `judgment_command_guard` is already internal.
+    ("provider_enabled_typesafe", "whether TypeSafe (Jev) is switched on at all: the master switch above the two judgment_* keys, managed in Settings → Models → Providers. Never via set_preference: switching it off moves the command guard's backend, which you must not do"),
 ];
 
 /// Preference keys the engine writes as its own internal state, and which
@@ -877,6 +920,11 @@ mod tests {
     /// to; `engine::aux_purpose` is what the call actually uses. Two
     /// declarations of one number drift, and the agent would then describe a
     /// default the engine does not apply.
+    ///
+    /// **An INHERITING key has no single default to state.** It writes the
+    /// parenthesised form instead, which must still name the key it follows and
+    /// the literal behind that. Otherwise the agent cannot answer what the key
+    /// is set to.
     #[test]
     fn background_reasoning_defaults_match_what_the_call_uses() {
         for purpose in [
@@ -884,16 +932,34 @@ mod tests {
             crate::engine::ContextPurpose::ImageDescribe,
             crate::engine::ContextPurpose::Memory,
             crate::engine::ContextPurpose::ConversationSummary,
+            crate::engine::ContextPurpose::QueryClassification,
         ] {
             let reasoning = crate::engine::aux_purpose::model_prefs(purpose)
                 .and_then(|p| p.reasoning)
                 .expect("every background purpose has a reasoning half");
             let spec = lookup(reasoning.key)
                 .unwrap_or_else(|| panic!("{} must be in the catalog", reasoning.key));
-            assert_eq!(
-                spec.default, reasoning.default,
-                "{} defaults differ between the catalog and the call",
-                reasoning.key
+            let Some(fallback) = reasoning.fallback_key else {
+                assert_eq!(
+                    spec.default, reasoning.default,
+                    "{} defaults differ between the catalog and the call",
+                    reasoning.key
+                );
+                continue;
+            };
+            assert!(
+                spec.default.starts_with('('),
+                "{} inherits {}, so its catalog default must be parenthesised",
+                reasoning.key,
+                fallback
+            );
+            assert!(
+                spec.default.contains(fallback) && spec.default.contains(reasoning.default),
+                "{} defaults to '{}', which names neither {} nor {}",
+                reasoning.key,
+                spec.default,
+                fallback,
+                reasoning.default
             );
         }
     }
@@ -907,6 +973,7 @@ mod tests {
             crate::engine::ContextPurpose::ImageDescribe,
             crate::engine::ContextPurpose::Memory,
             crate::engine::ContextPurpose::ConversationSummary,
+            crate::engine::ContextPurpose::QueryClassification,
             crate::engine::ContextPurpose::ImageGen,
         ] {
             let prefs = crate::engine::aux_purpose::model_prefs(purpose).expect("prefs");
@@ -917,6 +984,53 @@ mod tests {
                 purpose
             );
         }
+    }
+
+    /// The catalog tells the agent the response style defaults to `standard`.
+    /// `response_style::STANDARD_ID` is what the prompt builder actually reads.
+    /// Two spellings of one id drift, and the agent would then set a style
+    /// nothing resolves.
+    #[test]
+    fn the_response_style_default_is_the_off_switch_the_engine_reads() {
+        use crate::core::response_style;
+
+        let spec = lookup("response_style").expect("the response style is settable");
+        assert_eq!(spec.default, response_style::STANDARD_ID);
+        assert_eq!(spec.scope, PrefScope::Global);
+
+        // Text rather than an enum, deliberately: the user may add styles, so
+        // the set is open. `chat_model` is Text for the same reason.
+        assert!(matches!(spec.value, PrefValue::Text));
+
+        // The default has to name a real row, or the picker opens on nothing.
+        let library = response_style::merge(&[]);
+        assert!(library.iter().any(|s| s.id == spec.default));
+    }
+
+    /// The description quotes the bounds the write gate enforces. A number that
+    /// drifts here is the agent being told a limit that is not the limit, and
+    /// finding out by having its write refused.
+    #[test]
+    fn the_style_library_description_states_the_real_bounds() {
+        use crate::core::response_style;
+
+        let spec = lookup("response_styles").expect("the style library is settable");
+        assert_eq!(spec.scope, PrefScope::Global);
+        for bound in [
+            response_style::MAX_ID_CHARS,
+            response_style::MAX_LABEL_CHARS,
+            response_style::MAX_INSTRUCTION_CHARS,
+            response_style::MAX_STYLES,
+        ] {
+            assert!(
+                spec.description.contains(&bound.to_string()),
+                "the description omits the bound {bound}"
+            );
+        }
+        assert!(
+            spec.description.contains(response_style::STANDARD_ID),
+            "the description must say the off switch is refused here"
+        );
     }
 
     #[test]

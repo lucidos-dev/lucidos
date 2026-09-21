@@ -14,6 +14,7 @@ paths:
   - "crates/lucidos-engine/src/engine/event_bus/**"
   - "crates/lucidos-engine/src/engine/agentic_loop/**"
   - "crates/lucidos-engine/src/scheduler/mod.rs"
+  - "crates/lucidos-engine/src/scheduler/notifications.rs"
   - "crates/lucidos-engine/src/llm/tools/**"
   - "crates/lucidos-engine/src/engine/tools/**"
   - "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
@@ -30,6 +31,8 @@ paths:
   - "crates/lucidos-engine/src/core/plugins.rs"
   - "crates/lucidos-engine/src/engine/tools/plugins/**"
   - "packages/lucidos-sdk/**"
+  - "crates/lucidos-app/src/components/apps/appFrameSandbox.ts"
+  - "crates/lucidos-app/src/store/actions/app-bridge.ts"
   - "crates/lucidos-cli/**"
   - "crates/lucidos-engine/src/scheduler/push.rs"
   - "crates/lucidos-engine/src/core/device_presence.rs"
@@ -89,12 +92,14 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 | `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events/`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/triggers.md` if the change opens a new "you can now `on_event:` X" path |
 | `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
 | `crates/lucidos-app/src/styles/global/shared-components.css` (the app-facing shared component layer — the engine `include_str!`s it into `/api/v1/sdk-iframe.css` via `crates/lucidos-engine/src/api/sdk.rs`, so any class here ships to every opted-in app) — OR the iframe-only `crates/lucidos-engine/src/api/sdk_iframe.css` (tokens served to apps, `.action-btn-secondary`) | `system-knowhow/js-sdk.md` § "Component classes" + § "Theme variables" (the app-author contract — add/rename the class or token row, and keep documented token VALUES matching the CSS). Also keep the three-file split honest (reusable → `shared-components.css`; host-chrome → `host-components.css`; iframe-only → `sdk_iframe.css`) per `.claude/rules/frontend.md`. |
+| `crates/lucidos-app/src/components/apps/appFrameSandbox.ts` (the app frame's sandbox attribute), `crates/lucidos-engine/src/api/app_reach.rs` (*route reach*: which routes an app may call), or `crates/lucidos-app/src/store/actions/app-bridge.ts` (what the *app bridge* carries: the ops, the header and storage rules) | `system-knowhow/js-sdk.md` § Setup (what an app reaches the engine through, and what its own `fetch` / `EventSource` / storage can still do), AND `system-knowhow/workspace-audit.md` check 2 "What an isolated app frame can no longer do" plus its § Remediation mapping. The audit OWNS those detection patterns, per [ADR 0227](../../docs/adr/0227-app-frames-get-their-own-renderer-process.md), so widening or narrowing the frame's reach without touching them leaves the sweep hunting for a break that moved. |
 | `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
 | `crates/lucidos-engine/src/capability_manifest/**` (the *capability parity manifest* — a domain/operation/arg added or changed, or a `llm`/`cli`/`sdk` target flag flipped) | Regenerate the generated surfaces (`cargo test -p lucidos-engine --lib -- --ignored generate_cli_commands_file generate_sdk_capabilities_file`) so the staleness tests pass; wire any NEW `cli`-domain enum into `crates/lucidos-cli/src/main.rs` (`Command` variant + `run()` arm); add/adjust the grouped LLM handler under `engine/tools/` so its recognised actions match the manifest; register any NEW `sdk`-domain facade in `packages/lucidos-sdk/src/generated/capabilities.test.ts`; AND update `system-knowhow/lucidos-cli.md` / `system-knowhow/js-sdk.md` for the affected surface. See `docs/adr/0018-capability-parity-manifest.md`. |
 | `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins/` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/plugins.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
 | `crates/lucidos-engine/src/llm/tools/**` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |
 | `crates/lucidos-engine/src/core/preference_catalog.rs` (the *preference catalog* — a settable-key added/removed/renamed, its scope/allowed-values/default/side-effect changed, or an `INTERNAL_KEYS` entry changed) | `system-knowhow/preferences.md` (the agent-facing key table — a `cargo test` sync test in `preference_catalog.rs` already fails if a catalog or internal key is undocumented), AND the *preference* / *preference catalog* glossary entries if the user-facing semantics shifted |
 | `crates/lucidos-engine/src/engine/tools/bash_background.rs` (`BackgroundBashRegistry`: `read_output_in_memory_wait`, `BASH_OUTPUT_MAX_WAIT_SECS`, the `Notify`-on-chunk semantics), `crates/lucidos-engine/src/engine/tools/bash.rs` (`execute_bash_output_tool`: `wait_secs` arg handling, clamping), `crates/lucidos-engine/src/runtime/python.rs` (`truncate_python_error`: frame-trim shape, line/byte budgets), or `crates/lucidos-engine/src/engine/agentic_loop/` (`derive_call_key` / `python_call_key` for `RUN_PYTHON*`, the `excluded` list in the generic 3-strike guard) | `system-knowhow/running-python.md` (drain pattern, `wait_secs` semantics, error-truncation behavior, anti-pattern list, since the LLM acts on what this file says about `bash_output(wait_secs)`, the auto-truncation, and the repeated-call guard) |
+| `crates/lucidos-engine/src/scheduler/notifications.rs` (the `Tap` type: a kind added or retired, a sub-field added, the `Deserialize` strictness changed) | `system-knowhow/js-sdk.md` § `lucidos.notifications` (the canonical `Tap` type and its tap-shape examples), AND `system-knowhow/workspace-audit.md` check "Old-form `tap` strings" plus its § Remediation mapping. The audit OWNS those detection patterns rather than citing a migration recipe, per [ADR 0214](../../docs/adr/0214-one-shot-migrations-are-a-notice-plus-an-audit-check.md), so a shape change that skips it leaves the audit hunting for a form nothing emits any more. |
 | `crates/lucidos-engine/src/api/history.rs` + `crates/lucidos-engine/src/api/app_ui.rs` (HTTP shapes for events / app UI bridge) | `system-knowhow/js-sdk.md` (the SDK calls these), AND `system-knowhow/building-an-app.md` if the app-side contract shifts |
 | `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` + `proxy*.rs` siblings (the on-disk `data/config/apis.json` schema — auth pipeline, signer kinds, header/body shapes) | `system-knowhow/building-an-auth-handshake.md`, AND `system-knowhow/best-practices.md` § `config/` |
 | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (engine system prompts — the taxonomy/trigger sections, the intent registry advertise-list, the knowhow listing) | `system-knowhow/intent-registry.md` if intents added/removed, AND `system-knowhow/workspace-audit.md` (audit's reference table names sections of this file by heading) |
@@ -104,6 +109,21 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 | `crates/lucidos-app/src/components/settings/AddDeviceSection.tsx`, `components/picker/PairingGate.tsx` (Add a device, code expiry, the pairing screen) | `system-knowhow/remote-access.md` (§ Settings → Access, § A phone installs before it pairs) |
 | `crates/lucidos-app/src/components/settings/deviceList.ts`, `pairedDevices.ts`, or the Devices section of `SettingsView.tsx` (the one device list: what a row shows, the Revoke / Remove split, and what happens with no gateway) | `system-knowhow/remote-access.md` (§ The list of devices lives in Settings → Devices, § What a device is called), AND the *device* / *paired device* entries in `system-knowhow/glossary.md` if the user-facing semantics shifted |
 | Any code, UI string, or prose change that renames / retires / semantically shifts a term in `system-knowhow/glossary.md` (user-facing) or `docs/glossary.md` (dev-only) — e.g. renaming the `Trigger` Rust type, the `app` URL prefix, the `artifact` CLI subcommand, a `lucidos.*` SDK namespace; or replacing the canonical word in a user-facing message | The matching glossary entry — in the same commit. New term introduced → add a new entry to the appropriate layer (user-facing → `system-knowhow/glossary.md`; dev-only → `docs/glossary.md`). Drift between code/UI and the glossary is a `/harden` failure on the same footing as a stale `system-knowhow` file. |
+
+## A change that REMOVES a capability has no row above
+
+The table pairs a surface with the doc that NAMES it. A change taking a
+capability away slips through. The docs it falsifies are the ones that INSTRUCT
+using it, and those name a different surface. ADR 0227 is the worked case. It
+added no `lucidos.*` namespace, so the `packages/lucidos-sdk/**` row pointed at
+a heading that had not changed. Meanwhile `§ lucidos.apiUrl` went on teaching a
+`fetch` the frame can no longer make.
+
+So when a change narrows what a caller may do, **grep the corpus for the thing
+you took away**, not for the file you edited. Every doc that tells someone to
+use it is now wrong, including the ones that only mention it in passing. Where
+there is no replacement to name, say that plainly and open a row in
+`docs/temporary-measures.md`, rather than leaving guidance that cannot run.
 
 The rule is simple: **the doc and the code ship together, in the same commit, on the same branch**. If the doc update would be large and you want to defer it, that's a sign the change itself needs to wait. Do not land a code change with a TODO to "update knowhow later" — the engine LLM doesn't read TODOs, it reads the published `system-knowhow/*.md`.
 

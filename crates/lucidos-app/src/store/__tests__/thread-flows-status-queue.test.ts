@@ -918,6 +918,40 @@ describe('Queued follow-ups behind an active turn', () => {
     expect([...run.queuedIndices]).toEqual([1]);
   });
 
+  // The reported shape. A background task finished, and the delivery re-entered
+  // the thread through its `UserPromptInjected` re-entry anchor. The turn that
+  // anchor started was 66 seconds into a `run_bash` when the reader typed.
+  //
+  // A re-entry is a turn like any other, so the message queues behind it. Left
+  // off the list, nothing can queue behind it at all. The waiting message was
+  // promoted to active and read "Requesting". The running turn fell to
+  // `interrupted`, reading "Done" beside a step that was still spinning.
+  it('a follow-up queues behind a turn a re-entry anchor started', () => {
+    const { map, id } = makeThread('reentry-queue', 'running');
+    insertEvents(map, id, [
+      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived', mode: 'system' } as any,
+      { type: 'ThoughtStreamed', text: 'Context: 117888 tokens' } as any,
+      { type: 'ToolCalled', name: 'run_bash', args: { command: 'make test' } } as any,
+      { type: 'MessageReceived', text: 'put it in todo' } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    // The premise, so the assertions below cannot pass vacuously: the anchor
+    // really did start its own exchange and really does hold the live steps.
+    expect(exchanges).toHaveLength(2);
+    expect(exchanges[0].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[0].steps).toHaveLength(2);
+
+    const run = queuedFollowupRun(exchanges, /* busy */ true);
+    expect(run.activeIndex).toBe(0);
+    expect([...run.queuedIndices]).toEqual([1]);
+
+    // The re-entry keeps the active role, so it never takes the `interrupted`
+    // branch that renders as "Done" with the hand-off arrow.
+    expect(exchangeStatus(exchanges[0], '', /* isLast */ true)).toBe('streaming');
+    expect(getLabel(exchanges[0])).toBe('Working');
+  });
+
   it('queuedFollowupRun releases a follow-up once UserPromptInjected is absorbed', () => {
     const active = {
       userEvent: { type: 'MessageReceived', text: 'active', created: TS } as any,

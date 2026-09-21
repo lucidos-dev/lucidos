@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { computeFitsInOneRow, contentWidthOf, countGappedPairs } from './useFitsInOneRow';
+import { computeFitsInOneRow, contentWidthOf } from './useFitsInOneRow';
 
 // Pinning the actual width math the prompt uses to decide whether to lift the
 // secondary button (the Diff button — in the banner or standalone while
@@ -79,73 +79,6 @@ describe('computeFitsInOneRow', () => {
 
   it('charges nothing for a lone item, whatever the gap', () => {
     expect(computeFitsInOneRow([100], 100, 9, 0)).toBe(true);
-  });
-});
-
-interface FakeEl {
-  klass: string;
-  item: boolean;
-  kids: FakeEl[];
-  querySelectorAll(selector: string): FakeEl[];
-}
-
-/** A stand-in element answering DESCENDANT queries, which is the only thing
- *  `countGappedPairs` asks of the DOM. The project runs Vitest without jsdom,
- *  so a real row cannot be built here. Nesting is what tells a cluster-wide
- *  count apart from a per-parent one, so the stand-in has to model it. */
-function el(klass: string, kids: FakeEl[] = [], item = false): FakeEl {
-  const node: FakeEl = {
-    klass,
-    item,
-    kids,
-    querySelectorAll(selector) {
-      const all: FakeEl[] = [];
-      const walk = (n: FakeEl) => n.kids.forEach((k) => { all.push(k); walk(k); });
-      walk(node);
-      const matches = selector === '[data-row-item]'
-        ? (n: FakeEl) => n.item
-        : (n: FakeEl) => `.${n.klass}` === selector;
-      return all.filter(matches);
-    },
-  };
-  return node;
-}
-
-const item = () => el('', [], true);
-
-/** A `.prompt-actions-row`: three ungapped leading icons, then the gapped
- *  `.prompt-actions-right` cluster. `stacked` splits that cluster across two
- *  sub-rows, exactly as `.is-stacked` does. */
-function promptRow(stacked: boolean): HTMLElement {
-  const right = el('prompt-actions-right', stacked
-    ? [el('prompt-actions-subrow', [item()]), el('prompt-actions-subrow', [item()])]
-    : [item(), item()]);
-  return el('prompt-actions-row', [item(), item(), item(), right]) as unknown as HTMLElement;
-}
-
-describe('countGappedPairs', () => {
-  it('charges every adjacency when no cluster is named', () => {
-    expect(countGappedPairs(promptRow(false))).toBe(4);
-  });
-
-  it('charges only the named cluster', () => {
-    expect(countGappedPairs(promptRow(false), '.prompt-actions-right')).toBe(1);
-  });
-
-  // The point of reading through the cluster rather than each item's parent. A
-  // per-parent count drops to 0 here, so it reports a narrower row than the
-  // unstacked one needs. That unstacks the row and stacks it again next
-  // measurement.
-  it('gives the same count stacked and unstacked', () => {
-    const flat = countGappedPairs(promptRow(false), '.prompt-actions-right');
-    const split = countGappedPairs(promptRow(true), '.prompt-actions-right');
-    expect(flat).toBe(1);
-    expect(split).toBe(flat);
-  });
-
-  it('charges nothing when the cluster is absent', () => {
-    const bare = el('prompt-actions-row', [item(), item()]) as unknown as HTMLElement;
-    expect(countGappedPairs(bare, '.prompt-actions-right')).toBe(0);
   });
 });
 

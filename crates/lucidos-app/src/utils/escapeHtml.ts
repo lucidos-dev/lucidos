@@ -23,17 +23,24 @@ export function escapeHtml(text: string): string {
  *  branch is a sink and neither touches `el`. */
 let inertBody: HTMLElement | null | undefined;
 
+/** A fresh inert body, or `null` where this environment has none.
+ *
+ *  Exported because `utils/renderMarkdown.ts` needs the same probe. It does
+ *  NOT share this module's body: each caller memoizes its own, so neither can
+ *  read markup the other left behind. */
+export function makeInertBody(): HTMLElement | null {
+  const impl = document.implementation as DOMImplementation | undefined;
+  return typeof impl?.createHTMLDocument === 'function'
+    ? impl.createHTMLDocument('').body
+    : null;
+}
+
 /** The inert document's body, made once. Both callers run per list item per
  *  render, so building a whole document per call would cost N of them a frame.
  *  `undefined` means not yet probed, `null` means this environment has no
  *  `createHTMLDocument`. */
 function getInertBody(): HTMLElement | null {
-  if (inertBody === undefined) {
-    const impl = document.implementation as DOMImplementation | undefined;
-    inertBody = typeof impl?.createHTMLDocument === 'function'
-      ? impl.createHTMLDocument('').body
-      : null;
-  }
+  if (inertBody === undefined) inertBody = makeInertBody();
   return inertBody;
 }
 

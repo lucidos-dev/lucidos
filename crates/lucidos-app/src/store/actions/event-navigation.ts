@@ -5,7 +5,7 @@ import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
 import { computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
 import { showToast, threadMap, focusedThreadId } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
-import { ensureThreadByIdInMap, loadThreadEvents } from './thread-loading';
+import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents } from './thread-loading';
 import { focusThread } from './threads';
 
 /** A workspace domain event belongs to no conversation, so there is no
@@ -141,9 +141,14 @@ export async function resolveEventTarget(eventId: string): Promise<EventTarget> 
   // race later, so `nowhere` below means "drawn nowhere", never "not here yet".
   if (!loadedThreadHolds(threadId, eventId)) return { kind: 'unloaded', threadId };
   const anchor = anchorInLoadedThread(threadId, eventId);
-  return anchor
-    ? { kind: 'anchored', threadId, anchor }
-    : { kind: 'nowhere', note: NOTHING_TO_LAND_ON };
+  if (anchor) return { kind: 'anchored', threadId, anchor };
+  // A PAGED thread can hold the event and still draw it nowhere addressable.
+  // A *continuation fragment* wears no id, its turn starting off the loaded
+  // page, so every step inside one answers null here. That is "not here yet",
+  // the same trap the load check above guards, one layer in. `unloaded` is
+  // what the click path finishes, by loading the rest and asking again.
+  if (threadMap.value.get(threadId)?.hasOlderEvents) return { kind: 'unloaded', threadId };
+  return { kind: 'nowhere', note: NOTHING_TO_LAND_ON };
 }
 
 /** Settled answers to "does this event have somewhere to go". */
@@ -274,7 +279,19 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
     // The anchor is computed from the thread's OWN exchanges, so its events have
     // to be here first.
     await awaitThreadEvents(target.threadId);
-    const anchor = anchorInLoadedThread(target.threadId, eventId);
+    let anchor = anchorInLoadedThread(target.threadId, eventId);
+    // A long thread opens on its newest page, so a target older than that page
+    // is in no exchange yet and yields no anchor. The whole history is fetched
+    // only HERE, once the cheap attempt has failed, so an ordinary jump to a
+    // recent event still costs one page.
+    //
+    // Falling through with the raw id would not do instead. Plenty of events
+    // draw no element of their own, and their anchor IS the exchange holding
+    // them, which cannot be computed from history nobody loaded.
+    if (!anchor && threadMap.value.get(target.threadId)?.hasOlderEvents) {
+      await ensureWholeThreadLoaded(target.threadId);
+      anchor = anchorInLoadedThread(target.threadId, eventId);
+    }
     if (anchor) {
       focusThread(target.threadId, { targetEventId: anchor });
       return;

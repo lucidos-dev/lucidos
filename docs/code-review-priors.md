@@ -15,6 +15,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **An explicit JSON `null` for an optional tool argument means ABSENT, not a
+  type error, and that is deliberate.** A reviewer sees
+  `None | Some(Value::Null) => <default>` beside a `Some(_) => Err(...)` arm and
+  reads the null arm as a hole in the type check. Two handlers in
+  `engine/tools/todo.rs` do it: `notes`, where null clears, and `action`, where
+  null takes the write default. Several SDKs serialise an omitted optional field
+  as null, so refusing it costs a round and buys nothing. The safety argument
+  does not apply either: `action` is a verb selector, not an interlock, and what
+  a call destroys it says in `todos`. Pinned by
+  `a_null_action_is_the_write_default`, and re-flagging needs a NEW argument
+  about a field where null and absent genuinely differ.
+
 - **`voice::call` accumulating a caller's turn across several `UserTurnEnded`
   events is the rule, not a missing flush.** A reviewer sees `caller_said_more`
   append where the old code replaced, and reads it as a lost boundary. The
@@ -1009,6 +1021,46 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if `talker_said` gains a guard of its own, which would make the
   inner one genuinely dead.
 
+- **`judgment::select::typesafe_switch` is collapsed with opposite defaults by
+  its two callers, and both are deliberate.** It returns `Option<bool>`, so
+  each site names its own fallback where a reviewer can see it. That is the
+  idiom `.claude/rules/rust.md` sets for a probe that could not run.
+
+  `jev_for` takes `unwrap_or(false)`, which looks wrong beside
+  `provider_build::read_provider_switches` answering `true` on the same class
+  of failed read. The defaults are opposite because the fallbacks are. For one
+  of the six, `false` DROPS a configured provider and the workspace may be
+  unable to answer at all. For a judgment site, `false` runs the rubric prompt
+  it has always run, and the module header states that rule ("every doubt
+  resolves to `chat`").
+
+  `judgment_available` takes `unwrap_or(true)`, inverting its own file's rule,
+  and that is the second half of the same reasoning. It gates the `judge` tool,
+  which has no chat path to fall back to. Shutting the gate withdraws a
+  capability and rewrites the turn's tools cache tier, which
+  `read_turn_capabilities` says never to do on an unknown. An absent key still
+  closes it, so an unknown never opens the gate alone (ADR 0223).
+
+  Re-flag only if a judgment site loses its chat path, or if the tool gains
+  one. Either would move a default rather than merely look like it should.
+
+- **`change_action_refusal` reporting a `paused` thread as `ThreadWorking` even
+  when it also holds a wait is correct, not a missed parked case.** A reviewer
+  reads the working check running first, finds a thread that is paused AND
+  parked, and calls the classification wrong. `standing_verdict` matches on
+  STATUS first for the same reason: `running` and `paused` both mean more work
+  is promised, whatever else is pending. So the gate and the resolver agree
+  exactly, and the UI agrees too, since `available_thread_actions` offers
+  `ApplyWhenSettled` on precisely those two statuses.
+
+  The arm may still drop later, once the turn resumes and settles to `idle`
+  with the wait live. That is the standing apply's own documented lifecycle,
+  reached identically by pressing the button. The gate's wording does not claim
+  otherwise: ADR 0233 says "drops on a parked thread at rest".
+
+  Re-flag only if `standing_verdict` stops matching on status first, or if
+  `working_thread_ids` and `SWEEPABLE_THREAD_STATUSES` diverge.
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -1081,6 +1133,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **The composer row's 0.750 ink fraction is the GEOMETRIC extent, with the
+  stroke excluded.** A reviewer computes a glyph's painted extent by hand, as
+  geometry plus half a stroke on each side, and gets 0.833. Against the 0.750
+  the row documents, that reads as an oversized glyph. Two reviewers did this in
+  one round, and acting on it made a correct glyph a ninth too small.
+
+  On the geometric basis every glyph in the run agrees. `TodoListIcon` and
+  `ImageIcon` are `rect x=3 width=18` in a 24 box, and `EventWaitClockIcon` is
+  `r=6` in a 16 box. All three are 0.750, and all three are 0.833 with the
+  stroke. So the two bases are each self-consistent and the comparison only
+  works within one. `styles/__tests__/follow-toggle-ink.test.ts` now derives the
+  number and says which basis it is on.
+
+  Re-flag only with a measurement, never with arithmetic off the path data. A
+  glyph whose derived fraction differs from `--run-ink` is a real finding.
 
 - **A shipping comment may cite a `docs/plans/**` path, even though the release
   strips that directory.** A reviewer reads the private-data rule, sees that
@@ -2561,24 +2629,176 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   open and 120 ms of speech. It costs one pulse vanishing a second early.
   Re-flag only if a call gains a client-visible identity.
 
-- **The dead-press rescue's `activated` line records a dispatch, and every path
-  that could eat that dispatch is closed by the time it fires.** A reviewer
-  reads `face.el.click()` followed by an `activated` line and a toast saying the
-  action ran. They object that a swallowed click makes both a lie. The objection
-  is right in the abstract and unreachable here.
+- **RETIRED. The dead-press rescue no longer dispatches anything**, so the prior
+  that defended its `activated` line is void. It argued that every path which
+  could eat the dispatch was spent by the time it fired. That was about whether
+  the LINE was honest, and it never asked whether the dispatch was WANTED.
 
-  Three things could eat it, and each is already spent. An overlay's paired
-  swallow is a one-shot disarmed by the next primary `pointerdown`, which the
-  dead tap itself supplied. `touchActivated`'s twin suppression is per button
-  and lasts 500 ms. The dead press reached no button, so the commit face's own
-  timestamp is stale by the 600 ms grace. A cover is asked about at the moment
-  of firing, and refuses with `covered`.
+  It was not. The settle clicked the commit face on a tap 138 px from Send and
+  sent a draft nobody asked for. The commit is gone
+  ([ADR 0225](adr/0225-composer-never-sends-by-itself.md)), and
+  `deadPressProbe.ts` now dispatches no click on any path.
 
-  Proving it positively would mean writing `notePressOutcome` from the CLICK
-  path of `touchActivated`, app-wide. That slot is a single consuming global,
-  read against a settling press's own age. A foreign click inside that window
-  would be misread as the press being served, and a logging nicety is not worth
-  it. Re-flag if any of the three bounds above changes.
+  Kept as a record, because the shape of the mistake is worth having. The prior
+  answered a reviewer's narrow objection convincingly and in doing so made the
+  wider one look settled. **A prior that defends a mechanism's honesty says
+  nothing about its authority to act.**
+
+- **The dead-press settle never presses anything, and a reviewer proposing it
+  again is reopening a reversal.** A reviewer reads `commit-withheld` and sees
+  an obvious improvement: the app knows the press died on Send, so run it. That
+  is exactly ADR 0183, and exactly what ADR 0225 reversed after it fired wrongly
+  on a real user.
+
+  The evidence that would justify bringing it back is named in 0225: a run of
+  `commit-withheld` lines at a `reachPx` of zero. Read the ledger before
+  proposing it, and propose it as an ADR rather than as a review comment.
+
+  **`commit-withheld` no longer exists.** The machinery that produced it was
+  deleted by [ADR 0228](adr/0228-composer-recovers-on-the-keyboard-close.md), so
+  the evidence above would have to be re-instrumented first. That is deliberate
+  and does not lower the bar.
+
+- **The composer probe no longer hit-tests a face at its own centre, and adding
+  that back needs evidence rather than intuition.** A reviewer sees a probe for
+  a dead button with no reachability check and proposes the obvious one: ask
+  `elementFromPoint` at the face's centre, and repair when it answers something
+  else.
+
+  That check shipped for four rounds and was deleted by ADR 0228. It answered
+  `unreachable: 0` through every episode it was built for, all thirteen checks
+  of the last one included. The reason is structural: the face hit-tests to
+  itself while the page receives no touches, so the question cannot see the
+  state. It also cost a hit test and a computed-style read per face every three
+  seconds, forever, on the phone that is already struggling.
+
+  `silent-since-keyboard` is what replaced it. Propose the hit test again only
+  with a ledger line showing a face that failed it.
+
+- **The composer's stray verdicts are gated on the keyboard being UP, and that
+  is a noise bound rather than an oversight.** A reviewer notices the wedge is
+  keyboard-DOWN by definition and concludes the gate blinds the probe in exactly
+  the state it exists for. The observation is correct, and it is recorded in
+  ADR 0228.
+
+  Dropping the gate writes a line for every scroll and every tap anywhere in the
+  app, four a second. A ledger whose value is that a line is unusual cannot pay
+  that. The `silent-since-keyboard` line carries `sinceInputMs` beside
+  `sinceKeyboardMs` instead, so one line shows an input arrived after the close
+  and went unnamed.
+
+- **`renderMarkdown`'s post-sanitizer passes parse the document, and the parse
+  is not waste to optimize away.** A reviewer sees `inDom` build a DOM per
+  render, next to a `marked` parse and a DOMPurify parse, and proposes the
+  string transform it replaced: one `replace` per pass, no third parse.
+
+  Those string passes were both injection sinks, and the cause is structural.
+  The HTML fragment serializer escapes `&`, `"` and U+00A0 inside an attribute
+  value, and leaves `<` and `>` alone. So `<td` and `<img` reach the pass
+  verbatim inside a `title`, and no regex can tell those from a real tag. Each
+  pass splices into the tag it thinks it found. One put a column label in
+  attribute-name position, and the other freed a real `<img onerror>` out of a
+  `title` into element position.
+
+  Two narrower repairs look sufficient and are not. A quote-aware tag pattern
+  closes only one of the two `<td` shapes, and it makes the scan quadratic: a
+  quoted run crosses every `>` between its quotes, and the serializer emits a
+  raw `'` inside a value. Measured over 124 KB of one crafted span, 0.17 ms
+  for `[^>]*` against 481 ms quote-aware. Counting quote parity before
+  splicing closes neither shape, because a false start inside a value can
+  carry even parity.
+
+  The cost is paid where it is cheapest. `inDom` gates on the document
+  mentioning `<img` or `<table` at all, so the streaming buffer, re-rendered
+  per token, usually pays one substring search. On a document that does carry
+  one, the parse measured 1.14x to 1.21x of the DOMPurify pass already there.
+
+  Re-flag with a shape that keeps the parse and removes a pass, or with
+  evidence the gate stopped covering the streaming path. Never with a string
+  transform.
+
+- **A settings component may read `credentials.value` with no loader of its
+  own.** The obvious call sites look conditional: `useStartup.ts` fetches
+  credentials only for `settingsSubview === 'accounts'`, and
+  `openSettingsSubview` only for `key === 'accounts'`. A reviewer reading those
+  two concludes a component on Models or Permissions renders against a
+  permanently `not-loaded` signal.
+
+  `SettingsView` holds its own mount effect calling `loadCredentials()` on a
+  `not-loaded` signal. It sits beside the same effect for devices, OAuth
+  accounts, chat models and repositories. Every settings subview renders inside
+  it, so the fetch happens once per visit whichever subview is open.
+
+  Re-flag only if that effect leaves `SettingsView`, or for a credential reader
+  mounted OUTSIDE it.
+
+- **`markHeldScroll` schedules a frame on every held write, and the churn during
+  a glide is deliberate.** An efficiency-minded reviewer sees
+  `rideSettlesOnTheEdge()` on a function a tween calls sixty times a second.
+  They read the `cancelAnimationFrame` plus `requestAnimationFrame` pair as
+  waste that belongs behind a guard.
+
+  The pair is what COALESCES the check: one frame pending at a time, and each
+  round supersedes the last one's question. A guard keyed on "is a tween
+  running" would skip the frame the tween's LAST write schedules. That frame is
+  the one verifying where the glide came to rest, which is one of the two sites
+  the check exists for (ADR 0222). The body itself costs two number reads, and
+  returns early while `_scrollAnimRaf` is set.
+
+  Re-flag only with a measurement showing the pair on a scroll path, or if
+  `settleTheRide` grows work beyond its guards.
+
+- **An auxiliary `ContextCaptured` never reaches `exchange.steps`, so it cannot
+  be what broke a queue verdict.** `isUningestedMessage` asks whether every
+  step in a message's exchange merely landed there, and its exemption list
+  names only `UNANCHORABLE_ASYNC_EVENTS`. Read that predicate alone and the
+  conclusion looks closed. An *auxiliary model call* fires on a new message,
+  files a step in the waiting message, and takes it out of the queue. The
+  memory extractor and the title generator are the two that fire there. Both
+  carry no `request_event_id`, and the waiting message really is `current`.
+
+  `foldEvent` drops it first: `if (isAuxiliaryCapture(event)) return`, keyed on
+  `purpose` being present and not `turn`. No auxiliary capture is ever a step
+  of any exchange, which is also why it cannot bind a snapshot to a turn's row.
+
+  Chased once as the cause of a queued message reading "Requesting" while the
+  running turn read "Done". The real cause was `canQueueBehind` omitting
+  `UserPromptInjected`. Re-flag only if `foldEvent` stops calling
+  `isAuxiliaryCapture`, or if a capture starts arriving without a `purpose`.
+
+- **The transcript's `keydown` arm deliberately has NO `e.target === el`
+  check.** A reviewer reads `keydown` bubbling into a container listener and
+  proposes one, citing `scrollState.ts`, which does make that distinction.
+
+  The two handlers ask different questions. `scrollState` decides whether to
+  stamp a reader GESTURE. Its own comment says a scroll key on a descendant
+  "can still scroll the transcript", marking it a reveal instead. This handler
+  decides whether to ask for older history, and a descendant is the ORDINARY
+  case there: a choice card parks focus on its own button, and the browser
+  scrolls the nearest scrollable ancestor for any key that button does not
+  take. A target check would refuse the reader exactly where focus usually
+  sits, which is the freeze the arm exists to end (ADR 0232).
+
+  What separates a consumed key from a scrolling one is `e.defaultPrevented`,
+  which this bubble-phase listener reads after the control's own handler has
+  run. That is the guard, and it is already there.
+
+  Re-flag only if the handler stops reading `defaultPrevented`, or if it grows
+  a side effect a stray key could not safely take.
+
+- **A *continuation fragment* wears NO `data-event-id`, so nothing that reads
+  the attribute has to allow for one.** A reviewer sees a helper resolve the
+  resting turn through that attribute. They then reason that the fold stamps
+  the fragment with its first step's id, so the lookup answers for a step.
+
+  The id exists on the exchange and is deliberately withheld from the DOM.
+  `exchangeStarterId` (`store/thread-events/exchange-render.ts`) returns
+  `undefined` for a fragment. Both `ChatExchange`'s root and `stampedEventIds`
+  read it, so the attribute and the claim cannot drift. Stamping it would make
+  one row of a turn addressable, and would collide with the failure card when
+  that step IS the failure.
+
+  Re-flag only if `exchangeStarterId` starts answering for a fragment.
 
 ## Scripts (bash)
 
@@ -3793,6 +4013,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag only if `build.rs` stops emitting the arm, or if `history.rs` stops
   serving `SessionMessage` to a client.
+
+- **A `ROUTE_REACH` row binds the shell realm, and a standalone app tab
+  escaping it is the recorded limit, not a hole in the row.** A reviewer
+  narrowing or reading a row in `api/app_reach.rs` sees `enforce_app_reach`
+  pass an unstamped request straight through. They conclude the refusal is
+  worthless, because the same app in its own browser tab calls the route
+  directly.
+
+  The premise is right and the conclusion does not follow. ADR 0231 states the
+  limit in its own words. Such a tab is a top-level document on the engine's
+  origin, so no classification can bind it. The table is a boundary inside the
+  shell and a contract everywhere else. There is nothing to gate on either:
+  ADR 0156 decision 1 holds that nothing is unforgeable downward, so that tab
+  IS the shell to the engine. The escalation also buys nothing there, since the
+  realm already reaches `/credential-value`, `/changes/:id/apply` and
+  `/restart`.
+
+  Re-flag only with a distinct origin per app, which would make the tab
+  attributable and turn this into a real gap. Pinned by
+  `an_unstamped_call_is_untouched`.
 
 ## Product copy
 

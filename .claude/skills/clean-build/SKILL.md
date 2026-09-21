@@ -144,11 +144,12 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-09-17. Every Rust number
-below was confirmed unchanged; the `@ts-expect-error` count moved by thirteen.
+The currently-accepted categories, re-counted on 2026-09-21. Every Rust site
+count below was confirmed unchanged, file spread included, and so was every
+`eslint-disable` site; the `@ts-expect-error` count moved by thirty-eight.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 52 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 53 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -158,7 +159,7 @@ Anything not on this list is fair game to remove and re-fix:
   type, so the argument swap the lint guards against cannot compile.
   One of the 81 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 80 across 51 files. Both numbers here count the shared attribute.
+  reports 80 across 52 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -180,12 +181,13 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 578 sites across 201 files, every one of them
-  test-only code: 192 `*.test.ts`, eight `*.test.tsx`
+  `@types/node` in project**, 649 sites across 225 files, every one of them
+  test-only code: 215 `*.test.ts`, nine `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
   `components/chat/__tests__/the-bubble-pulses-before-the-words.test.tsx`,
+  `components/chat/__tests__/pure-voice-draws-no-turn-header.test.tsx`,
   `components/picker/__tests__/pairing-code-boxes.test.tsx`,
   `components/settings/__tests__/mcp-servers-page.test.tsx`,
   `components/shared/__tests__/apps-glyph-single-source.test.tsx` and
@@ -250,7 +252,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
 
 - **`packages/lucidos-sdk`'s own `npm run typecheck` RUNS now, and exits 0.
   No phase above invokes it.** Recorded 2026-08-04 as unrunnable, reopened
-  and cleared on the 2026-09-15 run, and still exit 0 on 2026-09-17. The entry
+  and cleared on the 2026-09-15 run, and still exit 0 on 2026-09-21. The entry
   stays because the coverage gap it describes is still real: no phase reads the
   SDK's test files.
 
@@ -297,8 +299,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   devDependency of `packages/lucidos-sdk` would make that solid. That is a
   dependency plus lockfile change (ADR 0020), and belongs in its own commit.
 
-- **Phase 4's entry chunk is 763.13 kB against its 600 kB ceiling, and the
-  2026-09-17 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 797.32 kB against its 600 kB ceiling, and the
+  2026-09-21 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -318,32 +320,33 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.36 kB, against a 163.13 kB gap,
-  re-measured on 2026-09-17:
+  attribution now puts the whole list at 38.59 kB, against a 197.32 kB gap,
+  re-measured on 2026-09-21:
 
   | Surface | kB of the built chunk |
   |---|---|
-  | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.60 |
+  | `PermissionCard` | 10.07 |
+  | `CodingAgentControlMenu` | 8.53 |
   | `ThreadFilterPanel` | 5.92 |
   | `WorkspaceSwitcher` | 4.38 |
   | `QuestionCard` | 3.93 |
-  | `TodoListPanel` | 2.96 |
-  | `OverflowMenu` | 2.56 |
+  | `TodoListPanel` | 3.12 |
+  | `OverflowMenu` | 2.64 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 124 kB of it. The next
+  leave the advisory firing, and would now leave 159 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
-  than this skill makes.
+  than this skill makes. The 2026-09-21 run read the whole 412-module ranking
+  looking for a fresh module of the cut's shape, and found none.
 
   Two smaller menus of the same shape sit beside them, `ThreadOverflowMenu` at
-  1.63 kB and `DraftOverflowMenu` at 0.41 kB. They are left out of the table so
+  1.64 kB and `DraftOverflowMenu` at 0.41 kB. They are left out of the table so
   its total stays comparable with the `manualChunks` measurement below, which
   covers the seven.
 
-  **The two composer diagnostics are 15.12 kB of the entry chunk and are NOT a
-  cut.** Measured on the 2026-09-17 run: `deadPressProbe.ts` at 13.79,
-  `deadKeystrokeProbe.ts` at 0.98, `probeViewport.ts` at 0.35. That outweighs
+  **The two composer diagnostics are 14.10 kB of the entry chunk and are NOT a
+  cut.** Measured on the 2026-09-21 run: `deadPressProbe.ts` at 12.76,
+  `deadKeystrokeProbe.ts` at 0.99, `probeViewport.ts` at 0.35. That outweighs
   every surface in the table above, so it reads as the obvious lift. It is not
   one. `main.tsx` installs both before the first render, on purpose, because a
   probe that arms behind a dynamic import misses the gesture it exists to
@@ -353,9 +356,12 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   Growth is diffuse rather than one mistake. The 2026-08-30 run added 21.18 kB
   and re-ran the check for the usual culprit, a component gone from lazy to
   eager. There was none, for the fifth run running. That run's growth arrived
-  with a wide batch of merged feature work, not from one module. The 2026-09-17
-  run spread the same way: `store/thread-events/` grew 1.07 KiB and `api/*`
-  grew 0.86, against roughly 10 KiB added across 397 modules.
+  with a wide batch of merged feature work, not from one module. The 2026-09-21
+  run spread the same way, over a 26.73 KiB rise. Fourteen new modules brought
+  15.40 KiB of it. The other 11.33 KiB came from existing modules growing:
+  `store/thread-events/` by 1.16 and `api/*` by 0.21, against the composer
+  probes shedding 2.42. So 176 frontend commits moved 412 modules a little
+  each, and no single module answers for the run.
 
   Every run since has re-run the check and found no lazy-to-eager regression:
 
@@ -371,12 +377,20 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | 2026-09-15 | 750.02 kB | +5.27 kB |
   | 2026-09-16 | 752.92 kB | +2.90 kB |
   | 2026-09-17 | 763.13 kB | +10.21 kB |
+  | 2026-09-19 | 769.95 kB | +6.82 kB |
+  | 2026-09-21 | 797.32 kB | +27.37 kB |
 
-  The 2026-09-17 run makes fourteen in a row with no regression. Sourcemap
-  attribution put 397 of our own modules in the entry chunk, one more than
-  the run before, and zero `node_modules` bytes. No module sits in both the
-  entry chunk and a separate one. All 32 non-test relative `import()` targets
-  have their own emitted chunk. They are reached from `App.tsx`, `main.tsx`,
+  The 2026-09-21 run makes sixteen in a row with no regression, and is the
+  largest single-run rise in the table. Sourcemap attribution put 412 of our
+  own modules in the entry chunk, fourteen more than the run before, and zero
+  `node_modules` bytes. Eleven of the fourteen are new app modules and three
+  are the SDK's `_bridge.ts`, `appReach.ts` and `generated/app-reach.ts`. They
+  are 15.40 KiB together, and the largest is `store/actions/app-bridge.ts` at
+  3.49.
+
+  Both regression questions came back clean. No module sits in both the entry
+  chunk and a separate one. All 32 non-test relative `import()` targets have
+  their own emitted chunk. They are reached from `App.tsx`, `main.tsx`,
   `PairingGate.tsx`, `ContentPane.tsx` and `InlineForm.tsx`, and not one of
   the 32 sits in the entry chunk. The per-surface figures above were
   re-measured on this run.
@@ -401,8 +415,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   Then drop TypeScript's type-position `import('...').Type`, which is erased at
   compile time and reaches no bundle. All 6 apparent entry-chunk hits were that
   form, in `api/threads.ts`, `api/types.ts`, `store/actions/navigation.ts` and
-  `store/store.ts`. So the real answer was zero. The three runs from 2026-09-15
-  on all found the same four files holding 8 of them. The 2026-09-17 run saw 40
+  `store/store.ts`. So the real answer was zero. The five runs from 2026-09-15
+  on all found the same four files holding 8 of them. The 2026-09-21 run saw 40
   non-test sites across the same 9 files, so 32 value imports once the 8 go.
 
   **Write that second filter carefully.** "The character after the closing
@@ -411,16 +425,23 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   site where there were 32. Keep `.then`, `.catch` and `.finally`; drop only
   the other dotted forms.
 
-  The top is unchanged, re-measured on 2026-09-17: `icons.tsx` at 21.24 kB,
-  `ThreadDrawer.tsx` at 17.96 and `store.ts` at 17.51. The three
-  `thread-events/exchange*` modules add 48.19 kB between them, and the whole
-  `store/thread-events/` directory puts six modules and 54.51 kB in the chunk.
-  A first paint reaches all of them.
+  `icons.tsx` still leads, at 21.26 kB, and the top four held their order on
+  2026-09-21. `thread-events/exchange-grouping.ts` keeps second at 19.59 kB,
+  ahead of `ThreadDrawer.tsx` at 17.98 and `store.ts` at 17.57. It gained
+  0.92 kB over the run before and now clears `ThreadDrawer.tsx` by 1.61, so its
+  second place is no longer a thin margin. `exchange-render.ts` sits fifth at
+  17.37. No earlier run recorded a rank 5, so call that a new entry rather than
+  a rank that held.
 
-  The next tier did reorder: `PromptInput.tsx` at 15.46 kB, then
-  `ChatExchange.tsx` at 15.14 and `chat/scrollState.ts` at 14.85. Those two
-  swapped places since 2026-08-30, when they sat 0.05 kB apart. A margin that
-  thin was never a ranking, so do not read the swap as a signal.
+  The three `thread-events/exchange*` modules add 51.15 kB
+  between them, and the whole `store/thread-events/` directory puts seven
+  modules and 57.72 kB in the chunk. A first paint reaches all of them.
+
+  The next tier lost its outsider: `PromptInput.tsx` at 15.93 kB, then
+  `ChatExchange.tsx` at 15.40 and `chat/scrollState.ts` at 15.16.
+  `deadPressProbe.ts` shed 2.43 kB and dropped out of the tier entirely. The
+  three that remain sit 0.53 and 0.24 kB apart. Margins that thin were never a
+  ranking, so do not read a swap here as a signal.
 
   **Attribute built bytes, not source bytes.** Ranking the sourcemap's
   `sourcesContent` lengths answers a different question and reorders the
@@ -430,24 +451,24 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   reproduces the figures above and accounts for 99.5% of the chunk.
 
   **Two units meet here, so do not chase the gap between them.** Vite divides
-  by 1000, so the 763.13 kB it reports is 763,130 bytes, which is 745.24 KiB.
+  by 1000, so the 797.32 kB it reports is 797,320 bytes, which is 778.63 KiB.
   Sourcemap columns count UTF-16 units, and every per-module figure above is
   KiB. The history table quotes vite and the attribution does not, so the two
   never sum to the same number.
 
   **The entry chunk carries no `node_modules` code at all**, measured again on
-  the 2026-09-17 run by grouping the sourcemap's sources. Every byte of it is
+  the 2026-09-21 run by grouping the sourcemap's sources. Every byte of it is
   code we wrote, so no vendor-chunking idea can buy anything here.
 
-  **The SDK's `tooltip.ts` is 6.25 kB of the entry chunk and is NOT a cut**,
+  **The SDK's `tooltip.ts` is 6.23 kB of the entry chunk and is NOT a cut**,
   measured on the 2026-08-28 run. It looks like one. `ui.ts` pulls the whole
   module in for `disableTooltips`, and `ui` rides the `lucidos` barrel that
   `api/client/settings.ts` imports at first paint. But the host shell installs
   tooltips itself, through `hooks/useTooltip.ts`. So the bytes are used rather
   than dragged, and moving the opt-out to its own module would free none.
 
-  The whole SDK is 14.53 kB of the entry chunk across 14 modules, measured on
-  the 2026-09-17 run. That bounds the barrel: dropping every SDK byte still
+  The whole SDK is 19.26 kB of the entry chunk across 17 modules, measured on
+  the 2026-09-21 run. That bounds the barrel: dropping every SDK byte still
   leaves the advisory firing.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
@@ -455,17 +476,18 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   The entry chunk holds every icon a lazy view reaches. Moving those out
   costs no round trip, because the lazy chunk already loads.
 
-  Only five of the 64 icons are reached by lazy chunks alone. They are
-  `FolderUpIcon`, `FolderIcon`, `EyeOffIcon`, `ChevronLeftIcon` and
-  `ChevronRightIcon`, worth 4.17 kB of source and less once minified. The
-  2026-08-30 run re-measured and found the same five. Re-measure before
-  spending the churn, rather than assuming the split is free money.
+  Only three of the 66 icons are reached by lazy chunks alone. They are
+  `FolderUpIcon`, `FolderIcon` and `EyeOffIcon`, worth 3.58 kB of source and
+  less once minified. The list was five until 2026-09-21, when
+  `ChevronLeftIcon` and `ChevronRightIcon` both gained an entry-chunk caller.
+  So the lever is shrinking as the barrel grows. Re-measure before spending the
+  churn, rather than assuming the split is free money.
 
   **`api/client.ts` is a second barrel, and the 2026-08-27 run measured it. It
-  is not a lever either.** 26.56 kB of `api/*` lands in the entry chunk across 17
+  is not a lever either.** 27.03 kB of `api/*` lands in the entry chunk across 17
   modules, and tree-shaking still works, though it now keeps less out: only
   `mcp.ts` and `data.ts`. `webhooks.ts` joined the entry chunk by the
-  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.64 kB,
+  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.85 kB,
   which first paint genuinely needs. It exports `getPreferences`,
   `setPreference` and the notification calls beside the backup, memory and
   OAuth ones. Splitting it is an API-client refactor rather than a clean cut.

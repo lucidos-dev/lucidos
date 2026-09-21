@@ -309,11 +309,12 @@ export interface EngineVersionStatus {
    *  receipt and counts up locally, so skew never reaches the number. */
   build_elapsed_ms?: number;
   /** The non-merge commits between the running engine's commit and HEAD,
-   *  grouped by what they are: what a Switch would bring, which is what the
-   *  status toast describes while a rebuild runs.
+   *  grouped by what they are: what a Switch would bring. Two surfaces read it,
+   *  the status toast while a rebuild runs and the new-version confirm once one
+   *  is ready.
    *
    *  Absent means UNKNOWN (git couldn't answer, or nothing was asked because
-   *  no build is in flight), never "none pending". A present object with
+   *  no surface would show it), never "none pending". A present object with
    *  `total: 0` is the only way to say there is nothing to bring. */
   pending_commits?: PendingCommits;
 }

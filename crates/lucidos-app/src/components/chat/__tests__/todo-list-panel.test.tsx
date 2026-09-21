@@ -41,10 +41,11 @@ const NOOP = () => {};
 // Indicator: hidden when no items, otherwise ONE ticked-checkbox SVG icon (no
 // count) whatever the state. The SVG is pixel-identical to the adjacent
 // ImageIcon because both inherit `.icon-btn.header-icon svg` sizing
-// (--icon-size-lg). State is carried by `data-state` and rendered as COLOR
-// (plus, for waiting, a pulse) in todo-list.css, never as a different glyph.
-// Counts go into the tooltip and aria-label instead of the glyph. Tap target
-// opens the panel.
+// (--icon-size-lg). There are TWO states, carried by `data-state` and rendered
+// as COLOR in todo-list.css, never as a different glyph: `in-progress` is
+// accent, `idle` is the row's gray. Counts, and the words `waiting` and
+// `abandoned`, go into the tooltip and aria-label instead. Tap target opens the
+// panel.
 // ──────────────────────────────────────────────────────────────────────────
 
 describe('todoListIndicatorBody', () => {
@@ -84,11 +85,11 @@ describe('todoListIndicatorBody', () => {
     expect(text).not.toContain('1/3');
     expect(text).toContain('1 of 3 done');
     expect(text).toContain('data-tooltip="doing b"');
-    // The aria-label NAMES the in-progress state, it does not just count.
-    // Every state renders the same glyph and differs only in color (or, for
-    // waiting, a pulse), which a screen reader can't read and forced-colors
-    // mode overwrites, and the tooltip is desktop-hover only. So this is the
-    // one non-visual channel that tells idle and in-progress apart.
+    // The aria-label NAMES the in-progress state, it does not just count. Both
+    // states render the same glyph and differ only in colour. A screen reader
+    // can't read colour, forced-colors mode overwrites it, and the tooltip is
+    // desktop-hover only. So this is the one non-visual channel that tells idle
+    // and in-progress apart.
     expect(text).toContain('aria-label="Todo list: doing b. 1 of 3 done. Click to expand."');
   });
 
@@ -122,65 +123,78 @@ describe('todoListIndicatorBody', () => {
     expect(text).toContain('data-row-item');
   });
 
-  it('renders the abandoned state when no item is in progress but some were abandoned', () => {
+  it('stays idle for abandoned items, and says so in words', () => {
+    // Abandoned used to dim the glyph. A dim reads as a disabled button, for a
+    // fact that is history rather than activity, so the count carries it alone.
     const items: TodoItem[] = [
       { content: 'a', active_form: 'doing a', status: 'completed' },
       { content: 'b', active_form: 'doing b', status: 'abandoned' },
       { content: 'c', active_form: 'doing c', status: 'abandoned' },
     ];
     const text = vnodeToText(todoListIndicatorBody({ items, onClick: NOOP }));
-    expect(text).toContain('data-state="abandoned"');
-    expect(text).not.toContain('data-state="idle"');
+    expect(text).toContain('data-state="idle"');
     expect(text).not.toContain('data-state="in-progress"');
     expect(text).toContain('1 of 3 done, 2 abandoned');
   });
 
-  it('renders the waiting state when items are parked on a live event wait', () => {
-    // The reported bug, seen from the indicator: a thread asleep on an event
-    // wait is not one that walked away, so the button must not dim to the
-    // abandoned colour.
+  it('stays idle for items parked on a live event wait, and says so in words', () => {
+    // Waiting used to pulse the glyph gray. An item is `waiting` only while the
+    // thread holds a live event wait. That is exactly when the *waiting
+    // indicator* renders in accent beside this button, so the pulse repeated a
+    // signal the row already carried.
     const items: TodoItem[] = [
       { content: 'a', active_form: 'doing a', status: 'completed' },
       { content: 'b', active_form: 'doing b', status: 'waiting' },
       { content: 'c', active_form: 'doing c', status: 'waiting' },
     ];
     const text = vnodeToText(todoListIndicatorBody({ items, onClick: NOOP }));
-    expect(text).toContain('data-state="waiting"');
-    expect(text).not.toContain('data-state="idle"');
-    expect(text).not.toContain('data-state="abandoned"');
+    expect(text).toContain('data-state="idle"');
+    expect(text).not.toContain('data-state="in-progress"');
     expect(text).toContain('1 of 3 done, 2 waiting');
     expect(text).toContain(
       'aria-label="Todo list: 1 of 3 done, 2 waiting. Click to expand."',
     );
   });
 
-  it('prefers waiting over abandoned, because waiting is the live fact', () => {
-    // A list carrying both has parked items that are still going somewhere,
-    // which is what the user needs to see at a glance.
+  it('says waiting rather than abandoned, because waiting is the live fact', () => {
+    // The two no longer differ in paint, so the precedence lives entirely in
+    // the words: a list carrying both has parked items still going somewhere.
     const items: TodoItem[] = [
       { content: 'a', active_form: 'doing a', status: 'abandoned' },
       { content: 'b', active_form: 'doing b', status: 'waiting' },
     ];
     const text = vnodeToText(todoListIndicatorBody({ items, onClick: NOOP }));
-    expect(text).toContain('data-state="waiting"');
+    expect(text).toContain('0 of 2 done, 1 waiting');
+    expect(text).not.toContain('abandoned');
   });
 
-  it('renders the SAME ticked-checkbox glyph in every state, so only its painting differs', () => {
+  it('is lit for in-progress and gray for every other list, and never a third state', () => {
+    // The whole glanceable contract: accent means an item is being worked right
+    // now, which is the composer row's own language. Anything else is idle.
+    const byState: Record<string, TodoItem['status'][]> = {
+      'in-progress': ['in_progress'],
+      idle: ['pending', 'completed', 'waiting', 'abandoned'],
+    };
+    for (const [state, statuses] of Object.entries(byState)) {
+      for (const status of statuses) {
+        const items: TodoItem[] = [{ content: 'a', active_form: 'doing a', status }];
+        expect(vnodeToText(todoListIndicatorBody({ items, onClick: NOOP })))
+          .toContain(`data-state="${state}"`);
+      }
+    }
+  });
+
+  it('renders the SAME ticked-checkbox glyph in both states, so only its painting differs', () => {
     // The state must never switch the shape. The pair this test was written
     // against drew this same checkbox for idle and a filled dome inside a
     // checkbox for in-progress, and the second one read as nothing
     // recognizable at 1.25rem. Whatever the agent is doing, the button has to
     // keep saying "todo list".
-    const byState: Record<string, TodoItem[]> = {
-      idle: [{ content: 'a', active_form: 'doing a', status: 'pending' }],
-      'in-progress': [{ content: 'a', active_form: 'doing a', status: 'in_progress' }],
-      waiting: [{ content: 'a', active_form: 'doing a', status: 'waiting' }],
-      abandoned: [{ content: 'a', active_form: 'doing a', status: 'abandoned' }],
-    };
-    for (const [state, items] of Object.entries(byState)) {
-      const node = todoListIndicatorBody({ items, onClick: NOOP });
-      expect(vnodeToText(node)).toContain(`data-state="${state}"`);
-      expect(componentTypes(node)).toEqual([TodoListIcon]);
+    const statuses: TodoItem['status'][] = ['pending', 'in_progress', 'waiting', 'abandoned'];
+    for (const status of statuses) {
+      const items: TodoItem[] = [{ content: 'a', active_form: 'doing a', status }];
+      expect(componentTypes(todoListIndicatorBody({ items, onClick: NOOP })))
+        .toEqual([TodoListIcon]);
     }
   });
 

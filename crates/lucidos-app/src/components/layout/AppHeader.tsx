@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
+import { watchTitlebarBand } from '../../store/actions/trafficLights';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchIcon } from '../shared/icons';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
@@ -12,6 +13,7 @@ import { MobileAppHeader } from './MobileAppHeader';
 import { BackupReminderBanner } from './BackupReminderBanner';
 import { ConnectionBanner } from './ConnectionBanner';
 import { IngressBanner } from './IngressBanner';
+import { WebhookRefusalBanner } from './WebhookRefusalBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -215,6 +217,9 @@ export function AppHeader() {
   // Docker-style: the whole header band drags the window (Tauri desktop). Window
   // zoom stays on the strip — the header's double-click keeps doing pane-maximize.
   useWindowDragRegion(headerRef, { canStart: headerCanDragStart });
+  // Packaged macOS: this header IS the band the OS traffic lights centre on, and
+  // only the page can measure it. See `watchTitlebarBand`.
+  useEffect(() => watchTitlebarBand(), []);
 
   const url = panelUrl.value;
   const showUrlPreview = panelOverlay.value?.type === 'url-preview';
@@ -390,6 +395,7 @@ export function AppHeader() {
             is a desktop-only surface. */}
         <ConnectionBanner layout="mobile" />
         <IngressBanner layout="mobile" />
+        <WebhookRefusalBanner layout="mobile" />
         <BackupReminderBanner layout="mobile" />
       </header>
     </>

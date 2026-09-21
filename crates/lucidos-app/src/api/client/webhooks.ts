@@ -60,6 +60,12 @@ export interface Webhook {
   /** Why that refusal happened. Shown to the workspace owner only: the sender
    *  gets a bare 401, since naming the reason helps whoever is guessing. */
   last_refusal_reason: string | null;
+  /** Every refusal since the last acceptance, absent when none stands.
+   *
+   *  The whole evidence rather than the last line of it. The field above holds
+   *  only the LAST refusal, so one diagnostic probe overwrites exactly what a
+   *  real outage left behind. */
+  refusal_run?: WebhookRefusalRun;
   /** Path a sender posts to, under whatever host the hook socket is exposed
    *  on. The engine knows no public hostname, so it states the path alone. */
   delivery_path: string;
@@ -88,6 +94,56 @@ export type WebhookSigningSecret =
 export interface WebhookWithToken extends Webhook {
   token?: string;
   signing_secret?: string;
+}
+
+/** What a webhook has been turning away since it last accepted anything.
+ *
+ *  Mirrors the engine's `RefusalRun`. An acceptance ends a run, so a present
+ *  one always means deliveries are being thrown away right now. */
+export interface WebhookRefusalRun {
+  /** How many deliveries have been turned away since one last verified. */
+  refusals: number;
+  /** RFC 3339, when the run started. */
+  since: string | null;
+  /** The breakdown, keyed by the engine's `DeliveryRefusal::key`. */
+  reasons: Record<string, number>;
+}
+
+/** What is turning a webhook's deliveries away.
+ *
+ *  `disabled` means the hook is switched off, so nothing was read and nothing
+ *  is wrong with the secret. `verification` means the delivery reached the
+ *  verifier and failed it. The two want different words and different actions,
+ *  which is the whole reason they are separate values. */
+export type WebhookRefusalCause = 'disabled' | 'verification';
+
+/** One webhook that is throwing its deliveries away.
+ *
+ *  Per hook, unlike `WebhookIngressOutage`: the ingress is one funnel in front
+ *  of every hook, and a refusal belongs to the one hook doing the refusing. */
+export interface WebhookRefusal {
+  webhook_id: string;
+  webhook_name: string;
+  /** Whether the hook is switched on right now. For a `disabled` cause the
+   *  recovery is one click, so the notice can say so plainly. */
+  enabled: boolean;
+  cause: WebhookRefusalCause;
+  refusals: number;
+  /** The run's breakdown by reason. The evidence, not the last line of it. */
+  reasons: Record<string, number>;
+  /** RFC 3339, from the engine's own reading of the run. */
+  refusing_since: string;
+  /** How long it has been going, measured by the database. */
+  refusing_secs: number;
+}
+
+/** Which webhooks are turning their deliveries away, for a cold page load.
+ *
+ *  SSE carries the two `WebhookDeliveries*` events while the app is open. This
+ *  is what a client that just started reads instead of replaying the timeline. */
+export interface WebhookRefusals {
+  /** Empty while every hook is landing what it gets. */
+  refusing: WebhookRefusal[];
 }
 
 /** Which address family an ingress probe could not reach. */
@@ -156,6 +212,10 @@ export function fetchWebhooks(): Promise<Webhook[]> {
 
 export function fetchWebhookIngress(): Promise<WebhookIngress> {
   return json(`${API}/webhooks/ingress`);
+}
+
+export function fetchWebhookRefusals(): Promise<WebhookRefusals> {
+  return json(`${API}/webhooks/refusals`);
 }
 
 export async function createWebhook(input: {

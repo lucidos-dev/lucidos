@@ -3,8 +3,17 @@ import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen }
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
-import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard, getRemPx } from '../../utils/dom';
+import {
+  isTextInput,
+  isInteractiveTarget,
+  opensSoftwareKeyboard,
+  getRemPx,
+  viewportIsKeyboardShrunk,
+} from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
+import { noteViewportResize } from './keyboardCloseRelayout';
+import { reportNavigation } from '../../utils/navigationMarks';
+import { useFocusedFieldVisible } from '../../hooks/useFocusedFieldVisible';
 
 export { SwipeTouch } from '../../utils/swipe';
 
@@ -149,9 +158,38 @@ export function computeAppHeight(args: {
   activeElementOpensKeyboard: boolean;
 }): number {
   const { vvHeight, innerHeight, activeElementOpensKeyboard } = args;
-  const isKeyboard = vvHeight < innerHeight - 100 && activeElementOpensKeyboard;
+  const isKeyboard = viewportIsKeyboardShrunk(vvHeight, innerHeight) && activeElementOpensKeyboard;
   return isKeyboard ? vvHeight : innerHeight;
 }
+
+/** Pure decision: how much room the software keyboard is taking off the foot of
+ *  the screen, in px, and 0 when it is down.
+ *
+ *  Published as `--keyboard-band` and spent as bottom padding inside the pane's
+ *  scroll container. iOS reveals a focused field by scrolling its nearest
+ *  scrollable ancestor. When that ancestor cannot scroll far enough it offsets
+ *  the whole viewport instead, which takes the fixed header with it. It also
+ *  moves the frame every measurement is made in, and that is what made the
+ *  reveal land differently on the same form twice running. The padding is the
+ *  slack that stops iOS reaching for the offset.
+ *
+ *  Same two terms as `computeAppHeight`, so the shell's height and the slack it
+ *  needs cannot disagree about whether the keyboard is up.
+ *  See `docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md`. */
+export function keyboardBandPx(args: {
+  vvHeight: number;
+  innerHeight: number;
+  activeElementOpensKeyboard: boolean;
+}): number {
+  const { vvHeight, innerHeight, activeElementOpensKeyboard } = args;
+  if (!activeElementOpensKeyboard || !viewportIsKeyboardShrunk(vvHeight, innerHeight)) return 0;
+  return Math.max(0, innerHeight - vvHeight);
+}
+
+/** The band to assume on a focus before any keyboard has been measured.
+ *  An iPhone's portrait keyboard is a little under half the screen, and
+ *  over-reserving costs only scrollable slack nobody scrolls into. */
+const ASSUMED_KEYBOARD_FRACTION = 0.45;
 
 /** Check if an element or any ancestor (up to pane boundary) scrolls horizontally. */
 function isHorizontallyScrollable(el: Element | null): boolean {
@@ -194,6 +232,11 @@ export function MobileSwipeContainer() {
   const touch = useRef(new SwipeTouch());
   const mountedRef = useRef(false);
 
+  // The other half of the `--app-height` write below. Shrinking the shell for
+  // the keyboard is what puts a focused field behind it. So the reveal that
+  // scrolls it back mounts with the shell that shrinks.
+  useFocusedFieldVisible();
+
   // Must be useLayoutEffect — see component JSDoc.
   useLayoutEffect(() => {
     const track = trackRef.current;
@@ -217,6 +260,10 @@ export function MobileSwipeContainer() {
     } else {
       track.style.transform = paneTransform(index);
     }
+    // The pane half of the navigation mark. This effect already runs on exactly
+    // the transition being measured, before paint, so the rAF lands on the frame
+    // the user sees. Same shape as `thread-render` in ThreadView.
+    reportNavigation('pane');
   }, [mobileView.value]);
 
   // Safety net: after every CSS transition on the track ends, verify the
@@ -482,6 +529,32 @@ export function MobileSwipeContainer() {
       activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
     });
 
+    // The widest band measured this session, so a focus can reserve the slack
+    // before the keys have animated in. iOS picks between scrolling the
+    // container and offsetting the viewport at FOCUS time. Slack arriving with
+    // the first resize arrives too late to change that decision.
+    let seenBand = 0;
+    let lastSetBand = -1;
+    const setBand = (px: number) => {
+      if (px === lastSetBand) return;
+      lastSetBand = px;
+      document.documentElement.style.setProperty('--keyboard-band', `${px}px`);
+    };
+    const syncBand = () => {
+      const band = keyboardBandPx({
+        vvHeight: vv.height,
+        innerHeight: window.innerHeight,
+        activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
+      });
+      if (band > seenBand) seenBand = band;
+      setBand(band);
+    };
+    /** Reserve the slack now, on the best figure available. */
+    const armBand = (e: FocusEvent) => {
+      if (!opensSoftwareKeyboard(e.target)) return;
+      setBand(seenBand || Math.round(window.innerHeight * ASSUMED_KEYBOARD_FRACTION));
+    };
+
     const onResize = () => {
       // The keyboard opening or closing changes --app-height, which shortens or
       // lengthens the transcript's viewport. The reader is left exactly where
@@ -490,9 +563,27 @@ export function MobileSwipeContainer() {
       // to the new bottom; see scrollState's header for why nothing does that
       // any more.)
       setHeight(currentAppHeight());
+      syncBand();
+      // A keyboard close leaves WKWebView routing touches against the
+      // keyboard-up geometry, and the page cannot read that. Relayout frees it.
+      // Called last, so the bounce starts from the height just written.
+      noteViewportResize({ height: vv.height, layoutViewport: window.innerHeight });
     };
     const onOrientationChange = () => {
       setHeight(currentAppHeight());
+      syncBand();
+    };
+    // The keyboard leaving is a focus change, and it may fire no resize at all
+    // when a hardware keyboard was in play. Recompute from live metrics so the
+    // slack cannot outlive the keys.
+    //
+    // A move between two fields is NOT that. The keys stay up, and dropping the
+    // padding for even one frame shortens the scroll range: a container near
+    // its end is clamped, and the content jumps by a keyboard's height. So the
+    // handoff is left alone, as `useHideOnScroll` leaves its own.
+    const onFocusOut = (e: FocusEvent) => {
+      if (opensSoftwareKeyboard(e.relatedTarget)) return;
+      syncBand();
     };
     // iOS PWA suspend/resume often dismisses the on-screen keyboard without
     // firing a visualViewport `resize` event. Without a wake-time recompute,
@@ -510,7 +601,7 @@ export function MobileSwipeContainer() {
     //
     //   2. iOS preserves focus on the textarea across suspend even when the
     //      on-screen keyboard is dismissed. Ghost-focused state then fools
-    //      computeAppHeight's keyboard check (vv.height < innerHeight - 100
+    //      computeAppHeight's keyboard check (viewportIsKeyboardShrunk
     //      AND opensSoftwareKeyboard(activeElement) = both true) when a
     //      delayed vv.resize finally fires — the helper returns vv.height
     //      and onResize writes the stale shrunk value back into --app-height.
@@ -526,13 +617,14 @@ export function MobileSwipeContainer() {
     // Reset lastSetHeight so the CSS write happens even when innerHeight
     // matches the cached value.
     const onWake = () => {
-      const vvLooksShrunk = vv.height < window.innerHeight - 100;
+      const vvLooksShrunk = viewportIsKeyboardShrunk(vv.height, window.innerHeight);
       const active = document.activeElement;
       if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
         active.blur();
       }
       lastSetHeight = -1;
       setHeight(currentAppHeight());
+      syncBand();
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') onWake();
@@ -541,13 +633,19 @@ export function MobileSwipeContainer() {
     window.addEventListener('orientationchange', onOrientationChange);
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('pageshow', onWake);
+    document.addEventListener('focusin', armBand, { passive: true });
+    document.addEventListener('focusout', onFocusOut, { passive: true });
     setHeight(currentAppHeight());
+    syncBand();
     return () => {
       vv.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onOrientationChange);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('pageshow', onWake);
+      document.removeEventListener('focusin', armBand);
+      document.removeEventListener('focusout', onFocusOut);
       document.documentElement.style.removeProperty('--app-height');
+      document.documentElement.style.removeProperty('--keyboard-band');
     };
   }, []);
 

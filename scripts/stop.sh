@@ -104,12 +104,17 @@ stop_workspace() {
     # Stop engine via SIGUSR1, not SIGTERM — the engine ignores SIGTERM to
     # survive accidental `xargs kill` from CC subprocess test scripts (see
     # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
+    # Remembered past this block for the build-watch teardown below: a SIGUSR1'd
+    # engine drains for seconds, so it is still in the process table when the
+    # teardown takes its vote, and counting it would spare the watch forever.
+    local stopped_engine_pid=""
     if [ -f "$engine_pid_file" ]; then
         local pid
         pid="$(cat "$engine_pid_file")"
         if kill -0 "$pid" 2>/dev/null; then
             echo "Stopping engine (PID $pid) for $ws"
             kill -USR1 "$pid" 2>/dev/null || true
+            stopped_engine_pid="$pid"
             stopped="1"
         fi
         rm -f "$engine_pid_file"
@@ -137,7 +142,7 @@ stop_workspace() {
         fi
         rm -f "$build_watch_pid_file"
     fi
-    teardown_shared_build_watch_if_idle
+    teardown_shared_build_watch_if_idle "$stopped_engine_pid"
 
     # Stop legacy per-workspace PostgreSQL container if --force. The shared
     # PostgreSQL container is never stopped for one workspace; it serves peers.

@@ -73,6 +73,16 @@ impl LucidosEngine {
             ));
         }
 
+        // The *style library* is one JSON document, and a bad one would cost
+        // the user every style they wrote. So it is checked here rather than in
+        // the tool handler: the Settings UI reaches only this path, and it is
+        // the writer that edits the document. Refused whole, never trimmed, and
+        // before the store write, so a rejected edit leaves the saved library
+        // exactly as it was.
+        if key == crate::core::PREF_RESPONSE_STYLES {
+            crate::core::response_style::validate_document(value)?;
+        }
+
         // A `backup_schedule` write re-registers the backup cron via the
         // scheduler's `PreferencesChanged` subscriber. Validate the cron up front
         // on this shared path (so a raw HTTP/SDK caller is covered, not just the

@@ -99,8 +99,12 @@ function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[
  * question on the browser's clock.
  *
  * `null` for a row with no timestamp to read, which no caller may order.
+ *
+ * Exported for `render-order.ts`, which checks the fold's output against the
+ * very rule the fold placed those rows by. Two readings would drift, and the
+ * drift is a check that passes over a transcript the reader sees out of order.
  */
-function happenedAt(event: StoredEvent): number | null {
+export function happenedAt(event: StoredEvent): number | null {
   const landed = instantMicros(event.created ?? event._displayCreated);
   const secs = event.type === 'SpokenReplyGenerated' ? event.spoken_secs_before : undefined;
   if (landed === null || secs === undefined) return landed;
@@ -327,8 +331,12 @@ function syntheticSeqBase(thread: ThreadState): number {
 }
 
 function foldedExchanges(thread: ThreadState): Exchange[] {
+  // The thread's own watermark, not a property of the events it holds. A page
+  // starting mid-turn and a corrupt thread look identical to the fold, and
+  // only this tells them apart. See `Exchange.continuationFragment`.
+  const paged = thread.hasOlderEvents === true;
   if (thread.pendingUserMessages.length === 0) {
-    return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events), thread.events);
+    return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events, paged), thread.events);
   }
   // Merge pending messages as synthetic MessageReceived events so they act as
   // proper exchange boundaries. MAX_SAFE_INTEGER seqs sort them after all real events.
@@ -364,7 +372,7 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   // pending message. So append, rather than re-fold the whole history on every
   // send and every streamed token. Checking only the earliest pending suffices:
   // later ones have strictly larger seqs and same-or-later timestamps.
-  const base = groupIntoExchangesCached(thread.events);
+  const base = groupIntoExchangesCached(thread.events, paged);
   const cache = incrementalCache.get(thread.events);
   const first = synthetic[0];
   const canAppendTrailing =
@@ -385,7 +393,7 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   // re-fold — literally the prior behavior, so equivalence holds either way.
   const augmented = new Map(thread.events);
   for (const { seq, event } of synthetic) augmented.set(seq, event);
-  return filterRemovedQueuedExchanges(groupIntoExchanges(augmented), augmented);
+  return filterRemovedQueuedExchanges(groupIntoExchanges(augmented, paged), augmented);
 }
 
 function removedQueuedMessageIds(events: Map<number, StoredEvent>): Set<string> {
@@ -420,7 +428,7 @@ function filterRemovedQueuedExchanges(
  *
  *  One boundary is decided by the EVENT rather than by its type and so is not
  *  in this set: see `isExchangeStartEvent`. */
-const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
+export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',
   'ResponseAborted',
@@ -458,6 +466,80 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
 export function isExchangeStartEvent(event: { type: string; cause?: string }): boolean {
   if (event.type === 'EventWaitCanceled') return isUserStoppedWait(event);
   return EXCHANGE_START_TYPES.has(event.type);
+}
+
+/** What a boundary does with a turn that is STILL RUNNING under it. See the
+ *  glossary's § Continuation handoff for the concept.
+ *
+ *  - `takes`: the turn's continuation moves here, so its remaining rows read
+ *    below this card. That is where they happened.
+ *  - `takes-unless-parked`: the same, unless the card above is a divider still
+ *    awaiting the user. Its answer belongs to that card.
+ *  - `leaves`: the turn keeps its owner, and the reason is on the entry.
+ *  - `ends`: the boundary terminates the turn, and returns before this is read.
+ *  - `own-arm`: an arm higher up in `foldEvent` decides it. */
+export type ContinuationHandoff = 'takes' | 'takes-unless-parked' | 'leaves' | 'ends' | 'own-arm';
+
+/** The handoff decision for every boundary type, with no gaps.
+ *
+ *  **A missing entry is what the reported bug WAS.** `ContinuationStarted` was
+ *  added to `EXCHANGE_START_TYPES` and to nothing else, so the resumed turn
+ *  kept writing into the card above the resume. An allow-list cannot say
+ *  whether a type was considered and declined, or simply forgotten. A table
+ *  can, and `render-order.test.ts` fails if a type reaches here undecided.
+ *
+ *  `EventWaitCanceled` is in the table and not in the set: a user stop is
+ *  decided by its cause (`isExchangeStartEvent`). */
+export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHandoff> = new Map<string, ContinuationHandoff>([
+  // A queued message. The loop has not picked it up, so the running turn
+  // keeps writing above it until a `UserPromptInjected` absorbs it.
+  ['MessageReceived', 'leaves'],
+  // Opens the thread's own first turn, so there is none to take.
+  ['TriggerStarted', 'leaves'],
+  ['ResponseAborted', 'ends'],
+  ['ResponseCanceled', 'ends'],
+  // The resume owns what it resumed. The turn can be anchored elsewhere: a
+  // pending event wait wakes the thread first and the turn anchors on that
+  // prompt. Leaving it stranded the work above the resume card.
+  ['ContinuationStarted', 'takes-unless-parked'],
+  // A wake from a detached wait, injected as a ReentryFromWait, which holds no
+  // turn of its own (ADR 0049).
+  ['UserPromptInjected', 'takes-unless-parked'],
+  // A sub-thread finishing mid response. The engine injects the summary as a
+  // ReentryFromEngine, minting no id, so only the redirect can find the card.
+  ['ChildThreadCompleted', 'takes-unless-parked'],
+  // Chat prompts the loop raises in-process. The turn resumes under its own
+  // unchanged req_id, so the answer must read below the card that asked.
+  ['UserQuestionAsked', 'takes'],
+  ['CommandPermissionRequested', 'takes'],
+  ['McpPermissionRequested', 'takes'],
+  // No producer emits either one today. Decided with their siblings above, so
+  // the family behaves alike the day one does.
+  ['CredentialRequested', 'takes'],
+  ['McpConsentRequested', 'takes'],
+  // Coding-agent events fold by the clock rather than by request id, so the
+  // continuation already lands below these. A handoff would move nothing.
+  ['CodingAgentPermissionRequest', 'leaves'],
+  ['MissingHardeningDetected', 'leaves'],
+  ['MergeConflictDetected', 'leaves'],
+  ['ChangeApplied', 'leaves'],
+  ['ChangeDiscarded', 'leaves'],
+  ['ChangeReverted', 'leaves'],
+  ['ChangeApplyFailed', 'leaves'],
+  // Both are settled before the decision below is read.
+  ['SpokenMessageReceived', 'own-arm'],
+  ['EventWaitCanceled', 'own-arm'],
+]);
+
+/** Does this boundary take the running turn? `previous` held it.
+ *
+ *  An unlisted type falls back to `leaves`, which is what every boundary did
+ *  before the table existed. The mirror test keeps that fallback unreachable. */
+function boundaryTakesTheTurn(type: string, previous: Exchange): boolean {
+  const rule = BOUNDARY_CONTINUATION_HANDOFF.get(type);
+  if (rule === 'takes') return true;
+  if (rule === 'takes-unless-parked') return !dividerStillAwaitsUser(previous);
+  return false;
 }
 
 /** True when `exchange` is a divider still PARKED awaiting a user action: its
@@ -1077,10 +1159,21 @@ interface GroupFoldState {
    *  until the first routed chat event, so the chat-divider redirect is a no-op
    *  on a pure CC thread. */
   lastChatTurnReqId?: string;
+  /** Does the server hold events older than the oldest one folded here?
+   *
+   *  The one thing that tells a page starting mid-turn from a corrupt thread.
+   *  Both reach the fold as steps with no boundary behind them, and only this
+   *  says which. See `Exchange.continuationFragment`.
+   *
+   *  Held on the fold state rather than passed down, because
+   *  `groupIntoExchangesCached` resumes a fold across calls and must rebuild
+   *  when the answer changes. */
+  paged: boolean;
 }
 
-function newFoldState(): GroupFoldState {
+function newFoldState(paged: boolean): GroupFoldState {
   return {
+    paged,
     exchanges: [],
     current: null,
     toolCallOwners: new Map(),
@@ -1254,8 +1347,18 @@ function liveReplyTargetIndex(exchanges: Exchange[]): number {
   return -1;
 }
 
-export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {
-  return foldSorted(sortEventsChronologically(events)).exchanges;
+/** Fold an event set into turns.
+ *
+ *  `paged` says the server holds events older than the oldest one here. That
+ *  is what opens a *continuation fragment* for a turn starting off the page.
+ *  It defaults to "this set is the whole thread", the truth for a fixture and
+ *  for every thread short enough to arrive in one response.
+ *
+ *  Only a caller reading a THREAD may take the default, and `computeExchanges`
+ *  is the one that does, off `hasOlderEvents`. A paged set folded as whole
+ *  silently drops every step ahead of its first boundary. */
+export function groupIntoExchanges(events: Map<number, StoredEvent>, paged = false): Exchange[] {
+  return foldSorted(sortEventsChronologically(events), paged).exchanges;
 }
 
 /** Incremental memo entry for one thread's events map. Valid only while events
@@ -1282,8 +1385,11 @@ interface IncrementalCache {
 const incrementalCache = new WeakMap<Map<number, StoredEvent>, IncrementalCache>();
 
 /** The sort comparator of `sortEventsChronologically`, as a key compare:
- *  created (when both present) with seq as tiebreak, else seq. */
-function compareSortKeys(
+ *  created (when both present) with seq as tiebreak, else seq.
+ *
+ *  Exported so `render-order.ts` reads the transcript's order off the same
+ *  comparator the fold sorted it with. */
+export function compareSortKeys(
   aMicros: number | null,
   aSeq: number,
   bMicros: number | null,
@@ -1301,7 +1407,7 @@ function compareSortKeys(
 }
 
 /** Full rebuild: run the one-shot fold and store its state for continuation. */
-function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
+function rebuildIncrementalCache(events: Map<number, StoredEvent>, paged: boolean): Exchange[] {
   const sorted = sortEventsChronologically(events);
   let cacheable = true;
   for (const { event } of sorted) {
@@ -1310,7 +1416,7 @@ function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
       break;
     }
   }
-  const fold = foldSorted(sorted);
+  const fold = foldSorted(sorted, paged);
   const last = sorted.length > 0 ? sorted[sorted.length - 1] : null;
   incrementalCache.set(events, {
     fold,
@@ -1327,12 +1433,16 @@ function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
  *  fresh copy each call, so signal subscribers fire on identity. The Exchange
  *  objects inside stay identity-stable across appends, so per-exchange
  *  memoization holds. */
-function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] {
+function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boolean): Exchange[] {
   const cache = incrementalCache.get(events);
-  if (!cache) return rebuildIncrementalCache(events);
-  if (!cache.cacheable) return groupIntoExchanges(events);
+  if (!cache) return rebuildIncrementalCache(events, paged);
+  // A cold open fills this Map and only then learns the thread is paged, so
+  // the answer can change under an unchanged Map. The fragments the fold owes
+  // depend on it, so a different answer is a different fold.
+  if (cache.fold.paged !== paged) return rebuildIncrementalCache(events, paged);
+  if (!cache.cacheable) return groupIntoExchanges(events, paged);
   if (events.size === cache.processedCount) return [...cache.fold.exchanges];
-  if (events.size < cache.processedCount) return rebuildIncrementalCache(events);
+  if (events.size < cache.processedCount) return rebuildIncrementalCache(events, paged);
 
   // New events are the insertion-order suffix. Sort the batch with the full
   // comparator so two events arriving in one frame fold in sorted order.
@@ -1359,12 +1469,12 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
     if (micros === null) {
       // Legacy row without a timestamp — give up on caching this map.
       cache.cacheable = false;
-      return groupIntoExchanges(events);
+      return groupIntoExchanges(events, paged);
     }
     if (compareSortKeys(micros, seq, prevMicros, prevSeq) < 0) {
       // Out-of-order arrival (e.g. a refresh replay delivering a missed
       // event): its sorted position is in the middle, not the end.
-      return rebuildIncrementalCache(events);
+      return rebuildIncrementalCache(events, paged);
     }
     const reqId = requestEventIdOf(event);
     if (event.type === 'ResponseAborted' && reqId) {
@@ -1377,7 +1487,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
     ) {
       // Legacy rerun-in-place: this terminal retro-classifies an
       // already-folded (or same-batch) ResponseAborted as a superseded step.
-      return rebuildIncrementalCache(events);
+      return rebuildIncrementalCache(events, paged);
     }
     prevMicros = micros;
     prevSeq = seq;
@@ -1406,7 +1516,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
  *  rerun-in-place pre-pass, folds every event, and applies the
  *  question-divider marking. Both `groupIntoExchanges` and the cache rebuild
  *  go through here. */
-function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
+function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
   // Legacy rerun-in-place. When a ResponseAborted shares request_event_id with
   // a later ResponseGenerated or ResponseFailed, the rerun re-used the original
   // exchange. Do not split at those aborts: supersededAbortIndices in
@@ -1428,7 +1538,7 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
     if (reqId && resolvedReqIds.has(reqId)) legacySupersededAbortSeqs.add(seq);
   }
 
-  const state = newFoldState();
+  const state = newFoldState(paged);
   for (const { seq, event } of sorted) {
     foldEvent(state, seq, event, legacySupersededAbortSeqs.has(seq), null);
   }
@@ -1882,7 +1992,7 @@ function foldEvent(
       // the running turn's pending `Thinking` marker would shimmer forever.
       //
       // Restoring `current` is the whole handling it needs, and is why it is
-      // also absent from `advancesRedirect` below. It continues nothing, so
+      // `own-arm` in `BOUNDARY_CONTINUATION_HANDOFF`. It continues nothing, so
       // there is no continuation to redirect and no handoff to record.
       if (isUserStoppedWait(event)) {
         current = previousCurrent;
@@ -1932,34 +2042,18 @@ function foldEvent(
           touched?.add(gated.exchange);
         }
       }
-      // Three shapes reach this advance, all one thing: a turn INTERRUPTED by a
-      // boundary that then resumes under its own, unchanged req_id. Without the
-      // redirect, everything after the boundary routes back to the pre-boundary
-      // exchange, which sits ABOVE the card, so the continuation renders first.
+      // A turn INTERRUPTED by a boundary that then resumes under its own,
+      // unchanged req_id. Without the redirect, everything after the boundary
+      // routes back to the pre-boundary exchange, which sits ABOVE the card, so
+      // the continuation renders first. `BOUNDARY_CONTINUATION_HANDOFF` decides
+      // it per type, and carries the reason for every entry.
       //
-      // 1. A chat `ask_user_question` or command-guard permission prompt, both
-      //    in-process in the agentic loop. The gated tool call and its result
-      //    still re-route to the MR exchange by tool_called_event_id, so only
-      //    the genuine continuation moves below the card. CC's
-      //    `CodingAgentPermissionRequest` is excluded, never being routed.
-      // 2. `ChildThreadCompleted`, a sub-thread finishing mid response. The
-      //    engine injects the summary as a ReentryFromEngine, minting no id.
-      // 3. An unabsorbed `UserPromptInjected`, injected as a ReentryFromWait
-      //    from a detached wait, which holds no turn of its own (ADR 0049).
-      //
-      // EXCEPTION for shapes 2 and 3: a turn parked at a divider STILL awaiting
-      // the user keeps its redirect, so the reply stays with the card being
-      // answered. A resolved divider gets no exception, see
-      // `dividerStillAwaitsUser`. An IDLE wake is unaffected: the engine starts
-      // a fresh turn anchored on the injection, which finds this exchange.
-      const advancesRedirect =
-        event.type === 'UserQuestionAsked'
-        || event.type === 'CommandPermissionRequested'
-        || event.type === 'McpPermissionRequested'
-        || ((event.type === 'ChildThreadCompleted' || event.type === 'UserPromptInjected')
-          && !!previousCurrent
-          && !dividerStillAwaitsUser(previousCurrent));
-      if (advancesRedirect && previousCurrent) {
+      // The gated tool call and its result still re-route to the MR exchange by
+      // tool_called_event_id, so only the genuine continuation moves below a
+      // permission card. An IDLE wake is unaffected either way: the engine
+      // starts a fresh turn anchored on the injection, which finds this
+      // exchange.
+      if (previousCurrent && boundaryTakesTheTurn(event.type, previousCurrent)) {
         handOverTheTurn(state, previousCurrent, current, touched);
       }
       // For a chat in-process divider, the post-answer continuation carries the
@@ -2071,7 +2165,13 @@ function foldEvent(
       if (event.type === 'ToolCalled' && event._eventId) {
         chatToolCallOwners.set(event._eventId, owner);
       }
-    } else if (current) {
+    } else {
+      // Nowhere to put the step, which on a PAGED thread means the boundary
+      // that opens this turn is older than the page. Hold it in a fragment
+      // rather than dropping it. See `Exchange.continuationFragment`.
+      const target = current ?? openContinuationFragment(state, seq, event, touched);
+      if (!target) return;
+      current = target;
       appendStep(current, seq, event);
       touched?.add(current);
       if (event.type === 'CodingAgentToolCalled') {
@@ -2085,6 +2185,27 @@ function foldEvent(
   };
   step();
   state.current = current;
+}
+
+/** Open a continuation fragment to hold a step whose turn starts off the page.
+ *
+ *  `null` on a thread served whole, where a step with no boundary behind it is
+ *  the corruption the transcript already reports. The one signal separating the
+ *  two is `GroupFoldState.paged`.
+ *
+ *  Its `userEvent` is the step itself. Nothing loaded names the turn, and a key
+ *  the render can hold still across a re-fold has to come from somewhere real. */
+function openContinuationFragment(
+  state: GroupFoldState,
+  seq: number,
+  event: StoredEvent,
+  touched: Set<Exchange> | null,
+): Exchange | null {
+  if (!state.paged) return null;
+  const fragment: Exchange = { userEvent: event, userSeq: seq, steps: [], continuationFragment: true };
+  state.exchanges.push(fragment);
+  touched?.add(fragment);
+  return fragment;
 }
 
 export interface HandleEventResult {

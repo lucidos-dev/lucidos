@@ -703,6 +703,30 @@ export async function setVoiceEnabled(page: Page, on: boolean): Promise<void> {
   expect(res.ok()).toBeTruthy();
 }
 
+/** The composer row's ⋯ trigger, present only while something is folded. */
+export const COMPOSER_FOLD_TRIGGER = '.prompt-actions-row .prompt-actions-more:visible';
+
+/** A composer control, wherever the row's fold has put it.
+ *
+ *  The prompt row folds its middle into a ⋯ menu when it runs short of room.
+ *  Both renderings carry the same `data-role` and the same `extraClass`, so one
+ *  selector finds the control either way. What differs is that the menu has to
+ *  be open first, which is what this does.
+ *
+ *  A toggle reports its state differently on each side: the row button says
+ *  `aria-pressed`, the menu row says `aria-checked`. Ask the one you were
+ *  handed rather than assuming which it is. */
+export async function composerControl(page: Page, selector: string): Promise<Locator> {
+  const inRow = page.locator(`.prompt-actions-row ${selector}:visible`).first();
+  if (await inRow.count() > 0) return inRow;
+  const more = page.locator(COMPOSER_FOLD_TRIGGER).first();
+  if (await more.count() === 0) {
+    throw new Error(`no ${selector} in the composer row, and no ⋯ trigger to look behind`);
+  }
+  await more.click();
+  return page.locator(`.thread-overflow-menu ${selector}`).first();
+}
+
 export async function assertHealthy(page: Page): Promise<void> {
   const response = await page.request.get('/api/v1/health');
   expect(response.ok()).toBeTruthy();

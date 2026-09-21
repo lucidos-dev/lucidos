@@ -38,12 +38,6 @@ test.describe('Thread overflow menu alignment', () => {
         const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const trigger = [...document.querySelectorAll('.thread-drawer button[aria-label="More thread actions"]')].find(visible);
-      if (trigger) {
-        const rect = trigger.getBoundingClientRect();
-        (trigger as HTMLElement).click();
-        return { mode: 'end' as const, edge: rect.right };
-      }
       // On screen, not merely laid out. An off-screen pane's row has a negative
       // left, and the position clamp pins the panel to the viewport margin
       // rather than to that row. The comparison below would then fail on
@@ -52,7 +46,23 @@ test.describe('Thread overflow menu alignment', () => {
         const r = el.getBoundingClientRect();
         return visible(el) && r.left >= 0 && r.right <= window.innerWidth;
       };
-      const row = [...document.querySelectorAll('.thread-drawer .thread-row')].find(onScreen);
+      const findTrigger = () =>
+        [...document.querySelectorAll('.thread-drawer button[aria-label="More thread actions"]')].find(visible);
+      const findRow = () => [...document.querySelectorAll('.thread-drawer .thread-row')].find(onScreen);
+      // WAIT for one of them. The drawer's rows land a beat after it opens, and
+      // a loaded WebKit stretches that beat past a single look. An empty drawer
+      // then read as a layout with no way into the menu. Looking costs nothing:
+      // a look that finds neither opens neither.
+      for (let i = 0; i < 100 && !findTrigger() && !findRow(); i++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const trigger = findTrigger();
+      if (trigger) {
+        const rect = trigger.getBoundingClientRect();
+        (trigger as HTMLElement).click();
+        return { mode: 'end' as const, edge: rect.right };
+      }
+      const row = findRow();
       if (!row) return null;
       const box = row.getBoundingClientRect();
       const at = (type: string) => row.dispatchEvent(new PointerEvent(type, {

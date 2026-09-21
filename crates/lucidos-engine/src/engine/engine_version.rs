@@ -114,8 +114,12 @@ const BUILD_FAILURE_SUMMARY_CAP: usize = 200;
 ///
 /// Pure, so every recognizer is testable without running a build.
 ///
-/// `None` when the output carries no error at all. Cargo always prints one for
-/// a real failure, so nothing found means the output was never captured. The
+/// Three recognizers, tried most specific first: a build-script panic, a cargo
+/// error line, then the wrapper script's own `ERROR:` for a build that died
+/// before cargo ran. See [`script_error`] for why the last one exists.
+///
+/// `None` when the output carries no error at all. One of the three prints for
+/// any real failure, so nothing found means the output was never captured. The
 /// caller must then say the cause is unknown rather than invent one.
 pub fn classify_build_failure(
     output: &str,
@@ -135,7 +139,9 @@ pub fn classify_build_failure(
         .map(str::trim)
         .filter(|l| !l.is_empty());
 
-    let summary = panic_message.or(error_line)?;
+    let summary = panic_message
+        .or(error_line)
+        .or_else(|| script_error(output))?;
     let summary = summary
         .get(..summary.floor_char_boundary(BUILD_FAILURE_SUMMARY_CAP))
         .unwrap_or(summary)
@@ -159,6 +165,30 @@ pub fn classify_build_failure(
         remedy,
         summary,
     })
+}
+
+/// The wrapper script's own refusal, for a build that died before cargo ran.
+///
+/// `web-dev.sh --engine-build` is a shell script and can fail on its own terms.
+/// A missing tool, a Docker daemon that is down, a preflight that refuses. Each
+/// prints `ERROR:` at line start, the convention every `scripts/lib/*.sh` uses,
+/// and none is a cargo diagnostic. The two recognizers above therefore found
+/// nothing, and the toast said "the engine could not read the build output".
+/// That message is false: the output was captured and named its cause.
+///
+/// RANKED LAST, after the panic and the cargo error, and that ordering is the
+/// point. A compile failure is the more specific cause whenever both appear.
+///
+/// Returns the text AFTER the marker. `ERROR:` is how the script shouts, not
+/// part of what it says, and the toast already frames the line as a failure. A
+/// blank remainder is no answer, so it falls through to the next `ERROR:` line.
+fn script_error(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("ERROR:"))
+        .map(str::trim)
+        .find(|l| !l.is_empty())
 }
 
 /// `cargo clean` for a build script that failed on a path which is not there.
@@ -355,8 +385,9 @@ pub struct CommitGroup {
 
 /// The commits a *Switch to new version* would bring: every non-merge commit
 /// between the running engine's commit and HEAD, grouped by what it is.
-/// Surfaced on `version_status` so the status toast behind the spinning brand
-/// badge can say what is being built instead of repeating its own tooltip.
+/// Surfaced on `version_status`, and read by two client surfaces: the status
+/// toast behind the spinning brand badge, which says what is being BUILT, and
+/// the new-version confirm, which says what the switch would BRING.
 ///
 /// **Merges are excluded** ([`LucidosEngine::read_pending_commits`] passes
 /// `--no-merges`). An Apply lands as a merge whose subject is the branch name,
@@ -490,8 +521,9 @@ pub struct VersionStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_elapsed_ms: Option<u64>,
     /// The commits between the running engine's commit and HEAD, or absent when
-    /// git could not say (see [`PendingCommits`]). Only read when a build is in
-    /// flight or the source is behind HEAD, so an idle workspace forks no git.
+    /// git could not say (see [`PendingCommits`]). Read only when a surface
+    /// will show it, so an idle workspace forks no git: see
+    /// [`wants_pending_commits`] for the four reasons.
     ///
     /// Absent is UNKNOWN, never "none pending": a `Some` with `total: 0` is the
     /// only way to say there is nothing to bring.
@@ -904,14 +936,16 @@ impl LucidosEngine {
         let shared_build_in_progress =
             !crate::runtime::is_packaged() && shared_engine_build_lock_held();
         let build_state = self.build_state();
-        // Only look up what a switch would bring when there is something to
-        // bring, so an at-rest workspace forks no `git log` per poll per client.
-        let pending_commits =
-            if build_state.elapsed().is_some() || shared_build_in_progress || source_behind_head {
-                self.pending_commits().await
-            } else {
-                None
-            };
+        let pending_commits = if wants_pending_commits(
+            build_state.elapsed().is_some(),
+            shared_build_in_progress,
+            source_behind_head,
+            update_available,
+        ) {
+            self.pending_commits().await
+        } else {
+            None
+        };
         // The HEAD rides the SAME gate, for the same reason. It only ever
         // answers "which pending version is this?", so a workspace with nothing
         // pending has no question to answer.
@@ -1393,6 +1427,30 @@ fn build_id_commit(id: &str) -> Option<&str> {
     (!commit.is_empty()).then_some(commit)
 }
 
+/// Is anyone going to read the pending range this poll? Pure, so the four
+/// reasons are one expression rather than a condition inlined in
+/// [`LucidosEngine::version_status`].
+///
+/// The range is read only when something will show it, since an at-rest
+/// workspace would otherwise fork a `git log` per poll per connected client.
+/// Each term names a surface that describes the range:
+///
+/// - `build_running`: this engine's own rebuild, narrated by the status toast.
+/// - `shared_building`: a co-located peer's, which advances the same binary.
+/// - `source_behind`: new code with nothing built behind it, the pending toast.
+/// - `update_available`: a built version waiting to be switched onto. This is
+///   the one the *new version* confirm reads, and it is not implied by any of
+///   the others: a finished rebuild leaves nothing building, and a binary can
+///   differ from the running one without the source being behind HEAD.
+fn wants_pending_commits(
+    build_running: bool,
+    shared_building: bool,
+    source_behind: bool,
+    update_available: bool,
+) -> bool {
+    build_running || shared_building || source_behind || update_available
+}
+
 /// Classify a `git log --no-merges --format=%s <range>` run into the grouped
 /// commit list the status toast shows, keeping "git could not answer" apart
 /// from "git answered none".
@@ -1741,7 +1799,7 @@ mod tests {
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
         disk_upgrade_verdict, engine_build_lock_path, lock_held_at, open_teardown,
         parse_pending_commits, rebuild_is_wedged, self_heal_is_wedged, stash_first_restart_actor,
-        try_lock_file, BuildProcessGroupGuard, BuildState, CommitGroupKind,
+        try_lock_file, wants_pending_commits, BuildProcessGroupGuard, BuildState, CommitGroupKind,
         BUILD_FAILURE_SUMMARY_CAP, COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
     };
     use crate::engine::thread_events::MessageOrigin;
@@ -1875,6 +1933,90 @@ Caused by:
         let long = format!("error: {}", "\u{e9}".repeat(400));
         let f = classify_build_failure(&long, None).expect("must classify");
         assert!(f.summary.len() <= BUILD_FAILURE_SUMMARY_CAP);
+    }
+
+    /// The real output from the incident that produced the script recognizer: a
+    /// background rebuild that died in the port allocator, before cargo. The
+    /// workspace path is a placeholder; everything else is verbatim.
+    const PORT_ALLOCATOR_OUTPUT: &str = "\
+ports.sh: refusing to signal protected host pid 39004
+ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 5173 (pid 39004)
+       Source: lucidos.toml vite=5173 (vite=5173, vite-internal=3000).
+       Free that port or change the pin in /Users/me/workspaces/dev/lucidos.toml.
+";
+
+    #[test]
+    fn a_build_that_died_before_cargo_still_names_its_cause() {
+        // The class this recognizer exists for. The output WAS captured, and
+        // its first error line said what went wrong. No cargo diagnostic
+        // appeared, so the toast reported the cause as unreadable.
+        let f = classify_build_failure(PORT_ALLOCATOR_OUTPUT, None)
+            .expect("a script refusal must classify");
+        assert!(
+            f.summary.starts_with("pinned port for workspace"),
+            "the marker is how the script shouts, not part of the cause: {}",
+            f.summary
+        );
+        assert_eq!(f.remedy, None);
+        assert!(
+            !f.repeatable,
+            "no remedy recognized, so Retry stays offered"
+        );
+    }
+
+    #[test]
+    fn a_repeated_script_refusal_still_keeps_the_retry_button() {
+        // Same rule as every other unrecognized shape: repetition alone is not
+        // proof. Retiring Retry takes a recognized remedy AND an observed
+        // repeat, and this recognizer deliberately offers no remedy.
+        let first = classify_build_failure(PORT_ALLOCATOR_OUTPUT, None).expect("must classify");
+        let second = classify_build_failure(PORT_ALLOCATOR_OUTPUT, Some(&first.summary))
+            .expect("must classify");
+        assert!(!second.repeatable, "{second:?}");
+    }
+
+    #[test]
+    fn a_compile_error_beats_a_script_error_line() {
+        // Ordering is the point. A script that shouts on its way out while
+        // cargo has already said what is wrong must not replace the diagnosis.
+        let out = "ERROR: the build slot broker went away\n\
+                   error[E0433]: failed to resolve: use of undeclared crate `foo`\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(
+            f.summary,
+            "error[E0433]: failed to resolve: use of undeclared crate `foo`"
+        );
+    }
+
+    #[test]
+    fn a_build_script_panic_beats_a_script_error_line_too() {
+        // The panic outranks both, unchanged by this recognizer.
+        let out = format!("ERROR: something the wrapper shouted\n{STALE_BUILD_SCRIPT_OUTPUT}");
+        let f = classify_build_failure(&out, None).expect("must classify");
+        assert!(
+            f.summary.contains("Failed to create default VERSION"),
+            "{}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_bare_marker_with_nothing_after_it_is_not_a_cause() {
+        // "ERROR:" alone says nothing, and a blank summary would render as a
+        // toast with an empty cause. Fall through to the line that talks.
+        let out = "ERROR:\nERROR:   the real problem\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(f.summary, "the real problem");
+
+        // ...and with no talking line at all, the cause stays unknown.
+        assert!(classify_build_failure("ERROR:\nERROR:    \n", None).is_none());
+    }
+
+    #[test]
+    fn a_marker_mid_line_is_prose_and_is_never_claimed() {
+        // The marker is how these scripts shout, at line start. A sentence
+        // mentioning one is not a diagnosis.
+        assert!(classify_build_failure("the build hit an ERROR: somewhere\n", None).is_none());
     }
 
     #[test]
@@ -2577,6 +2719,22 @@ Caused by:
         let none = parse_pending_commits("");
         assert_eq!(none.total, 0);
         assert!(none.groups.is_empty());
+    }
+
+    /// A ready version is its own reason to read the range. The confirm behind
+    /// *Switch to new version* lists what the switch brings, and that state
+    /// implies none of the other three: the build has finished, no peer is
+    /// building, and a binary can differ from the running one while the source
+    /// is level with HEAD.
+    #[test]
+    fn a_switch_on_offer_wants_the_range_on_its_own() {
+        assert!(wants_pending_commits(false, false, false, true));
+        // ...and an at-rest workspace still forks no git.
+        assert!(!wants_pending_commits(false, false, false, false));
+        // The three pre-existing reasons are unchanged.
+        assert!(wants_pending_commits(true, false, false, false));
+        assert!(wants_pending_commits(false, true, false, false));
+        assert!(wants_pending_commits(false, false, true, false));
     }
 
     /// The distinction the whole field rests on: git saying "no commits" is

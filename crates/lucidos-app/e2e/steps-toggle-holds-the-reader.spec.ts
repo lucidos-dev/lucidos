@@ -238,20 +238,35 @@ async function pressStepsOn(page: Page, seq: string, expected: 'true' | 'false')
   await pressControlOn(page, seq, 'toggle-steps', expected);
 }
 
+/** How far off the end the reader may sit and still count as ON it. Whole
+ *  pixels read off a fractional layout, so an exact zero is not on offer. */
+const LIVE_EDGE_GAP_PX = 2;
+
 /** Take the reader to the END of the thread.
  *
  *  A direct `scrollTop` write, which is not a reader GESTURE, so a standing
  *  follow survives it where one is armed. Two of its three callers press from
  *  the end with the seeded arm intact. The third runs disarmed, which is the
- *  state the clamp round trip was reported from. */
+ *  state the clamp round trip was reported from.
+ *
+ *  It re-parks until the edge stops moving. One write is not enough: the last
+ *  turn is still laying out, so `scrollHeight` grows after it and the edge
+ *  walks away again. On a loaded host that left the reader a screen short, and
+ *  the callers below read that as a precondition they never asked for. */
 async function parkAtLiveEdge(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
-      .find(c => c.getBoundingClientRect().height > 0);
-    if (!el) throw new Error('no visible .thread-content');
-    el.scrollTop = el.scrollHeight - el.clientHeight;
-  });
-  await waitForScrollSettled(page);
+  await expect.poll(async () => {
+    await page.evaluate(() => {
+      const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
+        .find(c => c.getBoundingClientRect().height > 0);
+      if (!el) throw new Error('no visible .thread-content');
+      el.scrollTop = el.scrollHeight - el.clientHeight;
+    });
+    await waitForScrollSettled(page);
+    return (await edgeState(page)).gap;
+  }, {
+    message: 'the transcript must settle on its live edge',
+    timeout: 15_000,
+  }).toBeLessThanOrEqual(LIVE_EDGE_GAP_PX);
 }
 
 /** Put `role` into the state the measured press moves OUT of, through STORAGE
@@ -432,7 +447,7 @@ test.describe('the step-log control holds what the reader pressed', () => {
         await parkAtLiveEdge(page);
 
         const edgeBefore = await edgeState(page);
-        expect(edgeBefore.gap, 'the reader must start on the end of the thread').toBeLessThanOrEqual(2);
+        expect(edgeBefore.gap, 'the reader must start on the end of the thread').toBeLessThanOrEqual(LIVE_EDGE_GAP_PX);
         const before = await geometry(page, seq, c.role);
         // A press the reader could not have made proves nothing about a press.
         expect(
@@ -490,7 +505,7 @@ test.describe('the step-log control holds what the reader pressed', () => {
       expect(
         (await edgeState(page)).gap,
         'the reader must start on the end of the thread',
-      ).toBeLessThanOrEqual(2);
+      ).toBeLessThanOrEqual(LIVE_EDGE_GAP_PX);
 
       const beforeHide = await geometry(page, seq);
       expect(

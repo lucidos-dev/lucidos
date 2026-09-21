@@ -30,6 +30,7 @@ import {
 } from '../../store/actions/models';
 import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
+import { ResponseStylesSection } from './ResponseStylesSection';
 import { ModelsManager } from './ModelsManager';
 import { VoiceSection } from './VoiceSection';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
@@ -39,6 +40,8 @@ import { XaiProviderSettings } from './XaiProviderSettings';
 import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
 import { ProviderBlock } from './ProviderBlock';
 import { LocalProviderSettings } from './LocalProviderSettings';
+import { TypeSafeJudgmentSettings } from './TypeSafeJudgmentSettings';
+import { JudgmentModelRow } from './JudgmentModelRow';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
@@ -1010,20 +1013,15 @@ export function SettingsView() {
             onChange={(c) => void setCommandGuardJudge(c)}
           />
         </div>
-        <ModelSelectionRow
+        {/* TypeSafe (Jev) is a row in this picker, not a switch beside it: a
+            backend is picked where the model is. */}
+        <JudgmentModelRow
+          site="command-guard"
           label="Judge model"
           anchor="command-safety:judge-model"
           nested
           models={backgroundModelChoices()}
-          vocabulary={LUCIDOS_TIER_VOCABULARY}
-          model={currentBackgroundModel('model_command_judge')}
-          effort={currentBackgroundReasoning('reasoning_command_judge')}
           disabled={!guardOn || !judgeOn}
-          onChange={(p) => void saveModelSelection(
-            'model_command_judge',
-            'reasoning_command_judge',
-            p,
-          )}
         />
       </div>
     );
@@ -1185,6 +1183,7 @@ export function SettingsView() {
             {estimateTurnDuration(maxToolCalls)} of work.
           </div>
         </div>
+        <ResponseStylesSection />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:image-generation">Image generation</div>
           {/* One row per model, no tier beside it: an image model has no tiers,
@@ -1231,6 +1230,16 @@ export function SettingsView() {
             effort={currentBackgroundReasoning('reasoning_memory')}
             onChange={(p) => void saveModelSelection('model_memory', 'reasoning_memory', p)}
           />
+          {/* Under the memory model, because it inherits it while unset, and
+              because this is the call deciding whether memory is retrieved at
+              all. TypeSafe (Jev) is one of its model rows. */}
+          <JudgmentModelRow
+            site="query-classification"
+            label="Query classification"
+            anchor="models:query-classification"
+            nested
+            models={backgroundModelChoices()}
+          />
           <ModelSelectionRow
             label="Conversation summary"
             anchor="models:conversation-summary"
@@ -1255,6 +1264,7 @@ export function SettingsView() {
           <XaiProviderSettings />
           <OpenCodeFreeSettings />
           <LocalProviderSettings />
+          <TypeSafeJudgmentSettings />
         </div>
         <ModelsManager />
       </>

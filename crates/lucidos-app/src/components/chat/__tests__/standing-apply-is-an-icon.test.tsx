@@ -148,8 +148,11 @@ describe('the prompt row draws the standing apply as an icon', () => {
 
   // useFitsInOneRow sums every [data-row-item]; a control missing the
   // attribute lets the row overflow instead of lifting its liftable slot.
-  it('is measured by the row-overflow hook', () => {
-    expect(control().hasAttribute('data-row-item')).toBe(true);
+  /** The composer stamps the measurement marker, because it also names WHICH
+   *  member this is. A hardcoded one here would win over that name and hide the
+   *  member from the fold. */
+  it('takes the row marker from the composer rather than hardcoding it', () => {
+    expect(control().hasAttribute('data-row-item')).toBe(false);
   });
 });
 

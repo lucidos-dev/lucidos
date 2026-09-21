@@ -38,6 +38,7 @@
 import { useRef } from 'preact/hooks';
 import { CallIcon } from '../shared/icons';
 import { MicrophonePicker } from './MicrophonePicker';
+import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuOpener } from '../shared/OverflowMenu';
 import { useLongPress } from '../../hooks/useLongPress';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -93,7 +94,7 @@ const CONNECT_DWELL_MS = 2_000;
  */
 const WAITING_TOOLTIP = 'Waiting for microphone access';
 
-export function CallToggle({ available = true }: { available?: boolean }) {
+export function CallToggle({ available = true, attrs }: { available?: boolean; attrs?: Record<string, string> }) {
   // Subscribe to the preference signal.
   preferences.value;
   const call = voiceCall.value;
@@ -128,11 +129,11 @@ export function CallToggle({ available = true }: { available?: boolean }) {
   return (
     <>
       <button
+        {...attrs}
         class={`icon-btn header-icon${on ? ' active' : ''}`}
         data-role="call-toggle"
         data-call-phase={phase}
         data-call-wait={waiting ? 'microphone' : undefined}
-        data-row-item
         aria-pressed={on}
         aria-disabled={dead}
         aria-label={PRESS_NAME[phase]}
@@ -156,4 +157,34 @@ export function CallToggle({ available = true }: { available?: boolean }) {
       <MicrophonePicker openRef={openRef} />
     </>
   );
+}
+
+/** The call toggle as a foldable member, or `null` when it would draw nothing.
+ *
+ *  The factory lives here rather than in the composer because deciding whether
+ *  the control exists reads the call. Nothing in the composer may
+ *  (`__tests__/composer-live-during-a-call.test.ts`), and this file already
+ *  owns that state.
+ *
+ *  It folds LAST with the follow toggle, so its slot holds at every width that
+ *  can show it. A hang-up one tap deeper is the price of a row that fits. The
+ *  row is never too narrow to hold the ⋯ the hang-up moved into. */
+export function callToggleAction(available: boolean): HeaderActionSpec | null {
+  preferences.value;
+  const call = voiceCall.value;
+  const on = isOnCall(call.phase);
+  if ((!voiceEnabled() || !available) && !on) return null;
+  return {
+    key: 'call-toggle',
+    dataRole: 'call-toggle',
+    label: PRESS_NAME[call.phase],
+    tooltip: TOOLTIP[call.phase],
+    icon: () => <CallIcon />,
+    // The on-call state, which the row paints and a menu row cannot. Folded,
+    // `aria-checked` is the only channel left saying a call is up, and that is
+    // exactly when the hang-up is one tap deeper.
+    active: on,
+    render: (attrs) => <CallToggle available={available} attrs={attrs} />,
+    onClick: () => pressCallToggle(),
+  };
 }

@@ -28,7 +28,10 @@ let installed = false;
  *  needed streaming repaint resumes within a throttle tick once motion settles. */
 export const USER_SCROLL_WINDOW_MS = 1200;
 
-function nowMs(): number {
+/** Monotonic milliseconds, falling back where `performance` is absent (the
+ *  minimal unit-test environment). Every scroll-timing window in the app reads
+ *  its clock here, so two of them cannot disagree about what "now" is. */
+export function nowMs(): number {
   return typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? performance.now()
     : Date.now();

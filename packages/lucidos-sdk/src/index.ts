@@ -12,15 +12,19 @@ import { utils } from './utils';
 import { capture } from './capture';
 import { proxy } from './proxy';
 import { oauth } from './oauth';
+import { request } from './request';
 
 export const lucidos = {
   configure,
-  // Public because an app has no other correct way to reach an engine endpoint
-  // no SDK method wraps: an app iframe carries no `<base href>`, so a relative
-  // URL resolves under `/<slug>/app/<id>/` and a root-absolute `/api/v1/…` reads
-  // its first segment as a workspace name. Both 404. See
-  // `system-knowhow/js-sdk.md` § lucidos.apiUrl.
+  // Public because an app builds a `src` or an `href` onto the engine with it:
+  // an app iframe carries no `<base href>`, so a relative URL resolves under
+  // `/<slug>/app/<id>/` and a root-absolute `/api/v1/…` reads its first segment
+  // as a workspace name. Both 404. A `fetch` of what it returns is refused from
+  // a frame; `lucidos.request` is the call. See `system-knowhow/js-sdk.md`.
   apiUrl,
+  // The escape hatch for an endpoint no namespace covers (ADR 0231). Bridged,
+  // and refused for a route the engine does not open to apps.
+  request,
   data,
   events,
   triggers,
@@ -38,6 +42,14 @@ export const lucidos = {
 
 export { SdkError };
 export type * from './types';
+
+// The engine's answer for which routes an app may reach, and the matcher over
+// it. Runtime values rather than an internal, because the host bridge enforces
+// the SAME table this SDK checks, from this one copy. `parseAppId` travels
+// with them, so the host names an app frame's app the way the frame does.
+export { appMayCall, appReachableMethods, normalizeSuffix, pathMatchesPattern } from './appReach';
+export { APP_REACHABLE_ROUTES } from './generated/app-reach';
+export { parseAppId } from './scroll';
 
 // Generated navigation contract (source of truth: the engine `navigate_ui`
 // tool). Exposed as runtime values so the host app can cross-check them against

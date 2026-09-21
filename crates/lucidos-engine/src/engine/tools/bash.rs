@@ -378,7 +378,13 @@ impl LucidosEngine {
             ));
         }
 
-        Ok(response)
+        // Last thing before the result leaves: the caller persists it into the
+        // `ToolResult` event verbatim, and every secret in it came from the
+        // env we just injected. See `core::injected_secret_values`.
+        Ok(crate::core::redact_secret_values(
+            &response,
+            &crate::core::injected_secret_values(&env_vars),
+        ))
     }
 
     /// `run_bash_background(command, timeout_secs?)` — spawn a long-running
@@ -912,6 +918,38 @@ fn format_bash_wake_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file with its test module cut off, through the shared reader.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/tools/bash.rs"),
+        )
+    }
+
+    /// The result leaves through the redaction, not around it.
+    ///
+    /// Every credential and OAuth token sits in this child's environment. The
+    /// string returned here is persisted verbatim in `ToolResult` and read
+    /// back by the agent. The composition is covered in `core::mod_tests`; this
+    /// is the wiring, which a helper test cannot see.
+    #[test]
+    fn the_bash_tool_result_leaves_through_the_secret_redaction() {
+        let src = production_src();
+        let at = src
+            .find("pub(crate) async fn execute_bash_tool")
+            .expect("execute_bash_tool is still here");
+        let end = src[at..]
+            .find("\n    /// `run_bash_background(")
+            .expect("execute_bash_tool is still followed by the background tool");
+        let body = &src[at..at + end];
+        assert!(
+            body.contains("redact_secret_values(")
+                && body.contains("injected_secret_values(&env_vars)"),
+            "execute_bash_tool must return through `core::redact_secret_values` \
+             over `core::injected_secret_values(&env_vars)`. A verbose curl or an \
+             `env` dump otherwise writes a credential into the events table."
+        );
+    }
 
     /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,
     /// so these exercise the real fd topology rather than a simplified one.

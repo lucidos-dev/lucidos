@@ -8,11 +8,14 @@ import { Overlay } from './Overlay';
 import {
   fractionForScale, scaleAfterKey, scaleAtPointer, type TrackMetrics,
 } from './scaleSlider';
+import { createWheelZoom } from './scaleWheel';
+import { nowMs } from '../../utils/scrollActivity';
 import {
   scaleModalOpen,
   previewScale,
   closeScaleModal,
   adjustUiScale,
+  renewScaleModalLinger,
   previewSliderValue,
   commitSliderValue,
 } from './scaleModalState';
@@ -24,14 +27,25 @@ export function ScaleModal() {
   /** The pointer that owns the drag, and the row it was measured against. */
   const drag = useRef<{ pointerId: number; track: TrackMetrics } | null>(null);
 
+  // Ctrl/meta wheel zooms the UI instead of the page. `createWheelZoom` owns
+  // the rest: it banks DISTANCE, so a trackpad pinch stops being one step per
+  // event, and it spends at most one step per frame.
   useEffect(() => {
+    const zoom = createWheelZoom(dir => adjustUiScale(dir * UI_SCALE_STEP));
     function handleWheel(e: WheelEvent) {
       if (!(e.metaKey || e.ctrlKey)) return;
       e.preventDefault();
-      adjustUiScale(e.deltaY < 0 ? UI_SCALE_STEP : -UI_SCALE_STEP);
+      // The gesture is the user working the control, whether or not it has
+      // travelled a whole notch yet. `adjustUiScale` renews the countdown, and
+      // a slow pinch may not reach it for several frames.
+      renewScaleModalLinger();
+      zoom.push(e.deltaY, e.deltaMode, nowMs());
     }
     document.addEventListener('wheel', handleWheel, { passive: false });
-    return () => document.removeEventListener('wheel', handleWheel);
+    return () => {
+      document.removeEventListener('wheel', handleWheel);
+      zoom.stop();
+    };
   }, []);
 
   if (!isOpen) return null;

@@ -11,7 +11,7 @@ import { viewportIsMobile } from '../../utils/viewport';
 import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
 
 /** The CSS custom property this banner publishes its measured height into. Its
- *  own, not either neighbour's: all three bars can be up at once, and
+ *  own, not any neighbour's: every bar can be up at once, and
  *  `--app-header-bottom` sums them (see `useBannerHeightVar`). */
 export const INGRESS_BANNER_HEIGHT_VAR = '--app-ingress-banner-height';
 

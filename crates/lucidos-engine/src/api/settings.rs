@@ -586,6 +586,24 @@ pub(super) async fn list_models(
     Ok(Json(ModelsListResponse { models }))
 }
 
+/// GET /api/v1/response-styles: the merged *style library*.
+///
+/// Shipped styles first, then whatever the user added, each row saying whether
+/// it is shipped, overridden or their own. That is what decides whether the
+/// editor offers Reset or Delete.
+///
+/// A read-only route on purpose: the library is written by `PUT /preferences`
+/// on `response_styles`, where the one write chokepoint bounds-checks it. This
+/// exists so the shipped instructions have a single home in Rust. Mirrored into
+/// TypeScript, they would drift the first time either side was reworded.
+pub(super) async fn list_response_styles(
+    State(state): State<AppState>,
+) -> Json<ResponseStylesListResponse> {
+    Json(ResponseStylesListResponse {
+        styles: crate::core::response_style::library(&state.pool).await,
+    })
+}
+
 /// POST /api/v1/models — add a user model.
 pub(super) async fn create_model(
     State(state): State<AppState>,
@@ -1833,6 +1851,12 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_model)
                 .delete(delete_model),
         )
+        // The merged *style library* (Settings → Models → Response style).
+        // Read-only: the library is written through `/preferences`, so the one
+        // write chokepoint bounds-checks it. This route exists so the shipped
+        // instructions have a single home, in Rust rather than mirrored here
+        // and in the client.
+        .route("/response-styles", get(list_response_styles))
         // OAuth account endpoints
         .route(
             "/oauth/accounts",

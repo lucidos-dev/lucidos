@@ -6,6 +6,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::core::webhook_ingress::{AddressProbe, Family, FamilyVerdict};
+use crate::core::webhook_refusal::{RefusalCause, Resolution};
 use crate::core::AuthType;
 use crate::engine::thread_events::MessageOrigin;
 use crate::scheduler::notifications::Tap;
@@ -364,6 +365,16 @@ pub enum SystemEvent {
         /// reports a healthy build.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_error: Option<String>,
+        /// Whether the build-watch is positively known to have STOPPED.
+        ///
+        /// Read from the pidfile beside that status file, because the status
+        /// alone cannot say: it records the last COMPLETED build, so a watch
+        /// that died leaves a healthy one behind. True means nothing will
+        /// republish until the stack is relaunched, which is the one case the
+        /// message must not describe as recoverable. False also covers "could
+        /// not tell", so this never over-claims.
+        #[serde(default)]
+        build_watch_stopped: bool,
         sent_at_ms: i64,
     },
     /// A dev engine advanced its boot-pinned served-frontend snapshot to the
@@ -908,6 +919,55 @@ pub enum SystemEvent {
         /// How long it lasted, in seconds.
         down_secs: i64,
     },
+    /// A webhook is turning away the deliveries it receives.
+    ///
+    /// The verification-layer sibling of `WebhookIngressDegraded`. That one
+    /// says a sender cannot reach the workspace. This one says a sender
+    /// reached it and had its delivery thrown away, which the ingress probe
+    /// cannot see: a 401 is the healthy answer there.
+    ///
+    /// Edge-triggered off the hook's own *refusal run*, so a standing fault
+    /// emits nothing per cycle. No actor, because the engine drove it.
+    WebhookDeliveriesRefused {
+        webhook_id: String,
+        webhook_name: String,
+        /// Whether the hook is switched on. The user's one-click recovery for
+        /// the `disabled` cause is to turn it back on, so it is here.
+        enabled: bool,
+        /// What is turning them away. `disabled` and `verification` want
+        /// different words and different actions.
+        cause: RefusalCause,
+        /// How many deliveries have been turned away since the last one
+        /// verified.
+        refusals: i64,
+        /// The run's breakdown by reason, keyed by `DeliveryRefusal::key`.
+        ///
+        /// The whole evidence rather than the last line of it. A single
+        /// diagnostic probe adds one to its own reason and erases nothing.
+        reasons: std::collections::BTreeMap<String, i64>,
+        /// When the run started, RFC 3339.
+        refusing_since: String,
+        /// How long it has been going, in seconds. Measured by Postgres beside
+        /// `refusing_since` (ADR 0053), never by the engine's own clock.
+        refusing_secs: i64,
+    },
+    /// A webhook stopped turning away the deliveries it receives.
+    ///
+    /// `resolution` says which way out it took. Every way a hook can leave the
+    /// refusing state has one, so a declaration cannot strand.
+    WebhookDeliveriesRecovered {
+        webhook_id: String,
+        webhook_name: String,
+        /// What had been declared, so a reader can pair the two events.
+        cause: RefusalCause,
+        resolution: Resolution,
+        /// When the run that was declared started, RFC 3339.
+        refusing_since: String,
+        /// How long the WHOLE run lasted, in seconds, not the part since it was
+        /// declared. Nothing is declared before the 30-minute floor, so the
+        /// declaring event's own age understates every outage.
+        refusing_secs: i64,
+    },
     /// An MCP server was registered, or an existing one re-registered with a
     /// new command / args / env. The `mcp_servers` table drives which external
     /// tools the agent can call, so a registration changes the agent's own tool
@@ -1374,6 +1434,8 @@ impl SystemEvent {
         "WebhookDeleted",
         "WebhookIngressDegraded",
         "WebhookIngressRecovered",
+        "WebhookDeliveriesRefused",
+        "WebhookDeliveriesRecovered",
         "McpServerRegistered",
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
@@ -1513,6 +1575,8 @@ impl SystemEvent {
             Self::WebhookDeleted { .. } => "WebhookDeleted",
             Self::WebhookIngressDegraded { .. } => "WebhookIngressDegraded",
             Self::WebhookIngressRecovered { .. } => "WebhookIngressRecovered",
+            Self::WebhookDeliveriesRefused { .. } => "WebhookDeliveriesRefused",
+            Self::WebhookDeliveriesRecovered { .. } => "WebhookDeliveriesRecovered",
             Self::McpServerRegistered { .. } => "McpServerRegistered",
             Self::McpServerUpdated { .. } => "McpServerUpdated",
             Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
@@ -1649,6 +1713,8 @@ impl SystemEvent {
         "WebhookDeleted",
         "WebhookIngressDegraded",
         "WebhookIngressRecovered",
+        "WebhookDeliveriesRefused",
+        "WebhookDeliveriesRecovered",
         "McpServerRegistered",
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
@@ -1763,7 +1829,9 @@ impl SystemEvent {
             | Self::WebhookUpdated { .. }
             | Self::WebhookDeleted { .. }
             | Self::WebhookIngressDegraded { .. }
-            | Self::WebhookIngressRecovered { .. } => "webhook",
+            | Self::WebhookIngressRecovered { .. }
+            | Self::WebhookDeliveriesRefused { .. }
+            | Self::WebhookDeliveriesRecovered { .. } => "webhook",
             Self::McpServerRegistered { .. }
             | Self::McpServerUpdated { .. }
             | Self::McpServerDisabledToolsChanged { .. }
@@ -1889,7 +1957,9 @@ impl SystemEvent {
             | Self::WebhookUpdated { webhook_id, .. }
             | Self::WebhookDeleted { webhook_id, .. }
             | Self::WebhookIngressDegraded { webhook_id, .. }
-            | Self::WebhookIngressRecovered { webhook_id, .. } => webhook_id.clone(),
+            | Self::WebhookIngressRecovered { webhook_id, .. }
+            | Self::WebhookDeliveriesRefused { webhook_id, .. }
+            | Self::WebhookDeliveriesRecovered { webhook_id, .. } => webhook_id.clone(),
             Self::McpServerRegistered { server_id, .. }
             | Self::McpServerUpdated { server_id, .. }
             | Self::McpServerDisabledToolsChanged { server_id, .. }

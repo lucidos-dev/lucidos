@@ -9,6 +9,13 @@
     color: var(--accent-red);
 }
 
+/* This hook's own standing refusal, on the one row it belongs to. Deliveries
+   are being lost while it is drawn, not merely at risk, so it takes the same
+   red as the outage above rather than a softer warning colour. */
+.webhook-refusal-warning {
+    color: var(--accent-red);
+}
+
 /* A signed hook naming a credential the store no longer holds. Same treatment
    as the outage above, and for the same reason: it is one line of fact on a row
    that already has fields, not a panel. The hook refuses every delivery until

@@ -69,12 +69,19 @@ describe('PromptInput refuses image attach while answering a UserQuestion', () =
     expect(beginSendIdx).toBeGreaterThan(guardIdx);
   });
 
-  it('both attach buttons (narrow + wide) bind disabled to isAnsweringQuestion', () => {
-    const attachBtns = promptSource.match(/<button[\s\S]*?aria-label="Attach image"[\s\S]*?\/?>/g) ?? [];
-    expect(attachBtns.length, 'expected narrow + wide attach buttons').toBe(2);
-    for (const tag of attachBtns) {
-      expect(tag).toMatch(/disabled=\{isAnsweringQuestion\}/);
-    }
+  it('the attach action is refused while answering, in every shape it takes', () => {
+    // It takes three. `disabledTooltip` covers the two the shared renderer
+    // draws: the narrow row button, and the ⋯ menu row it folds into. The wide
+    // row draws its own popover anchor, so that button binds `disabled` itself.
+    const spec = /foldActions\.push\(\{\n\s+key: 'attach-image'[\s\S]*?\n {2}\}\);/
+      .exec(promptSource);
+    expect(spec, 'no attach-image action in PromptInput.tsx').not.toBeNull();
+    expect(spec![0]).toMatch(
+      /disabledTooltip: isAnsweringQuestion \? ANSWER_NO_IMAGES_TOOLTIP : undefined,/,
+    );
+    const anchorBtns = promptSource.match(/<button[\s\S]*?aria-label="Attach image"[\s\S]*?\/?>/g) ?? [];
+    expect(anchorBtns.length, 'expected only the wide popover-anchor button').toBe(1);
+    expect(anchorBtns[0]).toMatch(/disabled=\{isAnsweringQuestion\}/);
   });
 
   it('attach-menu dropdown render is gated by !isAnsweringQuestion', () => {

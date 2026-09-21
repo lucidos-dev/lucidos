@@ -527,6 +527,105 @@ impl EventStore {
         .fetch_all(&self.pool)
         .await
     }
+
+    /// The NEWEST `limit` events of a thread, older than `before`.
+    ///
+    /// Rows come back oldest-first, the order every reader already expects, so
+    /// a page is prepended to what the client holds rather than reversed there.
+    ///
+    /// **The cursor is the pair, never the sequence alone.** Rows are ordered by
+    /// `(created, sequence)` because a sequence is allocated globally and can
+    /// run against the clock within one thread. Paging on `sequence` alone
+    /// would therefore skip or repeat rows at a page edge.
+    ///
+    /// **One statement, so the page and the watermark share a snapshot.** Read
+    /// separately, an event landing between the two queries would put a
+    /// sequence in `max_sequence` that no returned row carries. The client
+    /// advances its forward mark to it, and that event is then skipped by every
+    /// later delta.
+    pub async fn get_thread_events_page(
+        &self,
+        thread_id: Uuid,
+        before: Option<(DateTime<Utc>, i64)>,
+        limit: i64,
+    ) -> Result<ThreadEventPage, sqlx::Error> {
+        let (before_created, before_seq) = match before {
+            Some((created, seq)) => (Some(created), Some(seq)),
+            None => (None, None),
+        };
+        // One row beyond the page answers `has_more` without a second query,
+        // and without a count that could disagree with the page it describes.
+        let mut rows = sqlx::query_as::<_, PagedEventRow>(
+            r#"WITH page AS (
+                 SELECT sequence, event_type, payload, created, id
+                 FROM events
+                 WHERE thread_id = $1
+                   AND ($2::timestamptz IS NULL OR (created, sequence) < ($2, $3))
+                 ORDER BY created DESC, sequence DESC
+                 LIMIT $4
+               )
+               SELECT sequence, event_type, payload, created, id as event_id,
+                      (SELECT max(sequence) FROM events WHERE thread_id = $1) as max_sequence
+               FROM page
+               ORDER BY created ASC, sequence ASC"#,
+        )
+        .bind(thread_id)
+        .bind(before_created)
+        .bind(before_seq)
+        .bind(limit.saturating_add(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() as i64 > limit;
+        if has_more {
+            // The extra row is the OLDEST, because the page is ascending.
+            rows.remove(0);
+        }
+        // Every row carries the same value, and an empty page carries none.
+        // The client only reads it on a cold open, where an empty page means an
+        // empty thread and no watermark to advance.
+        let max_sequence = rows.first().and_then(|r| r.max_sequence);
+        Ok(ThreadEventPage {
+            events: rows.into_iter().map(ThreadEventRow::from).collect(),
+            has_more,
+            max_sequence,
+        })
+    }
+}
+
+/// A paged row, which carries the thread's watermark alongside itself so the
+/// two come from one statement. See `get_thread_events_page`.
+#[derive(sqlx::FromRow)]
+struct PagedEventRow {
+    sequence: i64,
+    event_type: String,
+    payload: serde_json::Value,
+    created: DateTime<Utc>,
+    event_id: Uuid,
+    max_sequence: Option<i64>,
+}
+
+impl From<PagedEventRow> for ThreadEventRow {
+    fn from(r: PagedEventRow) -> Self {
+        ThreadEventRow {
+            sequence: r.sequence,
+            event_type: r.event_type,
+            payload: r.payload,
+            created: r.created,
+            event_id: r.event_id,
+        }
+    }
+}
+
+/// One page of a thread's events, and whether older ones remain behind it.
+pub struct ThreadEventPage {
+    /// Oldest-first, as every other read path returns them.
+    pub events: Vec<ThreadEventRow>,
+    /// True when the thread holds events older than `events[0]`.
+    pub has_more: bool,
+    /// The highest `sequence` the whole thread holds, or `None` when it holds
+    /// nothing. NOT derivable from the page: see `get_thread_events_page`.
+    pub max_sequence: Option<i64>,
 }
 
 #[cfg(test)]

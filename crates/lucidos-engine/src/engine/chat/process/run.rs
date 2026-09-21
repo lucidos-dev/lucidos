@@ -1093,13 +1093,12 @@ impl LucidosEngine {
         let user_language = self.user_language.read().await.clone();
         let user_profile = self.user_profile.snapshot().await;
 
-        // The memory *model selection*, read once for the classification call
-        // below. History summarisation resolves its own
-        // (`ContextPurpose::ConversationSummary`), which is why this no longer
-        // travels into `load_chat_history`.
-        let memory_call = crate::engine::aux_purpose::AuxCall::resolve(
+        // The classification *model selection*, read once for the call below.
+        // Fact extraction and history summarisation each resolve their own, one
+        // purpose per preference, which is why neither travels from here.
+        let classification_call = crate::engine::aux_purpose::AuxCall::resolve(
             &self.pool,
-            crate::engine::ContextPurpose::Memory,
+            crate::engine::ContextPurpose::QueryClassification,
         )
         .await;
 
@@ -1182,13 +1181,19 @@ impl LucidosEngine {
             let capture = crate::engine::AuxCapture::new(
                 &self.event_bus,
                 thread_id,
-                crate::engine::ContextPurpose::Memory,
+                crate::engine::ContextPurpose::QueryClassification,
             );
             let Some(classification) = until_canceled(
                 &cancel_token,
                 classify_or_fallback(
-                    extractor.classify_query(user_message, ctx, &memory_call, Some(&capture)),
-                    memory_call.deadline(),
+                    extractor.classify_query(
+                        &self.pool,
+                        user_message,
+                        ctx,
+                        &classification_call,
+                        Some(&capture),
+                    ),
+                    classification_call.deadline(),
                 ),
             )
             .await
@@ -1254,34 +1259,51 @@ impl LucidosEngine {
             resume_tool_blocks.clear();
         }
 
-        // The thread's checklist, read once per turn. Under the mode it rides
-        // inside the working understanding at the tail, so the loop needs the
-        // snapshot it starts from. Only read when the mode is on, so an off
-        // workspace pays no query for it.
-        let todo_snapshot = if context_mode.is_on() {
-            match crate::engine::tools::todo::latest_todo_list(&self.pool, thread_id).await {
-                Ok(found) => found,
-                Err(e) => {
-                    // Not a reason to fail the turn. The list is the model's
-                    // own memo, so the honest degradation is a turn without
-                    // it: that costs a re-derivation, never correctness.
-                    log!(
-                        "[Chat] todo list read failed for thread {}: {}. This turn carries no checklist",
-                        thread_id,
-                        e
-                    );
-                    None
-                }
+        // The thread's checklist, read once per turn, on BOTH arms. Under the
+        // mode it rides inside the working understanding at the tail, so the
+        // loop needs the snapshot it starts from. With the mode off it becomes
+        // the `[TODO LIST]` block below. That block is the only thing putting
+        // the settle's own rewrites back in front of the agent.
+        //
+        // One indexed lookup, the same one the settle and the wake check
+        // already run per turn. A thread that never wrote a list finds no row
+        // and adds no bytes.
+        let todo_snapshot = match crate::engine::tools::todo::latest_todo_list(
+            &self.pool, thread_id,
+        )
+        .await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                // Not a reason to fail the turn. The list is the model's
+                // own memo, so the honest degradation is a turn without
+                // it: that costs a re-derivation, never correctness.
+                log!(
+                    "[Chat] todo list read failed for thread {}: {}. This turn carries no checklist",
+                    thread_id,
+                    e
+                );
+                None
             }
-        } else {
-            None
         };
+        // The two seeds stay gated on the mode, so an off turn hands the loop
+        // exactly what it handed it before. Every reader of these inside the
+        // loop sits behind `mode_on`, and an inert clone of up to 50 items per
+        // turn buys nothing.
         let todo_seed: Vec<crate::engine::thread_events::TodoItem> = todo_snapshot
             .as_ref()
+            .filter(|_| context_mode.is_on())
             .map(|list| list.items.clone())
             .unwrap_or_default();
-        let todo_notes_seed: Option<String> =
-            todo_snapshot.as_ref().and_then(|list| list.notes.clone());
+        let todo_notes_seed: Option<String> = todo_snapshot
+            .as_ref()
+            .filter(|_| context_mode.is_on())
+            .and_then(|list| list.notes.clone());
+
+        // The `[TODO LIST]` block. Empty under the mode, and empty on any
+        // thread with nothing unfinished: `turn_start_block` owns both gates.
+        let todo_list_block =
+            crate::engine::tools::todo::turn_start_block(context_mode, todo_snapshot.as_ref());
 
         // The working understanding, read once and rendered at the tail of
         // every round. Same degradation as the checklist: a read that fails
@@ -1455,6 +1477,7 @@ impl LucidosEngine {
             + file_context_section.len()
             + url_context_section.len()
             + loaded_knowhow_block.as_deref().map_or(0, str::len)
+            + todo_list_block.len()
             + engine_build_block.len()
             + client_url_block.len()
             + current_time_block.len()
@@ -1544,6 +1567,11 @@ impl LucidosEngine {
         if !thread_depth_context.is_empty() {
             user_message_parts.push(&thread_depth_context);
         }
+        // Empty on every thread with nothing unfinished, which is most of
+        // them, so most turns pay nothing for it.
+        if !todo_list_block.is_empty() {
+            user_message_parts.push(&todo_list_block);
+        }
         // Add stopped MCP servers context so the LLM knows they exist.
         // Initialised to empty `String` (not a conditional `let mcp_stopped_context;`)
         // so the same `&str` reference can be reused by `build_capture_sections`
@@ -1630,6 +1658,7 @@ impl LucidosEngine {
             &mcp_stopped_context,
             &setup_reminder,
             &thread_depth_context,
+            &todo_list_block,
             user_message,
             &super::turn_tail::TurnTail {
                 engine_build: &engine_build_block,

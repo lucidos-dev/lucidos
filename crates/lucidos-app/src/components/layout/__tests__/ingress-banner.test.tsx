@@ -18,6 +18,7 @@ import {
   ingressBannerBody,
   shouldRenderIngressBanner,
 } from '../IngressBanner';
+import { REFUSAL_BANNER_HEIGHT_VAR } from '../WebhookRefusalBanner';
 import { CONNECTION_BANNER_HEIGHT_VAR } from '../ConnectionBanner';
 import { BANNER_HEIGHT_VAR } from '../BackupReminderBanner';
 import { webhookIngressNotice } from '../../../utils/webhookIngressNotice';
@@ -70,12 +71,17 @@ describe('one instance renders, whichever layout is mounted', () => {
   });
 });
 
-describe('the three banners never share a height reservation', () => {
+describe('the banners never share a height reservation', () => {
   it('each publishes its own property', () => {
-    // All three can be up at once, and each measures itself. One shared
+    // Every bar can be up at once, and each measures itself. One shared
     // property would mean whichever measured last wins, and retracting any of
     // them would clear the space the others still need.
-    const vars = [INGRESS_BANNER_HEIGHT_VAR, CONNECTION_BANNER_HEIGHT_VAR, BANNER_HEIGHT_VAR];
+    const vars = [
+      INGRESS_BANNER_HEIGHT_VAR,
+      REFUSAL_BANNER_HEIGHT_VAR,
+      CONNECTION_BANNER_HEIGHT_VAR,
+      BANNER_HEIGHT_VAR,
+    ];
     expect(new Set(vars).size).toBe(vars.length);
   });
 });

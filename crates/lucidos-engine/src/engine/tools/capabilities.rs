@@ -68,6 +68,7 @@ impl LucidosEngine {
                 email_account,
                 intent: !intents.is_empty(),
                 image_provider: self.current_image_provider().await.is_some(),
+                judgment_provider: crate::llm::judgment::judgment_available(&self.pool).await,
                 context_mode,
             },
             intents,

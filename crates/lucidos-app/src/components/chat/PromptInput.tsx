@@ -1,3 +1,4 @@
+import { Fragment } from 'preact';
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
@@ -25,12 +26,16 @@ import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from '.
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
-import { PromptRowControls } from './PromptRowControls';
-import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, getStandingApplyControl, type BannerState } from './WaitingBanner';
+import { PromptRowControls, promptRowToggles } from './PromptRowControls';
+import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
+import { OverflowMenu } from '../shared/OverflowMenu';
+import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
+import { TodoPanelHost, closeTodoPanel, todoIndicatorAction } from './TodoListPanel';
+import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
+import { getBannerActions, getWaitingState, getStandaloneActions, type BannerState } from './WaitingBanner';
 import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
-import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { composeHandlers } from './promptFocus';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
@@ -52,6 +57,24 @@ import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
+/** The ⋯ trigger's row attributes. It is measured like a member, and its EMPTY
+ *  fold key is what tells the measurement it stands in for members rather than
+ *  being one. Module-level, so its identity is stable across renders. */
+const MORE_TRIGGER_ATTRS = { 'data-row-item': 'fold', [FOLD_KEY_ATTR]: '' };
+
+/** Retire every popover a foldable member owns.
+ *
+ *  Two callers, and a hazard each. A fold step moves controls between the row
+ *  and the ⋯ menu, so an open panel's anchor can leave the DOM under it.
+ *
+ *  And the ⋯ trigger is itself the anchor of any panel a menu row opened. An
+ *  anchor is exempt from its own panel's outside-click dismiss, so re-pressing
+ *  the trigger would stack a menu over a panel that will not go. */
+function closeFoldedPanels(): void {
+  attachMenuOpen.value = false;
+  closeTodoPanel();
+  closeWaitingPanel();
+}
 /** 1x length of the compose-destination row's fade-out, mirroring
  *  `.input-toggles-wrapper`'s `transition: opacity var(--duration-slow)` in
  *  chat/input-messages.css. The literal is `--duration-slow` before the
@@ -176,6 +199,70 @@ function CameraCapture() {
   );
 }
 
+/** The WIP app preview toggle, or null on a thread that has nothing to preview.
+ *
+ *  It stands whenever the focused thread is an app coding-agent thread with an
+ *  in-flight diff. `codingAgentHasDiff` is the same git-truth signal the Diff
+ *  button reads, and it clears when the worktree is removed. So the toggle can
+ *  never point at a gone worktree.
+ *
+ *  NOT gated on the app already being open. The preview swaps the app's
+ *  panel-overlay iframe, so gating it would strand a user reviewing the change
+ *  with the app closed. Clicking ON opens the target app if needed, then flips
+ *  that iframe to the worktree-served WIP through the engine's
+ *  `?thread_id=<id>` route (`api/apps.rs::serve_app_ui`).
+ *
+ *  Clicking OFF reverts to live, as does navigating away
+ *  (`actions/wipPreview.ts`) and an Apply or Discard removing the worktree (the
+ *  SSE handlers call `clearWipIfMatches`). */
+function wipPreviewAction(ft: ThreadState | undefined): HeaderActionSpec | null {
+  if (!ft || ft.meta.codingAgentKind !== 'app') return null;
+  if (!ft.meta.codingAgentHasDiff) return null;
+  const folder = ft.meta.codingAgentFolder;
+  const appId = folder ? folder.split('/').filter(Boolean).pop() : undefined;
+  if (!appId) return null;
+  const wipOn = wipPreviewThreadId.value === ft.meta.id;
+  return {
+    key: 'wip-preview-toggle',
+    dataRole: 'wip-preview-toggle',
+    label: wipOn ? 'Stop WIP app preview' : 'Show WIP app preview',
+    tooltip: wipOn
+      ? 'Showing the WIP app preview from this thread’s worktree. Click to return to the live app.'
+      : 'Preview the in-flight changes from this app coding-agent thread in the panel.',
+    // A filled eye, distinct from the outlined `EyeIcon` in shared/icons.tsx.
+    // No inline width/height: `.icon-btn.header-icon` sizes the glyph from
+    // `--icon-glyph`, so an attribute here would be overridden.
+    icon: () => (
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path d="M8 3C4.5 3 1.7 5.3 0.5 8c1.2 2.7 4 5 7.5 5s6.3-2.3 7.5-5c-1.2-2.7-4-5-7.5-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/>
+      </svg>
+    ),
+    active: wipOn,
+    activeClass: 'active',
+    onClick: () => {
+      if (wipOn) {
+        // Revert to live. pushNavState captures wipPreviewThreadId into the new
+        // entry, so flip the signal first.
+        wipPreviewThreadId.value = null;
+        pushNavState();
+        return;
+      }
+      // Turning WIP on. The preview swaps the target app's panel-overlay
+      // iframe, so open that app first if it isn't the one currently shown. Set
+      // the WIP signal only AFTER the app is in place, or the wipPreview effect
+      // would see a currentApp/wipApp mismatch and clear it at once.
+      void (async () => {
+        if (currentApp.value?.id !== appId) {
+          await openAppById(appId);
+          if (currentApp.value?.id !== appId) return; // open failed, toast already shown
+        }
+        wipPreviewThreadId.value = ft.meta.id;
+        pushNavState();
+      })();
+    },
+  };
+}
+
 // Pending uploads count as content. While a pasted or picked image is still
 // uploading, the prompt is actively composing, so the waiting banner yields to
 // the Send button. `computeMorphMode` reads `composeHasContent`, which includes
@@ -193,13 +280,6 @@ export function PromptInput() {
   // viewport-width heuristic to miss the squeeze on a dense row. When false,
   // the secondary candidate lifts to a row above the icons.
   //
-  // `.prompt-actions-right` is the row's ONLY gapped cluster: the row itself
-  // declares no `gap`, so its leading icon boxes touch. Naming the cluster
-  // stops the check billing four gaps the row never spends. Those phantom gaps
-  // lifted the Diff button off rows that could hold it.
-  const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef, {
-    gappedCluster: '.prompt-actions-right',
-  });
   // Scroll-vs-tap gate for the one-tap prompt buttons: the morph Send→Cancel
   // and the answer control's Submit / Cancel. An iOS PWA touch can stay under
   // iOS's ~10 px native cancel threshold during a scroll. It then lands a
@@ -1149,18 +1229,11 @@ export function PromptInput() {
     </button>
   ) : null;
 
-  // When the banner is suppressed, the in-banner Diff disappears with it. The
-  // standalone Diff button fills that gap, so a branch with commits always
-  // shows a Diff whatever the coding agent's run-state. It is the only liftable
-  // slot while composing.
-  //
-  // The primary slot is no longer empty there. A still-working thread carries
-  // the standing apply, so the row offers the change action that CAN act rather
-  // than nothing at all (ADR 0168).
-  const slots = bannerState
-    ? getBannerSlots(bannerState)
-    : { liftable: getStandaloneCcDiffButton(), primary: getStandingApplyControl() };
-  const stacked = !fitsInOneRow;
+  // The row's right-hand members. With the banner suppressed the standalone
+  // pair stands in. So a branch with commits always shows a Diff whatever the
+  // coding agent's run-state, and a still-working thread can still arm an apply
+  // (ADR 0168). Both FOLD, like everything between the menu and the send.
+  const bannerActions = bannerState ? getBannerActions(bannerState) : getStandaloneActions();
   const sendButton = morphMode !== 'hidden' ? (
     <button
       key="send-cancel-morph"
@@ -1206,14 +1279,125 @@ export function PromptInput() {
   const rowClass = bannerState
     ? 'prompt-actions-row thread-action-buttons'
     : 'prompt-actions-row';
-  // `stacked` reflects only the measurement; lifting requires something to
-  // lift. A row that overflows but has no liftable slot (e.g. the disabled
-  // "Apply..." spinner during an apply turn) renders inline anyway, so the
-  // is-stacked column layout would be wrong there.
-  const isStacked = stacked && !!slots.liftable;
-  const rightClass = isStacked
-    ? 'prompt-actions-right is-stacked'
-    : 'prompt-actions-right';
+  // ── The row's FOLDABLE members, in FOLD ORDER ──
+  //
+  // One list, and the fold takes a PREFIX of it. So the head goes into the ⋯
+  // menu first, and the last member standing is the one nearest the thumb. The
+  // order is also the row's own, so a row with room to spare is unchanged.
+  //
+  // The two STATUS readouts head it: an action the thumb reaches for outranks a
+  // readout, and a folded readout still says its state in words on its menu
+  // row. The follow and call toggles are LAST, so their fixed slots hold at
+  // every width that can show them.
+  //
+  // Only the control menu and the send button never fold, and those two fit at
+  // any width the app supports. So a row too narrow for its members is not a
+  // state this can settle in.
+  const foldActions: HeaderActionSpec[] = [];
+  const todoAction = promptCodingAgent === null ? todoIndicatorAction() : null;
+  if (todoAction) foldActions.push(todoAction);
+  const waitingAction = waitingIndicatorAction();
+  if (waitingAction) foldActions.push(waitingAction);
+  const wipAction = wipPreviewAction(focusedThread);
+  if (wipAction) foldActions.push(wipAction);
+  foldActions.push({
+    key: 'attach-image',
+    dataRole: 'attach-image',
+    label: 'Attach image',
+    tooltip: isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : 'Attach image',
+    icon: () => <ImageIcon />,
+    disabledTooltip: isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : undefined,
+    // Folded, and on a narrow row, this IS the file picker. The `.click()` is
+    // dispatched inside the menu item's own click, which <Overlay> treats as
+    // inside and therefore does not swallow.
+    onClick: () => fileInputRef.current?.click(),
+    // A wide row keeps the Camera / File popover instead, which the default
+    // button cannot express: it is an anchor hosting an <Overlay> of its own.
+    // composeHandlers keeps the textarea focused (the iPad PWA keyboard stays
+    // open) so the menu anchors to the right spot, see 5ca953fd7.
+    render: isNarrow ? undefined : (attrs) => (
+      <div class="image-attach-anchor" ref={menuRef} {...attrs}>
+        <button
+          class="icon-btn header-icon"
+          {...composeHandlers(() => { attachMenuOpen.value = !attachMenuOpen.value; })}
+          disabled={isAnsweringQuestion}
+          data-tooltip={isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : 'Attach image'}
+          aria-label="Attach image"
+        >
+          <ImageIcon />
+        </button>
+        <Overlay
+          open={attachMenuOpen.value && !isAnsweringQuestion}
+          onClose={() => { attachMenuOpen.value = false; }}
+          anchor={menuRef.current}
+          backdrop={false}
+          panelClass="image-attach-menu"
+        >
+          <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
+            <CameraIcon />
+            Camera
+          </button>
+          <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
+            <FileIcon />
+            File
+          </button>
+        </Overlay>
+      </div>
+    ),
+  });
+  // CLEAR THE DRAFT, deliberately not a second control on the right edge. What
+  // the corner placement cost the field, and why this one carries no rule of
+  // its own, is in `__tests__/composer-single-right-anchor.test.ts`.
+  //
+  // It joins the list only while there is a draft to clear, so the row reserves
+  // no box for it.
+  if (hasText) {
+    foldActions.push({
+      key: 'prompt-clear',
+      extraClass: 'prompt-clear',
+      label: 'Clear draft',
+      icon: () => <ClearIcon />,
+      onClick: () => {
+        const el = inputRef.current;
+        if (!el) return;
+        writeComposerValue(el, '');
+        const id = focusedThreadId.value;
+        if (id) updateCompose(id, { text: '' });
+        autoResize();
+        el.focus();
+      },
+    });
+  }
+  // Everything pushed so far renders at the ⋯'s own position, between the fixed
+  // toggles and the right-hand cluster.
+  const middleActions = foldActions.slice();
+  // The right-hand members, then the two fixed toggles. Those fold LAST, which
+  // is what keeps their slots stable at every width that can hold them.
+  foldActions.push(...bannerActions);
+  const toggles = promptRowToggles(promptCodingAgent, inComposeContext);
+  foldActions.push(...toggles.fold);
+
+  // Where each member renders. The cluster declares a gap and the rest of the
+  // row does not. So a member folding out of the cluster takes a gap with it.
+  const clusterKeys = new Set(bannerActions.map((a) => a.key));
+  const foldSignature = foldActions.map((a) => a.key).join(' ');
+  const foldKeys = useMemo(() => foldActions.map((a) => a.key), [foldSignature]);
+  const foldGroups = useMemo<FoldGroup[]>(
+    () => foldActions.map((a) => (clusterKeys.has(a.key) ? 'cluster' : 'row')),
+    [foldSignature],
+  );
+  const collapsedActions = usePromptActionCollapse(promptActionsAreaRef, foldKeys, foldGroups);
+  const foldedKeys = new Set(foldActions.slice(0, collapsedActions).map((a) => a.key));
+  const hidden = foldActions.slice(0, collapsedActions);
+  /** Is this member still wearing its own box, rather than sitting in the ⋯? */
+  const standing = (a: HeaderActionSpec) => !foldedKeys.has(a.key);
+  /** The row attributes a member carries: the measurement marker, and the name
+   *  the width cache remembers it by once it folds. */
+  const foldAttrs = (key: string) => ({ 'data-row-item': 'fold', [FOLD_KEY_ATTR]: key });
+  // A fold moves controls between the row and the ⋯ menu, so an open popover's
+  // anchor can leave the DOM under it. A panel pinned to a detached box is
+  // positioned against nothing. Close them all on a step rather than pick.
+  useEffect(closeFoldedPanels, [collapsedActions]);
 
   return (
     <div class="prompt-input-container">
@@ -1302,198 +1486,37 @@ export function PromptInput() {
             composeThreadId={composeControlThreadId}
             lucidosThreadId={focusedThreadId.value ?? undefined}
             composeContext={inComposeContext}
+            toggles={toggles.row.filter(standing)}
+            attrsFor={foldAttrs}
           />
-          {/* The FOLLOW TOGGLE is the second item of `PromptRowControls` above,
-              pinned there so it does not move between threads. Everything from
-              here down is conditional and sits behind that fixed pair. */}
-          {(() => {
-            // WIP app preview toggle. Visible whenever the focused thread is an
-            // app coding-agent thread with an in-flight diff.
-            // `codingAgentHasDiff` is the same git-truth signal the Diff button
-            // reads. It is cleared when the worktree is removed, so the toggle
-            // can never point at a gone worktree.
-            //
-            // NOT gated on the app already being open. The preview swaps the
-            // app's panel-overlay iframe, so gating it would leave a user
-            // reviewing the change with the app closed unable to reach it.
-            // Clicking ON opens the target app if needed, then flips that
-            // iframe to the worktree-served WIP through the engine's
-            // `?thread_id=<id>` route (`api/apps.rs::serve_app_ui`).
-            //
-            // Clicking OFF reverts to live, as does navigating away
-            // (`actions/wipPreview.ts`) and an Apply or Discard removing the
-            // worktree (the SSE handlers call `clearWipIfMatches`).
-            const ft = focusedThread;
-            if (!ft || ft.meta.codingAgentKind !== 'app') return null;
-            if (!ft.meta.codingAgentHasDiff) return null;
-            const folder = ft.meta.codingAgentFolder;
-            const appId = folder ? folder.split('/').filter(Boolean).pop() : undefined;
-            if (!appId) return null;
-            const wipOn = wipPreviewThreadId.value === ft.meta.id;
-            return (
-              <button
-                class={`icon-btn header-icon${wipOn ? ' active' : ''}`}
-                data-tooltip={wipOn ? 'Showing the WIP app preview from this thread’s worktree. Click to return to the live app.' : 'Preview the in-flight changes from this app coding-agent thread in the panel.'}
-                aria-pressed={wipOn}
-                aria-label={wipOn ? 'Stop WIP app preview' : 'Show WIP app preview'}
-                onClick={() => {
-                  if (wipOn) {
-                    // Revert to live. pushNavState captures wipPreviewThreadId
-                    // into the new entry, so flip the signal first.
-                    wipPreviewThreadId.value = null;
-                    pushNavState();
-                    return;
-                  }
-                  // Turning WIP on. The preview swaps the target app's
-                  // panel-overlay iframe, so open that app first if it isn't the
-                  // one currently shown. Set the WIP signal only AFTER the app
-                  // is in place — otherwise the wipPreview effect would see a
-                  // currentApp/wipApp mismatch and immediately clear it.
-                  void (async () => {
-                    if (currentApp.value?.id !== appId) {
-                      await openAppById(appId);
-                      if (currentApp.value?.id !== appId) return; // open failed — toast already shown
-                    }
-                    wipPreviewThreadId.value = ft.meta.id;
-                    pushNavState();
-                  })();
-                }}
-                data-row-item
-                data-role="wip-preview-toggle"
-              >
-                {/* A filled eye, distinct from the outlined `EyeIcon` in
-                    shared/icons.tsx. No inline width/height: the enclosing
-                    `.icon-btn.header-icon` sizes the glyph from
-                    `--icon-glyph`, so an attribute here is overridden. */}
-                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                  <path d="M8 3C4.5 3 1.7 5.3 0.5 8c1.2 2.7 4 5 7.5 5s6.3-2.3 7.5-5c-1.2-2.7-4-5-7.5-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/>
-                </svg>
-              </button>
-            );
-          })()}
-          {isNarrow ? (
-            <button
-              class="icon-btn header-icon"
-              onClick={() => fileInputRef.current?.click()}
-              aria-label="Attach image"
-              disabled={isAnsweringQuestion}
-              data-tooltip={isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : undefined}
-              data-row-item
-            >
-              <ImageIcon />
-            </button>
-          ) : (
-            <div class="image-attach-anchor" ref={menuRef} data-row-item>
-              {/* composeHandlers keeps the prompt textarea focused (iPad PWA
-                  keyboard stays open) so the menu anchors to the right spot —
-                  see 5ca953fd7. */}
-              <button
-                class="icon-btn header-icon"
-                {...composeHandlers(() => { attachMenuOpen.value = !attachMenuOpen.value; })}
-                disabled={isAnsweringQuestion}
-                data-tooltip={isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : 'Attach image'}
-                aria-label="Attach image"
-              >
-                <ImageIcon />
-              </button>
-              <Overlay
-                open={attachMenuOpen.value && !isAnsweringQuestion}
-                onClose={() => { attachMenuOpen.value = false; }}
-                anchor={menuRef.current}
-                backdrop={false}
-                panelClass="image-attach-menu"
-              >
-                <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
-                  <CameraIcon />
-                  Camera
-                </button>
-                <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
-                  <FileIcon />
-                  File
-                </button>
-              </Overlay>
-            </div>
+          {/* The ⋯ holds every folded member, from BOTH ends of the row, and it
+              sits here so a surviving right-hand button still renders on the
+              right. Folding never moves a button across the row. */}
+          {hidden.length > 0 && (
+            <OverflowMenu
+              ariaLabel="More actions"
+              extraClass="prompt-actions-more"
+              triggerAttrs={MORE_TRIGGER_ATTRS}
+              onOpen={closeFoldedPanels}
+              items={(ctx) => hidden.map((a) => renderMenuAction(a, ctx))}
+            />
           )}
-          {/* CLEAR THE DRAFT: the last icon of the row's left cluster, and
-              deliberately not a second control on the right edge.
-
-              It used to be pinned to the top-right corner of `.prompt-row`,
-              which made the composer a two-corner composition with one row of
-              controls. Three things were wrong with that and all three are
-              positional. The corner ×'s centre sat 6px off the send's, because
-              the two were inset by unrelated rules (its own `margin-right` vs
-              `.prompt-actions-row`'s `padding-right`) at two different
-              diameters, and circles are read by their centres. Their vertical
-              distance was set by however tall the textarea happened to be, so
-              nothing held the pair together. And the top-right corner is the
-              universal "close this panel" slot, which is not what clearing a
-              draft means.
-
-              It carries no class of its own beyond the `.prompt-clear` hook the
-              e2e specs select on: `.icon-btn.header-icon` is what gives it the
-              box, the --icon-size-lg glyph, the --text-secondary gray and (via
-              `.prompt-actions-row .icon-btn.header-icon`) the baseline nudge its
-              neighbours ride. That is the point of the move rather than a
-              side-effect of it. In the corner it drew a 14px --text-muted glyph
-              where every other icon here is 20px --text-secondary, and the
-              mobile override made it 22.5px, LARGER than the send, so the two
-              controls' size relationship inverted between viewports.
-
-              It renders only while there is a draft to clear. The row no
-              longer reserves the box. An empty row spent 2.25rem on nothing,
-              and on a phone that is what lifted the Diff button onto a row of
-              its own. Reserving bought little: the banner leaves on the same
-              keystroke this button arrives on, a far larger swing. Nothing on
-              screen moves either way. This is the last item
-              of the left cluster, and its next sibling has `margin-left: auto`,
-              so mounting it only eats free space.
-
-              Leaving `.prompt-row` also hands the textarea back its right
-              content edge: as an in-flow flex sibling this button took its
-              width, margin and the row gap out of the field in EVERY state,
-              invisible ones included, so the typed text stopped 51px short of
-              the box on the right against 13px on the left. */}
-          {hasText && (
-            <button
-              key="prompt-clear"
-              class="icon-btn header-icon prompt-clear"
-              aria-label="Clear draft"
-              data-tooltip="Clear draft"
-              onClick={() => {
-                const el = inputRef.current;
-                if (!el) return;
-                writeComposerValue(el, '');
-                const id = focusedThreadId.value;
-                if (id) updateCompose(id, { text: '' });
-                autoResize();
-                el.focus();
-              }}
-              data-row-item
-            >
-              <ClearIcon />
-            </button>
-          )}
-          <div class={rightClass}>
-            {isStacked ? (
-              <>
-                <div class="prompt-actions-subrow">
-                  {slots.liftable}
-                </div>
-                <div class="prompt-actions-subrow">
-                  {slots.primary}
-                  {isAnsweringQuestion ? answerControl : sendButton}
-                </div>
-              </>
-            ) : (
-              <>
-                {slots.liftable}
-                {slots.primary}
-                {isAnsweringQuestion ? answerControl : sendButton}
-              </>
-            )}
+          {middleActions.filter(standing).map((a) => (
+            <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
+          ))}
+          <div class="prompt-actions-right">
+            {bannerActions.filter(standing).map((a) => (
+              <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
+            ))}
+            {isAnsweringQuestion ? answerControl : sendButton}
           </div>
         </div>
       </div>
+      {/* The two indicator panels, mounted here rather than by their controls:
+          a control that folds into the ⋯ menu unmounts its button, and the
+          panel has to outlive that. Both portal, so this is placement only. */}
+      <TodoPanelHost />
+      <WaitingPanelHost />
       {cameraOpen.value && <CameraCapture />}
     </div>
   );

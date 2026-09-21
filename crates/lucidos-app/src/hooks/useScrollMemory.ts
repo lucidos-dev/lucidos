@@ -14,7 +14,7 @@ import {
   applyFollowSeed,
   type FollowResumeFrom,
 } from '../components/chat/scrollState';
-import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorTargetTop, readScrollAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
 import { watchUserAction } from '../utils/userAction';
 
@@ -171,6 +171,16 @@ export function resetContentScroll(viewKey: string): void {
 }
 
 const SAVE_DEBOUNCE_MS = 150;
+/** Longest a CONTENT change waits before the place is re-read.
+ *
+ *  A throttle rather than a debounce, so a transcript that mutates without
+ *  pause still commits. A streaming turn mutates on every token, and a debounce
+ *  there defers the read until the stream stops.
+ *
+ *  It exists because the read is not free: `readScrollAnchor` measures rects,
+ *  and a measurement per mutation batch is a forced layout per batch. One per
+ *  window bounds that, and the reading position is not urgent. */
+const CONTENT_READ_THROTTLE_MS = 150;
 /** How long to wait for async content to render before giving up on restoring.
  *  Long enough for typical Loadable<T> roundtrips, short enough that a stuck
  *  observer does not permanently suppress saves.
@@ -332,6 +342,11 @@ export function attachScrollMemory(
    *  `undefined` means this key has seen no scroll, which is what makes an
    *  unreached `writeNow` do nothing rather than delete a stored position. */
   let observed: string | undefined;
+  /** Watches the CONTENT for a change that moves the reading position without
+   *  moving the container, and the throttle that bounds the re-read. Only an
+   *  anchoring container arms them: see `watchContent`. */
+  let contentObserver: MutationObserver | null = null;
+  let contentTimer: ReturnType<typeof setTimeout> | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let mutationObserver: MutationObserver | null = null;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -816,7 +831,38 @@ export function attachScrollMemory(
     scheduleSave();
   };
 
+  /** Re-read the place after the CONTENT changed under a reader who did not
+   *  move. The transcript is windowed and paged, so the turn at the top can
+   *  change with no scroll at all. A backfill fold gives the top turn the id it
+   *  was missing, and until then the record names the turn BELOW it.
+   *
+   *  It asks everything `onScroll` asks, for the same reasons, because it
+   *  records the same thing from the other cause. A restore in flight is
+   *  placing the reader itself, and its own write is what gets recorded.
+   *
+   *  And one guard of its own: it keeps a record CURRENT and never opens one.
+   *  A reader who has not moved in this thread has no reading position, which
+   *  is the only state the *follow seed* speaks for. Letting a streaming turn
+   *  write one would take that first open away from the seed. */
+  const recordContentPlace = () => {
+    if (observed === undefined) return;
+    if (restoring) return;
+    if (isCurrent && !isCurrent()) return;
+    const next = currentPosition();
+    if (next === null) return;
+    observed = next;
+    scheduleSave();
+  };
+
   const flush = () => {
+    // A content change still inside its throttle has not been read yet, and
+    // this is the last chance to read it. `recordContentPlace` asks its own
+    // guards, so a superseded attachment still commits only its snapshot.
+    if (contentTimer !== null) {
+      clearTimeout(contentTimer);
+      contentTimer = null;
+      recordContentPlace();
+    }
     if (saveTimer !== null) {
       clearTimeout(saveTimer);
       saveTimer = null;
@@ -995,6 +1041,28 @@ export function attachScrollMemory(
     stopUserWatch = watchUserAction(() => stopRestore());
   }
 
+  /** Arm the content watch, for an ANCHORING container only.
+   *
+   *  A container recording a bare offset needs none of this. Its answer IS
+   *  `scrollTop`, which cannot change without a scroll event. Only a named
+   *  child can start or stop being nameable under a still reader.
+   *
+   *  Both arms are load-bearing. A page of older turns lands as a child-list
+   *  change. A fragment folding into its real turn only stamps the attribute,
+   *  on a node Preact keeps, since `exchangeKey` does not change with the fold. */
+  const watchContent = () => {
+    if (!anchorsToContent || typeof MutationObserver !== 'function') return;
+    contentObserver = new MutationObserver(() => {
+      if (contentTimer !== null) return;
+      contentTimer = setTimeout(() => {
+        contentTimer = null;
+        recordContentPlace();
+      }, CONTENT_READ_THROTTLE_MS);
+    });
+    contentObserver.observe(el, { childList: true, subtree: true, attributeFilter: [ANCHOR_ATTR] });
+  };
+  watchContent();
+
   el.addEventListener('scroll', onScroll, { passive: true });
 
 
@@ -1093,6 +1161,11 @@ export function attachScrollMemory(
     // restore had running on its behalf. A teardown for a real thread switch
     // says nothing either way, `settleRestore` being scoped to the current key.
     stopRestore(false);
+    // Before `flush`, which reads any throttled content change out for itself.
+    // Leaving this connected would keep measuring a container the next thread
+    // owns, under a key nothing will write again.
+    contentObserver?.disconnect();
+    contentObserver = null;
     el.removeEventListener('scroll', onScroll);
     unsubscribeArm?.();
     unsubscribeDeepLink();

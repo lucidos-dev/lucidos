@@ -485,8 +485,24 @@ impl CallTransport for ScriptedCaller {
             // talker's own script decides when the call ends.
             return std::future::pending().await;
         };
-        while *self.delivered.lock().unwrap() < target {
-            self.delivery.notified().await;
+        // **Registered before the count is read, and that order is the whole
+        // of it.** `notify_waiters` wakes only waiters already registered, and
+        // a `Notified` registers when it is first polled. Checking first left a
+        // window where the LAST delivery landed unheard, and the caller then
+        // waited for a delivery nobody was going to make. `enable` registers
+        // without awaiting, so no delivery can fall between the two.
+        //
+        // Rare, and this suite makes it likelier: a caller with a queued frame
+        // reaches this wait one `recv` late, by which point the talker's script
+        // is already pouring deliveries in.
+        loop {
+            let waiting = self.delivery.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            if *self.delivered.lock().unwrap() >= target {
+                break;
+            }
+            waiting.await;
         }
         self.gone = true;
         ending
@@ -1043,6 +1059,10 @@ fn deliveries_of(script: &[VoiceEvent]) -> usize {
     // changes nothing about that turn. A helper that missed this would count
     // frames nobody sends, which hangs the scripted caller.
     let mut audience: Option<bool> = None;
+    // `Call::mute_held_for`. An unheard sentence keeps the latch across its own
+    // turn end, so the helper has to carry it too or it counts frames nobody
+    // sends.
+    let mut held = 0u8;
     let mut deliveries = 0;
     for event in script {
         // The openers first, because one of them reaches the caller as
@@ -1058,7 +1078,12 @@ fn deliveries_of(script: &[VoiceEvent]) -> usize {
             if heard && !transcript.trim().is_empty() {
                 turns_left = turns_left.saturating_sub(1);
             }
-            audience = None;
+            let holding = !heard
+                && turns_left > 0
+                && held < super::TURNS_ONE_OPENER_BUYS
+                && super::the_sentence_is_unfinished(transcript);
+            held = if holding { held + 1 } else { 0 };
+            audience = if holding { Some(false) } else { None };
         }
         if !reaches_the_caller(event) {
             continue;
@@ -6694,6 +6719,154 @@ async fn a_turn_decided_unheard_does_not_resume_when_the_caller_speaks() {
     teardown_test_db(&db_name).await;
 }
 
+/// **The reported defect.** The caller heard the back half of a muted sentence.
+///
+/// A Live turn ends at every 700 ms hole in the words (ADR 0187), so the latch
+/// above expires inside a sentence. The talker opened the call mid-thought, the
+/// caller spoke over it, and the next fragment of that same sentence reached
+/// their ear and the thread. The row began "doc. It says it's intentional",
+/// which answers nothing anybody asked. The plan is
+/// `docs/plans/2026-09-18-a-muted-answer-is-muted-whole.md`.
+#[tokio::test]
+async fn a_muted_run_is_not_heard_from_its_middle() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        // Before the caller's first word, so nobody hears it. It stops
+        // mid-sentence, and the turn after it carries the rest.
+        the_talker_is_saying("Preflight flagged the deletion of that tap-shape migration"),
+        the_caller_says("What about"),
+        the_talker_says("Preflight flagged the deletion of that tap-shape migration"),
+        the_talker_is_saying("doc. It says it's intentional."),
+        VoiceEvent::Audio(vec![3; 320]),
+        the_talker_says("doc. It says it's intentional."),
+    ]);
+    let turns = RecordingTurns::default();
+    let overheard = turns.overheard();
+    // SessionStarted, the caller's own turn, and one frame per talker turn end.
+    // The muted words and the muted audio are no frame at all.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(4);
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(*audio_out.lock().unwrap(), 0, "the caller heard the tail");
+    let frames = sent.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, ServerFrame::TalkerTranscript { .. })),
+        "{:?}",
+        frames
+    );
+    let events = thread_events(&pool, thread_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(kind, _)| kind == "SpokenReplyGenerated"),
+        "{:?}",
+        events
+    );
+    assert!(overheard.lock().unwrap().is_empty());
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The other side of it: a muted run that FINISHED frees the next turn.
+///
+/// The hold is about a sentence, not about the call. A talker muted through a
+/// whole thought is heard again on its next one, which is the ordinary way a
+/// silent call starts working.
+#[tokio::test]
+async fn a_finished_muted_run_lets_the_next_turn_be_heard() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_talker_is_saying("Something else on your mind?"),
+        the_caller_says("Please"),
+        the_talker_says("Something else on your mind?"),
+        the_talker_is_saying("Two threads are running."),
+        VoiceEvent::Audio(vec![7; 480]),
+        the_talker_says("Two threads are running."),
+    ]);
+    // SessionStarted, the caller's turn, the muted turn's end, then the heard
+    // turn's delta, audio and end. The muted delta is no delivery. Stopping
+    // short of the last one leaves the hangup racing it.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(6);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        nobody_names(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(*audio_out.lock().unwrap(), 480);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "Two threads are running.");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **The reported defect, on the caller's side.** Half their question was eaten.
+///
+/// The transcriber split "What about now" one second apart. A heard turn
+/// between the halves says the talker answered the first, so the pile is
+/// dropped and the doer runs on the rest. The reported wake carried the single
+/// word "now", and the answer was about something else entirely.
+///
+/// A muted run answers nobody, so it spends nothing. This needs no code of its
+/// own: the flag is already gated on the turn being heard.
+#[tokio::test]
+async fn a_muted_run_spends_none_of_the_callers_words() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        uuid::Uuid::new_v4(),
+        vec![
+            the_talker_is_saying("Preflight flagged the deletion of that tap-shape migration"),
+            the_caller_says("What about"),
+            the_talker_says("Preflight flagged the deletion of that tap-shape migration"),
+            the_talker_is_saying("doc. It says it's intentional."),
+            the_talker_says("doc. It says it's intentional."),
+            the_caller_says("now"),
+            asks_for_the_doer(""),
+        ],
+    )
+    .await;
+
+    assert_eq!(did.woken, vec!["What about now".to_string()]);
+
+    teardown_test_db(&db_name).await;
+}
+
 /// An unheard turn answered nobody, so the caller is still owed one.
 ///
 /// The bound is what sends them to the doer instead. Read as an answer, a
@@ -6876,6 +7049,141 @@ async fn a_relayed_answer_stays_audible_across_the_pause_in_it() {
     assert_eq!(
         said,
         vec!["There's one waiting", "Run the tail, or leave it?"]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **The caller's own DEVICE hearing them start is enough too.**
+///
+/// The provider signal below reaches one provider. A Live session states no
+/// such frame, and its talker answers the caller's audio before its own
+/// transcriber reports a word. So the answer to their first sentence was
+/// played to nobody. The client measures the same edge for its own bubble
+/// (`voice/speechGate.ts`), and sends it.
+#[tokio::test]
+async fn the_callers_own_device_opens_the_floor() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let (mut caller, from_caller) = ScriptedCaller::driven();
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            // **Taken before the talker speaks, by construction.** The signal
+            // and the talker's words come from two senders, so nothing orders
+            // them but this: the channel emptying says the call has it. Sent
+            // and then raced, the turn is muted and the case reads as a
+            // failure of the floor rather than of its own sequencing.
+            let idle = from_caller.capacity();
+            from_caller
+                .send(CallerFrame::Control(ClientControl::CallerStartedSpeaking))
+                .await
+                .expect("the call to take the caller's signal");
+            until("the call to take that signal", || {
+                from_caller.capacity() == idle
+            })
+            .await;
+            say(&talker, the_talker_is_saying("Two threads")).await;
+            say(&talker, VoiceEvent::Audio(vec![4; 256])).await;
+            say(&talker, the_talker_says("Two threads")).await;
+            await_frames(&sent, 2, "the reply to end").await;
+            hang_up(&from_caller).await;
+        }
+    );
+
+    assert_eq!(*audio_out.lock().unwrap(), 256);
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["text"], "Two threads");
+    // It says they opened their mouth, and nothing more. Read as a cut, it
+    // would report one on every turn, this one included (ADR 0211).
+    assert_eq!(replies[0].0["interrupted"], false);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// It is not an interruption, even landing mid-reply.
+///
+/// It fires on the first word of a call with nothing playing, so reading it as
+/// a cut would report one on every turn. The client detects its own barge-in
+/// and sends that separately, under its own quiet-time condition.
+#[tokio::test]
+async fn the_callers_first_sound_cuts_nothing_off() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let (provider, talker) = MockVoiceProvider::driven();
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let (mut caller, from_caller) = ScriptedCaller::driven();
+    let sent = Arc::clone(&caller.sent);
+    let audio_out = Arc::clone(&caller.audio_out_bytes);
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            nobody_names(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            say(&talker, the_caller_says("what have I got running")).await;
+            await_frames(&sent, 1, "the caller's own turn to land").await;
+            say(&talker, the_talker_is_saying("Two threads")).await;
+            await_frames(&sent, 2, "the reply to start").await;
+            // Mid-reply, which is where a cut would show.
+            from_caller
+                .send(CallerFrame::Control(ClientControl::CallerStartedSpeaking))
+                .await
+                .expect("the caller to say they started");
+            say(&talker, VoiceEvent::Audio(vec![9; 192])).await;
+            say(&talker, the_talker_says("Two threads")).await;
+            await_frames(&sent, 3, "the reply to end").await;
+            hang_up(&from_caller).await;
+        }
+    );
+
+    assert_eq!(*audio_out.lock().unwrap(), 192, "the rest was cut off");
+    let replies = rows_of(&pool, thread_id, "SpokenReplyGenerated").await;
+    assert_eq!(replies.len(), 1, "{:?}", replies);
+    assert_eq!(replies[0].0["interrupted"], false);
+    let frames = sent.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, ServerFrame::Interrupted)),
+        "{:?}",
+        frames
     );
 
     teardown_test_db(&db_name).await;

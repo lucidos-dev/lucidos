@@ -322,6 +322,23 @@ export type ThreadState = {
   /** SSE events may arrive out of order during reconnect, so we track
    *  the max DB-loaded sequence separately to avoid skipping gap events. */
   lastDbSeq: number;
+  /** How far BACK this thread is loaded, and whether older events remain.
+   *
+   *  The mirror of `lastDbSeq`, which is how far forward. A long thread opens
+   *  on its newest page and backfills as the reader scrolls up. The two answer
+   *  different questions, and neither substitutes for the other.
+   *
+   *  `historyFloor` is the oldest row held, as the `(created, sequence)` pair
+   *  the server pages by. Null before the first load, and on a thread served
+   *  whole, which is every thread shorter than a page.
+   *
+   *  All three are OPTIONAL. A thread built without them reads as served
+   *  whole, which is the truth for a fixture and for any pre-paging state. */
+  historyFloor?: { created: string; sequence: number } | null;
+  /** True while the server says older events remain behind `historyFloor`.
+   *  False on a thread served whole, so nothing ever asks for a page that
+   *  cannot exist. */
+  hasOlderEvents?: boolean;
   /** Optimistic user messages shown before real SSE events arrive.
    *  Each entry is removed when its corresponding MessageReceived event arrives
    *  from SSE, matched by the client-generated event_id UUID. */
@@ -491,6 +508,8 @@ export function makeOptimisticThreadState(opts: {
     eventsLoaded: opts.eventsLoaded,
     eventsLoadFailed: false,
     lastDbSeq: 0,
+    historyFloor: null,
+    hasOlderEvents: false,
     pendingUserMessages: opts.pendingUserMessages ?? [],
     liveUtterances: [],
   };

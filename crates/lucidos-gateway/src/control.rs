@@ -103,9 +103,9 @@ pub fn router() -> Router<GatewayState> {
 // request exactly as a loopback one does, which
 // `an_uncredentialed_control_request_is_refused` pins against the real router.
 //
-// What this gate adds on top. App UIs are served same-origin at
-// `/<slug>/app/<id>/` with `allow-same-origin`, so an app's JS runs with
-// whatever credential the browser holds. Without this, that JS could
+// What this gate adds on top. App UIs are served at `/<slug>/app/<id>/`, and a
+// document opened there runs with whatever credential the browser holds.
+// Without this, its JS could
 // `fetch('/~/api/v1/control/workspaces/<slug>/stop', {method:'POST'})` and stop
 // the workspace it runs in, carrying the user's own cookie. Three arms:
 //
@@ -116,19 +116,23 @@ pub fn router() -> Router<GatewayState> {
 //   * Cross-site / cross-origin browser requests are rejected via the
 //     forge-proof `Sec-Fetch-Site` + `Origin`/`Host` checks (a page cannot set
 //     these via `fetch()`). This fully closes the classic CSRF vector.
-//   * Browser requests whose `Referer` is an app-iframe document
-//     (`/<slug>/app/...`) are rejected. The picker (`/~/...`) and the workspace
-//     shell (`/<slug>/...`, no `app` segment) pass.
+//   * Browser requests whose `Referer` is an app document (`/<slug>/app/...`)
+//     are rejected. The picker (`/~/...`) and the workspace shell
+//     (`/<slug>/...`, no `app` segment) pass.
 //
-// RESIDUAL: a deliberately malicious *same-origin* app could influence its own
-// `Referer` (the fetch `referrer` option accepts same-origin URLs), so the
-// Referer block is strong defense-in-depth, not an absolute boundary. The
-// complete fix is to serve app iframes from a DISTINCT origin (then they are
-// cross-origin and the forge-proof Sec-Fetch/Origin checks alone suffice); that
-// is recorded as future work in ADR 0014 and is out of scope for this change.
+// An app FRAME inside the shell is now an opaque origin (ADR 0227). The second
+// arm catches it on the forge-proof headers alone, and the third never has to.
+// What the third still carries is the app opened in its own TAB, a top-level
+// document on this origin.
+//
+// RESIDUAL: such a tab can influence its own `Referer`, since the fetch
+// `referrer` option accepts same-origin URLs. So for it the Referer block is
+// strong defense-in-depth rather than an absolute boundary. Serving an app tab
+// from a distinct origin would close that, and ADR 0014 records it as future
+// work.
 
-/// Axum middleware: reject a control-plane request that a browser app iframe (or
-/// a cross-site page) originated. Allows non-browser clients and same-origin
+/// Axum middleware: reject a control-plane request that an app document (or a
+/// cross-site page) originated. Allows non-browser clients and same-origin
 /// picker / workspace-shell requests. See the module note above.
 async fn control_authz(req: Request, next: Next) -> Response {
     let host = req

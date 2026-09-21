@@ -93,6 +93,16 @@ pub struct WindowSnapshot {
     pub label: String,
     pub url: String,
     pub frame: Rect,
+    /// Is `frame` a correction the CLIENT made, rather than where the user put
+    /// the window?
+    ///
+    /// A window is rescued when the desk could not hold the frame it was
+    /// remembered at. That includes a desk which was simply not all there yet.
+    /// Recording the rescue answers a question the user never asked, and loses
+    /// the arrangement they did choose. So [`capture`] keeps what the record
+    /// holds while this is true. ADR 0215 has the rest, and
+    /// `window_restore::is_wearing_a_rescue` decides when it stops being true.
+    pub rescued: bool,
 }
 
 /// Has any window reached the gateway yet?
@@ -153,9 +163,16 @@ pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSe
         let Some(workspace) = crate::window_target::window_workspace(&snapshot.url) else {
             continue;
         };
-        session
-            .geometry
-            .insert(workspace.to_string(), snapshot.frame);
+        // A rescued window keeps whatever the record already held for its
+        // workspace, because a frame the client chose is not an arrangement
+        // (ADR 0215). With nothing held there is nothing better to keep, so the
+        // corrected frame goes in and the workspace at least reopens somewhere.
+        let keep_previous = snapshot.rescued && session.geometry.contains_key(workspace);
+        if !keep_previous {
+            session
+                .geometry
+                .insert(workspace.to_string(), snapshot.frame);
+        }
         // Two windows on ONE workspace collapse to one entry. The record holds
         // no per-window identity, so a second restored window would land on top
         // of the first at the same frame.
@@ -310,11 +327,22 @@ mod tests {
         }
     }
 
+    /// A window wearing a frame the USER chose, which is nearly every window.
     fn snapshot(label: &str, url: &str, frame: Rect) -> WindowSnapshot {
         WindowSnapshot {
             label: label.to_string(),
             url: url.to_string(),
             frame,
+            rescued: false,
+        }
+    }
+
+    /// A window wearing a frame the CLAMP chose, because the desk could not
+    /// hold the one it was remembered at.
+    fn rescued_snapshot(label: &str, url: &str, frame: Rect) -> WindowSnapshot {
+        WindowSnapshot {
+            rescued: true,
+            ..snapshot(label, url, frame)
         }
     }
 
@@ -336,6 +364,112 @@ mod tests {
         assert_eq!(session.open, vec!["myws", "dev"]);
         assert_eq!(session.geometry.get("myws"), Some(&rect(0, 0, 1200, 800)));
         assert_eq!(session.geometry.get("dev"), Some(&rect(100, 50, 900, 700)));
+    }
+
+    // ── a correction is not an arrangement (ADR 0215) ────────────────────────
+
+    // The reported defect. A launch that cannot see the display a window was
+    // remembered on rescues it onto one it can. The debounced flush recorded
+    // that within a second. The arrangement was then gone for good, and the
+    // window never went home when the display came back.
+    #[test]
+    fn a_rescued_window_keeps_the_frame_the_record_already_held() {
+        let before = capture(
+            &WindowSession::default(),
+            &[snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, -191, 1728, 1084),
+            )],
+        );
+        let after = capture(
+            &before,
+            &[rescued_snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, 30, 1728, 1084),
+            )],
+        );
+        assert_eq!(
+            after.geometry.get("myws"),
+            Some(&rect(643, -191, 1728, 1084))
+        );
+        // Still open, and still first. Only the frame is held back.
+        assert_eq!(after.open, vec!["myws"]);
+    }
+
+    // The other half, and the one that matters more. A held frame outliving
+    // the user's own gesture is a window that cannot be re-arranged at all.
+    #[test]
+    fn a_window_the_user_moved_records_where_they_put_it() {
+        let before = capture(
+            &WindowSession::default(),
+            &[snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, -191, 1728, 1084),
+            )],
+        );
+        let after = capture(
+            &before,
+            &[snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(200, 100, 1200, 800),
+            )],
+        );
+        assert_eq!(after.geometry.get("myws"), Some(&rect(200, 100, 1200, 800)));
+    }
+
+    // Nothing better to hold, so the correction goes in. Dropping the frame
+    // instead would reopen the workspace at the declared default.
+    #[test]
+    fn a_rescued_window_with_no_remembered_frame_records_the_correction() {
+        let session = capture(
+            &WindowSession::default(),
+            &[rescued_snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, 30, 1728, 1084),
+            )],
+        );
+        assert_eq!(
+            session.geometry.get("myws"),
+            Some(&rect(643, 30, 1728, 1084))
+        );
+    }
+
+    // One rescued window must not hold back a workspace it is not on.
+    #[test]
+    fn a_rescue_holds_back_its_own_workspace_and_no_other() {
+        let before = capture(
+            &WindowSession::default(),
+            &[
+                snapshot("main", "http://localhost:3210/myws/", rect(0, 0, 1200, 800)),
+                snapshot(
+                    "window-1",
+                    "http://localhost:3210/dev/",
+                    rect(50, 50, 900, 700),
+                ),
+            ],
+        );
+        let after = capture(
+            &before,
+            &[
+                rescued_snapshot(
+                    "main",
+                    "http://localhost:3210/myws/",
+                    rect(300, 30, 800, 600),
+                ),
+                snapshot(
+                    "window-1",
+                    "http://localhost:3210/dev/",
+                    rect(70, 70, 900, 700),
+                ),
+            ],
+        );
+        assert_eq!(after.geometry.get("myws"), Some(&rect(0, 0, 1200, 800)));
+        assert_eq!(after.geometry.get("dev"), Some(&rect(70, 70, 900, 700)));
     }
 
     // The picker is not a workspace, and neither is a window still on the

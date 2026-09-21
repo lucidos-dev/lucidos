@@ -160,6 +160,7 @@ export type ContextPurpose =
   | 'image_describe'
   | 'memory'
   | 'conversation_summary'
+  | 'query_classification'
   | 'image_gen'
   | 'voice';
 

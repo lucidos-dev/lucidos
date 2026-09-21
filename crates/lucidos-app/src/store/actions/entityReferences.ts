@@ -22,6 +22,7 @@ import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices, getDeviceId } from './devices';
 import { loadWebhookIngress } from './webhookIngress';
+import { loadWebhookRefusals } from './webhookRefusals';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
@@ -376,12 +377,23 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // still counts. The last hook switched off retracts the bar, because a
       // path nothing delivers over cannot be reported as broken.
       void loadWebhookIngress();
+      // And it decides what a standing refusal SAYS. Re-enabling a hook ends
+      // the switched-off fault at once. The bar must not keep telling the user
+      // to turn on what they just turned on.
+      void loadWebhookRefusals();
       break;
     // The public delivery path went down, or came back. Edge-triggered by the
     // engine's 15-minute probe, so a re-read costs one request per outage.
     case 'WebhookIngressDegraded':
     case 'WebhookIngressRecovered':
       void loadWebhookIngress();
+      break;
+    // A hook started throwing away the deliveries that DO arrive, or stopped.
+    // The sibling of the pair above, one layer in: the ingress probe reads a
+    // 401 as healthy, so it cannot see this fault at all.
+    case 'WebhookDeliveriesRefused':
+    case 'WebhookDeliveriesRecovered':
+      void loadWebhookRefusals();
       break;
     // The agent grants a command or tool pattern by writing the allowlist file,
     // which is exactly what the Permissions editors show. Both files bump the

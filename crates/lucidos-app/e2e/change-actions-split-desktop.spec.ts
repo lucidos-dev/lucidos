@@ -5,10 +5,10 @@ import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
 // The close-set actions (Apply + Discard) collapse into a split button — a
 // one-tap Apply face + a caret menu holding Discard — on every viewport. The
-// Diff button lives permanently OUTSIDE that cluster as its own standalone
+// Diff icon lives permanently OUTSIDE that cluster as its own standalone
 // top-level button (it lifts to a row above when the prompt row is too narrow).
 // This spec pins that shape: the split button carries Apply + Discard, Diff is a
-// standalone button, and Diff is never folded into the caret menu.
+// standalone icon, and Diff is never folded into the caret menu.
 //
 // Desktop-only (`-desktop.spec.ts`): the mobile Playwright projects hard-pin
 // their viewport via device emulation, so setViewportSize behaves
@@ -26,8 +26,8 @@ test.describe('Prompt actions row — Apply/Discard split button, standalone Dif
     await expect(banner).toBeVisible({ timeout: 15_000 });
     // The primary face is a one-tap Apply, never behind the menu.
     await expect(banner.locator('.split-button-primary')).toBeVisible();
-    // Diff is a standalone top-level button — never folded into the caret menu.
-    await expect(banner.locator('button:has-text("Diff")')).toBeVisible();
+    // Diff is a standalone top-level icon, never folded into the caret menu.
+    await expect(banner.locator('button[data-role="thread-diff"]')).toBeVisible();
     // Discard is not a top-level button — it folds into the caret menu.
     await expect(banner.locator('button.action-btn-danger')).toHaveCount(0);
 
@@ -52,7 +52,7 @@ test.describe('Prompt actions row — Apply/Discard split button, standalone Dif
       await expect(page.locator('.thread-action-buttons:visible .split-button-primary')).toHaveText(/^Apply$/);
       const menu = await openSplitMenu(page);
       // Diff never appears in the menu; Discard does.
-      await expect(menu.locator('button:has-text("Diff")')).toHaveCount(0);
+      await expect(menu.locator('button[data-role="thread-diff"]')).toHaveCount(0);
       await expect(menu.locator('button:has-text("Discard")')).toBeVisible();
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);
@@ -73,7 +73,7 @@ test.describe('Prompt actions row — Apply/Discard split button, standalone Dif
 
       await expect(page.locator('.thread-action-buttons:visible .split-button-primary')).toHaveText(/^Apply\*$/);
       const menu = await openSplitMenu(page);
-      await expect(menu.locator('button:has-text("Diff")')).toHaveCount(0);
+      await expect(menu.locator('button[data-role="thread-diff"]')).toHaveCount(0);
       await expect(menu.locator('button:has-text("Discard")')).toBeVisible();
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);

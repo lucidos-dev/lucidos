@@ -1150,7 +1150,7 @@ const CHANGES_OPS: &[Operation] = &[
     },
     Operation {
         action: "apply",
-        summary: "Merge the coding-agent branch into main, exactly as the Apply button does; returns status, SHAs and restart_required. ONLY when the user asked. (requires: change_id)",
+        summary: "Merge the coding-agent branch into main, exactly as the Apply button does; returns status, SHAs and restart_required. Refused while its thread is unsettled; the error says what to do. ONLY when the user asked. (requires: change_id)",
         method: Method::Post,
         path: "/changes/:change_id/apply",
         args: &[],

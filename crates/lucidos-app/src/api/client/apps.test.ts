@@ -51,6 +51,36 @@ describe('appUrl', () => {
     // with no target must keep whatever the reader was looking at.
     expect(appUrl('pr-understanding', undefined, '')).not.toContain('#');
   });
+
+  // The device says whose appearance the app's first paint carries. An isolated
+  // frame cannot read that out of the shell's storage. So it rides the URL, and
+  // the engine stamps it onto the app's own `sdk-prefs.js` reference.
+  describe('with a device minted', () => {
+    beforeEach(() => localStorage.setItem('lucidos-device-id', 'cfdb4cbfe6044f8b'));
+    afterEach(() => localStorage.removeItem('lucidos-device-id'));
+
+    it('carries the device', () => {
+      expect(appUrl('pr-understanding')).toContain('?device=cfdb4cbfe6044f8b');
+    });
+
+    it('carries it beside the WIP-preview thread, not instead of it', () => {
+      const url = appUrl('pr-understanding', 'thread-7');
+      expect(url).toContain('thread_id=thread-7');
+      expect(url).toContain('device=cfdb4cbfe6044f8b');
+    });
+
+    it('still puts the fragment last', () => {
+      const url = appUrl('pr-understanding', undefined, 'pr-1645');
+      expect(url.indexOf('device=')).toBeLessThan(url.indexOf('#'));
+      expect(url.endsWith('#pr-1645')).toBe(true);
+    });
+  });
+
+  it('carries no device before one is minted', () => {
+    // A surface with no id sends nothing rather than inventing one, the same
+    // rule `deviceIdHeader` follows. The global preferences then answer.
+    expect(appUrl('pr-understanding')).not.toContain('device=');
+  });
 });
 
 describe('fetchEventTypes', () => {

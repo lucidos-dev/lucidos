@@ -10,12 +10,14 @@
  * decides it (48px at 100% UI scale, 72px at 150%). That number exists only
  * here.
  *
- * It is also live. UI scale is a preference, and the Style Remote can retune the
- * tokens the bar is built from over SSE, so this is pushed again on every apply
- * rather than once at boot. Both call sites already exist for exactly the same
- * reason: `applyUiScale` and `applyStyleOverrides` in `./preferences.ts` each
- * call `clampThreadDrawerWidth()` because the drawer's floor is rem-authored
- * too, and this sits beside it.
+ * It is also live, so the push FOLLOWS THE RENDERED BAND. Four things move that
+ * band: the UI scale, a Style Remote retune, the desktop-to-mobile switch, and
+ * the first frame it is laid out. Each was once a call site to remember. A
+ * measurement taken in a layout the window then left stuck for the rest of the
+ * session, because nothing measured again.
+ *
+ * `watchTitlebarBand` is the one mechanism now, and it is what stops the lights
+ * centring on a bar that is not on screen.
  */
 import { isTauri } from '../../utils/platform';
 import { setTrafficLightOffset } from '../../utils/tauri';
@@ -83,29 +85,66 @@ export function measureHeaderBarHeight(): number | null {
   return bottom < header.offsetHeight - ROUNDING_SLACK_PX ? null : bottom;
 }
 
+/** Whether this window wears the OS buttons. `data-titlebar-overlay` is stamped
+ *  pre-paint by `titlebar_inset_script` and exists nowhere else, so it is the one
+ *  signal that means "this window has native lights". A build without them has
+ *  nothing to place and must not call the command at all. */
+function hasNativeLights(): boolean {
+  return isTauri() && document.documentElement.hasAttribute('data-titlebar-overlay');
+}
+
+/** Keep the shell's placement on the band for as long as this surface is
+ *  mounted. Returns the teardown, so an effect can hand it straight back.
+ *
+ *  TWO SIGNALS, because the lights centre on the band's BOTTOM and that moves in
+ *  two ways. A `ResizeObserver` catches the band's own box, which is what a UI
+ *  scale or a retuned token changes. Its first delivery is the boot push, so a
+ *  band laid out late still reports itself. A window resize catches everything
+ *  ABOVE the band: the reclaimed strip is a flow sibling on desktop, and the
+ *  band covers it on mobile. Crossing the breakpoint therefore moves the bottom
+ *  without resizing the band.
+ *
+ *  Gated on the CLIENT rather than on the lights, which is weaker than the push
+ *  and deliberately so. `data-titlebar-overlay` arrives by an injected eval, and
+ *  a watch declined for a missing attribute is declined for the life of the
+ *  page: the effect runs once. The push re-reads the attribute per observation
+ *  instead, so a late stamp costs one observation rather than every one. */
+export function watchTitlebarBand(): () => void {
+  const band = document.querySelector(TITLEBAR_BAND_SELECTOR);
+  if (!band || !isTauri()) return () => {};
+  const push = (): void => pushTrafficLightOffset();
+  const observer = new ResizeObserver(push);
+  // BORDER-BOX, because that is the box whose bottom edge is being pushed. The
+  // default content box misses a change to the band's own padding or border,
+  // and `.app-header` pads by a safe-area inset. `useHideOnScroll` observes the
+  // same element the same way.
+  observer.observe(band, { box: 'border-box' });
+  window.addEventListener('resize', push);
+  return () => {
+    observer.disconnect();
+    window.removeEventListener('resize', push);
+  };
+}
+
 /** Push the measured bar height to the shell, so it re-centres the traffic
- *  lights on it. No-op unless this is the packaged macOS build: the attribute is
- *  stamped pre-paint by `titlebar_inset_script` and exists nowhere else, so it
- *  is the one signal that means "this window has native lights". A build without
- *  them has nothing to place and must not call the command at all.
+ *  lights on it. The one writer, called by [`watchTitlebarBand`] whenever the
+ *  band could have moved.
  *
  *  Best-effort telemetry carve-out (.claude/rules/frontend.md): nothing here is
- *  user-initiated, and a failure self-heals on the next scale or style apply,
- *  with the shell meanwhile holding the last position it was given. A toast
- *  would report an invisible cosmetic miss to a user who did not ask for
- *  anything. */
+ *  user-initiated, and a failure self-heals the next time the band moves, with
+ *  the shell meanwhile holding the last position it was given. A toast would
+ *  report an invisible cosmetic miss to a user who did not ask for anything. */
 export function pushTrafficLightOffset(): void {
-  if (!isTauri()) return;
-  if (!document.documentElement.hasAttribute('data-titlebar-overlay')) return;
+  if (!hasNativeLights()) return;
   const barHeightPx = measureHeaderBarHeight();
   if (barHeightPx === null || barHeightPx === lastPushedPx) return;
   lastPushedPx = barHeightPx;
   setTrafficLightOffset(barHeightPx).catch((e) => {
     // Give the de-duplication back, or the self-healing above is a lie: a
     // transient IPC failure would otherwise be remembered as a successful push,
-    // and every later apply measuring the SAME bar would skip, leaving the
-    // lights at the last position the shell managed to apply for the rest of
-    // the session. The next apply retries instead.
+    // and every later observation measuring the SAME bar would skip. The lights
+    // would stay at the last position the shell managed to apply, for the rest
+    // of the session. The next observation retries instead.
     lastPushedPx = 0;
     console.warn('[titlebar] traffic-light placement failed', e);
   });

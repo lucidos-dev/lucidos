@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { contentViewKey } from './contentViewKey';
+import { reportNavigation } from '../../utils/navigationMarks';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
@@ -125,6 +126,10 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   useLayoutEffect(() => {
     if (coveredKeyRef.current === viewKey) return;
     coveredKeyRef.current = viewKey;
+    // The content half of the navigation mark, ahead of the cover's own
+    // branches: a view swap is a navigation whether or not anything arrives to
+    // be covered. This effect is already the content-pane navigation edge.
+    reportNavigation('content-view', viewKey);
     // Navigating to nothing (the pane emptying as a thread takes over) has no
     // arriving view, so there is nothing to cover.
     if (viewKey === null) { setCoverKey(null); return; }

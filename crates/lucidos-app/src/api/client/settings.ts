@@ -239,9 +239,42 @@ export async function getPreferences(deviceId?: string): Promise<{ preferences: 
   return { preferences };
 }
 
-export async function setPreference(key: string, value: string, deviceId?: string): Promise<ApiResult> {
-  await lucidos.preferences.set(key, value, deviceId);
-  return { success: true };
+/** Write one preference. A REFUSAL THROWS.
+ *
+ *  It does not delegate to `lucidos.preferences.set`, and that is the point.
+ *  The engine answers a refused write with `200 {success: false, error}` rather
+ *  than a 4xx, and the SDK's `set` discards the body. So every refusal this
+ *  endpoint issues read as a save that worked: a malformed timezone, a bad
+ *  backup cron, an over-long response style.
+ *
+ *  It throws rather than returning the flag so that the shape every caller
+ *  already has is the correct one. A `.catch()`, a `Promise.all` rejection, a
+ *  try/catch: each now sees the refusal it was written for. Returning `false`
+ *  instead would need a new branch at all six call sites. The ones that forgot
+ *  it would keep reporting a refused write as saved.
+ *
+ *  `isTransientFetchError` wants a `TypeError` for transport, so it reads this
+ *  throw as a VERDICT rather than a dropped connection. `deliverNow` therefore
+ *  stops retrying and says why. */
+export async function setPreference(
+  key: string,
+  value: string,
+  deviceId?: string,
+): Promise<ApiResult> {
+  const result: ApiResult = await json(`${API}/preferences?key=${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value, device_id: deviceId }),
+  });
+  if (!result.success) {
+    // A plain Error, deliberately not an `ApiError`. The HTTP call SUCCEEDED,
+    // so there is no status code to carry. `ApiError`'s message reads
+    // `200 <reason>`, putting a success code in front of a refusal.
+    // `isTransientFetchError` wants a TypeError for transport, so this still
+    // reads as the verdict it is and nothing retries it.
+    throw new Error(result.error || `the engine refused the '${key}' preference`);
+  }
+  return result;
 }
 
 // --- Devices ---

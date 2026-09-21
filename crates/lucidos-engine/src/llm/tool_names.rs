@@ -187,6 +187,12 @@ pub const LIST_EVENT_WAITS: &str = "list_event_waits";
 /// had to admit the subscription would re-open it later regardless.
 pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
 
+/// Ask a judgment provider a set of typed questions about one state.
+///
+/// Named for the capability rather than for Jev, because `llm::judgment` is
+/// backend-neutral and a second backend must need no rename.
+pub const JUDGE: &str = "judge";
+
 // Image generation
 pub const GENERATE_IMAGE: &str = "generate_image";
 pub const SAVE_THREAD_IMAGE: &str = "save_thread_image";

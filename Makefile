@@ -1,4 +1,4 @@
-.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-full test-scripts clean clean-all run run-local start stop restart status logs fresh
+.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-gateway test-full test-scripts clean clean-all run run-local start stop restart status logs fresh
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -132,11 +132,11 @@ fmt:
 	cargo fmt --all
 
 # Run tests
-test: test-eval
+test: test-eval test-gateway
 	./scripts/test-engine.sh
 
 # Full test suite
-test-full: test-eval
+test-full: test-eval test-gateway
 	./scripts/test-engine.sh --full
 
 # Run the shell-library unit tests: every scripts/lib/*_test.sh, per-suite pass
@@ -157,6 +157,17 @@ test-scripts:
 # the same as not having written them.
 test-eval:
 	cargo test --locked -p lucidos-eval
+
+# The gateway crate's own unit tests. No Postgres, no Docker, half a second.
+#
+# They ran nowhere in the local gate until now, which is the same as not having
+# written them. `make lint` compiles them under `--all-targets` and then runs
+# none. The device gate lives in this crate, and so does the pin that fires
+# when the engine's public app-asset list and the gateway's stop agreeing. That
+# pin is worth nothing on a suite nobody runs, and its whole job is to catch an
+# edit made on the ENGINE side.
+test-gateway:
+	cargo test --locked -p lucidos-gateway
 
 # Clean build artifacts (preserves workspace artifacts)
 #

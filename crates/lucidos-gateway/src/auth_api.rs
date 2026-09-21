@@ -11,6 +11,10 @@
 //! bare 401 and no way forward. Every API under `/~/api/` is gated except the
 //! two pairing calls and health.
 //!
+//! Under a workspace slug, [`is_public_app_asset`] is the only exemption: the
+//! handful of `/api/v1` files an app frame loads as tags on its own document.
+//! It carries its own reasoning, and the engine holds the matching half.
+//!
 //! An unauthenticated *navigation* is answered with the pairing screen, at the
 //! URL it asked for. Anything else gets 401. [`crate::server::serve_pairing_shell`]
 //! records why the screen is served in place rather than redirected to.
@@ -42,18 +46,20 @@ pub fn router() -> Router<GatewayState> {
 /// Exact-matched, never prefix-matched, so a future `/~/api/v1/health/secrets`
 /// cannot inherit the exemption its parent has.
 pub fn is_public_path(path: &str) -> bool {
-    // A dot segment is never public. Paths arrive un-normalized, so without
-    // this a request like `/~/assets/../api/v1/control/...` reads as a picker
-    // asset. Nothing downstream currently routes such a path to the control
-    // plane, but the exemption list must not be the thing standing in the way.
-    if path.split('/').any(|seg| seg == ".." || seg == ".") {
+    // A dot segment is never public. Paths arrive un-normalized. Without this,
+    // `/~/assets/../api/v1/control/...` reads as a picker asset, and
+    // `/<slug>/api/v1/static/../threads/list` walks out of the app-asset
+    // exemption below onto a data route.
+    if path.split(['/', '\\']).any(is_dot_segment) {
         return false;
     }
     if path == "/" {
         return true;
     }
     let Some(rest) = path.strip_prefix("/~/") else {
-        return false;
+        // Outside the picker's namespace, so this is a workspace path. All of
+        // one is gated except the tags on an app frame's own document.
+        return is_public_app_asset(path);
     };
     if !rest.starts_with("api/") {
         // The picker shell and its bundled assets. Static files only: no
@@ -64,6 +70,80 @@ pub fn is_public_path(path: &str) -> bool {
         rest,
         "api/v1/health" | "api/v1/auth/pair" | "api/v1/auth/session"
     )
+}
+
+/// Is this segment a `.` or `..`, in any spelling a URL parser collapses?
+///
+/// Not a string comparison, because the gateway builds the upstream URL with
+/// `reqwest::Url::parse`, which follows the WHATWG rules. There `%2e` is a dot
+/// and `\` is a segment separator, so `/dev/api/v1/static/%2e%2e/threads/list`
+/// reaches the engine as `/api/v1/threads/list`. A literal-only guard reads
+/// that as an ordinary asset under `/static/` and exempts it, which is an auth
+/// bypass rather than a near miss.
+///
+/// The four double-dot spellings and the two single-dot ones are the parser's
+/// own list. `%2e%2e%2f` is not among them: an encoded slash stays encoded, so
+/// no segment split happens and nothing pops. A double-encoded `%252e` reaches
+/// the engine unchanged, where the two exempt trees hold three exact routes and
+/// no wildcard, so it 404s. Adding a `/static/*path` that decodes would reopen
+/// that half.
+fn is_dot_segment(segment: &str) -> bool {
+    if segment == "." || segment == ".." {
+        return true;
+    }
+    // Only an encoded spelling reaches the allocation below.
+    if !segment.contains('%') {
+        return false;
+    }
+    let spelled_out = segment.to_ascii_lowercase().replace("%2e", ".");
+    spelled_out == "." || spelled_out == ".."
+}
+
+/// The `/api/v1` files an app frame loads as tags, spelled as the engine spells
+/// them. Exact names, so a sibling route cannot inherit the exemption.
+const APP_ASSET_FILES: [&str; 4] = [
+    "/sdk.js",
+    "/sdk-prefs.js",
+    "/sdk-iframe.css",
+    "/sdk-iframe-audio.js",
+];
+
+/// The `/api/v1` sub-trees an app frame loads from. Prefixes, because a font
+/// file and a bundled script are named by the asset rather than listed here.
+const APP_ASSET_TREES: [&str; 2] = ["/fonts/", "/static/"];
+
+/// May an app frame load this with no credential at all?
+///
+/// An app frame runs at an OPAQUE origin (ADR 0227). Its site-for-cookies is
+/// null, so the browser withholds our `SameSite=Lax` device credential from
+/// every subresource the frame's document asks for. Those are `<script>`,
+/// `<link>` and `<font>` tags on the app's own document, and a bridge cannot
+/// carry a tag. Refuse them and every app renders unstyled, with no `lucidos`
+/// global.
+///
+/// Exempt because they carry nothing to protect. Four are the same bytes for
+/// every caller, and `sdk-prefs.js` answers one device's appearance. Everything
+/// that touches the workspace stays gated, over the host bridge instead.
+///
+/// The engine owns the same list, in
+/// `crates/lucidos-engine/src/api/browser_origin.rs::is_public_app_asset`, and
+/// `the_two_halves_of_the_app_asset_exemption_agree` pins the two together. It
+/// sees `/api/v1/sdk.js` where we see `/<slug>/api/v1/sdk.js` (ADR 0014 §4).
+/// `server::fallback` is the other reader: an exempt path must not lazy-start a
+/// stopped workspace for an unpaired caller.
+pub(crate) fn is_public_app_asset(path: &str) -> bool {
+    let Some((slug, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return false;
+    };
+    if slug.is_empty() {
+        return false;
+    }
+    // The leading slash is kept, so `api/v1beta/...` cannot wear the prefix and
+    // the names above are the engine's own spelling.
+    let Some(asset) = rest.strip_prefix("api/v1").filter(|a| a.starts_with('/')) else {
+        return false;
+    };
+    APP_ASSET_FILES.contains(&asset) || APP_ASSET_TREES.iter().any(|t| asset.starts_with(t))
 }
 
 /// Is this request a top-level page load, as opposed to a fetch?
@@ -480,6 +560,166 @@ mod tests {
         // A dot INSIDE a segment is an ordinary filename, not a traversal.
         assert!(is_public_path("/~/assets/index-abc123.js"));
         assert!(is_public_path("/~/..well-known"));
+    }
+
+    #[test]
+    fn an_app_frame_s_own_tags_are_public_under_a_workspace_slug() {
+        // The shape this gateway actually sees. An app frame loads at
+        // `/<slug>/app/<id>/`, and the engine rescopes its root-absolute refs,
+        // so every tag on its document arrives with the workspace prefix on.
+        for path in [
+            "/dev/api/v1/sdk.js",
+            "/dev/api/v1/sdk-prefs.js",
+            "/dev/api/v1/sdk-iframe.css",
+            "/dev/api/v1/sdk-iframe-audio.js",
+            "/dev/api/v1/fonts/fira-code.css",
+            "/dev/api/v1/static/html2canvas.min.js",
+            "/myws/api/v1/sdk.js",
+        ] {
+            assert!(is_public_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn nothing_beside_an_app_tag_inherits_the_exemption() {
+        for path in [
+            // Workspace data, which an app reaches over the host bridge.
+            "/dev/api/v1/threads/list",
+            "/dev/api/v1/data/artifacts/notes.md",
+            "/dev/app/habit-tracker/style.css",
+            // A neighbour of an exempt name is not that name.
+            "/dev/api/v1/sdk.js.map",
+            "/dev/api/v1/sdk.jsx",
+            "/dev/api/v1/sdk-iframe.css.map",
+            // A tree exemption needs the tree, not a route that starts like it.
+            "/dev/api/v1/fonts",
+            "/dev/api/v1/fonts-admin/list",
+            "/dev/api/v1/staticky",
+            // The prefix has to be the whole of `api/v1`, and a slug has to be
+            // there: `/api/v1/sdk.js` names a workspace called `api`.
+            "/dev/api/v1beta/sdk.js",
+            "/api/v1/sdk.js",
+            "//api/v1/sdk.js",
+            "/dev",
+            // A dot segment is never public, whatever it wears.
+            "/dev/api/v1/../control/x",
+            "/dev/api/v1/./sdk.js",
+            "/../dev/api/v1/sdk.js",
+            // The picker's namespace serves no app frame, so it gets no
+            // app-asset exemption on top of the three routes it already has.
+            "/~/api/v1/sdk.js",
+            "/~/api/v1/fonts/fira-code.css",
+        ] {
+            assert!(!is_public_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_tree_exemption_cannot_be_walked_out_of() {
+        // `/fonts/` and `/static/` are prefixes, so they admit a tail, and the
+        // proxy hands that tail to `reqwest::Url::parse`. Every path here is
+        // ordinary-looking to a literal `..` scan and pops the tree off once
+        // the parser sees it. Each assertion states both halves: the gate
+        // refuses it, and the reason it must.
+        for path in [
+            r"/dev/api/v1/static/%2e%2e/threads/list",
+            r"/dev/api/v1/static/%2E%2E/threads/list",
+            r"/dev/api/v1/static/.%2e/threads/list",
+            r"/dev/api/v1/static/%2e./threads/list",
+            r"/dev/api/v1/static/%2e/%2e%2e/threads/list",
+            r"/dev/api/v1/fonts/a/%2e%2e/%2e%2e/credentials",
+            r"/dev/api/v1/static/..\threads/list",
+            r"/dev/api/v1/static/%2e%2e\threads/list",
+        ] {
+            assert!(!is_public_path(path), "{path}");
+
+            // What `proxy::proxy` builds: the slug stripped, the rest appended
+            // to the engine's base. If one of these ever stops escaping, it is
+            // no longer the hostile input this test believes it is.
+            let rest = path.strip_prefix("/dev").expect("a slug-prefixed path");
+            let upstream =
+                reqwest::Url::parse(&format!("http://127.0.0.1:0{rest}")).expect("a parsable url");
+            assert!(
+                !upstream.path().starts_with("/api/v1/static/")
+                    && !upstream.path().starts_with("/api/v1/fonts/"),
+                "{path} was chosen because it escapes its tree, and it resolved to {}",
+                upstream.path()
+            );
+        }
+    }
+
+    #[test]
+    fn a_dot_is_a_dot_in_every_spelling_the_parser_collapses() {
+        for segment in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2e", ".%2e", "%2e."] {
+            assert!(is_dot_segment(segment), "{segment}");
+        }
+        // Three dots is a directory name, and the parser agrees: it collapses
+        // neither of these, so neither may be refused.
+        for segment in ["...", "%2e%2e%2e", "%2e%2e%2f", "a%2eb", "", "%2f"] {
+            assert!(!is_dot_segment(segment), "{segment}");
+        }
+    }
+
+    /// The engine's own copy of the list, read out of its source.
+    ///
+    /// A scan rather than a dependency: the gateway does not link the engine,
+    /// and pulling it in to share two arrays would be the tail wagging the dog.
+    /// `net_config.rs` reads this crate's sources the same way.
+    fn engine_app_asset_literals() -> Vec<String> {
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the gateway crate sits in crates/")
+            .join("lucidos-engine/src/api/browser_origin.rs");
+        let source = std::fs::read_to_string(&engine)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", engine.display()));
+        let body = source
+            .split_once("fn is_public_app_asset")
+            .expect("the engine still defines is_public_app_asset")
+            .1;
+        // Stop at the first line-initial `}`, which closes the function.
+        let body = body.split_once("\n}").expect("a closed function body").0;
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            // The `strip_prefix` argument, which is the nest rather than an
+            // asset. The gateway strips `/<slug>` and then the same prefix.
+            .filter(|literal| *literal != "/api/v1")
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_two_halves_of_the_app_asset_exemption_agree() {
+        // The engine admits these tags and this gateway refuses them, or the
+        // reverse, and an app frame is broken either way. Both must hold the
+        // same list, so adding one on one side alone fails here.
+        let engine = engine_app_asset_literals();
+        assert!(
+            engine.len() >= APP_ASSET_FILES.len(),
+            "the scan read {engine:?}, which is too little to be the real list"
+        );
+
+        // Sorted on both sides, so reordering the engine's `matches!` arms is
+        // not a failure. What has to agree is the set, not the spelling order.
+        let (mut trees, mut files): (Vec<&str>, Vec<&str>) = engine
+            .iter()
+            .map(String::as_str)
+            .partition(|literal| literal.ends_with('/'));
+        files.sort_unstable();
+        trees.sort_unstable();
+        let mut want_files = APP_ASSET_FILES;
+        let mut want_trees = APP_ASSET_TREES;
+        want_files.sort_unstable();
+        want_trees.sort_unstable();
+
+        assert_eq!(
+            files, want_files,
+            "the exact-matched names differ; reconcile with browser_origin.rs"
+        );
+        assert_eq!(
+            trees, want_trees,
+            "the prefix-matched trees differ; reconcile with browser_origin.rs"
+        );
     }
 
     #[test]
@@ -994,6 +1234,42 @@ mod tests {
             .headers()
             .get(crate::server::PAIRING_SHELL_HEADER)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_app_frame_loads_its_tags_with_no_cookie_and_reaches_nothing_else() {
+        // The reported break. An app frame is opaque-origin (ADR 0227), so its
+        // site-for-cookies is null and the browser sends no `SameSite=Lax`
+        // credential with a subresource. Every app rendered unstyled and every
+        // app calling the SDK hung, because each of these 401'd here.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        // What Chrome sends for a stylesheet on an opaque-origin document.
+        let as_a_tag = [
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-dest", "style"),
+        ];
+        for path in [
+            "/dev/api/v1/sdk-iframe.css",
+            "/dev/api/v1/sdk-prefs.js?device=abc123",
+            "/dev/api/v1/sdk.js",
+            "/dev/api/v1/sdk-iframe-audio.js",
+            "/dev/api/v1/fonts/fira-code.css",
+            "/dev/api/v1/static/html2canvas.min.js",
+        ] {
+            let response = get(&state, path, &as_a_tag).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::IM_A_TEAPOT,
+                "{path} must reach the workspace with no credential"
+            );
+        }
+
+        // And nothing beyond them moved. The same cookieless caller asking for
+        // workspace data is still refused, which is the whole device gate.
+        let refused = get(&state, "/dev/api/v1/threads/list", &as_a_tag).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

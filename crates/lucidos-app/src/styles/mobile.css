@@ -1257,6 +1257,25 @@
         height: 100%;
     }
 
+    /* Slack for the keyboard's OWN reveal, and the root-cause half of the
+       focused-field reveal (docs/glossary.md).
+
+       iOS brings a focused field above the keyboard by scrolling its nearest
+       scrollable ancestor. When that ancestor cannot scroll far enough it
+       offsets the whole viewport instead, dragging the fixed header off screen
+       and moving the frame our own measurements are taken in. Padding inside
+       the scroller is what removes the reason to do that.
+
+       --keyboard-band is published by MobileSwipeContainer beside --app-height,
+       and is 0px whenever the keys are down, so no view gains a dead scroll
+       zone. Reasoning and sources:
+       docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md
+
+       `.has-app-ui` is excluded below: it does not scroll at all. */
+    .mobile-swipe-pane .content-pane-body {
+        padding-bottom: var(--keyboard-band, 0px);
+    }
+
     /* Skill UI iframe: content-pane-body must not scroll — the iframe
        handles its own scrolling. Without this, the ::before spacer +
        height:100% skill-ui-inline overflows by the spacer height,
@@ -1265,6 +1284,7 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
+        padding-bottom: 0;
     }
     .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline {
         flex: 1;

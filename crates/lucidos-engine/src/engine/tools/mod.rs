@@ -13,6 +13,7 @@ mod grouped;
 mod http;
 pub(crate) mod image;
 mod import;
+mod judgment;
 mod mcp;
 mod memory;
 mod models;
@@ -228,6 +229,9 @@ impl LucidosEngine {
             }
             tn::HTTP_REQUEST => to_outcome(self.execute_http_tool(args).await),
             tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args).await),
+            // Already an outcome: this handler distinguishes a refusal from a
+            // judgment, so it must not be laundered through `to_outcome`.
+            tn::JUDGE => self.execute_judgment_tool(args).await,
             tn::RELOAD_PROXY_MODULES => to_outcome(self.execute_reload_proxy_modules_tool().await),
             tn::IMPORT_FILE | tn::GIT_CLONE => {
                 to_outcome(self.execute_import_tool(name, args, extraction_ctx).await)
@@ -343,14 +347,14 @@ impl LucidosEngine {
     }
 
     /// Thin wrapper that delegates to the standalone
-    /// [`todo::todo_write_impl`] so tests can drive the validation branches
+    /// [`todo::todo_tool_impl`] so tests can drive the validation branches
     /// without booting a full engine.
     async fn execute_todo_write(
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        todo::todo_write_impl(&self.event_bus, args, thread_id).await
+        todo::todo_tool_impl(&self.event_bus, &self.pool, args, thread_id).await
     }
 
     /// Resolve the turn's originating device into a `MessageOrigin` for
@@ -949,6 +953,20 @@ impl LucidosEngine {
             self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
                 .await?;
         }
+        // The same gate the Apply button asks, because this is the same act.
+        // Without it a chat agent merged a branch whose coding agent was
+        // mid-turn. The Tier 1 in-place merge then reset that worktree under
+        // the running session.
+        let refusal = crate::api::changes::change_action_refusal(
+            self.pool(),
+            change_id,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to check whether this change can apply: {e}"))?;
+        if let Some(refusal) = refusal {
+            return Err(apply_refusal_message(refusal));
+        }
         // The agent in THIS thread drove the apply, so the `ChangeApplied`
         // event (emitted on the *proposing* thread's timeline) deep-links back
         // here. `direction: Parent` fits the dominant flow: a chat thread
@@ -1229,6 +1247,44 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
             | "max_event_trigger_depth"
             | "overflow"
     )
+}
+
+/// The `changes` tool's wording for a refused Apply. Pure, so every branch is
+/// asserted without booting an engine.
+///
+/// It names `apply_when_settled` for ONE refusal, the working thread. A
+/// standing apply drops at once on a parked thread. Naming it there would swap
+/// a refusal the caller can act on for one it cannot.
+pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRefusal) -> String {
+    use crate::api::changes::ChangeActionRefusal as R;
+    match refusal {
+        R::NoFilesLeft => "Error: this change has no file changes left, so there is nothing to \
+             merge. Its branch's commits cancelled out. Tell the user to discard it from the \
+             Changes panel."
+            .to_string(),
+        R::ThreadWorking => {
+            "Error: the coding-agent thread that proposed this change is still working, so Apply \
+             is withheld. It may commit again on the same branch, and applying now would merge a \
+             branch it is still writing to. Use the 'apply_when_settled' action to apply it the \
+             moment that thread finishes."
+                .to_string()
+        }
+        // Deliberately never spells the standing-apply action, not even to
+        // forbid it. A named tool in a negative instruction is still a named
+        // tool. The test beside this asserts the bare absence, rather than
+        // trusting the model to read the "not".
+        R::ThreadParked => {
+            "Error: the thread that proposed this change is parked, on a question, an event wait \
+             or a sub-thread. It wakes on the delivery and may commit again, so Apply is \
+             withheld. Waiting for it will not help either: a standing apply drops at once on a \
+             parked thread. Tell the user, who can answer it or stop the wait, and then apply."
+                .to_string()
+        }
+        R::ActionUnavailable => "Error: the thread that proposed this change does not offer \
+             Apply, and no wait resolves that. Re-read the 'list' action and tell the user what \
+             you found."
+            .to_string(),
+    }
 }
 
 /// Parse a required UUID arg by name. Pure, so the validation branches are

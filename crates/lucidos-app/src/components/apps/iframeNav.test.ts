@@ -1,127 +1,45 @@
 import { describe, it, expect, vi } from 'vitest';
-import { navigateAppIframe, setAppFrameHash, splitFrameSrc } from './iframeNav';
+import { setAppFrameHash, splitFrameSrc } from './iframeNav';
+import { APP_FRAME_ISOLATED } from './appFrameSandbox';
 
-const APP_DOC = 'https://host.example/ws/app/pr-understanding/';
+/**
+ * An app frame is isolated, so the host cannot touch `contentWindow.location`
+ * and asks the frame to move itself instead.
+ *
+ * What that leaves HERE is the request: the right op, the right argument, and
+ * never a `src` mutation. The navigation ITSELF, `location.replace` rather than
+ * a pushed hash and the fragment arithmetic, moved into the frame's own realm
+ * with the code. Its cases moved with it, to
+ * `packages/lucidos-sdk/src/hostOps.test.ts`.
+ */
 
-/** A stub frame whose live URL can drift, the way a real app moves itself with
- *  `history.replaceState`. `replace` writes through, so a test can assert both
- *  where the frame ended up and that the document part never changed. */
-function stubFrame(hash = '') {
-  const location = {
-    href: `${APP_DOC}${hash}`,
-    replace: vi.fn((url: string) => { location.href = url; }),
-  };
-  return {
-    location,
-    replace: location.replace,
-    iframe: { contentWindow: { location } } as unknown as HTMLIFrameElement,
-  };
+/** A stub frame that records what the host posted to it. */
+function stubFrame() {
+  const posted: unknown[] = [];
+  let srcMutated = false;
+  const iframe = {
+    contentWindow: { postMessage: vi.fn((msg: unknown) => { posted.push(msg); }) },
+    get src() { return 'unused'; },
+    set src(_v: string) { srcMutated = true; },
+  } as unknown as HTMLIFrameElement;
+  return { iframe, posted, srcMutated: () => srcMutated };
 }
 
-describe('navigateAppIframe', () => {
-  it('uses contentWindow.location.replace() — never mutates iframe.src', () => {
-    // Setting iframe.src adds an entry to the joint session history per HTML
-    // spec; iOS Safari's edge-swipe-back gesture replays those entries and
-    // restores prior app states under the user's swipe (WebKit #9166). Using
-    // location.replace() updates the iframe URL without extending history.
-    const replaceSpy = vi.fn();
-    let srcMutated = false;
-    const iframe = {
-      contentWindow: { location: { replace: replaceSpy } },
-      get src() {
-        return 'unused';
-      },
-      set src(_v: string) {
-        srcMutated = true;
-      },
-    } as unknown as HTMLIFrameElement;
-
-    const ok = navigateAppIframe(iframe, '/app/notes-app/');
-
-    expect(ok).toBe(true);
-    expect(replaceSpy).toHaveBeenCalledTimes(1);
-    expect(replaceSpy).toHaveBeenCalledWith('/app/notes-app/');
-    expect(srcMutated).toBe(false);
-  });
-
-  it('returns false without throwing when contentWindow is null', () => {
-    // A detached iframe (mid-unmount, removed between layout and effect
-    // flushes) has contentWindow === null. The previous non-null assertion
-    // would throw a TypeError on `.location` that AppUiInline never caught.
-    const iframe = { contentWindow: null } as unknown as HTMLIFrameElement;
-
-    expect(() => navigateAppIframe(iframe, '/x')).not.toThrow();
-    expect(navigateAppIframe(iframe, '/x')).toBe(false);
-  });
+it('the app frame really is isolated, which is what the cases below assume', () => {
+  expect(APP_FRAME_ISOLATED).toBe(true);
 });
 
 describe('setAppFrameHash', () => {
-  it('moves the frame to the fragment without changing its document', () => {
-    // Same document means the browser treats it as a fragment navigation: the
-    // app is not reloaded and `hashchange` fires. It also means no `load`,
-    // which is why the caller must raise no cover.
-    const frame = stubFrame('');
+  it('asks the frame for the fragment, carrying it verbatim', () => {
+    // Verbatim matters for a `?` inside the fragment: it belongs to the
+    // fragment and must not be re-read as a query on either side.
+    const frame = stubFrame();
 
-    expect(setAppFrameHash(frame.iframe, 'pr-1645')).toBe(true);
+    expect(setAppFrameHash(frame.iframe, 'report?tab=files')).toBe(true);
 
-    expect(frame.replace).toHaveBeenCalledWith(`${APP_DOC}#pr-1645`);
-    expect(frame.location.href.split('#')[0]).toBe(APP_DOC);
-  });
-
-  it('replaces rather than pushes, so the joint history stays clean', () => {
-    // A plain `location.hash = …` PUSHES an entry. That is the bug
-    // `navigateAppIframe` exists to avoid: on an iOS PWA the edge-swipe-back
-    // gesture replays those entries.
-    const frame = stubFrame('');
-    let pushed = false;
-    Object.defineProperty(frame.location, 'hash', {
-      get: () => '',
-      set: () => { pushed = true; },
-    });
-
-    setAppFrameHash(frame.iframe, 'pr-1645');
-
-    expect(pushed).toBe(false);
-    expect(frame.replace).toHaveBeenCalledTimes(1);
-  });
-
-  it('moves a frame whose live hash has DRIFTED back onto the target', () => {
-    // The same link clicked twice. PR Understanding reflects its selection back
-    // with `history.replaceState`. By the second click the frame sits on a
-    // different report than the one the link names.
-    const frame = stubFrame('#pr-1700');
-
-    expect(setAppFrameHash(frame.iframe, 'pr-1645')).toBe(true);
-
-    expect(frame.location.href).toBe(`${APP_DOC}#pr-1645`);
-  });
-
-  it('keeps the frame query, so a WIP preview is not dropped', () => {
-    // The WIP-preview thread rides in the query. Rebuilding the URL from the
-    // frame's own href is what keeps it.
-    const frame = stubFrame('');
-    frame.location.href = `${APP_DOC}?thread_id=wip-7#pr-1700`;
-
-    setAppFrameHash(frame.iframe, 'pr-1645');
-
-    expect(frame.location.href).toBe(`${APP_DOC}?thread_id=wip-7#pr-1645`);
-  });
-
-  it('carries a `?` inside the fragment through to the frame', () => {
-    // The `?` belongs to the fragment, so it must not land in the query.
-    const frame = stubFrame('');
-
-    setAppFrameHash(frame.iframe, 'report?tab=files');
-
-    expect(frame.location.href).toBe(`${APP_DOC}#report?tab=files`);
-  });
-
-  it('does nothing when the frame is already on that fragment', () => {
-    // Idempotence is what lets both delivery sites write without fighting.
-    const frame = stubFrame('#pr-1645');
-
-    expect(setAppFrameHash(frame.iframe, 'pr-1645')).toBe(false);
-    expect(frame.replace).not.toHaveBeenCalled();
+    expect(frame.posted).toEqual([
+      { type: 'lucidos:bridge:host', op: 'hash', args: { fragment: 'report?tab=files' } },
+    ]);
   });
 
   it('returns false without throwing when contentWindow is null', () => {

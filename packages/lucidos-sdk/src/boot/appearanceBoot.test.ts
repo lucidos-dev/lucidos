@@ -41,8 +41,12 @@ function setEnv(opts: {
   search?: string;
   prefersLight?: boolean;
   stored?: Record<string, string>;
+  /** What the engine resolved and prepended, for an isolated app frame. */
+  served?: Record<string, string>;
 }) {
   configure({ baseUrl: opts.baseUrl ?? '/myws' });
+  if (opts.served) (globalThis as any).__lucidosPrefs = opts.served;
+  else delete (globalThis as any).__lucidosPrefs;
   rec = { props: {}, order: [], attrs: {}, background: '' };
   store = { ...(opts.stored ?? {}) };
 
@@ -83,6 +87,67 @@ afterEach(() => {
   for (const k of ['document', 'localStorage', 'matchMedia', 'location']) {
     (globalThis as any)[k] = saved[k];
   }
+  delete (globalThis as any).__lucidosPrefs;
+});
+
+/**
+ * An isolated app frame reads none of the shell's storage, so the engine
+ * prepends the values to `sdk-prefs.js` and this script reads them from there.
+ * The shell is seeded with nothing and takes the storage path above, which
+ * every other case in this file already covers.
+ */
+describe('an isolated app frame, served its values', () => {
+  it('paints the served appearance with nothing in storage', () => {
+    setEnv({
+      prefersLight: true,
+      served: { theme: 'dark', 'font-family': 'inter', 'ui-scale': '150' },
+    });
+    applyAppearanceBoot({ styleReset: false });
+
+    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.props['--font-ui']).toContain("'Inter'");
+    expect(rec.props['--user-ui-scale']).toBe('150%');
+  });
+
+  it('the served value beats a stale stored one', () => {
+    // The precedence `appearance.ts` documents for the live re-apply, applied
+    // to first paint so the two cannot disagree for a frame.
+    setEnv({
+      served: { theme: 'light' },
+      stored: { 'ws:myws:lucidos-theme': 'dark' },
+    });
+    applyAppearanceBoot({ styleReset: false });
+
+    expect(rec.attrs['data-theme']).toBe('light');
+  });
+
+  it('a key the engine did not resolve falls back to storage', () => {
+    setEnv({
+      served: { theme: 'dark' },
+      stored: { 'ws:myws:lucidos-ui-scale': '125' },
+    });
+    applyAppearanceBoot({ styleReset: false });
+
+    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.props['--user-ui-scale']).toBe('125%');
+  });
+
+  it('reads the pre-grid scale aliases in the same order the live re-apply does', () => {
+    setEnv({ served: { 'text-size': 'large' } });
+    applyAppearanceBoot({ styleReset: false });
+
+    expect(rec.props['--user-ui-scale']).toBe('125%');
+  });
+
+  it('an empty served value is not a value, and storage answers', () => {
+    setEnv({
+      served: { theme: '' },
+      stored: { 'ws:myws:lucidos-theme': 'light' },
+    });
+    applyAppearanceBoot({ styleReset: false });
+
+    expect(rec.attrs['data-theme']).toBe('light');
+  });
 });
 
 describe('a device with nothing stored', () => {

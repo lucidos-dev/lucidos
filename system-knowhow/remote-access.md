@@ -147,10 +147,12 @@ Five things about it are worth knowing, because each surprises people:
   only this machine reaches one. Every other device goes through the gateway at
   `/<slug>/` and pairs. A bookmark straight at an engine port stops resolving
   from elsewhere, which is the point: it was a way around pairing.
-- **Apps in an *app UI* iframe still act with your authority**, exactly as they
-  did before. They are served same-origin and share the browser's session. An
-  app cannot copy the credential off the machine, but it can still call the API
-  as you.
+- **Apps still act with your authority**, though no longer with your realm. An
+  app frame runs at an opaque origin and reaches the engine only through the
+  host. The host forwards a named set of `/api/v1` sub-trees and stamps your
+  device on each one. So an app cannot read the shell, its storage or another
+  app, and it cannot copy the credential off the machine. Within those sub-trees
+  it still calls the API as you.
 
 ### Still do not put Lucidos on the open internet
 

@@ -4,6 +4,7 @@ pub mod anthropic_wire;
 /// `docs/temporary-measures.md`.
 pub(crate) mod cache_probe;
 pub mod image;
+pub mod judgment;
 pub mod mock;
 pub mod model_registry;
 pub mod openai;
@@ -23,6 +24,10 @@ pub use anthropic::{
     resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource, AnthropicProvider,
 };
 pub use image::{ImageProvider, ImageSize};
+pub use judgment::{
+    Answers, ChoiceAnswer, JevProvider, Judgment, JudgmentProvider, NoulCriteria, Question,
+    JEV_DEFAULT_MODEL,
+};
 pub use model_registry::{ModelRegistry, ProviderKind};
 pub use openai::{
     resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,

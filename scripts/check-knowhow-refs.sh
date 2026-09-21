@@ -96,6 +96,11 @@ NOT_AN_ENGINE_EVENT = {
     "ThreadEvent",
     "WorkspaceAuditCompleted",
     "WorkspaceLearningCompleted",
+    # Browser types the isolated-app-frame check names, because the failure it
+    # hunts for is what the browser throws or refuses.
+    "EventSource",
+    "SecurityError",
+    "TypeError",
 }
 
 problems = []

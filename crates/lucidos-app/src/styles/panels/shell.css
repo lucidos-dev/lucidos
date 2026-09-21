@@ -56,7 +56,8 @@
    family. */
 .backup-reminder,
 .connection-banner,
-.ingress-banner {
+.ingress-banner,
+.refusal-banner {
     flex: none;
     display: flex;
     align-items: center;
@@ -150,23 +151,31 @@
    the first place.
 
    No dot. The .status-dot scale is the connection light's vocabulary, and this
-   bar says nothing about whether THIS client can reach the workspace. */
-.ingress-banner {
+   bar says nothing about whether THIS client can reach the workspace.
+
+   The refusal bar joins it on every rule below, because it reports the same
+   thing one layer in: a delivery that reached the workspace and was thrown
+   away. Two copies of these declarations is how the pair drifts apart. */
+.ingress-banner,
+.refusal-banner {
     background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
     line-height: var(--banner-line-height);
 }
 
 /* Takes the slack so the button sits at the trailing edge, and wraps rather
-   than truncating: the sentence names the address family, which is the one
-   thing a half-read version would drop. */
-.ingress-banner-text {
+   than truncating. The ingress sentence names the address family and the
+   refusal sentence names the hook, and a half-read version drops exactly the
+   thing the reader needs. */
+.ingress-banner-text,
+.refusal-banner-text {
     flex: 1;
     min-width: 0;
 }
 
 /* The headline at full strength, so the sentence after it reads as the
    explanation. Matches the connection bar's treatment of the same two halves. */
-.ingress-banner b {
+.ingress-banner b,
+.refusal-banner b {
     font-weight: 600;
     color: var(--accent-red);
 }
@@ -174,7 +183,8 @@
 /* The button keeps its width against a wrapping sentence. .action-btn sets
    white-space: nowrap and a 3.5rem min-width, so a shrinking flex item would
    clip its own label rather than wrap it. */
-.ingress-banner .action-btn {
+.ingress-banner .action-btn,
+.refusal-banner .action-btn {
     flex: none;
 }
 

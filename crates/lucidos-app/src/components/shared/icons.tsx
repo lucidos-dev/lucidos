@@ -214,32 +214,31 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
-/** A horseshoe MAGNET, poles UP: the *standing follow*'s toggle, in the
+/** A horseshoe MAGNET over the LIVE EDGE: the *standing follow*'s toggle, in the
  *  prompt area. It says stick to the live edge, where the chevron beside it
- *  says go there once.
+ *  says go there once. NOT `DownloadIcon`, worn one row above, and NOT
+ *  `ChevronDownIcon`, which the scroll button keeps: that one NAVIGATES to
+ *  the bottom, this one STAYS there. A labelled menu item can share a mark.
+ *  An icon-only toggle cannot.
  *
- *  It was an arrow coming down onto a line, and that glyph is `DownloadIcon`.
- *  The two are not far apart: Download wears it on the thread header's
- *  "Download thread" row, one row above this composer. A labelled menu item can
- *  carry a shared mark. An icon-only toggle cannot, so the toggle is the one
- *  that moved.
+ *  POLES DOWN, over a line, after both free-floating orientations failed at
+ *  this size. A horseshoe is read from its inner void and its two pole bands,
+ *  and both close up that small, so the bands are gone.
  *
- *  Deliberately NOT `ChevronDownIcon`, which the scroll button keeps. Those two
- *  stopped being one button precisely because they cannot be: the chevron
- *  NAVIGATES to the bottom, this one STAYS there.
+ *  A DETACHED LINE UNDER AN ARCH IS THE RAINBOW GLYPH, and an open-legged
+ *  version of this was reported as one. The shut pole ends tell the two arcs
+ *  apart from rainbow bands. Widen the 2-unit gap, or reopen the poles, and
+ *  the glyph goes back there.
  *
- *  No inline size, unlike the two chevrons above. This renders inside
- *  `.icon-btn`, whose class sizes the svg and whose rule bans an inline size
- *  for that reason (see `FullResponseIcon`). Poles UP is a legibility call.
- *  Inverted, the bands land beside the leg ends and smudge into one foot,
- *  the failure `CollapseTurnIcon` records. Up, they sit against open space
- *  and stay separate down to 14px. */
+ *  INK IS 0.750 OF THE BOX on both axes, the fraction this row's other glyphs
+ *  land. That is the GEOMETRIC extent, stroke excluded. With the stroke it is
+ *  0.833, and so is every neighbour. No inline size either: `.icon-btn` sizes
+ *  the svg and its rule bans one (see `FullResponseIcon`). */
 export function FollowLiveEdgeIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M4 4v8a8 8 0 0 0 16 0V4h-5v8a3 3 0 0 1-6 0V4z"/>
-      <path d="M4 8h5"/>
-      <path d="M15 8h5"/>
+      <path d="M4 17v-6a8 8 0 0 1 16 0v6h-5v-6a3 3 0 0 0-6 0v6z"/>
+      <path d="M3 21h18"/>
     </svg>
   );
 }
@@ -393,14 +392,25 @@ export function FileIcon({ size = '1rem' }: { size?: string }) {
   );
 }
 
-/** Unified-diff glyph: a `+` line over a `-` line. Toggle counterpart to FileIcon. */
+/** Unified-diff glyph: an added line, a context line, a removed line. Toggle
+ *  counterpart to FileIcon.
+ *
+ *  THREE rows, not two. The `+` and `-` pair sat across the middle third of the
+ *  box and read as squat. The report on the composer's Diff button named
+ *  exactly that. A hunk is the smallest shape saying "diff" rather than "two
+ *  lines", and it fills the box.
+ *
+ *  The middle row carries no marker on purpose. An unmarked gutter IS what a
+ *  context line looks like, and marking all three would say every line
+ *  changed. */
 export function DiffIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="5" y1="6" x2="5" y2="10" /><line x1="3" y1="8" x2="7" y2="8" />
-      <line x1="10" y1="8" x2="21" y2="8" />
-      <line x1="3" y1="16" x2="7" y2="16" />
-      <line x1="10" y1="16" x2="21" y2="16" />
+      <line x1="5" y1="3" x2="5" y2="7" /><line x1="3" y1="5" x2="7" y2="5" />
+      <line x1="10" y1="5" x2="21" y2="5" />
+      <line x1="10" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="19" x2="7" y2="19" />
+      <line x1="10" y1="19" x2="21" y2="19" />
     </svg>
   );
 }

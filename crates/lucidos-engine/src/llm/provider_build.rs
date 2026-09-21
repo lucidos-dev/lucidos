@@ -133,7 +133,11 @@ impl Default for ProviderSwitches {
 }
 
 /// One switch's value: on unless the stored preference explicitly says off.
-fn switch_is_on(stored: Option<&str>) -> bool {
+///
+/// Shared with `llm::judgment::select`, whose TypeSafe master switch is not one
+/// of the six and still has to read the same vocabulary. Two spellings of "off"
+/// would make one Settings toggle behave unlike the rest of the page.
+pub(crate) fn switch_is_on(stored: Option<&str>) -> bool {
     !stored.is_some_and(reads_as_false)
 }
 
@@ -1477,6 +1481,16 @@ mod tests {
                 ANTHROPIC_FALLBACK_SEARCH_MODEL
             ),
             "claude-fable-5"
+        );
+        // A point release keeps its trailing `-1` when the suffix comes off.
+        assert_eq!(
+            search_model_for(
+                &registry,
+                crate::llm::ProviderKind::Anthropic,
+                "claude-fable-5-1[1m]",
+                ANTHROPIC_FALLBACK_SEARCH_MODEL
+            ),
+            "claude-fable-5-1"
         );
     }
 

@@ -91,6 +91,7 @@ pub(crate) fn build_capture_sections(
     mcp_stopped_context: &str,
     setup_reminder: &str,
     thread_depth_context: &str,
+    todo_list_block: &str,
     user_message: &str,
     tail: &super::turn_tail::TurnTail<'_>,
     loaded_knowhow_docs: &[LoadedKnowhow],
@@ -117,7 +118,7 @@ pub(crate) fn build_capture_sections(
         })
     };
 
-    let labeled: [LabeledSection; 19] = [
+    let labeled: [LabeledSection; 20] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -209,6 +210,12 @@ pub(crate) fn build_capture_sections(
         LabeledSection {
             name: "Thread Depth",
             content: thread_depth_context,
+            role: ContextRole::User,
+            group: Some("System notices"),
+        },
+        LabeledSection {
+            name: "Todo List",
+            content: todo_list_block,
             role: ContextRole::User,
             group: Some("System notices"),
         },

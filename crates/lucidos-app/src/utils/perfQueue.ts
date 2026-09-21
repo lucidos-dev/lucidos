@@ -11,13 +11,23 @@
  *
  *  DEFAULT OFF. `recordPerfSample` is a no-op unless perf recording is enabled,
  *  so a shipping build emits no `[Client/perf]` log lines and does no batching /
- *  network. Enable it at runtime (no reload) from the PWA devtools console with
- *  `localStorage.setItem('lucidos:perf','1')` (and `removeItem` to stop) — flip
- *  it on to re-measure thread open / render / linkify cost or confirm a
- *  regression, off the rest of the time. Read live per sample (cheap, only a
- *  handful of calls per render) so a same-tab flip takes effect immediately. */
+ *  network. Flip it on to measure a reported lag, off the rest of the time.
+ *
+ *  ENABLE IT FROM Settings → System → Debugging, which is the only path that
+ *  arms everything at once. It calls `setPerfEnabled`, which converges the gate
+ *  and starts the probes that own a timer (`utils/mainThreadStall.ts`).
+ *
+ *  `localStorage.setItem('lucidos:perf','1')` from a console still works, and
+ *  is a step behind. The gate is read live, so samples start at once. A
+ *  timer-owning probe only learns on the next gate read, or on the next return
+ *  to the foreground. Nothing can observe a same-document storage write: the
+ *  `storage` event fires only for OTHER documents. Prefer the toggle. */
 
-import { API } from '../api/client';
+// Straight from `basePath` rather than through the `api/client` barrel. This
+// module is on the boot path (`utils/perfProbe` takes it at startup) and needs
+// one constant, which `api/client/_core.ts` only re-exports from here anyway.
+// Same reasoning as `utils/clientLog.ts`, which stays a leaf for it.
+import { API } from './basePath';
 
 interface PerfSample {
   message: string;
@@ -58,28 +68,86 @@ export function isPerfEnabled(): boolean {
   }
 }
 
+/** Who wants telling when the gate flips. See `onPerfEnabledChange`. */
+const gateListeners = new Set<(on: boolean) => void>();
+
+/** Run something whenever perf recording is switched on or off.
+ *
+ *  Every OTHER reader of the gate is pull-based: `recordPerfSample` asks on each
+ *  call, which costs one `localStorage` read and needs no notification. A probe
+ *  that owns a TIMER cannot work that way. Polling for the flip means running
+ *  the very timer the gate exists to keep unscheduled, so default-off would mean
+ *  "recording nothing" rather than "doing nothing".
+ *
+ *  Returns its own unsubscribe. A listener that throws is swallowed, on the
+ *  fire-and-forget contract above: a diagnostic must not break the toggle. */
+export function onPerfEnabledChange(listener: (on: boolean) => void): () => void {
+  gateListeners.add(listener);
+  return () => { gateListeners.delete(listener); };
+}
+
 /** Turn perf recording on (`'1'`) or off (remove the key) for THIS device. Live —
  *  a same-tab flip takes effect on the next sample, no reload. Safe (and a no-op)
  *  where storage is unavailable; toggling diagnostics must never throw. */
 export function setPerfEnabled(on: boolean): void {
   try {
-    if (typeof localStorage === 'undefined') return;
-    if (on) localStorage.setItem(PERF_FLAG_KEY, '1');
-    else localStorage.removeItem(PERF_FLAG_KEY);
+    if (typeof localStorage !== 'undefined') {
+      if (on) localStorage.setItem(PERF_FLAG_KEY, '1');
+      else localStorage.removeItem(PERF_FLAG_KEY);
+    }
   } catch {
     /* storage unavailable — toggling perf telemetry must never throw */
   }
+  // Converge on what PERSISTED, never on what was asked for. A `setItem` that
+  // throws, on blocked storage or a full quota, would otherwise announce "on"
+  // while the gate every reader consults stays off. The stall probe would then
+  // hold an interval that can record nothing.
+  perfRecordingOn();
 }
 
-/** Whether perf recording is on. Honors the test override, else the live flag. */
-function perfEnabled(): boolean {
-  if (perfEnabledOverride !== null) return perfEnabledOverride;
-  return isPerfEnabled();
+/** Tell the timer-owning probes the gate moved. Never throws. */
+function notifyGate(on: boolean): void {
+  for (const listener of gateListeners) {
+    try {
+      listener(on);
+    } catch {
+      /* a diagnostic listener must not break the toggle that called it */
+    }
+  }
 }
 
-/** Test-only: force the gate on/off, or `null` to defer to localStorage. */
+/** Whether perf recording is on. Honors the test override, else the live flag.
+ *
+ *  THE gate every recording path asks, and the reason it is exported: a caller
+ *  that skips work when recording is off must agree with `recordPerfSample`
+ *  about whether it is. `isPerfEnabled` is the raw storage read, and it ignores
+ *  the test override. A caller reaching for that one is untestable, and can
+ *  disagree with the queue it feeds. */
+export function perfRecordingOn(): boolean {
+  const on = perfEnabledOverride !== null ? perfEnabledOverride : isPerfEnabled();
+  // Reading the gate is also where a CHANGE is noticed, because the flag moves
+  // by routes that call nothing. The module header documents a bare
+  // `localStorage.setItem` from a console, and another tab's write lands here
+  // as storage alone. `announcedGate` is updated before the listeners run, so a
+  // listener that records a sample re-enters to no edge and stops.
+  if (announcedGate !== on) {
+    announcedGate = on;
+    notifyGate(on);
+  }
+  return on;
+}
+
+/** The gate value the listeners were last told about, or null before any read. */
+let announcedGate: boolean | null = null;
+
+/** Test-only: force the gate on/off, or `null` to defer to localStorage.
+ *
+ *  Notifies the gate listeners for a forced boolean, so a timer-owning probe can
+ *  be driven from a test without a localStorage environment. `null` hands the
+ *  decision back and announces nothing, having settled nothing. */
 export function _setPerfEnabledForTesting(value: boolean | null): void {
   perfEnabledOverride = value;
+  perfRecordingOn();
 }
 
 /** Keep only the newest `cap` entries (drop the oldest). Pure — unit-tested. */
@@ -91,6 +159,9 @@ export function trimToCap<T>(buf: T[], cap: number): T[] {
  *  sample nor a live timer leaks from one test into the next. Not part of the
  *  runtime surface. */
 export function _resetPerfQueueForTesting(): void {
+  // The announced gate goes too, or the next test's first read sees no edge and
+  // never tells the probes.
+  announcedGate = null;
   buffer = [];
   if (timer !== null) {
     clearInterval(timer);
@@ -110,7 +181,7 @@ export function recordPerfSample(message: string, data: Record<string, unknown>)
   // Default-off gate (single chokepoint for every mark) — no buffer, timer, or
   // flush unless perf recording is enabled. See the module header for how to flip
   // it on. Kept inside the fire-and-forget contract: the gate itself never throws.
-  if (!perfEnabled()) return;
+  if (!perfRecordingOn()) return;
   try {
     buffer.push({ message, data });
     if (buffer.length > HARD_CAP) buffer = trimToCap(buffer, HARD_CAP);

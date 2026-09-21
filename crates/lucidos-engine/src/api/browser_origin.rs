@@ -48,17 +48,23 @@
 //! therefore costs a browser its direct route to this port, which is the ADR
 //! 0096 posture. It no longer costs the API its privacy.
 
-//! # An app iframe passes, deliberately
+//! # An app iframe is refused here, and reaches the API another way
 //!
-//! Apps are served from the engine's own origin, so an SDK call from inside one
-//! reads as `same-origin`. That is the shipped contract: apps keep the user's
-//! authority, and ADR 0144 records why. The gateway's control plane refuses an
-//! app-iframe `Referer`, and copying that here would break every app.
+//! An app frame runs at an opaque origin (ADR 0227), so everything it asks for
+//! reads as `cross-site` and this gate refuses it. That is the intent. Its SDK
+//! calls go over the host bridge, which asks from the shell's own origin and
+//! passes here like any other shell request.
 //!
-//! A handful of routes refuse one anyway, per route rather than per surface.
-//! They are the ones that hand back a stored secret, and they live behind
-//! [`super::secret_reveal`]. Adding a route that returns a secret or a key
-//! means putting it there, not widening this gate.
+//! Apps keep the user's authority, which ADR 0144 records and the bridge
+//! preserves. What changed is the route, not the reach.
+//!
+//! One exemption: [`is_public_app_asset`], the `<script>` and `<link>` tags on
+//! the app's own document. A bridge cannot carry a tag.
+//!
+//! A handful of routes refuse a caller anyway, per route rather than per
+//! surface. They are the ones that hand back a stored secret, and they live
+//! behind [`super::secret_reveal`]. Adding a route that returns a secret or a
+//! key means putting it there, not widening this gate.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -144,12 +150,39 @@ pub(super) fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
     url.scheme() == "https" && url.port().is_none() && origin_host.eq_ignore_ascii_case(host)
 }
 
+/// The `/api/v1` assets an app frame loads as SUBRESOURCES of its own document.
+///
+/// An app frame has an opaque origin (ADR 0227), so every request it makes reads
+/// as `cross-site` and the gate above refuses it. Its API calls are meant to be
+/// refused: they go through the host bridge instead, which asks from the shell's
+/// own origin. These do not go through anything. They are `<script>`, `<link>`
+/// and `<font>` on the app's own document, and a bridge cannot carry a tag.
+///
+/// Exempt because they carry nothing to protect. Four are the same bytes for
+/// every caller and ship on the public mirror. `sdk-prefs.js` is the one that
+/// varies: with a `?device=`, it answers that device's theme, font and UI scale.
+/// A caller who has guessed a device uuid learns an appearance, which is the
+/// whole of it. Nothing here reads or writes workspace data.
+///
+/// `/app/*` and `/data/*` need no entry: both are nested outside `/api/v1`, so
+/// this gate never sees them.
+fn is_public_app_asset(path: &str) -> bool {
+    // An inner router sees the path with the nest prefix stripped, a direct
+    // caller with it on. Accept either rather than depend on which.
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    matches!(
+        path,
+        "/sdk.js" | "/sdk-prefs.js" | "/sdk-iframe.css" | "/sdk-iframe-audio.js"
+    ) || path.starts_with("/fonts/")
+        || path.starts_with("/static/")
+}
+
 /// Refuse a browser request that came from another origin.
 ///
 /// Layered over the whole `/api/v1` surface, so it runs before routing, and
 /// before any handler resolves a credential or touches the database.
 pub async fn enforce(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    if browser_request_allowed(req.headers()) {
+    if is_public_app_asset(req.uri().path()) || browser_request_allowed(req.headers()) {
         return next.run(req).await;
     }
     // A silent 403 in front of every route is undebuggable from the client
@@ -210,10 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn an_app_iframe_passes() {
-        // Apps are same-origin with the engine and call the API through the
-        // SDK. Refusing them here would break every app. The routes that hand
-        // back a secret refuse one on their own, in `api::secret_reveal`.
+    fn an_app_in_its_own_tab_passes() {
+        // A standalone app tab is a top-level document on the engine's origin,
+        // and calls the API through the SDK. Refusing it here would break every
+        // app opened that way. The routes that hand back a secret refuse it on
+        // their own, in `api::secret_reveal`. An app FRAME is cross-site and
+        // reaches the engine through the host instead, so its own requests get
+        // no further than the exemption below.
         let h = hm(&[
             ("host", "localhost:5173"),
             ("origin", "https://localhost:5173"),
@@ -377,5 +413,44 @@ mod tests {
             "http://name.ts.net:443",
             "name.ts.net"
         ));
+    }
+
+    #[test]
+    fn an_app_frames_own_subresources_are_exempt() {
+        // An app frame is opaque-origin, so every request it makes reads as
+        // cross-site. Its API calls SHOULD be refused, because they go through
+        // the host bridge instead. A `<script src>` on its own document cannot.
+        for path in [
+            "/sdk.js",
+            "/sdk-prefs.js",
+            "/sdk-iframe.css",
+            "/sdk-iframe-audio.js",
+            "/fonts/fira-code.css",
+            "/static/html2canvas.min.js",
+        ] {
+            assert!(is_public_app_asset(path), "{path}");
+            assert!(
+                is_public_app_asset(&format!("/api/v1{path}")),
+                "/api/v1{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_carrying_workspace_data_is_exempt() {
+        // The exemption is for bytes that are the same for everyone. A route
+        // that reads or writes the workspace stays behind the gate, and an app
+        // reaches it through the bridge, from the shell's own origin.
+        for path in [
+            "/threads/list",
+            "/data",
+            "/preferences",
+            "/credentials",
+            "/events/emit",
+            "/sdk.js.map",
+            "/fonts",
+        ] {
+            assert!(!is_public_app_asset(path), "{path}");
+        }
     }
 }

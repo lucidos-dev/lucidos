@@ -1,7 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -10,7 +10,7 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
 import { setComposeSelectionFromServer } from '../composeSelections';
 import { fetchThreads, fetchThreadById, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
-import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
+import type { ThreadSummary, ThreadEventRow, ThreadEventsSnapshot } from '../../api/threads';
 import { isTransientFetchError } from '../../api/client';
 import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
@@ -915,11 +915,20 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
 
   // Perf: stamp the open-start for the `thread-render` mark, the moment the
   // focused thread's real event load begins. ThreadView reads and clears it on
-  // first content render to measure open-to-paint. Gated to the focused thread,
-  // so loadAllThreads' eager loads of non-focused threads leave no stale marks
-  // that would later fire a multi-minute renderMs. Covers both the click case
-  // and cold start. See utils/threadOpenMarks.ts. Fire-and-forget telemetry.
-  if (threadId === focusedThreadId.value) markThreadOpenStart(threadId, currentPerfBaseline());
+  // first content render to measure open-to-paint. Fire-and-forget telemetry;
+  // see utils/threadOpenMarks.ts.
+  //
+  // This is the COLD half, and it must stay under the `eventsLoaded` return.
+  // A thread whose events are in memory leaves through that return, so every
+  // resync reaching here is not an open. `focusThread` owns the warm half, on
+  // the focus transition, which is the only thing that makes one.
+  //
+  // Gated to the focused thread, so loadAllThreads' eager loads of non-focused
+  // threads leave no stale marks that would later fire a multi-minute renderMs.
+  // Always cold by construction: a fetch is about to start.
+  if (threadId === focusedThreadId.value) {
+    markThreadOpenStart(threadId, { ...currentPerfBaseline(), warm: false });
+  }
 
   // Clear any prior failure so the UI shows the loading state again
   if (thread.eventsLoadFailed) {
@@ -938,7 +947,7 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         // dominates on a big coding-agent thread. Fire-and-forget. The grouping
         // half is measured separately in ThreadView. See utils/perfQueue.ts.
         const fetchStart = performance.now();
-        const snapshot = await fetchThreadEvents(threadId);
+        const snapshot = await fetchThreadEvents(threadId, { limit: THREAD_EVENTS_PAGE_SIZE });
         const fetchMs = performance.now() - fetchStart;
         // The rows are applied straight through, and nothing here may raise
         // the skeleton ahead of the delay gate. Doing so shows a loader
@@ -952,6 +961,15 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         const applyStart = performance.now();
         applyEventRows(threadMap.value, threadId, current, snapshot.events, snapshot.currentAggregate);
         const applyMs = performance.now() - applyStart;
+        noteHistoryFloor(current, snapshot);
+        // The FORWARD watermark, which a page cannot supply. `applyEventRows`
+        // raised `lastDbSeq` to the page's own highest sequence. A sequence can
+        // run against the clock, so an unseen older row may hold a higher one.
+        // The next delta would then refetch history and replay it through the
+        // live path. The server sends the thread's true maximum for this.
+        if (snapshot.maxSequence !== undefined) {
+          current.lastDbSeq = Math.max(current.lastDbSeq, snapshot.maxSequence);
+        }
         current.eventsLoaded = true;
         // Cleared here, not only at claim time. Another attempt can have set it
         // while this one was in flight. `eventsLoaded && eventsLoadFailed` then
@@ -965,13 +983,19 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
           channel: current.meta.channel,
           fetchMs: Math.round(fetchMs),
           applyMs: Math.round(applyMs),
+          // Whether this open was a page or the whole thread. A slow open of a
+          // paged thread and a slow open of a short one are different findings.
+          paged: current.hasOlderEvents,
         });
         // Unconditional, unlike the refresh's ownership-gated clear: a load
         // SUCCEEDING is terminal. It just set `eventsLoaded`, so no card may go
         // on claiming this device never got the thread's history. BOTH
-        // surfaces, because this fetch carries no `after` and returned the whole
-        // snapshot. It strictly subsumes a refresh, and a refresh card really
-        // does race a full load.
+        // surfaces, because this fetch took the NEWEST page and a refresh only
+        // ever brings what is newer than `lastDbSeq`. It therefore subsumes a
+        // refresh, and a refresh card really does race a load.
+        //
+        // Newest, not whole, is the whole of the argument. Paging bounds how far
+        // BACK this carries and changes nothing about how far forward.
         //
         // Claiming the refresh high-water mark makes that subsumption hold over
         // TIME rather than at this instant. A refresh that started before this
@@ -982,11 +1006,11 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         // would re-admit a third attempt sitting between them.
         lastRefreshReport.set(threadId, Math.max(lastRefreshReport.get(threadId) ?? 0, attemptToken));
         forgetThreadEventsFailures(threadId);
-        // Same subsumption, applied to the stale mark: this snapshot carries no
-        // `after`, so it holds everything a refresh would have brought and the
-        // thread is no longer behind. Gated rather than unconditional, because a
-        // mark raised while this load was in flight describes a gap this snapshot
-        // may predate (see `staleMarkedAtToken`).
+        // Same subsumption, applied to the stale mark: this snapshot took the
+        // newest page, so it holds everything a refresh would have brought and
+        // the thread is no longer behind. Gated rather than unconditional,
+        // because a mark raised while this load was in flight describes a gap
+        // this snapshot may predate (see `staleMarkedAtToken`).
         clearStaleMark(threadId, attemptToken);
         return;
       } catch (err) {
@@ -1469,6 +1493,196 @@ export function _applyEventRowsForTest(
   rows: ThreadEventRow[],
 ): void {
   applyEventRows(map, thread.meta.id, thread, rows, null);
+}
+
+/** How many events one page of history carries.
+ *
+ *  Sized against what the transcript actually paints. `ThreadView` seeds its
+ *  window from a step budget, and the tail it shows is well under this. So a
+ *  page covers the first screen with room to scroll before a backfill is owed.
+ *
+ *  It is also what a SHORT thread never notices. The median thread here is 198
+ *  events, so the overwhelming majority arrive whole in one response, exactly
+ *  as they did before paging existed. */
+export const THREAD_EVENTS_PAGE_SIZE = 400;
+
+/** Record how far back this response loaded, and whether more remain.
+ *
+ *  The same reading serves a first page and a backfill: each response's oldest
+ *  row is the new floor. An unpaged read reports no `hasMore`, so a thread
+ *  served whole settles on "nothing older" and never asks again. */
+function noteHistoryFloor(thread: ThreadState, snapshot: ThreadEventsSnapshot): void {
+  const oldest = snapshot.events[0];
+  if (oldest) thread.historyFloor = { created: oldest.created, sequence: oldest.sequence };
+  thread.hasOlderEvents = snapshot.hasMore === true;
+}
+
+/** Put a page of OLDER events in front of the ones already held.
+ *
+ *  Deliberately not `applyEventRows`. That walks `handleEvent`, which is the
+ *  live path: it moves `updatedAt`, clears the streaming buffer and claims
+ *  caller utterances. Every one of those is latest-wins, so replaying history
+ *  through it would drag the thread's state back to where it was hours ago.
+ *
+ *  It REPLACES the Map rather than inserting, which the contract in
+ *  `handleEvent` requires: `groupIntoExchangesCached` memoises on the Map
+ *  object and detects new work by size plus insertion-order suffix. Rows
+ *  arriving at the end but belonging at the start would be read as a suffix,
+ *  and serve stale exchanges with no failure signal. A fresh Map misses the
+ *  WeakMap and rebuilds cleanly. */
+function prependEventRows(thread: ThreadState, rows: ThreadEventRow[]): void {
+  if (rows.length === 0) return;
+  const merged = new Map<number, StoredEvent>();
+  for (const row of rows) {
+    if (thread.events.has(row.sequence)) continue;
+    merged.set(row.sequence, storedFromRow(row));
+  }
+  if (merged.size === 0) return;
+  for (const [seq, stored] of thread.events) merged.set(seq, stored);
+  thread.events = merged;
+}
+
+/** One row in the shape `handleEvent` stores, and it must stay that shape.
+ *  `created` and `_eventId` land after the payload spread, so a payload key of
+ *  either name cannot shadow the row's own. */
+function storedFromRow(row: ThreadEventRow): StoredEvent {
+  return {
+    type: row.event_type,
+    ...row.payload,
+    created: row.created,
+    ...(row.event_id ? { _eventId: row.event_id } : {}),
+  } as StoredEvent;
+}
+
+/** The history read in flight for a thread, so a second one waits rather than
+ *  racing or giving up.
+ *
+ *  Two readers want older events: the scroll-up backfill, and the whole-thread
+ *  load a deep link needs. A plain busy-flag let the second SKIP, which left a
+ *  deep link pointing at history nobody went on to fetch. */
+const historyReadInFlight = new Map<string, Promise<void>>();
+
+/** Test-only: forget every queued history read, so one test's unresolved fetch
+ *  cannot block the next test's chain forever. */
+export function _resetHistoryReadsForTesting(): void {
+  historyReadInFlight.clear();
+}
+
+/** Is a read of this thread's history already running?
+ *
+ *  `loadOlderThreadEvents` refuses one while another is, and reports that
+ *  refusal as "nothing was added", which is also what a FAILED fetch reports.
+ *  A caller budgeting its requests cannot tell them apart afterwards, so it
+ *  asks first instead: refused costs nothing, failed must cost a round. */
+export function threadHistoryReadInFlight(threadId: string): boolean {
+  return historyReadInFlight.has(threadId);
+}
+
+/** Run `read` once the thread's current history read has settled.
+ *
+ *  Serialised per thread, because both readers prepend to the same events Map
+ *  and move the same floor. Two in flight would interleave those writes. */
+async function afterHistoryRead(threadId: string, read: () => Promise<void>): Promise<void> {
+  // CHAINED, never awaited-then-registered. Awaiting first hands every caller
+  // queued behind one read the same promise, and they all resume together and
+  // start their own. Two whole-history fetches for a long thread is exactly
+  // what this exists to prevent. Registering synchronously means the next
+  // caller chains onto THIS run instead.
+  const prior = historyReadInFlight.get(threadId) ?? Promise.resolve();
+  const run = prior.catch(() => {}).then(read);
+  historyReadInFlight.set(threadId, run);
+  try {
+    await run;
+  } finally {
+    if (historyReadInFlight.get(threadId) === run) historyReadInFlight.delete(threadId);
+  }
+}
+
+/** Fetch the page of history behind what this thread holds.
+ *
+ *  Driven by the reader reaching the top of the loaded window, so it is user
+ *  intent and a failure is toasted rather than swallowed. `hasOlderEvents`
+ *  survives a failure, so the next scroll tries again.
+ *
+ *  Reports whether anything was added, which is what lets the caller stop. */
+export async function loadOlderThreadEvents(threadId: string): Promise<boolean> {
+  if (historyReadInFlight.has(threadId)) return false;
+  let added = false;
+  await afterHistoryRead(threadId, () => backfillOnePage(threadId).then(r => { added = r; }));
+  return added;
+}
+
+async function backfillOnePage(threadId: string): Promise<boolean> {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || !thread.hasOlderEvents) return false;
+  const floor = thread.historyFloor;
+  if (!floor) return false;
+  try {
+    const fetchStart = performance.now();
+    const snapshot = await fetchThreadEvents(threadId, {
+      limit: THREAD_EVENTS_PAGE_SIZE,
+      before: floor,
+    });
+    const fetchMs = performance.now() - fetchStart;
+    // Re-read: the map reference can change while the fetch is in flight.
+    const current = threadMap.value.get(threadId);
+    if (!current) return false;
+    const applyStart = performance.now();
+    prependEventRows(current, snapshot.events);
+    const applyMs = performance.now() - applyStart;
+    // Only the floor moves. `lastDbSeq` is the high-water mark of the NEWEST
+    // event seen. This page is older than everything already held, so touching
+    // it would claim a gap that is not there.
+    noteHistoryFloor(current, snapshot);
+    threadMap.value = new Map(threadMap.value);
+    bumpThreadEvents(threadId);
+    recordPerfSample('thread-backfill', {
+      threadId,
+      eventCount: snapshot.events.length,
+      fetchMs: Math.round(fetchMs),
+      applyMs: Math.round(applyMs),
+      hasMore: current.hasOlderEvents,
+    });
+    return snapshot.events.length > 0;
+  } catch {
+    showToast('Could not load older messages. Scroll up again to retry.', 'error');
+    return false;
+  }
+}
+
+/** Load every event this thread has, for a surface that renders all of them.
+ *
+ *  Rendering the WHOLE thread has to mean the whole HISTORY, not the part this
+ *  client happens to hold. Two surfaces ask: a notification deep link to an old
+ *  event, and the up-chevron's jump to the true top.
+ *
+ *  ONE unpaged request, not a loop of pages. Both callers want everything, and
+ *  a loop would rebuild the fold once per page to reach the same place.
+ *
+ *  It merges rather than replacing outright, so an event that arrived over SSE
+ *  while the request was in flight is not dropped. A no-op once the thread is
+ *  loaded to its start, which is every short thread. */
+export async function ensureWholeThreadLoaded(threadId: string): Promise<void> {
+  // WAITS for a backfill rather than skipping past one. A deep link that
+  // arrived mid-scroll would otherwise find nobody fetching the history it
+  // needs, and land on a transcript without its target.
+  await afterHistoryRead(threadId, () => loadWholeThread(threadId));
+}
+
+async function loadWholeThread(threadId: string): Promise<void> {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || !thread.hasOlderEvents) return;
+  try {
+    const snapshot = await fetchThreadEvents(threadId);
+    const current = threadMap.value.get(threadId);
+    if (!current) return;
+    prependEventRows(current, snapshot.events);
+    noteHistoryFloor(current, snapshot);
+    threadMap.value = new Map(threadMap.value);
+    bumpThreadEvents(threadId);
+  } catch {
+    showToast('Could not load the rest of this thread.', 'error');
+  }
 }
 
 function applyEventRows(

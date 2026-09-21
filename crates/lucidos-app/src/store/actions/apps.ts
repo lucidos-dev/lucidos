@@ -16,6 +16,12 @@ import {
   setFocusedThread,
 } from '../store';
 import { nativeFullscreenElement } from '../appFullscreenHost';
+import { APP_FRAME_ISOLATED } from '../../components/apps/appFrameSandbox';
+import { askFrame } from './app-bridge';
+
+/** How long a capture may take. `html2canvas` can hang on an external resource,
+ *  and an isolated frame can hang on being wedged. Same deadline either way. */
+const CAPTURE_TIMEOUT_MS = 5_000;
 import { clearWipIfMatches } from './wipPreview';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
@@ -430,29 +436,48 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
   // Wait a tick for any pending renders
   await new Promise(r => setTimeout(r, 50));
 
-  // Wait for lucidos._capture to become available (iframe may still be loading)
-  type LucidosCaptureApi = { _capture: () => Promise<{ screenshot: string; dom: string }> };
-  type LucidosWindow = Window & { lucidos?: Partial<LucidosCaptureApi> };
-  let lucidosApi: LucidosCaptureApi | null = null;
-  for (let i = 0; i < 15; i++) {
-    const candidate = (iframe.contentWindow as LucidosWindow | null)?.lucidos;
-    if (candidate?._capture) {
-      lucidosApi = candidate as LucidosCaptureApi;
-      break;
+  // An isolated frame denies `contentWindow.lucidos`, so it captures itself and
+  // sends the pair back. `html2canvas` runs inside the frame over the frame's
+  // own DOM either way, so only who calls it changes.
+  //
+  // The retry loop is what the reach-in path needed, for an SDK that has not
+  // evaluated yet. The asked path needs none. A request arriving early is
+  // answered when the handler installs, and `askFrame` has its own deadline for
+  // a frame that never installs one.
+  type CaptureResult = { screenshot: string; dom: string };
+  let result: CaptureResult;
+  if (APP_FRAME_ISOLATED) {
+    try {
+      result = await askFrame(iframe, 'capture', {}, CAPTURE_TIMEOUT_MS) as CaptureResult;
+    } catch (e) {
+      await postAppCapture(requestId, '', `Error: ${errorDetail(e)}`);
+      return;
     }
-    await new Promise(r => setTimeout(r, 100));
-  }
+  } else {
+    // Wait for lucidos._capture to become available (iframe may still be loading)
+    type LucidosCaptureApi = { _capture: () => Promise<CaptureResult> };
+    type LucidosWindow = Window & { lucidos?: Partial<LucidosCaptureApi> };
+    let lucidosApi: LucidosCaptureApi | null = null;
+    for (let i = 0; i < 15; i++) {
+      const candidate = (iframe.contentWindow as LucidosWindow | null)?.lucidos;
+      if (candidate?._capture) {
+        lucidosApi = candidate as LucidosCaptureApi;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
 
-  if (!lucidosApi) {
-    await postAppCapture(requestId, '', 'Error: Capture function not available in iframe');
-    return;
-  }
+    if (!lucidosApi) {
+      await postAppCapture(requestId, '', 'Error: Capture function not available in iframe');
+      return;
+    }
 
-  // Timeout the actual capture (html2canvas can hang on external resources)
-  const captureTimeout = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error('html2canvas capture timed out (5s)')), 5_000),
-  );
-  const result = await Promise.race([lucidosApi._capture(), captureTimeout]);
+    // Timeout the actual capture (html2canvas can hang on external resources)
+    const captureTimeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('html2canvas capture timed out (5s)')), CAPTURE_TIMEOUT_MS),
+    );
+    result = await Promise.race([lucidosApi._capture(), captureTimeout]);
+  }
   await postAppCapture(requestId, result.screenshot, mismatchNote + result.dom);
 }
 

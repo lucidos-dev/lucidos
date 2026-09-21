@@ -128,6 +128,9 @@ mod event_location_test;
 #[path = "api_support/snapshot_compression_test.rs"]
 mod snapshot_compression_test;
 
+#[path = "api_support/events_paging_test.rs"]
+mod events_paging_test;
+
 #[path = "api_support/trigger_groups_test.rs"]
 mod trigger_groups_test;
 
@@ -160,6 +163,9 @@ mod oauth_connect_test;
 
 #[path = "api_support/models_test.rs"]
 mod models_test;
+
+#[path = "api_support/response_styles_test.rs"]
+mod response_styles_test;
 
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;
@@ -196,3 +202,9 @@ mod webhook_delivery_test;
 
 #[path = "api_support/webhook_ingress_test.rs"]
 mod webhook_ingress_test;
+
+#[path = "api_support/webhook_refusal_test.rs"]
+mod webhook_refusal_test;
+
+#[path = "api_support/app_reach_test.rs"]
+mod app_reach_test;

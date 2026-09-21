@@ -17,6 +17,10 @@
 //! It re-places nothing between steps, which is the reproduction: only a resize
 //! re-applies in the client either. What it mirrors is written down in
 //! [`Action`] and [`DRIVE`].
+//!
+//! The `screens` mode walks the window through every move the client makes to
+//! one, and found that none of them reverts the placement. See
+//! [`walk_screens`], whose control step proves the walk can see a revert.
 
 use std::time::{Duration, Instant};
 
@@ -24,7 +28,7 @@ use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSEventMask, NSView, NSWindow, NSWindowOcclusionState, NSWindowStyleMask,
+    NSEventMask, NSScreen, NSView, NSWindow, NSWindowOcclusionState, NSWindowStyleMask,
     NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
@@ -145,9 +149,20 @@ const DRIVE: &[Step] = &[
     on("re-place", Action::RePlace, 5),
 ];
 
+/// Which run the probe was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The scripted lifecycle sequence in [`DRIVE`].
+    Drive,
+    /// Rows until the operator stops it, for what neither of the others covers.
+    Watch,
+    /// The display walk in [`walk_screens`].
+    Screens,
+}
+
 /// What the probe was asked to do.
 struct Options {
-    watch: bool,
+    mode: Mode,
     bar_px: f64,
     stall: Duration,
     /// Scales every dwell. `--quick` shrinks the run to a smoke test, which
@@ -158,7 +173,7 @@ struct Options {
 /// Read the command line, or say what is wrong with it.
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
-        watch: false,
+        mode: Mode::Drive,
         bar_px: DEFAULT_BAR_PX,
         stall: Duration::from_secs_f64(DEFAULT_STALL_SECS),
         scale: 1.0,
@@ -166,8 +181,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "drive" => options.watch = false,
-            "watch" => options.watch = true,
+            "drive" => options.mode = Mode::Drive,
+            "watch" => options.mode = Mode::Watch,
+            "screens" => options.mode = Mode::Screens,
             "--quick" => options.scale = 0.2,
             "--bar" => {
                 let value = rest.next().ok_or("--bar needs a value in px")?;
@@ -520,9 +536,286 @@ fn drive(
     faults
 }
 
-/// Print rows until the operator stops the probe. Three transitions have no
-/// public API and must be driven by hand: a Space switch, a move to a second
-/// display, and a fullscreen round trip.
+/// How long each stop of the display walk dwells before it is read. Long enough
+/// for AppKit to finish the move and post whatever it posts, and no longer: the
+/// walk reads geometry, not the page.
+const STOP_SETTLE: Duration = Duration::from_millis(900);
+
+/// What one stop of the display walk found.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    /// The display's backing scale factor, which is the transition under test.
+    scale: f64,
+    /// The cluster's centre, in points below the window's top edge.
+    centre: f64,
+    left_x: f64,
+    /// The window's own height, so a stop that was secretly a resize is caught.
+    height: f64,
+}
+
+/// Read one stop. A window reporting no buttons reads as NaN, which fails the
+/// judgement below rather than passing it.
+fn read_stop(window: &NSWindow) -> Reading {
+    let cluster = measure_cluster(window);
+    Reading {
+        scale: window.backingScaleFactor(),
+        centre: cluster.map(|c| c.centre_from_top).unwrap_or(f64::NAN),
+        left_x: cluster.map(|c| c.left_x).unwrap_or(f64::NAN),
+        height: window.frame().size.height,
+    }
+}
+
+/// Print one stop's row, and append whatever it got wrong.
+fn judge_stop(
+    name: &'static str,
+    stop: Reading,
+    born: Reading,
+    options: &Options,
+    out: &mut Vec<Fault>,
+) {
+    let want = options.bar_px / 2.0;
+    println!(
+        "[probe] {name:<14} scale={:<4} height={:>6.1}  centre={:>5.1} (want {want:.1})  x={:>4.1}",
+        stop.scale, stop.height, stop.centre, stop.left_x
+    );
+    if (stop.height - born.height).abs() > 0.5 {
+        out.push(Fault {
+            step: name,
+            what: format!(
+                "the window went from {:.1}pt tall to {:.1}pt, so this stop measures a resize",
+                born.height, stop.height
+            ),
+        });
+        return;
+    }
+    // A window with no buttons reads as NaN, and that is a fault rather than a
+    // pass. So the distance is judged finite before it is judged small.
+    let off = (stop.centre - want).abs();
+    if !off.is_finite() || off > CENTRE_TOLERANCE_PT {
+        out.push(Fault {
+            step: name,
+            what: format!(
+                "the light cluster centres {:.1}pt down, wanted {want:.1}pt",
+                stop.centre
+            ),
+        });
+    }
+}
+
+/// A screen the window is not on, or `None` on a single-display machine.
+///
+/// Identified by frame origin, which is unique in the global coordinate space.
+fn other_screen(window: &NSWindow, mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+    let here = window.screen()?.frame().origin;
+    let screens = NSScreen::screens(mtm);
+    (0..screens.count())
+        .map(|index| screens.objectAtIndex(index))
+        .find(|screen| {
+            let there = screen.frame().origin;
+            there.x != here.x || there.y != here.y
+        })
+}
+
+/// Where to drop a window of `size` so it lands wholly inside `screen`.
+///
+/// Wholly, because a window straddling two displays belongs to whichever holds
+/// more of it, and a stop unsure which display it is on measures nothing.
+fn landing_origin(screen: &NSScreen, size: NSSize) -> NSPoint {
+    let visible = screen.visibleFrame();
+    NSPoint::new(
+        visible.origin.x + (visible.size.width - size.width).max(0.0) / 2.0,
+        visible.origin.y + (visible.size.height - size.height).max(0.0) / 2.0,
+    )
+}
+
+/// Every move the client makes to a window, in the order it makes them. Places
+/// once, before the first stop, and never again: a re-apply inside the walk
+/// would hide the revert it is hunting.
+///
+/// ADR 0180 left a move to a second display and a backing-scale change untested,
+/// for want of an API to script them. `setFrameOrigin` into another screen's
+/// visible frame is that API. Two displays of different scale factors drive both
+/// transitions at once.
+///
+/// The client's launch is the first two stops, and the ordering is the point.
+/// `settle_main_geometry` corrects a restored frame while the window is still
+/// HIDDEN, and the correction is often a move alone: the window-state plugin
+/// already restored the size, and only the origin was off a display. So it posts
+/// no resize, and a resize is the only thing that re-applies.
+///
+/// Every stop but the last keeps the window's SIZE, so none of them is a resize
+/// in disguise. The last one is a resize on purpose, since that is what the desk
+/// watcher does to a window no display can hold.
+fn walk_screens(
+    app: &NSApplication,
+    window: &NSWindow,
+    options: &Options,
+    mtm: MainThreadMarker,
+) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    let born = read_stop(window);
+    judge_stop("placed-hidden", born, born, options, &mut faults);
+
+    // The startup correction: a new origin, the same size, still hidden.
+    let home = window.frame().origin;
+    window.setFrameOrigin(NSPoint::new(home.x + 80.0, home.y - 40.0));
+    pump(app, Instant::now() + STOP_SETTLE);
+    judge_stop(
+        "moved-hidden",
+        read_stop(window),
+        born,
+        options,
+        &mut faults,
+    );
+
+    window.makeKeyAndOrderFront(None);
+    app.activate();
+    pump(app, Instant::now() + STOP_SETTLE);
+    judge_stop("first-show", read_stop(window), born, options, &mut faults);
+
+    window.setFrameOrigin(NSPoint::new(home.x + 20.0, home.y - 20.0));
+    pump(app, Instant::now() + STOP_SETTLE);
+    judge_stop(
+        "same-display",
+        read_stop(window),
+        born,
+        options,
+        &mut faults,
+    );
+
+    // The size a correction RE-STATES. A move-only fix still sets both the size
+    // and the origin, so it hands back the size the window already wears. tao's
+    // `set_inner_size` is `setContentSize`, which lays the titlebar out again.
+    // The frame never changes, so AppKit posts no resize, and nothing in the
+    // client re-applies.
+    window.setContentSize(window.contentRectForFrameRect(window.frame()).size);
+    pump(app, Instant::now() + STOP_SETTLE);
+    judge_stop(
+        "restated-size",
+        read_stop(window),
+        born,
+        options,
+        &mut faults,
+    );
+
+    if let Some(other) = other_screen(window, mtm) {
+        window.setFrameOrigin(landing_origin(&other, window.frame().size));
+        pump(app, Instant::now() + STOP_SETTLE);
+        judge_stop(
+            "other-display",
+            read_stop(window),
+            born,
+            options,
+            &mut faults,
+        );
+
+        window.setFrameOrigin(home);
+        pump(app, Instant::now() + STOP_SETTLE);
+        judge_stop("back-home", read_stop(window), born, options, &mut faults);
+    } else {
+        println!("[probe] one display only: the cross-display stops need a second one attached");
+    }
+
+    // The POSITIVE CONTROL, and the last stop because it ends the run in a known
+    // wrong state. A resize is the one revert ADR 0074 measured, so this must
+    // fault. If it does not, the reading above proves nothing: a walk that
+    // cannot see the revert it knows about would report every other stop as a
+    // pass.
+    let mut frame = window.frame();
+    frame.size.height -= 60.0;
+    frame.size.width -= 60.0;
+    window.setFrame_display(frame, true);
+    pump(app, Instant::now() + STOP_SETTLE);
+    // Against its own reading, so the height check passes and the centre is what
+    // decides. The window is deliberately a different size from here on.
+    let after = read_stop(window);
+    let mut control = Vec::new();
+    judge_stop("resize-control", after, after, options, &mut control);
+    if control.is_empty() {
+        faults.push(Fault {
+            step: "resize-control",
+            what: "a resize left the placement alone, so this walk cannot see a revert at all"
+                .to_string(),
+        });
+    }
+    faults.extend(judge_the_re_apply(app, window, options));
+    faults
+}
+
+/// Whether the client's two re-applies still beat AppKit on this macOS.
+///
+/// The notification arm is the one ADR 0074 measured, and its correctness is a
+/// question of ORDERING that only a measurement can answer: AppKit must revert
+/// BEFORE it posts, and must not lay out again after. The queued arm stands in
+/// for `on_window_event`'s `Resized`, which lands a run-loop turn later.
+///
+/// Both place against `--bar`, exactly as the client places against the height
+/// its frontend last pushed.
+fn judge_the_re_apply(app: &NSApplication, window: &NSWindow, options: &Options) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    let bar = options.bar_px;
+    let observer = observe_resizes(window, bar);
+
+    let mut frame = window.frame();
+    frame.size.height -= 40.0;
+    window.setFrame_display(frame, true);
+    pump(app, Instant::now() + STOP_SETTLE);
+    let synchronous = read_stop(window);
+    judge_stop(
+        "re-apply-sync",
+        synchronous,
+        synchronous,
+        options,
+        &mut faults,
+    );
+
+    // The queued arm, applied by hand: everything AppKit had to do is long done.
+    inset_lights(window, LIGHTS_X_PX, bar);
+    pump(app, Instant::now() + STOP_SETTLE);
+    let queued = read_stop(window);
+    judge_stop("re-apply-late", queued, queued, options, &mut faults);
+
+    let observer: &objc2::runtime::AnyObject = observer.as_ref();
+    // SAFETY: the token `addObserverForName:object:queue:usingBlock:` handed
+    // back, on the same centre.
+    unsafe { objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(observer) };
+    faults
+}
+
+/// Re-apply the placement from AppKit's own resize notification, the shape
+/// [`crate::traffic_lights::watch_resizes`] installs. Mirrored rather than
+/// called, because the real one reads a height this process never pushed.
+fn observe_resizes(
+    window: &NSWindow,
+    bar_px: f64,
+) -> Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>> {
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+
+    let block = block2::RcBlock::new(move |notification: std::ptr::NonNull<NSNotification>| {
+        // SAFETY: the notification is alive for the duration of the call.
+        let Some(object) = (unsafe { notification.as_ref() }).object() else {
+            return;
+        };
+        // SAFETY: the observer is scoped to one window through `object:`, and
+        // that window is alive because it is the one posting.
+        let ns_window: &NSWindow = unsafe { &*objc2::rc::Retained::as_ptr(&object).cast() };
+        inset_lights(ns_window, LIGHTS_X_PX, bar_px);
+    });
+    let object: &objc2::runtime::AnyObject = window;
+    // SAFETY: AppKit's own notification name, scoped to this window. A nil queue
+    // runs the block synchronously on the posting thread, which is the point.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(objc2_app_kit::NSWindowDidResizeNotification),
+            Some(object),
+            None,
+            &block,
+        )
+    }
+}
+
+/// Print rows until the operator stops the probe. Two transitions have no public
+/// API and must be driven by hand: a Space switch and a fullscreen round trip.
 fn watch(app: &NSApplication, window: &NSWindow, web_view: &WKWebView, options: &Options) -> ! {
     println!(
         "[probe] watch mode. Drive the window yourself, Ctrl-C to stop. A row \
@@ -551,7 +844,7 @@ pub fn run(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!("[probe] {e}");
             eprintln!(
-                "[probe] usage: window_lifecycle_probe [drive|watch] \
+                "[probe] usage: window_lifecycle_probe [drive|watch|screens] \
                  [--bar PX] [--stall S] [--quick]"
             );
             return 2;
@@ -566,6 +859,16 @@ pub fn run(args: &[String]) -> i32 {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     let (window, web_view) = build_window(mtm);
     app.finishLaunching();
+    // AppKit's own arrangement, read before anything of ours touches it. It is
+    // the baseline every later row is judged against, and what a reverted
+    // placement looks like.
+    match measure_cluster(&window) {
+        Some(cluster) => println!(
+            "[probe] AppKit's own: centre={:.1} x={:.1}",
+            cluster.centre_from_top, cluster.left_x
+        ),
+        None => println!("[probe] AppKit's own: the window reports no buttons yet"),
+    }
     // Placed while the window is still hidden, which is when `setup` places
     // `main`. The first drive step is what orders it in. In watch mode there is
     // no drive, so show it here instead.
@@ -582,7 +885,12 @@ pub fn run(args: &[String]) -> i32 {
         ),
         None => println!("[probe] placed while hidden: the window reports no buttons yet"),
     }
-    if options.watch {
+    // The walk reads AppKit geometry and nothing else, so it neither waits for
+    // the page nor judges it. It shows the window itself, as its first stop.
+    if options.mode == Mode::Screens {
+        return report(walk_screens(&app, &window, &options, mtm));
+    }
+    if options.mode == Mode::Watch {
         window.makeKeyAndOrderFront(None);
         app.activate();
     }
@@ -595,10 +903,14 @@ pub fn run(args: &[String]) -> i32 {
         println!("[probe] --quick: dwells are too short to reach a real suspend");
     }
 
-    if options.watch {
+    if options.mode == Mode::Watch {
         watch(&app, &window, &web_view, &options);
     }
-    let faults = drive(&app, &window, &web_view, &options);
+    report(drive(&app, &window, &web_view, &options))
+}
+
+/// Print what a run found, and hand back the process exit code.
+fn report(faults: Vec<Fault>) -> i32 {
     if faults.is_empty() {
         println!("[probe] PASS: no fault reproduced");
         return 0;
@@ -616,16 +928,22 @@ mod tests {
     #[test]
     fn no_arguments_is_a_full_drive_at_the_default_bar() {
         let options = parse(&[]).expect("no arguments is a drive");
-        assert!(!options.watch);
+        assert_eq!(options.mode, Mode::Drive);
         assert_eq!(options.bar_px, DEFAULT_BAR_PX);
         assert_eq!(options.scale, 1.0);
+    }
+
+    #[test]
+    fn the_display_walk_has_its_own_mode() {
+        let options = parse(&["screens".to_string()]).expect("screens is a mode");
+        assert_eq!(options.mode, Mode::Screens);
     }
 
     #[test]
     fn watch_and_the_three_knobs_parse() {
         let args = ["watch", "--bar", "54", "--stall", "9", "--quick"].map(String::from);
         let options = parse(&args).expect("a valid command line");
-        assert!(options.watch);
+        assert_eq!(options.mode, Mode::Watch);
         assert_eq!(options.bar_px, 54.0);
         assert_eq!(options.stall, Duration::from_secs(9));
         assert!(options.scale < 1.0);

@@ -359,6 +359,72 @@ read_lucidos_toml_vite_port() {
     ' "$toml"
 }
 
+# How long a health probe may take. A launch must never block on a socket that
+# never answers, and the gateway's own restart-intent call uses the same budget.
+LUCIDOS_HEALTH_PROBE_TIMEOUT_S=2
+
+# ── probe_engine_on_port ────────────────────────────────────────────────
+# Ask the engine on `port` which workspace it serves.
+#
+# `GET /api/v1/health` carries `workspace_path`, so the engine itself settles
+# who owns a port. A pidfile cannot. `engine.pid` names whatever the gateway
+# spawned last, and a spawn that dies at once leaves a dead pid there while the
+# healthy engine keeps serving. See
+# docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
+#
+# Answers out of band, the way `_port_is_ours_or_free` passes `OCCUPIER_PID`,
+# because a caller needs both halves and a command substitution would lose the
+# second. Returns 0 only when a workspace was reported.
+#
+#   ENGINE_PROBE_WORKSPACE  what it said, or empty
+#   ENGINE_PROBE_REFUSED    set when NOTHING accepted the connection
+#
+# https first, then http, the same ladder `engine_health_scheme`
+# (scripts/lib/workspace.sh) climbs for the other half of this question, which
+# is which scheme answered. Keep the two in step.
+ENGINE_PROBE_WORKSPACE=""
+ENGINE_PROBE_REFUSED=""
+probe_engine_on_port() { # <port>
+    ENGINE_PROBE_WORKSPACE=""
+    ENGINE_PROBE_REFUSED=""
+    local port="$1" body="" https_rc=0 http_rc=0
+    [ -n "$port" ] || return 1
+    body="$(curl -sk --max-time "$LUCIDOS_HEALTH_PROBE_TIMEOUT_S" \
+        "https://localhost:$port/api/v1/health" 2>/dev/null)" || https_rc=$?
+    case "$body" in
+        *'"workspace_path"'*) ;;
+        *) body="$(curl -s --max-time "$LUCIDOS_HEALTH_PROBE_TIMEOUT_S" \
+            "http://localhost:$port/api/v1/health" 2>/dev/null)" || http_rc=$?
+            ;;
+    esac
+    # curl 7 is "could not connect". Both halves refusing is the ONE answer that
+    # means nothing is there. A timeout, a TLS error or a half-spoken reply all
+    # mean something accepted, so they settle nothing.
+    if [ "$https_rc" = "7" ] && [ "$http_rc" = "7" ]; then
+        ENGINE_PROBE_REFUSED=1
+    fi
+    case "$body" in
+        *'"workspace_path"'*) ;;
+        *) return 1 ;;
+    esac
+    ENGINE_PROBE_WORKSPACE="$(printf '%s' "$body" \
+        | sed -n 's/.*"workspace_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$ENGINE_PROBE_WORKSPACE" ]
+}
+
+# The physical path of `dir`, or the literal when it cannot be resolved. Two
+# spellings of one directory have to compare equal.
+_path_identity() { # <dir>
+    local dir="${1%/}"
+    ( cd "$dir" 2>/dev/null && pwd -P ) || printf '%s' "$dir"
+}
+
+# True when the engine answering on `port` serves `workspace`.
+engine_on_port_serves_workspace() { # <port> <workspace-dir>
+    probe_engine_on_port "$1" || return 1
+    [ "$(_path_identity "$ENGINE_PROBE_WORKSPACE")" = "$(_path_identity "$2")" ]
+}
+
 # Try to reclaim a port held by a stale lucidos-engine — one of ours that
 # crashed or got orphaned, with no live pidfile claiming it. Returns 0 if
 # the port is free afterwards, 1 if we shouldn't touch the occupier (an
@@ -388,6 +454,25 @@ _try_reclaim_stale_lucidos_on_port() {
         *lucidos-engine*) ;;
         *) return 1 ;;
     esac
+
+    # An engine that answers health is not stale, which is this function's whole
+    # premise. The arms above cannot see that: a dead pid in engine.pid leaves a
+    # live engine looking orphaned, and the SIGUSR1 below then tore down every
+    # in-flight thread in the workspace. See
+    # docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
+    #
+    # Asked twice unless the connection was REFUSED, the one answer that settles
+    # it. The costs are lopsided: a wrong "dead" stops a working engine and every
+    # thread on it, while a wrong "alive" costs a refused port and a message
+    # naming the holder. One 2s stall on a loaded host must not decide that.
+    local _probe
+    for _probe in 1 2; do
+        if probe_engine_on_port "$port"; then
+            echo "[ports] port $port answers /api/v1/health, leaving the live engine (pid $pid) alone" >&2
+            return 1
+        fi
+        if [ -n "$ENGINE_PROBE_REFUSED" ]; then break; fi
+    done
 
     echo "[ports] reclaiming stale lucidos-engine (pid $pid) on port $port" >&2
 
@@ -440,6 +525,14 @@ _port_is_ours_or_free() {
             return 0
         fi
         if [ -f "$frontend_pid_file" ] && [ "$OCCUPIER_PID" = "$(cat "$frontend_pid_file" 2>/dev/null)" ]; then
+            OCCUPIER_PID=""
+            return 0
+        fi
+
+        # The pidfile is a hint; the engine is the authority. Ask the port which
+        # workspace it serves, so a stale engine.pid cannot make our own live
+        # engine look foreign. This also covers the pid `head -1` did not pick.
+        if engine_on_port_serves_workspace "$port" "$workspace"; then
             OCCUPIER_PID=""
             return 0
         fi
@@ -565,14 +658,23 @@ allocate_ports() {
         "lucidos.toml"* | "env LUCIDOS_VITE_PORT"*)
             local pvite=$(( 5173 + offset ))
             local papi=$(( 3000 + offset ))
-            # Reclaim a stale lucidos-engine on the user-facing port (SIGUSR1
-            # path — engines ignore SIGTERM). No-op when free or ours.
-            _port_is_ours_or_free "$pvite" "$workspace" >/dev/null 2>&1 || true
-            # Kill unprotected (orphaned) listeners on both ports — our own
+            # Reclaim a stale lucidos-engine on the user-facing port (the
+            # SIGUSR1 path, since engines ignore SIGTERM). No-op when the port
+            # is free or ours. Its stderr is deliberately not swallowed: a
+            # launch that stops an engine has to say so.
+            local vite_is_ours=""
+            if _port_is_ours_or_free "$pvite" "$workspace"; then
+                vite_is_ours=1
+            fi
+            # Kill unprotected (orphaned) listeners on both ports: our own
             # leftover engine/Vite from a dead session. Live host pids recorded in
-            # any workspace's engine/frontend pidfile are skipped.
+            # any workspace's engine/frontend pidfile are skipped, and so is the
+            # user-facing port when the engine answering there is ours.
             local cp occ
             for cp in "$pvite" "$papi"; do
+                if [ "$cp" = "$pvite" ] && [ -n "$vite_is_ours" ]; then
+                    continue
+                fi
                 # `|| true`: lsof exits non-zero when the port is free, which under
                 # `set -e` would abort the whole script on a bare assignment.
                 occ=$(lsof -ti :"$cp" -sTCP:LISTEN 2>/dev/null || true)

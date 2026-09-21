@@ -512,19 +512,23 @@ pub const TABLES: &[TableRule] = &[
             exempt: &[
                 ExemptWriter {
                     function: "record_accepted",
-                    why: "Stamps when a delivery last verified, which is an \
-                          observation rather than a decision. The delivery \
-                          already emitted the hook's own pinned domain event, \
-                          and WebhookUpdated would put an edit nobody made on \
-                          the timeline.",
+                    why: "Stamps when a delivery last verified, and ends any \
+                          refusal run. An observation rather than a decision. \
+                          The delivery already emitted the hook's own pinned \
+                          domain event, and WebhookUpdated would put an edit \
+                          nobody made on the timeline. What the run ADDS up to \
+                          does announce, through WebhookDeliveriesRecovered, \
+                          which the scheduler emits after reading these rows.",
                 },
                 ExemptWriter {
                     function: "record_refused",
-                    why: "Stamps when a delivery was last turned away. Same \
-                          shape as record_accepted, and the refusal reaches \
-                          the owner through the row rather than through an \
-                          event, since a public endpoint receives thousands of \
-                          unsigned probes and each one would be a timeline row.",
+                    why: "Stamps when a delivery was last turned away, and \
+                          adds it to the refusal run. Same shape as \
+                          record_accepted: a public endpoint receives \
+                          thousands of unsigned probes, and each one would be \
+                          a timeline row. The run's VERDICT announces instead, \
+                          as WebhookDeliveriesRefused, once per fault rather \
+                          than once per arrival.",
                 },
             ],
         },

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserMessage, isEmptyContinuedExchange, resumeEngineNote, type ThreadEvent } from '../thread-events';
+import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserMessage, isEmptyContinuedExchange, renderOrderViolations, resumeEngineNote, type ThreadEvent } from '../thread-events';
 import { hidesEarlierProse } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
@@ -843,6 +843,65 @@ describe('Flow: post-restart resume reminder', () => {
     expect(note).not.toBeNull();
     expect(note!.toolCount).toBe(1);
     expect(note!.text).toContain('send_notification');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A resumed turn reads BELOW the boundary that resumed it
+//
+// Read off a live thread the user reported. A pending event wait woke the
+// thread first, half a second before the restart resume opened its boundary.
+// So the resumed turn anchored on the WAKE prompt, not on the resume.
+//
+// The turn then ran for 25 minutes above a card stamped 00:39, while that card
+// spun "Requesting" holding nothing a reader can see. Both halves are one
+// omission: the resume boundary took no ownership of the running turn.
+//
+// See `docs/plans/2026-09-20-the-transcript-reads-by-one-clock.md`.
+// ---------------------------------------------------------------------------
+describe('Flow: an engine-restart resume reads in clock order', () => {
+  function resumedAfterRestart() {
+    const { map, id } = makeThread('thread-1', 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'keep going', channel: 'chat', event_id: 'mr-1', created: '2026-01-01T07:51:29Z' },
+      { type: 'ToolCalled', name: 'read_file', args: {}, request_event_id: 'mr-1', event_id: 'call-1', created: '2026-01-01T07:55:11Z' },
+      { type: 'ToolResult', name: 'read_file', result: 'ok', tool_called_event_id: 'call-1', request_event_id: 'mr-1', created: '2026-01-01T07:55:12Z' },
+      { type: 'ResponseAborted', request_event_id: 'mr-1', cause: 'recovery_after_restart', created: '2026-01-01T08:00:09Z' },
+      // The wait wakes the thread first, and the turn anchors on this prompt.
+      { type: 'UserPromptInjected', text: 'A subscribed event arrived.', mode: 'agent', event_id: 'wake-1', created: '2026-01-01T08:00:38Z' },
+      { type: 'ContinuationStarted', event_id: 'cs-1', created: '2026-01-01T08:00:39Z' },
+      { type: 'UserPromptInjected', text: '[Engine note] 50 prior tool calls', mode: 'engine', request_event_id: 'cs-1', created: '2026-01-01T08:00:39.400Z' },
+      // Everything the resumed turn emits still carries the wake prompt's id.
+      { type: 'TextStreamed', text: 'Picking it back up.', request_event_id: 'wake-1', created: '2026-01-01T08:00:55Z' },
+      { type: 'ToolCalled', name: 'read_file', args: {}, request_event_id: 'wake-1', event_id: 'call-2', created: '2026-01-01T08:16:36Z' },
+      { type: 'ToolResult', name: 'read_file', result: 'ok', tool_called_event_id: 'call-2', request_event_id: 'wake-1', created: '2026-01-01T08:16:37Z' },
+      { type: 'TextStreamed', text: 'Done reading.', request_event_id: 'wake-1', created: '2026-01-01T08:19:00Z' },
+    ] as Array<ThreadEvent & { created?: string; event_id?: string }>);
+    return getExchanges(map, id);
+  }
+
+  it('files the resumed work under the resume boundary, not above it', () => {
+    const exchanges = resumedAfterRestart();
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived', 'ResponseAborted', 'UserPromptInjected', 'ContinuationStarted',
+    ]);
+    // The wake prompt opened the card; the resume boundary holds the work.
+    expect(exchanges[2].steps).toHaveLength(0);
+    expect(exchanges[3].steps.map(s => s.event.type)).toEqual([
+      'UserPromptInjected', 'TextStreamed', 'ToolCalled', 'ToolResult', 'TextStreamed',
+    ]);
+  });
+
+  it('leaves no card spinning "Requesting" under the running work', () => {
+    const exchanges = resumedAfterRestart();
+    const last = exchanges.length - 1;
+    expect(exchanges.map((ex, i) => getLabel(ex, '', i === last))).toEqual([
+      'Aborted', 'Done', 'Done', 'Working',
+    ]);
+  });
+
+  it('renders every row in clock order', () => {
+    expect(renderOrderViolations(resumedAfterRestart())).toEqual([]);
   });
 });
 

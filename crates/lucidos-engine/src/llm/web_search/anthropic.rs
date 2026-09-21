@@ -249,7 +249,12 @@ mod tests {
                 "{model} accepts dynamic filtering"
             );
         }
-        for model in ["claude-haiku-4-5", "claude-fable-5", "claude-opus-4-5"] {
+        for model in [
+            "claude-haiku-4-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-opus-4-5",
+        ] {
             assert_eq!(
                 search_tool_type_for(model),
                 "web_search_20250305",

@@ -23,17 +23,26 @@ fn todo_write_is_in_chat_agent_default_tools() {
         Some("array"),
         "todos must be an array",
     );
+    // `todos` is NOT schema-required, because the read action takes no list and
+    // JSON Schema cannot make one field depend on another. The handler is the
+    // gate instead, and `todo_write_rejects_missing_todos_field` pins it.
     let required = tool
         .parameters
         .get("required")
         .and_then(|v| v.as_array())
-        .expect("todo_write schema must declare required fields");
-    let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        .expect("todo_write schema must declare a required array, even an empty one");
     assert!(
-        required_names.contains(&"todos"),
-        "`todos` must be required, got: {:?}",
-        required_names,
+        required.is_empty(),
+        "nothing is schema-required, got: {:?}",
+        required,
     );
+    let actions = tool
+        .parameters
+        .get("properties")
+        .and_then(|v| v.get("action"))
+        .and_then(|v| v.get("enum"))
+        .expect("todo_write schema must offer both actions");
+    assert_eq!(actions, &serde_json::json!(["write", "read"]));
 }
 
 #[test]
@@ -1137,6 +1146,47 @@ fn generate_image_is_offered_exactly_when_a_provider_is_configured() {
     }
 }
 
+/// The gate that costs a workspace nothing until it configures a judgment
+/// provider. Most workspaces have none, and every schema is billed on every
+/// request, so an ungated `judge` would be prose nobody can call.
+#[test]
+fn judge_is_offered_exactly_when_a_judgment_provider_is_configured() {
+    assert!(
+        !offered_names(&ToolCapabilities::default()).contains(&tn::JUDGE.to_string()),
+        "no provider can answer a typed question, so nothing may offer to"
+    );
+
+    let caps = ToolCapabilities {
+        judgment_provider: true,
+        ..ToolCapabilities::default()
+    };
+    assert!(offered_names(&caps).contains(&tn::JUDGE.to_string()));
+}
+
+/// The one instruction the schema cannot do without. The engine runs a round's
+/// tool calls one after another, so fifty questions split across fifty calls
+/// cost fifty round trips. Upstream answers them in parallel in one.
+#[test]
+fn the_judge_schema_tells_the_agent_to_batch() {
+    let caps = ToolCapabilities {
+        judgment_provider: true,
+        ..ToolCapabilities::default()
+    };
+    let judge = get_default_tools(&caps)
+        .into_iter()
+        .find(|t| t.name == tn::JUDGE)
+        .expect("the judge schema is offered");
+    assert!(
+        judge.description.contains("ONE CALL"),
+        "the batching rule must survive an edit to this description: {}",
+        judge.description
+    );
+    assert!(
+        judge.description.contains("TypeSafe"),
+        "the agent composes the state, so it has to be told where it goes"
+    );
+}
+
 /// Invariant 20. The mode ADDS no tool, and takes one away: the checklist
 /// moved into the working understanding, so `todo_write` is shaped out.
 ///
@@ -1218,6 +1268,7 @@ fn two_callers_in_one_workspace_get_a_byte_identical_array() {
             email_account: true,
             intent: false,
             image_provider: true,
+            judgment_provider: false,
             context_mode: false,
         },
     ] {
@@ -1339,6 +1390,8 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     // the mode takes AWAY. `dismiss_from_context`, `keep_in_context` and
     // `scratchpad` all left, each in its own change.
     "todo_write",
+    // Appended last in FAMILIES, so opening its gate moves no family above it.
+    "judge",
     "send_notification",
     "notifications",
     "preferences",

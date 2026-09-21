@@ -75,11 +75,44 @@ export interface BootResult {
  * there is no fourth copy of that derivation here. The `no-raw-storage` guard
  * enforces it.
  */
+/**
+ * The values the engine resolved for this device and prepended to this script,
+ * or null in a document it did not seed.
+ *
+ * An isolated app frame is not same-origin with the shell, so it inherits none
+ * of the mirror writes `wsLocalGet` reads. This script is parser-blocking and
+ * settles first, so nothing async can feed it. That is why the values arrive in
+ * its own body rather than over a channel. See `api/sdk_prefs.rs`.
+ *
+ * The shell seeds nothing and falls through to storage, unchanged.
+ */
+function servedPrefs(): Record<string, string> | null {
+  // `globalThis`, not `window`. The engine writes `window.__lucidosPrefs`, and
+  // in a browser the two are one object. This form also runs where there is no
+  // `window` at all.
+  const served = (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs;
+  return served && typeof served === 'object' ? served as Record<string, string> : null;
+}
+
+/**
+ * The engine's value for `serverKey`, else the stored one.
+ *
+ * Server first is the precedence `appearance.ts` documents for the live
+ * re-apply. So first paint and every repaint after it rank the two sources the
+ * same way.
+ */
+function seeded(served: Record<string, string> | null, serverKey: string, storageKey: string):
+  string | null {
+  const value = served?.[serverKey];
+  return typeof value === 'string' && value !== '' ? value : wsLocalGet(storageKey);
+}
+
 export function applyAppearanceBoot(opts: BootOptions): BootResult {
   const d = document.documentElement;
+  const served = servedPrefs();
 
   // Theme. Nothing saved means follow the OS.
-  const raw = wsLocalGet('lucidos-theme');
+  const raw = seeded(served, 'theme', 'lucidos-theme');
   const theme = raw && (THEMES as readonly string[]).includes(raw)
     ? raw as ThemePref
     : DEFAULT_THEME;
@@ -95,7 +128,7 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
 
   // Font. The key is resolved ONCE and both maps are then read with it, which
   // is what keeps the family and its ligature settings from disagreeing.
-  const fontKey = resolveFontKey(wsLocalGet('lucidos-font-family'));
+  const fontKey = resolveFontKey(seeded(served, 'font-family', 'lucidos-font-family'));
   d.style.setProperty('--font-ui', FONT_FAMILY_VALUES[fontKey]);
   const features = fontFeaturesFor(fontKey);
   d.style.setProperty('--font-features-text', features.text);
@@ -105,7 +138,12 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   // not paint at 115% for one frame before the app boots, re-clamps to 112.5%
   // and re-paints. Left UNSET when nothing is stored, so the stylesheet's own
   // fallback answers rather than an inline value that would beat an override.
-  const scale = parseUiScale(wsLocalGet('lucidos-ui-scale'));
+  // `text-size` and `font-size` are the pre-grid aliases, read in the order
+  // `ui.applyPreferences` reads them so the two cannot resolve differently.
+  const scale = parseUiScale(
+    served?.['ui-scale'] || served?.['text-size'] || served?.['font-size']
+    || wsLocalGet('lucidos-ui-scale'),
+  );
   if (scale !== null) d.style.setProperty('--user-ui-scale', `${scale}%`);
 
   // The live style remote's first-paint seed. LAST on purpose: everything above
@@ -115,7 +153,9 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
     if (opts.styleReset && styleResetRequested(location.search)) {
       wsLocalRemove(STYLE_OVERRIDES_STORAGE_KEY);
     } else {
-      const overrides = parseStyleOverrides(wsLocalGet(STYLE_OVERRIDES_STORAGE_KEY));
+      const overrides = parseStyleOverrides(
+        seeded(served, 'style_overrides', STYLE_OVERRIDES_STORAGE_KEY),
+      );
       for (const name of Object.keys(overrides)) {
         d.style.setProperty(name, overrides[name]);
       }

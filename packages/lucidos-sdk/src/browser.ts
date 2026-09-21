@@ -4,11 +4,33 @@ import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
 import { installTooltips } from './tooltip';
 import { primeExternalLinkTarget } from './ui';
+import { isBridged } from './_bridge';
+import { primeBridgedStorage } from './_storage';
+import { installHostOps } from './hostOps';
 
 export * from './index';
 
 if (typeof document !== 'undefined') {
-  installScrollMemory();
+  // Answer the host's own requests: capture, app switch, fragment delivery. It
+  // reached through `contentWindow` for all three until an opaque origin closed
+  // that. Installed unconditionally, so the host can ask the same way whichever
+  // frame it got.
+  installHostOps();
+  // Scroll memory reads storage, and an isolated frame's own storage throws, so
+  // the host holds it. That read is async and the restore is not, so the values
+  // are fetched first. `primeBridgedStorage` is a no-op in a frame that can read
+  // for itself, which is why the direct path still installs synchronously.
+  if (isBridged()) {
+    primeBridgedStorage()
+      .catch((err) => {
+        console.warn('[lucidos-sdk] could not read this app\'s stored values:', err);
+      })
+      // Either way: an empty mirror reads as a first visit, which is a position
+      // worth landing at rather than no scroll memory at all from here on.
+      .finally(() => { installScrollMemory(); });
+  } else {
+    installScrollMemory();
+  }
   // A themed tooltip on any data-tooltip element, with no init call from the
   // app. The two options differ from the host shell, because an app author
   // never wires a touch affordance by hand: any data-tooltip answers a long
@@ -34,6 +56,28 @@ if (typeof document !== 'undefined') {
     if (!anchor) return;
     const href = anchor.getAttribute('href');
     if (!href) return;
+    // A download of one of the app's OWN files. The frame is isolated, so that
+    // file is cross-origin to it and the browser ignores the `download`
+    // attribute: the click would navigate the frame to the file. Ask the engine
+    // for it as an attachment instead, which is what a browser does obey.
+    // `blob:` and `data:` need none of this and are left alone.
+    if (isBridged() && anchor.hasAttribute('download') && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const url = new URL(href, window.location.href);
+      url.searchParams.set('download', '1');
+      const via = document.createElement('a');
+      via.href = url.href;
+      via.download = anchor.getAttribute('download') || '';
+      via.rel = 'noopener';
+      document.body.appendChild(via);
+      via.click();
+      // Removed on a later task, never in the same one. A download starts
+      // asynchronously, and tearing the anchor out from under it is enough to
+      // lose it on some engines.
+      setTimeout(() => via.remove(), 0);
+      return;
+    }
     if (/^https?:\/\//.test(href)) {
       e.preventDefault();
       e.stopPropagation();

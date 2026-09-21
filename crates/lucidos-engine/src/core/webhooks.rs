@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 pub use lucidos_local_token::ct_eq;
 
+use crate::core::webhook_refusal::RefusalCause;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -50,6 +51,51 @@ pub struct Webhook {
     pub last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
     /// What [`DeliveryRefusal::reason`] said about that refusal.
     pub last_refusal_reason: Option<String>,
+    /// Every refusal since the last acceptance, tallied by reason.
+    pub refusal_run: RefusalRun,
+}
+
+/// What a webhook has been turning away since it last accepted anything.
+///
+/// The three columns above hold the LAST refusal, which one diagnostic probe
+/// overwrites. This holds the whole run, so a stray probe adds one to its own
+/// reason and leaves the evidence beside it standing.
+///
+/// **A run is homogeneous in its cause**, because a refusal of the other kind
+/// restarts it. So the count, the start and the tally all describe one fault.
+/// Without that, a hook switched off mid-outage would be reported as having
+/// thrown away forty deliveries it had in fact read and rejected.
+///
+/// An acceptance ends a run. So `refusals == 0` is positive evidence that the
+/// hook works, and it is the only thing that produces it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalRun {
+    /// How many deliveries have been turned away since the run started.
+    pub refusals: i64,
+    /// When the run started. `None` when there is no run.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which fault the run is evidence of. `None` for a run whose stored cause
+    /// this engine cannot read, which judges nothing rather than guessing.
+    pub cause: Option<RefusalCause>,
+    /// How the run breaks down, keyed by [`DeliveryRefusal::key`].
+    ///
+    /// A `BTreeMap` so the JSON a reader sees is ordered, and so two runs with
+    /// the same contents compare equal.
+    pub reasons: std::collections::BTreeMap<String, i64>,
+    /// How long the run has been going, in seconds. **Measured by Postgres**
+    /// (ADR 0053), because the timestamp above is a database clock reading and
+    /// the engine's own clock is a different one.
+    pub run_secs: Option<i64>,
+    /// How long since the last refusal, in seconds, also measured by Postgres.
+    /// A run nothing has added to for a fortnight stops being news.
+    pub quiet_secs: Option<i64>,
+}
+
+impl RefusalRun {
+    /// Is any delivery being turned away right now?
+    pub fn is_running(&self) -> bool {
+        self.refusals > 0
+    }
 }
 
 /// Everything about a webhook except its identity: how it authenticates, and
@@ -232,10 +278,19 @@ fn default_template() -> String {
     "{body}".to_string()
 }
 
-/// Why a delivery was refused. Every arm answers 401, so this exists to be
-/// logged and tested rather than to be branched on by the caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a delivery was refused. Every arm answers 401, so the sender learns
+/// nothing; this is what the log, the row and the refusal run record instead.
+///
+/// [`verify`] produces five of these. `api::webhooks::deliver` produces the
+/// other two before it calls anything. Those two are arms here rather than
+/// hand-written strings, so `refusal_run_reasons` keys on a closed set and
+/// [`Self::examined_the_delivery`] can classify every one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRefusal {
+    /// The webhook is switched off, so nothing was read.
+    Disabled,
+    /// The body is not UTF-8, so no scheme we express could have signed it.
+    BodyNotUtf8,
     /// No bearer token, or the wrong one.
     Token,
     /// The signature header is missing or unparseable.
@@ -249,15 +304,76 @@ pub enum DeliveryRefusal {
 }
 
 impl DeliveryRefusal {
+    /// Every arm, so a test can walk them and a tally can be read back.
+    pub const ALL: [DeliveryRefusal; 7] = [
+        Self::Disabled,
+        Self::BodyNotUtf8,
+        Self::Token,
+        Self::SignatureMissing,
+        Self::SignatureMismatch,
+        Self::TimestampOutsideTolerance,
+        Self::CredentialMissing,
+    ];
+
     /// What to write in the log. Never returned to the caller: a public
     /// endpoint that says WHY it refused is a hint to whoever is guessing.
     pub fn reason(&self) -> &'static str {
         match self {
+            Self::Disabled => "the webhook is disabled",
+            Self::BodyNotUtf8 => "the body is not UTF-8",
             Self::Token => "bearer token did not match",
             Self::SignatureMissing => "signature header missing or unparseable",
             Self::SignatureMismatch => "signature did not match",
             Self::TimestampOutsideTolerance => "signed timestamp is too old or too far ahead",
             Self::CredentialMissing => "the configured credential does not exist",
+        }
+    }
+
+    /// How a [`RefusalRun`] keys this reason.
+    ///
+    /// Stable and kebab-case, because the tally is stored JSON and reaches the
+    /// wire. The log string above is prose and may be reworded; this may not.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::BodyNotUtf8 => "body-not-utf8",
+            Self::Token => "token",
+            Self::SignatureMissing => "signature-missing",
+            Self::SignatureMismatch => "signature-mismatch",
+            Self::TimestampOutsideTolerance => "timestamp-outside-tolerance",
+            Self::CredentialMissing => "credential-missing",
+        }
+    }
+
+    /// Read a stored key back. `None` for one this engine does not know, which
+    /// a row written by a newer engine can carry.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.key() == key)
+    }
+
+    /// Did this refusal look at the delivery at all?
+    ///
+    /// One arm answers no, and it is the whole reason a switched-off hook gets
+    /// its own words. `deliver` checks `enabled` first, before it reads the
+    /// body or looks up the credential. So that 401 is a configuration fact,
+    /// and it says nothing about the signature or the secret.
+    ///
+    /// The mirror of `Stage::measured_the_ingress` in `core/webhook_ingress.rs`
+    /// (ADR 0172): one predicate, read by every consumer, so a reading that
+    /// measured nothing cannot be reported as a measurement.
+    pub fn examined_the_delivery(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Which fault this refusal is evidence of.
+    ///
+    /// Derived from the predicate above and nothing else, so the two can never
+    /// disagree about which arm gets its own words.
+    pub fn cause(&self) -> RefusalCause {
+        if self.examined_the_delivery() {
+            RefusalCause::Verification
+        } else {
+            RefusalCause::Disabled
         }
     }
 }
@@ -454,57 +570,78 @@ pub fn verify(
     Ok(())
 }
 
-/// The columns every read selects, in the order [`row_to_webhook`] unpacks.
+/// The columns every read selects, plus the two ages Postgres measures.
+///
+/// **The ages are computed in SQL on purpose** (ADR 0053). The engine's clock
+/// and the database's are different clocks, and in dev the database's runs in a
+/// VM that drifts. Subtract one from the other and a run reads as negative
+/// seconds old. Every hook would then judge `Clear` for good, silencing the
+/// exact outage this feature exists to catch.
 const WEBHOOK_COLUMNS: &str = "id, name, event_type, token_hash, hmac, dedupe, headers, \
                                enabled, created_at, updated_at, last_accepted_at, \
-                               last_refused_at, last_refusal_reason";
+                               last_refused_at, last_refusal_reason, refusal_run_count, \
+                               refusal_run_since, refusal_run_cause, refusal_run_reasons, \
+                               EXTRACT(EPOCH FROM now() - refusal_run_since)::bigint \
+                                   AS refusal_run_secs, \
+                               EXTRACT(EPOCH FROM now() - last_refused_at)::bigint \
+                                   AS refusal_quiet_secs";
 
-type WebhookRow = (
-    Uuid,
-    String,
-    String,
-    Option<String>,
-    Option<serde_json::Value>,
-    Option<serde_json::Value>,
-    Vec<String>,
-    bool,
-    chrono::DateTime<chrono::Utc>,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<String>,
-);
+/// One row as read, before the JSON columns are decoded.
+///
+/// A struct rather than a tuple, so a column added in the middle of
+/// [`WEBHOOK_COLUMNS`] cannot silently shift every field after it.
+#[derive(sqlx::FromRow)]
+struct WebhookRow {
+    id: Uuid,
+    name: String,
+    event_type: String,
+    token_hash: Option<String>,
+    hmac: Option<serde_json::Value>,
+    dedupe: Option<serde_json::Value>,
+    headers: Vec<String>,
+    enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_refusal_reason: Option<String>,
+    refusal_run_count: i32,
+    refusal_run_since: Option<chrono::DateTime<chrono::Utc>>,
+    refusal_run_cause: Option<String>,
+    refusal_run_reasons: serde_json::Value,
+    refusal_run_secs: Option<i64>,
+    refusal_quiet_secs: Option<i64>,
+}
 
 fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error + Send + Sync>> {
-    let (
-        id,
-        name,
-        event_type,
-        token_hash,
-        hmac,
-        dedupe,
-        headers,
-        enabled,
-        created_at,
-        updated_at,
-        last_accepted_at,
-        last_refused_at,
-        last_refusal_reason,
-    ) = row;
     Ok(Webhook {
-        id,
-        name,
-        event_type,
-        token_hash,
-        hmac: hmac.map(serde_json::from_value).transpose()?,
-        dedupe: dedupe.map(serde_json::from_value).transpose()?,
-        headers,
-        enabled,
-        created_at,
-        updated_at,
-        last_accepted_at,
-        last_refused_at,
-        last_refusal_reason,
+        id: row.id,
+        name: row.name,
+        event_type: row.event_type,
+        token_hash: row.token_hash,
+        hmac: row.hmac.map(serde_json::from_value).transpose()?,
+        dedupe: row.dedupe.map(serde_json::from_value).transpose()?,
+        headers: row.headers,
+        enabled: row.enabled,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_accepted_at: row.last_accepted_at,
+        last_refused_at: row.last_refused_at,
+        last_refusal_reason: row.last_refusal_reason,
+        refusal_run: RefusalRun {
+            refusals: i64::from(row.refusal_run_count),
+            since: row.refusal_run_since,
+            cause: row
+                .refusal_run_cause
+                .as_deref()
+                .and_then(RefusalCause::parse),
+            // A tally that will not parse costs the breakdown alone. The count,
+            // the start and the cause still say what the run is, which is what
+            // decides whether the hook is refusing at all.
+            reasons: serde_json::from_value(row.refusal_run_reasons).unwrap_or_default(),
+            run_secs: row.refusal_run_secs,
+            quiet_secs: row.refusal_quiet_secs,
+        },
     })
 }
 
@@ -659,36 +796,68 @@ impl WebhookStore {
         Ok(Some((hook, token)))
     }
 
-    /// Stamp that a delivery verified and emitted.
+    /// Stamp that a delivery verified and emitted, and end any refusal run.
     ///
     /// An observation, so it emits nothing. `updated_at` stays where it is:
     /// nobody changed the hook, and moving it would make every delivery look
     /// like an edit.
+    ///
+    /// **Clearing the run here is what makes recovery positive evidence.** A
+    /// verdict on a hook is cleared by a delivery that worked, never by one
+    /// that stopped arriving.
     pub async fn record_accepted(
         pool: &PgPool,
         id: Uuid,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query("UPDATE webhooks SET last_accepted_at = NOW() WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE webhooks SET last_accepted_at = NOW(), refusal_run_count = 0, \
+             refusal_run_since = NULL, refusal_run_cause = NULL, \
+             refusal_run_reasons = '{}'::jsonb WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
     /// Stamp that a delivery arrived and was turned away, and why.
     ///
-    /// `reason` is a [`DeliveryRefusal::reason`] string. It reaches the
-    /// workspace owner's page and never the sender.
+    /// Takes the refusal rather than a string, so the tally keys on
+    /// [`DeliveryRefusal::key`]'s closed set and no caller can invent a reason.
+    /// The prose the owner reads is [`DeliveryRefusal::reason`], and it reaches
+    /// the page and never the sender.
+    ///
+    /// Every write is one statement, so the run's count, start, cause and tally
+    /// cannot disagree. The start is kept while the cause holds. A run that
+    /// restarted its own clock on every refusal could never age past the window
+    /// that declares it.
+    ///
+    /// **A refusal of the other cause restarts the run**, which is what keeps a
+    /// run homogeneous. Without it, a hook switched off after an hour of
+    /// signature failures would be reported as having thrown away every one of
+    /// them unread.
     pub async fn record_refused(
         pool: &PgPool,
         id: Uuid,
-        reason: &str,
+        refusal: DeliveryRefusal,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sqlx::query(
-            "UPDATE webhooks SET last_refused_at = NOW(), last_refusal_reason = $2 WHERE id = $1",
+            "UPDATE webhooks SET last_refused_at = NOW(), last_refusal_reason = $2, \
+             refusal_run_count = CASE WHEN refusal_run_cause = $4 \
+                 THEN refusal_run_count + 1 ELSE 1 END, \
+             refusal_run_since = CASE WHEN refusal_run_cause = $4 \
+                 THEN COALESCE(refusal_run_since, NOW()) ELSE NOW() END, \
+             refusal_run_reasons = CASE WHEN refusal_run_cause = $4 \
+                 THEN jsonb_set(refusal_run_reasons, ARRAY[$3], \
+                     to_jsonb(COALESCE((refusal_run_reasons->>$3)::bigint, 0) + 1), true) \
+                 ELSE jsonb_build_object($3, 1) END, \
+             refusal_run_cause = $4 \
+             WHERE id = $1",
         )
         .bind(id)
-        .bind(reason)
+        .bind(refusal.reason())
+        .bind(refusal.key())
+        .bind(refusal.cause().key())
         .execute(pool)
         .await?;
         Ok(())

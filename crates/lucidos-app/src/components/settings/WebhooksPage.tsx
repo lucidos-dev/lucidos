@@ -7,13 +7,14 @@ import {
   type Webhook,
   type WebhookWithToken,
 } from '../../api/client';
-import type { WebhookIngressOutage } from '../../api/client';
+import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { LoadableError } from '../shared/LoadableError';
 import { credentials, showConfirm, showToast, webhooksVersion } from '../../store/store';
 import { loadCredentials } from '../../store/actions/credentials';
 import { openCredentialSettings } from '../../store/actions/menu';
 import { currentIngressOutage } from '../../store/actions/webhookIngress';
+import { currentWebhookRefusals } from '../../store/actions/webhookRefusals';
 import { toFailed, loadingIfFresh, type Loadable } from '../../store/types';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -21,6 +22,7 @@ import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { copyToClipboard } from '../../utils/clipboard';
 import { lastDeliveryLine, lastRefusalLine } from './webhookDelivery';
 import { webhookIngressRowLine } from '../../utils/webhookIngressNotice';
+import { webhookRefusalRowLine } from '../../utils/webhookRefusalNotice';
 import {
   algorithmLabel,
   missingCredentialLine,
@@ -237,9 +239,12 @@ export function confirmWebhookDeletion(hook: Pick<Webhook, 'name'>): Promise<boo
 }
 
 function WebhookRow(
-  { hook, outage, now, onChanged }: {
+  { hook, outage, refusal, now, onChanged }: {
     hook: Webhook;
     outage: WebhookIngressOutage | null;
+    /** This hook's own standing refusal, or null. Unlike `outage`, which is
+     *  the shared path and is drawn on every enabled row. */
+    refusal: WebhookRefusal | null;
     now: Date;
     onChanged: () => void;
   },
@@ -247,7 +252,7 @@ function WebhookRow(
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<SignatureDraft | null>(null);
   const delivery = lastDeliveryLine(hook, now);
-  const refusal = lastRefusalLine(hook, now);
+  const lastRefusal = lastRefusalLine(hook, now);
 
   async function change(fn: () => Promise<unknown>) {
     setBusy(true);
@@ -321,7 +326,14 @@ function WebhookRow(
           <code>{hook.delivery_path}</code> on the hook port
         </div>
         {delivery && <div class="list-row-details">{delivery}</div>}
-        {refusal && <div class="list-row-details">{refusal}</div>}
+        {lastRefusal && <div class="list-row-details">{lastRefusal}</div>}
+        {/* The engine's own verdict on this hook, which the line above cannot
+            give: one refusal is a fact, and a run of them is an outage. */}
+        {refusal && (
+          <div class="list-row-details webhook-refusal-warning">
+            {webhookRefusalRowLine(refusal)}
+          </div>
+        )}
         {hook.enabled && outage && (
           <div class="list-row-details webhook-ingress-warning">
             {webhookIngressRowLine(outage)}
@@ -429,6 +441,11 @@ export function WebhooksPage() {
   // selector the app bar reads. Drawn on every enabled row rather than on the
   // hook the probe happened to target: what failed sits in front of all of them.
   const outage = currentIngressOutage(tick);
+  // Per hook, unlike the outage above: the engine judges each hook's own
+  // record, so fixing one says nothing about another.
+  const refusals = new Map(
+    currentWebhookRefusals(tick).map((refusal) => [refusal.webhook_id, refusal]),
+  );
 
   return (
     <div class="settings-section">
@@ -446,7 +463,14 @@ export function WebhooksPage() {
           <div class="empty-state">Loading webhooks...</div>
         )}
         {hooks.map((hook) => (
-          <WebhookRow key={hook.id} hook={hook} outage={outage} now={now} onChanged={reload} />
+          <WebhookRow
+            key={hook.id}
+            hook={hook}
+            outage={outage}
+            refusal={refusals.get(hook.id) ?? null}
+            now={now}
+            onChanged={reload}
+          />
         ))}
         <AddWebhookForm onCreated={reload} />
       </div>

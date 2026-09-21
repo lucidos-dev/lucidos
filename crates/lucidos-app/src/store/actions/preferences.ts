@@ -10,7 +10,6 @@ import { clampEffortFor } from './models';
 import { isIOSPwa, isTauri } from '../../utils/platform';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
-import { pushTrafficLightOffset } from './trafficLights';
 import {
   STYLE_OVERRIDES_KEY, STYLE_OVERRIDES_STORAGE_KEY, STYLE_RESET_PARAM,
   isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
@@ -257,32 +256,61 @@ export async function savePreference(
 
 // --- UI scale ---
 
+/** Whether a measurement pass is already owed this frame. */
+let scaleMeasurementPending = false;
+
+/** The two quantities DERIVED from the root font size, so both have to run
+ *  after something moves it.
+ *
+ *  The scrollbar gutter is published in px while our `::-webkit-scrollbar` width
+ *  is authored in rem. Un-remeasured, the composer stops lining up with the
+ *  transcript at any scale but the one live at boot. The thread drawer's floor
+ *  is what its rem-authored header row needs, so scaling up can leave a settled
+ *  drawer narrower than its own header. */
+function measureScaleDerivedValues(): void {
+  scaleMeasurementPending = false;
+  publishScrollbarGutter();
+  clampThreadDrawerWidth();
+}
+
+/** Owe one measurement pass, on the next frame, however many callers ask.
+ *
+ *  Both measurements READ layout back right after a write that dirtied it, which
+ *  forces a synchronous layout of the whole document. One is the honest price of
+ *  the answer. One PER INPUT EVENT is what wedged the tab. The read denies the
+ *  browser its batching. Every notch of a zoom gesture then paid a full layout,
+ *  at a root font size nothing had laid out at before.
+ *
+ *  Deferring is safe because neither value has this as its only writer. The boot
+ *  publish comes from `main.tsx`, `ThreadView` republishes on mount
+ *  (`utils/scrollbarGutter.ts`), and `store.ts`'s module init already clamps the
+ *  persisted drawer width. See
+ *  `docs/plans/2026-09-19-zooming-cannot-wedge-the-tab.md`. */
+function scheduleScaleMeasurements(): void {
+  if (scaleMeasurementPending) return;
+  if (typeof requestAnimationFrame !== 'function') {
+    measureScaleDerivedValues();
+    return;
+  }
+  // Claimed BEFORE the call, never after. A synchronous `requestAnimationFrame`
+  // runs the callback first, so a later assignment parks the flag at `true` and
+  // drops every pass after this one.
+  scaleMeasurementPending = true;
+  requestAnimationFrame(measureScaleDerivedValues);
+}
+
 export function applyUiScale(scale: number): void {
   const clamped = clampUiScale(scale);
   localStorage.setItem('lucidos-ui-scale', String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
-  // The scrollbar gutter is published in px but our ::-webkit-scrollbar width is
-  // authored in rem, so it changes with the root font size this line just moved.
-  // Re-measure, or the composer stops lining up with the transcript at any scale
-  // other than the one that was live at boot.
-  publishScrollbarGutter();
-  // Same reason, other quantity: the thread drawer's floor is what its header
-  // row needs, and that row is rem-authored too, so scaling up can leave a
-  // settled drawer narrower than its own header.
-  clampThreadDrawerWidth();
   // This just wrote --user-ui-scale inline, which the remote may be overriding.
+  // It leads the measurement rather than trailing it, because the override is
+  // free to retune the very property the two quantities are measured against.
   reapplyStyleOverrides();
-  // And the same reason a third time, this one outside the page: the macOS
-  // traffic lights are centred on the header bar, whose height this line just
-  // changed, and only we can tell the shell what it now is.
-  //
-  // AFTER the re-assert, and that is load-bearing: it MEASURES the rendered
-  // header rather than reading the value written above, so with an active
-  // --user-ui-scale override it would otherwise measure the preference scale a
-  // moment before the override put the real one back, and centre the lights for
-  // a bar that never paints. The two measurements above run before the re-assert
-  // deliberately, so the gutter they publish is the one actually reserved.
-  pushTrafficLightOffset();
+  scheduleScaleMeasurements();
+  // The macOS traffic lights are centred on the header bar, whose height this
+  // just changed, and nothing here tells the shell: `watchTitlebarBand` observes
+  // the rendered band and pushes for every mover, this one included.
 }
 
 export function currentUiScale(): number {
@@ -541,16 +569,13 @@ export function applyStyleOverrides(map: Record<string, string>): void {
   appliedOverrideNames = applied;
   localStorage.setItem(STYLE_OVERRIDES_STORAGE_KEY, serializeStyleOverrides(map));
   // A retuned --font-size-* or spacing token moves the root font size's
-  // consumers, and the scrollbar gutter is measured in px off rem-authored
-  // chrome. Same reason applyUiScale re-measures.
-  publishScrollbarGutter();
-  // Same reason again: --user-ui-scale is itself overridable, and the thread
-  // drawer's floor is what its rem-authored header row needs.
-  clampThreadDrawerWidth();
-  // And so is the bar the macOS traffic lights are centred on: a retuned
-  // --user-ui-scale or --desktop-bar-height moves it, and the shell only learns
-  // that from here.
-  pushTrafficLightOffset();
+  // consumers, and --user-ui-scale is itself overridable. So the remote owes the
+  // same two derived measurements a scale change does, through the same frame
+  // coalescer: it can write on every keystroke of a tuning session.
+  scheduleScaleMeasurements();
+  // The bar the macOS traffic lights are centred on moves here too, with a
+  // retuned --user-ui-scale or --desktop-bar-height. `watchTitlebarBand` is what
+  // tells the shell, by observing the band rather than the writers.
 }
 
 /** Re-assert the overrides after something else has written the same
@@ -725,6 +750,27 @@ export function setReasoningEffort(effort: string): Promise<void> {
   return savePreference('chat_reasoning_effort', effort, () => {
     reasoningEffort.value = effort;
   });
+}
+
+// --- Response style ---
+
+/** The id of the selected *response style*, or `standard` when unset.
+ *
+ *  Deliberately NOT validated against a fixed list, for the reason
+ *  `currentChatModel` is not: the user may add styles, so the set is open. An
+ *  id nothing defines resolves to Standard in the engine, which is also what
+ *  the picker shows for it. */
+export function currentResponseStyle(): string {
+  if (preferences.value.status !== 'loaded') return RESPONSE_STYLE_DEFAULT;
+  const v = preferences.value.data['response_style'];
+  return v && v.trim() ? v.trim() : RESPONSE_STYLE_DEFAULT;
+}
+
+/** Mirrors `response_style::STANDARD_ID`: the off switch, which adds nothing. */
+export const RESPONSE_STYLE_DEFAULT = 'standard';
+
+export function setResponseStyle(id: string): Promise<void> {
+  return savePreference('response_style', id);
 }
 
 // --- Max tool calls (the per-turn tool-call cap) ---
@@ -948,6 +994,43 @@ export function setProviderEnabled(
   return savePreference(providerEnabledKey(id), enabled ? 'true' : 'false');
 }
 
+/** The seventh switch on that page, for TypeSafe (Jev).
+ *
+ *  Same key family and same absent-means-on rule as the six, and deliberately
+ *  outside `SwitchableProvider`. Jev answers typed questions rather than
+ *  holding a conversation, so it has no `ProviderKind` and never appears in
+ *  `/health.configured_providers` (ADR 0220). Nothing keyed on that union may
+ *  therefore reach it, which is what keeps the type from admitting it.
+ *
+ *  Read by the engine's `llm::judgment::select::jev_for` on every
+ *  classification, so the switch takes effect with no restart. It is the master
+ *  switch above the two per-site `judgment_*` preferences: with it off, both
+ *  sites run their chat path whatever those two say. */
+export const PROVIDER_ENABLED_TYPESAFE_KEY = 'provider_enabled_typesafe';
+
+/** Every value the engine reads as an explicit off. Mirrors `reads_as_false`
+ *  in `llm/provider_build.rs`. */
+const SWITCH_OFF_VALUES = ['0', 'false', 'no', 'off'];
+
+/** Whether a stored switch value reads as an explicit off.
+ *
+ *  Wider than `providerSwitchedOff`'s own check just above, deliberately. The
+ *  six are answered by `/health`, which already reflects the engine's parse, so
+ *  a spelling only this side misreads is corrected there. TypeSafe has no
+ *  `/health` row (ADR 0220), which makes this the sole authority for its
+ *  switch position: reading `off` as on would draw the row live while the
+ *  engine ran chat. Absent is not off, because absent is the default. */
+export function switchValueReadsAsOff(raw: string | undefined): boolean {
+  return raw !== undefined && SWITCH_OFF_VALUES.includes(raw.trim().toLowerCase());
+}
+
+/** Switch TypeSafe on or off. Off leaves the stored `typesafe` credential
+ *  alone, exactly as the six do: the switch parks the provider, and Remove is
+ *  what deletes the key. */
+export function setTypeSafeEnabled(enabled: boolean): Promise<void> {
+  return savePreference(PROVIDER_ENABLED_TYPESAFE_KEY, enabled ? 'true' : 'false');
+}
+
 // --- Capture context ---
 
 /** Per-step ContextAssembled capture toggle. Defaults to false (off) — the
@@ -1055,6 +1138,7 @@ export type BackgroundModelKey =
   | 'model_image_description'
   | 'model_memory'
   | 'model_conversation_summary'
+  | 'model_query_classification'
   | 'model_command_judge';
 
 /** The reasoning half of each background *model selection*. */
@@ -1063,6 +1147,7 @@ export type BackgroundReasoningKey =
   | 'reasoning_image_description'
   | 'reasoning_memory'
   | 'reasoning_conversation_summary'
+  | 'reasoning_query_classification'
   | 'reasoning_command_judge';
 
 /** Default model for the command-guard judge (Haiku, per ADR 0002). Mirrors the
@@ -1071,15 +1156,25 @@ export const DEFAULT_COMMAND_JUDGE_MODEL = 'claude-haiku-4-5';
 
 /** Per-key default shown when the preference is unset. Most background tasks
  *  default to Gemini Flash; the command-guard judge defaults to Haiku. The
- *  conversation summary inherits the memory model until it is set, matching
- *  `aux_purpose`'s `model_fallback_key`. */
+ *  conversation summary and query classification inherit the memory model until
+ *  they are set, matching `aux_purpose`'s `model_fallback_key`. */
 const BACKGROUND_MODEL_DEFAULTS: Record<BackgroundModelKey, string> = {
   model_title: 'gemini-3-flash-preview',
   model_image_description: 'gemini-3-flash-preview',
   model_memory: 'gemini-3-flash-preview',
   model_conversation_summary: 'gemini-3-flash-preview',
+  model_query_classification: 'gemini-3-flash-preview',
   model_command_judge: DEFAULT_COMMAND_JUDGE_MODEL,
 };
+
+/** The keys that were split out of `model_memory` and inherit it while unset.
+ *  Each mirrors an `aux_purpose` entry whose `model_fallback_key` is
+ *  `model_memory`; the two lists must agree, or Settings shows a model the
+ *  engine is not running. */
+const INHERITS_MEMORY_MODEL: readonly BackgroundModelKey[] = [
+  'model_conversation_summary',
+  'model_query_classification',
+];
 
 /** Per-key effort default. Each mirrors the one `engine::aux_purpose` applies,
  *  and each is the literal its call site hardcoded before the preference
@@ -1090,11 +1185,19 @@ const BACKGROUND_REASONING_DEFAULTS: Record<BackgroundReasoningKey, string> = {
   reasoning_image_description: 'none',
   reasoning_memory: 'none',
   reasoning_conversation_summary: 'low',
+  reasoning_query_classification: 'none',
   reasoning_command_judge: 'none',
 };
 
+/** The effort keys that inherit `reasoning_memory` while unset, mirroring
+ *  `aux_purpose`'s `fallback_key`. Only query classification does. The summary
+ *  deliberately does not: its default is `low`, and inheriting would lower it. */
+const INHERITS_MEMORY_REASONING: readonly BackgroundReasoningKey[] = [
+  'reasoning_query_classification',
+];
+
 export function currentBackgroundModel(key: BackgroundModelKey): string {
-  const fallback = key === 'model_conversation_summary'
+  const fallback = INHERITS_MEMORY_MODEL.includes(key)
     // Split out of `model_memory`, so an unset value follows whatever the user
     // pinned there. The engine resolves the same fallback.
     ? currentBackgroundModel('model_memory')
@@ -1104,7 +1207,9 @@ export function currentBackgroundModel(key: BackgroundModelKey): string {
 }
 
 export function currentBackgroundReasoning(key: BackgroundReasoningKey): string {
-  const fallback = BACKGROUND_REASONING_DEFAULTS[key];
+  const fallback = INHERITS_MEMORY_REASONING.includes(key)
+    ? currentBackgroundReasoning('reasoning_memory')
+    : BACKGROUND_REASONING_DEFAULTS[key];
   if (preferences.value.status !== 'loaded') return fallback;
   return preferences.value.data[key] || fallback;
 }

@@ -516,9 +516,18 @@ pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolD
     let parameters = json!({
         "type": "object",
         "properties": {
+            // `todos` is required to write and meaningless to read, which no
+            // JSON Schema can say. So it is absent from `required` below and
+            // the handler enforces it, naming `read` in the refusal. Same
+            // shape as `request_credential`'s `base_urls`.
+            "action": {
+                "type": "string",
+                "enum": ["write", "read"],
+                "description": "Default `write`, which replaces the list and needs `todos`. `read` answers with the current list and changes nothing."
+            },
             "todos": {
                 "type": "array",
-                "description": "The whole new list. `[]` clears.",
+                "description": "The whole new list. `[]` clears. Required to write.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -540,12 +549,12 @@ pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolD
                 }
             }
         },
-        "required": ["todos"]
+        "required": []
     });
 
     vec![ToolDefinition {
         name: tn::TODO_WRITE.to_string(),
-        description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you call this again.".to_string(),
+        description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. EVERY CALL ANSWERS WITH THE RESULTING LIST, which is the same list the user sees. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you write the list again, so re-read it with `action: \"read\"` before telling the user where a plan stands.".to_string(),
         parameters,
     }]
 }

@@ -10,7 +10,7 @@ import {
   deadPressReport,
   canceledPressReport,
   noLiftReport,
-  faceHitTestReport,
+  pressWasAlone,
   pressIsWatchable,
   faceExclusion,
   underFingerReason,
@@ -18,13 +18,10 @@ import {
   nearestFaceMiss,
   missVector,
   screenOffset,
-  bounceHeight,
   morphStateOf,
   faceName,
-  rescueStandDown,
-  clickClaimedPress,
   shouldNudgeUntouched,
-  type FaceHitTestFacts,
+  shouldReportSilence,
   type LandingFacts,
   type ProbeViewport,
 } from '../deadPressProbe';
@@ -134,68 +131,6 @@ describe('landingReport: did the press reach the button it was aimed at', () => 
   });
 });
 
-// The question the finger cannot influence, and the one the landing check above
-// could not ask. That check needs the touch point INSIDE a painted rect, so a
-// coordinate space out of step with layout missed every rect and said nothing.
-describe('faceHitTestReport: is the face reachable where it is drawn', () => {
-  function hit(over: Partial<FaceHitTestFacts> = {}): FaceHitTestFacts {
-    return {
-      face: 'Send message',
-      centre: { x: 330, y: 434 },
-      answeredWithFace: true,
-      elementAtCentre: 'button.action-btn',
-      pointerEventsAtCentre: 'auto',
-      viewport: VIEWPORT,
-      ...over,
-    };
-  }
-
-  it('says nothing when the browser answers with the face', () => {
-    expect(faceHitTestReport(hit())).toBeNull();
-  });
-
-  it('says nothing when it answers with something inside the face', () => {
-    // The icon inside the button. The caller resolves that through
-    // `face.contains`, so a descendant is the face answering.
-    expect(faceHitTestReport(hit({ elementAtCentre: 'svg.icon' }))).toBeNull();
-  });
-
-  it('reports an ancestor answering, which is the face taking no pointer', () => {
-    const report = faceHitTestReport(hit({
-      answeredWithFace: false,
-      elementAtCentre: 'div.prompt-actions-row',
-      pointerEventsAtCentre: 'none',
-    }));
-    expect(report).toContain('not reachable where it is drawn');
-    expect(report).toContain('div.prompt-actions-row');
-    expect(report).toContain('pointer-events none');
-  });
-
-  it('reports an unrelated element, which is a stale hit-test or a cover', () => {
-    const report = faceHitTestReport(hit({
-      answeredWithFace: false,
-      elementAtCentre: 'div.thread-content',
-    }));
-    expect(report).toMatch(/^Send message is not reachable/);
-    expect(report).toContain('(330, 434)');
-  });
-
-  it('carries the viewport numbers, the keyboard flag and the scroll', () => {
-    const report = faceHitTestReport(hit({
-      answeredWithFace: false,
-      viewport: { ...VIEWPORT, pageScrollY: 87 },
-    }));
-    expect(report).toContain('vv 460 +0');
-    expect(report).toContain('kbd on');
-    expect(report).toContain('scroll 87');
-  });
-
-  it('names the absence when the page answers with nothing', () => {
-    const report = faceHitTestReport(hit({ answeredWithFace: false, elementAtCentre: null }));
-    expect(report).toContain('nothing');
-  });
-});
-
 // The decisive question, and the reason this round exists. Apple's Handling
 // Events page says a page change during the tap cascade stops the rest of it.
 // A `touchend` goes to the element the press STARTED on, so a replaced node
@@ -207,8 +142,17 @@ describe('deadPressReport: the press arrived and no path took it', () => {
     connectedAtLift: true,
     rowMutations: 0,
     outcome: null,
+    alone: true,
     viewport: VIEWPORT,
   };
+
+  it('stays silent on a press that shared the glass', () => {
+    // WebKit synthesises no click for a multi-finger gesture, so this press
+    // produces exactly what a dead one does and is not dead at all. The
+    // seventeenth report's Archive toast is the false alarm that costs.
+    expect(deadPressReport({ ...BASE, alone: false })).toBeNull();
+    expect(deadPressReport({ ...BASE, alone: false, connectedAtLift: false })).toBeNull();
+  });
 
   it('stays silent on a press somebody claimed, whichever of them took it', () => {
     // `served` is the button's own touch path running its action. `swallowed`
@@ -274,7 +218,7 @@ describe('deadPressReport: the press arrived and no path took it', () => {
 // path and produces no click, which is indistinguishable from the fault being
 // chased unless the app says so.
 describe('canceledPressReport: the system took the gesture', () => {
-  const BASE = { face: 'Cancel', movedPx: 0, viewport: VIEWPORT };
+  const BASE = { face: 'Cancel', movedPx: 0, alone: true, viewport: VIEWPORT };
 
   it('reports a stationary press the system still cancelled', () => {
     const report = canceledPressReport(BASE);
@@ -286,6 +230,10 @@ describe('canceledPressReport: the system took the gesture', () => {
     // A cancelled scroll is the platform working. Toasting on it is how a
     // diagnostic teaches the reader to ignore it.
     expect(canceledPressReport({ ...BASE, movedPx: 40 })).toBeNull();
+  });
+
+  it('stays silent on a press that shared the glass, which is a pinch', () => {
+    expect(canceledPressReport({ ...BASE, alone: false })).toBeNull();
   });
 
   it('shares the tap gate threshold rather than inventing a second one', () => {
@@ -413,28 +361,6 @@ describe('screenOffset: where the finger is against where the page says it is', 
   });
 });
 
-describe('bounceHeight: the relayout that stands in for a keyboard bounce', () => {
-  it('travels the keyboard\'s own span', () => {
-    // A 476 shell inside an 844 layout viewport is a 368px keyboard.
-    expect(bounceHeight(476, 844)).toBe(108);
-  });
-
-  // Growing clamps every scroller's offset at that layout, and the restore
-  // does not put those offsets back (ADR 0183).
-  it('goes down, never up', () => {
-    expect(bounceHeight(476, 844)).toBeLessThan(476);
-    expect(bounceHeight(844, 844)).toBeLessThan(844);
-  });
-
-  it('still moves when no keyboard is up', () => {
-    expect(bounceHeight(844, 844)).toBe(843);
-  });
-
-  it('never asks for a shell of no height', () => {
-    expect(bounceHeight(10, 900)).toBe(1);
-  });
-});
-
 describe('morphStateOf: what "the send button" was showing', () => {
   // "The button is there, it just doesn't work" is a claim about this, and no
   // line has ever carried it.
@@ -472,14 +398,22 @@ describe('the breadcrumb channel', () => {
 
   it('records every verdict a press can end on', () => {
     for (const verdict of [
-      'dead', 'clicked', 'canceled', 'missed', 'no-lift', 'click-no-touch', 'unreachable',
-      'covered', 'stray-click',
+      'dead', 'multi-touch', 'clicked', 'canceled', 'missed', 'no-lift', 'click-no-touch',
+      'covered', 'stray-click', 'untouched',
     ]) {
       expect(code).toContain(`'${verdict}'`);
     }
     // 'served' and 'swallowed' come from `takePressOutcome`, not from a
-    // literal here, and reach the line through `outcome ?? 'dead'`.
-    expect(code).toContain(`outcome ?? 'dead'`);
+    // literal here, and reach the line through the same fallback.
+    expect(code).toContain(`outcome ?? (alone ? 'dead' : 'multi-touch')`);
+  });
+
+  it('dispatches nothing, on any path', () => {
+    // The seventeenth report. The settle used to click the commit face, and it
+    // sent a draft on a tap 138px from Send. A diagnostic that acts is a bug of
+    // its own, so the module is read-only with respect to activation.
+    expect(code).not.toMatch(/\.click\(/);
+    expect(code).not.toContain('activated');
   });
 
   it('carries nothing the user typed', () => {
@@ -495,7 +429,7 @@ describe('the breadcrumb channel', () => {
 // every `touchstart`. Neither arriving is the touch pipeline stopping
 // mid-gesture, rather than a button declining a press.
 describe('noLiftReport: the press arrived and the lift did not', () => {
-  const BASE = { face: 'Send message', movedPx: 0, viewport: VIEWPORT };
+  const BASE = { face: 'Send message', movedPx: 0, alone: true, viewport: VIEWPORT };
 
   it('reports a stationary press whose lift never arrived', () => {
     const report = noLiftReport(BASE);
@@ -507,6 +441,10 @@ describe('noLiftReport: the press arrived and the lift did not', () => {
     expect(noLiftReport({ ...BASE, movedPx: 40 })).toBeNull();
   });
 
+  it('stays silent on a press that shared the glass', () => {
+    expect(noLiftReport({ ...BASE, alone: false })).toBeNull();
+  });
+
   it('shares the tap gate threshold rather than inventing a third one', () => {
     expect(noLiftReport({ ...BASE, movedPx: 8 })).not.toBeNull();
     expect(noLiftReport({ ...BASE, movedPx: 9 })).toBeNull();
@@ -514,6 +452,32 @@ describe('noLiftReport: the press arrived and the lift did not', () => {
 
   it('carries the viewport numbers, like every other report here', () => {
     expect(noLiftReport(BASE)).toContain('kbd on');
+  });
+});
+
+// The seventeenth report opened with an Archive press called dead. Its
+// `quiet.ms` of 13 places a second contact on the glass 13ms in front of it.
+// Nothing on the line could say so, because nothing counted the fingers.
+describe('pressWasAlone: was this press the only contact on the glass', () => {
+  it('takes one finger down and nothing left at the lift', () => {
+    expect(pressWasAlone({ fingers: 1, fingersAtLift: 0 })).toBe(true);
+  });
+
+  it('refuses a press that began beside another finger', () => {
+    expect(pressWasAlone({ fingers: 2, fingersAtLift: 0 })).toBe(false);
+  });
+
+  it('refuses one a finger joined halfway through', () => {
+    // The running maximum is why the count is not read at touchdown alone.
+    expect(pressWasAlone({ fingers: 2, fingersAtLift: 1 })).toBe(false);
+  });
+
+  it('refuses one that left a finger behind', () => {
+    expect(pressWasAlone({ fingers: 1, fingersAtLift: 1 })).toBe(false);
+  });
+
+  it('takes a count of zero, which a synthetic event reports', () => {
+    expect(pressWasAlone({ fingers: 0, fingersAtLift: 0 })).toBe(true);
   });
 });
 
@@ -658,64 +622,6 @@ describe('the probe consumes no gesture', () => {
     // status. It then spent the episode's one repair on a doomed layout.
     expect(code).toContain(`'data-ui-blocked'`);
   });
-
-  it('latches the reachability report, so one state is one toast', () => {
-    // It runs on every touch while composing, and its toast holds until
-    // dismissed. Unlatched, a wedged row buries the screen in copies.
-    expect(code).toMatch(/reportedUnreachable\.has\(name\)\) continue/);
-    expect(code).toMatch(/reportedUnreachable\.delete\(name\)/);
-  });
-});
-
-describe('the rescue rules a dropped press in one place', () => {
-  // Three bounds used to sit at three sites, and two of them refused in
-  // silence. The whole engine ledger holds no rescue, so the reading that
-  // would say which bound refused never existed.
-  const dead = { movedPx: 0, claimed: false, covered: false, hasCommitFace: true };
-
-  it('runs a stationary press that reached nothing, with a live face', () => {
-    // Note what is NOT an input here: where in the row the finger landed. The
-    // reporter refused a bound on it, and the composer takes no tap anywhere
-    // during an episode.
-    expect(rescueStandDown(dead)).toBeNull();
-  });
-
-  it('refuses a gesture the platform took', () => {
-    expect(rescueStandDown({ ...dead, movedPx: 9 })).toBe('traveled');
-  });
-
-  it('refuses a press something else claimed', () => {
-    expect(rescueStandDown({ ...dead, claimed: true })).toBe('claimed');
-  });
-
-  it('refuses one under a cover the app raised', () => {
-    expect(rescueStandDown({ ...dead, covered: true })).toBe('covered');
-  });
-
-  it('has nothing to run without a commit face, which is most taps', () => {
-    expect(rescueStandDown({ ...dead, hasCommitFace: false })).toBe('no-face');
-  });
-
-  it('names travel first, since the platform settles it hardest', () => {
-    expect(rescueStandDown({ movedPx: 9, claimed: true, covered: true, hasCommitFace: false }))
-      .toBe('traveled');
-  });
-});
-
-describe('a click stands the rescue down only if something could take it', () => {
-  it('ignores the dead press\u2019s own twin, which lands on the row', () => {
-    // The fourteenth episode turns on this. A tap on the row dispatches a
-    // click on the row, and reading that as an answer killed every rescue.
-    expect(clickClaimedPress({ onButton: false, inRow: true })).toBe(false);
-  });
-
-  it('stands down for a click a button took', () => {
-    expect(clickClaimedPress({ onButton: true, inRow: true })).toBe(true);
-  });
-
-  it('stands down for a click that landed outside the row', () => {
-    expect(clickClaimedPress({ onButton: false, inRow: false })).toBe(true);
-  });
 });
 
 describe('missVector: the signed miss, which a scalar cannot express', () => {
@@ -755,17 +661,64 @@ describe('nearestFaceMiss carries the vector to the face it names', () => {
   });
 });
 
+describe('shouldReportSilence: the wedge whose signature is silence', () => {
+  // The eighteenth report. Thirteen scheduled checks ran through a 36 second
+  // stretch where the page took nothing, and the ledger held not one line. The
+  // check is the only reading that runs in that state, so it is the only one
+  // that can name it.
+  const wedged = {
+    hasCommitFace: true,
+    msSinceKeyboardClose: 4000,
+    msSinceInput: 40000,
+  };
+
+  it('names a silence that followed the keyboard going', () => {
+    expect(shouldReportSilence(wedged)).toBe(true);
+  });
+
+  it('says nothing before the silence has lasted a tick', () => {
+    // The user who closes the keyboard and taps Send at once.
+    expect(shouldReportSilence({ ...wedged, msSinceKeyboardClose: 900 })).toBe(false);
+  });
+
+  it('measures from the LAST input, never from the close alone', () => {
+    // The correction the episode forced. Two inputs landed a second after the
+    // keys went, so a close-only anchor would have refused the whole window.
+    expect(shouldReportSilence({ ...wedged, msSinceInput: 500 })).toBe(false);
+    expect(shouldReportSilence({ ...wedged, msSinceKeyboardClose: 40000, msSinceInput: 4000 }))
+      .toBe(true);
+  });
+
+  it('says nothing until a keyboard has actually closed', () => {
+    // The state this describes starts at the close. Without one there is
+    // nothing to say, however long the page has been quiet.
+    expect(shouldReportSilence({ ...wedged, msSinceKeyboardClose: null })).toBe(false);
+  });
+
+  it('holds the silence against the close when the page took nothing at all', () => {
+    expect(shouldReportSilence({ ...wedged, msSinceInput: null })).toBe(true);
+    expect(shouldReportSilence({ ...wedged, msSinceKeyboardClose: 900, msSinceInput: null }))
+      .toBe(false);
+  });
+
+  it('has nothing to report with no commit face, which is an idle phone', () => {
+    // The bound that keeps the line rare. A live commit face says the composer
+    // has something to send, which is the state a user taps at.
+    expect(shouldReportSilence({ ...wedged, hasCommitFace: false })).toBe(false);
+  });
+});
+
 describe('shouldNudgeUntouched: the recovery with no gesture behind it', () => {
   // The fourteenth PWA episode took no touch and no click for 18.5 seconds.
   // Both of ADR 0183's answers wait to be touched, so this is the one state
   // neither can reach. Typing is what arms it instead.
   const waiting = {
     hasCommitFace: true,
-    typedSinceLastInput: true,
+    typedSinceComposerInput: true,
     msSinceKeystroke: 4000,
   };
 
-  it('runs for a typed draft the page has taken no touch since', () => {
+  it('runs for a typed draft the composer has taken no touch since', () => {
     expect(shouldNudgeUntouched(waiting)).toBe(true);
   });
 
@@ -777,15 +730,17 @@ describe('shouldNudgeUntouched: the recovery with no gesture behind it', () => {
     expect(shouldNudgeUntouched({ ...waiting, hasCommitFace: false })).toBe(false);
   });
 
-  it('stands down once a touch did reach the page after the typing', () => {
-    expect(shouldNudgeUntouched({ ...waiting, typedSinceLastInput: false })).toBe(false);
+  it('stands down once a touch did reach the composer after the typing', () => {
+    // The COMPOSER, not the page, and round 15 is the reason. A touch the page
+    // took elsewhere used to disarm this for the rest of an episode.
+    expect(shouldNudgeUntouched({ ...waiting, typedSinceComposerInput: false })).toBe(false);
   });
 
   it('never fires before the user has typed at all', () => {
     // `msSinceKeystroke` is 0 with no keystroke on record, which the elapsed
     // gate already refuses. Both gates say no, and neither alone should.
     expect(shouldNudgeUntouched({
-      ...waiting, typedSinceLastInput: false, msSinceKeystroke: 0,
+      ...waiting, typedSinceComposerInput: false, msSinceKeystroke: 0,
     })).toBe(false);
   });
 

@@ -229,6 +229,12 @@
     padding-inline: calc(var(--turn-surface-inset) - var(--prompt-box-border-width));
 }
 
+/* The composer declares NO resting height of its own, on either breakpoint. It
+   rests at the shared shell's floor (panels/previews.css, with a shorter
+   mobile.css value): a line plus the box's padding, and a little slack over
+   that on a desktop pane. It grows on typing, which resizeTextarea does.
+   A multi-line floor here is a settled no, see docs/adr/0221. */
+
 /* `.prompt-clear` intentionally has NO rule of its own. It is one of the prompt
    row's icons now, so `.icon-btn.header-icon` sizes and colours it and the nudge
    below aligns it, exactly as for the three buttons beside it. The class is kept
@@ -247,6 +253,26 @@
     position: relative;
 }
 
+/* NOTHING IN THIS ROW MAY SHRINK, and that is what makes the fold honest.
+ *
+ * The fold measures each member's laid-out width and folds until the row fits.
+ * A member that can be squeezed reports a width smaller than it needs, so the
+ * measurement concludes the row fits while a label spills off the screen. That
+ * is what shipped: `.action-btn` sets `min-width: 3.5rem`, which REPLACES a
+ * flex item's automatic min-content floor, so an Archive button shrank to
+ * 3.5rem and its `white-space: nowrap` label ran past the screen edge.
+ *
+ * With no shrink anywhere, a laid-out width IS the member's true width, and a
+ * false reading stops being representable. Pinned by
+ * styles/__tests__/prompt-row-one-row-guard.test.ts.
+ *
+ * Every descendant, not just the row's own children: `.prompt-actions-right`
+ * is a member AND a flex container, so its buttons would shrink inside it. */
+.prompt-actions-row > *,
+.prompt-actions-right > * {
+    flex-shrink: 0;
+}
+
 .image-attach-anchor {
     position: relative;
 }
@@ -259,11 +285,11 @@
     transform: translateY(0.375rem);
 }
 
-/* An icon in the RIGHT-hand group (today only the standing apply) has to undo
- * both halves of the rule above, because that group is laid out the other way
- * round: it centres its own children rather than sitting them on the row's
- * flex-end, and it is only as tall as a 1.5rem `.action-btn` beside a 1.625rem
- * send button.
+/* An icon in the RIGHT-hand group (the standing apply, and Diff beside it) has
+ * to undo both halves of the rule above, because that group is laid out the
+ * other way round: it centres its own children rather than sitting them on the
+ * row's flex-end, and it is only as tall as a 1.5rem `.action-btn` beside a
+ * 1.625rem send button.
  *
  * So the transform would push the glyph below its neighbours instead of level
  * with them. And the 2.25rem tap target would become the group's height, which
@@ -537,40 +563,21 @@
     color: var(--accent-green);
 }
 
+/* THE ROW IS ONE ROW, and a second one is unrepresentable rather than merely
+ * avoided. This cluster used to carry `flex-wrap: wrap-reverse` as a safety
+ * net, beside an `is-stacked` column variant that lifted the Diff button onto a
+ * sub-row. Both drew a second line above a phone's keyboard, and the two
+ * disagreed with the fold about which of them should give way.
+ *
+ * The fold is the only mechanism now. Every member between the control menu and
+ * the send button folds into the ⋯ menu, so there is always a count the row can
+ * hold and nothing is left to wrap. */
 .prompt-actions-right {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin-left: auto;
-    /* Safety net: when the measurement-driven `is-stacked` lift can't engage
-     * (no liftable slot — e.g. a question-answer thread showing
-     * Save / Cancel / Submit), the buttons must wrap onto another row instead
-     * of overflowing the prompt row off-screen. flex-shrink (default 1) lets
-     * this group give up width under the row's auto margin when free space goes
-     * negative, so wrapping engages. `wrap-reverse` keeps the default position
-     * the BOTTOM row (the first/primary buttons stay anchored at the bottom)
-     * and lifts only the overflow UP onto a new row above — matching the
-     * `is-stacked` lift, so a button like Save isn't needlessly pushed to the
-     * top. Right-aligned via justify-content. */
-    flex-wrap: wrap-reverse;
     justify-content: flex-end;
-}
-
-/* Stacked variant — useFitsInOneRow detected overflow, so the secondary
- * button (the Diff button, in the banner or standalone while composing) lifts
- * onto a sub-row directly above the primary buttons. Stays inside this column so
- * the icons (siblings on the left of .prompt-actions-row) don't introduce a
- * tall flex-end gap above the primary sub-row. */
-.prompt-actions-right.is-stacked {
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 0.5rem;
-}
-
-.prompt-actions-subrow {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
 }
 
 .changes-bulk-actions {
@@ -1323,10 +1330,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     background: var(--accent-red);
 }
 
-/* The app's "waiting" motion. Shared by the two progress dots above and by the
-   todo indicator's waiting state (chat/todo-list.css), which is deliberately
-   the same gray pulse rather than a colour of its own: keyframes are global,
-   so it reuses these rather than declaring a twin. */
+/* The app's "waiting" motion, used by the two progress dots above. Keyframes
+   are global, so a new waiting surface reuses these rather than declaring a
+   twin. */
 @keyframes progress-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }

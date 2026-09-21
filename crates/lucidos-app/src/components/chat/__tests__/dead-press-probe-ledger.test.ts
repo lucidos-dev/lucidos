@@ -14,6 +14,10 @@ vi.mock('../../../store/store', () => ({ showToast }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 
 import { installDeadPressProbe } from '../deadPressProbe';
+import {
+  noteViewportResize,
+  resetKeyboardCloseState,
+} from '../../layout/keyboardCloseRelayout';
 import { notePressOutcome } from '../../../utils/tapGesture';
 
 interface Box { left: number; right: number; top: number; bottom: number }
@@ -67,11 +71,19 @@ class FakeEl {
   }
   contains(other: unknown) { return other === this; }
   closest(sel: string) {
-    // A face is a real `<button>`; the row and the transcript are divs. Which
-    // of the two a click landed on is what says whether anything could have
+    // A face is a real `<button>`; the row, the textarea and the transcript are
+    // not. Whether a click landed on a control is what says anything could have
     // taken it. See `clickClaimedPress`.
-    if (sel === 'button') {
+    if (sel.startsWith('button,')) {
       return this.classes.some((c) => c === 'action-btn' || c === 'icon-btn') ? this : null;
+    }
+    // The composer: the row and its textarea, never the transcript. What arms
+    // the typing-driven recovery. See `COMPOSER_SELECTOR`.
+    if (sel === '.prompt-box') {
+      if (this.classes.includes('prompt-actions-row') || this.classes.includes('prompt-textarea')) {
+        return this;
+      }
+      return this.row;
     }
     if (sel !== '.prompt-actions-row') return null;
     if (this.classes.includes('prompt-actions-row')) return this;
@@ -93,6 +105,12 @@ let faces: FakeEl[];
  *  genuinely unattributed. Using the row itself would make `onRow` true and let
  *  a case pass through the old gate it was written to bypass. */
 let elsewhere: FakeEl;
+/** The composer's own text box, above the action row and inside `.prompt-box`.
+ *
+ *  A touch here reaches the composer without reaching the row, which is the
+ *  one thing that says the composer can still be pressed. Round 15's ledger
+ *  holds one of these mid-episode, and it used to disarm the recovery. */
+let textarea: FakeEl;
 /** What `elementFromPoint` answers, for the hit-test disagreement cases. */
 let atPoint: unknown = null;
 /** A per-point answer, for the one state a single answer cannot express: a face
@@ -133,8 +151,15 @@ function touch(el: unknown, x: number, y: number, fingers = 1, id = 0, screenOff
 }
 
 function fire(type: string, event: Record<string, unknown>) {
-  (globalThis.document as unknown as { dispatchEvent(e: unknown): void })
-    .dispatchEvent({ type, ...event });
+  const e: Record<string, unknown> = { type, ...event };
+  // The DOM drops a contact from `touches` before dispatching its end event, so
+  // an ordinary tap ends with an EMPTY list. The probe counts fingers off that
+  // list, and a harness that kept the lifted touch in it would read every tap
+  // as a two-finger gesture. See `pressWasAlone`.
+  if (type === 'touchend' || type === 'touchcancel') {
+    if (Array.isArray(e.touches)) e.touches = (e.touches as unknown[]).slice(1);
+  }
+  (globalThis.document as unknown as { dispatchEvent(x: unknown): void }).dispatchEvent(e);
 }
 
 interface Line {
@@ -154,13 +179,29 @@ interface Line {
   missedBy?: { face: string; px: number; dx?: number; dy?: number; rect?: Box } | null;
   /** The silence that ended at the input this line belongs to. */
   quiet?: {
-    ms: number; checks: number; unreachable: number; covered: number; nudges: number;
+    ms: number; checks: number; covered: number; nudges: number; closes: number;
   } | null;
+  /** How long ago the keyboard closed, and how long ago the page last took an
+   *  input. Only `silent-since-keyboard` carries them. */
+  sinceKeyboardMs?: number;
+  sinceInputMs?: number | null;
   /** The row's own state, read at the PRESS. See `PressContext`. */
   morph?: string;
   viewport?: { appHeight: string; keyboardActive: boolean };
-  /** Why the rescue refused. Only `rescue-stood-down` carries it. */
+  /** How far the finger travelled, in screen px. */
+  movedPx?: number;
+  /** Contacts the glass held across the press. See `PressFingers`. */
+  fingers?: number;
+  fingersAtLift?: number;
+  /** How far the press landed from the commit face. Both settled-miss verdicts
+   *  carry it. */
+  reachPx?: number | null;
+  /** Why the settle refused. Only `rescue-stood-down` carries it. */
   standDown?: string;
+  /** What the claiming click landed on. Only a `claimed` refusal carries it. */
+  claimedBy?: { target: string | null; onControl: boolean; sinceTouchMs: number | null };
+  /** Relayouts since the last keystroke, which a touch does not reset. */
+  nudgesSinceKeystroke?: number;
   /** Which cover the app had up when it declined to judge the press. */
   cover?: string;
   /** Set only on a repair line. */
@@ -211,6 +252,7 @@ beforeEach(() => {
   send = new FakeEl('Send message', SEND_BOX, ['action-btn', 'send-cancel-morph'], row);
   faces = [send];
   elsewhere = new FakeEl(null, { left: 0, right: 390, top: 0, bottom: 300 }, ['thread-content']);
+  textarea = new FakeEl(null, { left: 0, right: 390, top: 340, bottom: 396 }, ['prompt-textarea']);
   atPoint = send;
   atPointNear = null;
   showToast.mockClear();
@@ -279,11 +321,16 @@ describe('the press ledger keeps every press it watched', () => {
   it('still rules the first press when a second finger joined and then lifted', () => {
     // Clearing `armed` for the second finger stranded the press: no lift could
     // reach it and no line was ever written.
+    //
+    // It is `multi-touch` rather than `dead`, because WebKit owes no click to a
+    // gesture that shared the glass. The line is the point either way.
     fire('touchstart', touch(send, 350, 420));
     fire('touchstart', touch(row, 10, 420, 2, 1));
     fire('touchend', touch(send, 350, 420));
     vi.advanceTimersByTime(1000);
-    expect(verdicts()).toEqual(['dead']);
+    expect(verdicts()).toEqual(['multi-touch']);
+    expect(lines()[0].fingers).toBe(2);
+    expect(showToast).not.toHaveBeenCalled();
   });
 
   it('ignores a second finger lifting first, which is not this press ending', () => {
@@ -304,11 +351,10 @@ describe('the press ledger keeps every press it watched', () => {
     fire('touchmove', touch(row, 10, 200, 2, 1));
     fire('touchend', touch(send, 350, 420));
     vi.advanceTimersByTime(1000);
-    // Stationary, so the report is not suppressed as a swipe.
-    expect(showToast).toHaveBeenCalledWith(
-      expect.stringContaining('did not register'),
-      'warning',
-    );
+    // The press is still ruled and still written. The other finger's travel
+    // belongs to the other finger, so this one stays stationary.
+    expect(verdicts()).toEqual(['multi-touch']);
+    expect(lines()[0].movedPx).toBe(0);
   });
 
   it('reports a press that is never followed by anything at all', () => {
@@ -467,71 +513,6 @@ describe('a click with no touch behind it', () => {
   });
 });
 
-describe('the reachability question is no longer behind the row gate', () => {
-  /** Both the throttle and the reported-face latch are module state that
-   *  outlives a case. Clear the first by advancing, and the second by letting
-   *  the face answer once, which is the documented way it is forgotten. */
-  function freshWedgeState() {
-    vi.advanceTimersByTime(1000);
-    atPoint = send;
-    fire('touchstart', touch(elsewhere, 10, 90));
-    vi.advanceTimersByTime(1000);
-    postClientLog.mockClear();
-    showToast.mockClear();
-  }
-
-  it('reports a face the page will not answer with, for a touch that missed the row', () => {
-    // The gate this sits in front of is `!onRow && !inRow`, and a coordinate
-    // space out of step with layout defeats exactly that gate. For two rounds
-    // the immune check sat behind it. The target is OUTSIDE the row, so the
-    // gate would have returned before the question was ever asked.
-    freshWedgeState();
-    atPoint = row;
-    fire('touchstart', touch(elsewhere, 10, 90));
-    expect(showToast).toHaveBeenCalledWith(
-      expect.stringContaining('not reachable where it is drawn'),
-      'warning',
-    );
-    // A repair follows the detection on this path too. The latch would
-    // otherwise strand a wedge the user found by tapping, since the scheduled
-    // check goes quiet once the face is reported.
-    expect(verdicts()).toContain('unreachable');
-    expect(verdicts()).not.toContain('missed');
-  });
-
-  it('stays quiet about a composer parked off-screen on another pane', () => {
-    // The mobile swipe track is 300% wide and keeps all three panes laid out.
-    // The thread pane's row therefore has a real box outside the viewport
-    // whenever the user is elsewhere. `elementFromPoint` answers null for any
-    // such point, so asking would call the composer wedged on every tap.
-    freshWedgeState();
-    send.box = { left: -420, right: -376, top: 400, bottom: 444 };
-    atPoint = null;
-    fire('touchstart', touch(elsewhere, 10, 90));
-    expect(verdicts()).toEqual([]);
-    expect(showToast).not.toHaveBeenCalled();
-  });
-
-  it('stays quiet for an ordinary touch far from a reachable row', () => {
-    freshWedgeState();
-    fire('touchstart', touch(elsewhere, 10, 90));
-    expect(verdicts()).toEqual([]);
-    expect(showToast).not.toHaveBeenCalled();
-  });
-
-  it('does not put a missed line under every touch while a wedge lasts', () => {
-    // The finding gets its own line and its own latch. Widening the gate
-    // instead would log every touch in the app for as long as the wedge held.
-    freshWedgeState();
-    atPoint = row;
-    fire('touchstart', touch(elsewhere, 10, 90));
-    vi.advanceTimersByTime(1000);
-    fire('touchstart', touch(elsewhere, 10, 90));
-    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
-    expect(verdicts()).not.toContain('missed');
-  });
-});
-
 /** The scheduled check's period, mirrored from the module. */
 const TICK = 3000;
 
@@ -553,14 +534,6 @@ describe('the reading that does not wait to be touched', () => {
   // Full reconstruction:
   // docs/plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md
 
-  it('writes a line with no event dispatched at all', () => {
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    expect(verdicts()).toContain('unreachable');
-    expect(lines()[0].scheduled).toBe(true);
-  });
-
   it('stays quiet while no composer row is laid out', () => {
     settleHealthy();
     row.box = { left: 0, right: 0, top: 0, bottom: 0 };
@@ -579,16 +552,6 @@ describe('the reading that does not wait to be touched', () => {
     expect(verdicts()).toEqual([]);
   });
 
-  it('writes once for a wedge that lasts, and again after one that returns', () => {
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK * 4);
-    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
-  });
 });
 
 describe('a cover the app raised itself is not a wedge', () => {
@@ -681,135 +644,8 @@ describe('a cover the app raised itself is not a wedge', () => {
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
     expect(press?.quiet?.checks).toBeGreaterThan(0);
     expect(press?.quiet?.covered).toBe(press?.quiet?.checks);
-    expect(press?.quiet?.unreachable).toBe(0);
   });
 
-  it('reports a real wedge again once the blocker is gone', () => {
-    // A stand-down, not a latch. The next check must still report a refresh
-    // that left the row wedged behind it.
-    settleHealthy();
-    blockUi(true);
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    blockUi(false);
-    vi.advanceTimersByTime(TICK);
-    expect(verdicts()).toContain('unreachable');
-  });
-});
-
-describe('the repair, and whether it worked', () => {
-  /** A style object that actually stores, so the restore can be asserted. The
-   *  shared setup's stub answers the empty string for every property, which
-   *  the module reads as a shell it does not own. */
-  let props: Record<string, string>;
-  let priorStyle: unknown;
-
-  beforeEach(() => {
-    const root = (globalThis.document as unknown as { documentElement: Record<string, unknown> })
-      .documentElement;
-    priorStyle = root.style;
-    props = { '--app-height': '844px' };
-    root.style = {
-      setProperty: (k: string, v: string) => { props[k] = v; },
-      getPropertyValue: (k: string) => props[k] ?? '',
-      removeProperty: (k: string) => { delete props[k]; },
-    };
-  });
-
-  afterEach(() => {
-    const root = (globalThis.document as unknown as { documentElement: Record<string, unknown> })
-      .documentElement;
-    root.style = priorStyle;
-  });
-
-  /** Advance in steps shorter than the repair's own settle timer, stopping the
-   *  moment the check reports. The shared interval's phase drifts across cases,
-   *  so a single long advance can run the repair before the case can answer. */
-  function tickUntilUnreachable() {
-    for (let i = 0; i < 400 && !verdicts().includes('unreachable'); i++) {
-      vi.advanceTimersByTime(20);
-    }
-  }
-
-  it('says it worked when the face answers afterwards', () => {
-    settleHealthy();
-    atPoint = row;
-    tickUntilUnreachable();
-    atPoint = send;                       // the nudge took effect
-    vi.advanceTimersByTime(200);
-    expect(verdicts()).toContain('repaired');
-    expect(showToast).toHaveBeenCalledWith(
-      expect.stringContaining('stopped taking taps'),
-      'warning',
-    );
-  });
-
-  it('says it did not work when the face still will not answer', () => {
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    vi.advanceTimersByTime(200);
-    expect(verdicts()).toContain('repair-failed');
-    expect(showToast).not.toHaveBeenCalledWith(
-      expect.stringContaining('stopped taking taps'),
-      'warning',
-    );
-  });
-
-  it('restores the height it nudged', () => {
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    vi.advanceTimersByTime(200);
-    expect(props['--app-height']).toBe('844px');
-  });
-
-  it('never touches a healthy row', () => {
-    settleHealthy();
-    vi.advanceTimersByTime(TICK * 3);
-    expect(verdicts()).toEqual([]);
-    expect(props['--app-height']).toBe('844px');
-  });
-
-  it('spends one attempt per episode, not one per tick', () => {
-    settleHealthy();
-    atPoint = row;
-    vi.advanceTimersByTime(TICK * 5);
-    const attempts = verdicts().filter((v) => v === 'repaired' || v === 'repair-failed');
-    expect(attempts).toHaveLength(1);
-  });
-
-  it('does not call a row that re-rendered under it a failed repair', () => {
-    // The face left the document, so it answers nothing. Scoring that as a
-    // failure would poison the split the repair exists to read.
-    settleHealthy();
-    atPoint = row;
-    tickUntilUnreachable();
-    send.isConnected = false;
-    vi.advanceTimersByTime(200);
-    const judged = lines().find((l) => l.verdict === 'repair-failed');
-    expect(judged?.connected).toBe(false);
-  });
-
-  it('leaves a unit it does not own alone', () => {
-    settleHealthy();
-    props['--app-height'] = '100%';
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    vi.advanceTimersByTime(200);
-    expect(props['--app-height']).toBe('100%');
-    expect(lines().find((l) => l.verdict === 'repair-failed')?.nudged).toBe(false);
-  });
-
-  it('declines to write a height the shell never set', () => {
-    settleHealthy();
-    delete props['--app-height'];
-    atPoint = row;
-    vi.advanceTimersByTime(TICK);
-    vi.advanceTimersByTime(200);
-    expect(verdicts()).toContain('repair-failed');
-    expect(props['--app-height']).toBeUndefined();
-  });
 });
 
 describe('a dead composer tap runs the recovery the user runs by hand', () => {
@@ -876,12 +712,13 @@ describe('a dead composer tap runs the recovery the user runs by hand', () => {
     expect(writes.length).toBeGreaterThan(0);
   });
 
-  it('says so in the log', () => {
+  it('says nothing, because the missed line already said the press arrived', () => {
+    // The relayout is the recovery, not a reading. A second line per dead tap
+    // buys nothing the `missed` line above it does not already carry.
     settleHealthy();
     tapDeadSpace();
     vi.advanceTimersByTime(700);
-    const repair = lines().find((l) => l.verdict === 'repaired' || l.verdict === 'repair-failed');
-    expect(repair?.nudged).toBe(true);
+    expect(verdicts().filter((v) => v !== 'missed')).toEqual([]);
   });
 
   it('never toasts, because nothing here can score the repair', () => {
@@ -973,292 +810,6 @@ describe('a touch the composer never saw still leaves a line', () => {
   });
 });
 
-describe('a dead tap runs Send itself', () => {
-  // The app knows enough to do this: a touch reached the document, inside the
-  // composer row, no button claimed it, and Send is live (ADR 0183). A
-  // relayout helps the NEXT tap; this answers the one just made.
-  let priorHasAttribute: unknown;
-
-  function root(): Record<string, unknown> {
-    return (globalThis.document as unknown as { documentElement: Record<string, unknown> })
-      .documentElement;
-  }
-
-  function wedgedWithKeyboardUp() {
-    atPointNear = (x: number, y: number) => (
-      x >= SEND_BOX.left && x <= SEND_BOX.right && y >= SEND_BOX.top && y <= SEND_BOX.bottom
-        ? send
-        : row
-    );
-    root().hasAttribute = (name: string) => name === 'data-keyboard-active';
-  }
-
-  /** The state the caught episode was in. The face answers at its own centre
-   *  throughout, the finger reaches nothing, and no textarea is focused. */
-  function keyboardDownAndWedged() {
-    atPointNear = (x: number, y: number) => (
-      x >= send.box.left && x <= send.box.right && y >= send.box.top && y <= send.box.bottom
-        ? send
-        : row
-    );
-    root().hasAttribute = () => false;
-  }
-
-  function tapDeadSpace() {
-    fire('touchstart', touch(row, 10, 420));
-    fire('touchend', touch(row, 10, 420));
-  }
-
-  beforeEach(() => { priorHasAttribute = root().hasAttribute; });
-  afterEach(() => { root().hasAttribute = priorHasAttribute; });
-
-  it('sends, and says it did', () => {
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-    expect(verdicts()).toContain('activated');
-    expect(showToast).toHaveBeenCalledWith(
-      expect.stringContaining('did not register'),
-      'warning',
-    );
-  });
-
-  it('never stops a running turn', () => {
-    // The same node in cancel mode. A dropped tap must not cancel the run.
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    send.label = 'Cancel';
-    tapDeadSpace();
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(0);
-  });
-
-  it('runs anyway when the dead press’s own click lands on the row', () => {
-    // The fourteenth episode. A tap on the row dispatches a click ON the row,
-    // an inert div. The rescue used to stand down on any click at all. So
-    // every dead press killed its own recovery inside the grace window, and
-    // the whole engine ledger holds no rescue.
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    fire('click', { target: row });
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-  });
-
-  it('stands down when the click landed on something that could take it', () => {
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    fire('click', { target: send });
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(0);
-  });
-
-  it('stands down when the click landed outside the row entirely', () => {
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    fire('click', { target: elsewhere });
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(0);
-  });
-
-  it('runs with the keyboard down, which the fourteenth report describes', () => {
-    // The bound the previous round drew, and the state the caught episode was
-    // in: `keyboardActive false`, the row resting at the foot of the screen.
-    settleHealthy();
-    keyboardDownAndWedged();
-    tapDeadSpace();
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-    expect(verdicts()).toContain('activated');
-  });
-
-  it('runs for a press just outside the face, as the caught one was', () => {
-    // 9px above Send's top edge, on the strip of bare row above it. Where in
-    // the row the finger fell changes nothing: the reporter refused a bound on
-    // it, and every round that read this as aim has been wrong.
-    settleHealthy();
-    // The row's height comes from its icon cluster, so the commit face is
-    // shorter and rests on the row's foot with bare row above it.
-    send.box = { left: 330, right: 374, top: 419, bottom: 444 };
-    keyboardDownAndWedged();
-    fire('touchstart', touch(row, 352, 410));
-    fire('touchend', touch(row, 352, 410));
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-    expect(lines().find((l) => l.verdict === 'missed')?.missedBy?.px).toBe(9);
-  });
-
-  it('stands down under a cover the app raised in the meantime', () => {
-    // A synthetic click ignores the inert behind an overlay, so the rescue has
-    // to ask. Under one, the composer is unreachable by design.
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    root().hasAttribute = (name: string) => name === 'data-overlay-open'
-      || name === 'data-keyboard-active';
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(0);
-  });
-
-  it('stands down when the finger travelled', () => {
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    fire('touchstart', touch(row, 10, 420));
-    fire('touchmove', touch(row, 10, 500));
-    fire('touchend', touch(row, 10, 500));
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(0);
-  });
-
-  it('lets a pending rescue fire even though the next gesture travelled', () => {
-    // Tapping and then swiping is what a user does to a dead-feeling button.
-    // The swipe is judged in front of the grace window, so it cannot cancel
-    // the rescue the tap before it already earned.
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    tapDeadSpace();
-    vi.advanceTimersByTime(200);
-    fire('touchstart', touch(row, 10, 420));
-    fire('touchmove', touch(row, 10, 500));
-    fire('touchend', touch(row, 10, 500));
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-  });
-
-  it('never reads its own click as the page taking clicks with no touch', () => {
-    // The rescue dispatches at touchend + 600ms, so a finger held past 900ms
-    // puts that click outside the touch-behind window. Unflagged, the probe
-    // writes `click-no-touch` about a click it made itself, which is the
-    // verdict meaning the touch pipeline is dead.
-    settleHealthy();
-    wedgedWithKeyboardUp();
-    fire('touchstart', touch(row, 10, 420));
-    vi.advanceTimersByTime(1000);
-    fire('touchend', touch(row, 10, 420));
-    vi.advanceTimersByTime(700);
-    expect(send.clicks).toBe(1);
-    expect(verdicts()).not.toContain('click-no-touch');
-    expect(verdicts()).toContain('activated');
-  });
-
-  describe('and a refusal it could have answered is written down', () => {
-    // Two of the three bounds used to refuse in silence, so a ledger with no
-    // rescue in it could not say which one had. A refusal is only worth a line
-    // where there was a face to run, which is the rare case.
-
-    function declined() {
-      return lines().find((l) => l.verdict === 'rescue-stood-down');
-    }
-
-    it('names the claim that took the press', () => {
-      settleHealthy();
-      wedgedWithKeyboardUp();
-      tapDeadSpace();
-      fire('click', { target: send });
-      vi.advanceTimersByTime(700);
-      expect(declined()?.standDown).toBe('claimed');
-      expect(declined()?.face).toBe('Send message');
-    });
-
-    it('names the cover that went up inside the grace window', () => {
-      settleHealthy();
-      wedgedWithKeyboardUp();
-      tapDeadSpace();
-      root().hasAttribute = (name: string) => name === 'data-overlay-open'
-        || name === 'data-keyboard-active';
-      vi.advanceTimersByTime(700);
-      expect(declined()?.standDown).toBe('covered');
-    });
-
-    it('names the travel that took the gesture', () => {
-      settleHealthy();
-      wedgedWithKeyboardUp();
-      fire('touchstart', touch(row, 10, 420));
-      fire('touchmove', touch(row, 10, 500));
-      fire('touchend', touch(row, 10, 500));
-      vi.advanceTimersByTime(700);
-      expect(declined()?.standDown).toBe('traveled');
-    });
-
-    it('says nothing when there was no commit face to run', () => {
-      // Most taps in this row. 68 of the 69 the caught ledger holds.
-      settleHealthy();
-      wedgedWithKeyboardUp();
-      send.label = 'Cancel';
-      tapDeadSpace();
-      vi.advanceTimersByTime(700);
-      expect(verdicts()).not.toContain('rescue-stood-down');
-    });
-  });
-
-  describe('and in answer mode it runs the Submit', () => {
-    // The mode the thirteenth episode was in. `PromptInput` draws the answer
-    // control INSTEAD of the morph, so the rescue used to find no face and
-    // relayout alone. The user's typed answer sat unsent for two and three
-    // quarter minutes.
-    const SUBMIT_BOX: Box = { left: 300, right: 374, top: 400, bottom: 444 };
-    let submit: FakeEl;
-
-    /** Answer mode as the DOM holds it: no morph, one confirm Submit. */
-    function answering(label = 'Submit answer') {
-      submit = new FakeEl(label, SUBMIT_BOX, ['action-btn', 'action-btn-confirm'], row);
-      faces = [submit];
-      // The face answers at its own centre throughout, which is the wedge this
-      // rescue is for: the finger reaches nothing while the layout is healthy.
-      atPointNear = (x: number) => (
-        x >= SUBMIT_BOX.left && x <= SUBMIT_BOX.right ? submit : row
-      );
-      root().hasAttribute = (name: string) => name === 'data-keyboard-active';
-    }
-
-    it('submits the typed answer, and says so', () => {
-      settleHealthy();
-      answering();
-      tapDeadSpace();
-      vi.advanceTimersByTime(700);
-      expect(submit.clicks).toBe(1);
-      expect(verdicts()).toContain('activated');
-      expect(showToast).toHaveBeenCalledWith(
-        expect.stringContaining('Submit was run for you'),
-        'warning',
-      );
-    });
-
-    it('names the face it ran, so the ledger says which one', () => {
-      settleHealthy();
-      answering();
-      tapDeadSpace();
-      vi.advanceTimersByTime(700);
-      expect(lines().find((l) => l.verdict === 'activated')?.face).toBe('Submit answer');
-    });
-
-    it('refuses a Submit the app disabled, such as a multi-select at zero', () => {
-      settleHealthy();
-      answering();
-      submit.disabled = true;
-      tapDeadSpace();
-      vi.advanceTimersByTime(700);
-      expect(submit.clicks).toBe(0);
-    });
-
-    it('refuses any other confirm face, Apply above all', () => {
-      // Apply wears the same green. Running it on a tap nobody saw land would
-      // merge a change the user never approved.
-      settleHealthy();
-      answering('Apply');
-      tapDeadSpace();
-      vi.advanceTimersByTime(700);
-      expect(submit.clicks).toBe(0);
-      expect(verdicts()).not.toContain('activated');
-    });
-  });
-});
-
 describe('every press line carries the one reading layout cannot fake', () => {
   // `screenX/Y` is physical and `clientX/Y` is what the page hit-tests with.
   // Their difference is a constant while the mapping is sane, so a jump in it
@@ -1278,22 +829,19 @@ describe('every press line carries the one reading layout cannot fake', () => {
 });
 
 describe('every line brackets the silence before it', () => {
-  it('carries the gap, and what the checks saw across it', () => {
+  it('carries the gap, and how many checks ran across it', () => {
     // The recovery input is the one event guaranteed to arrive, so it is the
     // one moment a deaf window can be measured from.
     settleHealthy();
     tapSend();
     vi.advanceTimersByTime(1000);
     postClientLog.mockClear();
-    atPoint = row;
     vi.advanceTimersByTime(30000);
-    atPoint = send;
     tapSend();
     vi.advanceTimersByTime(1000);
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
     expect(press?.quiet?.ms).toBeGreaterThanOrEqual(30000);
     expect(press?.quiet?.checks).toBeGreaterThan(0);
-    expect(press?.quiet?.unreachable).toBeGreaterThan(0);
   });
 
   it('does not let a synthetic click erase the silence its own tap ended', () => {
@@ -1313,18 +861,6 @@ describe('every line brackets the silence before it', () => {
     expect(press?.quiet?.ms).toBeGreaterThanOrEqual(30000);
   });
 
-  it('reports a quiet stretch the checks found healthy as exactly that', () => {
-    settleHealthy();
-    tapSend();
-    vi.advanceTimersByTime(1000);
-    postClientLog.mockClear();
-    vi.advanceTimersByTime(30000);
-    tapSend();
-    vi.advanceTimersByTime(1000);
-    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
-    expect(press?.quiet?.checks).toBeGreaterThan(0);
-    expect(press?.quiet?.unreachable).toBe(0);
-  });
 });
 
 describe('a missed press says why no face took it', () => {
@@ -1522,20 +1058,24 @@ describe('the recovery a composer nobody can touch still gets', () => {
   afterEach(() => {
     root().style = priorStyle;
     root().hasAttribute = priorHasAttribute;
-    // Close the typing clock, so the next case starts from a touched page.
+    // Close the typing clock, so the next case starts from a touched composer.
     atPoint = send;
-    fire('touchstart', touch(elsewhere, 10, 90));
+    fire('touchstart', touch(textarea, 10, 350));
   });
 
-  /** A page that has just been touched, with every face answering.
+  /** A COMPOSER that has just been touched, with every face answering.
+   *
+   *  The textarea rather than the transcript, and round 15 is why: a touch the
+   *  page took elsewhere no longer settles this. It sits above the action row,
+   *  so the touch reaches the composer and no face.
    *
    *  The 1ms is what makes the ordering expressible. One fake clock serves the
    *  whole file, so a touch and a keystroke fired back to back share a
-   *  millisecond. "The user typed since the page was touched" then cannot be
-   *  said at all. A real device never delivers the two in one instant. */
+   *  millisecond. "The user typed since the composer was touched" then cannot
+   *  be said at all. A real device never delivers the two in one instant. */
   function settleTouched() {
     atPoint = send;
-    fire('touchstart', touch(elsewhere, 10, 90));
+    fire('touchstart', touch(textarea, 10, 350));
     vi.advanceTimersByTime(1);
     postClientLog.mockClear();
     showToast.mockClear();
@@ -1590,11 +1130,32 @@ describe('the recovery a composer nobody can touch still gets', () => {
     expect(untouched()).toHaveLength(0);
   });
 
-  it('stands down once a touch does reach the page', () => {
+  it('stands down once a touch does reach the composer', () => {
     settleTouched();
     type();
     vi.advanceTimersByTime(1000);
     settleTouched();
+    vi.advanceTimersByTime(TICK * 4);
+    expect(untouched()).toHaveLength(0);
+  });
+
+  it('keeps going when the touch reached the page and not the composer', () => {
+    // Round 15. A touch on the transcript used to disarm this for the rest of
+    // an episode. The reporter's ledger holds two of them while the composer
+    // could still not be sent from.
+    settleTouched();
+    type();
+    vi.advanceTimersByTime(1000);
+    fire('touchstart', touch(elsewhere, 10, 90));
+    vi.advanceTimersByTime(TICK * 4);
+    expect(untouched()).not.toHaveLength(0);
+  });
+
+  it('stands down for a CLICK on the composer, which a touch may not carry', () => {
+    settleTouched();
+    type();
+    vi.advanceTimersByTime(1000);
+    fire('click', { target: textarea });
     vi.advanceTimersByTime(TICK * 4);
     expect(untouched()).toHaveLength(0);
   });
@@ -1637,19 +1198,6 @@ describe('the recovery a composer nobody can touch still gets', () => {
     expect(untouched()).toHaveLength(spent);
   });
 
-  it('stands aside while a reachability wedge is latched and repairing', () => {
-    // `firstUnreachableFace` answers null for a face already reported, so from
-    // the second tick a real wedge looks like a healthy row. `attemptRepair`
-    // owns that episode and has spent its one attempt. Nudging over it would
-    // poison the reading both recoveries are scored by.
-    settleTouched();
-    type();
-    atPoint = row;                        // the face stops answering
-    vi.advanceTimersByTime(TICK * 8);
-    expect(verdicts()).toContain('unreachable');
-    expect(untouched()).toHaveLength(0);
-  });
-
   it('counts them onto the press that ends the silence', () => {
     // The only thing that can score this recovery. A press arriving with a
     // nudge behind it is what the next episode reads.
@@ -1675,6 +1223,35 @@ describe('the recovery a composer nobody can touch still gets', () => {
     expect(press?.quiet?.nudges).toBe(0);
   });
 
+  it('carries a second count a touch does not reset, so the send is scored', () => {
+    // `quiet.nudges` is zero on the press that finally lands whenever anything
+    // reached the page in between. Round 15's episode is exactly that shape,
+    // so the relayout could not be scored at all.
+    settleTouched();
+    type();
+    vi.advanceTimersByTime(TICK * 2);
+    fire('touchstart', touch(elsewhere, 10, 90));
+    vi.advanceTimersByTime(1000);
+    postClientLog.mockClear();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.nudges).toBe(0);
+    expect(press?.nudgesSinceKeystroke ?? 0).toBeGreaterThan(0);
+  });
+
+  it('starts that count over at the next keystroke', () => {
+    settleTouched();
+    type();
+    vi.advanceTimersByTime(TICK * 2);
+    type();
+    postClientLog.mockClear();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.nudgesSinceKeystroke).toBe(0);
+  });
+
   it('leaves the quiet window measuring touches, never keystrokes', () => {
     // Typing must not close the window. It is the one reading that brackets a
     // silence, and a keystroke resetting it would erase the episode.
@@ -1686,5 +1263,192 @@ describe('the recovery a composer nobody can touch still gets', () => {
     vi.advanceTimersByTime(1000);
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
     expect(press?.quiet?.ms ?? 0).toBeGreaterThanOrEqual(8000);
+  });
+});
+
+describe('the silence that follows a keyboard close', () => {
+  // The eighteenth report. The page took no touch for 36 seconds after the
+  // keyboard went, and the ledger held nothing at all for the whole stretch.
+  // Every other reading here waits to be touched, so "no line" meant both "the
+  // page took no touch" and "nothing was tapped".
+  //
+  // Full reconstruction:
+  // docs/plans/2026-09-20-the-composer-recovers-when-the-keyboard-closes.md
+
+  /** The reported iPhone: an 852 shell, 476 of it left with the keys up. */
+  const FULL = 852;
+  const UP = { height: 476, layoutViewport: FULL };
+  const DOWN = { height: FULL, layoutViewport: FULL };
+
+  let props: Record<string, string>;
+  let writes: string[];
+  let priorStyle: unknown;
+
+  function root(): Record<string, unknown> {
+    return (globalThis.document as unknown as { documentElement: Record<string, unknown> })
+      .documentElement;
+  }
+
+  beforeEach(() => {
+    resetKeyboardCloseState();
+    priorStyle = root().style;
+    writes = [];
+    props = { '--app-height': `${FULL}px` };
+    root().style = {
+      setProperty: (k: string, v: string) => { props[k] = v; if (k === '--app-height') writes.push(v); },
+      getPropertyValue: (k: string) => props[k] ?? '',
+      removeProperty: (k: string) => { delete props[k]; },
+    };
+  });
+
+  afterEach(() => {
+    root().style = priorStyle;
+    resetKeyboardCloseState();
+    // Leave the composer touched, so a later case starts from a live page.
+    fire('touchstart', touch(textarea, 10, 350));
+    vi.advanceTimersByTime(1000);
+  });
+
+  /** The keys going, as the app's own viewport handler reports it. */
+  function closeKeyboard() {
+    noteViewportResize(UP, Date.now());
+    noteViewportResize(DOWN, Date.now());
+  }
+
+  function silences(): Line[] {
+    return lines().filter((l) => l.verdict === 'silent-since-keyboard');
+  }
+
+  it('writes the line the wedge has never had', () => {
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(silences()).toHaveLength(1);
+    expect(silences()[0].face).toBe('Send message');
+    expect(silences()[0].scheduled).toBe(true);
+  });
+
+  it('says the close relaid the shell out, so the recovery is scored', () => {
+    closeKeyboard();
+    expect(writes).toEqual([`${FULL - 1}px`, `${FULL}px`]);
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(silences()[0].nudged).toBe(true);
+  });
+
+  it('carries both anchors, so an unnamed input in the gap is visible', () => {
+    // The correction the eighteenth report needed. Two inputs reached the page
+    // after the close and wrote no line, because the stray verdicts are gated
+    // on the keyboard being UP. A shorter `sinceInputMs` is what says so.
+    closeKeyboard();
+    vi.advanceTimersByTime(1000);
+    fire('touchstart', touch(elsewhere, 10, 90));
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 2);
+    const line = silences()[0];
+    expect(line.sinceInputMs ?? 0).toBeLessThan(line.sinceKeyboardMs ?? 0);
+  });
+
+  it('measures the silence from the LAST input, not from the close', () => {
+    // Anchoring on the close alone would refuse the episode outright: its two
+    // silent inputs landed a second after the keys went.
+    //
+    // A tap a second keeps the silence under the threshold whatever phase the
+    // shared interval is in, so the assertion does not ride on it.
+    closeKeyboard();
+    for (let i = 0; i < 8; i++) {
+      fire('touchstart', touch(elsewhere, 10, 90));
+      vi.advanceTimersByTime(1000);
+    }
+    expect(silences()).toHaveLength(0);
+    vi.advanceTimersByTime(TICK * 2);
+    expect(silences()).toHaveLength(1);
+  });
+
+  it('stays quiet for a user who closes the keyboard and taps straight away', () => {
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(500);
+    fire('touchstart', touch(textarea, 10, 350));
+    vi.advanceTimersByTime(500);
+    expect(silences()).toEqual([]);
+  });
+
+  it('stays quiet with nothing to send, which is most of an idle phone', () => {
+    send.label = 'Cancel';
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 4);
+    expect(silences()).toEqual([]);
+  });
+
+  it('stays quiet when no keyboard has closed at all', () => {
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 4);
+    expect(silences()).toEqual([]);
+  });
+
+  it('writes one line per close, not one per tick of the same silence', () => {
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 10);
+    expect(silences()).toHaveLength(1);
+  });
+
+  it('writes again for the NEXT close, since a wedge can return', () => {
+    closeKeyboard();
+    vi.advanceTimersByTime(TICK * 2);
+    closeKeyboard();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(silences()).toHaveLength(2);
+  });
+
+  it('stays quiet under a cover the app raised itself', () => {
+    const priorHasAttribute = root().hasAttribute;
+    closeKeyboard();
+    postClientLog.mockClear();
+    root().hasAttribute = (name: string) => name === 'data-ui-blocked';
+    vi.advanceTimersByTime(TICK * 4);
+    root().hasAttribute = priorHasAttribute;
+    expect(silences()).toEqual([]);
+  });
+
+  it('never toasts, because the user cannot act on it', () => {
+    closeKeyboard();
+    showToast.mockClear();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('presses nothing, on the close or on the line', () => {
+    closeKeyboard();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(send.clicks).toBe(0);
+  });
+
+  it('counts the close onto the press that ends the silence', () => {
+    // `quiet.closes` is the transition recovery's score, kept apart from
+    // `nudges` so that count keeps meaning what every earlier ledger reads.
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK);
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.closes).toBe(1);
+    expect(press?.nudgesSinceKeystroke).toBe(0);
+  });
+
+  it('leaves the quiet window alone, since a close is not an input', () => {
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    closeKeyboard();
+    vi.advanceTimersByTime(20000);
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().reverse().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.ms ?? 0).toBeGreaterThanOrEqual(20000);
   });
 });

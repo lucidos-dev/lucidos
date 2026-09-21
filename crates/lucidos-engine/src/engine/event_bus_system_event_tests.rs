@@ -235,6 +235,7 @@ fn frontend_update_stranded_is_transient_on_engine_aggregate() {
         served_dir: "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist".into(),
         served_in_worktree: true,
         build_error: None,
+        build_watch_stopped: false,
         sent_at_ms: 1_700_000_000_000,
     };
     assert!(!e.is_persisted());
@@ -264,6 +265,7 @@ fn a_failing_build_rides_along_with_the_stranded_signal() {
         served_dir: "/w/dev/crates/lucidos-app/dist".into(),
         served_in_worktree: false,
         build_error: Some("Rollup failed to resolve import \"jsqr\"".into()),
+        build_watch_stopped: false,
         sent_at_ms: 1_700_000_000_000,
     };
     let json = serde_json::to_value(&e).unwrap();
@@ -271,6 +273,36 @@ fn a_failing_build_rides_along_with_the_stranded_signal() {
         json["data"]["build_error"],
         "Rollup failed to resolve import \"jsqr\""
     );
+}
+
+#[test]
+fn a_stopped_build_watch_rides_along_with_the_stranded_signal() {
+    // The third way an Apply strands, and the one the status file cannot
+    // report: a watch that died leaves its last healthy build behind, so the
+    // engine saw no error and called the wait recoverable.
+    let e = SystemEvent::FrontendUpdateStranded {
+        served_dir: "/w/dev/crates/lucidos-app/dist".into(),
+        served_in_worktree: false,
+        build_error: None,
+        build_watch_stopped: true,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["data"]["build_watch_stopped"], true);
+
+    // Always serialized, unlike `build_error`. A bool that vanishes when false
+    // reads exactly like one an older engine never sent. The page has to treat
+    // those two the same way regardless, so there is nothing to save by hiding
+    // it.
+    let running = SystemEvent::FrontendUpdateStranded {
+        served_dir: "/w/dev/crates/lucidos-app/dist".into(),
+        served_in_worktree: false,
+        build_error: None,
+        build_watch_stopped: false,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&running).unwrap();
+    assert_eq!(json["data"]["build_watch_stopped"], false);
 }
 
 #[test]

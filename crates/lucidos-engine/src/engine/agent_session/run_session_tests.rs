@@ -332,3 +332,77 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// The regression. A note quoting "the composer's Diff is an icon" sat directly
+/// above "It needs more height. Three lines maybe?", and the pronoun bound to
+/// the note instead of to the glyph the user meant. So a non-empty block closes
+/// by disclaiming the topic, and a turn carrying no note gains nothing.
+#[tokio::test]
+async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
+    use super::run::{build_resume_prompt_text, ResumeSpawnContext, RESUME_NOTE_REFERENT_GUARD};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use uuid::Uuid;
+
+    let (pool, db_name) = setup_test_db().await;
+    let user_message = "It needs more height. Three lines maybe?";
+
+    let spawn = |note: Option<&'static str>| ResumeSpawnContext {
+        worktree_path: None,
+        last_idle_sha: None,
+        adoption_note: note,
+        session_branch: None,
+    };
+
+    // One note is enough: the guard is a property of the block, not of which
+    // note filled it. An empty thread contributes no turn-gap note, and no
+    // worktree means no external-edit note.
+    let noted = build_resume_prompt_text(
+        &pool,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        user_message,
+        spawn(Some(
+            "[Note from engine: APPLIED: fix(app): the composer's Diff is an icon]",
+        )),
+    )
+    .await;
+
+    // Matched against the constant, not against a copy of its wording, so the
+    // guard can be reworded without breaking a test about where it sits. An
+    // emptied constant still fails: `find("")` returns 0, below `note_at`.
+    let guard_at = noted
+        .find(RESUME_NOTE_REFERENT_GUARD)
+        .unwrap_or_else(|| panic!("note block must disclaim the topic: {noted}"));
+    let note_at = noted
+        .find("the composer's Diff")
+        .expect("the note itself must survive");
+    let message_at = noted
+        .find(user_message)
+        .expect("the user's message must survive");
+    assert!(
+        note_at < guard_at && guard_at < message_at,
+        "the guard belongs between the notes and the message: {noted}"
+    );
+    assert!(
+        noted.ends_with(user_message),
+        "prompt must still end with the user message: {noted}"
+    );
+
+    // Nothing happened in the gap, so there is no block and nothing to
+    // disclaim. The user's words reach the agent alone, as before.
+    let bare = build_resume_prompt_text(
+        &pool,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        user_message,
+        spawn(None),
+    )
+    .await;
+    assert_eq!(
+        bare, user_message,
+        "a turn with no note must carry no guard"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

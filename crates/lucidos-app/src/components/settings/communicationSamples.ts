@@ -11,7 +11,7 @@ import { restartDialogState, appUpdateDialogState } from '../../store/progressDi
 import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
-import type { WebhookIngressOutage } from '../../api/client';
+import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
  *  the page is layout and this is content.
@@ -123,6 +123,41 @@ export const SAMPLE_INGRESS_OUTAGE: WebhookIngressOutage = {
   ],
   down_since: '2026-08-26T22:10:00Z',
   down_secs: 28_800,
+};
+
+/** A hook somebody switched off that is still being delivered to.
+ *
+ *  The highest-value alarm in the set, and the one whose wording is hardest to
+ *  get right, so it is the sample. The numbers are the real incident's: a hook
+ *  disabled by hand, eighteen days of GitHub deliveries, every one refused
+ *  before the body was read.
+ *
+ *  A record rather than inline props, for the reason the outage above is. */
+export const SAMPLE_WEBHOOK_REFUSAL: WebhookRefusal = {
+  webhook_id: '6f1c0f3e-0000-4000-8000-000000000001',
+  webhook_name: 'GitHub workflow runs',
+  enabled: false,
+  cause: 'disabled',
+  refusals: 42,
+  reasons: { disabled: 42 },
+  refusing_since: '2026-09-02T04:41:06Z',
+  refusing_secs: 1_555_200,
+};
+
+/** The other cause, which wants different words and a different fix.
+ *
+ *  Here the hook is on, the path is fine, and the deliveries reach the verifier
+ *  and fail it. Sending this reader to the enable switch would waste the trip,
+ *  which is why the two never share a sentence. */
+export const SAMPLE_WEBHOOK_VERIFICATION_REFUSAL: WebhookRefusal = {
+  webhook_id: '6f1c0f3e-0000-4000-8000-000000000002',
+  webhook_name: 'GitHub workflow runs',
+  enabled: true,
+  cause: 'verification',
+  refusals: 42,
+  reasons: { 'signature-mismatch': 41, 'signature-missing': 1 },
+  refusing_since: '2026-09-18T04:57:00Z',
+  refusing_secs: 97_200,
 };
 
 // --- Dialogs ---

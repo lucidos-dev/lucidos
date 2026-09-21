@@ -34,6 +34,53 @@ const BRAND_FAVICON_LINKS: &str = concat!(
     r#"<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">"#
 );
 
+/// Tell `/api/v1/sdk-prefs.js` which device is asking, by stamping `?device=`
+/// onto the app's own reference to it.
+///
+/// That script resolves this device's theme, font and UI scale, and it is
+/// parser-blocking, so nothing async can feed it. It used to read them out of
+/// `localStorage`, which an app frame could see only because its sandbox said
+/// `allow-same-origin`. Isolating the frame takes that away.
+///
+/// **Nothing is added to the document.** No tag is injected, and no markup the
+/// app wrote is touched. The one edit is to how an engine route addresses
+/// itself. [`rescope_app_html`] already edits this same `src`, for the
+/// workspace prefix (ADR 0014 §4).
+///
+/// So styling stays opt-in, and the opt-in stays the app's own tag rather than
+/// anything inferred about it. An app that never asks for the script comes back
+/// byte-identical.
+pub(super) fn stamp_prefs_device(html: &str, device_id: &str) -> String {
+    static PREFS_SRC_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(src\s*=\s*")([^"?]*/api/v1/sdk-prefs\.js)(")"#)
+            .expect("app prefs-src regex must compile")
+    });
+    if !is_safe_device_id(device_id) {
+        return html.to_string();
+    }
+    rewrite_outside_script_bodies(html, |fragment| {
+        PREFS_SRC_RE
+            .replace_all(fragment, |caps: &regex::Captures| {
+                format!("{}{}?device={}{}", &caps[1], &caps[2], device_id, &caps[3])
+            })
+            .into_owned()
+    })
+}
+
+/// A device id safe to splice into an attribute value without escaping.
+///
+/// The id is minted by the client and arrives as a query param, so it is an
+/// untrusted string reaching HTML. Rather than escape it, refuse anything that
+/// is not the shape a device id has. The two live forms are a uuid and a hex
+/// token. A refusal costs the seed, which the app then corrects for itself.
+fn is_safe_device_id(device_id: &str) -> bool {
+    !device_id.is_empty()
+        && device_id.len() <= 64
+        && device_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Give an app document the Lucidos tab icon unless it names its own.
 ///
 /// An app opened in its own browser tab is a top-level document, and it lives
@@ -248,5 +295,71 @@ mod tests {
             !result.contains(r#"foo.png?thread_id"#),
             "script body must not be rewritten"
         );
+    }
+
+    const OPTED_IN: &str =
+        r#"<html><head><script src="/api/v1/sdk-prefs.js"></script></head><body></body></html>"#;
+
+    #[test]
+    fn prefs_src_carries_the_device() {
+        let out = stamp_prefs_device(OPTED_IN, "cfdb4cbfe6044f8b");
+        assert!(
+            out.contains(r#"<script src="/api/v1/sdk-prefs.js?device=cfdb4cbfe6044f8b">"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_rescoped_prefs_src_still_matches() {
+        // Behind the gateway the src is already `/dev/api/v1/…` by the time this
+        // runs, so the pattern cannot be anchored at the start of the path.
+        let out = stamp_prefs_device(&rescope_app_html(OPTED_IN, "/dev/"), "abc123");
+        assert!(
+            out.contains(r#"src="/dev/api/v1/sdk-prefs.js?device=abc123""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_app_that_did_not_opt_in_is_byte_identical() {
+        // Styling is opt-in, and the opt-in is the app's own tag. An app that
+        // names no prefs script gets nothing: no seed, no injected element, no
+        // edit of any kind.
+        let html =
+            r#"<html><head><title>Plain</title><script src="app.js"></script></head></html>"#;
+        assert_eq!(stamp_prefs_device(html, "abc123"), html);
+    }
+
+    #[test]
+    fn nothing_but_the_prefs_src_is_rewritten() {
+        let html = r#"<script src="/api/v1/sdk.js"></script><script src="/api/v1/sdk-prefs.js"></script><link href="/api/v1/sdk-iframe.css">"#;
+        let out = stamp_prefs_device(html, "abc123");
+        assert!(
+            out.contains(r#"src="/api/v1/sdk.js""#),
+            "sdk.js untouched: {out}"
+        );
+        assert!(
+            out.contains(r#"href="/api/v1/sdk-iframe.css""#),
+            "the stylesheet is not a src and stays put: {out}"
+        );
+        assert_eq!(
+            out.matches("?device=").count(),
+            1,
+            "exactly one stamp: {out}"
+        );
+    }
+
+    #[test]
+    fn a_device_id_that_is_not_one_is_refused_rather_than_escaped() {
+        // The id reaches HTML from a query param, so it is untrusted input. A
+        // quote in it would close the attribute and open a new one.
+        let out = stamp_prefs_device(OPTED_IN, r#"x" onload="alert(1)"#);
+        assert_eq!(out, OPTED_IN, "refused whole, not partly escaped: {out}");
+    }
+
+    #[test]
+    fn a_script_body_mentioning_the_prefs_src_is_left_alone() {
+        let html = r#"<script>var s = 'src="/api/v1/sdk-prefs.js"';</script>"#;
+        assert_eq!(stamp_prefs_device(html, "abc123"), html);
     }
 }

@@ -17,6 +17,10 @@ import { sniffImageBytes, imageRejectionMessage } from '../../utils/imageBytes';
 
 const PLUGIN_EXT = '.lucidos-plugin';
 
+/** What the composer says when the upload lands on bytes the draft already
+ *  holds. See `addAttachedImageHash`. */
+const DUPLICATE_IMAGE_TOAST = 'That image is already attached to this message.';
+
 /** Why an upload failed, for the toast and the pending-upload row.
  *  Deliberately not `utils/errorDetail`: that one reads `Error.message`, and an
  *  `ApiError` carries the engine's sentence in `reason` instead. */
@@ -104,11 +108,17 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
     // revoking the URL. `batch` collapses the writes into one render so
     // the strip never momentarily renders with neither entry (an empty
     // strip would unmount the wrapper and pop).
+    //
+    // The commit is refused when the draft already holds this hash, the shape
+    // a second paste of one screenshot takes. The preview URL is safe either
+    // way: `rememberSessionBlobUrl` keeps the first and revokes the duplicate.
+    let attached = true;
     batch(() => {
       rememberSessionBlobUrl(hash, previewUrl);
-      addAttachedImageHash(threadId, hash);
+      attached = addAttachedImageHash(threadId, hash);
       detachPendingUpload(threadId, localId);
     });
+    if (!attached) showToast(DUPLICATE_IMAGE_TOAST, 'info');
   } catch (err) {
     const reason = uploadFailureReason(err);
     patchPendingUpload(threadId, localId, { status: 'failed', error: reason });

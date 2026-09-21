@@ -7,6 +7,7 @@ import { AppHeader } from './components/layout/AppHeader';
 import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { IngressBanner } from './components/layout/IngressBanner';
+import { WebhookRefusalBanner } from './components/layout/WebhookRefusalBanner';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
@@ -113,10 +114,12 @@ export function App() {
             AppHeader), and each renders only under its own viewport.
             Ordered by reach, widest first. The connection bar says this whole
             workspace is unreachable; the ingress bar narrows that to the public
-            path a sender takes; the reminder below both is about a risk that
-            will still be there later. */}
+            path a sender takes; the refusal bar narrows it again to one hook
+            that is throwing away what does arrive; the reminder below all three
+            is about a risk that will still be there later. */}
         <ConnectionBanner layout="desktop" />
         <IngressBanner layout="desktop" />
+        <WebhookRefusalBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
         <Drawer />
         {mobile ? (

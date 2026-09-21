@@ -19,6 +19,7 @@ pub mod push_test_log;
 mod tasks;
 pub mod user_tasks;
 pub(crate) mod webhook_ingress;
+pub(crate) mod webhook_refusal;
 
 pub use notifications::{Notification, NotificationStore};
 pub use push::{PushSubscription, PushSubscriptionStore};
@@ -386,6 +387,25 @@ impl SchedulerManager {
         log!(
             "[Scheduler] Registered system task: webhook_ingress_check ({})",
             WEBHOOK_INGRESS_CRON
+        );
+
+        // Read what each hook did with the deliveries that DID arrive. Its own
+        // job rather than a step inside the ingress check, because that one
+        // stops when no webhook is enabled. That is the very state a disabled
+        // hook still taking deliveries is in.
+        let engine_refusal = self.engine.clone();
+        let pool_refusal = self.pool.clone();
+        let refusal_job = Job::new_async(WEBHOOK_REFUSAL_CRON, move |_uuid, _lock| {
+            let engine = engine_refusal.clone();
+            let pool = pool_refusal.clone();
+            Box::pin(async move {
+                run_webhook_refusal_check(engine, pool).await;
+            })
+        })?;
+        self.scheduler.add(refusal_job).await?;
+        log!(
+            "[Scheduler] Registered system task: webhook_refusal_check ({})",
+            WEBHOOK_REFUSAL_CRON
         );
 
         Ok(())
@@ -1325,6 +1345,7 @@ use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
 use plugin_updates::{run_plugin_marketplace_update_check, MARKETPLACE_UPDATE_CHECK_CRON};
 use webhook_ingress::{run_webhook_ingress_check, WEBHOOK_INGRESS_CRON};
+use webhook_refusal::{run_webhook_refusal_check, WEBHOOK_REFUSAL_CRON};
 
 /// Drop webhook delivery claims nothing can still be waiting on.
 ///

@@ -63,12 +63,12 @@ describe('app frame load cover', () => {
   });
 
   it('re-covers the frame on an app switch', () => {
-    // An app switch keeps the same iframe element and navigates it
-    // (location.replace), so the incoming app reopens the same white-canvas
-    // gap the initial mount had. Covering only the mount would leave the
-    // flash in place for every open that is not the first one.
-    const nav = src.match(/lastSrcRef\.current = src;[\s\S]*?\}, \[src\]\);/)?.[0] ?? '';
-    expect(nav).toMatch(/setLoaded\(false\)/);
+    // An app switch mounts a FRESH iframe, which reopens the same white-canvas
+    // gap the first mount had. Covering only the first would leave the flash in
+    // place for every open after it. The key carrying the document is what
+    // makes the switch a mount, and `loaded` starting false is what covers it.
+    expect(src).toMatch(/key=\{`\$\{refreshKey\}:\$\{splitFrameSrc\(frameSrc\)\.doc\}`\}/);
+    expect(src).toMatch(/const \[loaded, setLoaded\] = useState\(false\)/);
   });
 
   it('reveals the frame anyway if load never fires', () => {
@@ -95,31 +95,33 @@ describe('app frame load cover', () => {
   });
 });
 
-describe('app frame fragment delivery', () => {
-  /** The frame's whole navigation effect, the same span the cover tests read. */
-  const effect = src.match(/const previous = splitFrameSrc[\s\S]*?\}, \[src\]\);/)?.[0] ?? '';
+describe('app frame navigation', () => {
+  /** The frame's whole navigation effect. */
+  const effect = src.match(/const iframe = iframeRef\.current;[\s\S]*?\}, \[src\]\);/)?.[0] ?? '';
 
-  it('splits the src into document part and fragment before deciding', () => {
-    expect(effect, 'navigation effect not found in AppUiInline.tsx').not.toBe('');
-    expect(effect).toMatch(/splitFrameSrc\(lastSrcRef\.current\)/);
-    expect(effect).toMatch(/splitFrameSrc\(src\)/);
+  it('a change of DOCUMENT remounts the frame, rather than driving it', () => {
+    // An isolated app frame denies `contentWindow.location`, and mutating `src`
+    // on a live element adds the joint-history entry WebKit #9166 is about. A
+    // remount is the one move left, and it needs nothing from the app, which
+    // matters because the SDK is opt-in.
+    expect(src).toMatch(/key=\{`\$\{refreshKey\}:\$\{splitFrameSrc\(frameSrc\)\.doc\}`\}/);
+    expect(src).not.toContain('navigateAppIframe');
   });
 
-  it('hands a fragment-only change to setAppFrameHash and raises NO cover', () => {
-    // The trap this pins: a hash-only `location.replace` fires no `load`, so
-    // covering here would leave the cover over a live app until its fuse.
-    const branch = effect.match(/if \(previous\.doc === next\.doc\) \{[\s\S]*?\n    \}/)?.[0] ?? '';
-    expect(branch, 'same-document branch not found').not.toBe('');
-    expect(branch).toContain('setAppFrameHash(iframe, next.fragment)');
-    expect(branch).not.toContain('navigateAppIframe');
-    expect(branch).not.toContain('setLoaded(false)');
+  it('hands a fragment change to setAppFrameHash and raises NO cover', () => {
+    // The trap this pins: a fragment delivery must not reload the app, so it
+    // fires no `load`. Covering here would leave the cover over a live app
+    // until its fuse.
+    expect(effect, 'navigation effect not found in AppUiInline.tsx').not.toBe('');
+    expect(effect).toContain('setAppFrameHash(iframe, next.fragment)');
+    expect(effect).not.toContain('setLoaded(false)');
     // Guarded on a non-empty fragment: an emptied one is not a target, so it
     // must move nobody and leave the reader where they were.
-    expect(branch).toMatch(/if \(next\.fragment\)/);
+    expect(effect).toMatch(/if \(next\.fragment\)/);
   });
 
-  it('still navigates and re-covers when the document part changes', () => {
-    const after = effect.slice(effect.indexOf('navigateAppIframe'));
-    expect(after).toContain('setLoaded(false)');
+  it('a remount re-covers by construction, since the new frame starts uncovered', () => {
+    // What the old document branch did with an explicit `setLoaded(false)`.
+    expect(src).toMatch(/const \[loaded, setLoaded\] = useState\(false\)/);
   });
 });

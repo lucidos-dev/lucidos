@@ -182,10 +182,42 @@ fn persist_window_state_on_main(app: &tauri::AppHandle) {
 /// Every save site calls this, so a window recorded in one file is recorded in
 /// the other. The module header says why there are two.
 pub(crate) fn persist_windows(app: &tauri::AppHandle) {
-    if let Err(e) = app.save_window_state(window_state_flags()) {
-        eprintln!("[Tauri] Failed to persist window state: {e}");
-    }
+    save_plugin_state(app, "Failed to persist window state");
     persist_window_session(app);
+}
+
+/// Let the window-state plugin record, unless `main` is wearing a correction.
+///
+/// The plugin covers `main` alone, and reads its live geometry itself. So not
+/// calling it is the only way to keep a rescue out of its file. A correction is
+/// not an arrangement (ADR 0215). The session record enforces that for every
+/// window, and this is the same rule for the one file we do not write.
+///
+/// It matters in one corner. `app_window::main_frame_owed` prefers the session
+/// record, so the plugin's frame is read only for a workspace that record holds
+/// nothing for. Main thread only, like every geometry read here.
+fn save_plugin_state(app: &tauri::AppHandle, what: &str) {
+    if main_is_wearing_a_rescue(app) {
+        return;
+    }
+    if let Err(e) = app.save_window_state(window_state_flags()) {
+        eprintln!("[Tauri] {what}: {e}");
+    }
+}
+
+/// Is `main` on screen at a frame the clamp chose for it?
+///
+/// Unreadable geometry answers no, so the plugin still records. A missed skip
+/// costs what shipped before ADR 0215, and skipping on a guess would lose a
+/// real arrangement.
+fn main_is_wearing_a_rescue(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_window(crate::app_window::MAIN_WINDOW_LABEL) else {
+        return false;
+    };
+    let Some(frame) = window_restore::live_frame(&window) else {
+        return false;
+    };
+    window_restore::is_wearing_a_rescue(crate::app_window::MAIN_WINDOW_LABEL, frame)
 }
 
 /// Persist the plugin's record alone, without the session.
@@ -193,9 +225,7 @@ pub(crate) fn persist_windows(app: &tauri::AppHandle) {
 /// The one caller is a window CLOSE, where the session is written separately
 /// and only when the close is the user's own. See the `CloseRequested` arm.
 pub(crate) fn persist_window_state_only(app: &tauri::AppHandle) {
-    if let Err(e) = app.save_window_state(window_state_flags()) {
-        eprintln!("[Tauri] Failed to persist window state on close: {e}");
-    }
+    save_plugin_state(app, "Failed to persist window state on close");
 }
 
 /// What this launch restores: a workspace per window, and the frame each wants.
@@ -385,30 +415,24 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
         .filter(|(label, _)| crate::app_window::is_app_window(label))
         .filter_map(|(label, webview)| {
             let window = webview.window();
-            // The same pair the plugin persists and `window_restore` clamps, so
-            // all three reason about one set of numbers.
-            //
-            // Through `app_window::window_content_size`, never `inner_size`,
-            // which answers with the PAGE on macOS. This capture wrote a
-            // drifted page's size down as its window's frame, and the next
-            // launch restored the window to it (ADR 0202).
-            //
-            // The window's own scale factor comes with them, because that is
-            // what tao multiplied them by. Unreadable drops the window from the
-            // capture: a frame recorded at the wrong scale is what puts it off
-            // screen at twice its size on the next restore (ADR 0173).
-            let (Ok(url), Ok(position), Ok(size), Ok(scale)) = (
-                webview.url(),
-                window.outer_position(),
-                crate::app_window::window_content_size(&window),
-                window.scale_factor(),
-            ) else {
+            // Through `window_restore::live_frame`, the one reader of a live
+            // window's geometry, so the capture and the clamp cannot come to
+            // different numbers for one window. Unreadable drops the window
+            // from the capture rather than recording a guess: a frame taken at
+            // the wrong scale is what puts one off screen at twice its size on
+            // the next restore (ADR 0173).
+            let (Ok(url), Some(frame)) = (webview.url(), window_restore::live_frame(&window))
+            else {
                 return None;
             };
             Some(window_session::WindowSnapshot {
+                // Asked of the frame the window is wearing RIGHT NOW, which is
+                // what makes the answer expire on the user's first drag. See
+                // `window_restore::is_wearing_a_rescue`.
+                rescued: window_restore::is_wearing_a_rescue(&label, frame),
                 label,
                 url: url.to_string(),
-                frame: window_restore::Rect::from_physical(position, size, scale),
+                frame,
             })
         })
         .collect();

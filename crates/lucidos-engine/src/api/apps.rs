@@ -1,4 +1,6 @@
-use super::app_ui::{ensure_app_favicon, rescope_app_html, rewrite_for_thread_id};
+use super::app_ui::{
+    ensure_app_favicon, rescope_app_html, rewrite_for_thread_id, stamp_prefs_device,
+};
 use super::*;
 
 use std::path::PathBuf;
@@ -16,9 +18,18 @@ pub(super) struct AppQuery {
 /// of the live workspace copy. The thread must (a) be a coding-agent thread,
 /// (b) have `coding_agent_kind == 'app'`, and (c) own the same `app_id` we're
 /// serving — otherwise the route returns 404.
+///
+/// It also accepts `device`, which the host stamps onto the app frame's `src`.
+/// An isolated app frame cannot read the shell's storage, so the engine has to
+/// resolve that device's appearance itself: see
+/// [`super::app_ui::stamp_prefs_device`]. Absent, the global preferences
+/// answer, which is what a hand-typed app URL gets.
 #[derive(Debug, Deserialize)]
 pub(super) struct AppUiPreviewQuery {
     pub thread_id: Option<String>,
+    pub device: Option<String>,
+    /// `1` asks for the file as an attachment. See [`attachment_disposition`].
+    pub download: Option<u8>,
 }
 
 /// Resolve the worktree-relative root directory to serve from when an app-UI
@@ -350,6 +361,12 @@ pub(super) async fn serve_app_ui(
             };
             let html = ensure_app_favicon(&html);
             let html = rescope_app_html(&html, &prefix);
+            // After the re-scope, which rewrites the same `src`. Both edit one
+            // engine route's address and nothing else the app wrote.
+            let html = match query.device.as_deref() {
+                Some(device) => stamp_prefs_device(&html, device),
+                None => html,
+            };
             (
                 [
                     (header::CONTENT_TYPE, "text/html"),
@@ -404,19 +421,45 @@ pub(super) async fn serve_app_file(
     };
 
     match std::fs::read(&full_path) {
-        Ok(content) => (
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            content,
-        )
-            .into_response(),
+        Ok(content) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if let Some(value) = attachment_disposition(query.download, &file_path)
+                .and_then(|d| HeaderValue::from_str(&d).ok())
+            {
+                headers.insert(header::CONTENT_DISPOSITION, value);
+            }
+            (headers, content).into_response()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, "File not found").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// `Content-Disposition: attachment` when the request asked to download.
+///
+/// An app frame is isolated, so its own files are cross-origin to it, and a
+/// browser ignores the `download` attribute on a cross-origin link. The click
+/// would navigate the frame to the file instead. The SDK rewrites such a click
+/// to carry `?download=1`, and this is the other half: the header is what makes
+/// a browser download a cross-origin resource.
+///
+/// The filename comes from the PATH, never from the query. A caller could forge
+/// the query, and this header is the one a browser obeys.
+fn attachment_disposition(download: Option<u8>, file_path: &str) -> Option<String> {
+    if download != Some(1) {
+        return None;
+    }
+    let name = std::path::Path::new(file_path).file_name()?.to_str()?;
+    // A quote, a backslash or a control character would let the name carry a
+    // second header parameter. `is_path_traversal` has already run.
+    if name.is_empty() || name.contains(['"', '\\', '\r', '\n']) {
+        return None;
+    }
+    Some(format!("attachment; filename=\"{name}\""))
 }
 
 /// GET /app/:app_id/artifacts/*path - Serve shared artifacts for app iframes.
@@ -603,4 +646,34 @@ pub(super) fn ui_router() -> Router<AppState> {
         .route("/:app_id/", get(serve_app_ui))
         .route("/:app_id/artifacts/*path", get(serve_app_artifact))
         .route("/:app_id/*path", get(serve_app_file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_app_file_is_not_an_attachment() {
+        assert_eq!(attachment_disposition(None, "payload.txt"), None);
+        assert_eq!(attachment_disposition(Some(0), "payload.txt"), None);
+    }
+
+    #[test]
+    fn asking_to_download_names_the_file_from_its_path() {
+        // The browser obeys this header, and ignores the link's own `download`
+        // attribute once the frame is cross-origin to the file.
+        assert_eq!(
+            attachment_disposition(Some(1), "reports/payload.txt").as_deref(),
+            Some("attachment; filename=\"payload.txt\"")
+        );
+    }
+
+    #[test]
+    fn a_name_that_could_forge_a_header_parameter_is_refused() {
+        // A quote would close the filename and open a second parameter. The
+        // name comes off disk, so this is belt to `is_path_traversal`'s braces.
+        assert_eq!(attachment_disposition(Some(1), "a\"b.txt"), None);
+        assert_eq!(attachment_disposition(Some(1), "a\r\nX-Evil: 1"), None);
+        assert_eq!(attachment_disposition(Some(1), ""), None);
+    }
 }

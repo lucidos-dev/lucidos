@@ -223,6 +223,23 @@ export type CallEffect =
 
 const HANG_UP: CallEffect = { kind: 'send', control: { type: 'hang_up' } };
 const BARGE_IN: CallEffect = { kind: 'send', control: { type: 'barge_in' } };
+/**
+ * The caller opened their mouth, told to the engine as the floor opener it is.
+ *
+ * **The engine cannot measure this, and one provider cannot state it.** A call
+ * opens with the floor shut, and nothing the talker says is relayed until the
+ * caller has spoken (ADR 0211). The Live talker answers their audio before its
+ * own transcriber reports a word. So the answer to their first sentence was
+ * played to nobody. The gate here has already decided, 120 ms in, with no
+ * transcriber in the path.
+ *
+ * Sent on every opening edge, in both live phases. It is not an interruption:
+ * {@link BARGE_IN} is, and it keeps its own quiet-time condition.
+ */
+const STARTED_SPEAKING: CallEffect = {
+  kind: 'send',
+  control: { type: 'caller_started_speaking' },
+};
 const STOP_PLAYBACK: CallEffect = { kind: 'stop-playback' };
 const FORGET_SPEECH: CallEffect = { kind: 'forget-speech' };
 const FLUSH_AUDIO: CallEffect = { kind: 'flush-audio' };
@@ -314,6 +331,18 @@ function unchanged(state: CallState): { state: CallState; effects: CallEffect[] 
 }
 
 /**
+ * Whether the caller said something before the socket came up.
+ *
+ * The microphone opens ahead of the dial, so the gate can open, and shut
+ * again, with nothing to report it on. Both states count: `live` is a caller
+ * still mid-word, `landing` one who finished a short sentence in that window.
+ * Nothing has transcribed either yet.
+ */
+function spokeIntoTheConnectWindow(state: CallState): boolean {
+  return state.utterance === 'live' || state.utterance === 'landing';
+}
+
+/**
  * The caller started or stopped making speech.
  *
  * Over the talker, a start that CUTS IN is an interruption AND the beginning of
@@ -339,9 +368,15 @@ function onSpeech(
       : unchanged(state);
   }
   const heard = startUtterance(state);
+  // Only once there is a socket to say it on. A gate opening under `connecting`
+  // is told at `session_started` instead, with the held audio.
+  const started = isLive(state.phase) ? [STARTED_SPEAKING] : [];
   return state.phase === 'speaking' && quietMs >= BARGE_IN_QUIET_MS
-    ? { state: { ...heard, phase: 'listening' }, effects: [STOP_PLAYBACK, BARGE_IN] }
-    : { state: heard, effects: [] };
+    ? {
+        state: { ...heard, phase: 'listening' },
+        effects: [...started, STOP_PLAYBACK, BARGE_IN],
+      }
+    : { state: heard, effects: started };
 }
 
 /**
@@ -415,8 +450,21 @@ function onFrame(
       // connect window is held and goes up now. The utterance it may have
       // started is left exactly as it is: they are mid-sentence, and the
       // socket coming up is nothing they did.
+      //
+      // A caller who spoke into that window is the case the floor most needs.
+      // Their opening edge came before there was a socket, so it goes up with
+      // the audio it belongs to.
+      //
+      // `landing` counts as much as `live`. A short first sentence can open
+      // and shut the gate inside the window, and its reply is exactly the one
+      // a shut floor eats.
       return state.phase === 'connecting'
-        ? { state: { ...state, phase: 'listening' }, effects: [FLUSH_AUDIO] }
+        ? {
+            state: { ...state, phase: 'listening' },
+            effects: spokeIntoTheConnectWindow(state)
+              ? [FLUSH_AUDIO, STARTED_SPEAKING]
+              : [FLUSH_AUDIO],
+          }
         : unchanged(state);
     case 'user_transcript': {
       // The caller's own words as the provider hears them, mid-sentence. It

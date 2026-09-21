@@ -2039,8 +2039,9 @@ network_toml_exists() {
     [ -f "$HOME/.lucidos/network.toml" ]
 }
 
-# Bind for a directly-launched engine (start_engine): legacy no-gateway dev,
-# tauri-dev, and e2e. Loopback is what makes this port safe to serve
+# Bind for a directly-launched engine (start_engine): legacy no-gateway dev
+# (tauri-dev.sh included, under LUCIDOS_NO_GATEWAY) and e2e. Loopback is what
+# makes this port safe to serve
 # unauthenticated, so widening it is a deliberate act by the developer, never a
 # launch-script default. Widened, the engine asks every caller for the local
 # token (ADR 0155), which a browser cannot present.
@@ -2072,31 +2073,108 @@ apply_dev_gateway_bind() {
     fi
 }
 
+# The scheme a live engine answers /api/v1/health on, or empty if none does.
+#
+# https first, then http, mirroring gateway_stop_status. Probing `$PROTO` alone
+# is what broke tauri-dev: the gateway strips LUCIDOS_TLS_CERT from every engine
+# it spawns (crates/lucidos-gateway/src/stack.rs), so on a machine with dev certs
+# the live engine serves plain http while detect_tls picked https. The probe then
+# read a healthy engine as dead and the caller spawned a second one onto the held
+# port, which died with AddrInUse.
+#
+# Exits 0 even when neither scheme answers. That is an ordinary answer, and the
+# caller assigns this into a variable under `set -e`, where a non-zero command
+# substitution would take the whole launch down. An `if` with no `else` already
+# yields 0; the trailing `return 0` states the contract so a later restructure
+# into an `&&` chain cannot quietly drop it.
+engine_health_scheme() { # <port>
+    local port="$1"
+    if curl -sk "https://localhost:$port/api/v1/health" >/dev/null 2>&1; then
+        printf 'https'
+    elif curl -s "http://localhost:$port/api/v1/health" >/dev/null 2>&1; then
+        printf 'http'
+    fi
+    return 0
+}
+
+# Take the scheme a reused engine actually serves. Every URL this launch goes on
+# to build (the banner, the desktop window, the ports file every CLI caller
+# reads) must name a door that answers, and the running engine is the authority
+# on its own.
+adopt_engine_scheme() { # <scheme>
+    if [ "$1" = "$PROTO" ]; then
+        return 0
+    fi
+    echo "Engine on port $ENGINE_PORT serves $1, not $PROTO. Adopting $1."
+    PROTO="$1"
+    ports_file_set "$WORKSPACE/.lucidos/ports" "PROTO=$PROTO"
+}
+
+# How long start_engine lets a dying engine release the port before it calls the
+# port lost. The engine's own graceful-shutdown budget (main.rs).
+ENGINE_DRAIN_WAIT_S=10
+
 # ── start_engine ────────────────────────────────────────────────────────
 # Run engine in background with caffeinate, write PID, wait for health (30s).
 # Reuses an existing healthy engine if one is already running for this workspace.
 # Sets ENGINE_PID.
 start_engine() {
-    # Direct-front launch (legacy no-gateway dev, tauri-dev, e2e): the engine IS
+    # Direct-front launch (legacy no-gateway dev, e2e): the engine IS
     # the user-facing door on its own port. On loopback it serves every local
     # caller without a credential, so it stays there unless the developer widens
     # it deliberately. The gateway path does NOT use this function. It spawns
     # engines itself with the right bind (see gateway stack.rs spawn_engine).
     apply_dev_engine_bind
 
-    # Check if an existing engine is already healthy on our port
-    if [ -f "$ENGINE_PIDFILE" ]; then
-        local existing_pid
+    # Adopt an engine already healthy on our port instead of spawning a second
+    # one. The scheme is probed, never assumed (see engine_health_scheme).
+    local live_scheme existing_pid
+    live_scheme="$(engine_health_scheme "$ENGINE_PORT")"
+    if [ -n "$live_scheme" ] && [ -f "$ENGINE_PIDFILE" ]; then
         existing_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
         if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-            if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/v1/health" >/dev/null 2>&1; then
-                echo ""
-                echo "Reusing existing engine (PID $existing_pid) on port $ENGINE_PORT"
-                ENGINE_PID="$existing_pid"
-                start_caffeinate
-                return
-            fi
+            adopt_engine_scheme "$live_scheme"
+            echo ""
+            echo "Reusing existing engine (PID $existing_pid) on port $ENGINE_PORT"
+            ENGINE_PID="$existing_pid"
+            start_caffeinate
+            return
         fi
+    fi
+
+    # Nothing to adopt, so the port has to come free or the spawn below cannot
+    # bind. The supervisor would respawn it into a 90 second wall of dots ending
+    # in a timeout that names no cause, so name the holder instead.
+    #
+    # Poll rather than sample once. Without `-b`, kill_stale_processes signals
+    # the previous dev script's engine and never waits for it, so an
+    # instantaneous check races a drain that the engine gets 10s to finish
+    # (main.rs). ENGINE_DRAIN_WAIT_S matches that budget: anything still holding
+    # the port afterwards is not ours to wait for.
+    if ! _await_engine_port_released "$ENGINE_PORT" "" "$ENGINE_DRAIN_WAIT_S"; then
+        local holder holder_cmd held_scheme
+        holder="$(lsof -ti :"$ENGINE_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+        holder_cmd="$(ps -p "$holder" -o comm= 2>/dev/null || true)"
+        # Re-probe rather than reuse live_scheme. This branch is also reached
+        # when the holder IS healthy and merely unclaimable, because no live pid
+        # in our pidfile names it, and a message that says nothing answers would
+        # send the reader hunting the wrong fault.
+        held_scheme="$(engine_health_scheme "$ENGINE_PORT")"
+        echo ""
+        echo "ERROR: port $ENGINE_PORT is held by ${holder_cmd:-an unknown process} (PID ${holder:-unknown})"
+        if [ -n "$held_scheme" ]; then
+            echo "       It is healthy over $held_scheme, but no live pid in"
+            echo "       $ENGINE_PIDFILE claims it, so this launch cannot adopt it."
+        else
+            echo "       and nothing answers /api/v1/health there on http or https."
+        fi
+        echo ""
+        echo "  In the normal dev topology the gateway owns this port. Launch"
+        echo "  through it instead of starting a direct engine:"
+        echo "    ./scripts/web-dev.sh -w $WORKSPACE"
+        echo "  Or stop whatever holds the port first:"
+        echo "    ./scripts/stop.sh -w $WORKSPACE"
+        exit 1
     fi
 
     echo ""
@@ -2278,6 +2356,25 @@ workspace_slug() {
     [ -n "$s" ] && echo "$s" || echo "workspace"
 }
 
+# The URL a desktop window loads (tauri-dev.sh passes it as Tauri's devUrl).
+#
+# Gateway mode reaches the workspace through the gateway at /<slug>/, which is
+# the door the packaged app navigates to (desktop.rs). That prefix is what
+# makes the engine stamp `<base href="/<slug>/">`, so a dev window exercises
+# the same routing the packaged one does. Legacy direct-engine mode
+# (LUCIDOS_NO_GATEWAY) has no gateway, so the engine root is the front.
+#
+# The condition is show_banner's, deliberately: the banner and the window must
+# never name different URLs.
+desktop_window_url() { # <gateway_mode> <proto> <gateway_port> <ws_id> <engine_port>
+    local mode="$1" proto="$2" gateway_port="$3" ws_id="$4" engine_port="$5"
+    if [ -n "$mode" ] && [ -n "$ws_id" ]; then
+        printf '%s://localhost:%s/%s/' "$proto" "$gateway_port" "$ws_id"
+    else
+        printf '%s://localhost:%s' "$proto" "$engine_port"
+    fi
+}
+
 # Seed/refresh this workspace's entry in the SHARED gateway registry, preserving
 # every other workspace's entry AND this workspace's user-set display name +
 # autostart toggle (so a picker rename / autostart flip sticks across relaunch —
@@ -2329,10 +2426,15 @@ PY
 }
 
 # Wait for /<slug>/api/v1/health — the engine the gateway spawned.
+#
+# `-f`, not a bare `-s`: curl exits 0 for ANY http response, and the gateway
+# answers an unrouted slug with a 404 or a 503 rather than by hanging up. So
+# without it this loop printed "ready!" on its first tick whether or not the
+# workspace could be reached, which is the whole thing it is here to find out.
 wait_for_workspace_health() {
     echo -n "Waiting for workspace '$GATEWAY_WS_ID' engine"
     for _ in $(seq 1 90); do
-        if curl -sk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
+        if curl -fsk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"; return 0
         fi
         echo -n "."; sleep 1
@@ -2340,6 +2442,74 @@ wait_for_workspace_health() {
     echo ""
     echo "WARNING: workspace engine not healthy yet — check the picker or the gateway log:"
     echo "  $(gateway_log)"
+}
+
+# ── workspace_engine_restart_is_needed ──────────────────────────────────
+# Whether this launch must ask the gateway to RESTART this workspace's engine,
+# rather than adopt the one already answering.
+#
+# Pure, so the decision is testable without a gateway. Args: $1 = ENGINE_ONLY,
+# $2 = non-empty when our engine is already serving its port AND the gateway
+# already knows this workspace, which is what makes it adoptable.
+#
+# A restart is the wrong ask when the engine is already up. It tears down every
+# in-flight thread, and those settle crash-shaped because a script carries no
+# device (RestartIntentNotify::Skipped, crates/lucidos-gateway/src/stack.rs).
+# start_engine has always adopted on the direct path, and this is the same rule
+# for the gateway one. See
+# docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
+#
+# Two launches still need the POST. --engine-only IS the Apply switch, whose
+# whole job is to respawn onto the freshly built binary. A `-b` arrives here with
+# its engine already reaped by kill_stale_processes, so the probe says "not
+# running" and the POST becomes a start, which is what it is for: a new workspace
+# defaults to autostart off, so the gateway's own boot does not spawn it.
+workspace_engine_restart_is_needed() { # <engine_only> <engine_is_live>
+    [ -n "$1" ] && return 0
+    [ -z "$2" ] && return 0
+    return 1
+}
+
+# Whether the gateway on GATEWAY_PORT already lists this workspace.
+#
+# A running gateway holds its registry in memory and re-reads the file only when
+# the restart POST asks it to (`sync_registry_from_disk`). `adopt_running_engines`
+# walks that same in-memory list, so it can never pick up an entry
+# `seed_gateway_registry` has only written to disk. Adopting an engine for a slug
+# the gateway has never heard of would therefore leave the window on a route
+# nothing serves, for as long as that gateway lives.
+#
+# An unreachable or unparseable answer reads as "does not list it", so the POST
+# still goes out. Falling back to the old unconditional behaviour is the safe
+# direction here.
+gateway_lists_workspace() {
+    local body
+    body="$(gateway_curl -sk --max-time "${LUCIDOS_HEALTH_PROBE_TIMEOUT_S:-2}" \
+        "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces" 2>/dev/null || true)"
+    case "$body" in
+        *"\"id\":\"$GATEWAY_WS_ID\""*|*"\"id\": \"$GATEWAY_WS_ID\""*) return 0 ;;
+    esac
+    return 1
+}
+
+# Make sure this workspace's engine is running, and reachable at /<slug>/.
+#
+# The health wait runs on BOTH branches. An adopted engine may have no gateway
+# route yet, and `adopt_running_engines` installs one on the next supervise tick.
+# The wait cannot hurry that along: the gateway lazy-starts on a document
+# navigation only, never on the API call this makes.
+ensure_workspace_engine_running() {
+    local live=""
+    if engine_on_port_serves_workspace "$ENGINE_PORT" "$WORKSPACE" \
+        && gateway_lists_workspace; then
+        live=1
+    fi
+    if workspace_engine_restart_is_needed "${ENGINE_ONLY:-}" "$live"; then
+        gateway_curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
+    else
+        echo "Reusing the running engine for '$GATEWAY_WS_ID' on port $ENGINE_PORT"
+    fi
+    wait_for_workspace_health
 }
 
 # Start (or reuse) the ONE shared workspace gateway on the fixed GATEWAY_PORT. It
@@ -2396,10 +2566,11 @@ start_gateway() {
     assert_stack_not_worktree_pinned "$PROJECT_DIR" gateway || exit 1
     export LUCIDOS_STATIC_DIR="$FRONTEND_DIR/dist"
 
-    # Reuse a healthy gateway already on the port (no -b restart). Ask it to
-    # (re)start this workspace's stack so a rebuilt binary / refreshed registry
-    # takes effect — this is the engine-only Apply path in gateway dev. The
-    # gateway's own surface lives behind the sigil namespace (/~/, ADR 0014 §2).
+    # Reuse a healthy gateway already on the port (no -b restart), then make sure
+    # this workspace's stack is up. ensure_workspace_engine_running decides
+    # between a restart (the engine-only Apply path in gateway dev) and adopting
+    # the engine already serving. The gateway's own surface lives behind the
+    # sigil namespace (/~/, ADR 0014 §2).
     if [ -f "$gw_pidfile" ]; then
         local existing; existing="$(cat "$gw_pidfile" 2>/dev/null || true)"
         if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null \
@@ -2407,8 +2578,7 @@ start_gateway() {
             echo "Reusing existing gateway (PID $existing) on port $GATEWAY_PORT"
             GATEWAY_PID="$existing"; ENGINE_SUPERVISOR_PID=""
             start_caffeinate
-            gateway_curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
-            wait_for_workspace_health
+            ensure_workspace_engine_running
             return
         fi
     fi
@@ -2482,10 +2652,9 @@ start_gateway() {
     fi
     # Fresh gateway is up. Its boot adopts already-running engines + spawns
     # autostart workspaces, but NOT this just-launched one (autostart defaults
-    # OFF), so start it explicitly via the control API — same call the reuse path
-    # makes, so both paths end with this workspace's engine running.
-    gateway_curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
-    wait_for_workspace_health
+    # OFF), so start it explicitly. Same call the reuse path makes, so both paths
+    # end with this workspace's engine running.
+    ensure_workspace_engine_running
 }
 
 # The gateway is now ONE shared machine-global process fronting every workspace,
@@ -2560,15 +2729,136 @@ running_frontend_workspaces_in_project() (
 build_watch_pidfile() { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"; }
 build_watch_log()     { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/log"; }
 
+# ── host seams (overridden by the test) ─────────────────────────────────
+# Both fail CLOSED when the test replaces them: a synthetic feed is the whole
+# answer, never a fall-back to the real host (ADR 0025). Same posture as
+# preflight_reclaim.sh's seams.
+
+# Every process on this host, one `<pid> <argv>` line each. Deliberately NOT
+# `pgrep -x lucidos-engine`: on macOS pgrep EXCLUDES ancestors of the calling
+# process, and a coding-agent session runs under the very engine whose workspace
+# must be counted. Deliberately also NOT `ps -E` here, which would print every
+# process's whole environment; the environment is read per engine below.
+_build_watch_ps_listing() {
+    ps -ax -o pid=,command= 2>/dev/null
+}
+
+# One engine's environment, as `ps -E` prints it: argv first, then NAME=value.
+_build_watch_proc_env() {
+    ps -E -p "$1" -o command= 2>/dev/null
+}
+
+# ── engines_serving_checkout_dist ───────────────────────────────────────
+# Echo the pid of every LIVE engine serving a dist/ inside the given checkout.
+# Returns non-zero when the answer could not be established, which is NOT the
+# same as echoing nothing.
+#
+# This is the authoritative answer to "is anything still serving this checkout",
+# and ADR 0219 is why it asks processes rather than marker files: ownership is
+# what a process answers. `frontend.pid` is written only by start_frontend_built,
+# so an engine the GATEWAY spawned (a lazy start, the restart control API, every
+# in-app Switch) carries no marker and was invisible. One such engine was serving
+# the dev workspace when an unrelated stop read the ref-count as empty and killed
+# the watch out from under it.
+#
+# Selection is on argv[0] and never on the whole command line (ADR 0025): a
+# coding-agent session carries its transcript inside a ~22 KB argument, so a
+# substring test matches any session whose conversation quotes this path.
+#
+# Unknown is propagated at BOTH probes, not just the first. The listing is one
+# guard; the per-engine environment read is the other, and leaving it unguarded
+# put the original bug back one level down for an engine whose environment we
+# can see listed but cannot read.
+#
+# `exclude_pid` is the engine THIS caller has already stopped, and it is the
+# exact counterpart of removing `frontend.pid` before the marker scan: a
+# workspace on its way out must not count itself. Without it the primary caller
+# is a guaranteed no-op, because `stop.sh` signals the engine and reaches here
+# milliseconds later while a graceful drain still has seconds to run.
+engines_serving_checkout_dist() (
+    local project="$1" exclude_pid="${2:-}" project_real listing pid argv
+    project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
+    [ -n "$project_real" ] || return 0
+    listing="$(_build_watch_ps_listing)" || return 1
+    # A herestring, NOT a pipe: a `while` in a pipeline runs in a subshell, and
+    # `return 1` there would exit that subshell rather than this function, so an
+    # unknown discovered mid-loop could not be reported at all.
+    while read -r pid argv; do
+        [ -n "$pid" ] || continue
+        if [ -n "$exclude_pid" ] && [ "$pid" = "$exclude_pid" ]; then continue; fi
+        case "${argv%% *}" in
+            */lucidos-engine | lucidos-engine) ;;
+            *) continue ;;
+        esac
+        local env_line probe_rc=0 static_dir static_real
+        env_line="$(_build_watch_proc_env "$pid")" || probe_rc=$?
+        # A FAILED probe means the pid left between the snapshot and now, so it
+        # serves nothing and skipping it is the right answer.
+        [ "$probe_rc" -eq 0 ] || continue
+        # A probe that succeeded but carried no environment is a LIVE engine we
+        # cannot characterize, and that is unknown rather than "not serving".
+        # Every readable environment has PATH, so its absence is the test.
+        case "$env_line" in
+            *" PATH="*) ;;
+            *) return 1 ;;
+        esac
+        static_dir="$(proc_env_value "$env_line" LUCIDOS_STATIC_DIR)"
+        # Readable environment, no static dir: this engine serves no dist/ at
+        # all, which is a real answer rather than a missing one.
+        [ -n "$static_dir" ] || continue
+        # A dist/ that will not resolve is compared LEXICALLY rather than
+        # dropped. Dropping is the unsafe direction: an engine mid-publish
+        # (dist.staging is renamed onto dist/) would stop counting for exactly
+        # as long as the rename takes, which is when a teardown must not fire.
+        static_real="$(cd "$static_dir" 2>/dev/null && pwd -P || true)"
+        [ -n "$static_real" ] || static_real="$static_dir"
+        # Trailing slashes stop `/a/b` matching `/a/bb`, and keep a worktree's
+        # own dist/ from counting as the main checkout's. Both the resolved and
+        # the literal project path are tried, since only one side may resolve.
+        case "$static_real/" in
+            "$project_real/" | "$project_real"/* | "$project/" | "$project"/*) echo "$pid" ;;
+        esac
+    done <<< "$listing"
+)
+
 # Tear down the shared build-watch only when NO workspace of this checkout is
 # still serving the frontend. Call AFTER this workspace's frontend.pid has been
 # removed, so running_frontend_workspaces_in_project no longer counts us. No-op
 # when no shared build-watch is recorded.
+#
+# Two keep-alive votes, and either one alone spares the watch. The marker scan
+# covers the legacy per-workspace Vite dev server that release_frontend_marker
+# contemplates. The engine query covers every engine-served workspace, whoever
+# spawned it. Each says only "keep it alive", so neither can cause a wrong kill.
+#
+# Every refusal SAYS SO. A silent teardown is why the original incident took
+# hours to read back from a status file that still reported a healthy build.
+#
+# `$1` is the engine this caller has just stopped, excluded from the engine vote
+# for the same reason `frontend.pid` is removed before the marker scan: neither
+# vote may be cast by the workspace on its way out. `cleanup_processes` passes
+# nothing, since its engine deliberately keeps running.
 teardown_shared_build_watch_if_idle() {
+    local stopped_engine_pid="${1:-}"
     local pidfile; pidfile="$(build_watch_pidfile)"
     [ -f "$pidfile" ] || return 0
-    if [ -n "$(running_frontend_workspaces_in_project "$PROJECT_DIR")" ]; then
-        return 0   # another workspace still serves this checkout — keep it alive
+    local marked; marked="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
+    if [ -n "$marked" ]; then
+        echo "Keeping the shared frontend build-watch: workspace(s) $marked still serve this checkout"
+        return 0
+    fi
+    # An unreadable process table is UNKNOWN, and unknown never authorizes the
+    # kill. The costs are lopsided: a wrong "still serving" leaks one node
+    # process until the next launch, a wrong "nothing serving" is the incident.
+    local serving rc=0
+    serving="$(engines_serving_checkout_dist "$PROJECT_DIR" "$stopped_engine_pid")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "Keeping the shared frontend build-watch: could not read the process table to see who serves $PROJECT_DIR"
+        return 0
+    fi
+    if [ -n "$serving" ]; then
+        echo "Keeping the shared frontend build-watch: engine(s) $(echo "$serving" | tr '\n' ' ')still serve this checkout"
+        return 0
     fi
     local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then

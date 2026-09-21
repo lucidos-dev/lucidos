@@ -16,6 +16,7 @@ pub(in crate::engine) mod chat;
 pub(crate) mod claude_code;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
+pub(crate) mod command_judge_questions;
 pub mod command_permission;
 /// `pub(crate)` for the two cost helpers: `tool_definitions_chars` and
 /// `estimate_tokens_from_chars` are what the MCP settings surface reports, and

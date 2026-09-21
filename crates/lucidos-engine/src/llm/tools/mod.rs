@@ -21,6 +21,7 @@
 //! - `web` — web_search, fetch_news
 //! - `proxy` — reload_proxy_modules, proxy_request, http_request
 //! - `images` — save_thread_image, generate_image
+//! - `judgment`: judge (typed questions over one state, gated on a provider)
 //! - `misc` — navigate_ui, git_clone, get_backup_status, request_credential,
 //!   connect_oauth_account, execute_intent, ask_user_question, await_event,
 //!   list_event_waits, cancel_event_wait, todo_write
@@ -56,6 +57,7 @@ mod email;
 mod exec;
 mod file;
 mod images;
+mod judgment;
 mod misc;
 mod notifications;
 mod proxy;
@@ -102,6 +104,9 @@ pub struct ToolCapabilities {
     pub intent: bool,
     /// An image-generation provider is configured.
     pub image_provider: bool,
+    /// A judgment provider is configured and switched on, so the agent can ask
+    /// a typed question itself.
+    pub judgment_provider: bool,
     /// The *self-curated context mode* is on for this workspace.
     ///
     /// Unlike the three above it opens no family. It CLOSES one. The mode adds
@@ -124,6 +129,7 @@ impl ToolCapabilities {
             email_account: true,
             intent: true,
             image_provider: true,
+            judgment_provider: true,
             context_mode: false,
         }
     }
@@ -144,6 +150,8 @@ pub enum Gate {
     Intent,
     /// A configured image-generation provider.
     ImageProvider,
+    /// A configured judgment provider, switched on.
+    JudgmentProvider,
 }
 
 impl Gate {
@@ -153,6 +161,7 @@ impl Gate {
             Gate::EmailAccount => caps.email_account,
             Gate::Intent => caps.intent,
             Gate::ImageProvider => caps.image_provider,
+            Gate::JudgmentProvider => caps.judgment_provider,
         }
     }
 }
@@ -236,6 +245,13 @@ const FAMILIES: &[FamilyRow] = &[
     // working understanding, and two write surfaces for one list is the cost
     // bug twice over.
     (Gate::Ungated, Build::Shaped(misc::todo_write_tools)), // todo_write
+    // Last, so opening this gate moves no family already on the wire. It is
+    // the only row whose gate a workspace opens by configuring a provider that
+    // holds no conversation.
+    (
+        Gate::JudgmentProvider,
+        Build::Fixed(judgment::judgment_tools),
+    ), // judge
 ];
 
 /// The schemas the chat caller splices AFTER the grouped manifest set, so

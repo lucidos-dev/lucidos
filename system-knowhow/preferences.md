@@ -56,6 +56,27 @@ provider default.) The one way to change a *running* thread's model/effort is it
 in-thread model picker in the compose bar, which writes a per-thread value and
 never touches this account default.
 
+**The style library.** `response_styles` holds ONLY what the user changed. An
+entry whose id is `concise` or `minimal` overrides that shipped style. One with a
+fresh kebab-case id adds a style, and removing an entry restores the shipped
+text. `standard` is the off switch and is refused here.
+
+Two things to get right before you write it. The key REPLACES THE WHOLE ARRAY.
+So read the current value first and send it back with your edit applied, or you
+delete every style the user wrote. The bounds are refused rather than trimmed:
+40 characters of id, 40 of label, 1000 of instruction, 20 entries.
+
+`GET /api/v1/response-styles` is the easier read. It returns the merged library,
+each row carrying `source` (`builtin`, `overridden` or `user`) and the shipped
+text you would be overriding.
+
+**When the user asks for shorter or longer answers, SET `response_style`.** That
+is what makes the request stick. Saying it in chat lasts one thread, and these
+two keys are the reason the setting exists at all. A change applies from their
+NEXT message: a turn builds its prompt once, at the start, so the turn you are
+in finishes in the style it began in. It reaches triggers too, and it changes
+nothing about coding-agent sessions.
+
 **Device scope.** Device-scoped keys (theme, font-family, ui-scale,
 push_notifications) are stored per-device and override the global value on the
 device that set them. `set_preference` automatically targets the calling device —
@@ -71,15 +92,19 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
 | `chat_model` | global | a model id from the registry | `claude-opus-5@default` | Default chat model for NEW threads (a running thread reuses its own last-used model — see "How a write propagates"). Use `manage_models(action='list')` to see options. |
 | `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads (a running thread reuses its own last-used effort; clamped per model). |
+| `response_style` | global | the id of a style in the library | `standard` | How much comes back in a chat or trigger answer. `standard` adds nothing, so answers are as they always were. Shipped beside it: `concise` and `minimal`. Both are editable, and the user may add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids that exist here. An id nothing defines falls back to `standard`. |
+| `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" below. |
 | `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-1` \| `gpt-image-1.5` \| `gpt-image-2` | `auto` | Model used by `generate_image`. |
 | `model_title` | global | a model id | `gemini-3-flash-preview` | Background model for thread titles. |
 | `reasoning_title` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for title generation. Naming a thread needs none of it. |
 | `model_image_description` | global | a model id | `gemini-3-flash-preview` | Background model that describes uploaded images. |
 | `reasoning_image_description` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for describing an image. Captioning is perception, so the default spends nothing on deliberation. |
-| `model_memory` | global | a model id | `gemini-3-flash-preview` | Background model for the two memory calls every turn makes: extracting facts, and classifying what the turn needs retrieved. It no longer writes the conversation summary (see `model_conversation_summary`). |
-| `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for fact extraction and query classification. Both return short JSON on every turn. |
+| `model_memory` | global | a model id | `gemini-3-flash-preview` | Background model that extracts facts from a turn for long-term memory. It no longer writes the conversation summary or classifies the query: both were split out (see `model_conversation_summary` and `model_query_classification`), and both inherit this value while unset. |
+| `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for fact extraction. It returns short JSON on every turn. |
 | `model_conversation_summary` | global | a model id | (the `model_memory` model) | Background model that writes a thread's *conversation summary*: the paragraph standing in for its older assistant turns. Split out of `model_memory`, so it inherits that value until you set this one. Its input can be 80k tokens, far larger than any other background call. |
 | `reasoning_conversation_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for the conversation summary. Measured output length does not track this setting, so raising it is unlikely to help: the summariser's failures are calls that never complete. |
+| `model_query_classification` | global | a model id | (the `model_memory` model) | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Split out of `model_memory`, so it inherits that value until you set this one. Settings offers TypeSafe (Jev) in the same control, which writes `judgment_query_classification` instead. |
+| `reasoning_query_classification` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (the `reasoning_memory` value, else `none`) | Thinking budget for query classification. It answers three yes/no questions in front of every turn. Split out of `reasoning_memory`, so it inherits that value until you set this one. |
 | `voice_enabled` | global | `true` \| `false` | `false` | Off by default, and experimental. `true` puts a call control in the composer and lets `/api/v1/voice` accept a socket, so a thread can be spoken to. It rents a speech-to-speech talker and needs the OpenAI provider configured. Every spoken utterance starts an ordinary agent turn, so a short call can cost several. With this off nothing voice-shaped is reachable and the voice keys below do nothing. |
 | `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through, and the id that picks the call's protocol. It holds the conversation and nothing else, so every action still goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. Each bills by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. So a Live caller answers a question out loud, in their own words, and taps for a permission or to ring off. |
 | `model_voice_transcriber` | global | a model id | `gpt-4o-mini-transcribe` | Model turning the caller's speech into text inside a *voice session*, and only on a realtime one. A `gpt-live-1` talker transcribes the caller itself and reads no id here, so this key does nothing for it. The second and last model in the voice loop: nothing translates, nothing summarises, and `language` decides what it is pinned to. Settings offers six ids, and the two built for a live microphone lead: `gpt-live-transcribe` and `gpt-realtime-whisper`. The engine sends `gpt-live-transcribe`'s language pin as `languages`, an array, where every other model reads the singular `language`. The two stream as the caller speaks, and the rest transcribe a turn once it is committed: `gpt-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe` and `whisper-1`. |
@@ -119,6 +144,16 @@ surface):
   `reasoning_command_judge`: the command guard (safety gate over the agent's own
   bash/python) and the model selection its LLM judge runs on. Settings →
   Permissions only. You must not disable or weaken your own safety gate.
+- `judgment_command_guard`, `judgment_query_classification`: which backend
+  answers each classification, `chat` or `jev`. `chat` is the default and runs
+  the prompt the surface has always run. `jev` sends typed questions to
+  TypeSafe instead and decides the outcome in code. Neither is a control of its
+  own: **TypeSafe (Jev) is one of the models** in the site's model dropdown, so
+  choosing it writes `jev` and choosing any model writes `chat`. The first
+  dropdown is the Judge model row in Settings → Permissions (Command safety).
+  The second is the Query classification row in Settings → Models (Background
+  tasks). The Jev row appears only with a TypeSafe key stored in Settings →
+  Models (Providers), and both sit under `provider_enabled_typesafe` below.
 - `backup_last_run` — internal backup state (the last run's outcome), not a
   setting. The backup *schedule*, *provider*, and *retention* ARE settable (see
   the table above); use `get_backup_status` to read the current schedule, next /
@@ -169,6 +204,15 @@ surface):
   provider you switch off may be the one answering this turn. Contrast
   `opencode_free_enabled` above, which IS settable, because turning a keyless
   free tier on cannot leave the workspace unable to answer.
+- `provider_enabled_typesafe`: the same switch for TypeSafe (Jev), on the same
+  page. Same absent-means-**on** rule, and the same promise that off leaves the
+  stored key alone. It is the master switch above `judgment_command_guard` and
+  `judgment_query_classification`: with it off, every classification runs its
+  chat path whatever those two say. Jev holds no conversation, so it appears in
+  no chat model picker and in no `configured_providers` list. It is offered as a
+  model only in those two classification rows (ADR 0224). Never via
+  `set_preference`, and for a different reason from the six: switching it off
+  turns the command guard's backend back to chat, which is not your decision.
 
 > Keep this file in lockstep with `core/preference_catalog.rs` — a `cargo test`
 > sync test fails if a catalog key is missing here (see

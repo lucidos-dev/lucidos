@@ -5,6 +5,10 @@
 //! a window the user is looking at, and there only the size rule applies: see
 //! [`fit_to_displays`] for why the rest would be fighting them.
 //!
+//! It also remembers WHICH windows it corrected, because a correction is not an
+//! arrangement: `window_persist` asks, so the record keeps the frame the user
+//! chose until they move the window themselves (ADR 0215).
+//!
 //! The paragraphs below are the restore half's own story. `# Units` binds both.
 //!
 //! The plugin writes the saved rect straight onto the window, and its only guard
@@ -45,6 +49,8 @@
 //! `app_window::place_window`, which applies logical values and moves a window
 //! before it resizes it (ADR 0178).
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
 
 /// Height of the strip at the top of the window that counts as the drag handle:
@@ -134,22 +140,65 @@ impl Rect {
 pub(crate) struct Panel {
     /// The usable frame, menu bar and Dock excluded. Where a window is PLACED,
     /// since neither of those is somewhere a title bar can be grabbed.
-    pub work_area: Rect,
+    work_area: Rect,
     /// The whole screen. What bounds a RESIZE, which the Dock does not: the
     /// user can drag a window's bottom edge under it, and turning Dock
     /// auto-hide off shrinks the work area under a window already that tall.
     /// Judging a SIZE against the work area would read both as corruption.
-    pub frame: Rect,
+    frame: Rect,
+}
+
+impl Panel {
+    /// Is there any window at all this monitor could hold?
+    ///
+    /// A zero-sized frame is what a monitor reports while the desk is being
+    /// reconfigured. It is the same fact as a monitor that is not there, and
+    /// [`Displays::new`] drops it for that reason.
+    fn holds_anything(&self) -> bool {
+        self.frame.width > 0 && self.frame.height > 0
+    }
 }
 
 /// The display layout the clamp judges a rect against, in logical points.
+///
+/// **It always holds at least one monitor that could hold a window**, which is
+/// what [`Displays::new`] is for. Every question below is asked of `panels`,
+/// and an EMPTY list answers each of them the most destructive way there is:
+/// no screen can hold this window, its title bar is nowhere reachable, and it
+/// has no home. So a desk nobody could read re-centred every window on the
+/// primary, which is the one input where doing nothing is certainly right.
+///
+/// The fields are private so no other module can build one around that hole.
+/// Inside this module the literal is still reachable, so every site here goes
+/// through the constructor, tests included.
 #[derive(Debug, Clone)]
 pub(crate) struct Displays {
-    /// Every currently-attached monitor.
-    pub panels: Vec<Panel>,
+    /// Every currently-attached monitor that could hold a window.
+    panels: Vec<Panel>,
     /// Work area of the primary monitor: where a window with nowhere left to be
     /// gets re-centred.
-    pub primary: Rect,
+    primary: Rect,
+}
+
+impl Displays {
+    /// The desk, or `None` when nothing readable was attached.
+    ///
+    /// Drops the monitors that could hold no window, then refuses a desk with
+    /// nothing left. A caller that gets `None` leaves the geometry alone, which
+    /// is what every other unreadable input in this module already does.
+    ///
+    /// `primary` is held to the same bar, and separately, because it is read on
+    /// its own. It is where `sanitize` sends a window with nowhere left to be,
+    /// and it comes from `primary_monitor` rather than from the list. A desk
+    /// whose panels are fine but whose PRIMARY reads as zero-sized would
+    /// re-centre that window at the origin, off every real screen.
+    fn new(panels: Vec<Panel>, primary: Rect) -> Option<Self> {
+        if primary.width <= 0 || primary.height <= 0 {
+            return None;
+        }
+        let panels: Vec<Panel> = panels.into_iter().filter(Panel::holds_anything).collect();
+        (!panels.is_empty()).then_some(Self { panels, primary })
+    }
 }
 
 /// The floors and fallbacks the clamp applies, in logical points. Derived from
@@ -349,6 +398,50 @@ pub(crate) fn fit_to_displays(live: Rect, displays: &Displays, policy: &Policy) 
     sanitize(live, displays, policy)
 }
 
+/// The frame each window is wearing because THIS client corrected it, by label.
+///
+/// A correction is not an arrangement, and `window_persist` reads this so the
+/// record keeps what the user chose. See ADR 0215.
+static RESCUED: Mutex<BTreeMap<String, Rect>> = Mutex::new(BTreeMap::new());
+
+/// Record that `label` is on screen at `frame` because the clamp put it there.
+///
+/// Every correction site calls this, so there is no path that moves a window
+/// without saying it was not the user.
+fn note_rescued(label: &str, frame: Rect) {
+    RESCUED.lock().unwrap().insert(label.to_string(), frame);
+}
+
+/// Is `label` still wearing the frame a correction gave it?
+///
+/// **The comparison IS the expiry.** Any other rect means the user has moved or
+/// resized the window since. The note is dropped here, and their frame is
+/// recorded from now on. Nothing has to tell our own `Moved` event from theirs,
+/// which is not a thing tao reports.
+///
+/// A window that lands a point off what was asked reads as moved, and the
+/// record takes the live frame. That is what shipped before ADR 0215, so the
+/// inexact case degrades to the old behaviour rather than to something worse.
+pub(crate) fn is_wearing_a_rescue(label: &str, live: Rect) -> bool {
+    let mut rescued = RESCUED.lock().unwrap();
+    match rescued.get(label) {
+        Some(frame) if *frame == live => true,
+        Some(_) => {
+            rescued.remove(label);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Drop `label`'s note, because the window is gone.
+///
+/// `main` is hidden rather than closed, and comes back on its workspace. A note
+/// outliving its window would hold the record against a later, unrelated frame.
+pub(crate) fn forget_rescue(label: &str) {
+    RESCUED.lock().unwrap().remove(label);
+}
+
 /// The declared window config to judge `label` against, falling back to the
 /// declared `main` window.
 ///
@@ -423,20 +516,27 @@ fn policy_and_displays(
         eprintln!("[Tauri] No monitor to place the window on: skipping the restore clamp");
         return None;
     };
-    Some((
-        policy,
-        Displays {
-            panels: monitors.iter().map(panel_points).collect(),
-            primary: panel_points(&primary).work_area,
-        },
-    ))
+    let Some(displays) = Displays::new(
+        monitors.iter().map(panel_points).collect(),
+        panel_points(&primary).work_area,
+    ) else {
+        eprintln!("[Tauri] No monitor that could hold a window: skipping the clamp");
+        return None;
+    };
+    Some((policy, displays))
 }
 
 /// Say what a correction did, in the one wording both callers use.
-fn log_correction(what: &str, before: Rect, after: Rect) {
+///
+/// It names the DESK as well as the two frames. With the frames alone, which
+/// rule fired has to be derived from the arithmetic. The answer is often
+/// "against a desk that was not there".
+fn log_correction(what: &str, before: Rect, after: Rect, displays: &Displays) {
+    let primary = displays.primary;
     eprintln!(
         "[Tauri] {what} {}x{} at {},{} is unusable on the attached displays: \
-         correcting to {}x{} at {},{} (logical points)",
+         correcting to {}x{} at {},{} (logical points, judged against {} panel(s), \
+         primary work area {}x{} at {},{})",
         before.width,
         before.height,
         before.x,
@@ -444,7 +544,12 @@ fn log_correction(what: &str, before: Rect, after: Rect) {
         after.width,
         after.height,
         after.x,
-        after.y
+        after.y,
+        displays.panels.len(),
+        primary.width,
+        primary.height,
+        primary.x,
+        primary.y
     );
 }
 
@@ -468,7 +573,16 @@ pub(crate) fn sanitized_frame(app: &tauri::AppHandle, label: &str, frame: Rect) 
     };
     match sanitize(frame, &displays, &policy) {
         Some(fixed) => {
-            log_correction(&format!("The frame `{label}` is owed is"), frame, fixed);
+            log_correction(
+                &format!("The frame `{label}` is owed is"),
+                frame,
+                fixed,
+                &displays,
+            );
+            // The caller places this rect, so the window is about to wear a
+            // frame nobody chose. The record must keep the one it has, per
+            // ADR 0215.
+            note_rescued(label, fixed);
             fixed
         }
         None => frame,
@@ -549,37 +663,56 @@ fn clamp_geometry(
         return;
     };
 
-    // Position plus content size: the pair the window-state plugin itself
-    // persists and restores, and the pair `window_persist` captures. So all
-    // three reason about one set of numbers.
-    //
-    // The size comes from `app_window::window_content_size`, never from
-    // `inner_size`, which answers with the PAGE on macOS. This clamp spent its
-    // life judging the webview's frame and calling it the window's (ADR 0202).
-    //
-    // The scale factor comes with them, and an unreadable one skips the clamp
-    // rather than falling back to 1.0. It is what converts the pair into
-    // points, so a guess here is a wrong rect, not a coarse threshold.
-    let (Ok(position), Ok(size), Ok(scale)) = (
-        window.outer_position(),
-        crate::app_window::window_content_size(&window),
-        window.scale_factor(),
-    ) else {
+    let Some(worn) = live_frame(&window) else {
         eprintln!("[Tauri] Could not read the geometry of `{label}`: skipping the clamp");
         return;
     };
-    let worn = Rect::from_physical(position, size, scale);
 
     let Some(fixed) = decide(worn, &displays, &policy) else {
         return;
     };
-    log_correction(what, worn, fixed);
+    log_correction(what, worn, fixed, &displays);
+    // Noted BEFORE the placement, so the note can never lag the frame it
+    // describes. Both run in this one main-thread turn, so nothing reads the
+    // window in between. This frame is not the user's, and ADR 0215 keeps it
+    // out of the record until they move the window themselves.
+    note_rescued(label, fixed);
     // Through the one placer, rather than a setter pair of its own. It applies
     // logical values, which tao passes through untouched, and it MOVES before
     // it resizes. A correction can send a window to another display. A resize
     // queued across that change is read back at the wrong scale factor
     // (ADR 0178).
     crate::app_window::place_window(&window, fixed, &format!("`{label}` back on screen"));
+}
+
+/// The frame `window` is wearing right now, in points, or `None` when any part
+/// of it could not be read.
+///
+/// **The one reader of a live window's FRAME**, so the clamp, the session
+/// capture and the rescue check all reason about one set of numbers. Other
+/// readers take a window's size for their own purposes (`refit_webview`,
+/// `panel_preview::title_bar_gap`); none of them produces a frame.
+///
+/// Position plus CONTENT size, which is the pair the window-state plugin
+/// persists and restores. The size comes from `app_window::window_content_size`
+/// and never from `inner_size`, which answers with the PAGE on macOS. The clamp
+/// spent its life judging the webview's frame and calling it the window's
+/// (ADR 0202).
+///
+/// The scale factor comes with them, and an unreadable one gives `None` rather
+/// than falling back to 1.0. It is what converts the pair into points, so a
+/// guess here is a wrong rect rather than a coarse one.
+///
+/// By window, not webview window, per ADR 0140.
+pub(crate) fn live_frame(window: &tauri::Window) -> Option<Rect> {
+    let (Ok(position), Ok(size), Ok(scale)) = (
+        window.outer_position(),
+        crate::app_window::window_content_size(window),
+        window.scale_factor(),
+    ) else {
+        return None;
+    };
+    Some(Rect::from_physical(position, size, scale))
 }
 
 /// A monitor as the clamp sees it: its usable frame and its whole screen. Both
@@ -658,41 +791,46 @@ mod tests {
         }
     }
 
+    /// A desk a fixture declares, through the one constructor production uses.
+    fn desk(panels: Vec<Panel>, primary: Rect) -> Displays {
+        Displays::new(panels, primary).expect("a fixture desk must hold a window")
+    }
+
+    /// One monitor whose whole screen is its work area.
+    fn plain_panel(rect: Rect) -> Panel {
+        Panel {
+            work_area: rect,
+            frame: rect,
+        }
+    }
+
     /// The internal Retina panel alone: 1728x1117 points behind 3456x2234
     /// pixels, with a 37-point menu bar. The display the shipped clamp bug was
     /// reported on.
     fn one_panel() -> Displays {
         let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
-        Displays {
-            panels: vec![panel],
-            primary: panel.work_area,
-        }
+        desk(vec![panel], panel.work_area)
     }
 
     /// The panel above with the Dock showing along its bottom edge. It takes 80
     /// points out of the work area and none out of the screen.
     fn one_panel_with_a_dock() -> Displays {
-        let mut displays = one_panel();
-        displays.panels[0].work_area.height -= 80;
-        displays.primary = displays.panels[0].work_area;
-        displays
+        let mut panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
+        panel.work_area.height -= 80;
+        desk(vec![panel], panel.work_area)
     }
 
     /// The panel above plus an external display to its right, for the
     /// unplug case.
     fn two_panels() -> Displays {
-        let mut displays = one_panel();
+        let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
         let external = Rect {
             x: 1728,
             y: 0,
             width: 2560,
             height: 1440,
         };
-        displays.panels.push(Panel {
-            work_area: external,
-            frame: external,
-        });
-        displays
+        desk(vec![panel, plain_panel(external)], panel.work_area)
     }
 
     /// A 1x laptop panel with a 1x external display beside it: one desk, ONE
@@ -710,23 +848,14 @@ mod tests {
             width: 2560,
             height: 1440,
         };
-        Displays {
-            panels: vec![
-                laptop,
-                Panel {
-                    work_area: external,
-                    frame: external,
-                },
-            ],
-            primary: laptop.work_area,
-        }
+        desk(vec![laptop, plain_panel(external)], laptop.work_area)
     }
 
-    /// The desk above after the external display is unplugged.
+    /// The desk above after the external display is unplugged. Derived from it,
+    /// so the two cannot drift into describing different laptops.
     fn the_laptop_alone() -> Displays {
-        let mut displays = two_one_x_panels();
-        displays.panels.truncate(1);
-        displays
+        let laptop = two_one_x_panels().panels[0];
+        desk(vec![laptop], laptop.work_area)
     }
 
     /// The desk the placement bug was reported on: a 1x 5120x1440 ultrawide as
@@ -748,19 +877,7 @@ mod tests {
             width: 1728,
             height: 1117,
         };
-        Displays {
-            panels: vec![
-                Panel {
-                    work_area: ultrawide,
-                    frame: ultrawide,
-                },
-                Panel {
-                    work_area: panel,
-                    frame: panel,
-                },
-            ],
-            primary: ultrawide,
-        }
+        desk(vec![plain_panel(ultrawide), plain_panel(panel)], ultrawide)
     }
 
     /// `tauri.conf.json`'s 480x400 minimum and 1024x768 default.
@@ -866,6 +983,167 @@ mod tests {
                 "scale {scale}"
             );
         }
+    }
+
+    // ── Which frames are the client's rather than the user's (ADR 0215) ──────
+
+    /// A label no other test uses. `RESCUED` is process-wide, and the test
+    /// binary runs its threads in one process.
+    fn a_rescued_frame() -> Rect {
+        Rect {
+            x: 643,
+            y: 30,
+            width: 1728,
+            height: 1084,
+        }
+    }
+
+    #[test]
+    fn a_window_nothing_corrected_is_wearing_no_rescue() {
+        assert!(!is_wearing_a_rescue(
+            "rescue-test-untouched",
+            a_rescued_frame()
+        ));
+    }
+
+    #[test]
+    fn a_window_still_at_the_corrected_frame_is_wearing_the_rescue() {
+        note_rescued("rescue-test-held", a_rescued_frame());
+        assert!(is_wearing_a_rescue("rescue-test-held", a_rescued_frame()));
+        // Asked twice, because both the plugin gate and the session capture ask.
+        assert!(is_wearing_a_rescue("rescue-test-held", a_rescued_frame()));
+        forget_rescue("rescue-test-held");
+    }
+
+    /// The expiry, and the reason it needs no timer. Any frame but the one we
+    /// placed is the user having moved or resized the window.
+    #[test]
+    fn a_frame_the_user_changed_ends_the_rescue_for_good() {
+        note_rescued("rescue-test-moved", a_rescued_frame());
+        let moved = Rect {
+            x: 200,
+            ..a_rescued_frame()
+        };
+        assert!(!is_wearing_a_rescue("rescue-test-moved", moved));
+        // Dropped, so putting the window back where the clamp had it does not
+        // revive a note the user already spent.
+        assert!(!is_wearing_a_rescue("rescue-test-moved", a_rescued_frame()));
+    }
+
+    #[test]
+    fn forgetting_a_window_drops_its_rescue() {
+        note_rescued("rescue-test-closed", a_rescued_frame());
+        forget_rescue("rescue-test-closed");
+        assert!(!is_wearing_a_rescue(
+            "rescue-test-closed",
+            a_rescued_frame()
+        ));
+    }
+
+    // ── What counts as a desk at all ─────────────────────────────────────────
+
+    /// The defect this constructor exists for. `available_monitors` can answer
+    /// `Ok` with nothing in it, while `primary_monitor` still names a display.
+    /// Every question the clamp asks is asked of the panel list. An empty one
+    /// therefore says three things at once, about every window: no screen can
+    /// hold it, no title bar is reachable, and it has no home.
+    #[test]
+    fn a_desk_with_no_panels_is_not_a_desk() {
+        let primary = one_panel().primary;
+        assert!(Displays::new(Vec::new(), primary).is_none());
+    }
+
+    /// A monitor reporting a zero-sized frame is the same fact as one that is
+    /// not attached: no window fits on it. Left in the list it drags every
+    /// predicate to the empty list's answer, while looking like a real desk.
+    #[test]
+    fn a_desk_of_zero_sized_panels_is_not_a_desk() {
+        let nothing = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        let primary = one_panel().primary;
+        assert!(Displays::new(vec![plain_panel(nothing)], primary).is_none());
+    }
+
+    #[test]
+    fn a_zero_sized_panel_is_dropped_from_a_desk_that_has_a_real_one() {
+        let real = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
+        let nothing = plain_panel(Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+        let displays =
+            Displays::new(vec![nothing, real], real.work_area).expect("the real panel remains");
+        assert_eq!(displays.panels, vec![real]);
+    }
+
+    /// The primary is read on its own, so it needs its own guard. `sanitize`
+    /// re-centres a window with nowhere left to be on it, and a zero-sized one
+    /// puts that window at the origin: off every real screen, and recorded as
+    /// a rescue the workspace is then held behind.
+    #[test]
+    fn a_desk_whose_primary_could_hold_nothing_is_not_a_desk() {
+        let real = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
+        let nothing = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        assert!(Displays::new(vec![real], nothing).is_none());
+    }
+
+    #[test]
+    fn a_healthy_list_reaches_the_clamp_unchanged() {
+        let laptop = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
+        let external = plain_panel(Rect {
+            x: 1728,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        });
+        let displays = Displays::new(vec![laptop, external], laptop.work_area).expect("a desk");
+        assert_eq!(displays.panels, vec![laptop, external]);
+        assert_eq!(displays.primary, laptop.work_area);
+    }
+
+    /// The primary the shipped correction's arithmetic names. Re-centring
+    /// 1280 wide on it lands at `0 + (1728 - 1280) / 2 = 224`, the logged x.
+    fn reported_primary() -> Rect {
+        Rect {
+            x: 0,
+            y: 33,
+            width: 1728,
+            height: 1084,
+        }
+    }
+
+    /// The correction that shipped, in the numbers the client logged:
+    /// `1280x1084 at 0,33` re-centred to `224,33` on the 16 inch panel.
+    ///
+    /// Read against that panel the window fits, so BOTH clamps owe it nothing.
+    /// The shipped correction kept the SIZE. So step 2 found a home work area
+    /// big enough to hold it, and a work area sits inside its own screen. That
+    /// means `a_screen_can_hold` had to agree and no correction was owed. The
+    /// only reading left is a desk with no panels, now refused.
+    #[test]
+    fn the_window_the_client_moved_needed_no_correction_at_all() {
+        let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 33);
+        let displays = desk(vec![panel], panel.work_area);
+        let reported = Rect {
+            x: 0,
+            y: 33,
+            width: 1280,
+            height: 1084,
+        };
+        assert_eq!(displays.primary, reported_primary());
+        assert_eq!(fit_to_displays(reported, &displays, &policy()), None);
+        assert_eq!(sanitize(reported, &displays, &policy()), None);
     }
 
     // ── What the clamp decides ───────────────────────────────────────────────
@@ -1056,13 +1334,7 @@ mod tests {
             width: 300,
             height: 250,
         };
-        let displays = Displays {
-            panels: vec![Panel {
-                work_area: tiny,
-                frame: tiny,
-            }],
-            primary: tiny,
-        };
+        let displays = desk(vec![plain_panel(tiny)], tiny);
         let fixed = sanitize(
             Rect {
                 x: 0,
@@ -1215,10 +1487,7 @@ mod tests {
             None
         );
         let panel = mixed_dpi_desk().panels[1];
-        let retina_alone = Displays {
-            panels: vec![panel],
-            primary: panel.work_area,
-        };
+        let retina_alone = desk(vec![panel], panel.work_area);
         let fixed = fit_to_displays(sized_on_the_ultrawide, &retina_alone, &policy())
             .expect("must be corrected");
         assert_eq!((fixed.width, fixed.height), (1728, 1117));

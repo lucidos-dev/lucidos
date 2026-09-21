@@ -11,6 +11,12 @@
 //! nothing to the prompt and takes nothing away. ADR 0087's eval compares the
 //! two arms directly, and a drift in the off path is a drift in its baseline.
 //!
+//! One thing outside this file does move the off arm, deliberately: the
+//! `[TODO LIST]` block a turn opens with, in `tools::todo::turn_start_block`.
+//! It is suppressed under the mode, which already renders the checklist at the
+//! tail of every round. Both arms now show the agent its own list, where before
+//! only the mode did.
+//!
 //! The mode is one rule and two instruments. A tool result stays until a sweep
 //! takes it, whole, with the call that made it. The context panel shows what
 //! that leaves, and the working understanding is where the model writes what a

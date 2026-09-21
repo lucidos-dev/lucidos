@@ -219,7 +219,7 @@ mod tests {
     use super::*;
     use crate::core::event_subscription::EventSubscription;
     use crate::engine::thread_events::{EventMeta, EventWaitCancelCause, TodoStatus};
-    use crate::engine::tools::todo::todo_write_impl;
+    use crate::engine::tools::todo::todo_tool_impl;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use serde_json::json;
     use tokio::sync::broadcast::Receiver;
@@ -311,13 +311,13 @@ mod tests {
         found.expect("expected a TodoListWritten settle for the thread, none arrived")
     }
 
-    async fn seed_in_progress_list(bus: &EventBus, thread_id: Uuid) {
+    async fn seed_in_progress_list(bus: &EventBus, pool: &sqlx::PgPool, thread_id: Uuid) {
         let args = json!({
             "todos": [
                 { "content": "a", "active_form": "doing a", "status": "in_progress" },
             ]
         });
-        todo_write_impl(bus, &args, thread_id)
+        todo_tool_impl(bus, pool, &args, thread_id)
             .await
             .expect("seed write should succeed");
     }
@@ -471,7 +471,7 @@ mod tests {
         thread_id: Uuid,
         wait_ids: &[Uuid],
     ) {
-        seed_in_progress_list(bus, thread_id).await;
+        seed_in_progress_list(bus, pool, thread_id).await;
         for wait_id in wait_ids {
             emit_wait_started(bus, thread_id, *wait_id).await;
         }
@@ -521,7 +521,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         drain(&mut rx);
 
         emit_response_generated(&bus, thread_id).await;
@@ -545,7 +545,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         drain(&mut rx);
 
         emit_response_canceled(&bus, &pool, thread_id).await;
@@ -569,7 +569,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         drain(&mut rx);
 
         emit_response_aborted(&bus, thread_id).await;
@@ -597,7 +597,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         drain(&mut rx);
 
         bus.emit(BusEvent::Thread {
@@ -637,7 +637,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         // No EventWaitStarted at all: the wait does not exist yet at terminator
         // time, which is precisely the window this covers.
         bus.emit(BusEvent::Thread {
@@ -676,7 +676,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         emit_wait_started(&bus, thread_id, Uuid::new_v4()).await;
         drain(&mut rx);
 
@@ -701,7 +701,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        seed_in_progress_list(&bus, thread_id).await;
+        seed_in_progress_list(&bus, &pool, thread_id).await;
         drain(&mut rx);
 
         // Emit a MessageReceived — not a terminator, must not trigger cleanup.

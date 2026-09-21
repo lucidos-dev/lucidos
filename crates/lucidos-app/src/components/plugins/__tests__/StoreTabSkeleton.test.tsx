@@ -41,7 +41,7 @@ describe('StoreTabSkeleton — mirrors the loaded layout so the list does not ju
     // reload when the real wrapping bar lands. Pin enough placeholder pills that
     // the skeleton reserves roughly the same ~2 lines.
     const { classes } = render();
-    expect(classes).toContain('app-store-category-filter');
+    expect(classes).toContain('app-store-filter-pills');
     expect(
       classes.filter((c) => c === 'app-store-category-pill-skeleton').length,
     ).toBeGreaterThanOrEqual(9);

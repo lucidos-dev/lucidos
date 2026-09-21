@@ -21,8 +21,12 @@
  *  carries its turn's starter event id, and `stampedEventIds` in
  *  `store/thread-events/exchange-render.ts` is where that stamping rule is
  *  declared. Sharing the attribute with the deep link is deliberate: both ask
- *  "which turn", so a second marker could only disagree. */
-const ANCHOR_ATTR = 'data-event-id';
+ *  "which turn", so a second marker could only disagree.
+ *
+ *  Exported because the codec in `hooks/useScrollMemory.ts` watches it. A
+ *  backfill fold gives a fragment turn this attribute in place. The answer
+ *  below then changes with nothing else moving. */
+export const ANCHOR_ATTR = 'data-event-id';
 
 /** A reading position expressed against a turn.
  *

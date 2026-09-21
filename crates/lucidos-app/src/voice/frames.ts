@@ -19,7 +19,10 @@ export interface AudioSpec {
 
 /** Everything the client may say as text. Its binary frames are microphone
  *  audio, and the engine refuses any other control. */
-export type ClientControl = { type: 'barge_in' } | { type: 'hang_up' };
+export type ClientControl =
+  | { type: 'barge_in' }
+  | { type: 'caller_started_speaking' }
+  | { type: 'hang_up' };
 
 /** Everything the engine may say as text. Its binary frames are talker audio. */
 export type ServerFrame =
@@ -49,9 +52,10 @@ export const SERVER_FRAME_PAYLOAD = {
   error: ['message', 'string'],
 } as const satisfies Record<ServerFrame['type'], readonly [string, 'string' | 'object'] | null>;
 
-/** The same for the two things the client may say. Neither carries a payload. */
+/** The same for the things the client may say. None carries a payload. */
 const CLIENT_CONTROL_FLAGS = {
   barge_in: true,
+  caller_started_speaking: true,
   hang_up: true,
 } satisfies Record<ClientControl['type'], true>;
 

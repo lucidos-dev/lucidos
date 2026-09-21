@@ -1,6 +1,6 @@
 ---
 name: Workspace Consistency Audit
-description: Recipe for auditing the workspace's apps, triggers, knowhow, intents, scripts and artifacts against current Lucidos conventions and the SDK/CLI surface. Use when the user asks to audit the workspace, check for drift, or "see what's stale".
+description: Audits the workspace apps, triggers, knowhow, intents, scripts and artifacts against current conventions and the SDK/CLI surface. Use to audit the workspace, check for drift, see what is stale, or migrate every app off one retired pattern.
 ---
 
 # Workspace Consistency Audit
@@ -10,6 +10,38 @@ A read-only sweep of a Lucidos workspace that reports drift between what's on di
 ## When to run this
 
 User says "audit the workspace", "check for drift", "what's stale", "is everything still using the right pattern", "scan my apps/triggers". Or after a major change to the SDK / CLI / system prompt where existing content might silently use the old shape.
+
+**Every pass is a full pass.** Run every check below yourself, on every run,
+however recently the last one ran. A previous report is for comparing
+*findings*, never for deciding what to skip: its coverage is only as good as the
+checklist that produced it, and a check added since is a check that report never
+ran. Two passes in one morning both missed a broken app that way. The first read
+an outdated copy of this recipe, and the second skipped the category because the
+first had called it clean.
+
+So there is no delta pass. Re-walking a surface the previous run just fixed is
+cheap, and it is also how you confirm the fix held.
+
+## A targeted run: one check, then fix it everywhere
+
+A **targeted run** is the other shape this recipe has, and the one to reach for
+when the user already knows what broke. "Migrate my apps off `localStorage`",
+"fix the apps that call the engine themselves", "we renamed X, sweep for it".
+The checks below own the detection and § Remediation owns the rewrite, so a
+targeted run is those two parts and nothing else.
+
+It differs from a full pass in four ways:
+
+- **Pick the check by what the user named**, and run that one. Where a check has
+  sub-bullets, run the one that matches and say which.
+- **Skip the inventory.** Walk only the surface that check names.
+- **Go straight to § Remediation.** The user asking to migrate has already
+  answered "do the fixes", so do not ask again, and do not stop at a report.
+- **Claim only what you ran.** The report carries the one check and no
+  `Categories with no findings` line. A later pass must not read it as coverage.
+
+What a targeted run is NOT is a lighter audit. An unqualified "audit my
+workspace" is always the full pass above, whatever ran this morning.
 
 **Read-only.** Never edit or delete during the audit. The report proposes fixes; the user (or a follow-up session) decides what to apply. This covers *every* mutation, not just the ones the checks below name — no `rmdir`/`rm`, no writing a `.gitignore`, no `git add`/`git commit`, no `run_coding_agent`. If you catch yourself running a mutating command mid-sweep, you have left the recipe: put the fix in the report instead. Remediation, when the user asks for it, has its own rules — see § Remediation.
 
@@ -25,10 +57,17 @@ This knowhow does **not** restate the rules. It points at them. Each check below
 | `system-knowhow/building-knowhow.md` | Knowhow doc vs reference: which files a root lists, and where a doc's own supporting files go |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents — easy to miss) |
 | `system-knowhow/thread-events.md` | Every `ThreadEvent` name and which of them a trigger can subscribe to. For the **retired** set, ask the `events` tool rather than reading this file: see check 1 |
-| `system-knowhow/migrate-tap-shape.md` | The old-form `tap` detection patterns, and the paths they live in. The audit detects and reports; that recipe is what rewrites |
 | The active engine system prompt | The intent vs knowhow taxonomy, the trigger worked example |
 
 When a check below says "per `<file>`", that means: read the current version of that file and use *its* wording — not your memory of what it said.
+
+**Reach every one of them, and this file, with `load_knowhow`.** Never go
+looking for a copy in a repo by path. A Lucidos checkout carries gitignored
+duplicates of its own `system-knowhow/`: build staging, and every abandoned
+coding-agent worktree. Each is frozen at the commit that produced it, and a
+`find` answers with whichever it walks into first. One audit re-read its own
+recipe that way, got a five-week-old copy, and dropped findings it had already
+collected. `load_knowhow` serves the live file and nothing else can.
 
 ## What to walk
 
@@ -47,6 +86,82 @@ Resolve `data/` paths via the `lucidos` CLI. The audit covers:
 | Artifacts (structural only) | `data/artifacts/` |
 
 Trigger intent text lives in the `TriggerCreated` event payload (`run.intent`), not on disk — pull via `lucidos events query --type TriggerCreated`.
+
+## The mechanical scan: run this first, verbatim
+
+Every pattern below is something a grep decides, not something you judge. Run
+them as ONE call, before reading a single file, so coverage is a command that
+either ran or did not. Working through them from memory is how a check gets
+skipped, and a skipped check reads exactly like a clean one.
+
+`run_bash` starts in the workspace root, so this needs no absolute path.
+
+Each section prints its hit count, and the tail prints them again as one table.
+That table is the **receipt**: proof the section ran, and the only honest basis
+for calling a category clean.
+
+| section | what it looks for | the check that judges it |
+|---|---|---|
+| `storage` | browser storage an app frame cannot reach | 2 |
+| `host-realm` | the shell, read from an app frame | 2 |
+| `engine-fetch` | the app calling the engine itself, `apiUrl` included | 2 |
+| `download-link` | a download link, which needs `sdk.js` in a frame | 2 |
+| `tap-strings` | the retired `tap` string forms | 1 |
+| `removed-flags` | CLI flags and tool args that were removed | 7 |
+| `cred-env` | a credential read from the environment | 7 |
+| `auth-header` | an auth header built in app UI code | 7 |
+| `machine-path` | a hardcoded home or machine path | 5 |
+
+```bash
+cd data || exit 1
+ex="--exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=__pycache__"
+inc="--include=*.html --include=*.js --include=*.ts"
+all="apps triggers knowhow scripts"
+receipts=""
+
+scan() {
+  id="$1"; pattern="$2"; shift 2
+  out=$(grep -rnE "$pattern" $ex "$@" 2>/dev/null)
+  n=$(printf '%s' "$out" | grep -c . || true)
+  printf '\n=== %s (%s hits) ===\n%s\n' "$id" "$n" "${out:-none}"
+  receipts="$receipts| $id | $n |\n"
+}
+
+scan storage "localStorage|sessionStorage|document\.cookie|indexedDB" $inc apps
+
+scan host-realm "window\.parent|parent\.document|window\.top|top\.location" $inc apps
+
+scan engine-fetch "fetch\(['\"\`]/api/v1|new URL\(['\"\`]api/v1|new EventSource\(|apiUrl\(" $inc apps
+
+scan download-link "<a [^>]*download" --include=*.html apps
+
+scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
+
+scan removed-flags "spawn-thread[^|]*--parent|run_coding_agent\([^)]*repo[[:space:]]*=" $all
+
+scan cred-env "CRED_[A-Z0-9_]+" --exclude-dir=auth $all
+
+scan auth-header "Authorization|X-API-Key" $inc apps
+
+scan machine-path "/(Users|home)/[^\"'[:space:]]+" $all
+
+printf '\n=== RECEIPTS: copy this table into the report ===\n'
+printf '| section | hits |\n|---|---|\n'
+printf '%b' "$receipts"
+```
+
+**A hit is evidence, not a finding.** The check that owns each pattern says what
+the hit means, how bad it is, and what to recommend. Several are legitimate in
+context: `apiUrl` building a `src` is correct, and a `try` around a storage call
+changes the severity rather than clearing it. Judge every hit against its check
+below, and report the ones that stand.
+
+**The receipts table goes in the report, verbatim.** It is where a reader sees
+that a category was examined rather than assumed. A `0` is a result and says the
+category is clean. A section MISSING from the table is a category nobody looked
+at, and the report says so rather than dropping the row: a reader counts an
+absent row as clean, which is how a broken app survived two passes in one
+morning.
 
 ## What to check
 
@@ -91,11 +206,21 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 - **Notification routing: `tap` opt-ins for CTA-shaped triggers.** Take each trigger whose `run.intent` mentions `send_notification`, plus each `NotificationCreated` event traceable to a trigger. Read the body it produces and look that shape up in the table under `system-knowhow/triggers.md` § "Notification routing". Report each trigger whose `app_id`, `tap` or `event_id` disagrees with its row, quoting the row as the fix. Severity: **drift**, since the default works and the opt-in only tightens UX. Skip a trigger that already sets `tap` to a non-default value.
 
-- **Old-form `tap` strings.** The field used to be a four-string union. It is a discriminated union object now, and the engine hard-rejects the strings with `400 Bad Request` at write time. Grep the forms listed in `system-knowhow/migrate-tap-shape.md` § "Detection patterns" across the paths in its § "Where to walk". That recipe owns both lists, so read them there rather than working from memory.
+- **Old-form `tap` strings.** The field used to be a four-string union. It is a discriminated union object now, and the engine hard-rejects the strings with `400 Bad Request` at write time. Grep every code-bearing surface in § "What to walk". That means trigger scripts, app code (`ui/`, `*.html`, inline `<script>`), shared scripts, and fenced `python` / `bash` / `js` / `ts` blocks in knowhow. Skip `data/artifacts/` and `data/postgres/`, neither of which holds code that calls the API.
 
-  Surface path, line and the matched form, and recommend running that recipe to rewrite them in place. Severity: **broken**, because the next fire 400s. The one exception is the retired `{ kind: 'none' }` object, which the engine coerces to `{ kind: 'modal' }` rather than refusing: **stale**. Canonical `Tap` type: `system-knowhow/js-sdk.md` § `lucidos.notifications`.
+  Match each form in both quote styles. Cover the key-quoted `"tap":` spelling (Python, shell, JSON bodies) and the bare `tap:` spelling (JS, TS):
 
-  Do NOT rewrite during the audit. The audit stays read-only, and the migration recipe is the surface that edits files.
+  - `tap: 'modal'`
+  - `tap: 'none'`
+  - `tap: 'open_app'`
+  - `tap: 'open_thread'`
+  - `{ kind: 'none' }`, the retired object form
+
+  Surface path, line and the matched form. Severity: **broken**, because the next fire 400s. The retired `{ kind: 'none' }` object is the one exception. The engine coerces it to `{ kind: 'modal' }` rather than refusing, so it is **stale**: the code reads as current while still spreading by copy. Canonical `Tap` type: `system-knowhow/js-sdk.md` § `lucidos.notifications`.
+
+  URL-encoded and hash-form taps are **out of scope**. That channel belongs to the engine and the service worker, which are the source of truth for it, and no workspace file owns it.
+
+  Do NOT rewrite during the audit. The audit stays read-only, and § Remediation carries the old-to-new mapping a fix thread needs.
 
 ### 2. Apps — SDK boilerplate and structure
 
@@ -112,7 +237,25 @@ Per `system-knowhow/js-sdk.md`:
 
   A credential header written into app code is the same rule on one more surface. It belongs to check 7, not to this one.
 
-- **Hand-built engine URLs in app JS.** Walk `data/apps/**/*.{js,ts,html}` for an `/api/v1/` path constructed in JavaScript rather than in markup: `fetch('/api/v1/…')`, `new URL('api/v1/…', document.baseURI)`, `new EventSource('/api/v1/events')`, and any `location.pathname`-splicing that rebuilds the workspace address by hand. All of them 404 behind the gateway (an app iframe has no `<base href>`, and a leading `api` is read as a workspace name), and the engine's markup rewriter cannot reach a URL built at runtime. Recommend an SDK method, or `lucidos.apiUrl(suffix)` where none covers the endpoint. Severity: **broken**, and worth flagging even when the app looks fine: the 404 usually lands in a `catch` that logs and falls back, so the symptom is stale data rather than an error. Reference: `system-knowhow/js-sdk.md` § `lucidos.apiUrl`. An `/api/v1/` path in a markup `src` / `href` attribute is correct and must NOT be flagged.
+- **The app calling the engine with its own `fetch`.** Walk `data/apps/**/*.{js,ts,html}` for any engine call JavaScript makes for itself: `fetch('/api/v1/events/query')`, `new URL('api/v1/events/query', document.baseURI)`, `new EventSource('/api/v1/events')`, `fetch(lucidos.apiUrl('/<suffix>'))`, and any `location.pathname`-splicing that rebuilds the workspace address by hand. Inside the host shell none of them reaches the engine: the frame's origin is opaque and CORS refuses it. Severity **broken**. WebKit reports it as `Load failed` and Chromium as a `TypeError`. The failure usually lands in a `catch` that falls back, so the symptom is stale data rather than an error.
+
+  **`lucidos.apiUrl` is in that list deliberately, and the remedy depends on the endpoint.** Where an SDK method covers it, name that method. Where none does, the remedy is `lucidos.request('/<suffix>', init)`, which travels the bridge (ADR 0231). Recommending `apiUrl` for a call is how a working app gets moved onto a pattern that cannot run. Reference: `system-knowhow/js-sdk.md` § `lucidos.request`.
+
+  **A route an app may not reach has no remedy, and saying so is the finding.** The engine classifies every route, and `lucidos.request` refuses the rest with a 403 in both realms. Credentials, thread contents, consent routes and platform control are denied on purpose. Report the app's call, name what it is reaching for, and leave it at that rather than inventing a way around. Reference: `system-knowhow/js-sdk.md` § "Not every endpoint is reachable".
+
+  An `/api/v1/` path in a markup `src` / `href` attribute is correct and must NOT be flagged, and neither is `apiUrl` used to build one. Six are exempt from the gateway's device gate: `sdk.js`, `sdk-prefs.js`, `sdk-iframe.css`, `sdk-iframe-audio.js`, and anything under `fonts/` or `static/`. Every other `/api/v1/` path in a tag, and every file of the app's own, belongs to the subresource bullet below instead.
+
+- **What an isolated app frame can no longer do.** Inside the host shell an app runs at an opaque origin, in its own renderer process. So it cannot freeze the shell, and it cannot read it. The price is that the frame's own `fetch`, `EventSource` and browser storage all fail, and the SDK carries those three over a bridge. Reference: `system-knowhow/js-sdk.md` § Setup, and *app frame* / *app bridge* in `docs/glossary.md`. Walk `data/apps/**/*.{js,ts,html}` for code that goes around it, skipping any vendored `node_modules/` tree:
+
+  - **Browser storage touched directly**: `localStorage`, `sessionStorage`, `document.cookie`, `indexedDB`. Each throws a `SecurityError` in the frame. Report the two shapes apart, because they fail differently:
+    - **broken** where the call sits outside a `try`. The throw stops the rest of the script, so the app renders nothing.
+    - **stale** where a `try` / `catch` wraps it. That is the common shape, written for Safari private mode. It turns the break into an app that runs and silently stops remembering anything.
+  - **A read of the host realm**: `window.parent`, `parent.document`, `window.top`, or the device id lifted out of the shell's storage. All blocked. Severity: **broken**.
+  - **`<a href="<the app's own file>" download>`**, in an app whose `index.html` loads no `/api/v1/sdk.js`. A browser ignores `download` on a cross-origin link, so the click navigates the frame to the file instead. Severity: **broken**.
+  - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only: a user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. The read is untouched. Severity: **broken**, since the call answers 403 and the app's own settings never persist. § Remediation carries the replacement.
+  - **The app's own files, loaded as a separate subresource.** Walk each app's `index.html` for a `src` or `href` that is neither inline nor an exempt `/api/v1/` asset: `app.js`, `style.css`, an image beside them, and any `lucidos.data.url` result used as a `src`. Behind a gateway the frame sends no device credential with a subresource, so each answers **401** and the app renders unstyled or dead. Severity: **broken**. Nothing exists to move the app onto, so report the finding and say to inline the CSS and JS. Point at "Inline your own CSS and JS" advice to app authors in `docs/temporary-measures.md`.
+
+  An app opened in its own browser tab is a top-level document and keeps all of this. Never report one as unaffected on that basis: the same app is reachable both ways, and the frame is the usual one.
 
 Per `system-knowhow/best-practices.md`:
 
@@ -207,6 +350,11 @@ Write to `data/artifacts/audits/YYYY-MM-DD-HHMM/report.md` (user's local time; U
 - N findings across M categories
 - Severity breakdown: <broken>/<stale>/<drift>/<smell>/<nit>
 - Categories with no findings: <list>
+- Targeted run only, in place of the line above: "Scope: <the one check>. Every
+  other category is unexamined."
+
+## Scan receipts
+<the RECEIPTS table the scan printed, verbatim>
 
 ## <Category>
 ### <item> — <severity>
@@ -269,6 +417,55 @@ When you do spawn fix work:
 - **A child reporting back means its session ended, not that the fix is live.** Coding-agent work lands as a pending change the user applies. Report it as "proposed", never as "applied" or "live".
 - **Fold the outcomes into the same report.** When the children have reported back, append a `## Remediation` section to the run's existing `report.md` (same timestamped directory) listing target, spawned thread link, and outcome per fix. Don't start a new report — a fresh sweep gets a fresh directory, a remediation pass does not.
 
+### Rewriting an app for an isolated frame
+
+The storage findings need a decision rather than a rewrite. Hand a fix thread
+this table and the two rules under it:
+
+| Old | New |
+|---|---|
+| `localStorage.getItem('k')` holding app state | `await lucidos.data.read('artifacts/<app-id>/state.json')`, then parse |
+| `localStorage.setItem('k', v)` | `await lucidos.data.write('artifacts/<app-id>/state.json', JSON.stringify(state))` |
+| `localStorage.getItem('lucidos-device-id')` | delete it. The host stamps the device on every bridged call, and the frame is not meant to know which one |
+| an engine call the app's own `fetch` makes | the `lucidos.*` method that covers it, else `lucidos.request('/<suffix>', init)` |
+| `lucidos.request('/env-vars', { method: 'POST' })` storing the app's own setting | `lucidos.preferences` for a user-facing one, else `lucidos.data.write('artifacts/<app-id>/settings.json', …)`. The read stays, so a genuine read of the workspace's variables is left alone |
+| a call to a route the engine keeps from apps | nothing. Report it and name what it reaches for |
+| `<a href="report.pdf" download>` on the app's own file | load `/api/v1/sdk.js`, which rewrites the click, or build a `blob:` URL |
+
+- **The read becomes asynchronous.** A synchronous `localStorage.getItem` at
+  module top level becomes an `await`, so the first paint has to tolerate not
+  knowing the value yet. Rewriting the call and leaving the render is how an app
+  ends up reading `undefined`.
+- **The value becomes workspace-wide.** `lucidos.data` is one store for every
+  device, and there is no per-device app store. Some values are genuinely
+  per-device: a sound toggle, a display currency. Say so in the report and let
+  the user decide, rather than quietly making one shared.
+- **Some findings have no fix yet, and saying so is the deliverable.** There is
+  no `lucidos.storage`. Where a storage finding lands, leave the code alone and
+  record it against `app-frame-escape-hatches` in `docs/temporary-measures.md`.
+  A remedy written ahead of that decision moves a broken app onto a second
+  broken pattern. The endpoint half of that entry is closed: `lucidos.request`
+  covers an uncovered route, and a route the engine denies has no remedy by
+  design.
+
+### Rewriting an old-form `tap`
+
+A fix thread needs the mapping, not just the finding, so hand it this table:
+
+| Old | New |
+|---|---|
+| `tap: 'modal'` | `tap: { kind: 'modal' }` |
+| `tap: 'none'` | `tap: { kind: 'modal' }`, since the passive kind was retired and every notification is openable |
+| `tap: 'open_app'`, with a sibling `app_id: 'X'` | `tap: { kind: 'navigate', to: { target: 'app', app_id: 'X' } }` |
+| `tap: 'open_thread'`, with a sibling `thread_id: 'T'` and optional `event_id: 'E'` | `tap: { kind: 'navigate', to: { target: 'thread', id: 'T', event_id: 'E' } }` |
+| `{ kind: 'none' }` | `{ kind: 'modal' }` |
+
+Three rules the rewrite has to follow:
+
+- **Build the new sub-fields from the call's own sibling fields, and keep those siblings.** They are notification-level context. The §4 in-app matrix and the inbox modal both read them, even when the tap navigates elsewhere.
+- **Reuse the expression when a sibling is computed.** Hoist a `resolve_app()` call into a local, then pass that local to both `app_id` and `to.app_id`. Calling it twice risks two different answers.
+- **Flag a missing sibling, never guess one.** The old form let the engine fill the id in at write time, and the new one does not. A navigate with no thread id now raises the error toast `Navigation target missing thread id` on tap, where the old form silently did nothing. Leave a `MIGRATION REVIEW` comment naming the two ways out: supply `to.id`, or fall back to `{ kind: 'modal' }`. List every such site in the report's `## Remediation` section so the user can audit them.
+
 ## Out of scope
 
 - **No edits or deletes during the sweep.** Suggested fixes only; see § Remediation for the ask-first fix path.
@@ -284,5 +481,18 @@ Each run gets its own timestamped directory. Don't overwrite previous reports �
 ## Maintenance
 
 When a referenced source-of-truth file changes (new SDK call, new convention, deprecation), this audit's checks may go stale. The reverse is also true: a check here that references a section heading or filename will break silently if the upstream renames it. See the `Maintaining workspace-audit` section in the repo's `.claude/rules/system-knowhow.md` for the rule that governs when this file must be updated alongside changes to its sources. `./scripts/check-knowhow-refs.sh` catches the mechanical half of that in `/harden`.
+
+The old-form `tap` check owns its detection patterns outright, rather than citing another file. So a change to the `Tap` type has to update them here, and the § Remediation mapping with them, in the same commit. The rule file above carries that as a row.
+
+**§ The mechanical scan is where a pattern RUNS, and a check is where it means
+something.** Some checks also name their form in words, because the report and
+the remediation need it: the five `tap` strings, the two removed CLI flags.
+Those are the same forms the block greps. Change one and change both, in the
+same edit. A new check with a grep-able pattern needs a section in the block, or
+it is a check a pass can skip without noticing.
+
+The isolated-frame check owns its patterns the same way. A change to the app
+frame's sandbox, or to what the app bridge carries, has to reach this file: what
+an app can no longer do for itself is the whole of that check.
 
 When a deprecated CLI flag or tool arg is fully removed, add it to check 7's "Removed CLI flags and tool args" list. Include its replacement and any live same-named flag to exclude. The source is `docs/temporary-measures.md` § sunset deprecations.

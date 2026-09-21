@@ -941,6 +941,10 @@ mod tests {
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5"),
             Some(1_000_000)
         );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5-1"),
+            Some(1_000_000)
+        );
     }
 
     /// The picker pins a version on two rows and the agent echoes the model
@@ -967,6 +971,10 @@ mod tests {
         );
         assert_eq!(
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5[1m]"),
+            None
+        );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5-1[1m]"),
             None
         );
     }

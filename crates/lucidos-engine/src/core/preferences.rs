@@ -10,19 +10,42 @@ use crate::engine::thread_events::MessageOrigin;
 // per `ContextPurpose` in `engine::aux_purpose`.
 pub const PREF_MODEL_TITLE: &str = "model_title";
 pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
-/// Model for fact extraction and query classification.
+/// Model for fact extraction.
 ///
-/// It used to cover history summarisation too, which is now
-/// [`PREF_MODEL_CONVERSATION_SUMMARY`]. That key falls back to this one when
-/// unset, so a workspace that pinned a model here keeps summarising on it.
+/// It used to cover history summarisation and query classification too. Both
+/// have their own key now, [`PREF_MODEL_CONVERSATION_SUMMARY`] and
+/// [`PREF_MODEL_QUERY_CLASSIFICATION`], and both fall back to this one while
+/// unset. So a workspace that pinned a model here keeps running all three on it.
 pub const PREF_MODEL_MEMORY: &str = "model_memory";
 /// Model the *conversation summary* is written by, split out of
 /// [`PREF_MODEL_MEMORY`] so the summariser can be named, found and tuned.
 pub const PREF_MODEL_CONVERSATION_SUMMARY: &str = "model_conversation_summary";
+/// Model *query classification* runs on, split out of [`PREF_MODEL_MEMORY`] for
+/// the reason the summariser was: a call the user can choose a backend for needs
+/// a row of its own to choose it in.
+pub const PREF_MODEL_QUERY_CLASSIFICATION: &str = "model_query_classification";
 /// Model the *command guard*'s LLM *judge* uses to classify the ambiguous
 /// middle (ADR 0002, Phase 3). Configurable so a workspace can trade
 /// accuracy/cost; defaults to [`DEFAULT_COMMAND_JUDGE_MODEL`] when unset.
 pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
+
+/// Which backend answers the *command guard*'s classification: `chat` or `jev`.
+///
+/// `chat` is the default and the unset value, and it runs
+/// [`PREF_MODEL_COMMAND_JUDGE`] on the rubric prompt exactly as it always has.
+/// `jev` sends two typed Choice questions to TypeSafe instead, and applies the
+/// safe/danger tie-break in Rust. Read by `llm::judgment::select`, which turns
+/// any other value, and any read failure, into `chat`.
+pub const PREF_JUDGMENT_COMMAND_GUARD: &str = "judgment_command_guard";
+
+/// Which backend answers *query classification*: `chat` or `jev`.
+///
+/// The sibling of [`PREF_JUDGMENT_COMMAND_GUARD`], with the same two values and
+/// the same default. Separate keys because a safety gate and memory retrieval
+/// deserve separate decisions. `chat` runs
+/// [`PREF_MODEL_QUERY_CLASSIFICATION`].
+pub const PREF_JUDGMENT_QUERY_CLASSIFICATION: &str = "judgment_query_classification";
+
 /// The rented *talker* a *voice session* speaks through (ADR 0149).
 ///
 /// A bare model id, and deliberately NOT a chat-model registry row: the
@@ -55,6 +78,10 @@ pub const PREF_REASONING_TITLE: &str = "reasoning_title";
 pub const PREF_REASONING_IMAGE_DESCRIPTION: &str = "reasoning_image_description";
 pub const PREF_REASONING_MEMORY: &str = "reasoning_memory";
 pub const PREF_REASONING_CONVERSATION_SUMMARY: &str = "reasoning_conversation_summary";
+/// Effort *query classification* runs at, the other half of
+/// [`PREF_MODEL_QUERY_CLASSIFICATION`]. It answers three yes/no questions, so
+/// its default spends nothing, exactly as [`PREF_REASONING_MEMORY`] does.
+pub const PREF_REASONING_QUERY_CLASSIFICATION: &str = "reasoning_query_classification";
 /// Effort the command-guard judge runs at. Internal like its model sibling: the
 /// agent must not tune its own safety gate.
 pub const PREF_REASONING_COMMAND_JUDGE: &str = "reasoning_command_judge";
@@ -73,6 +100,17 @@ pub const DEFAULT_COMMAND_JUDGE_REASONING: &str = "none";
 // Chat preference keys (also written by frontend Settings UI)
 pub const PREF_CHAT_MODEL: &str = "chat_model";
 pub const PREF_CHAT_REASONING_EFFORT: &str = "chat_reasoning_effort";
+
+/// Which *response style* chat and trigger answers come back in: the id of a
+/// row in the *style library*. Unset means `standard`, which adds nothing.
+pub const PREF_RESPONSE_STYLE: &str = "response_style";
+
+/// The *style library* itself, as one JSON array of `{id, label, instruction}`.
+///
+/// Holds only what the user changed. The shipped styles live in
+/// `core::response_style`, and an entry here whose id matches one overrides it.
+/// Deleting that entry restores the shipped text.
+pub const PREF_RESPONSE_STYLES: &str = "response_styles";
 
 // Coding-agent binary path overrides (also written by frontend Settings UI).
 // Unset = auto-detect (probe list → PATH); a set path wins outright and a
@@ -129,6 +167,16 @@ pub const PREF_PROVIDER_ENABLED_OPENAI: &str = "provider_enabled_openai";
 pub const PREF_PROVIDER_ENABLED_OPENROUTER: &str = "provider_enabled_openrouter";
 pub const PREF_PROVIDER_ENABLED_XAI: &str = "provider_enabled_xai";
 pub const PREF_PROVIDER_ENABLED_LOCAL: &str = "provider_enabled_local";
+
+/// The master switch over TypeSafe's Jev, in the same family and with the same
+/// absent-means-enabled rule as the six above.
+///
+/// Deliberately NOT one of them. Jev holds no conversation, so it has no
+/// `ProviderKind` and never reaches `llm::provider_build` (ADR 0220). It is
+/// read per call by `llm::judgment::select::jev_for`, which returns `None`
+/// while the switch is off, so both classification sites run their chat path.
+/// Off leaves the `typesafe` credential alone.
+pub const PREF_PROVIDER_ENABLED_TYPESAFE: &str = "provider_enabled_typesafe";
 
 // Image generation model (also written by frontend Settings UI)
 pub const PREF_IMAGE_MODEL: &str = "image_model";

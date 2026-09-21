@@ -20,7 +20,12 @@ vi.mock('../../api/threads', () => ({ fetchEventLocation }));
 
 const ensureThreadByIdInMap = vi.hoisted(() => vi.fn(async () => true));
 const loadThreadEvents = vi.hoisted(() => vi.fn(async () => {}));
-vi.mock('./thread-loading', () => ({ ensureThreadByIdInMap, loadThreadEvents }));
+const ensureWholeThreadLoaded = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock('./thread-loading', () => ({
+  ensureThreadByIdInMap,
+  ensureWholeThreadLoaded,
+  loadThreadEvents,
+}));
 
 const focusThread = vi.hoisted(() => vi.fn());
 vi.mock('./threads', () => ({ focusThread }));
@@ -68,6 +73,7 @@ function resetAll(): void {
   fetchEventLocation.mockReset();
   ensureThreadByIdInMap.mockReset().mockResolvedValue(true);
   loadThreadEvents.mockReset().mockResolvedValue(undefined);
+  ensureWholeThreadLoaded.mockReset().mockResolvedValue(undefined);
   focusThread.mockReset();
   _resetEventTargetCacheForTesting();
 }
@@ -88,6 +94,41 @@ describe('showEventWhereItLives', () => {
     // aim at the turn that contains it or it would never resolve.
     expect(focusThread).toHaveBeenCalledWith('other', { targetEventId: 'starter-1' });
     expect(toastMessages()).toEqual([]);
+  });
+
+  it('loads the rest of a paged thread when the target is behind its page', async () => {
+    // A long thread opens on its newest page, so an older target sits in no
+    // exchange and yields no anchor. `CodingAgentIdled` draws no element of its
+    // own, so falling through with the raw id would time out on a node that
+    // cannot exist.
+    fetchEventLocation.mockResolvedValue({ thread_id: 'other' });
+    const paged = threadWith('starter-1', []);
+    paged.hasOlderEvents = true;
+    threadMap.value = new Map([['other', paged]]);
+    // The whole-history load is what puts the turn in the map.
+    ensureWholeThreadLoaded.mockImplementation(async () => {
+      threadMap.value = new Map([
+        ['other', threadWith('starter-1', [['CodingAgentIdled', 'idle-1']])],
+      ]);
+    });
+
+    await showEventWhereItLives('idle-1');
+
+    expect(ensureWholeThreadLoaded).toHaveBeenCalledWith('other');
+    expect(focusThread).toHaveBeenCalledWith('other', { targetEventId: 'starter-1' });
+    expect(toastMessages()).toEqual([]);
+  });
+
+  it('does NOT load the whole history when the first page already answers', async () => {
+    // The common jump is to a recent event, and it must still cost one page.
+    fetchEventLocation.mockResolvedValue({ thread_id: 'other' });
+    threadMap.value = new Map([
+      ['other', threadWith('starter-1', [['CodingAgentIdled', 'idle-1']])],
+    ]);
+
+    await showEventWhereItLives('idle-1');
+
+    expect(ensureWholeThreadLoaded).not.toHaveBeenCalled();
   });
 
   /** A wait can match an event in its own thread. On an iOS PWA over Tailscale a

@@ -11,21 +11,32 @@ the silhouette, not the full filled app-icon square.
 Run from crates/lucidos-app/:  python3 icons/gen-tray-template.py
 Requires Pillow (PIL).
 """
+import math
+
 from PIL import Image, ImageDraw
 
 SS = 16          # supersample factor for crisp anti-aliasing
-S = 36           # final px (== 18pt @2x, the canonical menu-bar template size)
-FILL = 0.94      # fraction of the canvas the glyph spans. The template is just the
-                 # tiles + sparkle (no blue background frame), so the glyph fills
-                 # nearly the whole canvas — only a thin safe margin so the sparkle
-                 # tip and tile corners don't butt against neighbouring bar items.
+S = 36           # canvas HEIGHT in px (== 18pt @2x, the canonical template size)
+FILL = 0.94      # fraction of that height the glyph spans. The template carries
+                 # only the tiles and the sparkle, with no blue background frame.
+                 # So the glyph nearly fills the canvas. What is left is a thin
+                 # margin above and below, clearing the menu bar's own edges.
 
 # Glyph geometry copied verbatim from public/icons/icon-source.svg (the logo <g>,
 # pre-translate/scale, background <rect> dropped). Content bbox: x[17,87] y[12,83].
 minx, miny, maxx, maxy = 17, 12, 87, 83
 cw, ch = maxx - minx, maxy - miny
-scale = FILL * S / max(cw, ch)
-ox = (S - cw * scale) / 2
+# The height alone sets the size. macOS scales a status-item image to 18pt
+# tall, then takes its width from the canvas aspect ratio. So a canvas wider
+# than the glyph is padding the bar still measures.
+scale = FILL * S / ch
+# AppKit lays the unread count out from the image's right edge, and adds a
+# fixed 2pt gap of its own past it. A transparent column here is more daylight
+# on top of that, so the canvas is exactly as wide as the glyph. Rounding up to
+# a whole pixel leaves a sliver, and it goes on the LEFT, where the bar's own
+# padding of about 10pt swallows it.
+W = math.ceil(cw * scale)
+ox = W - cw * scale
 oy = (S - ch * scale) / 2
 
 
@@ -37,7 +48,7 @@ def my(y):
     return (oy + (y - miny) * scale) * SS
 
 
-img = Image.new("RGBA", (S * SS, S * SS), (0, 0, 0, 0))
+img = Image.new("RGBA", (W * SS, S * SS), (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
 BLACK = (0, 0, 0, 255)
 
@@ -74,6 +85,6 @@ for s in segs:
     poly.extend(bez(*s))
 d.polygon(poly, fill=BLACK)
 
-img = img.resize((S, S), Image.LANCZOS)
+img = img.resize((W, S), Image.LANCZOS)
 img.save("icons/tray-template.png")
 print("wrote icons/tray-template.png", img.size)

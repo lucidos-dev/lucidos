@@ -36,12 +36,16 @@ describe('a call leaves the composer alone', () => {
     expect(read('PromptInput.tsx')).not.toContain('voiceCall');
   });
 
-  /** The row mounts the toggle and tells it whether this destination can take
+  /** The row asks for the toggle and tells it whether this destination can take
    *  a call (ADR 0165). What it must never read is the call's own STATE: that
-   *  is what would let a live call reach back into the composer. */
+   *  is what would let a live call reach back into the composer.
+   *
+   *  The factory lives in `CallToggle.tsx` for exactly that reason. Whether the
+   *  control exists at all reads the call, so the question is asked where the
+   *  answer already lives. */
   it('gives the controls row the toggle and nothing else about a call', () => {
     const source = read('PromptRowControls.tsx');
-    expect(source).toContain('<CallToggle available=');
+    expect(source).toContain('callToggleAction(codingAgent === null)');
     expect(source).not.toContain('voiceCall');
   });
 

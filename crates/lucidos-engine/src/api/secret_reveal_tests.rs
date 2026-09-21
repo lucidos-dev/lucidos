@@ -21,9 +21,11 @@ const BOTH_RULES: [(&str, RefererRule); 2] = [
 /// Regression: an app iframe cannot read a credential, and cannot read the
 /// backup key either.
 ///
-/// Both routes returned their secret to any caller. Apps are same-origin, so
-/// `Sec-Fetch-Site` reads `same-origin` for them exactly as for the Settings
-/// page, and the `Referer` path is the only thing that differs.
+/// Both routes returned their secret to any caller. The `Referer` path is the
+/// only thing that differs: a standalone app tab is same-origin, so
+/// `Sec-Fetch-Site` reads `same-origin` for it exactly as for the Settings
+/// page. The fixtures below are that tab, which is the case still worth pinning
+/// now an app frame is isolated.
 #[test]
 fn an_app_document_is_refused_under_either_rule() {
     for (label, rule) in BOTH_RULES {

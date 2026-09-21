@@ -2,6 +2,16 @@ import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy, ensureMobileView } from './helpers';
 import { createIframeAppFixture, createAppCCThreadWithChange, cleanupCCThread, git } from './db-helpers';
 
+/** Where the app frame currently is, asked of the driver.
+ *
+ *  An app frame is isolated (ADR 0227), so `contentWindow.location` throws for
+ *  the page. Playwright tracks a frame's URL from the protocol and answers
+ *  whatever its origin. It also reports where the frame actually IS, which the
+ *  `src` attribute stops doing the moment `location.replace` is used. */
+function appFrameUrl(page: import('@playwright/test').Page): string {
+  return page.frames().map((f) => f.url()).find((u) => u.includes('/app/')) ?? '';
+}
+
 test.describe('App coding-agent thread — WIP app preview toggle', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -62,26 +72,19 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
       const toggle = page.locator('[data-role="wip-preview-toggle"]:visible').first();
       await expect(toggle).toBeVisible({ timeout: 10_000 });
 
-      // Click → iframe contentWindow navigates to `?thread_id=<id>`.
-      // `navigateAppIframe` uses `contentWindow.location.replace` to avoid
-      // session-history pollution (WebKit #9166), which does NOT update the
-      // iframe's `src` attribute — so we read `contentWindow.location.href`.
-      // The fixture and the WIP URL are same-origin (engine serves both),
-      // so cross-origin access doesn't throw.
+      // Click → the frame navigates to `?thread_id=<id>`. The navigation is a
+      // `location.replace`, to avoid session-history pollution (WebKit #9166),
+      // so the iframe's `src` attribute never changes and cannot be read for
+      // the answer. `appFrameUrl` asks the driver, which an isolated frame
+      // does not refuse the way `contentWindow.location` does.
       await toggle.click();
-      await page.waitForFunction((tid) => {
-        const fr = document.querySelector('iframe[data-role="app-ui-frame"]') as HTMLIFrameElement | null;
-        const href = fr?.contentWindow?.location?.href ?? fr?.src ?? '';
-        return href.includes(`thread_id=${tid}`);
-      }, seeded.threadId, { timeout: 5_000 });
+      await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
+        .toContain(`thread_id=${seeded.threadId}`);
 
       // Click again → reverts to live.
       await toggle.click();
-      await page.waitForFunction(() => {
-        const fr = document.querySelector('iframe[data-role="app-ui-frame"]') as HTMLIFrameElement | null;
-        const href = fr?.contentWindow?.location?.href ?? fr?.src ?? '';
-        return href.length > 0 && !href.includes('thread_id=');
-      }, undefined, { timeout: 5_000 });
+      await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
+        .not.toContain('thread_id=');
     } finally {
       cleanupCCThread(seeded.threadId, seeded.changeId, seeded.branch, seeded.file);
       fixture.cleanup();
@@ -132,11 +135,8 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
       // Click → opens the app in the panel-overlay AND points its iframe at the
       // worktree-served WIP URL (`?thread_id=<id>`).
       await toggle.click();
-      await page.waitForFunction((tid) => {
-        const fr = document.querySelector('iframe[data-role="app-ui-frame"]') as HTMLIFrameElement | null;
-        const href = fr?.contentWindow?.location?.href ?? fr?.src ?? '';
-        return href.includes(`thread_id=${tid}`);
-      }, seeded.threadId, { timeout: 10_000 });
+      await expect.poll(() => appFrameUrl(page), { timeout: 10_000 })
+        .toContain(`thread_id=${seeded.threadId}`);
 
       // Turning WIP on opened the app, which on mobile swipes to the content
       // pane (openApp → revealContentPane) — that leaves the toggle, which lives
@@ -147,11 +147,8 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
 
       // Click again → reverts to live (app stays open, no thread_id).
       await toggle.click();
-      await page.waitForFunction(() => {
-        const fr = document.querySelector('iframe[data-role="app-ui-frame"]') as HTMLIFrameElement | null;
-        const href = fr?.contentWindow?.location?.href ?? fr?.src ?? '';
-        return href.length > 0 && !href.includes('thread_id=');
-      }, undefined, { timeout: 5_000 });
+      await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
+        .not.toContain('thread_id=');
     } finally {
       cleanupCCThread(seeded.threadId, seeded.changeId, seeded.branch, seeded.file);
       fixture.cleanup();

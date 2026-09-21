@@ -148,11 +148,16 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(answered.locator('.question-option-dimmed')).toHaveCount(1);
       // Nothing left to answer, so the prompt stops inviting one.
       await expect(promptInput).toHaveAttribute('placeholder', 'Post a follow up…');
-      // The extra height has to be given back too: it is written as inline px
-      // and a placeholder swap never touches the value resizeTextarea keys off,
-      // so without the re-measure the composer sits two lines tall with nothing
-      // left to answer. Compare the CONTENT box (clientHeight carries the
-      // padding) so the same assertion holds on desktop and phone alike.
+      // The extra height has to be given back too. resizeTextarea writes it as
+      // inline px, and a placeholder swap never touches the value it keys off.
+      // So without the re-measure the composer keeps the box the answering
+      // placeholder needed, after that placeholder is gone.
+      //
+      // Resting is a line plus the box's own padding: the composer declares no
+      // floor of its own and takes the shell's (panels/previews.css). So the
+      // bound is two lines, one line of tolerance over resting. Compare the
+      // CONTENT box (clientHeight carries the padding) so the same assertion
+      // holds on desktop and phone alike.
       await expect.poll(
         () => promptInput.evaluate((el) => {
           const ta = el as HTMLTextAreaElement;

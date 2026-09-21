@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/ho
 import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, awaitedThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
-import { loadThreadEvents, forceRetryThreadEvents, threadLoadInFlightMs } from '../../store/actions/thread-loading';
+import { loadThreadEvents, loadOlderThreadEvents, ensureWholeThreadLoaded, forceRetryThreadEvents, threadHistoryReadInFlight, threadLoadInFlightMs } from '../../store/actions/thread-loading';
 import { checkConnection } from '../../store/actions/connection';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { replaceDocument } from '../../utils/documentNavigation';
@@ -13,10 +13,10 @@ import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
-import { computeExchanges, exchangeResponseEvents, hasContentEvents } from '../../store/thread-events';
+import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, type Exchange } from '../../store/thread-events';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, deepLinkRenderAll } from './scrollState';
-import { MAX_FILL_EXPANSIONS, WHOLE_THREAD, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachIndex, exchangeRenderCost, expandWindowEdge, seedWindowEdge, windowNeedsFill, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type WindowEdge } from './threadWindow';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, markAnchorScroll, deepLinkRenderAll } from './scrollState';
+import { MAX_FILL_BACKFILLS, MAX_FILL_EXPANSIONS, WHOLE_THREAD, anythingAbove, atScrollTop, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachIndex, exchangeRenderCost, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, transcriptScrolls, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type WindowEdge } from './threadWindow';
 import { useScrollMemory, threadScrollKey, readSavedScroll } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
@@ -48,6 +48,10 @@ let lastRevealedThread: string | null = null;
 // switch-away-and-back (see the windowing block in ThreadView). `WHOLE_THREAD`
 // is what a deep-link sets. Session-scoped; two small ints per visited thread.
 //
+// A PARTIAL edge survives that switch. A render-all does not: it is a claim
+// one visit's navigation made, and a fresh open drops it back to the seed.
+// See `reseedOnReopen`.
+//
 // The edge, not the trailing count, in both dimensions. A turn or a row already
 // on screen must not leave the DOM when a newer one is appended.
 // `renderCountFromFloor` carries the rest.
@@ -58,6 +62,18 @@ const renderFloorByThread = new Map<string, WindowEdge>();
  *  per-mount counter would hand every revisit a fresh `MAX_FILL_EXPANSIONS` and
  *  compound the cost the cap exists to bound. */
 const fillRoundsByThread = new Map<string, number>();
+
+/** Pages the FILL has fetched per thread, held module-scoped for the same
+ *  reason. A scroll-driven backfill is the reader asking and is never counted
+ *  here: this bounds only what the fill asks for on its own. */
+const fillBackfillsByThread = new Map<string, number>();
+
+
+/** The thread this session last opened, so a re-open can be told from a later
+ *  commit of the same visit. Module-scoped for the same reason the maps above
+ *  are: it has to survive a remount, which a layout swap at the mobile
+ *  breakpoint performs mid-read. See `reseedOnReopen`. */
+let lastSeededVisit: string | null = null;
 
 /** Scroll metrics captured just before a window grow, so the anchor effect can
  *  restore `scrollTop` by the height added. */
@@ -79,10 +95,14 @@ function currentEdge(
  *  the scroll-up expansion, the fill and the anchor walk.
  *
  *  Prepending older rows grows the list upward, so it captures the metrics the
- *  anchor effect needs. That effect is keyed on the edge, which is why the
- *  anchor is armed only when the window ACTUALLY grows. A no-op grow would
- *  leave the ref set, and the re-entrancy guard every caller shares would then
- *  wedge each later expansion. Reports whether it grew. */
+ *  anchor effect needs, and arms only when the window ACTUALLY grows. Reports
+ *  whether it grew.
+ *
+ *  The capture is not always this one's to keep. The backfill re-point
+ *  overwrites it with the reading the REQUEST took, that being the last one
+ *  from the frame the reader was in. Safe because the anchor effect rides
+ *  `winTick`: every arming bumps it, so a capture is consumed whatever the
+ *  resulting edge string is. */
 function growRenderWindow(
     el: HTMLElement,
     threadId: string,
@@ -97,6 +117,112 @@ function growRenderWindow(
     pending.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
     renderFloorByThread.set(threadId, next);
     bump();
+    return true;
+}
+
+/** A backfill in flight, and what the reader was looking at when it started.
+ *
+ *  `anchorKey` is the `exchangeKey` of the exchange the window rested on. The
+ *  edge is an INDEX. A page of older history grows the array at the front, so
+ *  that index would afterwards name a different turn. Re-finding the anchor is
+ *  what holds the reader still.
+ *
+ *  Identity rather than a count of what arrived. The fold can merge a page's
+ *  last turn into the first one held. So the array does not grow by the number
+ *  of exchanges the page carried. */
+type PendingBackfill = {
+    /** Null when the window rests on no turn at all, which a page folding to
+     *  nothing renderable produces. There is no reader's place to hold, so the
+     *  re-point has nothing to do and the page is pure gain. */
+    anchorKey: string | null;
+    /** The turn BELOW the anchor, as a second chance at re-pointing.
+     *
+     *  A page boundary rarely lands on a turn start, so the oldest loaded turn
+     *  is usually a fragment whose opening message is still unfetched. When the
+     *  page behind it arrives, the fold merges that fragment into the real turn
+     *  and the anchor's key stops existing.
+     *
+     *  This one is a whole turn well inside the loaded set, so no merge at the
+     *  boundary can absorb it. The content the anchor held now sits in the
+     *  exchange just before it. */
+    nextKey: string | null;
+    rowsHidden: number;
+    prevScrollHeight: number;
+    prevScrollTop: number;
+} | null;
+
+/** Backfills in flight, per thread, for the same reason the window Map is
+ *  module-scoped: a switch away and back must not start a second one. */
+const pendingBackfillByThread = new Map<string, PendingBackfill>();
+
+/** Where the window should sit once a page of older history has folded in.
+ *
+ *  The anchor turn first, which is the reader's own place. Failing that, the
+ *  turn below it, because the boundary turn is usually a fragment the fold
+ *  absorbs when its opening message finally arrives. The absorbed content then
+ *  lives in the exchange just before that one, so that is where the window
+ *  goes.
+ *
+ *  `rowsHidden` travels only with the anchor itself. In the fallback it counts
+ *  rows of a turn that is gone, and showing a whole turn hides nothing the
+ *  reader had.
+ *
+ *  Null when neither survives, which leaves the caller nothing to re-point
+ *  against. Exported for its own unit test, since both arms turn on how the
+ *  fold merges. */
+export function anchorAfterBackfill(
+    exchanges: readonly Exchange[],
+    pend: { anchorKey: string | null; nextKey: string | null; rowsHidden: number },
+): WindowEdge | null {
+    // A null key matches nothing, `exchangeKey` always returning a string.
+    const found = exchanges.findIndex(e => exchangeKey(e) === pend.anchorKey);
+    if (found >= 0) return { exchange: found, rowsHidden: pend.rowsHidden };
+    if (!pend.nextKey) return null;
+    const below = exchanges.findIndex(e => exchangeKey(e) === pend.nextKey);
+    if (below < 0) return null;
+    return { exchange: Math.max(0, below - 1), rowsHidden: 0 };
+}
+
+/** Ask for the page of history behind the window, holding the reader's place.
+ *
+ *  A no-op on two counts: one is already in flight, or the store has nothing
+ *  older. The store refuses a second fetch itself, so this guard is about the
+ *  ANCHOR. A second capture would overwrite the first reader's position.
+ *
+ *  An empty transcript still asks. It has no anchor and needs none, there being
+ *  no reading position to hold. Refusing there left a page that folded to
+ *  nothing with no way to fetch the one behind it.
+ *
+ *  Reports whether it took the capture, which is the fill's signal that a
+ *  request is really going out. The fill has already ruled out the store's own
+ *  refusal by then, asking `threadHistoryReadInFlight` first. */
+function requestBackfill(
+    el: HTMLElement,
+    threadId: string,
+    exchanges: readonly Exchange[],
+    edge: WindowEdge,
+    onArrived: () => void,
+): boolean {
+    if (pendingBackfillByThread.get(threadId)) return false;
+    const anchor = exchanges[edge.exchange];
+    const next = exchanges[edge.exchange + 1];
+    pendingBackfillByThread.set(threadId, {
+        anchorKey: anchor ? exchangeKey(anchor) : null,
+        nextKey: next ? exchangeKey(next) : null,
+        rowsHidden: edge.rowsHidden,
+        prevScrollHeight: el.scrollHeight,
+        prevScrollTop: el.scrollTop,
+    });
+    void loadOlderThreadEvents(threadId).then((added: boolean) => {
+        // Nothing arrived, so nothing moved and the capture is spent. Clearing
+        // it here is what lets the next scroll ask again.
+        if (!added) { pendingBackfillByThread.delete(threadId); return; }
+        // THIS is what tells the re-point its page has landed. An `exchanges`
+        // change alone would not: a live turn on an active thread changes it
+        // too. Consuming the capture there spends it on an update the reader
+        // never asked for, and leaves nothing for the page that follows.
+        onArrived();
+    });
     return true;
 }
 
@@ -352,6 +478,10 @@ export function ThreadView() {
     const eventThread = threadId ? threadMap.value.get(threadId) : undefined;
     const eventsLoaded = eventThread?.eventsLoaded ?? false;
     const eventsLoadFailed = eventThread?.eventsLoadFailed ?? false;
+    // Does the SERVER hold turns above what this client has? The window's own
+    // edge answers a narrower question. Reading it for this one is what stuck a
+    // reported thread with no scroll and no chevron.
+    const hasOlderEvents = eventThread?.hasOlderEvents === true;
 
     const animating = promptAnimating.value;
     // Fallback: if loadThreadEvents failed (e.g. iOS Safari PWA resume),
@@ -423,7 +553,7 @@ export function ThreadView() {
     }, [exchanges]);
 
     // Perf instrumentation: record the open→paint span ONCE per thread open. The
-    // open-start was stamped when this thread's real event load began
+    // open-start was stamped when this thread was focused
     // (loadThreadEvents → utils/threadOpenMarks). Fire on the FIRST content
     // render — when exchanges first appear — and take() the mark so streaming
     // appends / scroll-window growth don't re-fire it (a later render finds no
@@ -446,6 +576,10 @@ export function ThreadView() {
             const totals = readRenderPhaseTotals();
             recordPerfSample('thread-render', {
                 threadId,
+                // Were this thread's events already in memory? A warm open
+                // fetches nothing, so its whole span is render. Without the
+                // field the two kinds average together and neither is legible.
+                warm: base.warm,
                 eventCount: events,
                 exchangeCount,
                 renderMs: Math.round(performance.now() - base.start),
@@ -499,7 +633,12 @@ export function ThreadView() {
     // instead, so a windowed-out target can render. The persist effect below then
     // keeps it full, so clearing the claim doesn't snap the user back.
     // See threadWindow.ts + scrollState.deepLinkRenderAll.
-    const [, bumpWin] = useState(0);
+    const [winTick, bumpWin] = useState(0);
+    // Bumped only when a page of older history has LANDED, which is what the
+    // re-point effect keys on. An `exchanges` change is not the same event: a
+    // live turn on an active thread produces one too.
+    const [backfillArrived, setBackfillArrived] = useState(0);
+    const bumpBackfill = () => setBackfillArrived(n => n + 1);
     // Re-render after a window write. `bumpWin` is stable, so an effect holding
     // an older copy of this still reaches the current component.
     const bumpWindow = () => bumpWin(n => n + 1);
@@ -537,6 +676,19 @@ export function ThreadView() {
         bumpWin(n => n + 1);
     }, [threadId, deepLinkRenderAll.value]);
 
+    // The window says draw everything, so the history has to BE everything. A
+    // long thread opens on one page, and the linked event is usually older.
+    //
+    // SEPARATE from the effect above, and keyed on `hasOlderEvents`. A cold
+    // open runs that one before the first page has landed, when the thread
+    // still reports nothing older. A single call there would ask for nothing
+    // and never be repeated. This asks again once the load settles the answer,
+    // and is a no-op on a thread already whole.
+    useEffect(() => {
+        if (!threadId || !deepLinkRenderAll.value) return;
+        void ensureWholeThreadLoaded(threadId);
+    }, [threadId, deepLinkRenderAll.value, eventThread?.hasOlderEvents]);
+
     // Fix the window once the event load settles, so later renders read a stored
     // value instead of re-deriving one. The seed is a function of the exchange
     // costs, and a live turn's cost grows with every streamed step. A derived
@@ -553,8 +705,25 @@ export function ThreadView() {
         eventsLoaded,
         eventsLoadFailed,
     });
+    // A VISIT, so the re-seed below fires once per open rather than on every
+    // commit that settles the load.
+    //
+    // MODULE-scoped, not a ref, and that is the fix for two holes a ref had.
+    // `ThreadView` is remounted whole when the layout swaps at the mobile
+    // breakpoint, which a rotation or a window drag does mid-read. And a ref
+    // written only past the `canSeedWindow` guard never records a visit whose
+    // events had not settled when the reader left it.
     useLayoutEffect(() => {
-        if (threadId && canSeedWindow && !renderFloorByThread.has(threadId)) {
+        if (!threadId || !canSeedWindow) return;
+        // Written HERE, past the settle guard, so a commit before the events
+        // land does not spend the visit. The teardown below is what ends one.
+        const firstThisVisit = lastSeededVisit !== threadId;
+        lastSeededVisit = threadId;
+        const stored = renderFloorByThread.get(threadId);
+        // A render-all the LAST visit claimed is not this visit's window. See
+        // `reseedOnReopen`, which carries why a partial edge is kept instead.
+        // `peek`, because a layout effect must not subscribe to the claim.
+        if (!stored || (firstThisVisit && reseedOnReopen(stored, deepLinkRenderAll.peek()))) {
             renderFloorByThread.set(threadId, seedWindowEdge(exchangeCosts, rowCountAt));
         }
     }, [threadId, canSeedWindow]);
@@ -567,6 +736,10 @@ export function ThreadView() {
     // running off a ref must fold THIS render's exchanges, not a captured copy.
     const rowCountAtRef = useRef(rowCountAt);
     rowCountAtRef.current = rowCountAt;
+    // The exchanges themselves, for the same reason again. The backfill names
+    // its anchor turn by identity, which a cost array cannot supply.
+    const exchangesRef = useRef<readonly Exchange[]>(exchanges);
+    exchangesRef.current = exchanges;
     // The window edge as one value an effect can depend on, BOTH dimensions. A
     // round that only uncovers rows leaves `edge.exchange` unmoved, so an effect
     // keyed on that alone would miss the commit it exists to answer.
@@ -971,39 +1144,221 @@ export function ThreadView() {
     useEffect(() => {
         const el = areaRef.current;
         if (!el || !threadId) return;
-        const onScroll = () => {
+        const reachForOlder = () => {
             if (pendingExpandRef.current) return;
-            // Only the READER asking for older turns may grow the window. Our
-            // own positioning fires scroll events too, and opening a thread now
-            // lands at the TOP of the rendered slice, which is inside the
-            // margin by construction: without this the open would grow the
-            // window by a chunk on every visit, markdown-parsing it
-            // synchronously on the open path and compounding across re-opens
-            // (renderFloorByThread is module-scoped), which is exactly the cost
-            // windowing exists to avoid. The up-chevron is covered too, and
-            // wants to be: it renders the full thread itself before gliding, so
-            // an expansion mid-glide would re-anchor the viewport and stall it.
-            if (isNavigationScroll(el)) return;
-            if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
             const costs = exchangeCostsRef.current;
             const rows = rowCountAtRef.current;
             const current = currentEdge(threadId, costs, rows);
-            if (!edgeHasMoreAbove(current)) return;
+            if (!edgeHasMoreAbove(current)) {
+                // The window has reached the oldest turn this client HOLDS,
+                // which on a long thread is not the oldest turn there is. Fetch
+                // the page behind it; the effect below re-points the edge, and
+                // the reader's next scroll grows into what arrived.
+                requestBackfill(el, threadId, exchangesRef.current, current, bumpBackfill);
+                return;
+            }
             growRenderWindow(el, threadId, costs, current, rows, pendingExpandRef, bumpWindow);
         };
+        const onScroll = () => {
+            // A page in flight is held against the reader's LAST known frame,
+            // so keep that reading current. The capture is taken when the
+            // request is made, and both the reader and the app move the
+            // transcript before the page lands: a restore places them on their
+            // turn, and a slow link leaves seconds to scroll. Refreshed HERE
+            // rather than at the landing, where the fold has already moved the
+            // frame the capture describes.
+            //
+            // Ahead of the navigation guard below, deliberately. The app's own
+            // writes are exactly the ones the landing must not undo. The layout
+            // read costs a forced reflow, and it is paid only while a page is
+            // actually in flight.
+            const inFlight = pendingBackfillByThread.get(threadId);
+            if (inFlight) {
+                inFlight.prevScrollTop = el.scrollTop;
+                inFlight.prevScrollHeight = el.scrollHeight;
+            }
+            // Only the READER asking for older turns may grow the window.
+            // Our own positioning fires scroll events too. Opening a thread
+            // lands at the TOP of the rendered slice, inside the margin by
+            // construction.
+            //
+            // So without this the open would grow the window by a chunk every
+            // visit, parsing that markdown synchronously on the open path.
+            // The cost compounds across re-opens, since renderFloorByThread is
+            // module-scoped, and it is exactly what windowing exists to avoid.
+            // The up-chevron is covered too, and wants to be: it renders the
+            // whole thread before gliding, so an expansion mid-glide would
+            // re-anchor the viewport and stall it.
+            if (isNavigationScroll(el)) return;
+            if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
+            reachForOlder();
+        };
+        // A reader pinned at the very top fires NO further scroll events, so
+        // the handler above cannot hear them ask again. On a thread several
+        // pages long that froze the walk: one page landed, and the rest was
+        // unreachable without scrolling back down first.
+        //
+        // A gesture IS the reader, so no navigation guard applies here. The
+        // page lands with them parked at the loaded floor. That is the state
+        // the anchored landing was built for, and `requestBackfill`'s own
+        // guard keeps a flurry of wheel events to one fetch.
+        //
+        // Direction decides it, and only an UPWARD gesture asks. The event
+        // fires before the browser moves `scrollTop`, so a reader leaving the
+        // top downward still reads as pinned there. Acting on that would
+        // render turns they are scrolling away from, then jump them by the
+        // height it added.
+        let lastTouchY: number | null = null;
+        const reachIfUp = (reachesUp: boolean) => {
+            if (!reachesUp || !atScrollTop(el)) return;
+            // A transcript that does NOT scroll is `fillWindow`'s case, and
+            // its round caps exist for the thread shape that never grows a
+            // scrollbar. Growing that from a gesture would have no cap at
+            // all, and one trackpad flick is fifty wheel events.
+            if (!transcriptScrolls(el)) return;
+            reachForOlder();
+        };
+        const onWheel = (e: WheelEvent) => reachIfUp(e.deltaY < 0);
+        const onTouchStart = (e: TouchEvent) => { lastTouchY = e.touches[0]?.clientY ?? null; };
+        // A finger travelling DOWN the screen pulls older content into view.
+        const onTouchMove = (e: TouchEvent) => {
+            const y = e.touches[0]?.clientY ?? null;
+            reachIfUp(lastTouchY !== null && y !== null && y > lastTouchY);
+            lastTouchY = y;
+        };
+        const onTouchEnd = () => { lastTouchY = null; };
+        // The transcript is `tabindex=0`, so a keyboard reader hits the same
+        // wall: at the top these keys scroll nothing and fire no event. A
+        // modifier makes it a shortcut rather than a scroll.
+        //
+        // `keydown` bubbles, and a scroll key on a DESCENDANT is the ordinary
+        // case rather than the odd one: a choice card parks focus on its own
+        // button, and the browser scrolls the nearest scrollable ancestor for
+        // any key that control does not take. Asking whether the key was
+        // CONSUMED separates the two, and this handler runs after the
+        // control's own. A target check cannot: it would refuse the reader
+        // exactly where focus usually sits.
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.defaultPrevented) return;
+            if (e.metaKey || e.ctrlKey || e.altKey) return;
+            // Space pages DOWN and Shift+Space pages UP, so it is the one key
+            // whose direction a modifier decides rather than the key itself.
+            const space = e.key === ' ' || e.key === 'Spacebar';
+            reachIfUp(space ? e.shiftKey : UPWARD_SCROLL_KEYS.has(e.key));
+        };
         el.addEventListener('scroll', onScroll, { passive: true });
-        return () => el.removeEventListener('scroll', onScroll);
+        el.addEventListener('wheel', onWheel, { passive: true });
+        el.addEventListener('touchstart', onTouchStart, { passive: true });
+        el.addEventListener('touchmove', onTouchMove, { passive: true });
+        el.addEventListener('touchend', onTouchEnd, { passive: true });
+        el.addEventListener('keydown', onKeyDown, { passive: true });
+        return () => {
+            el.removeEventListener('scroll', onScroll);
+            el.removeEventListener('wheel', onWheel);
+            el.removeEventListener('keydown', onKeyDown);
+            el.removeEventListener('touchstart', onTouchStart);
+            el.removeEventListener('touchmove', onTouchMove);
+            el.removeEventListener('touchend', onTouchEnd);
+        };
     }, [threadId, eventsLoaded]);
 
     // After a window grow prepends older exchanges (content grows upward), restore
-    // scrollTop by the height added so the viewport stays put — no jump.
+    // scrollTop by the height added so the viewport stays put, with no jump.
+    //
+    // Through `markAnchorScroll`, which is what that function exists for: a
+    // correction landing near the top must not read as a request for older
+    // turns. This was the one app write that skipped it. Bare, it lets a grow
+    // fire the next grow off its own correction, whenever the added height
+    // leaves the reader inside the expand margin.
+    //
+    // Keyed on the window TICK beside the edge, and the tick is the load-bearing
+    // half. Every arming bumps it, so consumption cannot depend on the edge
+    // STRING changing. It does not always: a backfill grows the array at the
+    // front, so the re-point below can arm while index 0 stays index 0. The
+    // capture then outlives its commit. Every grower early-returns on it, so
+    // all three wedge for the rest of the mount, leaving the chevron as the
+    // only thing that works. Same trap the scroll-to-top effect below carries.
     useLayoutEffect(() => {
         const el = areaRef.current;
         const pend = pendingExpandRef.current;
         if (!el || !pend) return;
         pendingExpandRef.current = null;
-        el.scrollTop = pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight);
-    }, [edgeKey]);
+        markAnchorScroll(el, pend.prevScrollTop + (el.scrollHeight - pend.prevScrollHeight));
+    }, [edgeKey, winTick]);
+
+    // Leaving the thread abandons any capture taken for it. The reader's
+    // position went with the unmount. Restoring against it on a later visit
+    // would move a viewport they have since re-placed themselves in.
+    //
+    // The pending jump to the top goes with it, for the same reason and one
+    // more: this component is mounted unkeyed, so the ref outlives the switch.
+    // An arming the old thread never consumed would fire on the next thread's
+    // first window write, and yank a reader who pressed nothing.
+    useEffect(() => () => {
+        if (threadId) pendingBackfillByThread.delete(threadId);
+        pendingScrollTopRef.current = false;
+        // The VISIT ends here, however it ends: a switch, a New chat that
+        // unmounts the pane, or the layout swapping at the breakpoint. Leaving
+        // the mark set would make the next open a later commit of this visit,
+        // and a render-all would outlive it after all. See `reseedOnReopen`.
+        if (lastSeededVisit === threadId) lastSeededVisit = null;
+    }, [threadId]);
+
+    // A backfill landed, so the array grew at the FRONT and the edge index now
+    // names an older turn than the reader was on. Put it back on the turn it
+    // named, by identity, then grow ONCE into what arrived.
+    //
+    // The grow is not a flourish. The reader asked by scrolling to the top, so
+    // they sit at `scrollTop` zero with nothing left to scroll. Re-pointing
+    // alone draws the same turns and moves nothing. No scroll event follows, so
+    // the next round never arrives and the transcript stalls a page short of
+    // its start.
+    //
+    // A layout effect, so the frame where the edge still names the wrong turn
+    // is corrected before it is painted. The scroll restore is left to
+    // `growRenderWindow` and the anchor effect above, the mechanism every other
+    // expansion already rides.
+    useLayoutEffect(() => {
+        if (!threadId) return;
+        const pend = pendingBackfillByThread.get(threadId);
+        const el = areaRef.current;
+        if (!pend || !el) return;
+        pendingBackfillByThread.delete(threadId);
+        // A transcript laid out at 0x0 measures nothing, the same guard the
+        // growers keep. A pane collapsed between the request and the landing
+        // gives one, and a height read there is zero rather than absent: the
+        // hold would take the reader to the top of a pane they are not looking
+        // through. Hold nobody instead, and leave the window to the observer.
+        const hold = isElementVisible(el) ? pend : null;
+        const anchored = anchorAfterBackfill(exchanges, pend);
+        if (!anchored) {
+            // Neither anchor survived the fold. Nothing can be re-pointed
+            // against turns that are gone, so hold the viewport by pixels and
+            // leave the window alone.
+            if (hold) markAnchorScroll(el, hold.prevScrollTop + (el.scrollHeight - hold.prevScrollHeight));
+            return;
+        }
+        renderFloorByThread.set(threadId, anchored);
+        const grew = growRenderWindow(
+            el, threadId, exchangeCostsRef.current, anchored,
+            rowCountAtRef.current, pendingExpandRef, bumpWindow,
+        );
+        // The hold comes from the REQUEST, never from here, and overwriting
+        // what the grow just captured is the point. This effect runs after the
+        // commit that folded the page in, so a reading taken now describes a
+        // viewport the landing already moved. Held against it, a reader
+        // restored onto their turn kept an offset two turns earlier. The
+        // request's capture is the last reading of the frame they were in, and
+        // the scroll listener keeps it current until the page lands.
+        pendingExpandRef.current = hold && {
+            prevScrollTop: hold.prevScrollTop,
+            prevScrollHeight: hold.prevScrollHeight,
+        };
+        // Nothing to grow into, so the re-point is the whole change. The bump
+        // still owes the effect above its round, the hold being armed either
+        // way.
+        if (!grew) bumpWindow();
+    }, [threadId, backfillArrived]);
 
     // After the up-chevron sets a whole-thread render floor, jump to the genuine
     // top once the expanded list commits. `scrollToTop()` starts a tween, and
@@ -1011,46 +1366,83 @@ export function ThreadView() {
     // in flight. So the render-all's ResizeObserver cannot pin the reader back
     // to the bottom. Runs before paint so the user never sees the intermediate
     // position.
+    //
+    // Keyed on the window TICK, never on `edgeKey` alone. The chevron is now
+    // offered on unloaded history too, and such a thread routinely has its
+    // whole loaded set drawn already. The press then writes the edge it was
+    // holding, so a dep on the edge's value never fires and the press reads as
+    // a no-op. The second arming, once the history lands, is dropped the same
+    // way. The ref guards the extra runs a tick dep brings.
     useLayoutEffect(() => {
         if (!pendingScrollTopRef.current) return;
         pendingScrollTopRef.current = false;
         scrollToTop();
-    }, [edgeKey]);
+    }, [edgeKey, winTick]);
 
-    // The window must leave the reader able to REACH what it left out, and one
-    // shorter than the pane does not. The scroll-up expansion above is the only
-    // way older exchanges enter it, and only a scroll event fires that. So the
-    // transcript freezes on the seed, with the up chevron as the sole way out.
-    // That is the reported "an old thread opens on one card and will not
-    // scroll". `windowNeedsFill` carries why the seed cannot prevent it.
+    // The transcript must leave the reader able to REACH the rest of the
+    // thread, and one shorter than the pane does not. The scroll handler above
+    // is the only thing that grows the window or fetches a page, and only a
+    // scroll event fires it. So a short transcript freezes on whatever the seed
+    // took. That is the reported "an old thread opens on one card and will not
+    // scroll". `fillAction` carries why the seed cannot prevent it, and which
+    // of the two moves is owed.
     //
-    // The grow goes through the same anchored primitive the scroll-up takes, so
-    // a fill lands the reader on the content they were already looking at. On
-    // the open that content is the tail, so the thread opens at its end with a
-    // full pane. A later fill, when a pane resize leaves the transcript short
-    // again, holds them still instead of dropping them into an older turn.
+    // Both go through the same anchored primitives the scroll-up takes, so a
+    // fill lands the reader on the content they were already looking at. On the
+    // open that content is the tail, so the thread opens at its end with a full
+    // pane. A later fill, when a pane resize leaves the transcript short again,
+    // holds them still instead of dropping them into an older turn.
     const fillWindow = () => {
         const el = areaRef.current;
-        if (!el || !threadId || !canSeedWindow) return;
+        // Settled, not `canSeedWindow`. That one also wants exchanges, and a
+        // page whose events all fold to nothing renderable is exactly the case
+        // owed a page. Waiting for the load to settle still matters: paging
+        // while the first page is in flight asks for history twice.
+        if (!el || !threadId || !(eventsLoaded || eventsLoadFailed)) return;
         // The re-entrancy guard the scroll-up shares: one grow is in flight
         // until the anchor effect lands it, and its metrics describe the DOM as
         // it stands now.
         if (pendingExpandRef.current) return;
         // Cheapest question first. It is pure arithmetic, and it rejects every
-        // thread already rendered whole, which is most of them. The reads below
-        // force a layout, so they must not run on a thread that cannot fill.
+        // thread rendered whole to its first event, which is most of them. The
+        // reads below force a layout, so they must not run on such a thread.
         const costs = exchangeCostsRef.current;
         const rows = rowCountAtRef.current;
         const current = currentEdge(threadId, costs, rows);
-        if (!edgeHasMoreAbove(current)) return;
-        const rounds = fillRoundsByThread.get(threadId) ?? 0;
-        if (rounds >= MAX_FILL_EXPANSIONS) return;
+        if (!edgeHasMoreAbove(current) && !hasOlderEvents) return;
         // A transcript laid out at 0x0 answers every geometric question wrongly.
         // A collapsed desktop split gives one, so this is an ordinary state
         // rather than a corner. The observer below is what brings the
         // measurement back once such a pane is revealed.
         if (!isElementVisible(el)) return;
-        if (!windowNeedsFill(el, current)) return;
+        const owed = fillAction(el, current, hasOlderEvents);
+        if (owed === 'none') return;
+        if (owed === 'page') {
+            // Nothing loaded is left to render, so grow the LOADED SET instead.
+            // Counted apart from the render rounds below, a page being a request
+            // rather than a fold. The re-point effect starts the next round.
+            const pages = fillBackfillsByThread.get(threadId) ?? 0;
+            if (pages >= MAX_FILL_BACKFILLS) return;
+            // Asked BEFORE the request, never sorted out after it. The store
+            // reports a refusal exactly as it reports a failure. Counting
+            // afterwards therefore either spends a round on a request that
+            // never ran, or spends none on one that ran and failed. The second
+            // leaves a failing endpoint retried for ever, one toast a round.
+            //
+            // A read that lands with rows re-drives this effect. One that
+            // FAILS mutates nothing, so the fill waits for a resize or a
+            // scroll instead. The chevron is the way out meanwhile, which is
+            // why it reads the same watermark this arm does.
+            if (threadHistoryReadInFlight(threadId)) return;
+            // Counted only when the capture was taken, the rule the grow below
+            // keeps.
+            if (requestBackfill(el, threadId, exchangesRef.current, current, bumpBackfill)) {
+                fillBackfillsByThread.set(threadId, pages + 1);
+            }
+            return;
+        }
+        const rounds = fillRoundsByThread.get(threadId) ?? 0;
+        if (rounds >= MAX_FILL_EXPANSIONS) return;
         // Counted only when it actually grew, so a no-op cannot spend a round.
         if (growRenderWindow(el, threadId, costs, current, rows, pendingExpandRef, bumpWindow)) {
             fillRoundsByThread.set(threadId, rounds + 1);
@@ -1063,8 +1455,18 @@ export function ThreadView() {
 
     // Measure after every commit that can change the answer. A grow changes
     // `edgeKey`, so the rounds run off these deps.
+    //
+    // `backfillArrived` is what carries the PAGE rounds, and it is not a
+    // duplicate of the two beside it. A page can land without changing either:
+    // its turns merge into the fragment already on screen, so the count holds,
+    // and the re-point can land on the same edge.
+    //
+    // `winTick` is what asks AGAIN once a capture is consumed. This effect runs
+    // in the same commit the re-point arms one in, so it stands down on the
+    // re-entrancy guard. No other dep has to change afterwards.
     useLayoutEffect(() => { fillWindowRef.current(); },
-        [threadId, canSeedWindow, edgeKey, exchanges.length]);
+        [threadId, canSeedWindow, eventsLoaded, eventsLoadFailed, hasOlderEvents,
+            edgeKey, exchanges.length, backfillArrived, winTick]);
 
     // The window must also reach the turn the reader PARKED on, which the seed
     // has no reason to have taken. A *reading position* names a turn, and the
@@ -1103,9 +1505,15 @@ export function ThreadView() {
         if (pendingExpandRef.current) return;
         // Cheapest question first, the rule the fill above states: the layout
         // read below must not run on a walk that is already over.
-        // `edgeMustReachIndex` owns the three ways it can be, an id matching
-        // nothing among them. Clearing the target is what stops a later commit
-        // asking again.
+        // `edgeMustReachIndex` owns the three ways it can be. Clearing the
+        // target is what stops a later commit asking again.
+        //
+        // AN ID MATCHING NOTHING IS A DELIBERATE GIVE-UP, and it covers two
+        // cases: a turn that is gone, and one behind the loaded page. Neither
+        // fetches history to chase the reader's place. The thread opens at the
+        // top of the newest page instead. A position INSIDE the loaded pages is
+        // still honoured, which is the walk below. ADR 0234 (docs/adr/) weighs
+        // the chase and rejects it.
         //
         // WHOLE, not merely rendered: the restore measures the turn's own top
         // edge, so the walk keeps going while that turn's head is clamped off.
@@ -1266,9 +1674,9 @@ export function ThreadView() {
                        tail: the reader sits at scrollTop 0 with older turns
                        above them that are not in the DOM, so the chevron
                        (whose handler renders the full thread first) hid exactly
-                       when it was the only way to reach them. Offer it whenever
-                       there is anything above, scrolled or windowed out. */
-                    showUp={isNotAtTop || edgeHasMoreAbove(edge)}
+                       when it was the only way to reach them. `anythingAbove`
+                       carries the other two terms and why each is needed. */
+                    showUp={anythingAbove(isNotAtTop, edge, hasOlderEvents)}
                     showDown={isUp}
                     onScrollUp={() => {
                         // Windowed thread with older exchanges still above the
@@ -1281,9 +1689,31 @@ export function ThreadView() {
                         // deep-link render-all already answers false here. A
                         // clamped floor turn answers TRUE: the true top is that
                         // turn's first row, not the first row on screen.
-                        if (threadId && scrollToTopNeedsRenderAll(edge)) {
+                        //
+                        // Unloaded history answers TRUE as well, which is the
+                        // second argument.
+                        if (threadId && scrollToTopNeedsRenderAll(edge, hasOlderEvents)) {
                             pendingScrollTopRef.current = true;
                             renderFloorByThread.set(threadId, WHOLE_THREAD);
+                            // The true top is the thread's first turn, not the
+                            // first one this client holds. Re-arm AFTER the
+                            // history lands: the jump below runs on the next
+                            // commit, which on a paged thread is the top of the
+                            // page rather than of the thread.
+                            //
+                            // Only while the reader is still HERE. One unpaged
+                            // fetch on a long thread takes seconds on a phone,
+                            // and the transcript element is shared across
+                            // threads. Re-arming blind drags whatever they
+                            // opened meanwhile to its top, and cancels any
+                            // landing that thread had in flight. The teardown
+                            // below cannot cover it: it runs at switch time,
+                            // which is before this resolves.
+                            void ensureWholeThreadLoaded(threadId).then(() => {
+                                if (focusedThreadId.value !== threadId) return;
+                                pendingScrollTopRef.current = true;
+                                bumpWin(n => n + 1);
+                            });
                             bumpWin(n => n + 1);
                         } else {
                             scrollToTop();

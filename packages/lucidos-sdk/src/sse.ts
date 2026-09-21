@@ -1,5 +1,7 @@
 import { apiBase } from './_fetch';
 import { eventStreamTargets, openEventStream, type EventStream } from './eventStream';
+import { isBridged } from './_bridge';
+import { openBridgedEventStream } from './sseBridge';
 
 export interface SseThreadEvent {
   type: 'ThreadEvent';
@@ -102,15 +104,23 @@ export const sse = {
    *  rather than ten. */
   connect(): void {
     if (stream) return;
+    const handlers = {
+      onFrame: handleFrame,
+      // An app has no resync to run and no status chrome to repaint, so both
+      // are no-ops here. Whichever transport it got reconnects for it.
+      onOpen: () => {},
+      onError: () => {},
+    };
+    // An isolated frame can open neither transport below: both reach the engine
+    // from an opaque origin, and CORS refuses that. The host relays instead,
+    // off the one connection it already holds.
+    if (isBridged()) {
+      stream = openBridgedEventStream(handlers);
+      return;
+    }
     stream = openEventStream(
       targets(),
-      {
-        onFrame: handleFrame,
-        // An app has no resync to run and no status chrome to repaint, so both
-        // are no-ops here. Whichever transport it got reconnects for it.
-        onOpen: () => {},
-        onError: () => {},
-      },
+      handlers,
       // An app has no presence voice, exactly as it has none today. It holds a
       // port and never answers a PresenceCheck, so the worker does not count it
       // among the documents it waits for.

@@ -127,6 +127,17 @@ class FakeSocket {
   controls(): string[] {
     return this.texts.map((t) => JSON.parse(t).type as string);
   }
+
+  /**
+   * The controls a barge-in case is about, which is the cut and not the floor.
+   *
+   * `caller_started_speaking` rides every opening edge, so it lands in most of
+   * these cases and says nothing about whether the talker was cut off. Cases
+   * about the opener itself read {@link controls} whole.
+   */
+  cuts(): string[] {
+    return this.controls().filter((type) => type !== 'caller_started_speaking');
+  }
 }
 
 function harness(opts: { microphone?: string; note?: string } = {}): Harness {
@@ -336,7 +347,7 @@ describe('barge-in', () => {
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
     h.hush(GAVE_UP_THE_FLOOR);
     h.speak();
-    expect(h.socket().controls()).toEqual(['barge_in']);
+    expect(h.socket().cuts()).toEqual(['barge_in']);
     expect(h.device().stops).toBeGreaterThan(0);
     expect(h.last().phase).toBe('listening');
   });
@@ -344,14 +355,14 @@ describe('barge-in', () => {
   it('stays quiet while the talker is not speaking', async () => {
     const h = await liveCall();
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen * 3);
-    expect(h.socket().controls()).toEqual([]);
+    expect(h.socket().cuts()).toEqual([]);
   });
 
   it('stays quiet when the caller is quiet', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
     h.hush(SPEECH_GATE_DEFAULTS.framesToOpen * 3);
-    expect(h.socket().controls()).toEqual([]);
+    expect(h.socket().cuts()).toEqual([]);
   });
 
   /** Stopping playback must not shut the gate. The caller is mid-word, and the
@@ -377,7 +388,7 @@ describe('barge-in', () => {
     expect(h.last().utterance).toBe('live');
     h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
-    expect(h.socket().controls()).toEqual([]);
+    expect(h.socket().cuts()).toEqual([]);
     expect(h.device().stops).toBe(0);
     expect(h.last().phase).toBe('speaking');
   });
@@ -391,7 +402,7 @@ describe('barge-in', () => {
     h.hush();
     h.socket().say({ type: 'talker_transcript', text: 'Still ' });
     h.speak();
-    expect(h.socket().controls()).toEqual([]);
+    expect(h.socket().cuts()).toEqual([]);
     expect(h.device().stops).toBe(0);
   });
 
@@ -404,7 +415,7 @@ describe('barge-in', () => {
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
     h.socket().say({ type: 'talker_transcript', text: 'is the answer' });
     h.speak(1);
-    expect(h.socket().controls()).toEqual(['barge_in']);
+    expect(h.socket().cuts()).toEqual(['barge_in']);
   });
 
   /** One interruption is one cut, whatever the gate does after it. A caller
@@ -416,7 +427,7 @@ describe('barge-in', () => {
     h.speak();
     h.hush();
     h.speak();
-    expect(h.socket().controls()).toEqual(['barge_in']);
+    expect(h.socket().cuts()).toEqual(['barge_in']);
     expect(h.device().stops).toBe(1);
   });
 });
@@ -744,13 +755,41 @@ describe('a microphone that will not close', () => {
 });
 
 describe('the frames a call sends', () => {
-  it('are only the two the engine will read', async () => {
+  it('are only the three the engine will read', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'hm' });
     h.hush(GAVE_UP_THE_FLOOR);
     h.speak();
     h.runner.press(THREAD);
-    expect(new Set(h.socket().controls())).toEqual(new Set(['barge_in', 'hang_up']));
+    expect(new Set(h.socket().controls())).toEqual(
+      new Set(['barge_in', 'caller_started_speaking', 'hang_up']),
+    );
+  });
+
+  /**
+   * The floor opener rides every opening edge, cut or no cut.
+   *
+   * It is what the engine's floor opens on, and the Live provider states no
+   * such frame of its own (ADR 0211). A caller speaking on their own floor
+   * interrupts nobody, so the cut is withheld and this is not.
+   */
+  it('tell the engine the caller opened their mouth, cut or no cut', async () => {
+    const h = await liveCall();
+    h.speak();
+    expect(h.socket().controls()).toEqual(['caller_started_speaking']);
+    expect(h.device().stops).toBe(0);
+  });
+
+  /** Their FIRST word is the one the floor most needs, and it beats the socket. */
+  it('tell it about a caller who started before the session was up', async () => {
+    const h = harness();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    h.speak();
+    expect(h.socket().controls()).toEqual([]);
+    h.socket().say(STARTED);
+    expect(h.socket().controls()).toEqual(['caller_started_speaking']);
   });
 });
 

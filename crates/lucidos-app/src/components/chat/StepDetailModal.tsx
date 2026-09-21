@@ -7,7 +7,7 @@ import type { Loadable, StepOutcome } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { highlightEllipsis } from './highlightEllipsis';
 import { fetchToolArgs, fetchToolResult } from '../../api/threads';
-import { fullCommandForCCTool } from '../../store/thread-events/exchange';
+import { fullCommandForCCTool, fullCommandForEngineTool } from '../../store/thread-events/exchange';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 function close() {
@@ -104,9 +104,9 @@ function ResultArea({
  *
  *  Two sources, one look. `inlineFull` is what the fold computed when the row
  *  still carried its args, which is every live SSE emission. A snapshot row has
- *  had them stripped, so this fetches them. It then runs the SAME
- *  `fullCommandForCCTool` the fold would have, rather than asking the server
- *  for a rendered string. One formatter, so the two paths cannot drift.
+ *  had them stripped, so this fetches them. It then runs the SAME formatter the
+ *  fold would have, rather than asking the server for a rendered string. One
+ *  formatter per channel, so the two paths cannot drift.
  *
  *  Elided when it only repeats the description, which is the rule the inline
  *  path has always applied. */
@@ -116,12 +116,14 @@ function FullCommandArea({
   toolName,
   argsStripped,
   callEventId,
+  toolChannel,
 }: {
   inlineFull: string | undefined;
   description: string;
   toolName: string | undefined;
   argsStripped: boolean | undefined;
   callEventId: string | undefined;
+  toolChannel: 'chat' | 'coding_agent' | undefined;
 }) {
   const inlineLoadable: Loadable<{ full: string | undefined }> = useMemo(() => ({
     status: 'loaded',
@@ -153,7 +155,13 @@ function FullCommandArea({
         if (cancelled) return;
         setLoadable({
           status: 'loaded',
-          data: { full: fullCommandForCCTool(toolName ?? '', payload.args) },
+          // The channel decides the formatter, because each has its own and
+          // the inline label was built with that one. See `tool_channel`.
+          data: {
+            full: toolChannel === 'chat'
+              ? fullCommandForEngineTool(toolName ?? '', payload.args)
+              : fullCommandForCCTool(toolName ?? '', payload.args),
+          },
         });
       })
       .catch((err: unknown) => {
@@ -161,7 +169,7 @@ function FullCommandArea({
         setLoadable(toFailed<{ full: string | undefined }>(err));
       });
     return () => { cancelled = true; };
-  }, [argsStripped, callEventId, toolName, inlineLoadable]);
+  }, [argsStripped, callEventId, toolName, toolChannel, inlineLoadable]);
 
   const showLoading = useDelayedLoading(loadable);
   if (loadable.status === 'failed') {
@@ -228,6 +236,7 @@ export function StepDetailModal() {
           toolName={step.tool_name}
           argsStripped={step.args_stripped}
           callEventId={step.call_event_id}
+          toolChannel={step.tool_channel}
         />
         {step.thinkingText && (
           <>

@@ -1082,6 +1082,10 @@ pub fn run() {
                     // behind, the map would keep one entry per destroyed
                     // window that had a preview up.
                     panel_preview::close_owned_by(app, window.label());
+                    // Before the re-record, or a note for a window that is gone
+                    // would hold the record against a later, unrelated frame
+                    // (ADR 0215).
+                    window_restore::forget_rescue(window.label());
                     // The window is out of the map by now, so re-recording is
                     // what drops it from the session. `CloseRequested` cannot
                     // do it: the window is still there when that one fires.
@@ -1127,10 +1131,18 @@ pub fn run() {
                     // `traffic_lights::watch_resizes` fixes. It stays for the
                     // moment the notification does not cover, tao's synthetic
                     // resize on leaving fullscreen, where late is right.
-                    // Idempotent, so the overlap costs nothing. Not on `Moved`:
-                    // the placement is a function of the window's HEIGHT.
+                    //
+                    // A MOVE re-applies too, and that is about reverts rather
+                    // than about the value. The placement is a function of the
+                    // window's HEIGHT, so a move never changes what to write.
+                    // What it changes is whether what we wrote is still there.
+                    // `window_desk` corrects an unusable frame from here, and a
+                    // user dragging a window is the reported way back from a
+                    // cluster AppKit has taken over. The write is idempotent and
+                    // costs a few frame reads. Paying it per move buys a
+                    // self-heal on the gesture that provoked the report.
+                    traffic_lights::place(window);
                     if matches!(event, tauri::WindowEvent::Resized(_)) {
-                        traffic_lights::place(window);
                         // A resize is the one moment the runtime's stored rate
                         // becomes visible, and the moment a wrong one must not
                         // survive. Each pass re-pins the rate to 1, so nothing
@@ -1646,6 +1658,52 @@ mod tests {
         // In dev the flag is inert. There is no tray there (`install_tray` is
         // skipped), so a hidden dev window would have nothing to reopen it.
         assert!(should_show_window_at_startup(&login, true));
+    }
+
+    /// The template's RIGHT edge is the seam macOS lays the unread count out
+    /// from. AppKit scales the image to 18pt tall, takes its width from the
+    /// canvas aspect ratio, and then adds a fixed 2pt gap before the title. So
+    /// a transparent column here is daylight between the mark and the count, on
+    /// top of a gap no public API reaches: `attributedTitle` and
+    /// `imageHugsTitle` are both no-ops on a status-bar button.
+    ///
+    /// `icons/gen-tray-template.py` sits the glyph flush right for that reason.
+    /// It rounds the canvas up to a whole pixel on the LEFT, where the bar's own
+    /// padding swallows the sliver. Regenerate it rather than editing the PNG.
+    #[test]
+    fn the_tray_template_ends_on_ink_so_the_unread_count_sits_against_the_mark() {
+        let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+            .expect("the menu-bar template decodes");
+        let (width, height) = (icon.width() as usize, icon.height() as usize);
+        let rgba = icon.rgba();
+        let column_ink = |x: usize| {
+            (0..height)
+                .map(|y| rgba[(y * width + x) * 4 + 3])
+                .max()
+                .unwrap_or(0)
+        };
+
+        // "Any alpha at all" does not discriminate. The supersampled downscale
+        // rings a trace of ink into a column the glyph never reaches. So the
+        // square canvas this replaced reads 1 here, and would pass. Measured at
+        // this canvas's own right edge: 47 where the sparkle's tip lands,
+        // against 3 with a single pixel of padding back. A tenth of full
+        // opacity sits between the two, with room either side.
+        const RINGING_FLOOR: u8 = 26;
+        let edge = column_ink(width - 1);
+        assert!(
+            edge > RINGING_FLOOR,
+            "the template's last column carries {edge} of ink. That is the \
+             downscale's ringing, not the glyph, so the count sits a column \
+             further from the mark than AppKit alone puts it"
+        );
+        // Taller than it is wide, which is what says the height alone is setting
+        // the size. A square canvas is the shape this replaced.
+        assert!(
+            width < height,
+            "template is {width}x{height}; the glyph is taller than it is wide, \
+             so a canvas as wide as it is tall carries padding"
+        );
     }
 
     /// Every step is here because `setup` was the wrong place for it. `setup`

@@ -583,8 +583,13 @@ impl LucidosEngine {
         relative: &str,
     ) -> Result<(String, std::path::PathBuf), String> {
         let repo = super::repo_files::resolve_repo(self.pool(), repo_arg).await?;
-        let full = super::repo_files::resolve_in_repo(std::path::Path::new(&repo.path), relative)?;
-        let display = format!("{}/{}", repo.name, relative.trim_start_matches("./"));
+        let root = std::path::Path::new(&repo.path);
+        let full = super::repo_files::resolve_in_repo(root, relative)?;
+        let clean = relative.trim().trim_start_matches("./");
+        if let Some(live) = super::repo_files::shadowed_tracked_path(root, clean).await {
+            return Err(super::repo_files::stale_copy_refusal(clean, &live));
+        }
+        let display = format!("{}/{}", repo.name, clean);
         Ok((display, full))
     }
 

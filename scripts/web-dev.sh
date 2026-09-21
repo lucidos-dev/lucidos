@@ -43,7 +43,7 @@ parse_dev_args "$@"
 # LUCIDOS_STATIC_DIR choke point deeper in.
 #
 # --engine-build is exempt: it compiles the on-disk binary and `exit 0`s below,
-# before swap_ports and start_gateway, so it starts no long-lived process and
+# before allocate_ports and start_gateway, so it starts no long-lived process and
 # exports no LUCIDOS_STATIC_DIR. That is the Apply-triggered background rebuild,
 # and blocking it would break a build-only workflow that cannot pin anything.
 #
@@ -61,9 +61,8 @@ if [ -z "$ENGINE_BUILD_ONLY" ]; then
     fi
 fi
 
-check_prereqs
+check_prereqs "${ENGINE_BUILD_ONLY:+build-only}"
 resolve_workspace
-allocate_ports "$WORKSPACE"
 
 # --engine-build (ADR: new-version-available/switch flow): rebuild the on-disk
 # engine binary in the BACKGROUND while the running engine keeps serving — no
@@ -71,12 +70,22 @@ allocate_ports "$WORKSPACE"
 # the running engine detects the new on-disk build-id and surfaces "New version
 # available", and the disruptive switch respawns onto it separately. Build only,
 # then exit — no postgres/ports/kill needed to compile.
+#
+# ABOVE allocate_ports, and that ordering is the whole point. A compile needs no
+# port, yet the allocator reclaims stale listeners, kills unprotected ones,
+# refuses to walk off a pinned port, and rewrites the registry. So a workspace
+# whose engine.pid had gone stale read its OWN live engine as a foreign squatter
+# and every background rebuild died there in under a second, before cargo, with
+# a "Retry build" toast that replayed the same failure forever. Pinned by
+# scripts/lib/engine_build_only_test.sh; see
+# docs/plans/2026-09-18-engine-build-only-needs-no-ports.md.
 if [ -n "$ENGINE_BUILD_ONLY" ]; then
     build_or_find_engine
     build_sdk
     exit 0
 fi
 
+allocate_ports "$WORKSPACE"
 detect_tls
 setup_postgres
 kill_stale_processes

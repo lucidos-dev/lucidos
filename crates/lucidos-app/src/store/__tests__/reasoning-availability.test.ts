@@ -36,6 +36,15 @@ describe('availableReasoningLevels', () => {
     expect(values).toContain('xhigh');
   });
 
+  // The branch matches the Fable family by prefix, so a new generation is
+  // offered the full ladder without a new rule. Fable 5.1 accepts every tier.
+  it('exposes full set for both Fable generations', () => {
+    for (const id of ['claude-fable-5', 'claude-fable-5-1', 'claude-fable-5-1[1m]']) {
+      const values = availableReasoningLevels(id).map(l => l.value);
+      expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
   it('drops xhigh for non-Opus-4.7 Claude models', () => {
     const values = availableReasoningLevels('claude-opus-4-6').map(l => l.value);
     expect(values).toEqual(['none', 'low', 'medium', 'high', 'max']);

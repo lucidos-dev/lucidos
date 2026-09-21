@@ -1,4 +1,5 @@
 import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk } from './_core';
+import { readDeviceId } from '../../utils/deviceIdHeader';
 import { lucidos } from '@lucidos/sdk';
 import type { App, PinnedAppEntry } from '../../store/types';
 import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
@@ -221,10 +222,19 @@ export function appUrl(
   fragment?: string,
 ): string {
   const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
+  const params = new URLSearchParams();
   // `thread_id` triggers the engine's WIP-preview branch (see
   // `api/apps.rs::serve_app_ui`) — content comes from the open
   // coding-agent thread's worktree instead of the live workspace data.
-  const withQuery = threadId ? `${base}?thread_id=${encodeURIComponent(threadId)}` : base;
+  if (threadId) params.set('thread_id', threadId);
+  // `device` is whose appearance the app's first paint should carry. The engine
+  // stamps it onto the app's own `sdk-prefs.js` reference, and that script then
+  // resolves this device's theme, font and scale. An isolated app frame cannot
+  // read them out of the shell's storage the way a same-origin one could.
+  const deviceId = readDeviceId();
+  if (deviceId) params.set('device', deviceId);
+  const query = params.toString();
+  const withQuery = query ? `${base}?${query}` : base;
   return fragment ? `${withQuery}#${fragment}` : withQuery;
 }
 

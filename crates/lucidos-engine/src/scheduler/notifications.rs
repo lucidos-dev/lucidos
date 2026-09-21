@@ -43,14 +43,14 @@ use crate::engine::thread_events::MessageOrigin;
 /// rejected; the bare string `"none"` is still rejected.)
 ///
 /// Workspaces that still have triggers or apps emitting the old strings
-/// must migrate them via `system-knowhow/migrate-tap-shape.md` (detected by
-/// `system-knowhow/workspace-audit.md`). Historical `NotificationCreated`
+/// must migrate them. `system-knowhow/workspace-audit.md` finds them, and
+/// its remediation section owns the rewrite. Historical `NotificationCreated`
 /// event payloads with the old form remain in the events table forever
 /// (event-sourcing immutability), but the projection is built once by the
 /// JSONB migration and incremental updates only consume new events with the
 /// canonical shape — normal operation never re-deserializes the old strings.
 /// A force projection rebuild on a pre-migration workspace will fail loudly,
-/// at which point the workspace owner runs `migrate-tap-shape.md` and
+/// at which point the workspace owner runs that audit's fix path and
 /// rebuilds.
 ///
 /// `to` is boxed because `NavigateUi` is one field per navigate target and
@@ -77,7 +77,7 @@ pub enum Tap {
 //
 // It delegates to a private derived helper that keeps serde's full strictness:
 // legacy bare strings ("modal"/"none"/"open_thread") and unknown object kinds are
-// still rejected loudly (the migrate-tap-shape guard). ONLY the well-formed
+// still rejected loudly (the strict-tap guard). ONLY the well-formed
 // `{"kind":"none"}` object is coerced — to `Modal`, which then re-serializes as
 // `{"kind":"modal"}`, so a rebuilt row never re-emits `none`.
 impl<'de> Deserialize<'de> for Tap {
@@ -731,7 +731,7 @@ mod tests {
     // Strict deserialization — only the canonical {kind, to?} object form is
     // accepted. Legacy bare strings ('modal' / 'none' / 'open_app' /
     // 'open_thread') are rejected; workspaces with stale taps must migrate
-    // via system-knowhow/migrate-tap-shape.md.
+    // via system-knowhow/workspace-audit.md.
 
     #[test]
     fn tap_deserializes_canonical_modal_object() {
@@ -777,8 +777,8 @@ mod tests {
     fn tap_rejects_legacy_bare_string_none_but_coerces_the_object() {
         // The retired `none` OBJECT (`{"kind":"none"}`) is coerced to Modal (see
         // tap_deserialize_none_coerces_to_modal), but the legacy BARE STRING
-        // `"none"` must still be rejected loudly (the migrate-tap-shape guard) —
-        // the two must never be conflated.
+        // `"none"` must still be rejected loudly (the strict-tap guard). The
+        // two must never be conflated.
         let bare: Result<Tap, _> = serde_json::from_str("\"none\"");
         assert!(
             bare.is_err(),

@@ -2,13 +2,20 @@
 //!
 //! An app calls `lucidos.proxy(<name>).fetch(path, init)` → the engine's
 //! `/api/v1/proxy/<name>/<path>` route. When `<name>` has no entry in
-//! `data/config/apis.json` but matches one of the model-registry providers
-//! (`vertex`, `openai`, `openrouter`, `xai`, `anthropic`, `local`), the engine
+//! `data/config/apis.json` but matches a provider the engine holds auth for
+//! (`vertex`, `openai`, `openrouter`, `xai`, `anthropic`, `local`,
+//! `typesafe`), the engine
 //! synthesizes the upstream target here — the provider's API base URL plus a
 //! server-side auth layer sourced from the engine's OWN provider auth, resolved
 //! exactly as the LLM providers resolve it (a stored credential first, then the
 //! provider's env fallback), so a workspace never has to duplicate a provider
 //! credential into `apis.json`.
+//!
+//! **A builtin name is not always a model-registry row.** The first six are
+//! `ProviderKind`s and `typesafe` is not. Jev answers typed questions rather
+//! than holding a conversation, so it never enters the model picker
+//! (ADR 0220). Nothing here needs a `ProviderKind`: a resolver reads a
+//! credential by name and pins a base URL.
 //!
 //! **Precedence.** `apis.json` is consulted first (`resolve_proxy_target`);
 //! this fallback fires only on that 404, so an `apis.json` entry with the same
@@ -30,6 +37,9 @@ use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHin
 use crate::api::proxy_static_layers::StaticHeaderLayer;
 use crate::core::{
     AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
+};
+use crate::llm::judgment::{
+    TYPESAFE_API_BASE_URL, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE,
 };
 use crate::llm::vertex::{self, TokenCache};
 use crate::llm::{
@@ -63,6 +73,10 @@ pub(crate) async fn resolve_builtin_provider(
         "anthropic" => resolve_anthropic(engine.pool()).await.map(Some),
         "local" => resolve_local(engine.pool()).await.map(Some),
         "vertex" => resolve_vertex(engine).await.map(Some),
+        // A literal, like every arm above. A const path in pattern position is
+        // a constant only while its name stays SCREAMING_CASE: lowercase it and
+        // the arm silently becomes a catch-all binding.
+        "typesafe" => resolve_typesafe(engine.pool()).await.map(Some),
         _ => Ok(None),
     }
 }
@@ -159,6 +173,31 @@ async fn resolve_xai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, 
     };
     let layer = StaticHeaderLayer::bearer("xai".to_string(), key, pinned("xai", XAI_BASE_URL));
     Ok((XAI_BASE_URL.to_string(), vec![Arc::new(layer)]))
+}
+
+/// TypeSafe's System One endpoint, for an app that wants a typed judgment.
+///
+/// Reads the same credential and the same env var as
+/// [`crate::llm::judgment::select`], through the same helper. So the proxy and
+/// the engine's own judgment calls cannot disagree about which key is in
+/// effect. Both constants come from that module rather than being spelled
+/// again here.
+async fn resolve_typesafe(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
+    let cred = credential_pair(pool, TYPESAFE_CREDENTIAL_SERVICE).await?;
+    let key = resolve_bearer_key(cred, std::env::var(TYPESAFE_API_KEY_ENV).ok());
+    let Some(key) = key else {
+        return Err(unconfigured_msg(
+            TYPESAFE_CREDENTIAL_SERVICE,
+            "a TypeSafe API key",
+            "add a 'typesafe' credential in Settings → Models → Providers, set TYPESAFE_API_KEY",
+        ));
+    };
+    let layer = StaticHeaderLayer::bearer(
+        TYPESAFE_CREDENTIAL_SERVICE.to_string(),
+        key,
+        pinned(TYPESAFE_CREDENTIAL_SERVICE, TYPESAFE_API_BASE_URL),
+    );
+    Ok((TYPESAFE_API_BASE_URL.to_string(), vec![Arc::new(layer)]))
 }
 
 async fn resolve_anthropic(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
@@ -614,6 +653,81 @@ mod tests {
             injected_headers(&target).await,
             vec![("authorization".to_string(), "Bearer xai-test".to_string())]
         );
+        teardown_test_db(&db).await;
+    }
+
+    /// A seeded `typesafe` credential resolves to the System One root with a
+    /// `Bearer` header. So an app asks Jev a typed question through the proxy,
+    /// and never holds the key itself.
+    #[tokio::test]
+    async fn resolve_typesafe_injects_bearer_from_credential() {
+        let (pool, db) = setup_test_db().await;
+        seed_credential(
+            &pool,
+            TYPESAFE_CREDENTIAL_SERVICE,
+            TYPESAFE_API_BASE_URL,
+            AuthType::ApiKey,
+            "ts-test",
+        )
+        .await;
+
+        let target = resolve_typesafe(&pool).await.expect("typesafe resolves");
+        assert_eq!(target.0, TYPESAFE_API_BASE_URL);
+        assert_eq!(
+            injected_headers(&target).await,
+            vec![("authorization".to_string(), "Bearer ts-test".to_string())]
+        );
+        // The gate every credential-bearing arm passes (ADR 0144 decision 4).
+        // The upstream is a constant in this binary, so it pins to that
+        // constant and no API caller can point the key somewhere else.
+        assert_eq!(
+            target.1[0].scope_bindings(),
+            vec![pinned(TYPESAFE_CREDENTIAL_SERVICE, TYPESAFE_API_BASE_URL)]
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The credential wins over the env var, which is the order
+    /// `judgment::select::api_key` reads them in. A proxy finding a key the
+    /// judgment path does not, or the reverse, is the drift this pins.
+    #[tokio::test]
+    async fn the_typesafe_proxy_prefers_the_credential_over_the_env_var() {
+        let (pool, db) = setup_test_db().await;
+        seed_credential(
+            &pool,
+            TYPESAFE_CREDENTIAL_SERVICE,
+            TYPESAFE_API_BASE_URL,
+            AuthType::ApiKey,
+            "ts-stored",
+        )
+        .await;
+
+        let target = resolve_typesafe(&pool).await.expect("typesafe resolves");
+        assert_eq!(
+            injected_headers(&target).await,
+            vec![("authorization".to_string(), "Bearer ts-stored".to_string())]
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// `typesafe` is a recognized builtin, so an unconfigured one is a 404
+    /// naming what to set rather than the generic unknown-proxy message.
+    /// Skipped when the launch environment supplies a key, since the case
+    /// cannot arise there.
+    #[tokio::test]
+    async fn an_unconfigured_typesafe_proxy_names_what_to_set() {
+        if std::env::var(TYPESAFE_API_KEY_ENV).is_ok() {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+
+        let Err((status, message)) = resolve_typesafe(&pool).await else {
+            panic!("no credential and no env var must not resolve");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(message.contains("typesafe"), "{message}");
+        assert!(message.contains("TYPESAFE_API_KEY"), "{message}");
+        assert!(message.contains("apis.json"), "{message}");
         teardown_test_db(&db).await;
     }
 

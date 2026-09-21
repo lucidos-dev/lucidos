@@ -1,6 +1,6 @@
 import { useSignal } from '@preact/signals';
 import { restartRequired, engineVersionReady, updateAvailable, engineNewVersionReady } from '../../store/store';
-import { initiateEngineRestart } from '../../store/actions/chat-changes';
+import { confirmAndRestartEngine, initiateEngineRestart } from '../../store/actions/chat-changes';
 import { refreshClient } from '../../hooks/sw-update';
 import { ReloadIcon, PowerIcon } from '../shared/icons';
 
@@ -86,24 +86,21 @@ export function WorkspaceRefreshRow({ onClose }: { onClose: () => void }) {
  * Restart: stop and start this workspace's engine, which is also how a new
  * version is switched onto.
  *
- * A tap does NOT restart. It turns the row into its own confirmation, an `OK`
- * button in the trailing slot the Workspaces row puts its value pill in, and
- * only that button fires. Restarting is disruptive (every running session is
- * torn down and resumed) and it sits directly under a Refresh that is not, so a
- * mis-tap must not be able to do it.
+ * A tap does NOT restart. Every running session is torn down and resumed, and
+ * the row sits under a harmless Refresh, so a mis-tap must not do it. What it
+ * raises depends on whether there is a version to read about.
  *
- * The confirm is rendered INSIDE the menu panel on purpose: pressing it neither
- * dismisses the menu nor gets swallowed by the outside-click contract, which a
- * global confirm modal would hit (the menu would treat it as "outside" and eat
- * the click). There is no Cancel: closing the menu IS the cancel, it costs
- * nothing to reach (tap anywhere outside, or Escape), and this state lives in a
- * component the Overlay unmounts on close, so backing out genuinely resets the
- * prompt rather than leaving it armed for the next open. It also keeps the row
- * inside the panel's fixed width, which an icon plus the label plus two buttons
- * did not fit in.
+ * **A new version waits.** The menu closes, then the row opens the shared
+ * restart confirm, which lists what the switch brings. Closing FIRST is
+ * required: the menu's dismiss contract treats a modal raised over it as
+ * "outside", and eats the first click on it.
  *
- * `onClose` shuts the menu once a restart is actually initiated: the app is
- * about to reconnect, so leaving the menu sitting open over it is stale chrome.
+ * **Nothing newer.** Nothing to read, so the row becomes its own confirmation:
+ * an `OK` in the trailing slot, and only that button fires. Closing the menu IS
+ * the cancel, and the Overlay unmounts this component on close.
+ *
+ * `onClose` shuts the menu once a restart is initiated: the app reconnects
+ * next, so leaving the menu open over it is stale chrome.
  */
 export function WorkspaceRestartRow({ onClose }: { onClose: () => void }) {
   const confirming = useSignal(false);
@@ -113,6 +110,10 @@ export function WorkspaceRestartRow({ onClose }: { onClose: () => void }) {
     // `role="none"`, so this is not an orphan node in a `role="menu"` panel:
     // while it is showing, the row is a prompt with a button in it, not a menu
     // item.
+    //
+    // Only a NOT-pending tap reaches this branch, and a build can still land
+    // while the prompt sits open. So the row can light up under it, and the OK
+    // re-reads below rather than trusting the tap that opened it.
     return (
       <div class={`brand-menu-item brand-menu-confirm-row${pending ? ' is-pending' : ''}`} role="none">
         <PowerIcon />
@@ -126,6 +127,13 @@ export function WorkspaceRestartRow({ onClose }: { onClose: () => void }) {
               e.stopPropagation();
               confirming.value = false;
               onClose();
+              // A version that arrived since the first tap gets its own
+              // confirm. Switching onto one through a prompt that never named
+              // it is the one thing this row must not do.
+              if (engineNewVersionReady()) {
+                void confirmAndRestartEngine();
+                return;
+              }
               void initiateEngineRestart();
             }}
           >
@@ -143,7 +151,14 @@ export function WorkspaceRestartRow({ onClose }: { onClose: () => void }) {
       role="menuitem"
       aria-label={tooltip}
       data-tooltip={tooltip}
-      onClick={() => { confirming.value = true; }}
+      onClick={() => {
+        if (pending) {
+          onClose();
+          void confirmAndRestartEngine();
+          return;
+        }
+        confirming.value = true;
+      }}
     >
       <PowerIcon />
       Restart

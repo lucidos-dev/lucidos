@@ -3,7 +3,9 @@ import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadI
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { StandingApplyIcon } from '../shared/icons';
+import { ArchiveIcon, CheckIcon, DiffIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import type { HeaderActionSpec } from '../layout/headerActions';
+import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { blurPromptInputIfFocused } from './promptFocus';
 
@@ -98,87 +100,172 @@ export function getWaitingState(): WaitingState | null {
   return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff };
 }
 
-interface BannerSlots {
-  /** The single secondary item the parent may move onto a row above when the
-   *  natural single-row layout would overflow — the standalone Diff button
-   *  whenever the branch has a diff. `null` when there is nothing worth lifting
-   *  (the busy "Apply..." / "Discard..." spinners and Diff-less actions all fit
-   *  naturally). */
-  liftable: ComponentChildren | null;
-  /** Action buttons that always render on the bottom row, anchored to the
-   *  right. PromptInput places them after the liftable slot and before the
-   *  send control, never inside the lift sub-row. So the bottom row reads
-   *  [icons][Diff][actions][Send] whenever there is room for it. */
-  primary: ComponentChildren;
+/** ONE close-set action, as a ⋯ menu row. The composite split button folds into
+ *  several of these, so the caret's actions survive the fold with the face. */
+function actionMenuRow(action: TaggedAction, ctx: OverflowMenuContext) {
+  return (
+    <button
+      key={action.kind}
+      type="button"
+      class="thread-overflow-item"
+      role="menuitem"
+      onClick={ctx.run(() => void action.invoke())}
+    >
+      {ACTION_ICON[action.kind]?.() ?? null}
+      {action.label}
+    </button>
+  );
 }
 
-/** Splits the banner's buttons into liftable + primary slots so the caller
- *  (PromptInput) can decide whether to render them as one row or stack the
- *  liftable slot above the row that holds the icons. Diff is ALWAYS its own
- *  standalone button in the liftable slot, never folded into the Apply/Discard
- *  cluster. So [Diff][Discard][Apply] sit together when there is room. When
- *  there is not, only Diff hops to a row above and [Discard][Apply] stay on
- *  the bottom. */
-export function getBannerSlots(state: BannerState): BannerSlots {
-  if (state.type === 'applying') {
-    return {
-      liftable: null,
-      primary: <button key="applying" class="action-btn action-btn-confirm" data-row-item disabled>Apply...</button>,
-    };
-  }
+/** A glyph per close-set kind, for the menu row. The row buttons carry words,
+ *  so this exists only for the folded rendering. */
+const ACTION_ICON: Record<string, () => ComponentChildren> = {
+  apply: () => <CheckIcon />,
+  discard: () => <TrashIcon />,
+  archive: () => <ArchiveIcon />,
+};
 
-  if (state.type === 'discarding') {
-    return {
-      liftable: null,
-      primary: <button key="discarding" class="action-btn action-btn-danger" data-row-item disabled>Discard...</button>,
-    };
-  }
-
+/** The banner's members, in FOLD ORDER, as specs the composer row can fold.
+ *
+ *  Diff folds before the change actions: looking is cheaper to postpone than
+ *  doing. A busy state is one member, the spinner, and it folds like any other
+ *  rather than being a reason to overflow the box. */
+export function getBannerActions(state: BannerState): HeaderActionSpec[] {
+  if (state.type === 'applying') return [busyAction('applying', 'action-btn-confirm', 'Apply...')];
+  if (state.type === 'discarding') return [busyAction('discarding', 'action-btn-danger', 'Discard...')];
   // Archive in flight: a dedicated disabled spinner (the selector no longer
   // returns an Archive action once the optimistic section flips).
-  if (state.isArchiving) {
-    return {
-      liftable: null,
-      primary: <button key="archive" class="action-btn" data-row-item disabled aria-label="Archive thread">Archive...</button>,
-    };
-  }
+  if (state.isArchiving) return [busyAction('archiving', '', 'Archive...')];
 
-  // Diff is ALWAYS its own standalone button in the liftable slot — never folded
-  // into the Apply/Discard cluster. It shows whenever the branch has a diff on
-  // disk (state.showDiff), independent of whether the close set has an Apply.
-  const liftable = state.showDiff ? renderDiffButton(state.threadId) : null;
+  const members: HeaderActionSpec[] = [];
+  // Diff shows whenever the branch has a diff on disk, independent of whether
+  // the close set has an Apply. It always opens the thread-level branch diff.
+  // The historical change-row Diff buttons (ChatExchange, ChangesView) call
+  // viewChangeDiff for one Change; this asks what the branch looks like now.
+  if (state.showDiff) members.push(diffAction(state.threadId));
 
-  // When the close set has a primary Apply action, collapse the remaining
-  // close-set buttons into a split button — a one-tap "Apply (& Restart)" face
-  // plus a caret menu holding the other action(s) (Discard, Archive). One
-  // compact control instead of two or three buttons that overflowed the prompt
-  // row. Diff sits outside it, in the liftable slot above. The separate-button
-  // path below runs for the no-Apply states (e.g. an idle CC thread with a diff
-  // but no pending change → Archive + standalone Diff).
+  // When the close set has a primary Apply, the remaining close-set buttons
+  // collapse into a split button: a one-tap face plus a caret menu holding the
+  // others. One compact control instead of two or three. Folded, it is several
+  // menu rows, because the caret's actions would otherwise go with it.
   const applyAction = state.actions.find((a) => a.kind === 'apply');
   if (applyAction) {
     const menuActions = state.actions.filter((a) => a !== applyAction);
-    return {
-      liftable,
-      primary: (
+    members.push({
+      key: 'change-actions',
+      label: applyAction.label,
+      tooltip: applyAction.tooltip,
+      icon: () => <CheckIcon />,
+      render: (attrs) => (
         <ChangeActionSplitButton
           primary={applyAction}
           menuActions={menuActions}
+          attrs={attrs}
         />
       ),
-    };
+      menuRows: (ctx) => [applyAction, ...menuActions].map((a) => actionMenuRow(a, ctx)),
+    });
+    return members;
   }
 
-  // Diff always opens the thread-level branch diff. The historical
-  // change-row Diff buttons (ChatExchange, ChangesView) call viewChangeDiff
-  // for a specific Change; the WaitingBanner's affordance is "show me what
-  // this thread's branch looks like right now" — backed by codingAgentHasDiff,
-  // not by any one Change row.
-  const actionButtons = state.actions.map((action) => renderActionButton(action));
+  // The no-Apply states (an idle coding-agent thread with a diff but no pending
+  // change, so Archive plus a standalone Diff). Each button is its own member,
+  // so the row can fold one without the other.
+  for (const action of state.actions) members.push(closeSetAction(action));
+  return members;
+}
 
+/** The members the row carries when the banner is SUPPRESSED because the thread
+ *  is still working: the same Diff, and the standing apply.
+ *
+ *  Diff is decoupled from `waitingState` so the user-facing rule "branch has a
+ *  diff, Diff visible" holds whatever the coding agent's run-state. The
+ *  standing apply is here because that row used to lift Diff and nothing else.
+ *  A working thread then offered no way to arm an apply at all. */
+export function getStandaloneActions(): HeaderActionSpec[] {
+  const focused = focusedThreadId.value;
+  if (!focused) return [];
+  const members: HeaderActionSpec[] = [];
+  const thread = threadMap.value.get(focused);
+  if (thread && thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff) {
+    members.push(diffAction(focused));
+  }
+  const standing = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
+  if (standing) {
+    members.push({
+      key: 'standing-apply',
+      dataRole: 'standing-apply',
+      label: standing.label,
+      tooltip: standing.tooltip,
+      icon: () => <StandingApplyIcon armed={standingApplyThreadIds.value.has(focused)} />,
+      render: (attrs) => (
+        <StandingApplyButton threadId={focused} action={standing} attrs={attrs} />
+      ),
+      onClick: () => void standing.invoke(),
+    });
+  }
+  return members;
+}
+
+function diffAction(threadId: string): HeaderActionSpec {
   return {
-    liftable,
-    primary: <>{actionButtons}</>,
+    key: 'thread-diff',
+    dataRole: 'thread-diff',
+    label: 'Diff',
+    tooltip: 'Show what this thread changed',
+    icon: () => <DiffIcon />,
+    render: (attrs) => <DiffButton threadId={threadId} attrs={attrs} />,
+    onClick: () => {
+      blurPromptInputIfFocused();
+      void viewThreadCcDiff(threadId);
+    },
+  };
+}
+
+/** A request in flight. Disabled on both sides: `disabledTooltip` is what makes
+ *  the folded row `aria-disabled` rather than a live action. */
+function busyAction(key: string, variant: string, label: string): HeaderActionSpec {
+  return {
+    key,
+    label,
+    disabledTooltip: label,
+    icon: () => null,
+    render: (attrs) => (
+      <button {...attrs} class={`action-btn ${variant}`.trim()} disabled aria-label={label}>
+        {label}
+      </button>
+    ),
+  };
+}
+
+/** Render one close-set TaggedAction as a member. Class and aria derive from
+ *  the kind; label, tooltip and the (confirm-wrapped) handler come from the
+ *  selector. */
+function closeSetAction(action: TaggedAction): HeaderActionSpec {
+  const cls =
+    action.kind === 'discard'
+      ? 'action-btn action-btn-danger'
+      : action.kind === 'apply'
+        ? 'action-btn action-btn-confirm'
+        : 'action-btn';
+  const label = action.kind === 'archive' ? 'Archive thread' : action.label;
+  return {
+    key: action.kind,
+    label,
+    tooltip: action.tooltip,
+    icon: () => ACTION_ICON[action.kind]?.() ?? null,
+    render: (attrs) => (
+      <button
+        {...attrs}
+        class={cls}
+        aria-label={action.kind === 'archive' ? label : undefined}
+        data-tooltip={action.tooltip}
+        onClick={() => void action.invoke()}
+      >
+        {action.label}
+      </button>
+    ),
+    onClick: () => void action.invoke(),
   };
 }
 
@@ -193,9 +280,11 @@ export function getBannerSlots(state: BannerState): BannerSlots {
 function ChangeActionSplitButton({
   primary,
   menuActions,
+  attrs,
 }: {
   primary: TaggedAction;
   menuActions: TaggedAction[];
+  attrs?: Record<string, string>;
 }) {
   const menuItems: SplitButtonMenuItem[] = menuActions.map((action) => ({
     key: action.kind,
@@ -213,6 +302,7 @@ function ChangeActionSplitButton({
       caretClassName="action-btn action-btn-confirm"
       caretAriaLabel="More change actions"
       menuItems={menuItems}
+      attrs={attrs}
     />
   );
 }
@@ -223,31 +313,39 @@ function ChangeActionSplitButton({
  *  button is always clickable, with no disabled form. Same key in both so Preact
  *  treats it as one node across banner and standalone transitions.
  *
+ *  An ICON, wearing the shape the standing apply beside it already wears. The
+ *  blue pill it replaces was the widest control on a phone's prompt row. The
+ *  word survives as the `aria-label`, and `data-tooltip-longpress` puts the
+ *  tooltip within reach of a finger (`hooks/useTooltip.ts`).
+ *
  *  TOUCH ACTIVATED, like the composer's Send and its answer Submit beside it.
- *  This button sits in the prompt row, so the user reaches it with the mobile
- *  keyboard up, and there WebKit drops the synthetic click. It was reported dead
- *  in exactly that state. Diff is non-destructive and idempotent, so it takes
- *  the touch path with none of the reasons Stop and Cancel decline it.
+ *  The user reaches this row with the mobile keyboard up, and there WebKit
+ *  drops the synthetic click. It was reported dead in exactly that state. Diff
+ *  is non-destructive and idempotent, so it takes the touch path.
  *
  *  A component rather than a function returning JSX, because it holds a hook and
  *  `getBannerSlots` is called conditionally from `PromptInput`'s render.
  *
- *  The action blurs the composer itself. `touchActivated` suppresses the click,
- *  and `installActionBtnBlurListener` listens on `click`, so the shared keyboard
- *  drop never runs for a touch-activated face. */
-export function DiffButton({ threadId }: { threadId: string }) {
+ *  It drops the keyboard itself, because nothing else will now: the shared
+ *  `installActionBtnBlurListener` fires for an `.action-btn`, which this no
+ *  longer is, and a touch-activated face suppresses the click it listens on. */
+export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Record<string, string> }) {
   const activate = useTouchActivated(() => {
     blurPromptInputIfFocused();
     void viewThreadCcDiff(threadId);
   });
   return (
     <button
-      class="action-btn"
-      data-row-item
+      {...attrs}
+      class="icon-btn header-icon"
+      data-role="thread-diff"
+      aria-label="Diff"
+      data-tooltip="Show what this thread changed"
+      data-tooltip-longpress=""
       onTouchEnd={activate.onTouchEnd}
       onClick={activate.onClick}
     >
-      Diff
+      <DiffIcon />
     </button>
   );
 }
@@ -283,17 +381,19 @@ function renderDiffButton(threadId: string): ComponentChildren {
 export function StandingApplyButton({
   threadId,
   action,
+  attrs,
 }: {
   threadId: string;
   action: TaggedAction;
+  attrs?: Record<string, string>;
 }) {
   const busy = armingStandingApplyThreadIds.value.has(threadId);
   const armed = standingApplyThreadIds.value.has(threadId);
   return (
     <button
+      {...attrs}
       class={`icon-btn header-icon${armed ? ' active' : ''}`}
       data-role="standing-apply"
-      data-row-item
       aria-pressed={armed}
       aria-label={action.label}
       data-tooltip={action.tooltip}
@@ -337,27 +437,4 @@ export function getStandaloneCcDiffButton(): ComponentChildren | null {
   if (thread.meta.channel !== 'claude_code') return null;
   if (!thread.meta.codingAgentHasDiff) return null;
   return renderDiffButton(focused);
-}
-
-/** Render one close-set TaggedAction. Class + aria derive from the action kind;
- *  label, tooltip, and the (confirm-wrapped) handler come from the selector. */
-function renderActionButton(action: TaggedAction) {
-  const cls =
-    action.kind === 'discard'
-      ? 'action-btn action-btn-danger'
-      : action.kind === 'apply'
-        ? 'action-btn action-btn-confirm'
-        : 'action-btn';
-  return (
-    <button
-      key={action.kind}
-      class={cls}
-      data-row-item
-      aria-label={action.kind === 'archive' ? 'Archive thread' : undefined}
-      data-tooltip={action.tooltip}
-      onClick={() => void action.invoke()}
-    >
-      {action.label}
-    </button>
-  );
 }

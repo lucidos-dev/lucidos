@@ -39,8 +39,8 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
     available_disk_bytes, deterministic_worktree_for, directory_size_bytes, inventory_worktrees,
     is_worktree_dirty, prune_build_artifacts, remove_stranded_worktree,
-    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, BranchDisposal,
-    FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
+    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, ActiveThreads,
+    AgentSessionsActiveThreads, BranchDisposal, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
 };
 
 /// GET /api/v1/disk-usage/worktrees — inventory of all known per-thread worktrees.
@@ -74,6 +74,28 @@ pub(super) async fn cleanup_worktree(
         return Err((
             StatusCode::NOT_FOUND,
             format!("No worktree on disk for thread {}", thread_uuid),
+        ));
+    }
+
+    // Ask the same question the background worker asks first, and for the same
+    // reason (`worktree_cleanup.rs`): a live coding-agent session parked on
+    // `AskUserQuestion` emits no events, so no age or dirtiness check can see
+    // it. Tier 1 strips the build artifacts a running build is using. Tiers 2
+    // and 3 delete the directory the subprocess runs in, and take its branch
+    // with them. The worker's helpers say "the caller has already skipped
+    // active", and this caller had not.
+    if AgentSessionsActiveThreads::new(state.engine.agent_sessions.clone())
+        .is_active(thread_uuid)
+        .await
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Thread {} has a live coding-agent session in this worktree. \
+                 Stop it first, or wait for it to finish: cleaning up now would \
+                 delete the tree it is working in.",
+                thread_uuid
+            ),
         ));
     }
 
@@ -208,4 +230,55 @@ pub(super) fn router() -> Router<AppState> {
             "/disk-usage/worktrees/:thread_id/cleanup",
             post(cleanup_worktree),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// This file with its test module cut off. Uncut, a scan can match its own
+    /// test fixtures and pass while production has lost the thing it pins.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("api/disk_usage.rs"),
+        )
+    }
+
+    /// A live session answers `is_active`, and nothing else here can.
+    ///
+    /// `AgentSession::is_live` is the liveness signal, not mere presence in the
+    /// map: a phantom left by a dropped run future used to hold `true` forever
+    /// and block reclamation of a tree whose subprocess was long gone.
+    #[tokio::test]
+    async fn an_empty_session_map_reports_no_live_thread() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let probe = AgentSessionsActiveThreads::new(sessions);
+        assert!(!probe.is_active(uuid::Uuid::new_v4()).await);
+    }
+
+    /// The liveness gate runs BEFORE the tier match, so every tier is covered.
+    ///
+    /// A gate inside one tier arm leaves the other two destroying a live
+    /// session's tree. `cleanup_worktree` states what each tier removes.
+    #[test]
+    fn the_cleanup_handler_refuses_a_live_session_before_it_picks_a_tier() {
+        let src = production_src();
+        let at = src
+            .find("pub(super) async fn cleanup_worktree")
+            .expect("cleanup_worktree is still here");
+        let body = &src[at..];
+        let gate = body
+            .find("is_active(thread_uuid)")
+            .expect("cleanup_worktree must ask whether a coding-agent session is live");
+        let tiers = body
+            .find("match req.tier")
+            .expect("cleanup_worktree still dispatches on the tier");
+        assert!(
+            gate < tiers,
+            "the live-session refusal must come before the tier match, or tier 1 \
+             still strips a running build's artifacts"
+        );
+    }
 }

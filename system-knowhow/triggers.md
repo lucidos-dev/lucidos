@@ -26,6 +26,7 @@ The working reference for *triggers*: choosing one, building it, editing it, and
 | "When either X or Y happens, do Z" | One trigger with multiple entries in `on` — not two parallel triggers |
 | "Check this once and tell me" | Just do it now, no trigger |
 | "Remind me at 5pm today" | One-shot trigger (cron for today) — see "One-shot triggers" below |
+| "Turn trigger X back on afterwards" / "re-enable X tomorrow" | A trigger cannot re-arm another trigger. Use a skip marker, or a human re-arm. See "What a trigger fire may not do to other triggers" |
 | "Tell me **here** when X happens" | `await_event`, NOT a trigger. See the next section |
 
 ### First ask where the answer goes, not just how often
@@ -705,6 +706,31 @@ Copying `run.intent` into `run_thread`, or running the trigger's script yourself
 
 Both stay fine for **debugging** ("does the script still crash?"), as long as you call it that. A hand-run script gets none of `TRIGGER_EVENT_TYPE` / `TRIGGER_EVENT_PAYLOAD` / `TRIGGER_EVENT_ID` / `TRIGGER_EVENT_THREAD_ID`, so an event-driven one raises `KeyError` on the first lookup, and `LUCIDOS_THREAD_ID` points at your conversation, so any `lucidos notify` lands in the wrong thread.
 
+## What a trigger fire may not do to other triggers
+
+**A trigger fire may act on itself and on nothing else, and even on itself it may not run itself.** The engine enforces it. Five scheduling tools are gated during a fire, and the `run` action is stricter still.
+
+| Tool | On the firing trigger itself | On any other trigger |
+|---|---|---|
+| `create_trigger` | refused | refused |
+| `update_trigger` | refused | refused |
+| `delete_trigger` | allowed | refused |
+| `pause_trigger` | allowed | refused |
+| `resume_trigger` | allowed | refused |
+| `run` | refused | refused |
+
+Self-delete and self-pause are allowed because they **terminate**: the fire acts on its own id and stops. Self-run is refused because it **recurses**. The per-trigger concurrency cap is 1, so a self-run cannot start a second copy. Each fire instead adds one entry to a queue that never drains. That is why `run` is refused even on the firing trigger's own id, where pause and delete are not.
+
+The consequence for whoever writes a trigger: **a trigger whose purpose is to re-arm, reschedule, pause, or reconfigure ANOTHER trigger cannot work.** Nothing validates this when you create it. It arms clean, its panel row looks healthy, and it fires on time. The work fails only at the moment it runs.
+
+### What to do instead
+
+The realistic case is the one that keeps happening. A recurring trigger is paused so a one-off run can take its place, and something has to turn it back on. In order of preference:
+
+1. **Do not pause the recurring trigger at all.** Have it read a skip marker, a small file or a domain event. It then skips its own next run when the marker is set. The recurring trigger stays armed throughout, so nothing has to re-arm it, and the skip clears itself.
+2. **If it must be paused, the re-arm is a human action.** A one-shot trigger that NOTIFIES the user the paused trigger needs resuming does work, because a notification is not a scheduling call. Tell the user plainly that this is a reminder, not an automation.
+3. **Do not route around the guard with `curl`.** The `run` refusal already holds at the HTTP layer, and the other guards are ones the engine states explicitly. Posting to the engine API to reach another trigger is out of bounds.
+
 ## Questions to settle with the user before creating
 
 Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled — confirm before writing the trigger. Skip questions only when the user has already answered them in the same turn.
@@ -806,6 +832,7 @@ in `list_triggers`.
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
 - **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
+- **A trigger that manages another trigger.** Re-arming, rescheduling, pausing, or running a *different* trigger is refused at fire time. Nothing catches it earlier: the create succeeds and the panel row looks healthy, so it stays invisible until the fire. See § "What a trigger fire may not do to other triggers".
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. Almost always because the knowhow file was never written first. See "Write the knowhow file FIRST, then the intent" above.
 - **A webhook condition without the `payload.` prefix.** The delivery is wrapped, so `{"action": "completed"}` matches nothing. Nothing warns you: the trigger stays healthy and never fires again. See § "The envelope: a webhook's body lands under `payload`".
 - **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.

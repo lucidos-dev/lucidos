@@ -17,11 +17,11 @@ import type { Page } from './fixtures';
  * Verifies the WaitingBanner Diff affordance reacts to `coding_agent_has_diff`
  * flips driven by the projection. Diff SHOWS only when there is a diff — no diff
  * means no Diff affordance at all (not a greyed/disabled one). Diff is always a
- * standalone top-level button (never folded into the Apply/Discard split menu),
+ * standalone top-level icon (never folded into the Apply/Discard split menu),
  * so `diffVisible()` just checks for that button.
  *
  *   - CC thread, no diff     → Diff hidden.
- *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (standalone button).
+ *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (standalone icon).
  *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disappears.
  *
  * The seed step uses `POST /api/v1/internal/seed-change-for-test`, which emits
@@ -34,11 +34,11 @@ import type { Page } from './fixtures';
  */
 
 /** Whether the Diff affordance is currently available. Diff is always a
- *  standalone top-level button in the banner (never folded into the Apply/Discard
+ *  standalone top-level icon in the banner (never folded into the Apply/Discard
  *  split menu), so this is a single top-level check. Used inside `expect.poll` so
  *  it converges as SSE settles the projection. */
 async function diffVisible(page: Page): Promise<boolean> {
-  return page.locator('.thread-action-buttons:visible button:has-text("Diff")').first()
+  return page.locator('.thread-action-buttons:visible button[data-role="thread-diff"]').first()
     .isVisible().catch(() => false);
 }
 

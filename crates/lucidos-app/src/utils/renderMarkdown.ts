@@ -3,6 +3,7 @@ import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
 import { lucidos } from '@lucidos/sdk';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
+import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
 import { DATA_PATH_PREFIXES } from './linkifyPaths';
@@ -53,6 +54,47 @@ const COPY_MARKER_PATTERN = new RegExp(
 
 const CODE_PROTECTION_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
 
+/** Attribute carrying a copy block's slot while the markup crosses the
+ *  sanitizer. `resolveCopyTargets` writes the real payload attribute
+ *  afterwards, in the DOM.
+ *
+ *  Raw HTML in markdown source reaches DOMPurify, which keeps `class` and every
+ *  `data-*` by default. Model output could therefore write
+ *  `class="copyable-block" data-copy-text="…"` itself, and the click handler in
+ *  `useStartup` hands that value straight to the clipboard. The user then
+ *  pastes a command they never read. `data-copy-text` is in `FORBID_ATTR`, so
+ *  content cannot write the payload. */
+const COPY_ID_ATTR = 'data-copy-id';
+
+/** Unguessable prefix on every slot id, so content cannot name a slot.
+ *
+ *  A bare counter is not enough, and "a forged id only yields text a real block
+ *  already offered" was the wrong reassurance: content authors BOTH halves. It
+ *  writes a real `<copy>` block, collapsed inside `<details>` where nobody
+ *  reads it, then a forged span labelled `brew install lucidos` carrying that
+ *  block's id. The label and the payload are then decoupled, which is the whole
+ *  attack. With an unguessable prefix there is no id to forge.
+ *
+ *  Once per module load, not per render: the nonce never reaches the DOM,
+ *  because `resolveCopyTargets` removes the attribute it rides on, and the
+ *  streaming buffer re-renders per token. */
+const COPY_ID_NONCE = ((): string => {
+  const bytes = new Uint8Array(8);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+})();
+
+/** The slot a `data-copy-id` names, or `undefined` when content wrote it. */
+function copyTextForSlot(attr: string | null, copyTexts: Map<number, string>): string | undefined {
+  const prefix = `${COPY_ID_NONCE}-`;
+  if (attr === null || !attr.startsWith(prefix)) return undefined;
+  return copyTexts.get(Number(attr.slice(prefix.length)));
+}
+
 /**
  * Convert <copy>...</copy> tags to copyable UI blocks.
  *
@@ -60,6 +102,8 @@ const CODE_PROTECTION_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
  * uses HTML comment markers that survive marked, which postprocessCopyBlocks
  * then wraps: CommonMark's HTML block rule ends a <div> at the first blank
  * line.
+ *
+ * Both shapes carry a slot id rather than the text: see `COPY_ID_ATTR`.
  */
 function preprocessCopyBlocks(md: string, encodedTexts: Map<number, string>): string {
   // Protect fenced code blocks and inline code spans from copy tag matching.
@@ -73,42 +117,53 @@ function preprocessCopyBlocks(md: string, encodedTexts: Map<number, string>): st
   let counter = 0;
   safeMd = safeMd.replace(/<copy>([\s\S]*?)<\/copy>/g, (_match, content: string) => {
     const trimmed = content.trim();
-    const encoded = trimmed
-      .replace(/&/g, '&amp;')
-      .replace(/"/g, '&quot;')
-      .replace(/\n/g, '&#10;');
-
     const isMultiline = trimmed.includes('\n');
 
-    // Restore any protected code spans in the copy text so backticks are preserved
-    const restoredEncoded = encoded.replace(/\x00CODE(\d+)\x00/g, (_, idx) => {
-      const original = codeSlots[parseInt(idx, 10)];
-      return original.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-    });
+    // Restore any protected code spans in the copy text so backticks are
+    // preserved. Stored RAW: `setAttribute` in `resolveCopyTargets` escapes it.
+    const restored = trimmed.replace(/\x00CODE(\d+)\x00/g, (_, idx) =>
+      codeSlots[parseInt(idx, 10)],
+    );
+
+    const id = counter++;
+    encodedTexts.set(id, restored);
 
     if (!isMultiline) {
-      return `<span class="copyable-block" data-copy-text="${restoredEncoded}">` +
+      return `<span class="copyable-block" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${id}">` +
         trimmed +
         `<button type="button" class="copy-btn" aria-label="Copy to clipboard">${COPY_ICON}</button>` +
         `</span>`;
     }
 
-    const id = counter++;
-    encodedTexts.set(id, restoredEncoded);
     return `<!--${COPY_MARKER}_START_${id}-->\n\n${trimmed}\n\n<!--${COPY_MARKER}_END_${id}-->`;
   });
 
   return safeMd.replace(/\x00CODE(\d+)\x00/g, (_, idx) => codeSlots[parseInt(idx, 10)]);
 }
 
-function postprocessCopyBlocks(html: string, encodedTexts: Map<number, string>): string {
-  return html.replace(COPY_MARKER_PATTERN, (_match, idStr: string, inner: string) => {
-    const id = parseInt(idStr, 10);
-    const encoded = encodedTexts.get(id) ?? '';
-    return `<div class="copyable-block copyable-block-multi" data-copy-text="${encoded}">` +
+function postprocessCopyBlocks(html: string): string {
+  return html.replace(COPY_MARKER_PATTERN, (_match, idStr: string, inner: string) =>
+    `<div class="copyable-block copyable-block-multi" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${idStr}">` +
       inner.trim() +
       `<button type="button" class="copy-btn" aria-label="Copy to clipboard">${COPY_ICON}</button>` +
-      `</div>`;
+      `</div>`,
+  );
+}
+
+/** Write each copy block's payload onto the sanitized tree, from the slot map.
+ *
+ *  Runs AFTER the sanitizer, which is the whole point: `data-copy-text` is
+ *  forbidden there, so every surviving one was written here, from a slot this
+ *  render allocated and named with `COPY_ID_NONCE`. An id content invented loses
+ *  its attribute. The copy handler then reads that block as having no text,
+ *  and `useStartup` returns on the null. */
+function resolveCopyTargets(html: string, copyTexts: Map<number, string>): string {
+  return inDom(html, [COPY_ID_ATTR], (body) => {
+    for (const el of Array.from(body.querySelectorAll(`[${COPY_ID_ATTR}]`))) {
+      const raw = copyTextForSlot(el.getAttribute(COPY_ID_ATTR), copyTexts);
+      el.removeAttribute(COPY_ID_ATTR);
+      if (raw !== undefined) el.setAttribute('data-copy-text', raw);
+    }
   });
 }
 
@@ -202,6 +257,17 @@ const PURIFY_CONFIG = {
   // otherwise keep. `animate` and `set` are already in its SVG denylist, and
   // stay listed so this policy does not rest on that default.
   FORBID_TAGS: ['style', 'animate', 'animateTransform', 'set'],
+  // The clipboard payload, which only `resolveCopyTargets` may write, and
+  // which DOMPurify's defaults would otherwise let content author. See
+  // `COPY_ID_ATTR`.
+  //
+  // `style` is NOT here. A kept `position: fixed` does let content paint its
+  // own chrome over the app, and `opacity: 0` does hide text from the reader.
+  // But this config is shared. `sanitizeHtmlFragments` also scrubs
+  // `SlidesPreview` and `RenderedDiff`, where authored markup carries inline
+  // style as its only styling channel. Forbidding it here silently unstyles
+  // every existing deck, so that hole wants a per-caller config.
+  FORBID_ATTR: ['data-copy-text'],
   ALLOWED_URI_REGEXP,
 };
 
@@ -231,60 +297,115 @@ export function sanitizeHtmlFragments(html: string): string {
  *  number. */
 const STACK_MIN_COLUMNS = 4;
 
-const TABLE_BLOCK = /<table>([\s\S]*?)<\/table>/g;
-const TABLE_ROW = /<tr>[\s\S]*?<\/tr>/g;
-const HEADER_CELL = /<th\b[^>]*>([\s\S]*?)<\/th>/g;
-const BODY_CELL = /<td\b([^>]*)>([\s\S]*?)<\/td>/g;
-
-/** Undo marked's text escaping so a header can be re-escaped for an attribute
- *  without double-escaping. `&amp;` is decoded LAST: a source `&lt;` that
- *  marked wrote as `&amp;lt;` then survives as the four characters the author
- *  typed, instead of collapsing into a `<`.
+/** The inert body the post-sanitizer passes work in, made once.
  *
- *  Nothing security-sensitive reads this. It runs on a header cell that is
- *  already sanitized, and its output goes straight back into an attribute
- *  through `escapeHtmlAttr`. */
-function decodeMarkedTextEscapes(s: string): string {
-  return s
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, '&');
+ *  `createHTMLDocument` has no browsing context, so it runs no script and
+ *  loads no resource. Its input here is already sanitized, so that is belt to
+ *  the braces rather than the guard itself.
+ *
+ *  Its own body rather than the one `utils/escapeHtml.ts` memoizes for
+ *  `stripHtml`, sharing only the probe. One shared node would let either pass
+ *  read markup the other left behind.
+ *
+ *  `undefined` means not yet probed, `null` means this environment has no
+ *  `createHTMLDocument`. Every browser Lucidos ships on has carried it for
+ *  over a decade, and `sanitizeHtmlFragments` has already refused a caller
+ *  with no DOM at all. */
+let renderBody: HTMLElement | null | undefined;
+
+function inertRenderBody(): HTMLElement | null {
+  if (renderBody === undefined) renderBody = makeInertBody();
+  return renderBody;
 }
 
-/** A header cell's plain text, safe to sit inside a double-quoted attribute.
- *  Inline markup (`<code>`, `<strong>`, a link) is dropped rather than
- *  rendered, since `content: attr(data-label)` can only produce a text run. */
-function headerCellLabel(cellHtml: string): string {
-  return escapeHtmlAttr(decodeMarkedTextEscapes(cellHtml.replace(/<[^>]*>/g, '')).trim());
+/** Run `pass` over `html` parsed into the inert body, and serialize the result.
+ *
+ *  **A pass that anchors on `<` or `>` belongs here, never in a regex.** The
+ *  serializer leaves both raw inside an attribute value. So no pattern can
+ *  tell a real `<td` or `<img` from the same characters in a `title`. Both
+ *  string passes this replaced were injection sinks. One put a column label in
+ *  attribute-name position. The other freed a real `<img onerror>` out of a
+ *  `title` into element position.
+ *
+ *  The `thread:` rewrite below stays a regex for the reason that names: it
+ *  anchors on `"`, which the serializer DOES escape inside a value, so it
+ *  cannot match inside one.
+ *
+ *  `needles` gate the parse. The live streaming buffer re-renders per token,
+ *  and most documents carry no image and no table, so those pay one substring
+ *  search and nothing else. `docs/code-review-priors.md` carries the measured
+ *  cost of the parse, so a later reviewer need not re-derive it. */
+function inDom(html: string, needles: string[], pass: (body: HTMLElement) => void): string {
+  if (!needles.some((needle) => html.includes(needle))) return html;
+  const body = inertRenderBody();
+  if (!body) return html;
+  body.innerHTML = html;
+  try {
+    pass(body);
+    return body.innerHTML;
+  } finally {
+    // Emptied whatever happened, so a throw cannot leave one render's markup
+    // visible to the next one.
+    body.textContent = '';
+  }
+}
+
+/** A table's own `<th>` and `<tr>`, never a nested table's.
+ *
+ *  `querySelectorAll` reaches every descendant. Unscoped, it counted a nested
+ *  table's headers toward the outer column count, and stamped the outer
+ *  labels onto the inner cells. */
+function ownDescendants<T extends Element>(table: Element, selector: string): T[] {
+  return Array.from(table.querySelectorAll<T>(selector))
+    .filter((el) => el.closest('table') === table);
+}
+
+/** A column header's plain text, with angle brackets dropped.
+ *
+ *  Inline markup (`<code>`, a link) goes with them: `content: attr(data-label)`
+ *  can only produce a text run, so `textContent` is the whole label.
+ *
+ *  **Temporary measure**, `docs/temporary-measures.md` § "Angle brackets kept
+ *  out of `data-label`". The serializer writes `<` and `>` raw inside an
+ *  attribute value, and `utils/linkifyPaths.ts` then re-scans this output with
+ *  a tag regex. A raw `>` ends its idea of the tag mid-value. It splices a
+ *  link into what is left, which puts the rest of the label in attribute-name
+ *  position. Dropping the two characters costs a rare header the bracket it
+ *  typed, on the phone caption only. */
+function stackLabelText(cell: Element): string {
+  return (cell.textContent ?? '').replace(/[<>]/g, '').trim();
+}
+
+/** Stamp `data-stack` plus a per-cell `data-label` carrying its column header,
+ *  on a table wide enough to read as cards on a phone.
+ *
+ *  The column index restarts per row, so a row carrying a different cell count
+ *  cannot shift every later row's labels by one. */
+function stampStackLabels(table: Element): void {
+  const labels = ownDescendants(table, 'th').map(stackLabelText);
+  if (labels.length < STACK_MIN_COLUMNS) return;
+  table.setAttribute('data-stack', '');
+  for (const row of ownDescendants(table, 'tr')) {
+    let col = 0;
+    for (const cell of Array.from(row.children)) {
+      if (cell.tagName !== 'TD') continue;
+      cell.setAttribute('data-label', labels[col] ?? '');
+      col += 1;
+    }
+  }
 }
 
 /** Wrap every table in the scroll container that lets it pan sideways instead
- *  of squeezing its columns, and stamp the ones wide enough to stack on a
- *  phone with `data-stack` plus a per-cell `data-label` carrying its column
- *  header. GFM forbids a nested table, so the non-greedy block match is exact.
- *
- *  A string transform rather than a DOM one: this runs inline on every render
- *  of every exchange. The unit tests also run under node with stub `document`
- *  objects (src/test-setup.ts), where there is no DOMParser. */
+ *  of squeezing its columns. Stamp the wide ones for the phone layout. */
 function transformTables(html: string): string {
-  return html.replace(TABLE_BLOCK, (_match, body: string) => {
-    const labels = [...body.matchAll(HEADER_CELL)].map((m) => headerCellLabel(m[1]));
-    if (labels.length < STACK_MIN_COLUMNS) {
-      return `<div class="table-scroll-wrapper"><table>${body}</table></div>`;
+  return inDom(html, ['<table'], (body) => {
+    for (const table of Array.from(body.querySelectorAll('table'))) {
+      stampStackLabels(table);
+      const wrapper = body.ownerDocument.createElement('div');
+      wrapper.className = 'table-scroll-wrapper';
+      table.replaceWith(wrapper);
+      wrapper.append(table);
     }
-    // Column index resets per row, so a row that somehow carries a different
-    // cell count cannot shift every later row's labels by one.
-    const labelled = body.replace(TABLE_ROW, (row) => {
-      let col = 0;
-      return row.replace(BODY_CELL, (_cell, attrs: string, inner: string) => {
-        const label = labels[col] ?? '';
-        col += 1;
-        return `<td${attrs} data-label="${label}">${inner}</td>`;
-      });
-    });
-    return `<div class="table-scroll-wrapper"><table data-stack>${labelled}</table></div>`;
   });
 }
 
@@ -298,8 +419,8 @@ function transformTables(html: string): string {
  *  and that miss shows up as an `<img>` served the SPA fallback. */
 const WORKSPACE_DATA_DIRS = new Set(DATA_PATH_PREFIXES.map((p) => p.slice(0, -1)));
 
-/** The attribute-ready `src` for a workspace-relative image source, or `null`
- *  when the source is not ours to resolve.
+/** The served `src` for a workspace-relative image source, or `null` when the
+ *  source is not ours to resolve.
  *
  *  Workspace files are served under the `/data` mount, so a bare
  *  `artifacts/x.png` resolves against the SPA base instead, which no route
@@ -337,17 +458,10 @@ function workspaceDataImageSrc(src: string): string | null {
   const segments = path.split('/');
   if (!WORKSPACE_DATA_DIRS.has(segments[0])) return null;
   if (segments.includes('..')) return null;
-  // Only the path half is escaped for the attribute, and even there it is
-  // defence in depth: every segment comes back percent-encoded. The suffix is
-  // a verbatim slice of an already-escaped attribute value, so re-escaping it
-  // would turn `?a=1&amp;b=2` into `&amp;amp;`.
-  return `${escapeHtmlAttr(lucidos.data.url(path))}${suffix}`;
+  // Plain text, not attribute-ready: `setAttribute` is what writes it, and the
+  // serializer escapes on the way out. Escaping here too would double it.
+  return `${lucidos.data.url(path)}${suffix}`;
 }
-
-const IMG_TAG = /<img\b[^>]*>/gi;
-/** Leading whitespace is required so `data-src="…"` is not read as `src="…"`
- *  (`-` is a word boundary, so a `\b` anchor would match inside it). */
-const IMG_SRC_ATTR = /(\ssrc=")([^"]*)(")/i;
 
 /** Point every workspace-relative image at the mount that actually serves it.
  *
@@ -356,12 +470,28 @@ const IMG_SRC_ATTR = /(\ssrc=")([^"]*)(")/i;
  *  ones outright. So only an attribute that already passed that gate is ever
  *  rewritten, and the sanitizer is never handed a value to re-judge. */
 function rewriteImageSources(html: string): string {
-  return html.replace(IMG_TAG, (tag) =>
-    tag.replace(IMG_SRC_ATTR, (whole, open: string, src: string, close: string) => {
-      const rewritten = workspaceDataImageSrc(src);
-      return rewritten === null ? whole : `${open}${rewritten}${close}`;
-    })
-  );
+  return inDom(html, ['<img'], rewriteImageSourcesIn);
+}
+
+function rewriteImageSourcesIn(body: HTMLElement): void {
+  for (const img of Array.from(body.querySelectorAll('img'))) {
+    const src = img.getAttribute('src');
+    if (src === null) continue;
+    const rewritten = workspaceDataImageSrc(src);
+    if (rewritten !== null) img.setAttribute('src', rewritten);
+  }
+}
+
+/** Point every image at its real source AND wrap it, in one parse.
+ *
+ *  The block path wants both, so they share a visit. `renderMarkdownInline`
+ *  wants only the first: the wrapper is a block box, invalid in the phrasing
+ *  content those helpers exist to emit. */
+function prepareImages(html: string): string {
+  return inDom(html, ['<img'], (body) => {
+    rewriteImageSourcesIn(body);
+    wrapImagesIn(body);
+  });
 }
 
 /** Wrap every image in the scroll container that lets an oversized screenshot
@@ -371,12 +501,14 @@ function rewriteImageSources(html: string): string {
  *  A `<span>` rather than the table wrapper's `<div>`, because marked puts an
  *  image inside a `<p>` and a `<div>` there is invalid: the parser closes the
  *  paragraph at it, stranding the prose that followed. The CSS gives the span
- *  `display: block`, so the layout is the table wrapper's regardless.
- *
- *  A string transform rather than a DOM one, for the same reason as
- *  `transformTables`. */
-function wrapImages(html: string): string {
-  return html.replace(IMG_TAG, (tag) => `<span class="image-scroll-wrapper">${tag}</span>`);
+ *  `display: block`, so the layout is the table wrapper's regardless. */
+function wrapImagesIn(body: HTMLElement): void {
+  for (const img of Array.from(body.querySelectorAll('img'))) {
+    const wrapper = body.ownerDocument.createElement('span');
+    wrapper.className = 'image-scroll-wrapper';
+    img.replaceWith(wrapper);
+    wrapper.append(img);
+  }
 }
 
 // LRU cache for parsed markdown. `renderMarkdown` is pure, but the chat
@@ -404,13 +536,15 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
   // throws. See utils/renderPhaseTimers.ts.
   const parseStart = performance.now();
   try {
-    const encodedTexts = new Map<number, string>();
-    const preprocessed = preprocessCopyBlocks(md, encodedTexts);
+    const copyTexts = new Map<number, string>();
+    const preprocessed = preprocessCopyBlocks(md, copyTexts);
     let html = marked.parse(preprocessed, { async: false }) as string;
-    html = postprocessCopyBlocks(html, encodedTexts);
+    // Before the sanitizer, because DOMPurify drops the HTML comments the
+    // multiline marker rides on. It carries the slot id, not the payload.
+    html = postprocessCopyBlocks(html);
     html = sanitizeHtmlFragments(html);
-    html = rewriteImageSources(html);
-    html = wrapImages(html);
+    html = resolveCopyTargets(html, copyTexts);
+    html = prepareImages(html);
     html = transformTables(html);
     // The workspace-qualified form is what the copy-ref button emits.
     html = html.replace(

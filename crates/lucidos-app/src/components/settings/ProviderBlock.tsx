@@ -6,8 +6,7 @@ import {
   setProviderEnabled,
   type SwitchableProvider,
 } from '../../store/actions/preferences';
-import { LoadableToggle } from '../shared/LoadableToggle';
-import { Explainer } from '../shared/Explainer';
+import { ProviderBlockFrame } from './ProviderBlockFrame';
 import {
   blockIsOpen,
   overrideIsSettled,
@@ -36,7 +35,9 @@ const OVERRIDE_HOLD_MS = 8000;
  *  parked key can still be deleted without switching the provider back on.
  *
  *  The state machine lives in `providerEnablement.ts`, and every branch of it
- *  is unit-tested there. */
+ *  is unit-tested there. The markup lives in `ProviderBlockFrame`, which the
+ *  TypeSafe row wears too. What stays here is the `/health` half: this block is
+ *  the one whose truth arrives late. */
 export function ProviderBlock(props: {
   /** Matches the engine's `ProviderKind` and the preference key's suffix. */
   id: SwitchableProvider;
@@ -92,34 +93,19 @@ export function ProviderBlock(props: {
   }
 
   return (
-    <>
-      <div class="settings-row" data-search-anchor={props.anchor}>
-        <span class="settings-row-label">
-          {props.label}
-          <Explainer title={props.label}>{props.explainer}</Explainer>
-          {props.detail}
-          {/* Says what the OFF position means here. Without it a parked
-              provider is indistinguishable from one never set up, and the key
-              still sitting in the credential store is invisible. It only
-              promises a kept key where this page stored one: Vertex has none,
-              and an env-configured provider's key was never ours to keep. */}
-          {state === 'switched-off' && (
-            <span class="list-row-details">
-              {props.hasStoredConfig ? 'switched off, key kept' : 'switched off'}
-            </span>
-          )}
-        </span>
-        <div class="settings-row-options">
-          {props.actions}
-          <LoadableToggle
-            loaded={loaded}
-            checked={open}
-            ariaLabel={`Enable ${props.label}`}
-            onChange={onToggle}
-          />
-        </div>
-      </div>
-      {open && props.children}
-    </>
+    <ProviderBlockFrame
+      label={props.label}
+      anchor={props.anchor}
+      explainer={props.explainer}
+      detail={props.detail}
+      actions={props.actions}
+      switchedOff={state === 'switched-off'}
+      hasStoredConfig={props.hasStoredConfig}
+      loaded={loaded}
+      open={open}
+      onToggle={onToggle}
+    >
+      {props.children}
+    </ProviderBlockFrame>
   );
 }

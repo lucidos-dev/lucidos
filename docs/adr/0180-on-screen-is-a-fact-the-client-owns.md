@@ -84,9 +84,14 @@ and never suspended the page, and the light placement never reverted.
 - **The probe is checked in and run by hand.** WKWebView exposes no WebDriver and
   `tauri-driver` is Linux and Windows only (ADR 0016), so this cannot be an
   automated test. It is behind a feature, so no shipped build carries it.
-- **Four transitions remain untested**, because no public API can script them: a
+- **Four transitions were left untested**, for want of an API to script them: a
   Space switch, a move to a second display, a backing-scale change, and a
-  fullscreen round trip. The probe's `watch` mode is how to settle them.
+  fullscreen round trip. Two of them are scripted now, in the probe's `screens`
+  mode: `setFrameOrigin` into another screen's visible frame is the API, and on
+  two displays of different scale factors it drives both at once. Neither
+  reverts the placement, and nor does a move on one display or a restated
+  `setContentSize`. A Space switch and a fullscreen round trip still need the
+  `watch` mode.
 - **One in-tree claim is contradicted.** `app_window.rs` and
   `utils/nativeWindow.ts` say the embedded WKWebView cannot observe `orderOut:`.
   A bare WKWebView observes it immediately and every time, so whatever produced

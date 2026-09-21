@@ -16,6 +16,7 @@
 import { webhookIngress } from '../store';
 import { failedIfFresh, setLoadingIfFresh } from '../types';
 import { fetchWebhookIngress, type WebhookIngressOutage } from '../../api/client';
+import { elapsedSeconds } from '../../utils/formatTime';
 
 export async function loadWebhookIngress(): Promise<void> {
   setLoadingIfFresh(webhookIngress);
@@ -48,13 +49,8 @@ export function currentIngressOutage(now: number): WebhookIngressOutage | null {
   if (reading.status !== 'loaded') return null;
   const outage = reading.data.ingress.degraded;
   if (!outage) return null;
-  return { ...outage, down_secs: outage.down_secs + secondsSince(reading.data.receivedAt, now) };
-}
-
-/** Whole seconds between two readings of the browser clock, never negative.
- *
- *  A clock the user or NTP moved backwards must not make an outage look younger
- *  than the engine measured it. */
-function secondsSince(receivedAt: number, now: number): number {
-  return Math.max(0, Math.floor((now - receivedAt) / 1000));
+  return {
+    ...outage,
+    down_secs: outage.down_secs + elapsedSeconds(reading.data.receivedAt, now),
+  };
 }

@@ -48,6 +48,7 @@ const {
   bridgePreviewIframeLinks,
   previewBaseHref,
   withPreviewBase,
+  withPreviewScale,
   documentDeclaresBase,
 } = await import('./previewIframeLinks');
 
@@ -678,5 +679,62 @@ describe('withPreviewBase', () => {
 
   it('escapes the base href', () => {
     expect(withPreviewBase('<p>x</p>', 'https://h/a"b/')).toContain('href="https://h/a&quot;b/"');
+  });
+});
+
+// The scale stamp is what makes an HTML artifact grow with the shell around it.
+// It shares `injectAtHeadStart` with the base stamp, so the placement cases
+// below are the same four, asserted through the other caller.
+describe('withPreviewScale', () => {
+  const DOC = '<!DOCTYPE html><html><head><title>T</title></head><body>x</body></html>';
+
+  it('stamps zoom as the first thing in <head>', () => {
+    expect(withPreviewScale(DOC, 125)).toContain('<head><style>:root{zoom:125%}</style><title>');
+  });
+
+  it('keeps the fractional step of the preference grid', () => {
+    expect(withPreviewScale(DOC, 112.5)).toContain('zoom:112.5%');
+  });
+
+  // The default scale must cost the document nothing at all, or every artifact
+  // at 100% would differ from the bytes on disk for no reason.
+  it('leaves the document byte-identical at 100%', () => {
+    expect(withPreviewScale(DOC, 100)).toBe(DOC);
+  });
+
+  // An unreadable preference must never cost the reader the document.
+  it('leaves it alone for a value that is not a usable scale', () => {
+    for (const bad of [NaN, Infinity, 0, -50]) {
+      expect(withPreviewScale(DOC, bad)).toBe(DOC);
+    }
+  });
+
+  it('creates a head when the document has <html> but no <head>', () => {
+    expect(withPreviewScale('<html><body>x</body></html>', 125))
+      .toBe('<html><head><style>:root{zoom:125%}</style></head><body>x</body></html>');
+  });
+
+  it('keeps the doctype first, so the page stays out of quirks mode', () => {
+    expect(withPreviewScale('<!DOCTYPE html>\n<p>x</p>', 125).startsWith('<!DOCTYPE html>')).toBe(true);
+  });
+
+  it('prepends to a bare fragment', () => {
+    expect(withPreviewScale('<p>x</p>', 125)).toBe('<style>:root{zoom:125%}</style><p>x</p>');
+  });
+
+  // The two stamps compose the way the preview composes them, and the base has
+  // to come first: it governs relative URLs the rest of the head may carry.
+  it('leaves the base first when both are stamped', () => {
+    const out = withPreviewBase(withPreviewScale(DOC, 125), 'https://h/ws/data/artifacts/');
+    expect(out).toContain('<head><base href="https://h/ws/data/artifacts/"><style>:root{zoom:125%}</style>');
+  });
+
+  // The bridge asks `documentDeclaresBase` about the ORIGINAL artifact, so a
+  // scaled document with its own base must still route links against it.
+  it('does not disturb an artifact that declares its own base', () => {
+    const html = '<html><head><base href="https://elsewhere/"></head></html>';
+    const scaled = withPreviewScale(html, 125);
+    expect(documentDeclaresBase(scaled)).toBe(true);
+    expect(withPreviewBase(scaled, 'https://h/ws/data/artifacts/')).toBe(scaled);
   });
 });

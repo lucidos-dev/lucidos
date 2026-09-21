@@ -5,6 +5,7 @@ import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
+import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
 import { installLiveUtteranceRow } from './liveUtterance';
 import { voiceCall, watchCallLiveness } from './voice';
 import { setCallLive } from '../components/chat/scrollState';
@@ -285,6 +286,14 @@ effect(() => {
 // rules they feed rather than spread across this file. See
 // actions/notification-visit.ts and system-knowhow/notifications.md §4.
 installSeenTargetWatch();
+
+// A toast is the third projection of the unread set, beside the bell badge and
+// the Unread tab. So a row that has been read can hold no toast. The rule the
+// watch above runs is the loudest reason it exists: reaching a tap target drops
+// the notification, and the toast has to go with it. Wired beside its own
+// toasts for the same reason the watch is wired beside its own rules. See
+// actions/in-app-notification-toast.ts and system-knowhow/notifications.md §4.
+installNotificationToastLifetime();
 
 // The caller's bubble appears as they start speaking, rather than when the
 // words finally land. Its own module for the same reason as the watch above:

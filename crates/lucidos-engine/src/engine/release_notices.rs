@@ -126,6 +126,36 @@ pub fn all() -> &'static [ReleaseNotice] {
     })
 }
 
+/// The release this engine reports to the notice sequence, or why it cannot.
+///
+/// ONE definition, because two let the startup stamp and the HTTP surface
+/// disagree about which notices exist. A fresh workspace would then be placed
+/// behind a notice the panel already offers, and meet its modal on first run.
+/// That is the whole thing [`fresh_workspace_stamp`] exists to prevent.
+pub fn running_release() -> Result<Version, String> {
+    reported_release(crate::LUCIDOS_RELEASE, crate::LUCIDOS_RELEASE_DIRTY)
+}
+
+/// The release an engine on `release`, built `dirty`, reports for this purpose.
+///
+/// A release-dirty build counts as the NEXT PATCH. Such a build is past the
+/// published snapshot by definition, so a notice written for the release it is
+/// becoming already applies to it. That is the only way an author reads their
+/// own notice on screen, since no engine reports an unreleased version.
+///
+/// It stays off for everyone else. `build.rs` sets the flag false whenever git
+/// is unavailable, so a shipped install never takes this arm. And a notice
+/// deliberately floored further out stays held back, because one patch is all
+/// this adds.
+fn reported_release(release: &str, dirty: bool) -> Result<Version, String> {
+    let mut version =
+        Version::parse(release).map_err(|e| format!("{release} is not semver: {e}"))?;
+    if dirty {
+        version.patch += 1;
+    }
+    Ok(version)
+}
+
 /// Does `notice` apply to an engine reporting `running`?
 fn applies_to(notice: &ReleaseNotice, running: &Version) -> bool {
     Version::parse(&notice.since).is_ok_and(|since| since <= *running)
@@ -238,12 +268,9 @@ pub async fn stored_cursor(pool: &PgPool) -> Option<String> {
 /// binary reports, and whether the workspace has ever held a thread. A
 /// workspace that already has a usable cursor is left alone.
 pub async fn seed_cursor_at_startup(pool: &PgPool, notices: &[ReleaseNotice]) {
-    match Version::parse(crate::LUCIDOS_RELEASE) {
+    match running_release() {
         Ok(running) => place_workspace(pool, notices, &running).await,
-        Err(_) => crate::log!(
-            "[ReleaseNotices] {} is not semver, so no notice can be placed",
-            crate::LUCIDOS_RELEASE
-        ),
+        Err(e) => crate::log!("[ReleaseNotices] {e}, so no notice can be placed"),
     }
 }
 
@@ -327,6 +354,49 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    /// The dev half. Nobody's engine reports an unreleased version, so without
+    /// this a notice written for the next release can be read only in the file.
+    #[test]
+    fn a_dirty_build_reports_the_release_it_is_becoming() {
+        assert_eq!(reported_release("0.38.2", true).unwrap(), v("0.38.3"));
+    }
+
+    /// The other half, and the one that must not move: a shipped install is
+    /// never dirty, so a notice reaches a user exactly on its own release.
+    #[test]
+    fn a_clean_build_reports_the_release_it_is_on() {
+        assert_eq!(reported_release("0.38.2", false).unwrap(), v("0.38.2"));
+    }
+
+    /// One patch, never a free pass. A notice held back for a later minor stays
+    /// held back on a dev build too. The later minor is derived, so the release
+    /// line catching up to it never turns this into an unsynced literal.
+    #[test]
+    fn a_dirty_build_does_not_reach_a_notice_floored_further_out() {
+        let reported = reported_release("0.38.2", true).unwrap();
+        let next_minor = v(&format!("{}.{}.0", reported.major, reported.minor + 1));
+        assert!(next_minor > reported);
+    }
+
+    #[test]
+    fn a_release_that_is_not_semver_is_an_error_either_way() {
+        assert!(reported_release("0.38", false).is_err());
+        assert!(reported_release("0.38", true).is_err());
+    }
+
+    /// The stamp and the surfaces read one release, so a fresh workspace is
+    /// placed past every notice the panel would offer it.
+    #[tokio::test]
+    async fn a_fresh_workspace_is_stamped_at_the_release_the_surfaces_report() {
+        let (pool, db_name) = setup_test_db().await;
+        let running = running_release().expect("the shipped RELEASE is semver");
+        let notices = vec![notice("a", "1.0.0"), notice("b", &running.to_string())];
+        place_workspace(&pool, &notices, &running).await;
+        assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
+        assert!(view(&notices, &running, Some("b")).next_id.is_none());
+        teardown_test_db(&db_name).await;
     }
 
     /// A notice with no action, which is the shape most of them have.

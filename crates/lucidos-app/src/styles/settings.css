@@ -5,6 +5,7 @@
 @import './settings/backup.css';
 @import './settings/toggle.css';
 @import './settings/directory-picker.css';
+@import './settings/response-style-editor.css';
 @import './settings/disk-usage.css';
 @import './settings/keyboard-shortcuts.css';
 @import './settings/system.css';

@@ -63,7 +63,11 @@ describe('restampDeadline', () => {
  *  Both derivations are locked here because they are what the SDK reads INSTEAD
  *  of the two shapes an author reaches for (a relative path against
  *  `document.baseURI`, or a root-absolute `/api/v1/…`). See
- *  `system-knowhow/js-sdk.md` § lucidos.apiUrl. */
+ *  `system-knowhow/js-sdk.md` § lucidos.apiUrl.
+ *
+ *  What the address is FOR narrowed with ADR 0227. An app frame loads a
+ *  subresource from it and cannot `fetch` it, so these cases pin the derivation
+ *  rather than a working call. */
 describe('apiUrl workspace-address derivation', () => {
   const originalQuerySelector = globalThis.document.querySelector;
   const originalLocation = (globalThis as unknown as { location?: unknown }).location;

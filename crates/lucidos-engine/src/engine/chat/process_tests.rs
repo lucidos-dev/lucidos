@@ -54,6 +54,9 @@ fn run_build(
         mcp_stopped_context,
         setup_reminder,
         thread_depth_context,
+        // Empty for the same reason as the two tail blocks below, and filled
+        // in by `build_capture_sections_bills_the_todo_list_block`.
+        "",
         user_message,
         // Engine Build and Client URL empty, so the row set stays what the
         // per-section tests below assert. The two are filled in by
@@ -802,6 +805,76 @@ fn build_capture_sections_filters_empty_sections() {
     );
 }
 
+/// The turn-start todo block is billed like any other section, so the viewer's
+/// budget bar accounts for it. It is absent on the overwhelming majority of
+/// turns, which is what keeps it cheap: `run_build` above passes it empty and
+/// no row appears.
+#[test]
+fn build_capture_sections_bills_the_todo_list_block() {
+    let block = "[TODO LIST]\n1. [abandoned] a (doing a)\n[END TODO LIST]";
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        block,
+        "user msg",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+        true,
+    );
+
+    let row = sections
+        .iter()
+        .find(|s| s.name == "Todo List")
+        .expect("the todo block needs a row of its own");
+    assert_eq!(row.role, ContextRole::User, "it rides in the user message");
+    assert_eq!(row.group.as_deref(), Some("System notices"));
+    assert_eq!(row.content.as_deref(), Some(block));
+    assert_eq!(row.budget_delta_chars, block.chars().count());
+
+    let empty = run_build(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
+    );
+    assert!(
+        !empty.iter().any(|s| s.name == "Todo List"),
+        "a turn with no block must not carry an empty row"
+    );
+}
+
 /// The two blocks ADR 0084 moved out of the system prompt are billed where
 /// they now ride: the request tail, one row each. Without their own rows the
 /// viewer's budget bar would lose them entirely, since they left the System
@@ -813,6 +886,7 @@ fn build_capture_sections_filters_empty_sections() {
 fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
     let sections = build_capture_sections(
         "sys",
+        "",
         "",
         "",
         "",
@@ -1055,6 +1129,7 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "",
+        "",
         "user",
         &TurnTail {
             engine_build: "",
@@ -1067,6 +1142,7 @@ fn build_capture_sections_honors_capture_body_flag() {
     );
     let off = build_capture_sections(
         "sys",
+        "",
         "",
         "",
         "",

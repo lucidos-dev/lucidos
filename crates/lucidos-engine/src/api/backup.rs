@@ -798,9 +798,10 @@ mod tests {
 
     /// Regression: the backup key was one bare GET away from any installed app.
     ///
-    /// App UIs are same-origin with the engine, so `Sec-Fetch-Site` reads
-    /// `same-origin` for them exactly as for the Settings page. The `Referer`
-    /// is the only thing that differs, and every key route now reads it.
+    /// A standalone app tab is same-origin with the engine, so `Sec-Fetch-Site`
+    /// reads `same-origin` for it exactly as for the Settings page. The
+    /// `Referer` is the only thing that differs, and every key route now reads
+    /// it. An app frame inside the shell cannot reach the route at all.
     #[test]
     fn an_app_document_cannot_reach_any_key_route() {
         // Both rules, because the mint, the read and the generate between them

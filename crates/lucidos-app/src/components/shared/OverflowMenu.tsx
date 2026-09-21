@@ -30,6 +30,10 @@ export interface OverflowMenuContext {
   open: boolean;
   openedViaKeyboard: boolean;
   run: (fn: () => void) => (e: MouseEvent) => void;
+  /** What the menu is anchored to: the ⋯ trigger, or the host's element in
+   *  host-opened mode. An item that OPENS a popover of its own needs it, since
+   *  the row it was clicked on unmounts as the menu closes. */
+  anchor: HTMLElement | null;
 }
 
 /** How a host opens a menu that renders no ⋯ trigger. The element passed is what
@@ -67,10 +71,21 @@ export type OverflowMenuOpener = (anchor: HTMLElement) => void;
  *  (the drawer row's focus-thread `onClick`) — toggling the menu or running an
  *  item must not also fire it.
  */
-export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex, openRef, items, infoRows }: {
+export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, openRef, items, infoRows }: {
   ariaLabel: string;
   stopPropagation?: boolean;
   extraClass?: string;
+  /** Extra attributes for the ⋯ trigger. A host whose row is MEASURED marks its
+   *  members with one, and the trigger is a member like any other. Ignored in
+   *  host-opened mode, which draws no trigger. */
+  triggerAttrs?: Record<string, string>;
+  /** Run as the menu opens, before anything else.
+   *
+   *  For a host whose items open popovers of their OWN against this trigger.
+   *  The trigger is then that popover's anchor, and an anchor is exempt from
+   *  the outside-click dismiss. So re-pressing it would stack a menu over a
+   *  panel that will not go. Retire them here instead. */
+  onOpen?: () => void;
   /** `-1` removes the ⋯ trigger from the Tab order (the drawer row's mouse-only
    *  use — the drawer is a single tab stop, and the menu is opened via the
    *  "Open thread actions" shortcut). Default undefined → natively tabbable
@@ -138,6 +153,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
     if (stopPropagation) e.stopPropagation();
     closeInfo();
     if (open) { close(); return; }
+    onOpen?.();
     // detail === 0 ⇒ keyboard activation or the shortcut's synthetic click.
     const keyboard = e.detail === 0;
     setOpenedViaKeyboard(keyboard);
@@ -161,6 +177,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
   if (openRef) {
     openRef.current = (el: HTMLElement) => {
       closeInfo();
+      onOpen?.();
       hostAnchorRef.current = el;
       setOpenedViaKeyboard(false);
       lastFocusedRef.current = null;
@@ -215,6 +232,9 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
         <button
           ref={triggerRef}
           type="button"
+          // The spread leads, so the trigger's own class and tab order always
+          // win over a host's attributes rather than the other way round.
+          {...triggerAttrs}
           tabIndex={tabIndex}
           class={`icon-btn header-icon${extraClass ? ` ${extraClass}` : ''}`}
           onClick={toggle}
@@ -240,7 +260,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
           ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }
           : { visibility: 'hidden' }}
       >
-        {open && items({ open, openedViaKeyboard, run })}
+        {open && items({ open, openedViaKeyboard, run, anchor })}
         {rows && (
           <>
             <div class="thread-overflow-divider" role="separator" />

@@ -5,6 +5,7 @@ pub mod legacy_cache;
 pub mod model_download;
 pub mod pgvector;
 pub mod provider;
+pub(crate) mod query_judgment;
 pub mod reembed;
 
 pub use embedder_slot::{EmbedderSlot, EmbeddingModelLoadState, EmbeddingModelStatus};

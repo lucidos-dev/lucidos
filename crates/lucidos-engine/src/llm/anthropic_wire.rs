@@ -1045,6 +1045,11 @@ mod tests {
             parse_context_suffix("claude-sonnet-5[1m]"),
             ("claude-sonnet-5", true)
         );
+        // A point-release id keeps its trailing `-1`: only the suffix comes off.
+        assert_eq!(
+            parse_context_suffix("claude-fable-5-1[1m]"),
+            ("claude-fable-5-1", true)
+        );
     }
 
     #[test]
@@ -1059,10 +1064,24 @@ mod tests {
         );
     }
 
+    /// Both gates match the Fable FAMILY by substring, so a new Fable
+    /// generation inherits them with no new arm. Fable 5.1 is the first id to
+    /// rely on that, and it must: sending `budget_tokens` earns a 400, and
+    /// falling to the no-thinking path caps a Fable turn at 8192 tokens.
     #[test]
-    fn fable_5_is_adaptive_thinking() {
-        assert!(supports_extended_thinking("claude-fable-5"));
-        assert!(requires_adaptive_thinking("claude-fable-5"));
+    fn every_fable_generation_is_adaptive_thinking() {
+        for id in [
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+        ] {
+            assert!(supports_extended_thinking(id), "extended: {id}");
+            assert!(requires_adaptive_thinking(id), "adaptive: {id}");
+            // The ceiling the Anthropic API accepts for a Fable turn. A higher
+            // value fails every request on the model, not just a long one.
+            assert_eq!(adaptive_max_output_tokens(id), Some(128_000), "{id}");
+        }
     }
 
     #[test]

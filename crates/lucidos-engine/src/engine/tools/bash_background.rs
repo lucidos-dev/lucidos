@@ -173,6 +173,15 @@ struct BackgroundTask {
     /// `BackgroundBashCompleted` carries it. Held here so the registry can name
     /// its own tasks: the watcher and the teardown sweep both read it.
     command: String,
+    /// The secret VALUES this task's environment carries, from
+    /// [`crate::core::injected_secret_values`]. Both exits redact against it.
+    /// So a child that echoes its own environment cannot put a credential in
+    /// the model's context or in the persisted `BackgroundBashCompleted`.
+    ///
+    /// Captured at spawn rather than passed to each reader, for the reason
+    /// stated on the command above. A reader handed both the raw bytes and the
+    /// secrets to hide is one transposition away from storing them.
+    secrets: Vec<String>,
     stdout: Stream,
     stderr: Stream,
     /// How the child ended. `None` until the watchdog writes it, in the same
@@ -246,6 +255,7 @@ impl BackgroundTask {
         BackgroundTask {
             started_at: Utc::now(),
             command: "cargo build".to_string(),
+            secrets: Vec::new(),
             stdout: Stream::default(),
             stderr: Stream::default(),
             outcome: None,
@@ -442,6 +452,10 @@ impl BackgroundBashRegistry {
         // raw command to run and a safe one to store, `spawn` would be one
         // transposition away from persisting the secret.
         let safe_prefix = command_prefix(&crate::core::redact_postgres_secrets(command));
+        // Read off the env we just injected, for the same reason and at the
+        // same moment. The child can echo any of these, and its output becomes
+        // both a tool result and a persisted event.
+        let secrets = crate::core::injected_secret_values(env);
 
         {
             let mut tasks = self.locked().await;
@@ -450,6 +464,7 @@ impl BackgroundBashRegistry {
                 BackgroundTask {
                     started_at: Utc::now(),
                     command: safe_prefix,
+                    secrets,
                     stdout: Stream::default(),
                     stderr: Stream::default(),
                     outcome: None,
@@ -812,6 +827,13 @@ impl BackgroundBashRegistry {
         let (abandoned, killed) = ending(&*task, outcome);
         let (stdout, stdout_dropped) = task.stdout.all();
         let (stderr, stderr_dropped) = task.stderr.all();
+        // The caller writes this straight into `BackgroundBashCompleted`, which
+        // is permanent. Redact over the whole retained buffer, so no drain
+        // boundary can split a token here. `Stream::push` can still have
+        // trimmed the front mid-token on a chatty task, which no call site can
+        // undo. `core::injected_secret_values` records both gaps.
+        let stdout = crate::core::redact_secret_values(&stdout, &task.secrets);
+        let stderr = crate::core::redact_secret_values(&stderr, &task.secrets);
         Some(CompletionRecord {
             started_at: task.started_at,
             finished_at,
@@ -1013,6 +1035,13 @@ fn sweep_finished(tasks: &mut HashMap<String, BackgroundTask>) {
 fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
     let (stdout, stdout_dropped) = task.stdout.drain();
     let (stderr, stderr_dropped) = task.stderr.drain();
+    // This window is a tool result the agent reads, so redact it the way the
+    // synchronous `run_bash` result is. A drain carries only the bytes
+    // buffered since the last cursor, so a token straddling two windows stops
+    // matching and its tail survives. `core::injected_secret_values` records
+    // that gap and the trim gap beside it.
+    let stdout = crate::core::redact_secret_values(&stdout, &task.secrets);
+    let stderr = crate::core::redact_secret_values(&stderr, &task.secrets);
     // Measure to `finished_at` once the task is done so a late drain reports
     // the task's runtime, not "how long ago it was spawned".
     let until = task.finished_at.unwrap_or_else(Utc::now);
@@ -1085,6 +1114,79 @@ mod tests {
         assert!(snap.stdout.contains("hi"), "stdout was: {:?}", snap.stdout);
         assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
         assert!(snap.finished);
+    }
+
+    // Self-marking fake, matching the `sk-test` fixtures in `llm/`. This file
+    // ships to the public mirror, where a `live`-shaped key costs somebody a
+    // scanner triage. Long enough to clear `MIN_REDACTABLE_SECRET_LEN`.
+    const SECRET: &str = "sk-test-abcdef0123456789";
+
+    fn secret_env() -> Vec<(String, String)> {
+        vec![("CRED_DEMO_TOKEN".to_string(), SECRET.to_string())]
+    }
+
+    /// The env a background task carries is the same one the synchronous
+    /// `run_bash` injects, and `run_bash_background("env")` is one tool call.
+    /// This test takes the drain exit, which reaches the model. Its sibling
+    /// below takes the record, which reaches the `events` table.
+    #[tokio::test]
+    async fn a_background_drain_redacts_the_injected_credential() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo \"$CRED_DEMO_TOKEN\"",
+                5,
+                std::path::Path::new("/tmp"),
+                &secret_env(),
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(5)).await);
+
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert!(
+            !snap.stdout.contains(SECRET),
+            "the drain handed the model a live credential: {:?}",
+            snap.stdout
+        );
+        assert!(
+            snap.stdout.contains("[REDACTED]"),
+            "the secret was neither redacted nor echoed: {:?}",
+            snap.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn the_persisted_completion_record_redacts_the_injected_credential() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo \"$CRED_DEMO_TOKEN\" >&2; echo \"$CRED_DEMO_TOKEN\"",
+                5,
+                std::path::Path::new("/tmp"),
+                &secret_env(),
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(5)).await);
+
+        let record = reg
+            .completion_record(&task_id)
+            .await
+            .expect("completion record for a finished task");
+        assert!(
+            !record.stdout.contains(SECRET) && !record.stderr.contains(SECRET),
+            "BackgroundBashCompleted would store a live credential: {:?} / {:?}",
+            record.stdout,
+            record.stderr
+        );
+        assert!(record.stdout.contains("[REDACTED]"));
+        assert!(record.stderr.contains("[REDACTED]"));
     }
 
     #[tokio::test]

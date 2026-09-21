@@ -56,8 +56,8 @@ pub fn forwarded_prefix(headers: &HeaderMap) -> String {
 /// `lucidos-gateway`'s proxy STRIPS any client-supplied `x-forwarded-prefix` and
 /// injects its own, so the header is present on every proxied request and
 /// forgeable on none. A caller that carries it is therefore provably on the far
-/// side of the gateway (in practice: a browser, including a same-origin app
-/// iframe), and one that does not came straight to this engine's port, which
+/// side of the gateway (in practice: a browser, including an app document),
+/// and one that does not came straight to this engine's port, which
 /// under the gateway is bound to loopback.
 ///
 /// Used by the engine-internal routes that must not be reachable from a page.

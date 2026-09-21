@@ -241,13 +241,15 @@ function buildElapsedDetail(
   return formatElapsed(detail.elapsedMs + Math.max(0, nowMs - detail.anchoredAt));
 }
 
-/** What each commit group is called in the toast. The engine decides which
- *  bucket a commit is in (it is the side parsing the log); the wording is the
- *  frontend's, like every other string here.
+/** What each commit group is called, in the toast and in the new-version
+ *  confirm. ONE table, so the two surfaces cannot name a group differently.
+ *
+ *  The engine decides which bucket a commit is in, being the side that parses
+ *  the log. The wording is the frontend's, like every other string here.
  *
  *  `housekeeping` has no heading because it is never a section: it is one
- *  counted line, worded at its callsite below. */
-const GROUP_LABEL: Record<Exclude<CommitGroupKind, 'housekeeping'>, string> = {
+ *  counted line, worded by {@link housekeepingLine} below. */
+export const GROUP_LABEL: Record<Exclude<CommitGroupKind, 'housekeeping'>, string> = {
   new: 'New',
   fixed: 'Fixed',
   improved: 'Improved',
@@ -275,11 +277,7 @@ const GROUP_LABEL: Record<Exclude<CommitGroupKind, 'housekeeping'>, string> = {
  *  commit has not moved). */
 function pendingCommitsNote(commits: PendingCommits | null): string | undefined {
   if (!commits || commits.total === 0 || commits.groups.length === 0) return undefined;
-  const sections: string[] = [
-    commits.total === 1
-      ? '1 commit since your running version'
-      : `${commits.total} commits since your running version`,
-  ];
+  const sections: string[] = [pendingCommitsHeadline(commits.total)];
   for (const group of commits.groups) {
     if (group.kind === 'housekeeping') {
       // Title-less, so it reads as a footnote under the described work rather
@@ -295,11 +293,24 @@ function pendingCommitsNote(commits: PendingCommits | null): string | undefined 
   return sections.join('\n\n');
 }
 
+/** How a pending range is counted, wherever it is counted.
+ *
+ *  Shared with the new-version confirm (`store/restartConfirmCopy.ts`), which
+ *  describes the same range at the other end of the same build. The two must
+ *  not phrase it differently, so neither owns the sentence. */
+export function pendingCommitsHeadline(total: number): string {
+  return total === 1
+    ? '1 commit since your running version'
+    : `${total} commits since your running version`;
+}
+
 /** The one counted line for the commits the toast does not describe. Names what
  *  is in the bucket rather than calling it "other", so the number reconciles
  *  with the heading without pretending the work was hidden. The parenthetical
- *  carries the contents in both forms, since "1 docs commit" does not read. */
-function housekeepingLine(total: number): string {
+ *  carries the contents in both forms, since "1 docs commit" does not read.
+ *
+ *  Shared with the new-version confirm, for the reason above. */
+export function housekeepingLine(total: number): string {
   return total === 1
     ? '1 housekeeping commit (docs, tests, chores)'
     : `${total} housekeeping commits (docs, tests, chores)`;

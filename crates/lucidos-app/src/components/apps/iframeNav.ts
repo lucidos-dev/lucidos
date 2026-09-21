@@ -1,33 +1,21 @@
-/** Navigate an iframe without recording a session-history entry.
+import { APP_FRAME_ISOLATED } from './appFrameSandbox';
+import { tellFrame } from '../../store/actions/app-bridge';
+
+/** Deliver an app fragment to a MOUNTED app, and re-scope the frame's own URL.
  *
- *  Setting `iframe.src` is treated by browsers as a navigation that goes into
- *  the parent's joint session history (HTML spec; WebKit bug #9166). On iOS
- *  PWAs the edge-swipe-back gesture replays those entries and surfaces a
- *  cached snapshot of a previous app pane mid-swipe. `location.replace()`
- *  performs the navigation without extending history.
- *
- *  An in-document iframe is normally guaranteed a browsing context, but a
- *  detached iframe (mid-unmount, or one removed from the DOM between layout
- *  and effect flushes) has `contentWindow === null` and would throw a
- *  TypeError on `.location`. We return `false` instead — caller surfaces a
- *  toast and skips the `lastSrcRef` update so the next render retries the
- *  navigation against whatever iframe is mounted then.
- *
- *  No silent fallback to `iframe.src = url`: that would reintroduce the exact
- *  bug being fixed (a history entry per app switch) with no test signal. */
-export function navigateAppIframe(iframe: HTMLIFrameElement, url: string): boolean {
-  const win = iframe.contentWindow;
-  if (!win) return false;
-  win.location.replace(url);
-  return true;
-}
+ *  A change of DOCUMENT is not here: the host keys the frame on the document,
+ *  so a change of app remounts the element with the new URL as its initial src.
+ *  An isolated frame denies `contentWindow.location`, and mutating `src` on a
+ *  live element adds a joint-history entry (WebKit #9166). So a remount is the
+ *  one move that needs nothing from the app.
+ */
 
 /** Move a MOUNTED app to an app fragment, without reloading it. Apps that care
  *  listen for `hashchange`; the rest are untouched.
  *
- *  `location.replace` again, and for the reason in this file's header: a plain
- *  `location.hash = …` PUSHES a session-history entry, so a fragment delivery
- *  would extend the joint history exactly the way an app switch used to. The
+ *  The frame runs `location.replace`, for the reason in this file's header: a
+ *  plain `location.hash = …` PUSHES a session-history entry, so a fragment
+ *  delivery would extend the joint history an app switch used to. The
  *  URL differs from the frame's only in its fragment, so the navigation stays
  *  same-document: the app is not reloaded and `hashchange` still fires.
  *
@@ -42,6 +30,11 @@ export function navigateAppIframe(iframe: HTMLIFrameElement, url: string): boole
 export function setAppFrameHash(iframe: HTMLIFrameElement, fragment: string): boolean {
   const win = iframe.contentWindow;
   if (!win) return false;
+  // An isolated frame denies `contentWindow.location`, so it moves itself. The
+  // SDK's `hash` handler runs this same arithmetic against its own href, the
+  // idempotence check included. The answer it reaches cannot come back, so here
+  // the return means the request was delivered. Both callers ignore it.
+  if (APP_FRAME_ISOLATED) return tellFrame(iframe, 'hash', { fragment });
   // Built from the frame's OWN href, never from a bare `#frag`: `replace`
   // resolves a relative URL against the CALLER's document, so the host would
   // navigate the app frame to the host page.

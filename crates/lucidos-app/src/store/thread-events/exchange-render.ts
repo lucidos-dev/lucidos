@@ -721,13 +721,20 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'ToolCalled': {
         // The call names the Thinking row it came out of instead of opening a
         // second row. See `nameThinkingRow`.
-        const e = event as { name: string; args: unknown; description?: string };
+        //
+        // Carries the source event id and the strip marker for the same reason
+        // the coding-agent arm below does: the snapshot drops `args`, and the
+        // modal addresses this call to fetch them back. Live SSE leaves the
+        // marker absent and `full` is computed inline.
+        const e = event as { name: string; args?: unknown; description?: string; args_stripped?: boolean };
         const naming = {
           description: e.description || describeEngineTool(e.name, e.args),
           tool_name: e.name,
           full: fullCommandForEngineTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
           created,
+          ...(event._eventId ? { call_event_id: event._eventId } : {}),
+          ...(e.args_stripped ? { args_stripped: true, tool_channel: 'chat' as const } : {}),
         };
         if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         break;
@@ -796,7 +803,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           outcome: callOutcome(exchange, seq),
           created,
           ...(event._eventId ? { call_event_id: event._eventId } : {}),
-          ...(e.args_stripped ? { args_stripped: true } : {}),
+          ...(e.args_stripped ? { args_stripped: true, tool_channel: 'coding_agent' as const } : {}),
         };
         if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         terminal = null; // CC resumed, not finished yet
@@ -1309,10 +1316,26 @@ export function stampedEventIds(exchange: Exchange): string[] {
   const ids: string[] = [];
   // Both stamps are conditional in the component, since Preact drops an
   // `undefined` attribute. An id the DOM will not carry is not listed here.
-  if (exchange.userEvent._eventId) ids.push(exchange.userEvent._eventId);
+  const starter = exchangeStarterId(exchange);
+  if (starter) ids.push(starter);
   const failure = exchangeError(exchange)?.eventId;
   if (failure) ids.push(failure);
   return ids;
+}
+
+/** The id the turn root wears, or undefined where the turn has no starter.
+ *
+ *  A *continuation fragment* is the undefined case. Its boundary is older than
+ *  the loaded page. Its `userEvent` is only its own first step, which the rule
+ *  above says a step never wears. Stamping it would make one row addressable
+ *  out of a turn's many, and would collide with the failure card when that step
+ *  IS the failure.
+ *
+ *  Read by `ChatExchange`'s root and by `stampedEventIds`, so the attribute and
+ *  the claim about it cannot drift. */
+export function exchangeStarterId(exchange: Exchange): string | undefined {
+  if (exchange.continuationFragment) return undefined;
+  return exchange.userEvent._eventId;
 }
 
 /** The `data-event-id` a deep-link to `eventId` should target within
@@ -1348,10 +1371,11 @@ export function deepLinkAnchorForEvent(
     const step = exchange.steps.find(({ event }) => event._eventId === eventId);
     if (step) {
       if (UNANCHORABLE_ASYNC_EVENTS.has(step.event.type)) return null;
-      // A turn whose own starter is unstamped (a legacy row) gives the
-      // deep-link nothing to aim at. Saying so beats an `undefined` that would
-      // read as "not in this thread" further down.
-      return exchange.userEvent._eventId ?? null;
+      // A turn whose own starter is unstamped gives the deep-link nothing to
+      // aim at. Saying so beats an `undefined` that would read as "not in this
+      // thread" further down. Two ways to be unstamped: a legacy row carrying
+      // no id, and a turn with no starter loaded at all.
+      return exchangeStarterId(exchange) ?? null;
     }
   }
   return null;
@@ -1625,10 +1649,26 @@ function canQueueBehind(exchange: Exchange): boolean {
   // takes the running turn's continuation (ADR 0201). A follow-up queues
   // behind that turn, wherever it is now showing.
   if (exchange.tookTheTurn) return true;
+  // A *continuation fragment* is a turn whose boundary is off the loaded page,
+  // so the switch below cannot recognise it: its `userEvent` is a step. Read as
+  // holding no turn, it hands the running turn's stream to the follow-up's own
+  // bubble. That message then shows no Queued tag and nothing to retract. The
+  // terminal check above still decides a fragment that has finished.
+  if (exchange.continuationFragment) return true;
   switch (exchange.userEvent.type) {
     case 'MessageReceived':
     case 'TriggerStarted':
     case 'ContinuationStarted':
+    // An engine RE-ENTRY, and a turn like any other. An event wait resolving
+    // writes one as its *re-entry anchor*, so a delivery or an expiry renders
+    // as the new turn it is. The loop then runs, and a message typed meanwhile
+    // waits for the same window.
+    //
+    // Only an anchor that STARTS an exchange reaches here. The fold absorbs one
+    // carrying an `injected_message_id` into the message it names, whose
+    // `MessageReceived` answers this above. A rerun pairs its anchor with a
+    // `ContinuationStarted`, which starts the exchange and answers above too.
+    case 'UserPromptInjected':
     case 'UserQuestionAsked':
     case 'CodingAgentPermissionRequest':
     case 'CommandPermissionRequested':

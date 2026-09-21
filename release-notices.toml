@@ -15,9 +15,15 @@
 #   id             stable forever, kebab-case. Names the notice, not its release.
 #   since          the release this applies FROM, plain semver, no leading "v".
 #                  A floor, not a stamp: the notice is invisible until the
-#                  engine reports that version or newer. Write the CURRENT
-#                  release for a notice that applies as soon as it lands, and a
-#                  future one only to hold it back deliberately.
+#                  engine reports that version or newer. For UNRELEASED work
+#                  that is the NEXT PATCH, never a guess at the eventual number:
+#                  a floor already reached by the release that ships it, and a
+#                  higher one would hide the notice if a patch shipped first.
+#                  Pick a further one only to hold a notice back deliberately.
+#                  A dev build reports the next patch itself (it is past the
+#                  published RELEASE), so it shows such a notice before it
+#                  ships and you can read the real card. A shipped install is
+#                  never release-dirty and sees it on its own release.
 #   title          one line. The modal's heading and the panel row's label.
 #   body           markdown. A link is how a notice points at a settings page.
 #   action_label   optional, and paired with action_prompt. Draws one button.
@@ -65,6 +71,29 @@ clear rename error instead of running.
 
 A workspace audit finds any such straggler on disk and tells you the one-line \
 fix. Worth running once now.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "apps-run-isolated"
+since = "0.38.3"
+title = "Your apps now run isolated"
+body = """
+An app used to run in the same browser process as Lucidos itself, which is how \
+one busy app could freeze the whole page. Each app now gets its own process. It \
+can no longer hang the rest of Lucidos, and it can no longer read the shell, \
+your device id, or another app.
+
+The cost lands on apps that reached for the browser directly. An app that \
+stored something in `localStorage`, or called the engine with its own `fetch`, \
+loses that. Everything it does through `lucidos.*` is unchanged.
+
+**This one is quiet.** Most apps wrap a storage call in a `try`, so the app \
+still opens and simply stops remembering your settings. A workspace audit finds \
+every affected app and says what each one needs. Expect real changes rather \
+than renames, and a few that wait on us: an app reaching a corner of the API \
+the SDK does not cover yet has nothing to move onto.
 """
 action_label = "Audit my workspace"
 action_prompt = "Audit my workspace for drift."

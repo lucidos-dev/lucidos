@@ -33,8 +33,13 @@ vi.mock('../actions/chat-changes', async () => {
 vi.mock('../actions/notifications', () => ({
   loadUnreadNotifications: vi.fn(),
 }));
+vi.mock('../actions/releaseNotices', () => ({
+  loadReleaseNotices: vi.fn(),
+}));
 
 const { checkConnection, handleRestartTimeout } = await import('../actions/connection');
+const { loadReleaseNotices } = await import('../actions/releaseNotices');
+const { releaseNoticeDismissed } = await import('../releaseNotices');
 
 const RESTART_FAILURE_TOAST_KEY = 'restart-required';
 const STARTED_AT = '2026-03-20T06:00:00Z';
@@ -52,6 +57,7 @@ beforeEach(() => {
   latestEngineVersion.value = null;
   engineRestarting.value = false;
   engineRestartNewVersion.value = false;
+  releaseNoticeDismissed.value = false;
   toasts.value = [];
   localStorage.removeItem(RESTART_LS_KEY);
   localStorage.removeItem('lucidos-restart-groups');
@@ -105,6 +111,53 @@ describe('restart state survives network reconnect', () => {
     // drives the brand badge + confirm dialog).
     expect(restartRequired.value).toBe(true);
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
+  });
+
+  /** The reported defect, at the moment it happened.
+   *
+   *  A release notice is baked into the engine BINARY, so the list is an
+   *  answer about one build. A page that read it seconds before an update
+   *  restart holds the outgoing build's answer, and nothing else corrects it:
+   *  the only event over the list fires when somebody ANSWERS a notice, never
+   *  when a new one arrives. One workspace therefore showed no notice at all
+   *  until the reader opened the What's New page by hand. */
+  it('re-reads the release notices when the engine restarted under a live page', async () => {
+    await establishConnection();
+    // `hasEverConnected` is module state an earlier test already set, so the
+    // connect above can sync too. Clear, and assert about the RESTART alone.
+    vi.mocked(loadReleaseNotices).mockClear();
+
+    // The update's restart: the engine comes back on a new started_at.
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
+    await checkConnection();
+
+    expect(loadReleaseNotices).toHaveBeenCalled();
+  });
+
+  /** The other half of the same defect. A dismissal means "not now, ask on the
+   *  next open", and it is page-local because a reload used to BE the next
+   *  open. Re-reading without a reload broke that: a page that pressed Escape
+   *  on an older notice would never raise the one the new build carries. */
+  it('lets a notice from the new build raise itself after an earlier dismissal', async () => {
+    await establishConnection();
+    releaseNoticeDismissed.value = true;
+
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
+    await checkConnection();
+
+    expect(releaseNoticeDismissed.value).toBe(false);
+  });
+
+  /** A network blip is not a new open, so a dismissal survives it. */
+  it('keeps the dismissal across a plain reconnect', async () => {
+    await establishConnection();
+    releaseNoticeDismissed.value = true;
+
+    await forceDisconnect();
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth());
+    await checkConnection();
+
+    expect(releaseNoticeDismissed.value).toBe(true);
   });
 
   it('clears restart state when engine actually restarted (started_at changed)', async () => {

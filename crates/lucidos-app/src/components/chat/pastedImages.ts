@@ -104,10 +104,18 @@ export const attachedImagesForCurrentThread = computed<AttachedImage[]>(() =>
 /** Append a confirmed hash to the draft. Called from `attachImageToActiveDraft`
  *  on a successful blob upload — the bytes are already on disk; this just
  *  records the reference. Goes through `updateCompose` so the keystroke
- *  debounce + cross-device PUT fires once for the change. */
-export function addAttachedImageHash(threadId: string, hash: string): void {
-  const next = [...getDraft(threadId).image_hashes, hash];
-  updateCompose(threadId, { image_hashes: next });
+ *  debounce + cross-device PUT fires once for the change.
+ *
+ *  Returns false when the draft already holds the hash, the one case this
+ *  refuses. A hash IS the bytes, so the same image twice is two references to
+ *  one blob: the strip draws the thumbnail twice, and we send the model the
+ *  picture twice and pay for it twice. The caller owes the user a word: a paste
+ *  that attaches nothing reads as a dead gesture. */
+export function addAttachedImageHash(threadId: string, hash: string): boolean {
+  const current = getDraft(threadId).image_hashes;
+  if (current.includes(hash)) return false;
+  updateCompose(threadId, { image_hashes: [...current, hash] });
+  return true;
 }
 
 export function removeAttachedImage(threadId: string, index: number): void {

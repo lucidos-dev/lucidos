@@ -325,7 +325,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await input.fill(`typing while reviewing ${suffix}`);
       await expect(page.locator('html')).toHaveAttribute('data-keyboard-active', '');
 
-      const diff = page.locator('.prompt-actions-row button:has-text("Diff")').first();
+      const diff = page.locator('.prompt-actions-row button[data-role="thread-diff"]').first();
       await expect(diff).toBeVisible({ timeout: 10_000 });
       const box = await diff.boundingBox();
       expect(box, 'the Diff button never rendered').not.toBeNull();

@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { computeAppHeight } from '../MobileSwipeContainer';
+import { computeAppHeight, keyboardBandPx } from '../MobileSwipeContainer';
 
 // iOS PWA suspend/resume frequently dismisses the on-screen keyboard without
 // firing a fresh visualViewport `resize` event. The vv.resize handler is the
@@ -87,9 +87,11 @@ describe('MobileSwipeContainer — --app-height wake recovery', () => {
     // Don't dismiss focus on a search modal / settings input when no
     // keyboard-related state needs clearing — only clear ghost focus when
     // vv.height looks shrunk enough that a delayed resize could re-stamp it.
+    // Through the shared predicate, so the wake gate and computeAppHeight's
+    // keyboard check cannot drift apart on the threshold.
     const onWakeBody = swipeSource.match(/const onWake = \(\) => \{([\s\S]*?)\};/)?.[1];
     expect(onWakeBody, 'onWake handler not found in MobileSwipeContainer.tsx').toBeTruthy();
-    expect(onWakeBody!).toMatch(/vv\.height\s*<\s*window\.innerHeight\s*-\s*100/);
+    expect(onWakeBody!).toMatch(/viewportIsKeyboardShrunk\(vv\.height,\s*window\.innerHeight\)/);
   });
 
   it('onResize, onOrientationChange, and the initial write all route through computeAppHeight', () => {
@@ -185,5 +187,81 @@ describe('computeAppHeight', () => {
       innerHeight: 844,
       activeElementOpensKeyboard: true,
     })).toBe(743);
+  });
+});
+
+// The slack the keyboard's own reveal needs. iOS scrolls the focused field's
+// nearest scrollable ancestor to clear the keys, and offsets the whole viewport
+// when that ancestor cannot scroll far enough. Padding inside the scroller is
+// what removes the reason to do that, and the band is how much to add.
+describe('keyboardBandPx', () => {
+  it('is the room the keys take, while they are up', () => {
+    expect(keyboardBandPx({
+      vvHeight: 430,
+      innerHeight: 844,
+      activeElementOpensKeyboard: true,
+    })).toBe(414);
+  });
+
+  it('is zero with nothing focused, so no view gains a dead scroll zone', () => {
+    expect(keyboardBandPx({
+      vvHeight: 430,
+      innerHeight: 844,
+      activeElementOpensKeyboard: false,
+    })).toBe(0);
+  });
+
+  it('is zero when the viewports agree', () => {
+    expect(keyboardBandPx({
+      vvHeight: 844,
+      innerHeight: 844,
+      activeElementOpensKeyboard: true,
+    })).toBe(0);
+  });
+
+  it('shares computeAppHeight threshold, so a small shrink buys no slack', () => {
+    expect(keyboardBandPx({
+      vvHeight: 800,
+      innerHeight: 844,
+      activeElementOpensKeyboard: true,
+    })).toBe(0);
+  });
+
+  it('never answers negative when the visual viewport reads taller', () => {
+    // iOS 26 reports these two out of step, so the guard is not theoretical.
+    expect(keyboardBandPx({
+      vvHeight: 900,
+      innerHeight: 844,
+      activeElementOpensKeyboard: true,
+    })).toBe(0);
+  });
+});
+
+describe('the band reaches the scroll container', () => {
+  const mobileCss: string = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf-8');
+
+  it('is published as --keyboard-band', () => {
+    expect(swipeSource).toMatch(/setProperty\(\s*'--keyboard-band'/);
+  });
+
+  it('is reserved at focus time, before the keys have animated in', () => {
+    // iOS picks between scrolling the container and offsetting the viewport as
+    // the field is focused. Slack arriving with the first resize is too late.
+    expect(swipeSource).toMatch(/addEventListener\('focusin', armBand/);
+  });
+
+  it('survives a move between two fields', () => {
+    // The keys stay up across the handoff. Dropping the padding for even one
+    // frame shortens the scroll range, and a container near its end is clamped:
+    // the content jumps by a keyboard's height and the reveal has to undo it.
+    expect(swipeSource).toMatch(
+      /const onFocusOut = \(e: FocusEvent\) => \{\s*if \(opensSoftwareKeyboard\(e\.relatedTarget\)\) return;/,
+    );
+  });
+
+  it('is spent as padding inside the pane scroller', () => {
+    expect(mobileCss).toMatch(
+      /\.mobile-swipe-pane \.content-pane-body \{\s*padding-bottom: var\(--keyboard-band, 0px\);/,
+    );
   });
 });

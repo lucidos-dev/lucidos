@@ -18,6 +18,15 @@
  */
 
 import { wsDeviceId } from './_storage';
+import {
+  callHost,
+  fromWireResponse,
+  headersToRecord,
+  isBridged,
+  toWireBody,
+  type WireRequest,
+  type WireResponse,
+} from './_bridge';
 
 /** Derive the workspace base path (`/<slug>`) the SDK runs under, so calls to
  *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Two
@@ -63,9 +72,14 @@ export function getBaseUrl(): string {
   return _baseUrl;
 }
 
-/** Resolve an `/api/v1`-relative suffix to an absolute URL (for `EventSource`,
- *  `<script src>`, anchor hrefs, etc.). Pass the path *after* `/api/v1`, e.g.
- *  `apiUrl('/events')` → `<baseUrl>/api/v1/events`. */
+/** Resolve an `/api/v1`-relative suffix to an absolute URL (for `<script src>`,
+ *  anchor hrefs, etc.). Pass the path *after* `/api/v1`, e.g.
+ *  `apiUrl('/events')` → `<baseUrl>/api/v1/events`.
+ *
+ *  An app frame can LOAD what this returns, as a subresource, and cannot
+ *  `fetch` it: its origin is opaque and CORS refuses. So this is no longer the
+ *  escape hatch for an endpoint no SDK method covers. See
+ *  `app-frame-escape-hatches` in `docs/temporary-measures.md`. */
 export function apiUrl(suffix: string): string {
   const normalized = suffix.startsWith('/') ? suffix : `/${suffix}`;
   return `${_baseUrl}${API_V1}${normalized}`;
@@ -122,33 +136,10 @@ async function rawFetch(
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<Response> {
-  const headers: Record<string, string> = {};
-  // Every app call says which device it came from, so a publish or a trigger
-  // edit is attributed to the person who clicked it. Without it the engine has
-  // no evidence of who is calling and refuses the write (ADR 0169).
-  const deviceId = wsDeviceId();
-  if (deviceId) headers[DEVICE_ID_HEADER] = deviceId;
-  if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
-
   const normalized = path.startsWith('/') ? path : `/${path}`;
-  // `AbortSignal.timeout` rejects with a `TimeoutError`, which callers can tell
-  // apart from a deliberate `AbortError` cancel; the old manual AbortController
-  // could only ever produce the latter. A caller's `init.signal` is COMPOSED
-  // with the deadline rather than overwritten (the manual controller silently
-  // dropped it), so either can abort the request.
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
-
-  let res: Response;
-  try {
-    res = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
-      ...init,
-      signal,
-      headers: { ...headers, ...(init?.headers as Record<string, string>) },
-    });
-  } catch (err) {
-    throw restampDeadline(err, timeoutSignal, timeoutMs, init?.signal);
-  }
+  const res = isBridged()
+    ? await bridgedFetch(normalized, init, timeoutMs)
+    : await directFetch(normalized, init, timeoutMs);
   if (!res.ok) {
     let reason = res.statusText;
     try {
@@ -158,6 +149,76 @@ async function rawFetch(
     throw new SdkError(res.status, reason);
   }
   return res;
+}
+
+/** The engine call this document can make for itself. */
+async function directFetch(
+  normalized: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const headers: Record<string, string> = {};
+  // Every app call says which device it came from, so a publish or a trigger
+  // edit is attributed to the person who clicked it. Without it the engine has
+  // no evidence of who is calling and refuses the write (ADR 0169).
+  const deviceId = wsDeviceId();
+  if (deviceId) headers[DEVICE_ID_HEADER] = deviceId;
+  if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
+
+  // `AbortSignal.timeout` rejects with a `TimeoutError`, which callers can tell
+  // apart from a deliberate `AbortError` cancel; the old manual AbortController
+  // could only ever produce the latter. A caller's `init.signal` is COMPOSED
+  // with the deadline rather than overwritten (the manual controller silently
+  // dropped it), so either can abort the request.
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  try {
+    return await fetch(`${_baseUrl}${API_V1}${normalized}`, {
+      ...init,
+      signal,
+      headers: { ...headers, ...headersToRecord(init?.headers) },
+    });
+  } catch (err) {
+    throw restampDeadline(err, timeoutSignal, timeoutMs, init?.signal);
+  }
+}
+
+/**
+ * The same call, made by the host on this frame's behalf.
+ *
+ * The frame is isolated, so its own `fetch` to the engine is CORS-blocked at
+ * `Origin: null`. It sends the path SUFFIX and the host supplies the base, so
+ * an app cannot address anything outside `/api/v1` however it spells the path.
+ *
+ * No device header rides along. The host owns the real device id and stamps it.
+ * So an app can no longer claim to be a device it is not.
+ *
+ * A caller's `init.signal` rejects this promise but does not reach the host's
+ * request, which runs to completion and is discarded. Every SDK read is short,
+ * and the alternative is a cancel channel for no gain.
+ */
+async function bridgedFetch(
+  normalized: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const headers: Record<string, string> = {};
+  if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
+  const wire: WireRequest = {
+    path: normalized,
+    method: init?.method ?? 'GET',
+    headers: { ...headers, ...headersToRecord(init?.headers) },
+    body: toWireBody(init?.body),
+    timeoutMs,
+  };
+  const abort = init?.signal
+    ? new Promise<never>((_, reject) => {
+      init.signal?.addEventListener('abort', () =>
+        reject(new DOMException('Request cancelled', 'AbortError')), { once: true });
+    })
+    : null;
+  const call = callHost('fetch', wire, timeoutMs).then((v) => fromWireResponse(v as WireResponse));
+  return abort ? Promise.race([call, abort]) : call;
 }
 
 export async function request<T>(

@@ -4,10 +4,10 @@
  * The macOS traffic lights are centred on our header bar by
  * `src/traffic_lights.rs`, but the bar's height is `--titlebar-inset` plus a
  * rem-authored `--app-header-height`, so it depends on the user's UI scale and
- * exists only in the page. These scans pin the three properties that make the
- * push correct: it happens on boot and on every scale change, it measures the
- * rendered header rather than restating `3rem`, and it does not fire at all on a
- * build with no native lights.
+ * exists only in the page. These pin the three properties that make the push
+ * correct. It follows the rendered band, rather than a list of the applies that
+ * move it. It measures that band, rather than restating `3rem`. And it does not
+ * fire at all on a build with no native lights.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -31,7 +31,7 @@ vi.mock('../../utils/tauri', () => ({
 
 import {
   measureHeaderBarHeight, pushTrafficLightOffset, resetTrafficLightPush,
-  TITLEBAR_BAND_SELECTOR,
+  watchTitlebarBand, TITLEBAR_BAND_SELECTOR,
 } from './trafficLights';
 
 /** The header's bottom edge below the viewport's top, which under the overlay
@@ -202,76 +202,147 @@ describe('pushTrafficLightOffset', () => {
   });
 });
 
-describe('the push is wired into every apply that can move the bar', () => {
-  // A source scan, because the call sites are what the contract is: the bar
-  // moves when the root font size does, and BOTH paths that write it have to
-  // tell the shell. `applyUiScale` covers boot (loadPreferences calls it) and
-  // the scale picker; `applyStyleOverrides` covers the Style Remote retuning
-  // --user-ui-scale or the tokens the bar is built from over SSE. Each already
-  // calls `clampThreadDrawerWidth()` for exactly the same reason, which is why
-  // missing one is easy and invisible until someone changes their scale.
-  const here: string = dirname(fileURLToPath(import.meta.url));
-  const prefs: string = readFileSync(resolve(here, 'preferences.ts'), 'utf-8');
+describe('watchTitlebarBand', () => {
+  // The contract the call sites used to be. A hand-written list of the applies
+  // that move the bar is one somebody has to keep complete, and the cost of
+  // missing one is silent: the shell keeps the stale height for the rest of the
+  // session, because nothing else ever measures. A packaged window was reported
+  // centring its lights 17pt down a 60pt bar.
+  let observed: Element[] = [];
+  let fireResize: () => void = () => {};
+  let disconnected = 0;
 
-  const bodyOf = (name: string): string => {
-    const at = prefs.indexOf(`export function ${name}(`);
-    expect(at, `${name} not found in preferences.ts`).toBeGreaterThanOrEqual(0);
-    const open = prefs.indexOf('{', at);
-    let depth = 0;
-    for (let i = open; i < prefs.length; i++) {
-      if (prefs[i] === '{') depth++;
-      else if (prefs[i] === '}' && --depth === 0) return prefs.slice(open + 1, i);
+  class FakeResizeObserver {
+    constructor(private readonly cb: () => void) {}
+    observe(el: Element): void {
+      observed.push(el);
+      // A real one delivers the element's current size straight away, which is
+      // what makes this the boot push as well.
+      fireResize = () => this.cb();
+      this.cb();
     }
-    throw new Error(`unterminated body for ${name}`);
-  };
-
-  for (const fn of ['applyUiScale', 'applyStyleOverrides']) {
-    it(`${fn} pushes the new bar height`, () => {
-      expect(bodyOf(fn)).toContain('pushTrafficLightOffset()');
-    });
+    disconnect(): void { disconnected++; }
+    unobserve(): void {}
   }
 
-  it('applyUiScale pushes AFTER re-asserting the style overrides', () => {
-    // The push MEASURES the rendered header, so it has to run against the bar
-    // the user will actually see. `applyUiScale` writes the preference scale
-    // inline and then `reapplyStyleOverrides()` puts a remote override of
-    // --user-ui-scale back on top, so measuring in between centres the lights
-    // for a bar that never paints, and nothing measures again until the scale
-    // changes once more. The two measurements above it stay BEFORE the
-    // re-assert on purpose (the gutter they publish is the one the transcript
-    // actually reserved), which is why this is an ordering check on one call
-    // and not on the block.
-    const body = bodyOf('applyUiScale');
-    expect(body.indexOf('pushTrafficLightOffset()'))
-      .toBeGreaterThan(body.indexOf('reapplyStyleOverrides()'));
+  /** Every watch this describe starts, so none of them outlives its test. The
+   *  window listener is global, so a leaked one answers the NEXT test's
+   *  resize. */
+  let stops: Array<() => void> = [];
+  const watch = (): (() => void) => {
+    const stop = watchTitlebarBand();
+    stops.push(stop);
+    return stop;
+  };
+
+  beforeEach(() => {
+    observed = [];
+    disconnected = 0;
+    stops = [];
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = FakeResizeObserver;
+  });
+
+  afterEach(() => {
+    for (const stop of stops) stop();
+  });
+
+  it('pushes the band it is watching as soon as it is observed', () => {
+    watch();
+    expect(observed).toHaveLength(1);
+    expect(setTrafficLightOffsetMock).toHaveBeenCalledWith(48);
+  });
+
+  it('pushes again when the band itself changes size', () => {
+    // A UI scale or a retuned --desktop-bar-height, without either writer having
+    // to remember to say so.
+    watch();
+    mountHeader(60);
+    fireResize();
+    expect(setTrafficLightOffsetMock.mock.calls).toEqual([[48], [60]]);
+  });
+
+  it('pushes on a window resize, which is what moves the band without resizing it', () => {
+    // Crossing the mobile breakpoint rebuilds the bar out of different parts:
+    // the strip is a flow sibling above the header on desktop, and the header
+    // covers it on mobile. The band's own box can come out the same size while
+    // its bottom moves.
+    watch();
+    mountHeader(44, 44);
+    window.dispatchEvent(new Event('resize'));
+    expect(setTrafficLightOffsetMock.mock.calls).toEqual([[48], [44]]);
+  });
+
+  it('stops watching when the surface unmounts', () => {
+    watch()();
+    expect(disconnected).toBe(1);
+    mountHeader(60);
+    window.dispatchEvent(new Event('resize'));
+    expect(setTrafficLightOffsetMock.mock.calls).toEqual([[48]]);
+  });
+
+  it('pushes nothing on a build with no native lights', () => {
+    overlayBuild = false;
+    watch();
+    expect(setTrafficLightOffsetMock).not.toHaveBeenCalled();
+  });
+
+  it('still watches when the lights attribute has not landed yet', () => {
+    // `data-titlebar-overlay` arrives by an injected eval, and the effect that
+    // starts this runs once. Declining the watch for a missing attribute would
+    // decline it for the life of the page, where declining one push costs one
+    // observation. The window IS a packaged one; only the stamp is late.
+    overlayBuild = false;
+    watch();
+    expect(observed, 'the band is watched anyway').toHaveLength(1);
+    overlayBuild = true;
+    fireResize();
+    expect(setTrafficLightOffsetMock).toHaveBeenCalledWith(48);
+  });
+
+  it('observes nothing in a browser, which has no shell to tell', () => {
+    platformMocks.isTauri = false;
+    watch();
+    expect(observed).toHaveLength(0);
+    expect(setTrafficLightOffsetMock).not.toHaveBeenCalled();
+  });
+
+  it('observes nothing when the surface declares no band', () => {
+    mountHeader(null);
+    watch();
+    expect(observed).toHaveLength(0);
   });
 });
 
-describe('every surface with native lights on it declares its own band', () => {
-  // The other half of the contract, and a source scan for the same reason: what
-  // makes the placement right is that the surface STATES its bar rather than
-  // inheriting one. The picker mounts no app shell. Keyed on `.app-header`, the
-  // measurement therefore found nothing there, so the picker pushed nothing and
-  // wore whichever bar the last app page had persisted.
+describe('every surface with native lights on it owns its own band', () => {
+  // Source scans, because what makes the placement right is that the surface
+  // STATES its bar and WATCHES it, rather than inheriting either. The two are
+  // mutually exclusive renders, so neither can cover the other. The picker
+  // mounts no app shell: keyed on `.app-header`, the measurement found nothing
+  // there, so it pushed nothing and wore whichever bar the last app page had
+  // persisted. No preferences load reaches it either.
   const here: string = dirname(fileURLToPath(import.meta.url));
   const read = (path: string): string =>
     readFileSync(resolve(here, '../../components', path), 'utf-8');
 
-  const surfaces = {
+  for (const [what, path] of Object.entries({
     'the app shell header': 'layout/AppHeader.tsx',
     'the workspace picker': 'picker/WorkspacePicker.tsx',
-  };
-
-  for (const [what, path] of Object.entries(surfaces)) {
+  })) {
     it(`${what} carries data-titlebar-band`, () => {
       expect(read(path)).toContain('data-titlebar-band');
     });
+
+    it(`${what} calls watchTitlebarBand`, () => {
+      expect(read(path)).toContain('watchTitlebarBand()');
+    });
   }
 
-  it('the picker pushes its band itself, since no preferences load will', () => {
-    // `pushTrafficLightOffset` otherwise rides `applyUiScale`, which only the
-    // app shell's `loadPreferences` reaches. The picker renders instead of
-    // `<App/>`, so nothing there would ever measure.
-    expect(read(surfaces['the workspace picker'])).toContain('pushTrafficLightOffset()');
+  it('no preference apply hand-pushes beside them', () => {
+    // The drift this replaced: `applyUiScale` and `applyStyleOverrides` each
+    // carried a push, and between them they still missed every other mover.
+    // Two mechanisms would also disagree about which measurement is live, since
+    // only the observer runs after layout.
+    const prefs: string = readFileSync(resolve(here, 'preferences.ts'), 'utf-8');
+    expect(prefs).not.toContain('pushTrafficLightOffset()');
   });
 });

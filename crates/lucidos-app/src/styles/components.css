@@ -264,8 +264,15 @@
     margin-bottom: 0.125rem;
 }
 
+/* Wraps, so a long OK label stacks instead of overflowing the box. The dialog
+   is 90% of the viewport, and its OK can be as long as `Switch to new version`
+   (ADR 0229), which is the exact label that once overflowed the toast at 320px.
+   Shared with PromptDialog, ProgressDialog and the release notice, so the rule
+   lives here rather than on the `.button-group` primitive: those three do not
+   carry that class, and moving layout onto it would strip theirs. */
 .confirm-actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 0.5rem;
 }
@@ -333,8 +340,12 @@
     margin-bottom: 1.25rem;
 }
 
+/* Wraps for the same reason, and right-aligned so a pair that stacks keeps the
+   edge the unwrapped row sits on. */
 .confirm-actions-right {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 0.5rem;
 }
 
