@@ -46,13 +46,17 @@ export function toastAutofocusTarget(
  *     After it, normal per-pane Tab resumes; the toast drops out of the cycle.
  *   - `null` — nothing to trap (`count === 0`): fall through to default Tab.
  *
- *  `overlayOpen` guards the exit: a toast stays interactive ABOVE an open
- *  modal/popover, so focus can land on it while an overlay owns the app — but
- *  the pane is then BEHIND the overlay and not a valid Tab target (moving focus
- *  there would break the overlay's focus containment, the way `handlePaneTab`
- *  and the toast auto-focus already yield to `data-overlay-open`). So while an
- *  overlay is open, Shift+Tab wraps backward within the toast instead of
- *  exiting, keeping focus contained above the overlay.
+ *  `overlayOpen` guards the exit. Focus can already be in a toast when an
+ *  overlay opens, and the pane behind that overlay is not a valid Tab target:
+ *  moving focus there would break the overlay's focus containment, the way
+ *  `handlePaneTab` and the toast auto-focus already yield to
+ *  `data-overlay-open`. So while an overlay is open, Shift+Tab wraps backward
+ *  within the toast instead of exiting.
+ *
+ *  It no longer follows that the toast is ON TOP of the overlay. A standing
+ *  stack is drawn under an open modal (`components/shared/toastUrgency.ts`),
+ *  and only an urgent one still paints over it. Containment is the right
+ *  answer either way: the pane behind is no more reachable for being visible.
  *
  *  Pure (no DOM) so the trap logic is unit-tested; the caller resolves an index
  *  to a real element and 'exit' to the pane-focus move. */

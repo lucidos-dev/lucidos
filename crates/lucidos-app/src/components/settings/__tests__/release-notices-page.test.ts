@@ -161,15 +161,22 @@ describe('answering a notice from the panel', () => {
     expect(SECTION).toContain('{notice.action_label && (');
   });
 
-  // An answered row keeps the button as a record of what the notice offered,
-  // greyed rather than gone.
   it('leaves a resolved row its action button', () => {
     expect(SECTION).toContain("{(notice.action_label || state !== 'resolved') && (");
   });
 
-  it('lets only the OWED row act', () => {
-    // One predicate for both buttons: a queued notice is waiting its turn, and
-    // an answered one is done. Neither can be pressed.
-    expect(SECTION.match(/disabled=\{state !== 'owed'\}/g) ?? []).toHaveLength(2);
+  /** **Got it is not the action, so answering does not spend it.** An answered
+   *  row's button stays LIVE. Greyed out it read as already carried out, which
+   *  is what a reader who acknowledged the notice and then wanted the audit was
+   *  told. The action is a seeded sentence, so it can be run whenever. */
+  it('keeps a resolved row able to run its action', () => {
+    expect(SECTION).toContain("disabled={state === 'queued'}");
+  });
+
+  /** Got it answers THIS notice, and only the owed one is this notice. A queued
+   *  row is waiting its turn, which is the modal's ordering rule surviving on a
+   *  page that shows every row at once. */
+  it('lets only the owed row answer', () => {
+    expect(SECTION.match(/disabled=\{state !== 'owed'\}/g) ?? []).toHaveLength(1);
   });
 });

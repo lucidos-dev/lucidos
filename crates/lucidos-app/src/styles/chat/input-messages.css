@@ -852,15 +852,16 @@
     flex-shrink: 0;
 }
 
-/* Camera capture overlay */
+/* Camera capture overlay: an `overlayClass` on a backdrop <Overlay>, so
+   `.modal-overlay` already supplies the fixed full-screen box and the centring.
+   A darker backdrop is the only thing that differs.
+   It also carried `z-index: 500`, and this sheet loads after global.css, so
+   that beat `--z-modal` on source order: the camera drew BELOW the floating
+   header chrome at 2200. <Overlay> now writes the band level inline, which
+   outranks any class rule, so the 500 was dead as well as wrong. Never name a
+   z-index in an overlayClass (modal-overlay-z-index.test.ts scans for it). */
 .camera-overlay {
-    position: fixed;
-    inset: 0;
     background: rgba(0, 0, 0, 0.7);
-    z-index: 500;
-    display: flex;
-    align-items: center;
-    justify-content: center;
 }
 
 .camera-container {

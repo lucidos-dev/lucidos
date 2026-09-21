@@ -520,6 +520,25 @@
     pointer-events: none;
 }
 
+/* An open modal outranks the toast layer, unless the stack has something that
+   cannot wait. A standing offer ("Switch to new version") is still there when
+   the modal closes, so covering what the reader is reading buys nothing. An
+   error or a warning is the exception: a failure raised by a button INSIDE a
+   modal has to be seen while that modal is up, or the button reads as having
+   done nothing (.claude/rules/frontend.md, No Hidden Errors). Which case this
+   is comes from toastUrgency.ts, per stack, because the container carries the
+   z-index and is one stacking context.
+
+   Below the FLOOR of the modal band, so one value clears every stacked modal.
+
+   The UI blocker is excluded. It is not an <Overlay> and raises no
+   data-overlay-open of its own, but a modal left open when a client refresh
+   starts would otherwise take the "Refreshing…" toast down with it, and that
+   toast is the only thing the reader may still act on. */
+:root[data-overlay-open]:not([data-ui-blocked]) .toast-container[data-toast-urgency="standing"] {
+    z-index: calc(var(--z-modal) - 1);
+}
+
 /* One stack per visible pane. A toast is pinned to the pane that was focused
    WHEN IT APPEARED (ToastItem.pane, frozen in showToast) and lands in that
    pane's column, so it displaces only that pane's other toasts. Which columns
@@ -1224,15 +1243,18 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 }
 
 /* Image popup for full-size viewing */
-/* Extends .modal-overlay — darker backdrop for image viewing.
-   z-index above --z-control-panel so header buttons (which sit at 2200)
-   don't punch through the dim overlay. */
+/* Extends .modal-overlay: a darker backdrop for image viewing, and nothing
+   else. It states no z-index. <Overlay> writes an INLINE one on this same
+   element, its place in the modal band (store/overlayStack.ts), and an inline
+   declaration beats a class rule. So a level named here would be dead, and
+   dead in a way nothing reports: it resolved to the band floor, so it looked
+   like it was working right up until a token moved. The band already clears
+   the header chrome at 2200, which is what the level here was for. */
 .image-popup {
     background: rgba(0, 0, 0, 0.9);
     padding: 1.25rem;
     overflow: hidden;
     overscroll-behavior: contain;
-    z-index: calc(var(--z-control-panel) + 100);
     /* Width of the white ring on every control below. A hairline needs two
        DEVICE pixels to hold an even weight around a curve. At one, its straight
        runs land on a whole row and paint solid, while its arcs spread over two

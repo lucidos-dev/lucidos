@@ -58,6 +58,10 @@ import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
 import { flushUndeliveredComposeDrafts } from '../store/actions/compose';
 import { isKnownAppFrame } from '../utils/appFrame';
 import { installAppBridge } from '../store/actions/app-bridge';
+import {
+  startFrameCapabilityRenewal,
+  stopFrameCapabilityRenewal,
+} from '../store/actions/app-frame-capability';
 import { handleAppToastMessage } from '../store/actions/app-toast-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../utils/devServerBundle';
@@ -117,6 +121,10 @@ export function useStartup(): void {
     // storage. Installed before anything mounts an app, so a frame that asks on
     // its first line is not answered by silence. See store/actions/app-bridge.ts.
     const stopAppBridge = installAppBridge();
+    // Keep an open frame's URL pass to its own files fresh (ADR 0238). Behind a
+    // gateway the engine seeds one per frame, and it lasts an hour. This side
+    // re-mints at half-life, because the shell holds the device credential.
+    startFrameCapabilityRenewal();
 
     // Restore focused thread from localStorage (set at signal init, reinforce here).
     // setFocusedThread short-circuits when the value is unchanged, so this is a
@@ -790,6 +798,7 @@ export function useStartup(): void {
       unmounted = true;
       stopLiveness();
       stopAppBridge();
+      stopFrameCapabilityRenewal();
       clearInterval(connectionInterval);
       clearTimeout(coldStartBounceTimer);
       swProbe.stop();

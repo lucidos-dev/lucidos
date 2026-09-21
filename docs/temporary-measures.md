@@ -1341,8 +1341,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `auth_api::is_public_app_asset`. These paths carry workspace content, so
   exempting them is a security decision nobody has taken.
 - **Removal / resolution condition:** when an app frame can load its own files
-  behind a gateway again. Two routes are open, and each needs a decision rather
-  than a patch:
+  behind a gateway again. Two routes were open, and each needed a decision
+  rather than a patch:
   - Give the frame a real origin with its own credential, the port route ADR
     0227 priced and rejected.
   - Or carry a per-frame capability into the subresource URL.
@@ -1351,12 +1351,33 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   gateway URL, and confirm a 200. Then take out the five passages above and
   drop the audit check. Restore the two bullets `building-an-app.md` lost, and
   correct ADR 0227's § Consequences subresource bullets.
-- **Status:** active
-- **Investigation:** n/a. The cause is understood and the fix needs a design
+- **Resolved by:** the second route, in
+  [ADR 0238](adr/0238-app-frame-carries-a-capability-to-its-own-files.md). The
+  engine mints a *frame capability* when it serves a framed app document. It
+  stamps the pass into the document's `<base href>`, so every relative ref the
+  app writes resolves through it. The pass reaches `/<slug>/data/*` and
+  `/<slug>/app/<id>/*` only, read-only, for an hour. The host re-mints at
+  half-life.
+- **Verification run:** `chain_tests::an_app_frames_own_files_load_through_a_gateway`
+  (`crates/lucidos-gateway/src/chain_tests.rs`), which `./scripts/e2e-api.sh`
+  runs. It puts the real gateway router in front of the live e2e engine. It
+  writes an app shipping a separate `style.css`, then asks for that stylesheet
+  with no cookie at all. It answers **200**. So does the artifact a preview
+  iframe loads, and the relative link one hop down inside it. The same
+  stylesheet with no capability still answers 401, and a capability aimed at
+  `/api/v1` answers 401.
+- **What stays refused, and is not part of this:**
+  `lucidos.data.url('system-knowhow/…')` routes through `/api/v1/data/…`. A
+  frame capability deliberately reaches no `/api/v1` route, so that one call
+  still answers 401 behind a gateway. `system-knowhow/js-sdk.md` § `lucidos.data`
+  says so.
+- **Status:** removed (2026-09-21)
+- **Investigation:** n/a. The cause was understood and the fix needed a design
   decision, which
-  `docs/plans/2026-09-20-the-gateway-half-of-the-app-asset-exemption.md`
-  records. A sibling of `app-frame-escape-hatches` in § 4: the same opaque
-  origin, a third capability it took away. Tracked apart because the answer is
+  `docs/plans/2026-09-20-the-gateway-half-of-the-app-asset-exemption.md` and
+  `docs/plans/2026-09-21-an-app-frame-carries-a-capability-to-its-own-files.md`
+  record. A sibling of `app-frame-escape-hatches` in § 4: the same opaque
+  origin, a third capability it took away. Tracked apart because the answer was
   a routing decision rather than an SDK surface.
 
 ---
@@ -2684,7 +2705,8 @@ measure now eligible for removal** — search this file for the id to find them 
   audit's remediation both name it.
 - **Status:** open (storage half)
 - **Measures referencing this investigation:** none yet.
-- **Related:** the same opaque origin took a third thing, behind a gateway. An
-  app frame cannot load its own files as subresources, because it sends no
-  device credential. See "Inline your own CSS and JS" advice to app authors
-  (§1).
+- **Related, and now closed:** the same opaque origin took a third thing, behind
+  a gateway. An app frame could not load its own files as subresources, because
+  it sends no device credential. [ADR 0238](adr/0238-app-frame-carries-a-capability-to-its-own-files.md)
+  carries a frame capability in the URL instead. See "Inline your own CSS and
+  JS" advice to app authors (§1), now `removed`.

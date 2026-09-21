@@ -6,7 +6,7 @@ import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { setAppFrameHash, splitFrameSrc } from './iframeNav';
-import { APP_FRAME_SANDBOX } from './appFrameSandbox';
+import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from './appFrameSandbox';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
@@ -89,7 +89,7 @@ function AppFrame({ src }: { src: string }) {
         class="app-ui-iframe"
         src={initialSrc}
         sandbox={APP_FRAME_SANDBOX}
-        allow="autoplay; fullscreen; encrypted-media"
+        allow={APP_FRAME_ALLOW}
         onLoad={() => setLoaded(true)}
       />
       {coverMounted && (

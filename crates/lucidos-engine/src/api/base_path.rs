@@ -175,7 +175,7 @@ pub fn inject_workspace_id(html: &str, id: Option<&str>) -> String {
 }
 
 /// Minimal HTML attribute escaping for a double-quoted value.
-fn escape_attr(value: &str) -> String {
+pub(super) fn escape_attr(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('"', "&quot;")

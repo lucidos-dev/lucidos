@@ -200,6 +200,22 @@ function fanOut(payload: unknown): void {
   }
 }
 
+/** Push one thing to one app frame, on a named channel.
+ *
+ *  The fan-out above is for the event stream, where every subscriber gets the
+ *  same payload. A renewed frame capability is per frame, so it goes straight
+ *  to the element rather than through the subscriber map. */
+export function postToAppFrame(
+  frame: HTMLIFrameElement,
+  channel: string,
+  data: unknown,
+): boolean {
+  const target = frame.contentWindow;
+  if (!target) return false;
+  postToFrame(target, { type: BRIDGE_PUSH_TYPE, channel, data });
+  return true;
+}
+
 /** One event-stream frame, verbatim, to every app that asked for it. */
 export function fanOutEventFrame(data: string): void {
   if (sseSubscribers.size === 0) return;

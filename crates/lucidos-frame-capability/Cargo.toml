@@ -1,0 +1,19 @@
+[package]
+name = "lucidos-frame-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The frame capability: the URL pass an opaque-origin app frame carries to its
+# own workspace files behind a gateway (ADR 0238).
+#
+# Two processes need it and they need it to agree exactly. The engine mints,
+# the gateway verifies, and a disagreement is either an app that stays broken
+# or a gate that opens for the wrong caller. So this is the
+# `lucidos-local-token` shape: one crate small enough for both to take, rather
+# than two halves pinned together by a source scan.
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+lucidos-local-token = { path = "../lucidos-local-token" }

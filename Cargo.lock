@@ -4321,6 +4321,7 @@ dependencies = [
  "lettre",
  "libc",
  "lucidos-file-backup-exclusion",
+ "lucidos-frame-capability",
  "lucidos-local-token",
  "lucidos-tailscale",
  "mail-parser",
@@ -4390,6 +4391,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucidos-frame-capability"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "lucidos-local-token",
+ "sha2",
+]
+
+[[package]]
 name = "lucidos-gateway"
 version = "0.1.0"
 dependencies = [
@@ -4402,6 +4412,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "lucidos-file-backup-exclusion",
+ "lucidos-frame-capability",
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",

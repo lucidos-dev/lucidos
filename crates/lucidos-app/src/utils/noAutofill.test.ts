@@ -177,6 +177,7 @@ const PROSE_FIELDS = [
   '../components/email/EmailConfirmModal.tsx', // email subject
   '../components/triggers/TriggerDetails.tsx', // trigger name, group name, intent
   '../components/settings/ResponseStylesSection.tsx', // a response style's instruction
+  '../components/settings/MarketplacesSection.tsx', // a marketplace's display name
 ];
 
 // Config / code / secret surfaces: an iOS auto-capital here corrupts the value.

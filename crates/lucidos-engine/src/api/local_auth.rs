@@ -235,6 +235,16 @@ fn publish_local_token(token: Option<String>) {
     let _ = LOCAL_TOKEN.set(token);
 }
 
+/// The machine-local token, for a caller deriving a key from it rather than
+/// checking a credential against it.
+///
+/// One reader today: [`super::frame_capability`], which derives the key an app
+/// frame's URL pass is signed with. The gateway derives the same key from the
+/// same file, which is what lets it verify with no handshake.
+pub(super) fn machine_local_token() -> Option<&'static str> {
+    LOCAL_TOKEN.get().and_then(Option::as_deref)
+}
+
 /// Is this caller a process on this machine, running as this user?
 ///
 /// Attribution only. See the module note: it is asked on every bind, including

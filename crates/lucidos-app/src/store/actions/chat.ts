@@ -685,7 +685,7 @@ function getQueuedMessages(threadId: string): QueuedMessage[] {
 /** Append retracted queued-message texts (FIFO) to the thread's compose draft,
  *  after any existing draft (blank-line separated), and force the prompt input
  *  to show it (the compose→textarea sync skips a focused non-empty input, so a
- *  programmatic append needs the explicit override — as `applySuggestion` does). */
+ *  programmatic append needs the explicit override, as `seedSuggestion` does). */
 function appendQueuedTextToCompose(threadId: string, texts: string[]): void {
   if (texts.length === 0) return;
   const existing = getDraft(threadId).text;

@@ -834,7 +834,9 @@ It arrives as a card over the workspace, with the instruction and, where there i
 
 Every notice this workspace has met lives at **Settings > System > Release Notices**, its own page. Go there if you closed the card on the way to doing something else, or tapped one action and want the others. It is apart from *What's New* on purpose: that panel says what CHANGED, and a notice says what to do about it.
 
-Anything still owed leads the page. Answered notices fold away below, behind a shut **Already answered** row. Open that and each one is ticked, struck through, and its button greyed out. It is a record of what the release asked and what you did, not something still asking. To do one again, just say so in the prompt.
+Anything still owed leads the page. Answered notices fold away below, behind a shut **Already answered** row. Open that and each one is ticked and struck through: a record of what the release asked, not something still asking.
+
+Its button stays live though. **Got it** says you have READ the notice, never that you have carried it out, so the two are answered separately. Acknowledge the card first and the audit is still one tap away, on the answered row.
 
 Answering is remembered per *workspace*, not per *device*: settle it on your laptop and your phone will not ask. The workspace's own place in the sequence is the *release notice cursor* (`docs/glossary.md`). A brand new workspace starts level and hears from its next upgrade instead, so nothing lands over the first-run welcome.
 

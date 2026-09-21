@@ -66,10 +66,15 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
   };
 }
 
-/** One row. Only the OWED notice can be acted on: a queued one is waiting its
- *  turn, and an answered one is done. The modal keeps that order by drawing no
- *  later notice at all, and this is the same rule where every row is visible at
- *  once.
+/** One row. Only a QUEUED notice can be acted on nowhere: it is waiting its
+ *  turn. The modal keeps that order by drawing no later notice at all, and this
+ *  is the same rule where every row is visible at once.
+ *
+ *  **An answered row keeps a LIVE action button.** Got it says the reader has
+ *  read the notice, never that they have carried it out, so the two are
+ *  answered separately. Greyed out it read as done, which is exactly what a
+ *  reader who acknowledged first and wanted the audit afterwards was told. The
+ *  action is a seeded sentence, so running it twice is running it twice.
  *
  *  An unresolved row ALWAYS offers Got it, and any row with an action keeps that
  *  button, answered or not. Two separate conditions, and each is load bearing.
@@ -77,8 +82,7 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
  *  `action_label` is optional. Without the first, a notice carrying no action
  *  could be answered nowhere but the modal, which Escape closes for the page's
  *  life. The *System attention badge* points at this page, so the reader would
- *  arrive at a dot with nothing to press. The second keeps an answered notice's
- *  button as a record of what it offered, greyed rather than gone. */
+ *  arrive at a dot with nothing to press. */
 function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: string }) {
   return (
     <div class="release-notice-row" data-state={state}>
@@ -109,7 +113,7 @@ function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: strin
             <button
               type="button"
               class="action-btn"
-              disabled={state !== 'owed'}
+              disabled={state === 'queued'}
               onClick={() => void takeReleaseNoticeAction(notice)}
             >
               {notice.action_label}

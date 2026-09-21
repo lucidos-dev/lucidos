@@ -15,14 +15,16 @@
    gateway boot splash + GET-gate + SSE reconnect make it a recoverable
    non-event, so the tab stays interactive and shows only a light dismissible
    "Restarting engine…" toast.
-   z-index above --z-control-panel so the header (.pane-header-brand,
-   .thread-toggle-slot, .message-route-panel all sit at 2200) is
-   covered by the dim overlay and its buttons aren't clickable through.
+   z-index above the WHOLE modal band, which is --z-modal plus a stack depth of
+   at most MAX_MODAL_STACK_DEPTH (store/overlayStack.ts). Stated against the
+   band rather than against --z-control-panel, because the band is the tallest
+   thing the blocker has to cover; the header (.pane-header-brand,
+   .thread-toggle-slot, .message-route-panel, all at 2200) is below it anyway.
    .toast-container sits a step higher so the "Refreshing…" toast stays visible. */
 .ui-blocking-overlay {
     position: fixed;
     inset: 0;
-    z-index: calc(var(--z-control-panel) + 100);
+    z-index: calc(var(--z-modal) + 50);
     background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;

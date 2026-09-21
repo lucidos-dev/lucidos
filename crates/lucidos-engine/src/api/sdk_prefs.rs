@@ -238,9 +238,12 @@ mod tests {
         // The iframe realm has no access to the parent's Storage.prototype
         // override, so it must derive the workspace slug and namespace the keys
         // itself, or a parent `ws:<slug>:lucidos-theme` write would never match
-        // the iframe read and every app would FOUC. An app iframe has no <base>,
-        // so its slug is the path before `/app/`.
+        // the iframe read and every app would FOUC. Direct to an engine the
+        // slug is the path before `/app/`. Behind a gateway the engine stamps a
+        // frame capability base, and the slug is everything before that segment
+        // (ADR 0238). The script has to carry both derivations.
         assert!(SDK_PREFS_JS.contains("indexOf(\"/app/\")"));
+        assert!(SDK_PREFS_JS.contains("~cap"));
         assert!(SDK_PREFS_JS.contains("ws:"));
     }
 

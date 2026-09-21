@@ -8,6 +8,7 @@ import { linkifyText } from './linkifyText';
 import { toastAutofocusTarget, toastTabTarget } from './toastFocus';
 import { computeToastShifts } from './toastReflow';
 import { toastColumns, toastLayout } from './toastColumns';
+import { toastStackUrgency } from './toastUrgency';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
 import { isTextInput } from '../../utils/dom';
@@ -245,6 +246,10 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
          rule keyed on this, so the render stays one code path. Temporary, and it
          goes with the picker (docs/temporary-measures.md). */
       data-toast-placement={toastPlacement.value}
+      /* Whether this stack may paint over an open modal (`toastUrgency.ts`).
+         The container carries the z-index and is therefore one stacking
+         context, so the answer is per stack rather than per toast. */
+      data-toast-urgency={toastStackUrgency(items)}
       onKeyDown={handleToastKeyDown}
     >
       {columns.map((column) => (

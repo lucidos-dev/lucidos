@@ -243,3 +243,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0233: An apply takes the gate wherever it is asked from: the LLM tool asks what the button asks](0233-an-apply-takes-the-gate-wherever-it-is-asked-from.md)
 - [0234: A reading position behind the loaded page opens at the top of the newest page; the app never fetches older history to chase it](0234-a-position-behind-the-page-opens-at-the-newest-page.md)
 - [0235: A refused delivery is an outage, and a switched-off hook says so itself](0235-a-refused-delivery-is-an-outage.md)
+- [0236: A queue the engine drains from memory keeps its membership in the event store](0236-queue-membership-lives-in-the-event-store.md)
+- [0237: Paint order follows what the reader is looking at: the overlay stack decides modal depth, and a modal outranks a toast that can wait](0237-overlay-and-toast-paint-order.md)
+- [0238: An app frame carries a short-lived capability into its own subresource URLs, so it can load its files behind a gateway](0238-app-frame-carries-a-capability-to-its-own-files.md)
+- [0239: A session raises a user-reaching security or correctness finding it will not fix, with the question tool, and never buries it as a non-goal](0239-a-session-raises-user-reaching-findings.md)

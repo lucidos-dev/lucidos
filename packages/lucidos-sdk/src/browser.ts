@@ -7,6 +7,7 @@ import { primeExternalLinkTarget } from './ui';
 import { isBridged } from './_bridge';
 import { primeBridgedStorage } from './_storage';
 import { installHostOps } from './hostOps';
+import { installCapabilityRenewal } from './frameCapability';
 
 export * from './index';
 
@@ -16,6 +17,11 @@ if (typeof document !== 'undefined') {
   // that. Installed unconditionally, so the host can ask the same way whichever
   // frame it got.
   installHostOps();
+  // Take the renewed pass the host pushes before this one lapses (ADR 0238).
+  // The engine seeded the first one into `<base href>`, and each renewal is one
+  // attribute write. Nothing reloads, and an already-loaded resource is
+  // untouched. A document with no pass ignores every push.
+  installCapabilityRenewal();
   // Scroll memory reads storage, and an isolated frame's own storage throws, so
   // the host holds it. That read is async and the restore is not, so the values
   // are fetched first. `primeBridgedStorage` is a no-op in a frame that can read
@@ -64,7 +70,11 @@ if (typeof document !== 'undefined') {
     if (isBridged() && anchor.hasAttribute('download') && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
       e.preventDefault();
       e.stopPropagation();
-      const url = new URL(href, window.location.href);
+      // Against `document.baseURI`, which is what the browser itself resolves
+      // this href against. Behind a gateway the base carries the frame
+      // capability (ADR 0238). `window.location.href` does not, so the older
+      // form asked for a file with no pass on it.
+      const url = new URL(href, document.baseURI);
       url.searchParams.set('download', '1');
       const via = document.createElement('a');
       via.href = url.href;

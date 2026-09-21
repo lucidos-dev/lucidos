@@ -20,9 +20,9 @@ export function notificationDiscussPrompt(n: Notification): string {
 
 /** Start a conversation about a notification that has no thread of its own.
  *
- *  `sendSeededPrompt` owns the whole gesture: it confirms before replacing a
- *  draft in progress, forces the Lucidos Agent destination, reveals the thread
- *  pane, sends, and toasts on failure. The thread id is allocated client-side,
+ *  `sendSeededPrompt` owns the whole gesture. It takes a draft of its own
+ *  rather than the one being typed in. It forces the Lucidos Agent
+ *  destination, reveals the thread pane, sends, and toasts on failure. The thread id is allocated client-side,
  *  so there is no submit-then-navigate step: the user is already looking at the
  *  thread when the request goes out.
  *

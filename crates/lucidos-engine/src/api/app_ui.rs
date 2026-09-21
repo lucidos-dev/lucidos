@@ -125,10 +125,18 @@ pub(super) fn rewrite_for_thread_id(html: &str, thread_id: &str) -> String {
 ///
 /// A `prefix` of `/` (direct access, no gateway) is a no-op. Only root-absolute
 /// refs to engine routes / bundled assets are rewritten; the app's own relative
-/// refs (`./style.css`) already resolve against the iframe URL and are left
-/// alone, and `<script>` BODIES are skipped so inline-JS string literals aren't
-/// corrupted. Idempotent in practice (already-prefixed paths don't re-match).
-pub(super) fn rescope_app_html(html: &str, prefix: &str) -> String {
+/// refs (`./style.css`) already resolve against the base stamped by
+/// [`stamp_frame_capability`], and `<script>` BODIES are skipped so inline-JS
+/// string literals aren't corrupted. Idempotent in practice (already-prefixed
+/// paths don't re-match).
+///
+/// `capability` threads the frame's URL pass onto the two prefixes that carry
+/// workspace content, `/data/` and `/app/` (ADR 0238). A root-absolute ref to
+/// one of those is the app addressing its own files, and behind a gateway those
+/// need the pass. The engine's own `/api/v1` assets are exempt by name and get
+/// none. A pass reaching `/api/v1` would put the whole API behind a token the
+/// frame hands to every document it embeds.
+pub(super) fn rescope_app_html(html: &str, prefix: &str, capability: Option<&str>) -> String {
     if prefix == "/" {
         return html.to_string();
     }
@@ -143,13 +151,73 @@ pub(super) fn rescope_app_html(html: &str, prefix: &str) -> String {
         .expect("app rescope attr regex must compile")
     });
 
+    let carrier = capability
+        .map(|token| format!("/{}/{token}", lucidos_frame_capability::SEGMENT))
+        .unwrap_or_default();
+
     rewrite_outside_script_bodies(html, |fragment| {
         ATTR_RE
             .replace_all(fragment, |caps: &regex::Captures| {
-                format!("{}{}{}", &caps[1], slug, &caps[2])
+                let path = &caps[2];
+                let pass = if carries_workspace_content(path) {
+                    carrier.as_str()
+                } else {
+                    ""
+                };
+                format!("{}{}{}{}", &caps[1], slug, pass, path)
             })
             .into_owned()
     })
+}
+
+/// Does this root-absolute ref address the workspace, rather than the engine?
+///
+/// The two trees a frame capability reaches, and the only two that need one.
+fn carries_workspace_content(path: &str) -> bool {
+    path.starts_with("/data/") || path.starts_with("/app/")
+}
+
+/// Give a framed app document a `<base href>` carrying its capability.
+///
+/// This is the whole of how an app's OWN relative refs work behind a gateway.
+/// `./style.css`, `<img src="logo.png">` and a nested iframe all resolve against
+/// the base, so each picks the pass up with no attribute rewritten.
+///
+/// It is also the one handle a renewal can move. The SDK swaps a fresh token
+/// into this element when the host pushes one, and nothing reloads.
+/// `history.replaceState` would have been the alternative, and it throws at an
+/// opaque origin on WebKit.
+///
+/// **A renewal reaches what resolves against the DOCUMENT, and nothing else.**
+/// A dynamic `import()` inside an ES module resolves against that module's own
+/// url, a stylesheet's `url()` against the stylesheet's. Both keep the pass
+/// they loaded with. ADR 0238 § Consequences carries the class.
+///
+/// An app that declares its own `<base href>` keeps it and gets none. The first
+/// base in a document wins, so inserting ours would silently override a choice
+/// the author made. Such an app loads as it does today.
+pub(super) fn stamp_frame_capability(
+    html: &str,
+    prefix: &str,
+    capability: &str,
+    app_id: &str,
+) -> String {
+    static BASE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)<base\b[^>]*?\bhref\s*=\s*"#).expect("app base-href regex")
+    });
+    if BASE_RE.is_match(html) {
+        return html.to_string();
+    }
+    // `prefix` reaches us from `X-Forwarded-Prefix`, which is the gateway's on a
+    // proxied request and forgeable on a direct hit to the engine's own port.
+    // `frame_capability::mint` refuses a prefix that is not slug-shaped, so
+    // there is no pass to stamp when one is crafted. Escaped anyway, because
+    // that guarantee lives in another function and `inject_base_href` escapes
+    // the same value for the same reason.
+    let segment = lucidos_frame_capability::SEGMENT;
+    let href = format!("{prefix}{segment}/{capability}/app/{app_id}/");
+    let tag = format!("<base href=\"{}\">", super::base_path::escape_attr(&href));
+    super::base_path::insert_into_head(html, &tag)
 }
 
 /// Append a query string (e.g. `?thread_id=abc123`) to relative src/href
@@ -211,7 +279,7 @@ mod tests {
     #[test]
     fn rescope_app_html_prefixes_absolute_engine_refs() {
         let html = r#"<script src="/api/v1/sdk.js"></script><link href="/assets/x.css"><img src="/data/a.png">"#;
-        let out = rescope_app_html(html, "/dev/");
+        let out = rescope_app_html(html, "/dev/", None);
         assert!(out.contains(r#"<script src="/dev/api/v1/sdk.js">"#));
         assert!(out.contains(r#"<link href="/dev/assets/x.css">"#));
         assert!(out.contains(r#"<img src="/dev/data/a.png">"#));
@@ -220,7 +288,7 @@ mod tests {
     #[test]
     fn rescope_app_html_root_prefix_is_noop() {
         let html = r#"<script src="/api/v1/sdk.js"></script><link href="style.css">"#;
-        assert_eq!(rescope_app_html(html, "/"), html);
+        assert_eq!(rescope_app_html(html, "/", None), html);
     }
 
     #[test]
@@ -228,7 +296,7 @@ mod tests {
         // App's own relative refs resolve against the iframe URL — untouched.
         // Inline-JS string literals containing src="/api/v1/…" must NOT change.
         let html = r#"<script src="/api/v1/sdk.js">var x='<img src="/api/v1/foo">';</script><link href="./style.css">"#;
-        let out = rescope_app_html(html, "/work/");
+        let out = rescope_app_html(html, "/work/", None);
         assert!(out.contains(r#"<script src="/work/api/v1/sdk.js">"#)); // opening tag rewritten
         assert!(out.contains(r#"var x='<img src="/api/v1/foo">';"#)); // body verbatim
         assert!(out.contains(r#"href="./style.css""#)); // relative untouched
@@ -245,7 +313,11 @@ mod tests {
 
     #[test]
     fn the_stamped_favicon_follows_the_workspace_prefix_behind_the_gateway() {
-        let out = rescope_app_html(&ensure_app_favicon("<html><head></head></html>"), "/dev/");
+        let out = rescope_app_html(
+            &ensure_app_favicon("<html><head></head></html>"),
+            "/dev/",
+            None,
+        );
         assert!(out.contains(r#"href="/dev/favicon.svg""#));
         assert!(out.contains(r#"href="/dev/favicon-32.png""#));
     }
@@ -313,7 +385,7 @@ mod tests {
     fn the_rescoped_prefs_src_still_matches() {
         // Behind the gateway the src is already `/dev/api/v1/…` by the time this
         // runs, so the pattern cannot be anchored at the start of the path.
-        let out = stamp_prefs_device(&rescope_app_html(OPTED_IN, "/dev/"), "abc123");
+        let out = stamp_prefs_device(&rescope_app_html(OPTED_IN, "/dev/", None), "abc123");
         assert!(
             out.contains(r#"src="/dev/api/v1/sdk-prefs.js?device=abc123""#),
             "{out}"
@@ -361,5 +433,105 @@ mod tests {
     fn a_script_body_mentioning_the_prefs_src_is_left_alone() {
         let html = r#"<script>var s = 'src="/api/v1/sdk-prefs.js"';</script>"#;
         assert_eq!(stamp_prefs_device(html, "abc123"), html);
+    }
+
+    // ── The frame capability (ADR 0238) ─────────────────────────────────────
+
+    const PASS: &str = "6a0b~site-publisher~00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn the_base_carries_the_pass_to_every_relative_ref() {
+        // The app writes nothing special. `./style.css` resolves against this
+        // base, and so does a nested iframe and a runtime import.
+        let html =
+            r#"<!DOCTYPE html><html><head><link href="./style.css"></head><body></body></html>"#;
+        let out = stamp_frame_capability(html, "/dev/", PASS, "site-publisher");
+        assert!(
+            out.contains(&format!(
+                r#"<head><base href="/dev/~cap/{PASS}/app/site-publisher/">"#
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<link href="./style.css">"#),
+            "the app's own markup is untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn an_app_that_declares_its_own_base_keeps_it() {
+        // The first base in a document wins, so ours would silently override a
+        // choice the author made. Such an app loads as it does today.
+        for declared in [
+            r#"<base href="./">"#,
+            r#"<base target="_top" href="/dev/app/x/">"#,
+            r#"<BASE HREF='./sub/'>"#,
+        ] {
+            let html = format!("<html><head>{declared}</head></html>");
+            assert_eq!(
+                stamp_frame_capability(&html, "/dev/", PASS, "site-publisher"),
+                html,
+                "{declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pass_reaches_workspace_refs_and_no_engine_route() {
+        let html = concat!(
+            r#"<script src="/api/v1/sdk.js"></script>"#,
+            r#"<link href="/api/v1/sdk-iframe.css">"#,
+            r#"<img src="/data/artifacts/chart.png">"#,
+            r#"<a href="/app/site-publisher/report.pdf" download>r</a>"#,
+            r#"<link href="/assets/x.css"><link href="/favicon.svg">"#,
+        );
+        let out = rescope_app_html(html, "/dev/", Some(PASS));
+        // Workspace content, which needs the pass behind a gateway.
+        assert!(out.contains(&format!(
+            r#"src="/dev/~cap/{PASS}/data/artifacts/chart.png""#
+        )));
+        assert!(out.contains(&format!(
+            r#"href="/dev/~cap/{PASS}/app/site-publisher/report.pdf""#
+        )));
+        // Engine routes and bundle assets, which must never carry one.
+        assert!(out.contains(r#"src="/dev/api/v1/sdk.js""#), "{out}");
+        assert!(
+            out.contains(r#"href="/dev/api/v1/sdk-iframe.css""#),
+            "{out}"
+        );
+        assert!(out.contains(r#"href="/dev/assets/x.css""#), "{out}");
+        assert!(out.contains(r#"href="/dev/favicon.svg""#), "{out}");
+        assert_eq!(
+            out.matches("~cap").count(),
+            2,
+            "exactly the two workspace refs: {out}"
+        );
+    }
+
+    #[test]
+    fn a_direct_hit_gets_no_pass_and_no_base() {
+        // No gateway means no device gate, so there is nothing to prove and
+        // nothing is added. Every other rewrite here has the same shape.
+        let html = r#"<html><head><img src="/data/a.png"></head></html>"#;
+        assert_eq!(rescope_app_html(html, "/", Some(PASS)), html);
+        assert_eq!(rescope_app_html(html, "/", None), html);
+    }
+
+    #[test]
+    fn the_wip_preview_suffix_rides_on_top_of_the_base() {
+        // A preview rewrites relative refs to carry `?thread_id=`, and those
+        // then resolve against the capability base. Both survive.
+        let html = r#"<html><head><link href="style.css"></head></html>"#;
+        let out = stamp_frame_capability(
+            &rescope_app_html(&rewrite_for_thread_id(html, "abc"), "/dev/", Some(PASS)),
+            "/dev/",
+            PASS,
+            "site-publisher",
+        );
+        assert!(out.contains(r#"href="style.css?thread_id=abc""#), "{out}");
+        assert!(
+            out.contains(&format!(r#"<base href="/dev/~cap/{PASS}/app/"#)),
+            "{out}"
+        );
     }
 }

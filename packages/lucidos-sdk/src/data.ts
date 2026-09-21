@@ -1,5 +1,6 @@
 import { apiUrl, getBaseUrl, request, requestText, requestVoid } from './_fetch';
 import { assertArray } from './_validate';
+import { capabilityCarrier } from './frameCapability';
 import { parseAppId } from './scroll';
 
 export interface WriteResult {
@@ -64,6 +65,10 @@ export const data = {
     // system-knowhow lives in the engine repo, not the workspace, so it isn't
     // served by the static `/data` mount. Route it through the API endpoint
     // which dispatches to the engine's system_knowhow_dir.
+    //
+    // This one carries no frame capability, because the pass deliberately
+    // reaches no `/api/v1` route (ADR 0238). So it stays refused behind a
+    // gateway, which `system-knowhow/js-sdk.md` says out loud.
     if (path.startsWith('system-knowhow/')) {
       return apiUrl(`/data/${encodePathSegments(path)}`);
     }
@@ -76,16 +81,20 @@ export const data = {
     // branch. The engine's HTML rewriter (api/app_ui.rs) handles markup
     // `<img src="…">` but skips `<script>` bodies, leaving JS-set src as the
     // remaining footgun this closes.
+    // The carrier is what makes this load behind a gateway, and `''` direct to
+    // one. Read per call, so a renewal needs no cache to invalidate.
+    const carrier = capabilityCarrier();
     if (typeof window !== 'undefined') {
       const appUrl = buildAppLocalUrl(
         path,
         window.location.pathname,
         window.location.search,
         getBaseUrl(),
+        carrier,
       );
       if (appUrl !== null) return appUrl;
     }
-    return `${getBaseUrl()}/data/${encodePathSegments(path)}`;
+    return `${getBaseUrl()}${carrier}/data/${encodePathSegments(path)}`;
   },
 
   edit(path: string, operations: EditOperation[]): Promise<void> {
@@ -121,6 +130,10 @@ function encodePathSegments(path: string): string {
  * caller falls through to the default `/data/...` mount (which serves from the
  * live workspace).
  *
+ * `carrier` is the frame capability segment, or `''` where there is none
+ * (ADR 0238). It sits between the workspace prefix and `/app/`, because that
+ * is where the gateway reads it and strips it back off.
+ *
  * Exported for unit testing — the production call site reads `pathname` /
  * `search` / `baseUrl` from `window` + `getBaseUrl()`.
  */
@@ -129,6 +142,7 @@ export function buildAppLocalUrl(
   pathname: string,
   search: string,
   baseUrl: string,
+  carrier = '',
 ): string | null {
   const appId = parseAppId(pathname, baseUrl);
   if (!appId) return null;
@@ -145,5 +159,5 @@ export function buildAppLocalUrl(
 
   const encodedAppId = encodeURIComponent(appId);
   const encodedRest = encodePathSegments(rest);
-  return `${baseUrl}/app/${encodedAppId}/${encodedRest}${qs ? `?${qs}` : ''}`;
+  return `${baseUrl}${carrier}/app/${encodedAppId}/${encodedRest}${qs ? `?${qs}` : ''}`;
 }

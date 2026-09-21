@@ -72,21 +72,47 @@ and refuses the rest. See § `lucidos.request`. Storage has no replacement yet,
 so keep per-device state out of an app or hold it in `lucidos.data`, which is
 workspace-wide.
 
-**Inline your own CSS and JS, rather than shipping them as separate files.** The
-opaque origin costs your frame the device credential on every subresource, and
-the gateway in front of the engine asks for it. So your own
-`<script src="app.js">`, `<link href="style.css">`, `<img src>` and
-`lucidos.data.url(path)` all come back **401** where a gateway is in front. That
-is every packaged install and every remote-access URL.
+**Your own files load normally: a separate `app.js`, `style.css` or image is
+fine.** The opaque origin costs your frame the device credential on every
+subresource, and the gateway in front of the engine asks for it. So the engine
+gives your document a short-lived pass to its own files and stamps it into a
+`<base href>`. Every relative ref you write resolves through that, and
+`lucidos.data.url(path)` carries it too. You write nothing, and the host keeps
+the pass fresh while your app is open. See
+[ADR 0238](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0238-app-frame-carries-a-capability-to-its-own-files.md).
 
-The four `/api/v1` assets in the table above are exempt and always load. So is
-anything under `lucidos.apiUrl('/static/…')`, and a `data:` URL works from any
-frame. This is a break rather than a design. It is registered in
-`docs/temporary-measures.md`, and the inlining advice comes out when it is
-fixed.
+**Do not declare your own `<base href>`.** The first base in a document wins, so
+yours would replace the pass and your files would stop loading behind a gateway.
+Relative refs already resolve against your app's own directory, so there is
+nothing a base buys you here.
 
-Popups, OAuth and fullscreen are untouched. Opened in its own browser tab an app
-is a top-level document, not a frame, so it keeps every direct path.
+The pass reaches your app's files and the workspace's `data/` tree, and nothing
+else. One `lucidos.data.url` call is outside it: a `system-knowhow/` path routes
+through `/api/v1/data/…`, an engine API route, so it still answers **401**
+behind a gateway. Read those with `lucidos.data.read` instead.
+
+**The shell hands your frame a short list of browser features, and denies the
+rest.** A permissions-policy feature defaults to an allowlist of `self`, and an
+opaque origin is not `self`. So the frame gets a feature only where the shell
+delegates it. Today that is `autoplay`, `fullscreen`, `encrypted-media` and
+`clipboard-write`. Media plays, fullscreen works, and
+`navigator.clipboard.writeText()` puts text on the clipboard from a Copy button.
+
+What your frame does not get, and why each one. Some are a choice and some are
+a browser limit, so each bullet says which:
+
+- **Reading the clipboard.** `navigator.clipboard.readText()` is refused. A read
+  would hand your app whatever the user last copied from anywhere, so it is
+  withheld on purpose.
+- **The camera and the microphone.** `getUserMedia` fails in a frame however the
+  shell is configured, because both browsers refuse media capture to an opaque
+  origin outright. An app that needs either has to run in its own tab.
+- **The OS share sheet.** `navigator.share` is refused, and is not delegated
+  because iOS refuses the delegation anyway. Call
+  `lucidos.ui.openExternal(url)`, which opens the link through the host.
+
+Popups and OAuth are untouched. Opened in its own browser tab an app is a
+top-level document, not a frame, so it keeps every direct path.
 
 **One link shape needs `sdk.js` specifically:** `<a href="report.pdf" download>`
 on one of your own bundled files. A browser ignores the `download` attribute on
@@ -95,9 +121,9 @@ would navigate the frame to the file. `sdk.js` intercepts it and asks the engine
 for the file as an attachment. Without the SDK, use a `blob:` or `data:` URL,
 which download from any frame.
 
-Behind a gateway that interception is refused too. It asks for
+That interception works behind a gateway too. It asks for
 `/<slug>/app/<id>/<file>?download=1`, which is one of your own files, so the
-paragraph above applies. Use a `blob:` or `data:` URL there.
+pass above reaches it.
 
 ### Theme variables
 
@@ -396,7 +422,11 @@ const src = lucidos.data.url('artifacts/screenshots/latest.png');
 
 One other special case: a `system-knowhow/...` path is routed through the engine's `/api/v1/data/...` endpoint (these files live in the engine repo, not the workspace, so the static `/data` mount can't serve them).
 
-Behind a gateway, a URL this returns is refused from inside an app frame: it is a subresource, and the frame sends no device credential. Use a `data:` URL, or read the bytes with `lucidos.data.read` and build one. See § Setup.
+Behind a gateway a URL this returns carries your frame's pass to its own files. So it loads from inside an app frame like any other subresource. The `system-knowhow/` case above is the one exception: it is an `/api/v1` route, which a pass deliberately never reaches, so it still answers **401** there. Read those with `lucidos.data.read` instead. See § Setup.
+
+A URL you keep around is not a URL you can keep forever. The pass behind it lasts an hour, and `url()` reads the current one on every call. So build the URL where you use it rather than caching the string. An `<iframe src>` you set once and leave open past the hour needs its `src` rebuilt before an in-page link inside it works again.
+
+The same applies to a url the browser captured when it loaded something. A dynamic `import()` inside an ES module resolves against that module's own url, and a stylesheet's `url()` against the stylesheet's. Both keep the pass they loaded with, so a chunk imported for the first time an hour into a session answers 401. Load what you need up front, or accept that the user reloads.
 
 ## lucidos.events — Event Store
 
@@ -655,7 +685,7 @@ first resolve somewhere else:
 
 | Written in JS | Resolves to | Answer |
 |---|---|---|
-| `new URL('api/v1/events/query', document.baseURI)` | `/<workspace>/app/<app-id>/api/v1/events/query` | `404` |
+| `new URL('api/v1/events/query', document.baseURI)` | your app's own directory, plus `api/v1/events/query` | `404` |
 | `fetch('/api/v1/events/query')` | `/api/v1/events/query` | `404 unknown workspace 'api'` |
 
 **Inside the host shell the call fails before it gets that far.** An app frame
@@ -664,11 +694,12 @@ and the engine grants no CORS. The `fetch` rejects with a `TypeError` and your
 code never sees a status. The addresses above are what a standalone app tab, a
 top-level document on the engine's own origin, still resolves.
 
-The relative form fails because **an app iframe has no `<base href>`**. The SPA
-shell gets one stamped in (`<base href="/<workspace>/">`), an app page does not,
-so `document.baseURI` is the app's own directory and every relative path hangs
-off it. The root-absolute form fails because the gateway reads the **first path
-segment as a workspace name**, and there is no workspace called `api`.
+The relative form fails because **`document.baseURI` is your app's own
+directory**, so every relative path hangs off it. Behind a gateway that
+directory also carries your frame's pass to its own files. A pass reaches no
+engine route, so the URL is wrong twice over. The root-absolute form fails
+because the gateway reads the **first path segment as a workspace name**, and
+there is no workspace called `api`.
 
 **Markup is rewritten on the way out, runtime JS is not.** This is the
 non-obvious part, and it is why the boilerplate in § Setup works at all: the
@@ -680,10 +711,11 @@ JavaScript builds at runtime. **The same `/api/v1/…` string is correct in mark
 and broken in JS.**
 
 `apiUrl` derives the prefix the way the SDK derives it internally: the
-`<base href>` when the document has one, otherwise everything before `/app/` in
-the path. Don't re-derive it in app code, and never hardcode a slug: the
-workspace name is not the app's to know. (`lucidos.configure({ baseUrl })` is
-the one override, for an app hosted outside the engine.)
+`<base href>` when the document has one, minus your frame's pass, and otherwise
+everything before `/app/` in the path. Don't re-derive it in app code, and never
+hardcode a slug: the workspace name is not the app's to know.
+(`lucidos.configure({ baseUrl })` is the one override, for an app hosted outside
+the engine.)
 
 **The failure mode is silence.** Neither failure names itself: a wrong URL is a
 plain 404, and a refused one is `Load failed` on WebKit or a `TypeError` on

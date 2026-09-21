@@ -1175,6 +1175,11 @@ pub(crate) async fn lookup_interrupted_ask(
 /// `request_event_id`, or no `ToolCalled` at all. Without an anchor the
 /// resumed events would carry no `request_event_id` and strand outside every
 /// exchange, which is worse than a redundant boundary panel.
+///
+/// The fallback carries `interrupted_turn: None` because that is the same
+/// missing field. With no lower bound the queued-message recovery would sweep
+/// the whole thread, so it is skipped instead
+/// ([`ChatResumeAnchor::interrupted_turn`]).
 pub(crate) fn resume_anchor_for_ask(
     ask: Option<&InterruptedAsk>,
     thread_id: Uuid,
@@ -1186,7 +1191,9 @@ pub(crate) fn resume_anchor_for_ask(
                 "[CCQuestion] no interrupted turn to continue for thread {} — resuming with a Continue boundary",
                 thread_id
             );
-            ChatResumeAnchor::NewBoundary
+            ChatResumeAnchor::NewBoundary {
+                interrupted_turn: None,
+            }
         }
     }
 }

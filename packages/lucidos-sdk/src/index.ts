@@ -16,11 +16,13 @@ import { request } from './request';
 
 export const lucidos = {
   configure,
-  // Public because an app builds a `src` or an `href` onto the engine with it:
-  // an app iframe carries no `<base href>`, so a relative URL resolves under
-  // `/<slug>/app/<id>/` and a root-absolute `/api/v1/…` reads its first segment
-  // as a workspace name. Both 404. A `fetch` of what it returns is refused from
-  // a frame; `lucidos.request` is the call. See `system-knowhow/js-sdk.md`.
+  // Public because an app builds a `src` or an `href` onto the engine with it.
+  // A relative URL resolves under the frame's own directory, and a
+  // root-absolute `/api/v1/…` reads its first segment as a workspace name. Both
+  // 404. Behind a gateway that directory also carries a frame capability (ADR
+  // 0238), which reaches no engine route. A `fetch` of what this returns is
+  // refused from a frame; `lucidos.request` is the call. See
+  // `system-knowhow/js-sdk.md`.
   apiUrl,
   // The escape hatch for an endpoint no namespace covers (ADR 0231). Bridged,
   // and refused for a route the engine does not open to apps.

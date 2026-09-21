@@ -18,6 +18,7 @@
  */
 
 import { wsDeviceId } from './_storage';
+import { splitCapability } from './frameCapability';
 import {
   callHost,
   fromWireResponse,
@@ -29,12 +30,16 @@ import {
 } from './_bridge';
 
 /** Derive the workspace base path (`/<slug>`) the SDK runs under, so calls to
- *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Two
- *  contexts, both slug-agnostic:
+ *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Three
+ *  contexts, all slug-agnostic:
  *   • The main app loads the SPA shell, which the engine stamps with
  *     `<base href="/<slug>/">` — read that (authoritative, any slug name).
- *   • An app iframe loads at `/<slug>/app/<app_id>/…` with no `<base>` — derive
- *     the prefix as everything before `/app/`.
+ *   • An app iframe BEHIND A GATEWAY is stamped with a frame-capability base,
+ *     `<base href="/<slug>/~cap/<token>/app/<id>/">` (ADR 0238). Everything
+ *     before the segment is the prefix. The pass reaches `/data/` and
+ *     `/app/<id>/`, never `/api/v1`, so it must not ride an API call.
+ *   • An app iframe direct to the engine has no `<base>`, so the prefix is
+ *     everything before `/app/`.
  *  Falls back to `''` (legacy root / no DOM). `configure({ baseUrl })` overrides
  *  for embedders that set it explicitly. */
 function computeBaseUrl(): string {
@@ -47,6 +52,8 @@ function computeBaseUrl(): string {
       } catch {
         /* keep raw */
       }
+      const capability = splitCapability(path);
+      if (capability) return capability.prefix; // '' at root, '/<slug>' otherwise
       return path.replace(/\/+$/, ''); // '' at root, '/<slug>' or '/~' otherwise
     }
   }

@@ -748,6 +748,95 @@ fn the_previously_unlabelled_tools_render_a_real_label() {
     }
 }
 
+/// Applying, and the three standing-apply actions beside it, each name what
+/// they do. All three fell to the list label before, so the step row read
+/// "Listing changes..." in the middle of an apply.
+#[test]
+fn describe_tool_labels_every_changes_action() {
+    for (action, expected) in [
+        ("list", "Listing changes..."),
+        ("apply", "Applying change..."),
+        ("apply_when_settled", "Arming a standing apply..."),
+        ("apply_as_they_settle", "Applying, and arming the rest..."),
+        ("cancel_standing_apply", "Canceling a standing apply..."),
+    ] {
+        assert_eq!(
+            describe_tool("changes", &serde_json::json!({ "action": action })),
+            expected,
+            "grouped `changes` action '{action}'"
+        );
+        // The flat back-compat alias reads the same: one operation, one label,
+        // whichever name the call arrived under.
+        let alias = crate::capability_manifest::domain_for_tool("changes")
+            .and_then(|d| d.legacy_tool_for_action(action))
+            .unwrap_or_else(|| panic!("no llm_alias for changes action '{action}'"));
+        assert_eq!(describe_tool(alias, &serde_json::json!({})), expected);
+    }
+}
+
+/// A grouped tool dispatches on `action`, and `tool_label`'s `_` arm carries
+/// whichever action the domain reads as its default. An action with no arm of
+/// its own lands there in silence, which is how arming a standing apply came to
+/// narrate as "Listing changes...". Two actions rendering one label is the
+/// fingerprint of that miss, so hold every grouped tool to a label per action.
+///
+/// The fingerprint needs a named action to already own the default arm, which
+/// is true of every domain that has gone wrong so far. Two answer an unknown
+/// action with a label no action of theirs renders: `manage_models` and
+/// `manage_repositories`. A missing arm there stays invisible to this guard,
+/// and closing that needs a default no known action can reach.
+#[test]
+fn every_grouped_action_renders_its_own_step_label() {
+    // The one honest collision: correcting a memory by text and correcting it
+    // by id are the same act to the user, and one label says so. Keyed by tool
+    // name, which is what the failure below prints. Two domains carry a `name`
+    // that differs from it.
+    const SHARED_BY_DESIGN: &[(&str, &[&str])] = &[("memory", &["correct", "correct_by_id"])];
+
+    let mut checked = 0usize;
+    let mut collisions: Vec<String> = Vec::new();
+    for domain in crate::capability_manifest::domains() {
+        let mut by_label: std::collections::BTreeMap<String, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for action in domain.actions() {
+            checked += 1;
+            // Only `action`, so every label falls back the same way: an arm
+            // that names its operation stays distinct with no other argument.
+            let label = describe_tool(domain.tool_name, &serde_json::json!({ "action": action }));
+            by_label.entry(label).or_default().push(action);
+        }
+        for (label, mut actions) in by_label {
+            // Sorted, so the exemption reads as a set: reordering a domain's
+            // operations changes nothing a user sees and must not fail here.
+            actions.sort_unstable();
+            if actions.len() < 2
+                || SHARED_BY_DESIGN.iter().any(|(tool, shared)| {
+                    *tool == domain.tool_name && shared.iter().eq(actions.iter())
+                })
+            {
+                continue;
+            }
+            collisions.push(format!(
+                "{} actions {:?} all render \"{}\"",
+                domain.tool_name, actions, label
+            ));
+        }
+    }
+    // A manifest refactor that stopped yielding actions would disarm the guard
+    // while it still passed. Hold a floor well under today's count.
+    assert!(
+        checked >= 40,
+        "only {checked} grouped actions examined: capability_manifest::domains() \
+         no longer reports what this guard walks"
+    );
+    assert!(
+        collisions.is_empty(),
+        "these grouped actions share a step label, so at least one is falling to \
+         the default arm: {}. Add a match arm in core::mod::tool_label for each.",
+        collisions.join("; ")
+    );
+}
+
 /// The grouped `triggers` tool dispatches on `action`, and an unrecognised
 /// action falls to the list label. An off-schedule run is the opposite of a
 /// list, so "Listing triggers..." for `action: "run"` was actively wrong, not

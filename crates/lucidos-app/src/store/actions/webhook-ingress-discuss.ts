@@ -52,9 +52,9 @@ export function webhookIngressDiscussPrompt(outage: WebhookIngressOutage): strin
 
 /** Start a conversation about the standing ingress outage.
  *
- *  `sendSeededPrompt` owns the whole gesture: it confirms before replacing a
- *  draft in progress, forces the Lucidos Agent destination, reveals the thread
- *  pane, sends, and toasts on failure.
+ *  `sendSeededPrompt` owns the whole gesture. It takes a draft of its own
+ *  rather than the one being typed in. It forces the Lucidos Agent
+ *  destination, reveals the thread pane, sends, and toasts on failure.
  *
  *  The bar stays up behind the conversation. Only a good probe retracts it, so
  *  hiding it here would claim a recovery nothing measured. */

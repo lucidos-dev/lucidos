@@ -197,21 +197,43 @@ function applyMarketplaceMutation(marketplaces: PluginMarketplace[]): void {
   void refreshPluginCatalog();
 }
 
+/** The one POST both an add and a rename make. A marketplace is keyed on a hash
+ *  of its canonical source, so posting a source the engine already holds
+ *  rewrites that entry in place. Only the wording differs, and the user is owed
+ *  the word for what they did. */
+async function postMarketplace(
+  source: string,
+  name: string | undefined,
+  verb: 'register' | 'rename',
+): Promise<boolean> {
+  try {
+    const { marketplaces } = await addPluginMarketplace(source, name);
+    applyMarketplaceMutation(marketplaces);
+    showToast(verb === 'rename' ? 'Marketplace renamed' : 'Marketplace registered', 'success');
+    return true;
+  } catch (e) {
+    showToast(`Failed to ${verb} marketplace: ${errorDetail(e)}`, 'error');
+    return false;
+  }
+}
+
 export async function addPluginMarketplaceAction(source: string, name?: string): Promise<boolean> {
   const trimmed = source.trim();
   if (!trimmed) {
     showToast('Marketplace URL is required', 'error');
     return false;
   }
-  try {
-    const { marketplaces } = await addPluginMarketplace(trimmed, name?.trim() || undefined);
-    applyMarketplaceMutation(marketplaces);
-    showToast('Marketplace registered', 'success');
-    return true;
-  } catch (e) {
-    showToast(`Failed to register marketplace: ${errorDetail(e)}`, 'error');
-    return false;
-  }
+  return postMarketplace(trimmed, name?.trim() || undefined, 'register');
+}
+
+/** Rename a registered marketplace, by re-posting the URL it already carries.
+ *
+ *  The URL is the marketplace's identity, so it is not editable: pointing at
+ *  another repository is a different marketplace, which Remove plus the Add
+ *  form already express. Pass the stored `source` verbatim. A changed one lands
+ *  on a different id and leaves the old row behind. */
+export function renamePluginMarketplaceAction(source: string, name: string): Promise<boolean> {
+  return postMarketplace(source, name, 'rename');
 }
 
 /** One-click register the official Lucidos marketplace (the empty-state

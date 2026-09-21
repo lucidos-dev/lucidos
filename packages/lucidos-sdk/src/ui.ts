@@ -481,9 +481,14 @@ export const ui = {
     ) {
       // Deliberately NOT routed through the host: user activation does not
       // survive the hop (the host's navigate goes over HTTP and lands via SSE),
-      // so a host-side share would be refused on every app link. The iframe is
-      // same-origin, so the `web-share` permissions-policy default of `self`
-      // covers this frame.
+      // so a host-side share would be refused on every app link.
+      //
+      // In an app frame this no longer reaches the sheet. ADR 0227 gave the
+      // frame an opaque origin, which matches no feature's `self` default, and
+      // `web-share` is not delegated. WebKit refuses it even when it is, so
+      // the attribute is no remedy and iOS is the only caller. The catch below
+      // takes the host path, so the link still opens. A standalone app tab is
+      // a top-level document and still gets the sheet.
       return navigator.share({ url }).catch((err: unknown) => {
         // The user closing the sheet chose "none of these"; honour it rather
         // than opening something anyway. Anything else means the sheet never

@@ -50,13 +50,20 @@ export async function resolveReleaseNoticeById(id: string): Promise<void> {
  *  thread they were just sent to. Any notices behind this one return on the
  *  next open, and the What's New panel keeps them reachable meanwhile.
  *
- *  Resolved only when the send actually happened. A declined draft override
- *  leaves the notice owed, because nothing was started. */
+ *  Resolved only when the send actually happened. A failed send leaves the
+ *  notice owed, because nothing was started.
+ *
+ *  An ALREADY answered notice can still be run, from its row on the Release
+ *  Notices page. Got it says the reader has read the instruction, not that they
+ *  have carried it out, so the action outlives it. Nothing is resolved a second
+ *  time: the answer is already recorded, and re-recording it would append an
+ *  event saying what the first one said. */
 export async function takeReleaseNoticeAction(notice: ReleaseNotice): Promise<void> {
   if (!notice.action_prompt) return;
   const sent = await sendSeededPrompt(notice.action_prompt, 'start that from the release notice');
   if (!sent) return;
   releaseNoticeDismissed.value = true;
+  if (notice.resolved) return;
   await resolveReleaseNoticeById(notice.id);
 }
 

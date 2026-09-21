@@ -2151,12 +2151,24 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
   // closes (e.g. the "Engine restarted" / "Restart failed" / "Engine restart
   // timed out" toasts, each set after clearing the flag) show normally.
   if (workspaceUnavailable() && !showWhileUnavailable) return;
+  // When this toast goes away on its own, or `undefined` to wait to be
+  // answered. A KEYED toast is timed only where the caller names a delay. An
+  // unkeyed one is timed unless it carries an action or reports a problem.
+  //
+  // Computed once, ahead of both branches, because `persistent` rides onto the
+  // stored toast and the two would otherwise decide it from two shapes.
+  // `toastStackUrgency` reads it to let a modal outrank the toast layer. A
+  // timed toast lowered behind a modal is one the reader never sees.
+  const autoMs = key
+    ? autoDismissMs
+    : autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : TOAST_AUTO_DISMISS_MS);
+  const persistent = autoMs === undefined;
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus } : t);
-      scheduleAutoDismiss(key, autoDismissMs);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, persistent } : t);
+      scheduleAutoDismiss(key, autoMs);
       return;
     }
   }
@@ -2169,17 +2181,15 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
   // Prepend, so the newest toast renders at the top of its pane's column and
   // pushes that pane's existing toasts down. Each column is pinned to the top
   // of the viewport, so array order runs top to bottom.
-  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, pane }, ...toasts.value];
+  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, persistent, pane }, ...toasts.value];
   if (key) {
-    scheduleAutoDismiss(key, autoDismissMs);
+    scheduleAutoDismiss(key, autoMs);
     return;
   }
-  // Unkeyed: errors, warnings, and toasts with actions/onClick require manual dismissal; other types auto-close
-  const ms = autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : TOAST_AUTO_DISMISS_MS);
-  if (ms !== undefined) {
+  if (autoMs !== undefined) {
     setTimeout(() => {
       toasts.value = toasts.value.filter((t) => t.id !== id);
-    }, ms);
+    }, autoMs);
   }
 }
 

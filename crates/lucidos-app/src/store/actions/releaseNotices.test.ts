@@ -136,8 +136,8 @@ describe('acting on a notice', () => {
   });
 
   it('answers nothing when the send did not happen', async () => {
-    // Declining the draft-override confirm starts nothing, so the notice is
-    // still owed and the modal stays up to ask again.
+    // A failed send starts nothing, so the notice is still owed and the modal
+    // stays up to ask again.
     loaded([notice('a', false, true)], 'a');
     sendSeededPrompt.mockResolvedValue(false);
 
@@ -146,6 +146,21 @@ describe('acting on a notice', () => {
     expect(resolveReleaseNotice).not.toHaveBeenCalled();
     expect(releaseNoticeDismissed.value).toBe(false);
     expect(releaseNoticeModalOpen()).toBe(true);
+  });
+
+  /** **Got it says "I have read this", never "I have done it".** So the action
+   *  outlives the answer, and the Release Notices page keeps its button live on
+   *  an answered row. Greyed out, it read as already carried out. */
+  it('still runs an already answered notice, without answering it twice', async () => {
+    loaded([notice('a', true, true)], null);
+    sendSeededPrompt.mockResolvedValue(true);
+
+    await takeReleaseNoticeAction(notice('a', true, true));
+
+    expect(sendSeededPrompt).toHaveBeenCalledWith('Do the thing for me.', expect.any(String));
+    // The answer is already recorded. Recording it again would append an event
+    // saying exactly what the first one said.
+    expect(resolveReleaseNotice).not.toHaveBeenCalled();
   });
 });
 

@@ -57,6 +57,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/agent-allowed-commands", Host, &[]),
     ("/app", App, &["GET"]),
     ("/app-capture", Host, &[]),
+    ("/app-frame-capability", Host, &[]),
     ("/app/:app_id/source", Host, &[]),
     ("/apps", App, &["GET"]),
     ("/backup", Host, &[]),

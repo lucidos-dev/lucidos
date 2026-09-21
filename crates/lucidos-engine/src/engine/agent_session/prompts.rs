@@ -444,6 +444,34 @@ const APPLY_CONFIRMATION_NOTE: &str = "APPLYING YOUR WORK: Concretely, a questio
      proposed, so the user can review the Diff, click Apply, and see it live — never gate a \
      finished change behind a \"does this look good?\" question.";
 
+/// A session may not settle a question about the shipped product's security,
+/// data exposure, or user-visible correctness on its own. When it finds
+/// something reaching users that it will not fix, it raises the finding with the
+/// question tool. It names the finding in the report. A non-goal in a plan file
+/// is not a gate. That gap shipped an unauthenticated app-frame reach, then a
+/// clipboard regression. The reasoning and the incident are in the ADR (see ADR
+/// 0227, ADR 0231 for the change that produced them).
+///
+/// Scoped to the six chat-style prompts, the ones that carry
+/// `ASK_USER_QUESTION_RULE`. The rule points at the ASKING USERS section, so it
+/// can live only where that section is present. `conflict_resolution` has no
+/// such section and runs unattended, so it is left out. It is backend-generic
+/// on purpose: it names no tool, so the Codex swap of that section leaves it
+/// correct. Pinned by
+/// `chat_style_prompts_require_raising_user_reaching_findings`.
+const RAISE_USER_REACHING_FINDINGS_RULE: &str = "RAISE A USER-REACHING FINDING YOU WON'T FIX, \
+    DON'T BURY IT: You may not settle, by yourself, a question about the shipped product's \
+    security, data exposure, or user-visible correctness. When you find something you are NOT \
+    fixing in this change and it reaches users of the shipped product, raise it with the question \
+    tool (named in the ASKING USERS section) BEFORE you finish, and name it in your final report. \
+    Recording it as a non-goal, known limitation, follow-up, deferred item, or release gate in a \
+    plan file, an ADR, or a commit message does NOT discharge this: a note is not a gate, and your \
+    authority stops at the product's users. Judge \"reaches users\" by who could hit it and the \
+    harm, NOT by whether it fires on this machine or workspace (a shipped feature is in use by \
+    someone). The bar: you are choosing not to fix it, or cannot within your scope, AND it is a \
+    silent failure, a security hole, data exposure, or data loss. A finding you DO fix in this \
+    change needs no question; one that is out of scope but loud and harmless can stay a note.";
+
 /// Permission allowlist rule — Claude Code ONLY. Lucidos passes
 /// `--allowedTools` when spawning CC, which overrides settings.json permission
 /// rules, so tool allowlist edits MUST go in the workspace's
@@ -809,6 +837,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
@@ -828,6 +857,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         no_memory_files = NO_MEMORY_FILES_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
@@ -860,6 +890,7 @@ pub(super) fn external_repo_system_prompt(
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
@@ -867,6 +898,7 @@ pub(super) fn external_repo_system_prompt(
          Running `exit` in bash can crash the host application.{process_safety}{build_slot}",
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
@@ -891,6 +923,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          uncommitted changes. Commit or discard anything unintentional.\n\n\
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{build_slot}",
@@ -899,6 +932,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
@@ -935,6 +969,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {no_pull_requests}\n\n\
          {hardening}\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
@@ -949,6 +984,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         no_memory_files = NO_MEMORY_FILES_RULE,
         hardening = HARDENING_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
@@ -1013,6 +1049,7 @@ pub(super) fn app_worktree_system_prompt(
          user to \"open a PR\" or \"submit a PR\". The engine is the merge mechanism: when \
          the user clicks Apply, your branch lands on the workspace git's `main`.\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
@@ -1024,6 +1061,7 @@ pub(super) fn app_worktree_system_prompt(
          your lifecycle. Running `exit` in bash can crash the host application.{process_safety}",
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
@@ -1061,6 +1099,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {commit_cadence}\n\n\
          COMMANDS: Never use /cpa. Just commit with `git add` + `git commit -m \"…\"`.\n\n\
          {ask_user_question}\n\n\
+         {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
@@ -1068,6 +1107,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
+        raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
@@ -1601,23 +1641,23 @@ mod tests {
         // are 549 bytes higher than they were, for `NO_MEMORY_FILES_RULE`.
         // Only these flavors carry it: a fact about THIS repo has to land in
         // git, where Codex and the next session on another machine read it.
-        ("worktree", "claude-code", 24192),
-        ("worktree", "codex", 22651),
+        ("worktree", "claude-code", 25245),
+        ("worktree", "codex", 23704),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 17138),
-        ("external_repo", "codex", 15597),
-        ("recovery", "claude-code", 22787),
-        ("recovery", "codex", 21246),
-        ("external_repo_recovery", "claude-code", 17014),
-        ("external_repo_recovery", "codex", 15473),
-        ("app_worktree", "claude-code", 19779),
-        ("app_worktree", "codex", 18238),
-        ("app_worktree_recovery", "claude-code", 18343),
-        ("app_worktree_recovery", "codex", 16802),
+        ("external_repo", "claude-code", 18190),
+        ("external_repo", "codex", 16649),
+        ("recovery", "claude-code", 23840),
+        ("recovery", "codex", 22299),
+        ("external_repo_recovery", "claude-code", 18066),
+        ("external_repo_recovery", "codex", 16525),
+        ("app_worktree", "claude-code", 20832),
+        ("app_worktree", "codex", 19291),
+        ("app_worktree_recovery", "claude-code", 19396),
+        ("app_worktree_recovery", "codex", 17855),
         ("conflict_resolution", "claude-code", 5811),
         ("conflict_resolution", "codex", 7083),
     ];
@@ -1784,6 +1824,77 @@ mod tests {
                              fact goes instead (missing: {needle:?})"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// A session may not settle a question about the shipped product's
+    /// security, data exposure, or user-visible correctness by itself. When it
+    /// finds a user-reaching thing it will not fix, it must raise it with the
+    /// question tool before finishing. It must not bury it as a non-goal in a
+    /// plan file, an ADR, or a commit message. That gap shipped an
+    /// unauthenticated app-frame reach and a clipboard regression (ADR 0227,
+    /// ADR 0231).
+    ///
+    /// Scoped to the six chat-style prompts, the ones carrying the ASKING USERS
+    /// section this rule points at. `conflict_resolution` has no such section
+    /// and runs unattended, so it must NOT carry the rule. Both backends carry
+    /// it: the rule is in the shared builder. It names no tool, so the Codex
+    /// swap of the ASKING USERS section leaves it correct.
+    #[test]
+    fn chat_style_prompts_require_raising_user_reaching_findings() {
+        let taught = [
+            "worktree",
+            "recovery",
+            "external_repo",
+            "external_repo_recovery",
+            "app_worktree",
+            "app_worktree_recovery",
+        ];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &all_prompt_flavors() {
+                let full = append_backend_rules(base.clone(), agent);
+                let has = full.contains("RAISE A USER-REACHING FINDING YOU WON'T FIX");
+                assert_eq!(
+                    has,
+                    taught.contains(label),
+                    "{label}/{} carries the raise-findings rule: {has}, expected the opposite",
+                    agent.as_str()
+                );
+                if has {
+                    // The load-bearing bar must survive a paraphrase, the same
+                    // way APPLY_RESTART_RULE pins its file-type list. Without
+                    // these, an edit could keep the header and gut the rule.
+                    for needle in [
+                        // Burying it does not discharge the obligation.
+                        "does NOT discharge this",
+                        // A note is not a gate; the authority claim.
+                        "your authority stops at the product's users",
+                        // Reach is judged by population and harm, not by
+                        // whether it fires on this machine.
+                        "NOT by whether it fires on this machine or workspace",
+                        // The carve-out that keeps it from firing on trivia.
+                        "A finding you DO fix in this change needs no question",
+                    ] {
+                        assert!(
+                            full.contains(needle),
+                            "{label}/{} must keep the raise-findings bar (missing: {needle:?})",
+                            agent.as_str()
+                        );
+                    }
+                    // The rule points at the ASKING USERS section for the
+                    // question tool. That pointer dangles unless the section is
+                    // in the same prompt. Pin it, like the plan-rule test pins
+                    // its own pointer target.
+                    assert!(
+                        full.contains("ASKING USERS:"),
+                        "{label}/{} names the ASKING USERS section, so it must be present",
+                        agent.as_str()
+                    );
                 }
             }
         }

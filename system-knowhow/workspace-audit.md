@@ -105,7 +105,10 @@ for calling a category clean.
 | `storage` | browser storage an app frame cannot reach | 2 |
 | `host-realm` | the shell, read from an app frame | 2 |
 | `engine-fetch` | the app calling the engine itself, `apiUrl` included | 2 |
+| `relative-fetch` | the app fetching its own bundled file by relative path | 2 |
 | `download-link` | a download link, which needs `sdk.js` in a frame | 2 |
+| `media-capture` | the camera or the microphone, from an app frame | 2 |
+| `web-share` | the OS share sheet, from an app frame | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
 | `cred-env` | a credential read from the environment | 7 |
@@ -133,7 +136,13 @@ scan host-realm "window\.parent|parent\.document|window\.top|top\.location" $inc
 
 scan engine-fetch "fetch\(['\"\`]/api/v1|new URL\(['\"\`]api/v1|new EventSource\(|apiUrl\(" $inc apps
 
+scan relative-fetch "fetch\([[:space:]]*['\"\`][A-Za-z0-9_.-]+[/.]" $inc apps
+
 scan download-link "<a [^>]*download" --include=*.html apps
+
+scan media-capture "getUserMedia" $inc apps
+
+scan web-share "navigator\.share" $inc apps
 
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
@@ -243,7 +252,7 @@ Per `system-knowhow/js-sdk.md`:
 
   **A route an app may not reach has no remedy, and saying so is the finding.** The engine classifies every route, and `lucidos.request` refuses the rest with a 403 in both realms. Credentials, thread contents, consent routes and platform control are denied on purpose. Report the app's call, name what it is reaching for, and leave it at that rather than inventing a way around. Reference: `system-knowhow/js-sdk.md` § "Not every endpoint is reachable".
 
-  An `/api/v1/` path in a markup `src` / `href` attribute is correct and must NOT be flagged, and neither is `apiUrl` used to build one. Six are exempt from the gateway's device gate: `sdk.js`, `sdk-prefs.js`, `sdk-iframe.css`, `sdk-iframe-audio.js`, and anything under `fonts/` or `static/`. Every other `/api/v1/` path in a tag, and every file of the app's own, belongs to the subresource bullet below instead.
+  An `/api/v1/` path in a markup `src` / `href` attribute is correct and must NOT be flagged, and neither is `apiUrl` used to build one. Six are exempt from the gateway's device gate: `sdk.js`, `sdk-prefs.js`, `sdk-iframe.css`, `sdk-iframe-audio.js`, and anything under `fonts/` or `static/`. Any OTHER `/api/v1/` path in a tag is refused behind a gateway: the frame's pass to its own files reaches no engine route. Severity: **broken**, and the remedy is the `lucidos.*` method that covers it.
 
 - **What an isolated app frame can no longer do.** Inside the host shell an app runs at an opaque origin, in its own renderer process. So it cannot freeze the shell, and it cannot read it. The price is that the frame's own `fetch`, `EventSource` and browser storage all fail, and the SDK carries those three over a bridge. Reference: `system-knowhow/js-sdk.md` § Setup, and *app frame* / *app bridge* in `docs/glossary.md`. Walk `data/apps/**/*.{js,ts,html}` for code that goes around it, skipping any vendored `node_modules/` tree:
 
@@ -252,8 +261,17 @@ Per `system-knowhow/js-sdk.md`:
     - **stale** where a `try` / `catch` wraps it. That is the common shape, written for Safari private mode. It turns the break into an app that runs and silently stops remembering anything.
   - **A read of the host realm**: `window.parent`, `parent.document`, `window.top`, or the device id lifted out of the shell's storage. All blocked. Severity: **broken**.
   - **`<a href="<the app's own file>" download>`**, in an app whose `index.html` loads no `/api/v1/sdk.js`. A browser ignores `download` on a cross-origin link, so the click navigates the frame to the file instead. Severity: **broken**.
+  - **The camera or the microphone.** `navigator.mediaDevices.getUserMedia`. Both browsers refuse media capture to an opaque origin outright, whatever the frame is granted, so no remedy exists inside a frame. Severity: **broken**. Say the app has to run in its own tab. Reference: `system-knowhow/js-sdk.md` § Setup, which lists what the frame is granted.
+  - **The OS share sheet.** `navigator.share` called directly. The frame is not granted `web-share`, and iOS refuses the delegation anyway. Severity: **broken**. The remedy is `lucidos.ui.openExternal(url)`, which opens the link through the host. A hit inside a vendored copy of `sdk.js` is the SDK's own fallback, not the app's, so read the call site before reporting it.
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only: a user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. The read is untouched. Severity: **broken**, since the call answers 403 and the app's own settings never persist. § Remediation carries the replacement.
-  - **The app's own files, loaded as a separate subresource.** Walk each app's `index.html` for a `src` or `href` that is neither inline nor an exempt `/api/v1/` asset: `app.js`, `style.css`, an image beside them, and any `lucidos.data.url` result used as a `src`. Behind a gateway the frame sends no device credential with a subresource, so each answers **401** and the app renders unstyled or dead. Severity: **broken**. Nothing exists to move the app onto, so report the finding and say to inline the CSS and JS. Point at "Inline your own CSS and JS" advice to app authors in `docs/temporary-measures.md`.
+  - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path rather than an absolute URL. The frame's origin is opaque, so the browser refuses it exactly as it refuses an engine call. WebKit words that refusal `Load failed` and Chromium raises a `TypeError`. The path being one of the app's own files is what makes it read as safe, and the engine-fetch pattern above cannot see it: nothing in the string says `/api/v1`. Split the severity the way the failure does:
+    - **broken** where the throw escapes setup, or the fetch is the app's only data path. The app renders an error banner, or nothing.
+    - **stale** where a `catch` falls back to `lucidos.data` and the app keeps running, minus whatever the bundled file carried.
+
+    The remedy is `lucidos.data.read('apps/<app-id>/<path>')`, which travels the bridge. **`lucidos.data.url()` is not a remedy.** It builds a URL for a `src` or an `href`, and fetching one is refused identically.
+  - **A `<base href>` the app declares itself.** The first base in a document wins. So it replaces the pass the engine stamps for the app's own files, and behind a gateway every relative `src` / `href` then answers **401**. Severity: **broken**. The remedy is to delete it: relative refs already resolve against the app's own directory. Reference: `system-knowhow/js-sdk.md` § Setup, and [ADR 0238](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0238-app-frame-carries-a-capability-to-its-own-files.md).
+
+  **A separate `app.js`, `style.css` or image is NOT a finding.** It was one while the frame had no way to prove itself. The engine now gives each framed document a short-lived pass to its own files. Do not flag one, and do not recommend inlining.
 
   An app opened in its own browser tab is a top-level document and keeps all of this. Never report one as unaffected on that basis: the same app is reachable both ways, and the frame is the usual one.
 
@@ -428,9 +446,11 @@ this table and the two rules under it:
 | `localStorage.setItem('k', v)` | `await lucidos.data.write('artifacts/<app-id>/state.json', JSON.stringify(state))` |
 | `localStorage.getItem('lucidos-device-id')` | delete it. The host stamps the device on every bridged call, and the frame is not meant to know which one |
 | an engine call the app's own `fetch` makes | the `lucidos.*` method that covers it, else `lucidos.request('/<suffix>', init)` |
+| `fetch('<the app's own bundled file>')` | `await lucidos.data.read('apps/<app-id>/<file>')`, then parse. Not `lucidos.data.url()`, which builds a `src` and is refused when fetched |
 | `lucidos.request('/env-vars', { method: 'POST' })` storing the app's own setting | `lucidos.preferences` for a user-facing one, else `lucidos.data.write('artifacts/<app-id>/settings.json', …)`. The read stays, so a genuine read of the workspace's variables is left alone |
 | a call to a route the engine keeps from apps | nothing. Report it and name what it reaches for |
 | `<a href="report.pdf" download>` on the app's own file | load `/api/v1/sdk.js`, which rewrites the click, or build a `blob:` URL |
+| a `<base href>` the app declares | delete it. It replaces the pass the engine stamps for the app's own files |
 
 - **The read becomes asynchronous.** A synchronous `localStorage.getItem` at
   module top level becomes an `await`, so the first paint has to tolerate not
@@ -493,6 +513,9 @@ it is a check a pass can skip without noticing.
 
 The isolated-frame check owns its patterns the same way. A change to the app
 frame's sandbox, or to what the app bridge carries, has to reach this file: what
-an app can no longer do for itself is the whole of that check.
+an app can no longer do for itself is the whole of that check. That check's
+`fetch` half now runs as two scan sections: `engine-fetch` for the engine
+address and `relative-fetch` for the app's own files, because one CORS refusal
+has two spellings in app code. A sandbox change reaches both.
 
 When a deprecated CLI flag or tool arg is fully removed, add it to check 7's "Removed CLI flags and tool args" list. Include its replacement and any live same-named flag to exclude. The source is `docs/temporary-measures.md` § sunset deprecations.

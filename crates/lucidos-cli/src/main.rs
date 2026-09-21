@@ -397,6 +397,17 @@ enum Command {
         #[command(subcommand)]
         action: generated::ModelsCmd,
     },
+    /// List registered repositories (`list`): the external git repos a
+    /// coding-agent thread can work on. Read-only, because registering one
+    /// changes the platform under the user. Registering and unregistering are
+    /// the chat agent's `manage_repositories` tool. Generated from the
+    /// capability parity manifest; routed through the gateway-safe HTTP
+    /// client. An app frame may not reach this route, so a script that needs
+    /// the list uses the CLI.
+    Repositories {
+        #[command(subcommand)]
+        action: generated::RepositoriesCmd,
+    },
     /// Manage MCP servers: `list` (status, tool manifest and per-request token
     /// cost), `start --id <id>`, `stop --id <id>`, or `remove --id <id>`.
     /// Generated from the capability parity manifest; routed through the
@@ -1445,6 +1456,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Models { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_models(&ws, action)?;
+            Ok(0)
+        }
+        Command::Repositories { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_repositories(&ws, action)?;
             Ok(0)
         }
         Command::Mcp { action } => {

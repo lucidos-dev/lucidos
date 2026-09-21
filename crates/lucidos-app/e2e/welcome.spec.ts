@@ -1,6 +1,6 @@
 import { test, expect, Locator, Page } from './fixtures';
 import { navigateToApp, assertHealthy, assertUserMessagesVisible, waitForVisibleInput, isMobileViewport } from './helpers';
-import { clearAllThreads, resetWelcomePreference } from './db-helpers';
+import { clearAllThreads, psql, resetWelcomePreference } from './db-helpers';
 
 /** Press the setup-interview button the way the running device would.
  *
@@ -92,40 +92,40 @@ test.describe('Welcome surface', () => {
     await expect.poll(async () => (await input.inputValue()).trim(), { timeout: 5_000 }).toBe('');
   });
 
-  test('draft in progress: the interview confirms before it replaces the typed text', async ({ page }) => {
+  test('draft in progress: the interview takes a draft of its own and asks nothing', async ({ page }) => {
     await navigateToApp(page);
 
     const welcome = page.locator('.welcome-message:visible').first();
     await expect(welcome).toBeVisible({ timeout: 10_000 });
 
-    // Start typing a draft first. The interview seeds the prompt through
-    // applySuggestion, which REPLACES the whole input, so the click must not
-    // silently blow away typed text.
+    // Type a draft first. The interview is SENT, so it has no use for this
+    // composer. Pressing it must neither overwrite the text nor stop to ask
+    // about it. A confirm used to stand here, which is what could lose the
+    // text on a mis-tap.
     const input = await waitForVisibleInput(page, 10_000);
     await input.click();
     await input.fill('my own half-typed idea');
     await expect.poll(async () => (await input.inputValue()).trim()).toBe('my own half-typed idea');
 
-    // Click 1: declining keeps the draft AND sends nothing (startSetupInterview
-    // bails on a false return from applySuggestion).
     const start = page.locator('.welcome-setup-interview-btn:visible').first();
     await pressInterview(page, start);
-    const dialog = page.locator('.confirm-dialog');
-    await expect(dialog).toBeVisible({ timeout: 5_000 });
-    await dialog.getByRole('button', { name: 'Keep my draft' }).click();
-    await expect(dialog).toHaveCount(0);
-    await expect.poll(async () => (await input.inputValue()).trim()).toBe('my own half-typed idea');
-    await expect(welcome).toBeVisible();
 
-    // Click 2: accepting replaces the draft and sends. The bug guard is that the
-    // VISIBLE prompt has to give way to the seeded sentence: the normal compose
-    // sync skips a focused, non-empty textarea to protect in-flight typing, so
-    // applySuggestion force-syncs it (requestPromptOverrideSync).
-    await pressInterview(page, start);
-    await expect(dialog).toBeVisible({ timeout: 5_000 });
-    await dialog.getByRole('button', { name: 'Replace' }).click();
-    await expect(dialog).toHaveCount(0);
+    // One gesture, no question, and the interview lands in its own thread.
+    await expect(page.locator('.confirm-dialog')).toHaveCount(0);
     await assertUserMessagesVisible(page, ['Help me get the most out of Lucidos']);
+
+    // The typed draft is still there, whole. Asserted against the STORED draft
+    // rather than a drawer row. The desktop project opens with the drawer shut,
+    // so it renders no row at all. What is claimed is that the draft survives,
+    // not where it is drawn. Polled, because the compose PUT is debounced.
+    await expect
+      .poll(
+        () => psql(
+          "select count(*) from thread_summaries where compose_text = 'my own half-typed idea'",
+        ).trim(),
+        { timeout: 10_000 },
+      )
+      .toBe('1');
   });
 
   test('its text column lands on the composer box, both edges', async ({ page }) => {

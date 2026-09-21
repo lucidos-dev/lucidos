@@ -680,6 +680,56 @@
     background: transparent;
 }
 
+/* The rename pencil carries a 2.25rem tap target, taller than the Remove button
+   beside it. Centre the pair, or the default stretch pulls Remove up to the
+   pencil's height. */
+.app-store-marketplace-row .list-row-actions {
+    align-items: center;
+}
+
+/* Holds a marketplace's name and its rename field in one box, so the field can
+   sit exactly over the name while idle. */
+.app-store-marketplace-name-slot {
+    position: relative;
+    display: block;
+    min-width: 0;
+}
+
+.app-store-marketplace-renaming .list-row-name {
+    display: none;
+}
+
+/* Same text as the .title .list-row-name it stands in for, spelled out rather
+   than `font: inherit`, which would also reset the weight. The margin is that
+   row's own, so the URL under it does not move when the field opens. */
+.app-store-marketplace-name-input {
+    width: 100%;
+    min-width: 0;
+    margin-bottom: 0.25rem;
+    padding: 0.125rem 0.25rem;
+    border: 1px solid var(--accent);
+    border-radius: 0.1875rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--font-size-lg);
+    font-weight: 500;
+}
+
+/* The idle field, laid over the name at the name's own size. Invisible and
+   taking no pointer, so the row looks and behaves as it did. It is mounted
+   rather than absent so the pencil can focus it inside the tap, the only way
+   iOS raises the keyboard (see MarketplacesSection). Deliberately NOT sized to
+   nothing: iOS scrolls the focused element into view, and that should be the
+   box the field is about to occupy. */
+.app-store-marketplace-row:not(.app-store-marketplace-renaming) .app-store-marketplace-name-input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
 /* Store cards stack as a column with the action buttons pinned to the
    bottom-right — the same bottom placement the installed-app rows use — instead
    of floating beside the (tall) title block at the top-right. The base

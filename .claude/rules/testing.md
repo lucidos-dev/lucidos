@@ -83,6 +83,21 @@ Tests in `crates/lucidos-e2e/tests/api_support/` (workspace member crate `lucido
 
 **When to write:** New endpoints, changed responses, error handling, SSE.
 
+`e2e-api.sh` runs one more thing afterwards: the **gateway chain test**
+(`crates/lucidos-gateway/src/chain_tests.rs`), the only test that puts a real
+gateway in front of a real engine. It binds the gateway's own router to a free
+port and routes `/e2e-test/` at the session's engine. It then asks for an app's
+own files with no cookie. It lives in `lucidos-gateway` because that crate is
+bin-only: nothing outside it can build the router. It is `#[ignore]`d because
+`make test` has no engine. The script runs it BY NAME, so a second ignored test
+cannot join the step by accident.
+
+The gateway BINARY is not an option here: it refuses to boot from a
+coding-agent worktree, deliberately and with no opt-out (ADR 0021 § "the opt-out
+stops at the gateway"). Do not work around that to write a gateway test. A test
+process spawns no engine and dies with the run, which is why the router is fair
+game where the daemon is not.
+
 ## Contract Tests (Rust ↔ TypeScript)
 
 Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.

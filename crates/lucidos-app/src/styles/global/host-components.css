@@ -680,6 +680,20 @@ html[data-theme="dark"] .split-button.open::before {
     visibility: visible;
 }
 
+/* Every option label is stacked in that one grid cell, so the trigger is as
+   wide as the widest of them and never resizes on a pick. The hidden rows
+   measure WIDTH only, so they carry no height, and they clip rather than feed
+   their overflow to a scrolling ancestor. The tallest row in the cell would
+   otherwise set the height of the whole control. A label the UI font cannot
+   draw falls back to a font with taller metrics: the compose destination
+   picker's fullwidth plus, or an emoji in an app name. That is what left that
+   picker standing taller than the coding-agent chip beside it. Width survives,
+   since a grid column sizes on its items' inline contributions. */
+.dropdown-sizer > *:not(:first-child) {
+    height: 0;
+    overflow: hidden;
+}
+
 /* A model selection reads as a whole pair, `Opus 5 (1M) · X-High`, so its
    trigger is far wider than an ordinary dropdown's and a long registry id would
    push its row past the pane. `.dropdown`'s blanket `flex-shrink: 0` is right

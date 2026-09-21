@@ -16,8 +16,8 @@ import { dirname, resolve } from 'node:path';
 import type { WebhookIngressOutage } from '../../api/client';
 
 // `sendSeededPrompt` owns the whole gesture and compose.test.ts covers it: the
-// confirm before replacing a draft, the forced Lucidos Agent destination, the
-// thread-pane reveal, the send and the failure toast. Here it is a seam.
+// fresh draft it seeds, the forced Lucidos Agent destination, the thread-pane
+// reveal, the send and the failure toast. Here it is a seam.
 const sendSeededPrompt = vi.fn(async () => true);
 vi.mock('./compose', () => ({ sendSeededPrompt }));
 

@@ -1,6 +1,8 @@
 use super::app_ui::{
-    ensure_app_favicon, rescope_app_html, rewrite_for_thread_id, stamp_prefs_device,
+    ensure_app_favicon, rescope_app_html, rewrite_for_thread_id, stamp_frame_capability,
+    stamp_prefs_device,
 };
+use super::frame_capability;
 use super::*;
 
 use std::path::PathBuf;
@@ -360,7 +362,16 @@ pub(super) async fn serve_app_ui(
                 None => content,
             };
             let html = ensure_app_favicon(&html);
-            let html = rescope_app_html(&html, &prefix);
+            // Behind a gateway this frame sends no device credential with its
+            // own subresources, so it carries a pass in the URL instead (ADR
+            // 0238). The rescope threads it onto root-absolute workspace refs,
+            // and the base carries every relative one.
+            let capability = frame_capability::mint_for_document(&headers, &app_id);
+            let html = rescope_app_html(&html, &prefix, capability.as_deref());
+            let html = match capability.as_deref() {
+                Some(pass) => stamp_frame_capability(&html, &prefix, pass, &app_id),
+                None => html,
+            };
             // After the re-scope, which rewrites the same `src`. Both edit one
             // engine route's address and nothing else the app wrote.
             let html = match query.device.as_deref() {
@@ -623,6 +634,42 @@ pub(super) async fn serve_html2canvas() -> impl IntoResponse {
     )
 }
 
+/// What the renewal call names.
+#[derive(Debug, Deserialize)]
+pub(super) struct FrameCapabilityQuery {
+    /// The app whose frame is asking. The HOST supplies it, from the frame it
+    /// owns, never the app (ADR 0231 decision 4).
+    app_id: String,
+}
+
+/// A fresh pass, and when the host should come back for the next one.
+#[derive(Serialize)]
+struct FrameCapabilityBody {
+    /// `None` with no gateway in front, where a frame needs no pass at all.
+    capability: Option<String>,
+    renew_after_secs: i64,
+}
+
+/// GET /api/v1/app-frame-capability - Re-mint the pass an open app frame holds.
+///
+/// A pass lasts an hour, and an app stays open for longer. So the host calls
+/// this at half-life and pushes the answer down the bridge, where the SDK swaps
+/// it into the frame's `<base href>`. Nothing reloads and no app notices.
+///
+/// Classified `Host` in `app_reach`. An app calling it for itself would gain
+/// nothing, since its own pass is already in its base. It would also get to
+/// name an app id that is not its own.
+async fn mint_frame_capability(
+    headers: HeaderMap,
+    Query(query): Query<FrameCapabilityQuery>,
+) -> Json<FrameCapabilityBody> {
+    let prefix = crate::api::base_path::forwarded_prefix(&headers);
+    Json(FrameCapabilityBody {
+        capability: frame_capability::mint(&prefix, &query.app_id),
+        renew_after_secs: lucidos_frame_capability::RENEW_AFTER_SECS,
+    })
+}
+
 /// Routes for the `/apps`, `/app*`, `/app-capture`, and `/static/*`
 /// surfaces (html2canvas is served for the app-capture flow).
 pub(super) fn router() -> Router<AppState> {
@@ -635,6 +682,7 @@ pub(super) fn router() -> Router<AppState> {
         )
         // App capture endpoints
         .route("/app-capture", post(submit_app_capture))
+        .route("/app-frame-capability", get(mint_frame_capability))
         .route("/static/html2canvas.min.js", get(serve_html2canvas))
 }
 

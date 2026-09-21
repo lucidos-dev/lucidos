@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
+import { MAX_MODAL_STACK_DEPTH } from '../../../store/overlayStack';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const styles = (rel: string): string =>
@@ -78,6 +79,14 @@ describe('ui-blocking overlay z-index (only toasts above the blocker)', () => {
 
   it('only the toast layer sits above the blocking overlay', () => {
     expect(TOKENS['z-toast']).toBeGreaterThan(overlayZ);
+  });
+
+  /** `--z-modal` is the FLOOR of a band: an open modal adds its overlay-stack
+   *  depth, so a confirm raised by a modal is drawn over it. The blocker has to
+   *  clear the tallest that band can reach, or a stacked modal punches through
+   *  the thing that exists to cover it. */
+  it('the whole modal band stays below the blocking overlay', () => {
+    expect(TOKENS['z-modal'] + MAX_MODAL_STACK_DEPTH).toBeLessThan(overlayZ);
   });
 
   it('the tooltip layer is pulled below the overlay while blocked', () => {

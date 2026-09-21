@@ -1798,6 +1798,13 @@ impl LucidosEngine {
     ///
     /// A cancel during setup goes through here too: a Stop must end the current
     /// turn, never swallow the follow-up the user typed while it was unwinding.
+    ///
+    /// **This drain is total while the process lives, so it reads no event
+    /// store.** A `chat::queued_recovery` union here was tried and removed: the
+    /// contract above leaves exactly two cases, and the query's whole yield is
+    /// the second one. Those messages the refused caller already owns, so
+    /// re-submitting them answers each twice. The recovery belongs where the
+    /// channel is GONE, which is the resume (`chat/rerun.rs`).
     async fn drain_turn_orphans(
         &self,
         thread_id: Uuid,

@@ -1867,8 +1867,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 args["event_type"].as_str().unwrap_or("all")
             ),
         },
+        // An arm for every action that writes. The default here is the list
+        // label, so an action falling through narrates a write as a read. The
+        // wording matches the flat aliases above, and a test holds them equal.
         "changes" => match args["action"].as_str() {
             Some("apply") => "Applying change...".to_string(),
+            Some("apply_when_settled") => "Arming a standing apply...".to_string(),
+            Some("apply_as_they_settle") => "Applying, and arming the rest...".to_string(),
+            Some("cancel_standing_apply") => "Canceling a standing apply...".to_string(),
             _ => "Listing changes...".to_string(),
         },
         // Flat back-compat aliases for the two LLM-exposed `thread_queue`

@@ -113,6 +113,18 @@
     window.parent.postMessage(message, hostOrigin());
   }
 
+  // src/frameCapability.ts
+  var CAPABILITY_SEGMENT = "~cap";
+  function splitCapability(path) {
+    const marker = `/${CAPABILITY_SEGMENT}/`;
+    const at = path.indexOf(marker);
+    if (at < 0) return null;
+    const after = path.slice(at + marker.length);
+    const slash = after.indexOf("/");
+    if (slash <= 0) return null;
+    return { prefix: path.slice(0, at), capability: after.slice(0, slash), rest: after.slice(slash) };
+  }
+
   // src/_fetch.ts
   function computeBaseUrl() {
     var _a;
@@ -124,6 +136,8 @@
           if (/^https?:\/\//i.test(href)) path2 = new URL(href).pathname;
         } catch (e) {
         }
+        const capability = splitCapability(path2);
+        if (capability) return capability.prefix;
         return path2.replace(/\/+$/, "");
       }
     }

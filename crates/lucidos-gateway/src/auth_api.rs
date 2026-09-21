@@ -11,9 +11,11 @@
 //! bare 401 and no way forward. Every API under `/~/api/` is gated except the
 //! two pairing calls and health.
 //!
-//! Under a workspace slug, [`is_public_app_asset`] is the only exemption: the
-//! handful of `/api/v1` files an app frame loads as tags on its own document.
-//! It carries its own reasoning, and the engine holds the matching half.
+//! Under a workspace slug there are two exemptions. [`is_public_app_asset`]
+//! covers the handful of `/api/v1` files an app frame loads as tags on its own
+//! document. [`frame_capability_admits`] covers the frame's own workspace
+//! files, which carry proof in the URL rather than being exempt by name. Each
+//! carries its own reasoning, and the engine holds the matching half of both.
 //!
 //! An unauthenticated *navigation* is answered with the pairing screen, at the
 //! URL it asked for. Anything else gets 401. [`crate::server::serve_pairing_shell`]
@@ -27,9 +29,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use lucidos_frame_capability as frame_capability;
+
 use crate::auth::{self, Authorization};
 use crate::error::ApiError;
 use crate::pairing_qr;
+use crate::registry::SIGIL;
 use crate::server::GatewayState;
 
 pub fn router() -> Router<GatewayState> {
@@ -46,11 +51,7 @@ pub fn router() -> Router<GatewayState> {
 /// Exact-matched, never prefix-matched, so a future `/~/api/v1/health/secrets`
 /// cannot inherit the exemption its parent has.
 pub fn is_public_path(path: &str) -> bool {
-    // A dot segment is never public. Paths arrive un-normalized. Without this,
-    // `/~/assets/../api/v1/control/...` reads as a picker asset, and
-    // `/<slug>/api/v1/static/../threads/list` walks out of the app-asset
-    // exemption below onto a data route.
-    if path.split(['/', '\\']).any(is_dot_segment) {
+    if carries_a_dot_segment(path) {
         return false;
     }
     if path == "/" {
@@ -70,6 +71,18 @@ pub fn is_public_path(path: &str) -> bool {
         rest,
         "api/v1/health" | "api/v1/auth/pair" | "api/v1/auth/session"
     )
+}
+
+/// Does any segment of this path walk upwards?
+///
+/// A dot segment is never public, and paths arrive un-normalized. Three walks
+/// this stops: `/~/assets/../api/v1/control/...` out of the picker's assets,
+/// `/<slug>/api/v1/static/../threads/list` out of the app-asset exemption, and
+/// `/<slug>/~cap/<token>/data/../api/v1/credentials` out of a capability.
+///
+/// Both exemptions call it first, so neither can forget it.
+fn carries_a_dot_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(is_dot_segment)
 }
 
 /// Is this segment a `.` or `..`, in any spelling a URL parser collapses?
@@ -132,18 +145,87 @@ const APP_ASSET_TREES: [&str; 2] = ["/fonts/", "/static/"];
 /// `server::fallback` is the other reader: an exempt path must not lazy-start a
 /// stopped workspace for an unpaired caller.
 pub(crate) fn is_public_app_asset(path: &str) -> bool {
-    let Some((slug, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+    let Some((_, rest)) = split_workspace_path(path) else {
         return false;
     };
-    if slug.is_empty() {
-        return false;
-    }
     // The leading slash is kept, so `api/v1beta/...` cannot wear the prefix and
     // the names above are the engine's own spelling.
-    let Some(asset) = rest.strip_prefix("api/v1").filter(|a| a.starts_with('/')) else {
+    let Some(asset) = rest.strip_prefix("/api/v1").filter(|a| a.starts_with('/')) else {
         return false;
     };
     APP_ASSET_FILES.contains(&asset) || APP_ASSET_TREES.iter().any(|t| asset.starts_with(t))
+}
+
+/// Split `/<slug>/<rest>` into its two halves, the shape of every workspace
+/// path (ADR 0014 §4). The rest keeps its leading slash, which is how the
+/// engine spells its own routes.
+///
+/// `None` for a path with no slug, and for a slug with nothing after it. The
+/// picker's `/~/` namespace splits like any other, so a caller that must not
+/// treat it as a workspace says so for itself.
+fn split_workspace_path(path: &str) -> Option<(&str, &str)> {
+    let after = path.strip_prefix('/')?;
+    let cut = after.find('/')?;
+    let (slug, rest) = after.split_at(cut);
+    if slug.is_empty() {
+        return None;
+    }
+    Some((slug, rest))
+}
+
+/// Does a frame capability in this URL admit this request?
+///
+/// An app frame's own files cannot be exempted by name the way the `/api/v1`
+/// assets above are: `/<slug>/data/*` is the user's artifacts and
+/// `/<slug>/app/<id>/*` is an app's source. So the browser carries proof
+/// instead, in one path segment the engine minted when it served that frame's
+/// document (ADR 0238). An unpaired device that guesses a URL still gets
+/// nothing, because it cannot forge the segment.
+///
+/// Five things have to hold, and the crate owns the last two:
+///
+///  * no dot segment, so nothing walks out of the tree it was admitted to;
+///  * `GET` or `HEAD`, because reading is the whole grant;
+///  * no `Upgrade`, so a handshake cannot ride a pass meant for a file;
+///  * a signature this machine's key made, for THIS slug, not yet expired;
+///  * a target under `/data/` or under the capability's own `/app/<id>/`.
+///
+/// The key is derived per call rather than held. It is one HMAC of a short
+/// constant, and only a request that already carries the segment pays it.
+pub(crate) fn frame_capability_admits(state: &GatewayState, req: &Request) -> bool {
+    // Shape first, then policy. This runs on EVERY gated request, and almost
+    // none of them carry a segment, so the two prefix checks below are what
+    // most callers pay. The five conditions are ANDed, so the order decides
+    // cost rather than the answer.
+    let Some((slug, rest)) = split_workspace_path(req.uri().path()) else {
+        return false;
+    };
+    let Some((token, target)) = frame_capability::split(rest) else {
+        return false;
+    };
+    if carries_a_dot_segment(req.uri().path())
+        || !frame_capability::method_is_read_only(req.method().as_str())
+        || req.headers().contains_key(header::UPGRADE)
+        // The picker is not a workspace, and no engine mints for it. Said here
+        // rather than left to the signature, so the boundary is readable.
+        || slug.strip_prefix(SIGIL).is_some_and(str::is_empty)
+    {
+        return false;
+    }
+    let key = frame_capability::derive_key(state.local_token());
+    frame_capability::verify(&key, token, slug, chrono::Utc::now().timestamp())
+        .is_some_and(|app_id| frame_capability::admits(target, &app_id))
+}
+
+/// Does this path carry a capability segment at all, whatever it proves?
+///
+/// Asked by callers that must treat such a request as machinery rather than as
+/// a person arriving: [`crate::server::fallback`] will not wake a stopped
+/// workspace for one, and the refusal below will not hand one the pairing
+/// screen. Presence is the right question for both, because a forged segment
+/// is no more a person than a valid one.
+pub(crate) fn path_carries_frame_capability(path: &str) -> bool {
+    split_workspace_path(path).is_some_and(|(_, rest)| frame_capability::split(rest).is_some())
 }
 
 /// Is this request a top-level page load, as opposed to a fetch?
@@ -168,12 +250,47 @@ fn wants_html(headers: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("text/html"))
 }
 
+/// Is this the browser's OWN address bar arriving, rather than a frame or a
+/// subresource inside somebody's page?
+///
+/// Only that caller may be handed the pairing screen. `Sec-Fetch-Dest` is the
+/// discriminator, because [`wants_html`] cannot tell the two apart: a nested
+/// iframe navigates, so it reads there as a page load. That is how a refused
+/// artifact preview rendered the whole Lucidos shell inside a user's app. It
+/// looks like the app being possessed (ADR 0238).
+///
+/// An absent value falls back to the older question, which decides exactly as
+/// it did before. Two callers land there. A client sending no fetch metadata is
+/// the ordinary one. The other is a browser old enough to send `Sec-Fetch-Mode`
+/// and not `Sec-Fetch-Dest`, which Chrome shipped four versions apart. Such a
+/// browser keeps today's behaviour, including the shell in a nested frame.
+fn is_top_level_navigation(headers: &HeaderMap) -> bool {
+    match headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        Some(dest) => dest == "document",
+        None => wants_html(headers),
+    }
+}
+
+/// What a refused nested frame renders.
+///
+/// Small, and honest about both causes: an unpaired device, and a capability
+/// that lapsed under a long-open app. The reader is looking at a box inside an
+/// app, so the one useful instruction is to reload it.
+const REFUSED_FRAME_PAGE: &str = concat!(
+    "<!doctype html><meta charset=\"utf-8\">",
+    "<title>Lucidos could not load this</title>",
+    "<body style=\"margin:0;display:grid;place-items:center;min-height:100vh;",
+    "font:14px/1.5 system-ui,sans-serif;color:#7a828c;text-align:center;padding:1rem\">",
+    "<p>Lucidos could not load this file. The app's pass to it expired, ",
+    "or this device is not paired.<br>Reload the app to try again.</p>"
+);
+
 /// Refuse a request that proved nothing.
 ///
 /// Applied in front of everything: the proxy into each workspace, the control
 /// plane and the picker's own API.
 pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: Next) -> Response {
-    if is_public_path(req.uri().path()) {
+    if is_public_path(req.uri().path()) || frame_capability_admits(&state, &req) {
         return next.run(req).await;
     }
     // One scan of the `Cookie` header for a decision this then acts on twice:
@@ -225,13 +342,26 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
         Authorization::Unauthorized => {}
     }
     state.log_device_refusal(req.headers());
-    if wants_html(req.headers()) {
+    if is_top_level_navigation(req.headers()) {
         // Show the pairing screen here, rather than a bare 401 with no
         // affordance. In place rather than redirected: see `serve_pairing_shell`.
         // Hand the screen the code the caller arrived with: a `pair` query does
         // reach a gated path, and `serve_pairing_shell` says how.
         let pair_code = pairing_qr::pairing_code_in_query(req.uri().query());
         return crate::server::serve_pairing_shell(&state, pair_code);
+    }
+    if is_nested_frame(req.headers()) {
+        // A frame renders what it is given, so JSON would paint the reader a
+        // wall of braces. Never the shell: see `is_top_level_navigation`.
+        return (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            REFUSED_FRAME_PAGE,
+        )
+            .into_response();
     }
     (
         StatusCode::UNAUTHORIZED,
@@ -241,6 +371,16 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
         })),
     )
         .into_response()
+}
+
+/// Is this request a nested document, rather than a subresource of one?
+///
+/// The engine asks the same question of the same header, to decide whether to
+/// mint. So the answer lives in the crate the two share.
+fn is_nested_frame(headers: &HeaderMap) -> bool {
+    frame_capability::is_nested_frame_dest(
+        headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
+    )
 }
 
 /// Did the handler already say something about the credential cookie?
@@ -1289,5 +1429,269 @@ mod tests {
         )
         .await;
         assert_eq!(local.status(), StatusCode::IM_A_TEAPOT);
+    }
+
+    // ── What a refusal looks like ───────────────────────────────────────────
+
+    #[test]
+    fn only_the_address_bar_counts_as_a_top_level_navigation() {
+        assert!(is_top_level_navigation(&headers(&[(
+            "sec-fetch-dest",
+            "document"
+        )])));
+        // The measured bug: a nested iframe navigates, so the older question
+        // reads it as a page load and hands it the whole shell.
+        let nested = headers(&[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "iframe")]);
+        assert!(wants_html(&nested), "the older question still says yes");
+        assert!(!is_top_level_navigation(&nested));
+        for dest in [
+            "iframe", "frame", "script", "style", "image", "font", "empty",
+        ] {
+            let h = headers(&[("sec-fetch-dest", dest), ("accept", "text/html")]);
+            assert!(!is_top_level_navigation(&h), "{dest}");
+        }
+    }
+
+    #[test]
+    fn a_client_with_no_fetch_metadata_is_judged_exactly_as_before() {
+        // Curl, an old browser, a script. Nothing about this case changed, so
+        // the pairing screen still answers one that asks for HTML.
+        assert!(is_top_level_navigation(&headers(&[(
+            "accept",
+            "text/html,*/*"
+        )])));
+        assert!(!is_top_level_navigation(&headers(&[(
+            "accept",
+            "application/json"
+        )])));
+        assert!(!is_top_level_navigation(&headers(&[])));
+    }
+
+    #[tokio::test]
+    async fn a_refused_nested_frame_gets_a_short_page_and_never_the_shell() {
+        // Rendering the Lucidos shell inside somebody's app reads as the app
+        // being possessed, on every install with a gateway in front.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        for dest in ["iframe", "frame"] {
+            let response = get(
+                &state,
+                "/dev/data/artifacts/web/lucidos-me/index.html",
+                &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", dest)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{dest}");
+            assert!(
+                response
+                    .headers()
+                    .get(crate::server::PAIRING_SHELL_HEADER)
+                    .is_none(),
+                "{dest} must not be handed the pairing screen"
+            );
+            let body = body_text(response).await;
+            assert!(!body.contains("boot-splash"), "{dest}: {body}");
+            assert!(body.len() < 1000, "{dest} got {} bytes", body.len());
+            assert!(body.contains("Reload the app"), "{dest}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_subresource_still_gets_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        for dest in ["script", "style", "image", "font", "empty"] {
+            let response = get(
+                &state,
+                "/dev/app/site-publisher/style.css",
+                &[("sec-fetch-dest", dest)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{dest}");
+            let body = body_text(response).await;
+            assert!(body.contains("not paired with Lucidos"), "{dest}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_page_load_still_gets_the_pairing_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let response = get(
+            &state,
+            "/dev/",
+            &[
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::server::PAIRING_SHELL_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+        );
+    }
+
+    // ── The frame capability ────────────────────────────────────────────────
+    //
+    // An app frame's own files behind a gateway (ADR 0238). Every case here is
+    // COOKIELESS, because that is the whole problem: an opaque-origin frame
+    // sends no device credential with any subresource of its document.
+
+    /// A capability this test gateway's key signs, for one workspace and app.
+    fn capability(slug: &str, app_id: &str) -> String {
+        let key = frame_capability::derive_key("test-local-token");
+        let now = chrono::Utc::now().timestamp();
+        frame_capability::mint(&key, slug, app_id, now, frame_capability::TTL_SECS)
+            .expect("a slug-shaped app id mints")
+    }
+
+    /// One that lapsed an hour ago, for the long-open-app case.
+    fn expired_capability(slug: &str, app_id: &str) -> String {
+        let key = frame_capability::derive_key("test-local-token");
+        let then = chrono::Utc::now().timestamp() - frame_capability::TTL_SECS - 1;
+        frame_capability::mint(&key, slug, app_id, then, frame_capability::TTL_SECS)
+            .expect("a slug-shaped app id mints")
+    }
+
+    #[tokio::test]
+    async fn a_frame_capability_carries_an_app_to_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        // A stylesheet, an image, the app's own index, the artifact a preview
+        // iframe loads, and the relative click one hop INSIDE that preview.
+        for path in [
+            format!("/dev/~cap/{cap}/app/site-publisher/style.css"),
+            format!("/dev/~cap/{cap}/app/site-publisher/img/logo.png"),
+            format!("/dev/~cap/{cap}/app/site-publisher/"),
+            format!("/dev/~cap/{cap}/data/artifacts/web/lucidos-me/index.html"),
+            format!("/dev/~cap/{cap}/data/artifacts/web/lucidos-me/five-ai-words/index.html"),
+        ] {
+            let response = get(&state, &path, &[("sec-fetch-dest", "iframe")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::IM_A_TEAPOT,
+                "{path} must reach the workspace with no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_capability_reaches_nothing_but_those_two_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        for path in [
+            // The engine API and the control plane, which the pass must never
+            // widen. A frame hands it to every document it embeds.
+            format!("/dev/~cap/{cap}/api/v1/threads/list"),
+            format!("/dev/~cap/{cap}/api/v1/credentials"),
+            format!("/dev/~cap/{cap}/api/v1/data/config/apis.json"),
+            format!("/dev/~cap/{cap}/control/workspaces"),
+            // A sibling app's source, and a name that merely starts the same.
+            format!("/dev/~cap/{cap}/app/habit-tracker/index.html"),
+            format!("/dev/~cap/{cap}/app/site-publisher-two/style.css"),
+            // Out of the tree, in the two spellings the URL parser collapses.
+            format!("/dev/~cap/{cap}/data/../api/v1/threads/list"),
+            format!("/dev/~cap/{cap}/data/%2e%2e/api/v1/threads/list"),
+            // Another workspace, which matters because the signing key is
+            // machine-wide and every engine on this host derives the same one.
+            format!("/personal/~cap/{cap}/data/artifacts/notes.md"),
+            // A capability minted for another app, against this app's files.
+            format!(
+                "/dev/~cap/{}/app/site-publisher/style.css",
+                capability("dev", "habit-tracker")
+            ),
+            // One that lapsed. This is what a long-open app hits if renewal
+            // never lands, and it must refuse rather than slide.
+            format!(
+                "/dev/~cap/{}/data/artifacts/notes.md",
+                expired_capability("dev", "site-publisher")
+            ),
+            // Nothing anyone can guess without the key.
+            "/dev/~cap/forged/data/artifacts/notes.md".to_string(),
+            "/dev/~cap//data/artifacts/notes.md".to_string(),
+            // And the same file with no capability at all, which is the state
+            // this whole feature starts from.
+            "/dev/data/artifacts/notes.md".to_string(),
+        ] {
+            let response = get(&state, &path, &[("sec-fetch-dest", "iframe")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must stay refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_namespace_gets_no_capability_branch() {
+        // Asserted against the branch rather than a status code. Anything under
+        // `/~/` that is not `api/` is already public: that is where the picker's
+        // own static files live. So a 401 would prove nothing here. What must
+        // hold is that a signed pass never becomes a second way in.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("~", "site-publisher");
+        for path in [
+            format!("/~/~cap/{cap}/data/artifacts/notes.md"),
+            format!("/~/~cap/{cap}/api/v1/control/workspaces"),
+            format!("/~/~cap/{cap}/api/v1/auth/devices"),
+        ] {
+            let req = axum::extract::Request::builder()
+                .method("GET")
+                .uri(&path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert!(!frame_capability_admits(&state, &req), "{path}");
+        }
+
+        // The picker's real API is three exact routes, so no segment wedged in
+        // front of one reaches it. That is what keeps the branch above from
+        // mattering, and it holds with a capability as without.
+        let gated = get(
+            &state,
+            "/~/api/v1/auth/devices",
+            &[("sec-fetch-dest", "empty")],
+        )
+        .await;
+        assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn only_a_read_rides_a_frame_capability() {
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        let uri = format!("/dev/~cap/{cap}/data/artifacts/notes.md");
+
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            let request = axum::extract::Request::builder()
+                .method(method)
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = gated_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} must not ride a read-only pass"
+            );
+        }
+
+        // A WebSocket handshake is a GET, so the method check alone would let
+        // one through. An upgraded connection is not a subresource load.
+        let handshake = get(
+            &state,
+            &uri,
+            &[("connection", "Upgrade"), ("upgrade", "websocket")],
+        )
+        .await;
+        assert_eq!(handshake.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -843,6 +843,17 @@ export interface ToastItem {
    *  pane's. Ignored while only one pane is on screen: mobile, and a collapsed
    *  split, both merge every toast into one column. */
   pane?: 'thread' | 'content';
+  /** true = this toast waits to be answered, with no auto-dismiss timer.
+   *
+   *  Decided in `showToast`, which is the one place that knows: the rule mixes
+   *  `autoDismissMs`, the key, the actions and the type. Recorded rather than
+   *  re-derived, because a re-derivation that drifts from that rule loses a
+   *  toast in silence.
+   *
+   *  Its one reader is `toastStackUrgency`, which lets an open modal outrank
+   *  the toast layer. A toast on a timer may not be lowered: it would vanish
+   *  behind the modal and the reader would never learn what it said. */
+  persistent?: boolean;
 }
 
 // Credential request from SSE (engine needs credentials)

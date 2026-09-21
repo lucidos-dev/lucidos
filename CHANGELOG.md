@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.39.1 — 2026-09-21
+
+### Changed
+
+- A marketplace renames in place from Settings. Its URL stays as it is.
+- The CLI lists registered repositories. `lucidos repositories list` prints the external git repositories available to coding-agent sessions.
+- A coding-agent session raises a finding it will not fix, when that finding reaches users: security, data exposure, or user-visible correctness. It asks before it finishes, rather than leaving the note in a plan file.
+
+### Fixed
+
+- An app loads its own files behind a gateway. A framed app document carries a short-lived read-only pass to its own workspace files and app assets, so separate CSS, JS and images work without inlining them. The host renews the pass while the app is open.
+- A refused app frame shows one short line, not the Lucidos boot splash inside your app.
+- Copy works inside an app. An app frame delegates clipboard-write, so a Copy button in an app puts text on the clipboard.
+- A follow-up sent to a busy thread survives an engine restart. Both resume paths read the queued messages back and announce each one they recover.
+- A confirm is drawn above the modal that asked for it.
+- A standing toast drops below a modal. An error or a warning still paints over one.
+- A seeded sentence, from a release notice, the setup interview or Discuss, opens a fresh draft and leaves the one you are typing in untouched.
+- Got it on a release notice marks it read and leaves its action button live, so the action can still be run afterwards.
+- The steps row names what a changes action is doing. Arming a standing apply, applying as threads settle, and cancelling one each read as themselves.
+- The compose destination picker is the same height as the agent chip beside it.
+- On a phone, the webhook bars give their sentence the whole width.
 ## v0.39.0 — 2026-09-21
 
 ### Added

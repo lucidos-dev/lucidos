@@ -44,8 +44,10 @@ export function overlayLayerTarget(
  *  `appFullscreenHost`, which owns the mount and the `display: contents` +
  *  `data-overlay-layer` element it publishes). Moving the group as a UNIT is the
  *  point: the overlays keep their relative order because they keep sharing one
- *  stacking context, so a toast still covers a modal rather than the two
- *  swapping depending on which was raised first.
+ *  stacking context, rather than swapping depending on which was raised first.
+ *  The order itself is decided elsewhere. A modal takes its level from the
+ *  band (`store/overlayStack.ts`) and a toast from its own urgency
+ *  (`components/shared/toastUrgency.ts`).
  *
  *  Two App-root overlays deliberately stay OUTSIDE this layer.
  *  `UiBlockingOverlay` inerts its own siblings (`overlay.parentElement`'s

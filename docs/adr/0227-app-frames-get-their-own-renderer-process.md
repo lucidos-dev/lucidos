@@ -119,15 +119,16 @@ and a source scan pins the two lists together. See
 - An app that calls `fetch('/api/v1/…')` or `localStorage` directly loses it.
   That is the accepted cost, and it is loud rather than silent.
 - Popups, OAuth and fullscreen are untouched.
-- Subresources hold DIRECT to an engine, and behind a gateway only the exempt
-  `/api/v1` assets do. An app's own `<script>`, `<link>`, `<img>` and
-  `lucidos.data.url(path)` are subresources of an opaque-origin document, so
-  they carry no device credential and the gateway refuses them. Measured in a
-  real browser, not inferred. That is the residual this decision leaves open,
-  and it is registered in `docs/temporary-measures.md`.
-- The `<a download>` rewrite above goes the same way behind a gateway. It asks
-  for `/<slug>/app/<id>/<file>?download=1`, which is one of those refused
-  paths, so the same row covers it.
+- Subresources hold DIRECT to an engine. Behind a gateway they carry no device
+  credential, because they are subresources of an opaque-origin document.
+  Measured in a real browser, not inferred. The exempt `/api/v1` assets are
+  named, and everything else needed a decision this ADR did not take. That
+  residual is now closed by
+  [ADR 0238](0238-app-frame-carries-a-capability-to-its-own-files.md): the frame
+  carries a short-lived capability in the URL, so an app's own `<script>`,
+  `<link>`, `<img>` and `lucidos.data.url(path)` load again.
+- The `<a download>` rewrite above went the same way, and is closed with it. It
+  asks for `/<slug>/app/<id>/<file>?download=1`, which the capability reaches.
 - The first-paint appearance script had to move first. It read theme, font and
   UI scale out of the shell's storage, which only `allow-same-origin` made
   visible. It is parser-blocking, so nothing async can replace it. The engine

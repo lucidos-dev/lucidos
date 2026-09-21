@@ -16,7 +16,7 @@
  * focused-textarea guards.
  */
 
-import { threadMap, focusedThreadId, inputMode, showToast, removeToast, showConfirm, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
 import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
 import {
@@ -1008,7 +1008,7 @@ export function ensureFocusedComposeThread(): string {
  *  Lands on whatever `ensureFocusedComposeThread` resolves, which is the
  *  FOCUSED thread when there is one, active threads included. A caller that
  *  must not write into an already-sent thread calls `dropNonComposingFocus()`
- *  first. `applySuggestion` does, and has to do it there rather than here,
+ *  first. `seedSuggestion` does, and has to do it there rather than here,
  *  because it reads the target before prefilling. */
 export function prefillCompose(text: string): string {
   const threadId = ensureFocusedComposeThread();
@@ -1028,8 +1028,9 @@ export function prefillCompose(text: string): string {
  *  aims the interview at whatever the user was looking at.
  *  `handleNavigationRequest`'s `new-chat` branch drops focus for this reason.
  *
- *  A focused DRAFT is left alone. Replacing it in place, after the confirm, is
- *  what a suggestion is supposed to do. `unfocusThread` rather than a bare
+ *  A focused DRAFT is left alone here, because emptiness is what decides its
+ *  fate and this function cannot see it. `seedSuggestion` reads the draft and
+ *  steps off an occupied one itself. `unfocusThread` rather than a bare
  *  `setFocusedThread(null)`, so the leaving thread's coding-agent pending picks
  *  are reset and the thread pane is revealed. That is how a mobile user tapping
  *  the header button reaches the conversation that starts. */
@@ -1040,46 +1041,45 @@ function dropNonComposingFocus(): void {
   unfocusThread();
 }
 
-/** Apply a suggested sentence to the compose input on the user's behalf.
+/** Seed a suggested sentence into a composer, and return the draft it landed
+ *  on.
  *
  *  Its one caller is {@link sendSeededPrompt}, which reuses every part of it and
- *  only adds the send. It stays a separate step because the seeding and the send
- *  fail independently: a declined confirm must stop before either the pane moves
- *  or a message goes out.
+ *  only adds the send. It stays a separate step so the seeding stays testable
+ *  without a message going out.
+ *
+ *  **A draft in progress is stepped off, never overwritten.** The sentence is
+ *  sent immediately, so it has no use for the user's composer: an occupied one
+ *  is released and `prefillCompose` allocates a fresh draft. Their text, their
+ *  attachments and their destination are left exactly as they were.
+ *
+ *  That replaced a "Replace it with this suggestion?" confirm, and the confirm
+ *  is what made the loss possible in the first place. It also cost the reader a
+ *  decision about their own work that this never has to ask. An EMPTY focused
+ *  draft is still reused, since there is nothing to protect and a second empty
+ *  row is litter.
  *
  *  A suggested sentence is conversational, so the destination is forced to the
- *  Lucidos Agent, a coding-agent draft flipping back to chat. It REPLACES the
- *  focused draft's whole input, text and attached images, via
- *  `prefillCompose`. A non-empty draft already in progress therefore needs the
- *  override confirmed first, since a click must never blow away typed text.
- *  Declining keeps the draft untouched.
+ *  Lucidos Agent, a coding-agent draft flipping back to chat.
  *
- *  The override is force-synced into the textarea via
+ *  The seeded text is force-synced into the textarea via
  *  `requestPromptOverrideSync('replace')`. The normal sync skips a focused,
  *  non-empty input, to protect in-flight typing. Without the force, the draft
  *  signal would update while the visible prompt stayed stale. `'replace'` also
- *  end-snaps the caret: the old offset indexes text that is gone, so restoring
+ *  end-snaps the caret: any old offset indexes text that is gone, so restoring
  *  it would drop the user inside the seeded sentence.
  *
- *  Returns true when the sentence was applied, false when the user declined the
- *  override. Does NOT send: that is {@link sendSeededPrompt}'s extra step. */
-export async function applySuggestion(text: string): Promise<boolean> {
+ *  Does NOT send: that is {@link sendSeededPrompt}'s extra step. */
+export function seedSuggestion(text: string): string {
   dropNonComposingFocus();
   const existingId = focusedThreadId.value;
-  if (existingId && !draftIsEmpty(getDraft(existingId))) {
-    const ok = await showConfirm(
-      'You have a draft in progress. Replace it with this suggestion?',
-      'Replace',
-      { title: 'Replace draft?', cancelLabel: 'Keep my draft' },
-    );
-    if (!ok) return false;
-  }
+  if (existingId && !draftIsEmpty(getDraft(existingId))) unfocusThread();
   // Target the Lucidos Agent. Set BEFORE prefill so a brand-new draft is born on
   // the chat channel, and so an existing coding-agent draft flips back to chat.
   applyDestination(focusedThreadId.value, { kind: 'lucidos-agent' });
-  prefillCompose(text);
+  const threadId = prefillCompose(text);
   requestPromptOverrideSync('replace');
-  return true;
+  return threadId;
 }
 
 /** The message the setup-interview entry points send.
@@ -1108,15 +1108,14 @@ export const SETUP_INTERVIEW_PROMPT =
 
 /** Start the setup interview: seed {@link SETUP_INTERVIEW_PROMPT} and SEND it.
  *
- *  Unlike {@link applySuggestion}, this does not stop at the draft. A first-run
+ *  Unlike {@link seedSuggestion}, this does not stop at the draft. A first-run
  *  user staring at a prefilled box they did not write has to decide whether to
  *  send it. That hesitation is what the entry point exists to remove, so the
  *  click is the whole gesture. Nothing is hidden by sending: the seeded
  *  sentence is what appears in the transcript, on the same code path a typed
  *  message takes.
  *
- *  Returns true when the interview was sent, false when the user declined the
- *  draft override or no draft resolved. */
+ *  Returns true when the interview was sent, false when the send failed. */
 export async function startSetupInterview(): Promise<boolean> {
   return sendSeededPrompt(SETUP_INTERVIEW_PROMPT, 'start the setup interview');
 }
@@ -1129,20 +1128,20 @@ export async function startSetupInterview(): Promise<boolean> {
  *  reword and re-send by typing, which is the prompt-first side of
  *  `docs/philosophy.md` principle 3.
  *
+ *  It never disturbs a draft in progress: `seedSuggestion` steps onto a fresh
+ *  one rather than borrowing an occupied composer.
+ *
  *  It reveals the thread pane, because a send that starts a conversation lands
  *  on a thread (`.claude/rules/frontend.md` § Navigation That Lands Content).
- *  `applySuggestion` covers only the branch where it unfocuses, and `sendCompose`
+ *  `seedSuggestion` covers only the branch where it unfocuses, and `sendCompose`
  *  passes an explicit thread id, so `sendMessage`'s raw-new reveal never fires.
  *  Without this, a caller in the content pane sent into a thread the user could
  *  not see.
  *
  *  `what` completes "Failed to …" in the error toast, so write it as a verb
- *  phrase. Returns false when the user declined the draft override, when no
- *  draft resolved, or when the send failed. */
+ *  phrase. Returns false when the send failed. */
 export async function sendSeededPrompt(text: string, what: string): Promise<boolean> {
-  if (!(await applySuggestion(text))) return false;
-  const threadId = focusedThreadId.value;
-  if (!threadId) return false;
+  const threadId = seedSuggestion(text);
   // Before the send, not after. `ensureFocusedComposeThread` allocated the id
   // client-side, so the thread can be on screen while the request is still in
   // flight, rather than after a round trip.

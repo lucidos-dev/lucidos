@@ -41,6 +41,10 @@ echo "Running API e2e tests (port $VITE_PORT)"
 cd "$PROJECT_DIR"
 
 export E2E_WORKSPACE
+# The gateway chain test below reads all three: where the workspace is, which
+# port its engine answers on, and whether that hop is TLS.
+export VITE_PORT
+export PROTO
 
 # The CLI tests shell out to the `lucidos` binary. Make sure it's built and at
 # the expected target path before tests run.
@@ -51,3 +55,15 @@ CMD=(cargo test --locked -p lucidos-e2e --test api)
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 
 "${CMD[@]}"
+
+# The gateway chain test, which is the only one that puts a real gateway in
+# front of a real engine. It lives in lucidos-gateway rather than lucidos-e2e
+# because that crate is bin-only, so nothing outside it can build its router.
+# `--ignored` keeps it out of `make test`, which has no engine to serve it. Run
+# by name, so a second ignored test cannot join this step by accident.
+# Skipped when a filter asked for something else.
+if [ -z "$FILTER" ]; then
+    echo "Running the gateway chain test (an app's own files behind a gateway)"
+    cargo test --locked -p lucidos-gateway -- --ignored --exact \
+        chain_tests::an_app_frames_own_files_load_through_a_gateway
+fi

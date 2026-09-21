@@ -4034,6 +4034,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   attributable and turn this into a real gap. Pinned by
   `an_unstamped_call_is_untouched`.
 
+- **The retraction check before a queued message is announced is a check then
+  an act, and that window is not closable here.** A reviewer sees
+  `filter_removed_queued_prompts` followed by an awaited
+  `emit_user_prompt_injected_event` (`chat/rerun.rs`, and the same pair in
+  `api::chat::announce_orphan_batch`) and asks for an atomic conditional write.
+
+  Three things make the residual acceptable. The check runs per message rather
+  than per batch, so the window is one statement rather than the whole announce
+  loop. The other side guards too: the removal endpoint refuses with 409 once a
+  `UserPromptInjected` names the message. And an atomic form would have to write
+  the event outside `EventBus`, which CLAUDE.md names as the single entry point
+  for event persistence.
+
+  The live orphan path carries the identical window, so closing it only in the
+  recovery would split one mechanism in two. Re-flag with a shape that keeps
+  every emit inside `EventBus`. Re-flag too if the consequence grows past the
+  model reading a message the user retracted a moment earlier.
+
 ## Product copy
 
 - **"apps and automations you describe" is the settled positioning line, and

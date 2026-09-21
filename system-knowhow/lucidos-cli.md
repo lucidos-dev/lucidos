@@ -956,6 +956,29 @@ change the **default** chat model for new threads, set the `chat_model`
 preference instead (a thread that's already running reuses its own last-used
 model — see `preferences.md`). Mirrors the chat agent's `manage_models` tool.
 
+### `lucidos repositories list`
+
+List the *repositories* registered with this workspace: the external git repos a
+*coding-agent thread* can work on. Read-only.
+
+```bash
+$ lucidos repositories list
+```
+
+Each row carries `id`, `name`, `path`, `description`, `root_commit_sha` and
+`created_at`. The `id` comes from the repo's root-commit SHA, so it survives a
+move, a rename and a re-clone. Compare `path` when a script has found a local
+clone and needs to know whether Lucidos already knows about it.
+
+**Registering and unregistering are not CLI ops.** They are the chat agent's
+`manage_repositories` tool (`add` / `remove`). Adding a repo changes what coding
+agents may touch, so the CLI stops at reading.
+
+An app UI has no equivalent. `/api/v1/repositories` is not app-reachable, so the
+engine refuses `lucidos.request` from an app frame (ADR 0231). A script running
+as a subprocess is a different caller, and uses this subcommand rather than a
+hand-rolled GET.
+
 ### `lucidos mcp list | start --id <id> | stop --id <id> | remove --id <id>`
 
 Manage MCP servers: which are running, what tools they offer, and what those

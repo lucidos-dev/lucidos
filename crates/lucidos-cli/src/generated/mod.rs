@@ -908,6 +908,24 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
     }
 }
 
+/// External git repositories registered for coding-agent sessions, so a coding agent can work on a local repo.
+#[derive(clap::Subcommand)]
+pub enum RepositoriesCmd {
+    /// List registered repositories.
+    List,
+}
+
+/// Execute a `lucidos repositories <op>` command against the parent workspace.
+pub fn dispatch_repositories(ws: &Workspace, cmd: RepositoriesCmd) -> Result<(), BoxError> {
+    match cmd {
+        RepositoriesCmd::List => {
+            let url = format!("{}/api/v1/repositories", ws.base_url());
+            let req = client()?.get(&url);
+            send_and_print("GET", &url, req)
+        }
+    }
+}
+
 /// Manage MCP (Model Context Protocol) servers. web_search first for the right package and command.
 #[derive(clap::Subcommand)]
 pub enum McpCmd {

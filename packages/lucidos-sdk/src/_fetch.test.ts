@@ -106,6 +106,19 @@ describe('apiUrl workspace-address derivation', () => {
     const apiUrl = await apiUrlUnder(null, '/');
     expect(apiUrl('/events/query')).toBe('/api/v1/events/query');
   });
+
+  it('never lets a frame capability ride an API call', async () => {
+    // Behind a gateway the engine stamps the frame's base with a pass to its
+    // own files (ADR 0238). That pass reaches `/data/` and `/app/<id>/` and
+    // nothing else, so an `/api/v1` URL carrying one would simply 401. The
+    // prefix is everything before the segment.
+    const pass = '6a0b~habit-tracker~00ff';
+    const apiUrl = await apiUrlUnder(
+      `/dev/~cap/${pass}/app/habit-tracker/`,
+      '/dev/app/habit-tracker/',
+    );
+    expect(apiUrl('/events/query?limit=1')).toBe('/dev/api/v1/events/query?limit=1');
+  });
 });
 
 describe('rawFetch deadline + caller signal', () => {

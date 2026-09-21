@@ -13,10 +13,12 @@
 //!    actor: engine }` carrying the side-effect-aware system note. The engine
 //!    note is what the LLM will read; persisting it as `UserPromptInjected`
 //!    leaves the audit trail visible in the UI.
-//! 5. Re-enters `process_message_with_steps_internal` with the engine note as
-//!    the latest user message, using the ContinuationStarted event id as
-//!    `pre_emitted_origin` so the rerun's events carry a fresh
-//!    `request_event_id` linking them to the resume boundary.
+//! 5. Announces every queued follow-up the restart stranded, read back from
+//!    the event store by `chat::queued_recovery`.
+//! 6. Re-enters `process_message_with_steps_internal` with the engine note and
+//!    those follow-ups as the latest user message. The ContinuationStarted
+//!    event id is the `pre_emitted_origin`, so the rerun's events link to the
+//!    resume boundary.
 //!
 //! Idempotency: if a ContinuationStarted already exists newer than the most
 //! recent ResponseAborted, the call is a no-op (returns Ok). Prevents
@@ -71,7 +73,11 @@ pub(crate) enum ChatResumeAnchor {
     /// prior tool calls"). That reminder is the point of this path: it tells
     /// the user what the engine told the model about the side effects the
     /// aborted run already performed.
-    NewBoundary,
+    ///
+    /// `interrupted_turn` is that run's originating event, and it is the lower
+    /// bound of the queued-message recovery: see
+    /// [`ChatResumeAnchor::interrupted_turn`].
+    NewBoundary { interrupted_turn: Option<Uuid> },
     /// Answer-driven resume of a turn that was **never terminated** — a thread
     /// parked on an `ask_user_question` survived a restart (no abort was
     /// emitted; see `agent_recovery::thread_has_unanswered_question`) and the
@@ -82,6 +88,25 @@ pub(crate) enum ChatResumeAnchor {
     /// question card exactly as they would have without the restart (the chat
     /// parity of the coding agent's silent `--resume`).
     ExistingTurn(Uuid),
+}
+
+impl ChatResumeAnchor {
+    /// The originating event of the turn the restart interrupted, which bounds
+    /// the queued-message recovery from below (`chat::queued_recovery`).
+    ///
+    /// `ExistingTurn` already IS that turn's `request_event_id`, since it is
+    /// read off the `ToolCalled{ask_user_question}` the resume answers.
+    ///
+    /// `None` means the interrupted turn is unknown. Only one caller produces
+    /// it: a legacy `ToolCalled` with no `request_event_id`, via
+    /// `agent_question::resume_anchor_for_ask`. Recovering with no lower bound
+    /// would sweep the whole thread, so that resume recovers nothing.
+    pub(crate) fn interrupted_turn(self) -> Option<Uuid> {
+        match self {
+            Self::NewBoundary { interrupted_turn } => interrupted_turn,
+            Self::ExistingTurn(request_event_id) => Some(request_event_id),
+        }
+    }
 }
 
 /// Emit whatever timeline boundary `anchor` calls for and return the
@@ -271,13 +296,17 @@ impl LucidosEngine {
             resolve_resume_channel(abort_channel.as_deref(), thread_source.as_deref());
 
         // A genuine interruption the user asked to revive → the resume gets its
-        // own boundary + the side-effect reminder.
+        // own boundary + the side-effect reminder. The anchor carries the
+        // interrupted turn so the resume can also recover whatever the user
+        // queued behind it.
         self.spawn_chat_resume(
             thread_id,
             engine_note,
             resume_channel,
             actor,
-            ChatResumeAnchor::NewBoundary,
+            ChatResumeAnchor::NewBoundary {
+                interrupted_turn: Some(originating_event_id),
+            },
         )
         .await?;
 
@@ -319,6 +348,21 @@ impl LucidosEngine {
     ) -> ChatResumeFuture {
         let engine = self.clone_arc();
         Box::pin(async move {
+            // Sampled BEFORE the anchor emit, which is this reader's fence: a
+            // message landing after it finds no live handle and gets a turn of
+            // its own from the chat API. See `queued_recovery`.
+            let window_end = super::queued_recovery::window_end_sequence(engine.pool(), thread_id)
+                .await
+                .unwrap_or_else(|e| {
+                    log!(
+                        "[Continue] window-end sample failed for thread {}: {}. \
+                         Any queued follow-up keeps its remove button",
+                        thread_id,
+                        e
+                    );
+                    0
+                });
+
             let anchor_event_id = emit_resume_anchor(
                 &engine.event_bus,
                 thread_id,
@@ -329,6 +373,20 @@ impl LucidosEngine {
             )
             .await?;
 
+            let recovered = ingest_queued_messages_for_resume(
+                ResumeStores {
+                    bus: &engine.event_bus,
+                    pool: engine.pool(),
+                    workspace: engine.workspace_path(),
+                },
+                thread_id,
+                anchor,
+                anchor_event_id,
+                channel,
+                window_end,
+            )
+            .await;
+
             // The engine note itself is the user prompt to the LLM (the original
             // prompt is in the thread history). `pre_emitted_origin =
             // Some(anchor_event_id)` skips a fresh MessageReceived emit and
@@ -336,7 +394,12 @@ impl LucidosEngine {
             // anchor_event_id` — the frontend uses this to gather them into the
             // resume exchange (or back into the interrupted turn's own exchange).
             let loop_engine = engine.clone();
-            let prompt_for_llm = engine_note;
+            let prompt_for_llm =
+                prompt_with_recovered_messages(engine_note, recovered.as_ref().map(|r| &*r.text));
+            // The recovered messages' own attachments. An image-only follow-up
+            // says nothing without them, and the live orphan path carries them
+            // the same way.
+            let recovered_images = recovered.and_then(|r| r.images);
             tokio::spawn(async move {
                 if let Err(e) = loop_engine
                     .process_message_with_steps(
@@ -345,7 +408,7 @@ impl LucidosEngine {
                         None,
                         None,
                         None,
-                        None,
+                        recovered_images.as_deref(),
                         None,
                         None,
                         None,
@@ -372,6 +435,124 @@ impl LucidosEngine {
 
             Ok(anchor_event_id)
         })
+    }
+}
+
+/// The three engine handles the recovery reads and writes through.
+///
+/// Grouped so [`ingest_queued_messages_for_resume`] stays a free function: a
+/// test drives it with a bare `EventBus` and a temp directory, which is what
+/// makes the emitted-event surface checkable without a live agentic loop.
+pub(crate) struct ResumeStores<'a> {
+    pub(crate) bus: &'a EventBus,
+    pub(crate) pool: &'a sqlx::PgPool,
+    pub(crate) workspace: &'a std::path::Path,
+}
+
+/// What the resume recovered: the follow-ups' coalesced text, and the bytes
+/// they were sent with.
+///
+/// Both halves travel, because a message is not its text alone. An image-only
+/// follow-up carries nothing else, and the live injection path hands the model
+/// the bytes (`coalesced_images_for_reprocess`).
+pub(crate) struct RecoveredMessages {
+    pub(crate) text: String,
+    pub(crate) images: Option<Vec<crate::api::ChatImage>>,
+}
+
+/// Announce every queued follow-up this resume still owes an answer for, and
+/// return what the resumed turn should carry.
+///
+/// The announcement is a `UserPromptInjected` per message, awaited before the
+/// loop is spawned. That write is what a second resume reads, so it is the
+/// whole idempotency story: a double Continue finds the marker and recovers
+/// nothing.
+///
+/// Anchored on the RESUME, not on the first recovered message, because the
+/// turn's own `PreEmittedOrigin` is the resume anchor. The live orphan path
+/// (`api::chat::announce_orphan_batch`) anchors on its first message for the
+/// same reason, with a different origin.
+///
+/// **The retraction check is per message, immediately before its own emit.**
+/// Filtering the batch once leaves a window as wide as the whole announce
+/// loop, and the trash icon is live throughout it. Only what was actually
+/// announced reaches the prompt, so the two can never disagree.
+pub(crate) async fn ingest_queued_messages_for_resume(
+    stores: ResumeStores<'_>,
+    thread_id: Uuid,
+    anchor: ChatResumeAnchor,
+    anchor_event_id: Uuid,
+    channel: EventChannel,
+    window_end: i64,
+) -> Option<RecoveredMessages> {
+    let ResumeStores {
+        bus,
+        pool,
+        workspace,
+    } = stores;
+    let interrupted_turn = anchor.interrupted_turn()?;
+    let prompts = match super::queued_recovery::undrained_user_messages(
+        pool,
+        workspace,
+        thread_id,
+        interrupted_turn,
+        window_end,
+    )
+    .await
+    {
+        Ok(prompts) => prompts,
+        Err(e) => {
+            log!(
+                "[Continue] queued-message read failed for thread {}: {}. \
+                 Any queued follow-up keeps its remove button",
+                thread_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    let base_meta = EventMeta {
+        request_event_id: Some(anchor_event_id),
+        channel: Some(channel),
+        ..EventMeta::NONE
+    };
+    let mut announced: Vec<crate::engine::InjectedPrompt> = Vec::new();
+    for prompt in prompts {
+        let still_owed =
+            crate::engine::filter_removed_queued_prompts(pool, thread_id, vec![prompt]).await;
+        let Some(prompt) = still_owed.into_iter().next() else {
+            continue;
+        };
+        crate::engine::emit_user_prompt_injected_event(bus, thread_id, &base_meta, &prompt).await;
+        announced.push(prompt);
+    }
+    if announced.is_empty() {
+        return None;
+    }
+    log!(
+        "[Continue] Recovered {} queued follow-up(s) stranded on thread {}",
+        announced.len(),
+        thread_id
+    );
+
+    Some(RecoveredMessages {
+        text: crate::engine::coalesced_user_text_for_reprocess(&announced),
+        images: crate::engine::coalesced_images_for_reprocess(&announced),
+    })
+}
+
+/// Where the recovered follow-ups go in the resumed prompt: after the engine
+/// note, in arrival order.
+///
+/// The note reports what the aborted run already did, which is older than the
+/// follow-ups and is the context they were sent against. The other order tells
+/// the model to act on a steer before it knows what already ran. That is how a
+/// `send_notification` goes out twice.
+fn prompt_with_recovered_messages(engine_note: String, recovered: Option<&str>) -> String {
+    match recovered {
+        Some(text) => format!("{}\n\n---\n\n{}", engine_note, text),
+        None => engine_note,
     }
 }
 
@@ -513,6 +694,10 @@ fn build_engine_note(summary: &str) -> String {
         summary
     )
 }
+
+#[cfg(test)]
+#[path = "rerun_queued_tests.rs"]
+mod queued_tests;
 
 #[cfg(test)]
 mod tests {

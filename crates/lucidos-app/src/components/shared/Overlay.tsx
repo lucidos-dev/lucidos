@@ -2,7 +2,13 @@ import { useRef, useLayoutEffect } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren, RefObject, JSX } from 'preact';
 import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
-import { pushOverlay, removeOverlay, topPanelOverlay } from '../../store/overlayStack';
+import {
+  overlayStack,
+  overlayStackDepth,
+  pushOverlay,
+  removeOverlay,
+  topPanelOverlay,
+} from '../../store/overlayStack';
 
 let overlayIdCounter = 0;
 
@@ -241,5 +247,10 @@ export function Overlay({
 
   if (!backdrop) return usePortal ? createPortal(panel, document.body) : panel;
   const cls = ['modal-overlay', overlayClass].filter(Boolean).join(' ');
-  return <div class={cls}>{panel}</div>;
+  // Paint order follows the stack, so the overlay the contract calls top is the
+  // one the reader sees on top (ADR 0237). Backdrop mode only: an anchored panel
+  // takes its level from its own class, which this cannot know. An `overlayClass`
+  // may name no z-index, since this inline one beats it.
+  const z = `z-index: calc(var(--z-modal) + ${overlayStackDepth(overlayStack.value, idRef.current)})`;
+  return <div class={cls} style={z}>{panel}</div>;
 }

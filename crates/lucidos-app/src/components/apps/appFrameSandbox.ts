@@ -1,8 +1,8 @@
 /**
- * The app iframe's `sandbox`, and the one question the rest of the shell asks
- * about it.
+ * The app iframe's `sandbox` and `allow`, and the one question the rest of the
+ * shell asks about them.
  *
- * It lives alone because three places must agree: the frame that carries the
+ * They live alone because three places must agree: the frame that carries the
  * attribute, the navigation that drives the frame, and the capture that reads
  * it. Deriving the answer from the attribute means there is one thing to
  * change, and no second place to forget.
@@ -31,3 +31,24 @@ export const APP_FRAME_SANDBOX =
  * and the host asks the frame over `postMessage` instead.
  */
 export const APP_FRAME_ISOLATED = !APP_FRAME_SANDBOX.includes('allow-same-origin');
+
+/**
+ * What the shell delegates to an app frame, as a permissions policy.
+ *
+ * Every feature here defaults to an allowlist of `self`, and the opaque origin
+ * above is not `self`. So each one is DENIED unless this attribute hands it
+ * over. That is why the list exists at all: while the frame shared the shell's
+ * origin, `self` covered it and the attribute was a formality.
+ *
+ * - `autoplay`, `fullscreen`, `encrypted-media`: an app playing media.
+ * - `clipboard-write`: every Copy button in every app. Without it Chromium
+ *   rejects `writeText` with `NotAllowedError` and the text never lands, which
+ *   is silent because app code does not await the promise. WebKit allows the
+ *   write either way.
+ *
+ * `clipboard-read` is deliberately absent. A write is gated on a user gesture
+ * and puts the app's own text out. A read hands the app whatever the user last
+ * copied. That may be a password or a token from another app, for no gesture
+ * aimed at the app. Nothing in the SDK needs it.
+ */
+export const APP_FRAME_ALLOW = 'autoplay; fullscreen; encrypted-media; clipboard-write';

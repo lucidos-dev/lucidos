@@ -9,8 +9,8 @@ import { panelOverlay } from '../store';
 import type { Notification } from '../types';
 
 // `sendSeededPrompt` owns the whole gesture and compose.test.ts covers it: the
-// confirm before replacing a draft, the forced Lucidos Agent destination, the
-// thread-pane reveal, the send and the failure toast. Here it is a seam. These
+// fresh draft it seeds, the forced Lucidos Agent destination, the thread-pane
+// reveal, the send and the failure toast. Here it is a seam. These
 // tests are about what the Discuss action hands it.
 const sendSeededPrompt = vi.fn(async () => true);
 vi.mock('./compose', () => ({ sendSeededPrompt }));

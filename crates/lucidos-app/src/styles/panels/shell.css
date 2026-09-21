@@ -188,6 +188,33 @@
     flex: none;
 }
 
+/* On a phone the buttons' own column is what the sentence loses. The button
+   cannot shrink (the rule above), so the sentence wrapped inside roughly 60%
+   of the bar. The refusal notice ran to ten lines beside a tall empty gap.
+   Wrapping gives the sentence the whole first line and drops the buttons to a
+   second one, at the trailing edge where they already sat.
+
+   Both bars, one rule, for the reason the grouped rules above are grouped.
+   The backup reminder is NOT here: its trailing X is a dismiss. Sent down to
+   a row of actions, a dismiss reads as a third action. The connection bar
+   carries no control at all, so its sentence already spans the bar.
+
+   Stacked, the shared --space-md gap reads as a hole between the sentence and
+   its own button, so the row gap alone is tighter. */
+@media (max-width: 768px) {
+    .ingress-banner,
+    .refusal-banner {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        row-gap: var(--space-sm);
+    }
+
+    .ingress-banner-text,
+    .refusal-banner-text {
+        flex-basis: 100%;
+    }
+}
+
 /* ─── Content row (thread drawer + split layout) ─── */
 
 .content-row {

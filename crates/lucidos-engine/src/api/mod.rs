@@ -18,6 +18,7 @@ pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
 mod file_response;
+mod frame_capability;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
 pub(crate) mod handshake_scripts;

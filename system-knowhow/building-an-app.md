@@ -172,7 +172,8 @@ Before you call the app done, check it against this list. A "no" on any line mea
 - Anything in the **top-right corner**, or an interactive control pinned to the left or right edge? Those regions belong to the host's fullscreen controls, and a tap there never reaches your app.
 - Is there **one clear focal point**, generous whitespace, and a consistent spacing rhythm — or a cramped grid of equal-weight widgets?
 - Dropped into Lucidos next to the host UI, **would it look like it belongs** — or like a bolted-on web page?
-- **Inline `<script>` and `<style>`, at any size.** A separate `app.js` or `style.css` of your own is refused behind a gateway today, which is every packaged install. Your frame sends no device credential with a subresource. See `system-knowhow/js-sdk.md` § Setup.
+- **Inline `<script>` for small apps.** Split into `app.js` only when the script grows past ~100 lines or you want to share it with another script.
+- **Inline `<style>` likewise.** External CSS is for shared design across apps.
 - **Use the SDK for everything stateful.** `lucidos.data.read` / `lucidos.data.write` are the right primitives. A direct `fetch` to `/api/v1/*` doesn't just bypass the workspace abstraction: inside the host shell it has no network at all. An app frame's origin is opaque, so the engine is cross-origin to it and CORS refuses the answer. `localStorage` and `new EventSource` go the same way, and the SDK carries all three over a bridge to the host. Where no SDK method covers the endpoint, see `system-knowhow/js-sdk.md` § `lucidos.apiUrl`, which says what a frame can and cannot reach.
 - **External APIs: call `lucidos.proxy(name).fetch(path, init)`. Always.** Configure the backend in `data/config/apis.json`; the engine forwards server-side and injects the configured auth header. Never paste credentials into iframe code.
 

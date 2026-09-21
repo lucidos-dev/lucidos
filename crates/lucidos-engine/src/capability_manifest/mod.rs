@@ -1436,17 +1436,21 @@ const MODELS_DOMAIN: Domain = Domain {
 
 // ---------------------------------------------------------------------------
 // repositories — registered external git repos for coding-agent sessions.
-// Migrates the already-grouped `manage_repositories` LLM tool into the manifest
-// (tool_name kept; schema now manifest-built SSOT, replacing
-// misc::get_manage_repositories_tool). Declared LLM-only (cli/sdk = false) so
-// the migration adds no new generated surface: the LLM handler reaches
-// `RepositoryStore` in-process. HTTP routes for the same verbs DO exist
-// (`POST /api/v1/repositories` and `DELETE /api/v1/repositories/:id`, see
-// `api::repositories::router`); the `path` values recorded below are the
-// conceptual mapping, not something a generator could emit today, since
-// `remove` is keyed there by an `:id` path segment rather than by the body
-// `name` this tool takes. execute_tool keeps routing manage_repositories to the
-// unchanged execute_manage_repositories handler. See engine/tools/mod.rs.
+// The grouped `manage_repositories` LLM tool builds its schema from here, and
+// execute_tool routes it to the unchanged execute_manage_repositories handler
+// (engine/tools/mod.rs).
+//
+// The CLI is READ-ONLY. `add` and `remove` carry `cli: Some(false)`, so only
+// `list` generates. That is a decision, not a limit: `POST /repositories`
+// takes exactly the body `add` declares. Registering a repo changes the
+// platform under the user, so a CLI write verb needs its own decision.
+//
+// `remove`'s path is the conceptual mapping, not an emittable route. The real
+// one is `DELETE /api/v1/repositories/:id`, keyed by a path segment rather
+// than the body `name` this tool takes. Nothing reads it while the op is off
+// both generators.
+//
+// No SDK: an app frame may not reach `/repositories` at all (ADR 0231).
 // ---------------------------------------------------------------------------
 
 const REPO_NAME_ARG: Arg = Arg {
@@ -1487,7 +1491,8 @@ const REPOSITORIES_OPS: &[Operation] = &[
         llm_alias: None,
         llm_schema: None,
         llm: None,
-        cli: None,
+        // Read-only CLI: see the block comment above `REPO_NAME_ARG`.
+        cli: Some(false),
         sdk: None,
     },
     Operation {
@@ -1517,7 +1522,8 @@ const REPOSITORIES_OPS: &[Operation] = &[
         llm_alias: None,
         llm_schema: None,
         llm: None,
-        cli: None,
+        // Read-only CLI, and the path here is not the real route either.
+        cli: Some(false),
         sdk: None,
     },
 ];
@@ -1527,11 +1533,10 @@ const REPOSITORIES_DOMAIN: Domain = Domain {
     tool_name: "manage_repositories",
     tool_summary: "External git repositories registered for coding-agent sessions, so a coding agent can work on a local repo.",
     llm: true,
-    // Declared N/A: the LLM handler runs add/remove in-process against
-    // `RepositoryStore`, and this entry is a pure schema-SSOT migration that
-    // deliberately ships no generated surface. Not because the routes are
-    // missing, they are not: see the block comment above `REPO_NAME_ARG`.
-    cli: false,
+    // `list` only. The two write ops opt out per operation, so a script can
+    // read the registry while registering a repo stays the LLM tool's job.
+    cli: true,
+    // No app frame reaches `/repositories`, so there is nobody to serve.
     sdk: false,
     operations: REPOSITORIES_OPS,
     llm_aliases: &[],
@@ -3291,11 +3296,20 @@ mod tests {
         );
         assert_eq!(domain_for_tool("manage_models").unwrap().name, "models");
 
-        // repositories — LLM-only migration (no CLI: add/remove are in-process).
+        // repositories: all three verbs on the LLM tool, `list` alone on the
+        // CLI. A write verb appearing here means the read-only decision was
+        // reversed by accident. See the block comment above `REPO_NAME_ARG`.
         let repos = domains().iter().find(|d| d.name == "repositories").unwrap();
         assert_eq!(repos.tool_name, "manage_repositories");
-        assert!(repos.llm && !repos.cli && !repos.sdk);
+        assert!(repos.llm && repos.cli && !repos.sdk);
         assert_eq!(repos.actions(), vec!["add", "list", "remove"]);
+        let repo_cli_ops: Vec<&str> = repos
+            .operations
+            .iter()
+            .filter(|o| o.on_cli(repos))
+            .map(|o| o.cli_name)
+            .collect();
+        assert_eq!(repo_cli_ops, vec!["list"]);
         let repo_tool = build_llm_tool(repos);
         let repo_props = &repo_tool.parameters["properties"];
         for p in ["action", "name", "path", "description"] {

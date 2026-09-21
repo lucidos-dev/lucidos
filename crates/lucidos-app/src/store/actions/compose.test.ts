@@ -23,7 +23,7 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { applySuggestion, clearSupersededDraft, composeEditedAt, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
@@ -214,7 +214,7 @@ describe('prefillCompose: seeded-prompt drop-in', () => {
   });
 });
 
-describe('applySuggestion: seeding the compose input on the user\'s behalf', () => {
+describe('seedSuggestion: seeding the compose input on the user\'s behalf', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -238,16 +238,17 @@ describe('applySuggestion: seeding the compose input on the user\'s behalf', () 
     vi.restoreAllMocks();
   });
 
-  it('no draft in progress: drops the text in and does NOT confirm', async () => {
+  it('no draft in progress: drops the text in and asks nothing', async () => {
     const seqBefore = promptOverrideSyncSeq.value;
 
-    const applied = await applySuggestion('Build me an app that tracks my reading list.');
+    const seeded = seedSuggestion('Build me an app that tracks my reading list.');
 
-    expect(applied).toBe(true);
-    // No confirm was raised (no draft to protect).
+    // Nothing is ever asked now: an occupied composer is stepped off rather
+    // than overwritten, so there is no decision left to put to the reader.
     expect(confirmState.value.visible).toBe(false);
     const id = focusedThreadId.value!;
     expect(id).toBeTruthy();
+    expect(seeded).toBe(id);
     expect(getDraft(id).text).toBe('Build me an app that tracks my reading list.');
     // Force-sync ticket bumped so the textarea reflects the override.
     expect(promptOverrideSyncSeq.value).toBe(seqBefore + 1);
@@ -257,7 +258,7 @@ describe('applySuggestion: seeding the compose input on the user\'s behalf', () 
     // Not sent — prefill is not a send.
     const chatCall = mockFetch.mock.calls.find(([url]) =>
       typeof url === 'string' && url.endsWith('/chat/stream'));
-    expect(chatCall, 'applySuggestion must not POST a chat message').toBeUndefined();
+    expect(chatCall, 'seedSuggestion must not POST a chat message').toBeUndefined();
   });
 
   it('sets the destination to the Lucidos Agent (chat channel)', async () => {
@@ -268,48 +269,50 @@ describe('applySuggestion: seeding the compose input on the user\'s behalf', () 
     threadMap.value = map;
     focusedThreadId.value = 'cc-1';
 
-    // Empty draft (mode-only) → no confirm.
-    const applied = await applySuggestion('Tell me how to set up Lucidos for mobile access.');
+    // An EMPTY draft is reused: there is nothing to protect, and a second
+    // empty row would be litter in the drawer.
+    const seeded = seedSuggestion('Tell me how to set up Lucidos for mobile access.');
 
-    expect(applied).toBe(true);
+    expect(seeded).toBe('cc-1');
     expect(inputMode.value).toEqual({ type: 'do' });
     expect(getDraft('cc-1').mode).toBe('lucidos');
     expect(getDraft('cc-1').text).toBe('Tell me how to set up Lucidos for mobile access.');
   });
 
-  it('draft in progress + confirm accepted: overrides text AND clears attachments', async () => {
+  /** The reported loss, and the reason the confirm existed. A seeded sentence
+   *  is sent straight away, so it has no use for the reader's composer: it
+   *  takes a fresh one and leaves their work alone. */
+  it('draft in progress: seeds a NEW draft and leaves the old one whole', () => {
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea', composeImages: ['iVBORfake'] }));
     threadMap.value = map;
     focusedThreadId.value = 't-1';
 
-    const p = applySuggestion('Where can I download apps?');
-    // The confirm is raised synchronously (showConfirm's executor runs eagerly).
-    expect(confirmState.value.visible).toBe(true);
-    expect(confirmState.value.okLabel).toBe('Replace');
-    confirmState.value.resolve!(true);
+    const seeded = seedSuggestion('Where can I download apps?');
 
-    expect(await p).toBe(true);
-    expect(getDraft('t-1').text).toBe('Where can I download apps?');
-    // "Replace" means the whole draft — stale attachments must not linger.
-    expect(getDraft('t-1').image_hashes).toEqual([]);
+    expect(confirmState.value.visible).toBe(false);
+    expect(seeded).not.toBe('t-1');
+    expect(focusedThreadId.value).toBe(seeded);
+    expect(getDraft(seeded).text).toBe('Where can I download apps?');
+    // Their text AND their attachments survive untouched.
+    expect(getDraft('t-1').text).toBe('my own idea');
+    expect(getDraft('t-1').image_hashes).toEqual(['iVBORfake']);
   });
 
-  it('draft in progress + confirm declined: keeps the draft untouched', async () => {
-    const seqBefore = promptOverrideSyncSeq.value;
+  /** The fresh draft is a chat draft, wherever the one stepped off was aimed.
+   *  A suggested sentence is conversational. */
+  it('aims the new draft at the Lucidos Agent', () => {
+    inputMode.value = { type: 'coding_agent' };
     const map = new Map<string, ThreadState>();
-    map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea' }));
+    map.set('cc-1', makeThread({ id: 'cc-1', state: 'composing', channel: 'claude_code', composeMode: 'claude_code', composeText: 'my own idea' }));
     threadMap.value = map;
-    focusedThreadId.value = 't-1';
+    focusedThreadId.value = 'cc-1';
 
-    const p = applySuggestion('Where can I download apps?');
-    expect(confirmState.value.visible).toBe(true);
-    confirmState.value.resolve!(false);
+    const seeded = seedSuggestion('Where can I download apps?');
 
-    expect(await p).toBe(false);
-    // Draft untouched, no override sync fired.
-    expect(getDraft('t-1').text).toBe('my own idea');
-    expect(promptOverrideSyncSeq.value).toBe(seqBefore);
+    expect(seeded).not.toBe('cc-1');
+    expect(getDraft(seeded).mode).toBe('lucidos');
+    expect(getDraft('cc-1').text).toBe('my own idea');
   });
 });
 
@@ -1987,10 +1990,9 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     await expect(started).resolves.toBe(true);
   });
 
-  it('leaves the pane alone when the user declines to replace their draft', async () => {
-    // The reveal sits AFTER the confirm, so a decline moves nothing. Reordering
-    // it above `applySuggestion` would swipe a mobile user off the surface they
-    // just said no from.
+  it('sends from a new draft, leaving a draft in progress untouched', async () => {
+    // Nothing is asked and nothing is overwritten. The send lands on a thread
+    // of its own, and the reader's work is still where they left it.
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea' }));
     threadMap.value = map;
@@ -1998,11 +2000,12 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     focusedPane.value = 'content';
 
     const started = startSetupInterview();
-    expect(confirmState.value.visible).toBe(true);
-    confirmState.value.resolve!(false);
+    expect(confirmState.value.visible, 'still asking about a draft it does not touch').toBe(false);
 
-    await expect(started).resolves.toBe(false);
-    expect(focusedPane.value, 'declined confirm still moved the user').toBe('content');
+    releaseThreadStart!(new Response(null, { status: 200 }));
+    await expect(started).resolves.toBe(true);
+    expect(focusedThreadId.value).not.toBe('t-1');
+    expect(getDraft('t-1').text).toBe('my own idea');
   });
 });
 
@@ -2070,29 +2073,29 @@ describe('a suggestion never lands on an already-sent thread', () => {
     expect(getDraft('cc-1').text, 'interview prompt written into the open thread').toBe('');
   });
 
-  it('applySuggestion prefills a fresh draft rather than the open thread', async () => {
-    await expect(applySuggestion('summarize my week')).resolves.toBe(true);
+  it('seedSuggestion prefills a fresh draft rather than the open thread', () => {
+    const draftId = seedSuggestion('summarize my week');
 
-    const draftId = focusedThreadId.value!;
     expect(draftId).not.toBe('cc-1');
+    expect(focusedThreadId.value).toBe(draftId);
     expect(getDraft(draftId).text).toBe('summarize my week');
     expect(getDraft('cc-1').text).toBe('');
   });
 
-  it('does not stop to ask: an open thread is not a draft to replace', async () => {
-    await applySuggestion('summarize my week');
-    expect(confirmState.value.visible, 'confirmed a replace of a thread with no draft').toBe(false);
+  it('does not stop to ask, whatever the focused thread is', () => {
+    seedSuggestion('summarize my week');
+    expect(confirmState.value.visible, 'asked about a thread it was never going to touch').toBe(false);
   });
 
-  it('leaves a half-typed follow-up on the open thread alone', async () => {
+  it('leaves a half-typed follow-up on the open thread alone', () => {
     setDraft('cc-1', { text: 'and also rename the button', image_hashes: ['h1'], mode: null });
 
-    await applySuggestion('summarize my week');
+    seedSuggestion('summarize my week');
 
-    // The confirm exists to protect a DRAFT the suggestion would replace. A
-    // follow-up being typed into an open thread is not that: the suggestion is
-    // going somewhere else entirely, so there is nothing to ask about and
-    // nothing to overwrite.
+    // A follow-up being typed into an OPEN thread was never at risk: the
+    // suggestion goes somewhere else entirely. It is pinned here because
+    // `dropNonComposingFocus` is what steers it there, and a change to that
+    // would take the follow-up with it.
     expect(confirmState.value.visible).toBe(false);
     expect(getDraft('cc-1').text).toBe('and also rename the button');
     expect(getDraft('cc-1').image_hashes).toEqual(['h1']);

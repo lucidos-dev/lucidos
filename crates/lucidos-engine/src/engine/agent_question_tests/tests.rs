@@ -1246,7 +1246,9 @@ async fn interrupted_response_continue_still_emits_boundary_and_reminder() {
     let anchor_event_id = crate::engine::chat::rerun::emit_resume_anchor(
         &bus,
         thread_id,
-        ChatResumeAnchor::NewBoundary,
+        ChatResumeAnchor::NewBoundary {
+            interrupted_turn: None,
+        },
         note,
         EventChannel::Chat,
         None,
@@ -1296,15 +1298,22 @@ async fn ask_call_without_request_event_id_falls_back_to_boundary() {
         ask.as_ref().is_some_and(|a| a.request_event_id.is_none()),
         "legacy row must read back with no turn anchor"
     );
+    // `interrupted_turn: None` is the same missing field, so the resume also
+    // recovers no queued message: with no lower bound the recovery would sweep
+    // the whole thread.
     assert_eq!(
         resume_anchor_for_ask(ask.as_ref(), thread_id),
-        ChatResumeAnchor::NewBoundary,
+        ChatResumeAnchor::NewBoundary {
+            interrupted_turn: None
+        },
     );
 
     // Same fallback when the thread has no `ask_user_question` call at all.
     assert_eq!(
         resume_anchor_for_ask(None, thread_id),
-        ChatResumeAnchor::NewBoundary,
+        ChatResumeAnchor::NewBoundary {
+            interrupted_turn: None
+        },
     );
 
     pool.close().await;

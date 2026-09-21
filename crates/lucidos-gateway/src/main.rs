@@ -38,6 +38,9 @@ mod auth_api;
 mod boot_failure;
 mod boot_phase;
 mod build_id;
+/// The one test that needs a live engine, run by `./scripts/e2e-api.sh`.
+#[cfg(test)]
+mod chain_tests;
 mod control;
 mod error;
 mod file_backup;

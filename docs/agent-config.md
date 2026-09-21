@@ -130,6 +130,7 @@ The routing decided on 2026-08-06, as calibration for the next case.
 | Worktree isolation, Apply and restart, turn lifecycle, the question tool, the plan marker, `/harden` | engine | Session truth. `CLAUDE.md` deleted its copy of each. |
 | Never start a stack from a worktree (ADR 0021) | engine | Session truth, and a hand-run `claude` is not in a worktree, so it is not bound. |
 | Never hand-roll HTTP to the engine API (ADR 0050) | engine | Session truth. The incident narrative lives in the ADR, not in front of a session. |
+| Raise a user-reaching product finding you won't fix, never bury it (ADR 0239) | engine | Session truth. It is true because the engine gave the session the question tool; the incident lives in the ADR. |
 | Commit cadence, no pull requests | engine | Session truth, and never duplicated. `CLAUDE.md`'s conventional-commits bullet is commit *message format*, a different rule, and its "not PR-based" mention is rationale inside the GitHub-Actions bullet, load-bearing for a different claim. |
 | Never kill broadly (ADR 0025) | **both** | The one mirror, guarded by `check-prompt-mirror.sh`. |
 | A `scripts/lib/*_test.sh` run can kill a live engine | `CLAUDE.md` | Repo truth about specific repo scripts, which no-checkout sessions do not have. |

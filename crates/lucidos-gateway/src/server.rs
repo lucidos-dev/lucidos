@@ -300,6 +300,18 @@ impl GatewayState {
     /// owns a directory gets its own store with it.
     #[cfg(test)]
     pub fn for_tests_with_static_dir(static_dir: Option<PathBuf>) -> Self {
+        Self::for_tests_with(static_dir, "test-local-token", false)
+    }
+
+    /// [`Self::for_tests_with_static_dir`], plus the two things a test running
+    /// against a REAL engine has to match: the machine-local token that engine
+    /// derived its frame-capability key from, and whether it serves TLS.
+    #[cfg(test)]
+    pub fn for_tests_with(
+        static_dir: Option<PathBuf>,
+        local_token: &str,
+        engine_tls: bool,
+    ) -> Self {
         let scratch = match static_dir.as_ref() {
             Some(dir) => dir.join("state"),
             None => std::env::temp_dir().join(format!("lucidos-gw-state-{}", std::process::id())),
@@ -309,7 +321,7 @@ impl GatewayState {
                 app_data: scratch.clone(),
                 registry_path: scratch.join("workspaces.json"),
                 gateway_port: 5251,
-                local_token: "test-local-token".to_string(),
+                local_token: local_token.to_string(),
                 webhook_token: "test-webhook-token".to_string(),
                 paired_devices_path: scratch.join("paired-devices.json"),
                 device_cookie_name: auth::device_cookie_name(&scratch),
@@ -321,7 +333,7 @@ impl GatewayState {
                 engine_bin: scratch.join("lucidos-engine"),
                 static_dir,
                 engine_loopback: true,
-                engine_tls: false,
+                engine_tls,
                 pg_backend: PgBackend::Docker,
                 packaged: false,
                 pg_lock: AsyncMutex::new(()),
@@ -692,6 +704,17 @@ impl GatewayState {
         if let Ok(mut r) = self.inner.routes.write() {
             r.insert(id.to_string(), port);
         }
+    }
+
+    /// List a workspace a test controls, so the proxy has somewhere to route.
+    #[cfg(test)]
+    pub(crate) fn register_for_test(&self, ws: Workspace) {
+        self.inner
+            .registry
+            .lock()
+            .expect("an unpoisoned registry in a test")
+            .add(ws)
+            .expect("registering a test workspace");
     }
 
     /// Point `id` at a port a test controls. That lets a hop run end to end
@@ -3389,11 +3412,15 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 if rest == "manifest.json" {
                     return serve_workspace_manifest(&state, &slug);
                 }
-                // Never for an app asset, whatever it claims to accept.
-                // `auth_api::enforce` exempts those from the device gate. So an
-                // unpaired caller could otherwise send one `Accept: text/html`
-                // and start the engine the picker's Stop just shut down.
-                if is_document_navigation(&req) && !crate::auth_api::is_public_app_asset(&path) {
+                // Never for an app asset or a frame-capability URL, whatever
+                // either claims to accept. `auth_api::enforce` lets both past
+                // the device gate. So an unpaired caller could otherwise send
+                // one `Accept: text/html` and start the engine the picker's
+                // Stop just shut down.
+                if is_document_navigation(&req)
+                    && !crate::auth_api::is_public_app_asset(&path)
+                    && !crate::auth_api::path_carries_frame_capability(&path)
+                {
                     // Kick the lazy-start in the background and return the boot
                     // window at once, rather than blocking this response on a
                     // multi-second provision and spawn. The page's auto-refresh
@@ -5561,6 +5588,55 @@ mod tests {
         assert!(
             response.headers().get("x-lucidos-boot-splash").is_none(),
             "an exempt path must answer 'stopped', never the starting page"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_caller_cannot_start_a_stopped_workspace_with_a_frame_capability() {
+        // The sibling of the app-asset case above, and the same hazard. A
+        // capability path walks past the device gate, so a caller with one
+        // could otherwise resurrect the engine the picker's Stop shut down.
+        // Presence decides, not validity: a forged segment is no more a person
+        // arriving than a signed one.
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .add(Workspace::gateway_provisioned(
+                "dev".into(),
+                "Dev".into(),
+                51998,
+            ))
+            .unwrap();
+
+        // A real pass, so the request clears the device gate and reaches the
+        // branch under test. `for_tests_with_static_dir` mints this token.
+        let key = lucidos_frame_capability::derive_key("test-local-token");
+        let cap = lucidos_frame_capability::mint(
+            &key,
+            "dev",
+            "site-publisher",
+            chrono::Utc::now().timestamp(),
+            lucidos_frame_capability::TTL_SECS,
+        )
+        .unwrap();
+
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri(format!("/dev/~cap/{cap}/data/artifacts/web/x/index.html"))
+            .header(header::ACCEPT, "text/html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get("x-lucidos-boot-splash").is_none(),
+            "a capability path must answer 'stopped', never the starting page"
         );
     }
 

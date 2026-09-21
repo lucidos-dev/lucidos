@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect } from 'preact/hooks';
 import type { TriggerGroup } from '../../store/types';
 import { collapsedTriggerGroupIds, toggleTriggerGroupCollapsed } from '../../store/store';
 import { deleteTriggerGroup, renameTriggerGroup } from '../../store/actions/triggerGroups';
+import { useInlineRename } from '../../hooks/useInlineRename';
 import { EditIcon, TrashIcon } from '../shared/icons';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
@@ -19,40 +19,15 @@ interface Props {
  */
 export function TriggerGroupHeader({ group }: Props) {
   const collapsed = collapsedTriggerGroupIds.value.has(group.id);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(group.name);
-  // Enter and blur BOTH call commit; committing hides the input, whose trailing
-  // blur would rename a second time. Guard with a submit-once flag, reset when
-  // editing reopens.
-  const renamingRef = useRef(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Leaving edit mode leaves the field focused (Enter commits without blurring,
-  // and the field stays mounted now), so it would keep the mobile keyboard up
-  // over a panel with nothing to type into. Same reason ThreadTitleEditor does
-  // this. onBlur is only wired while editing, so this cannot re-commit.
-  useEffect(() => {
-    if (!editing) inputRef.current?.blur();
-  }, [editing]);
-
-  // While not editing, the field mirrors the served name. Without this a
-  // `TriggerGroupRenamed` frame from another device leaves the old name behind
-  // the rename button, and the next tap offers it back for editing. It also
-  // resets the draft on every close, so an abandoned edit, an empty one and a
-  // failed rename all settle on the stored name. Same shape as
-  // ThreadTitleEditor (ADR 0118).
-  useEffect(() => {
-    if (!editing) setDraft(group.name);
-  }, [group.name, editing]);
-
-  async function commit() {
-    if (renamingRef.current) return;
-    const trimmed = draft.trim();
-    if (!trimmed || trimmed === group.name) { setEditing(false); return; }
-    renamingRef.current = true;
-    await renameTriggerGroup(group.id, trimmed);
-    setEditing(false);
-  }
+  const {
+    renaming: editing,
+    draft,
+    setDraft,
+    inputRef,
+    open,
+    commit,
+    cancel,
+  } = useInlineRename(group.name, (next) => renameTriggerGroup(group.id, next));
 
   return (
     <div
@@ -97,7 +72,7 @@ export function TriggerGroupHeader({ group }: Props) {
             onBlur={editing ? commit : undefined}
             onKeyDown={e => {
               if (e.key === 'Enter') void commit();
-              else if (e.key === 'Escape') setEditing(false);
+              else if (e.key === 'Escape') cancel();
             }}
           />
         </span>
@@ -107,18 +82,7 @@ export function TriggerGroupHeader({ group }: Props) {
         <button
           class="icon-btn row-icon trigger-group-rename"
           type="button"
-          onClick={e => {
-            e.stopPropagation();
-            renamingRef.current = false;
-            setDraft(group.name);
-            // Synchronous, and before the state flip: this call is what the
-            // keyboard rides in on, so it has to happen while the tap is still
-            // the current gesture. Preact flushes the render afterwards, in a
-            // microtask that no longer carries one.
-            inputRef.current?.focus();
-            inputRef.current?.select();
-            setEditing(true);
-          }}
+          onClick={e => { e.stopPropagation(); open(); }}
           aria-label={`Rename group “${group.name}”`}
           data-tooltip="Rename group"
         >

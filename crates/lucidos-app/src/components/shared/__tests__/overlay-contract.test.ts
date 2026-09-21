@@ -59,6 +59,14 @@ describe('Overlay — centralizes the dismiss contract', () => {
     expect(source).toMatch(/removeOverlay\(/);
   });
 
+  /** **What the stack calls top is what the reader sees on top.** The class
+   *  alone puts every modal on `--z-modal`, so paint order fell to the child
+   *  list in `OverlayLayer` (ADR 0237). */
+  it('derives the backdrop container z-index from its overlay-stack depth', () => {
+    expect(source).toMatch(/overlayStackDepth\(\s*overlayStack\.value\s*,\s*idRef\.current\s*\)/);
+    expect(source).toMatch(/z-index:\s*calc\(var\(--z-modal\)/);
+  });
+
   it('never hand-rolls its own document dismiss listener', () => {
     // A bare addEventListener('pointerdown'|'mousedown'|'click', …) is exactly
     // the anti-pattern the central component exists to eliminate.

@@ -148,6 +148,16 @@ The definition, carve-out (legitimate attribution), and approved placeholders
 live in `.claude/rules/no-private-data.md` — flag against that rule and name the
 placeholder to use.
 
+**Buried user-reaching finding.** Flag a diff that records a security,
+data-exposure, or user-visible-correctness finding and then buries it. Burying
+means a non-goal, known limitation, follow-up, deferred item, or release gate in
+a plan file, an ADR, a commit message, or a session summary. The trigger is a
+finding the session is not fixing that reaches users of the shipped product. The
+session had to raise it with the question tool, and a sound reason for the
+non-goal does not make the note sufficient. Flag against ADR 0239 and
+`RAISE_USER_REACHING_FINDINGS_RULE`; a finding the diff also fixes, or a loud
+harmless out-of-scope note, is not this.
+
 Cleanup and altitude candidates use the same `file`/`line`/`summary` shape; in
 `failure_scenario`, state the concrete cost (what is duplicated, wasted, or
 harder to maintain) instead of a crash. **Correctness bugs always outrank

@@ -74,13 +74,18 @@ html {
        app's lucidos.ui.previewFile / confirm / prompt / toast rendered behind
        the app and the reader's click looked like it did nothing. */
     --z-app-fullscreen: 2250;
-    /* Modal overlays must sit above the floating header chrome (2200) so the
-       dim backdrop actually covers it — otherwise header buttons punch
-       through, show tooltips on hover, and outside-click never lands on the
-       overlay. Same level as .ui-blocking-overlay (--z-control-panel + 100). */
+    /* The FLOOR of the modal band, not a single level. Each open modal adds its
+       overlay-stack depth to this (see store/overlayStack.ts), so the one the
+       reader opened last is the one drawn on top: a confirm raised BY a modal
+       has to cover the modal that asked. The band tops out at
+       --z-modal + MAX_MODAL_STACK_DEPTH, and .ui-blocking-overlay sits above
+       all of it at --z-modal + 50.
+       The floor is above the floating header chrome (2200) so the dim backdrop
+       covers it. Otherwise header buttons punch through, show tooltips on
+       hover, and outside-click never lands on the overlay. */
     --z-modal: 2300;
-    /* Toasts sit above --z-modal and .ui-blocking-overlay (both at 2300) so they
-       remain visible over any open modal. */
+    /* Toasts sit above the whole modal band and above .ui-blocking-overlay, so
+       they remain visible over any open modal and during a client refresh. */
     --z-toast: 2400;
     /* NOTE: the boot splash sits above all of the above (z-index 2500), but it is
        inlined in index.html (it must paint before this bundle's CSS loads), so it

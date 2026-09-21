@@ -70,6 +70,28 @@ export function topPanelOverlay(): OverlayEntry | null {
   return null;
 }
 
+/** The tallest modal band `--z-modal` reserves, as an offset over it.
+ *
+ *  `.ui-blocking-overlay` sits at `calc(var(--z-modal) + 50)`, so an uncapped
+ *  band would climb through the blocker that exists to cover it.
+ *  `components/shared/__tests__/ui-blocking-overlay-z-index.test.ts` pins the
+ *  two against each other. */
+export const MAX_MODAL_STACK_DEPTH = 49;
+
+/** How far up the modal band `id` paints, as an offset over `--z-modal`.
+ *
+ *  Paint order has to agree with this stack, which already decides who takes
+ *  Escape and who answers a pointer. Why, and what went wrong when it did not:
+ *  `docs/adr/0237-overlay-and-toast-paint-order.md`.
+ *
+ *  An id the stack has not seen is one `Overlay` is about to push on top:
+ *  `pushOverlay` runs a render later, in a layout effect. Answering the floor
+ *  for it would paint a first frame under the modal it just opened over. */
+export function overlayStackDepth(stack: readonly OverlayEntry[], id: string): number {
+  const i = stack.findIndex((e) => e.id === id);
+  return Math.min(i === -1 ? stack.length : i, MAX_MODAL_STACK_DEPTH);
+}
+
 /** Dismiss the top overlay. Returns true iff one was present and dismissed. */
 export function dismissTopOverlay(): boolean {
   const top = topOverlay();

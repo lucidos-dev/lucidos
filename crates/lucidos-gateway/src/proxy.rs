@@ -15,6 +15,8 @@
 //! gateway doesn't forward framing headers that conflict with hyper's own
 //! connection management.
 
+use std::borrow::Cow;
+
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -176,9 +178,35 @@ pub fn strip_prefix<'a>(path_and_query: &'a str, slug: &str) -> Option<&'a str> 
     }
 }
 
+/// Drop a `/~cap/<token>` segment, leaving the path the engine knows.
+///
+/// A frame capability is addressing, not authorization, by the time it reaches
+/// here: [`crate::auth_api::frame_capability_admits`] already decided. So the
+/// segment comes off whether it verified or not. A paired device reaches the
+/// same file without one, and the engine's URL space stays exactly what a
+/// direct-to-engine caller sees (ADR 0238).
+///
+/// **The split happens on the PATH, and the query is re-attached.** The gate
+/// reads `uri.path()`, so cutting a path-and-query here would let a `/` inside
+/// the query move the cut. The two would then disagree about what was verified
+/// and what is fetched, which is the invariant the whole design rests on.
+fn strip_frame_capability(path_and_query: &str) -> Cow<'_, str> {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    };
+    let Some((_, stripped)) = lucidos_frame_capability::split(path) else {
+        return Cow::Borrowed(path_and_query);
+    };
+    match query {
+        Some(query) => Cow::Owned(format!("{stripped}?{query}")),
+        None => Cow::Borrowed(stripped),
+    }
+}
+
 /// Proxy `req` to `target_base` (e.g. `http://127.0.0.1:51811`), stripping the
-/// `/<slug>` prefix and adding `X-Forwarded-Prefix: /<slug>/`. `target_base` has
-/// no trailing slash.
+/// `/<slug>` prefix and any frame capability, and adding
+/// `X-Forwarded-Prefix: /<slug>/`. `target_base` has no trailing slash.
 pub async fn proxy(
     client: &Client,
     target_base: &str,
@@ -203,6 +231,8 @@ pub async fn proxy(
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
+    let rest = strip_frame_capability(rest);
+    let rest = rest.as_ref();
 
     if is_websocket_upgrade(&req) {
         return proxy_upgrade(target_base, rest, slug, local_token, req).await;
@@ -1174,6 +1204,67 @@ mod proxy_tests {
         assert!(
             got.contains("accept-language"),
             "other request headers must pass through; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_frame_capability_segment_never_reaches_the_engine() {
+        // The engine's URL space stays what a direct-to-engine caller sees. By
+        // the time a request gets here the pass is addressing rather than
+        // authorization (ADR 0238). So it comes off, and the query rides on.
+        let (port, captured) = capturing_upstream().await;
+        let resp = proxy(
+            &build_client(),
+            &format!("http://127.0.0.1:{port}"),
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            request(
+                "GET",
+                "/dev/~cap/6a0b~site-publisher~00/app/x/s.css?v=2",
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.clone();
+        assert!(
+            got.starts_with("GET /app/x/s.css?v=2 "),
+            "the capability must be stripped and the query kept; upstream saw:\n{got}"
+        );
+        assert!(
+            !got.contains("~cap"),
+            "no trace of the pass may reach the engine; upstream saw:\n{got}"
+        );
+    }
+
+    #[test]
+    fn stripping_a_capability_leaves_an_ordinary_path_alone() {
+        for path in [
+            "/api/v1/sdk.js",
+            "/data/artifacts/x.png?t=1",
+            "/~cap",
+            "/~cap/tok",
+            "/",
+        ] {
+            assert_eq!(strip_frame_capability(path), path, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_capability_is_cut_out_of_the_path_and_never_out_of_the_query() {
+        // The gate reads `uri.path()`, so a `/` inside the query must not move
+        // the cut. Otherwise the verified path and the fetched path are two
+        // different strings, which is the invariant this design rests on.
+        assert_eq!(
+            strip_frame_capability("/~cap/tok/data/x.png?to=/a/b"),
+            "/data/x.png?to=/a/b"
+        );
+        // No slash after the token, so the path carries no capability at all.
+        // The query's slashes must not supply one.
+        assert_eq!(
+            strip_frame_capability("/~cap/tok?x=/y/data/z"),
+            "/~cap/tok?x=/y/data/z"
         );
     }
 

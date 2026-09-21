@@ -165,4 +165,38 @@ describe('buildAppLocalUrl', () => {
       ),
     ).toBe(`${BASE}/app/habit-tracker/icon.png?thread_id=abc`);
   });
+
+  describe('the frame capability (ADR 0238)', () => {
+    const CARRIER = '/~cap/6a0b~habit-tracker~00ff';
+
+    it('sits between the workspace prefix and /app/, which is where the gateway reads it', () => {
+      expect(
+        buildAppLocalUrl(
+          'apps/habit-tracker/icon.png',
+          '/dev/app/habit-tracker/',
+          '',
+          '/dev',
+          CARRIER,
+        ),
+      ).toBe(`/dev${CARRIER}/app/habit-tracker/icon.png`);
+    });
+
+    it('rides beside the WIP-preview thread_id rather than instead of it', () => {
+      expect(
+        buildAppLocalUrl(
+          'apps/habit-tracker/icon.png',
+          '/dev/app/habit-tracker/',
+          '?thread_id=abc',
+          '/dev',
+          CARRIER,
+        ),
+      ).toBe(`/dev${CARRIER}/app/habit-tracker/icon.png?thread_id=abc`);
+    });
+
+    it('is absent direct to an engine, where there is no gate to pass', () => {
+      expect(
+        buildAppLocalUrl('apps/habit-tracker/icon.png', '/app/habit-tracker/', '', BASE, ''),
+      ).toBe(`${BASE}/app/habit-tracker/icon.png`);
+    });
+  });
 });
