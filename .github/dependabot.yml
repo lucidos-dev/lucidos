@@ -20,8 +20,10 @@ updates:
       #
       # The advisory affects ">= 0.15.0, < 0.20.0", so the lowest non-vulnerable
       # version is 0.20.0, and this tree cannot reach it: tauri 2.11.4 -> tao
-      # 0.35.3 -> gtk 0.18.2 -> glib 0.18.5, and gtk3-rs has never moved past glib
-      # 0.18. Every attempt therefore ends in
+      # 0.35.3 / wry 0.55.1 -> gtk 0.18.2 -> glib 0.18.5. The blocker is Tauri's
+      # Linux stack, not gtk3-rs. gtk 0.19.0 does take glib ^0.22, but tao, wry
+      # and webkit2gtk 2.0.2 all still require gtk ^0.18, wry as of its latest
+      # release 0.57.0. Every attempt therefore ends in
       #
       #   security_update_not_possible
       #   { "latest-resolvable-version": "0.18.5",
@@ -37,11 +39,12 @@ updates:
       # below it is left alone. So a future advisory whose fix lands inside the
       # resolvable 0.18.x range still alerts and still gets a pull request.
       #
-      # Revisit when the gtk/tauri chain moves. Once tao/gtk depend on glib >= 0.20,
-      # delete this entry and let the update run. Nothing reopens it on its own:
-      # "the tree can now resolve 0.20" is not a condition this schema can express,
-      # and an upper bound here would only re-raise the same impossible upgrade the
-      # next time glib cuts a release.
+      # Why the chain is stuck, why mirror alert 12 is dismissed as `not_used`,
+      # and what has to be true to delete this entry: see
+      # docs/temporary-measures.md, "glib held at 0.18 by the Tauri Linux stack".
+      # Nothing reopens this on its own: "the tree can now resolve 0.20" is not a
+      # condition this schema can express, and an upper bound here would only
+      # re-raise the same impossible upgrade the next time glib cuts a release.
       - dependency-name: "glib"
         versions:
           - ">= 0.20.0"

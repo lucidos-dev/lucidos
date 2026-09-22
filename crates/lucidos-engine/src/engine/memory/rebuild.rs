@@ -4,7 +4,8 @@
 //! helpers in `super::extract` in bulk.
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
-use crate::engine::LucidosEngine;
+use crate::engine::{AuxCapture, LucidosEngine};
+use crate::llm::provider::LlmProvider;
 use crate::llm::{Message, MessageContent};
 use crate::memory::{
     cosine_similarity, EmbeddingProvider, MemoryEntry, MemorySource, PgVectorIndex,
@@ -14,46 +15,85 @@ use uuid::Uuid;
 
 use super::scoring::MEMORY_CORRECTION_THRESHOLD;
 
-impl LucidosEngine {
-    /// Generate a summary for an artifact using the LLM
-    pub(crate) async fn summarize_artifact(&self, path: &str, content: &str) -> Option<String> {
-        // Skip very small files
-        if content.len() < 50 {
-            return Some(format!("Small file: {}", path));
-        }
+/// Summarise one artifact on an arbitrary provider, recording what it cost.
+///
+/// A free function so a stubbed provider drives it offline, which resolving
+/// the engine's own provider would not allow. A file too small to be worth a
+/// model call returns its one-line stand-in and spends nothing.
+pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
+    provider: &P,
+    path: &str,
+    content: &str,
+    capture: Option<&AuxCapture>,
+) -> Option<String> {
+    if content.len() < 50 {
+        return Some(format!("Small file: {}", path));
+    }
 
-        // Truncate very large content for summarization
-        let content_for_summary: String = if content.len() > 4000 {
-            format!(
-                "{}...\n[truncated, {} total chars]",
-                content.chars().take(3500).collect::<String>(),
-                content.len()
-            )
-        } else {
-            content.to_string()
-        };
+    // Truncate very large content for summarization
+    let content_for_summary: String = if content.len() > 4000 {
+        format!(
+            "{}...\n[truncated, {} total chars]",
+            content.chars().take(3500).collect::<String>(),
+            content.len()
+        )
+    } else {
+        content.to_string()
+    };
 
-        let prompt = format!(
-            "Summarize this file in 1-2 sentences. Focus on what it contains and its purpose.\n\nFile: {}\n\nContent:\n{}",
-            path, content_for_summary
-        );
+    let prompt = format!(
+        "Summarize this file in 1-2 sentences. Focus on what it contains and its purpose.\n\nFile: {}\n\nContent:\n{}",
+        path, content_for_summary
+    );
+    let request_chars = prompt.chars().count();
 
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(prompt),
-        }];
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: MessageContent::Text(prompt),
+    }];
 
-        match self
-            .current_provider()
-            .chat(messages, vec![], None, None, None, None)
-            .await
-        {
-            Ok(response) => response.content,
-            Err(e) => {
-                log!("[Memory] Failed to generate summary for {}: {}", path, e);
-                None
+    match provider
+        .chat(messages, vec![], None, None, None, None)
+        .await
+    {
+        Ok(response) => {
+            if let Some(capture) = capture {
+                capture
+                    .record(provider.default_model(), request_chars, &response)
+                    .await;
             }
+            response.content
         }
+        Err(e) => {
+            log!("[Memory] Failed to generate summary for {}: {}", path, e);
+            None
+        }
+    }
+}
+
+impl LucidosEngine {
+    /// Generate a summary for an artifact using the LLM.
+    ///
+    /// `thread_id` anchors the capture. The only caller is the `import_file`
+    /// tool, which runs inside a turn and holds one.
+    pub(crate) async fn summarize_artifact(
+        &self,
+        path: &str,
+        content: &str,
+        thread_id: Uuid,
+    ) -> Option<String> {
+        let capture = AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::ArtifactSummary,
+        );
+        summarize_on(
+            self.current_provider().as_ref(),
+            path,
+            content,
+            Some(&capture),
+        )
+        .await
     }
 
     /// Rebuild memory entries from event store and artifact history.
@@ -666,6 +706,73 @@ async fn correction_candidates(index: &PgVectorIndex, search_query: &str) -> Vec
         }
     }
     candidates
+}
+
+#[cfg(test)]
+mod summary_capture_tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+
+    const SUMMARY_MODEL: &str = "claude-opus-4-5";
+
+    /// One import, one model call, one row. The call runs on the agent's own
+    /// chat model, so an import of a long document is real money.
+    #[tokio::test]
+    async fn an_artifact_summary_records_what_it_cost() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::ArtifactSummary,
+        );
+
+        let provider = ScriptedProvider::new(SUMMARY_MODEL, vec!["A quarterly sales report."]);
+        let summary = summarize_on(
+            &provider,
+            "artifacts/projects/reports/q4.md",
+            &"sales figures, one per region. ".repeat(20),
+            Some(&capture),
+        )
+        .await;
+        assert_eq!(summary.as_deref(), Some("A quarterly sales report."));
+
+        let captures = aux_captures(&pool, thread_id, "artifact_summary").await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(captures[0]["model"], SUMMARY_MODEL);
+        assert_eq!(captures[0]["usage"]["input_tokens"], 210);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A file under the size floor never reaches a provider, so it must leave
+    /// no row. A row with no call behind it is as wrong as a call with no row.
+    #[tokio::test]
+    async fn a_file_too_small_to_summarise_records_nothing() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::ArtifactSummary,
+        );
+
+        // No scripted reply: reaching the provider at all would fail the call.
+        let provider = ScriptedProvider::new(SUMMARY_MODEL, vec![]);
+        let summary = summarize_on(&provider, "notes.md", "too short", Some(&capture)).await;
+        assert!(summary.is_some_and(|s| s.starts_with("Small file:")));
+        assert!(aux_captures(&pool, thread_id, "artifact_summary")
+            .await
+            .is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
 }
 
 #[cfg(test)]

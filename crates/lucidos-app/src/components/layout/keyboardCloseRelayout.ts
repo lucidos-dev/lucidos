@@ -54,19 +54,27 @@ export type CoverWatch = number | null;
  *  PREVIOUS reading would see 820 before 852 and call that no keyboard at all.
  *  The close this exists for would then be lost.
  *
+ *  `covered` is the opposite edge, and a stamp is retired on it. A stale close
+ *  described a keyboard that had come back up, and the ledger line naming it
+ *  read the opposite of the viewport beside it.
+ *
  *  Pure, so the whole sequence tests without a DOM. */
 export function foldViewportReading(
   watch: CoverWatch,
   sample: ViewportSample,
-): { watch: CoverWatch; closed: boolean } {
+): { watch: CoverWatch; closed: boolean; covered: boolean } {
   const full = sample.layoutViewport;
   if (!Number.isFinite(full) || full <= 0 || !Number.isFinite(sample.height)) {
-    return { watch, closed: false };
+    return { watch, closed: false, covered: false };
   }
   const live = watch === full ? watch : null;
-  if (sample.height <= full - KEYBOARD_COVER_MIN_PX) return { watch: full, closed: false };
-  if (sample.height < full - RESTORED_SLACK_PX) return { watch: live, closed: false };
-  return { watch: null, closed: live !== null };
+  if (sample.height <= full - KEYBOARD_COVER_MIN_PX) {
+    return { watch: full, closed: false, covered: true };
+  }
+  if (sample.height < full - RESTORED_SLACK_PX) {
+    return { watch: live, closed: false, covered: false };
+  }
+  return { watch: null, closed: live !== null, covered: false };
 }
 
 /** The height to relayout the shell at before putting it back.
@@ -135,9 +143,34 @@ let watch: CoverWatch = null;
 let closedAt: number | null = null;
 let closeRelaidOut = false;
 let closes = 0;
+let closePath: ClosePath | null = null;
+
+/** How long a covered reading after a wake is taken for a stale echo.
+ *
+ *  iOS leaves `visualViewport.height` pinned at the shrunk value for a moment
+ *  after a resume, and corrects it on a delayed resize. Folding that echo would
+ *  arm a second close on the correction.
+ *
+ *  BOUNDED, and the bound is the whole point. An unbounded suppression clears
+ *  only on a reading it accepts. A keyboard the user genuinely reopens is then
+ *  swallowed, and its real close is lost.
+ *
+ *  SHORT, because the interval it has to cover is short. It is the resume to
+ *  the correcting resize, which lands in well under a second. It is NOT the
+ *  resume to the next dismissal, which can be minutes. A tap that reopens the
+ *  keys inside the window still loses its close, so every millisecond here is
+ *  hole. Erring long loses a close, and erring short over-counts one at the
+ *  cost of a spare invisible relayout. */
+const WAKE_ECHO_MS = 600;
+let wakeEchoUntil = 0;
+
+/** Which path saw a close. Defined in `docs/glossary.md` § Close path. */
+export type ClosePath = 'resize' | 'wake' | 'poll';
 
 export interface KeyboardCloseState {
-  /** When the last close was seen, or null if none has been. */
+  /** When the last close was seen, or null if none has been. Null again once
+   *  the keyboard comes back up, so a silence verdict cannot cite a close the
+   *  viewport has already contradicted. */
   at: number | null;
   /** Whether that close's own relayout ran. False says `--app-height` was not
    *  ours to write at that moment, which rules the recovery out rather than
@@ -146,10 +179,38 @@ export interface KeyboardCloseState {
   /** Closes seen since the page loaded. A running total, so a reader can count
    *  the ones inside any stretch by subtracting the two ends. */
   closes: number;
+  /** Which path saw the last close. See `ClosePath`. */
+  path: ClosePath | null;
 }
 
 export function keyboardCloseState(): KeyboardCloseState {
-  return { at: closedAt, relaidOut: closeRelaidOut, closes };
+  return { at: closedAt, relaidOut: closeRelaidOut, closes, path: closePath };
+}
+
+/** Stamp a close and spend its relayout. The one place any path lands. */
+function recordClose(path: ClosePath, now: number): void {
+  closedAt = now;
+  closePath = path;
+  closes += 1;
+  closeRelaidOut = relayoutShell();
+}
+
+/** Drop a stamp the keyboard has outlived. `closes` is a total and stays. */
+function retireClose(): void {
+  closedAt = null;
+  closeRelaidOut = false;
+  closePath = null;
+}
+
+/** Fold one reading from whichever path took it. */
+function takeReading(sample: ViewportSample, path: ClosePath, now: number): void {
+  const folded = foldViewportReading(watch, sample);
+  // See `WAKE_ECHO_MS`. Dropped rather than folded, so the echo cannot arm a
+  // watch and turn its own correction into a second close.
+  if (folded.covered && now < wakeEchoUntil) return;
+  watch = folded.watch;
+  if (folded.covered) retireClose();
+  if (folded.closed) recordClose(path, now);
 }
 
 /** Take a viewport reading, and relayout when it restored a covered viewport.
@@ -159,12 +220,65 @@ export function keyboardCloseState(): KeyboardCloseState {
  *  a call rather than a second listener. The property keeps one owner, and the
  *  bounce starts from the height the owner just settled on. */
 export function noteViewportResize(sample: ViewportSample, now = Date.now()): void {
-  const folded = foldViewportReading(watch, sample);
-  watch = folded.watch;
-  if (!folded.closed) return;
-  closedAt = now;
-  closes += 1;
-  closeRelaidOut = relayoutShell();
+  takeReading(sample, 'resize', now);
+}
+
+/** A reading nobody asked for, taken on a timer.
+ *
+ *  The backstop for a close no event announced. A wedged page keeps its timers
+ *  while it takes no touch, which is what makes a reading possible where an
+ *  event is not. Same contract as `noteViewportResize`: the caller settles
+ *  `--app-height` first, so the bounce starts from the height it just wrote. */
+export function notePolledViewport(sample: ViewportSample, now = Date.now()): void {
+  takeReading(sample, 'poll', now);
+}
+
+/** Open a resume's echo window, and say whether this call is a twin to skip.
+ *
+ *  A twin needs BOTH an open window and a close already standing. The corrected
+ *  half reports only an edge it observed, so it finds nothing when no cover was
+ *  armed. That is the wedge case: no resize ever fired, so no cover exists. The
+ *  pinned half must still land its close there, and the stamp test is what lets
+ *  it.
+ *
+ *  BOTH halves of the wake go through here, and the ordering is why. One resume
+ *  fires `visibilitychange` AND `pageshow`, so the caller runs twice, and iOS
+ *  can hand the two events different viewports. A window only the pinned half
+ *  opened leaves corrected-then-pinned unguarded, which is two closes for one
+ *  resume.
+ *
+ *  Scoped to THAT PAIR, and no wider. The two land milliseconds apart, so the
+ *  window bounds them. A guard on the outstanding stamp alone swallows every
+ *  later resume too. The wedge this answers is the state where no reading
+ *  arrives to retire a stamp, so one can stand indefinitely. */
+function openWakeWindow(now: number): boolean {
+  const paired = now < wakeEchoUntil;
+  wakeEchoUntil = now + WAKE_ECHO_MS;
+  return paired && closedAt !== null;
+}
+
+/** A resume whose viewport came back already corrected.
+ *
+ *  The other half of the wake, and it needs no verdict: the restored reading IS
+ *  the edge the fold has waited for since the keys went up. Only the pinned
+ *  half below has none to offer.
+ *
+ *  Its own path, so the ledger says a wake caught it either way. */
+export function noteWakeViewport(sample: ViewportSample, now = Date.now()): void {
+  if (openWakeWindow(now)) return;
+  takeReading(sample, 'wake', now);
+}
+
+/** The keys went and no resize said so.
+ *
+ *  For the wake path, which restores the shell itself. iOS dismisses the
+ *  keyboard across a suspend and fires no resize, so the fold never sees the
+ *  edge and the recovery never runs. The caller has already ruled the keys
+ *  gone, so this takes its word rather than a viewport reading. */
+export function noteKeyboardClosed(now = Date.now()): void {
+  if (openWakeWindow(now)) return;
+  watch = null;
+  recordClose('wake', now);
 }
 
 /** Forget every reading, so one test's transition cannot reach the next. */
@@ -173,4 +287,6 @@ export function resetKeyboardCloseState(): void {
   closedAt = null;
   closeRelaidOut = false;
   closes = 0;
+  closePath = null;
+  wakeEchoUntil = 0;
 }

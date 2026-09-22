@@ -22,8 +22,12 @@
 //! link on stdout — the engine renders this as a clickable thread link when a
 //! coding-agent subprocess includes it in its response.
 //!
-//! `--folder <path>` targets a folder instead of a repo: with `--cc`,
-//! `--codex`, or `--coding-agent`, a `data/apps/<id>` value spawns an
+//! `--reasoning-effort <level>` pins the coding agent's thinking level for this
+//! spawn only, overriding whatever default the backend would otherwise read.
+//! It needs a coding-agent flag, and takes one of [`EFFORT_LEVELS`].
+//!
+//! `--folder <path>` targets a folder instead of a repo: with `--coding-agent`,
+//! `--codex`, or `--cc`, a `data/apps/<id>` value spawns an
 //! *app coding-agent thread* — the engine
 //! resolves the `folder` body field through the same `coding_agent_kind`
 //! pipeline `run_coding_agent(folder=…)` uses (sparse-checkout worktree of the app
@@ -36,6 +40,56 @@ use std::path::PathBuf;
 
 use crate::workspace::{read_ports, BoxError};
 use crate::{CliRelation, SpawnThreadArgs};
+
+/// Reasoning levels `--reasoning-effort` accepts, ascending.
+///
+/// Both coding-agent backends offer exactly these five, so the flag is
+/// backend-neutral. The chat ladder's `none` is deliberately absent: neither
+/// backend menu has it.
+///
+/// This crate cannot call the engine's `is_valid_effort`, so
+/// `effort_levels_match_the_backend_menus` pins the list against the two menu
+/// files that validator reads.
+pub(crate) const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The two picker menus the engine validates a coding-agent effort against.
+/// Baked in at compile time, so the CLI needs no path lookup at runtime.
+const CC_MENU: &str = include_str!("../../lucidos-engine/src/runtime/cc_menu_options.json");
+const CODEX_MENU: &str = include_str!("../../lucidos-engine/src/runtime/codex_menu_options.json");
+
+/// The `reasoning_efforts` rows of one menu file.
+///
+/// Empty on a malformed file, which reads downstream as "no restriction". That
+/// direction is deliberate: the engine still drops a level its model rejects,
+/// so a broken parse costs a refusal the CLI could have made, never a wrong
+/// refusal. `effort_levels_match_the_backend_menus` fails if either file stops
+/// parsing, so the empty case cannot reach a release.
+fn effort_rows(menu: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(menu)
+        .ok()
+        .and_then(|parsed| parsed["reasoning_efforts"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// The models `effort` is restricted to, or `None` when every model offers it.
+///
+/// Read by the same rule the engine's `validate_codex_effort` applies to these
+/// same rows. That function DROPS a level the model does not offer, rather than
+/// refusing, because an unsupported value kills a Codex turn outright. The
+/// session still records the level that was asked for, so the picker shows a
+/// tier the backend never ran. Refusing here is what keeps the two honest.
+fn models_offering(menu: &str, effort: &str) -> Option<Vec<String>> {
+    let row = effort_rows(menu)
+        .into_iter()
+        .find(|row| row["value"] == effort)?;
+    let allowed = row["supported_models"].as_array()?;
+    Some(
+        allowed
+            .iter()
+            .filter_map(|m| m.as_str().map(str::to_string))
+            .collect(),
+    )
+}
 
 pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let selected_coding_agent = if args.codex {
@@ -50,8 +104,24 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     // already rejects `--folder` together with `--repo`.
     if args.folder.is_some() && !use_coding_agent {
         return Err(
-            "--folder requires --cc, --codex, or --coding-agent (folder targeting only applies to coding-agent threads)".into(),
+            "--folder requires --coding-agent, --codex, or --cc (folder targeting only applies to coding-agent threads)".into(),
         );
+    }
+
+    // A chat thread's effort comes off a different ladder, which has a `none`
+    // tier these five levels do not. So the flag would mean something else.
+    if args.reasoning_effort.is_some() && !use_coding_agent {
+        return Err(
+            "--reasoning-effort requires --coding-agent, --codex, or --cc (a chat thread's reasoning level is not set here)".into(),
+        );
+    }
+
+    if let Some(effort) = args.reasoning_effort.as_deref() {
+        check_effort_fits_model(
+            selected_coding_agent,
+            args.coding_agent_model.as_deref(),
+            effort,
+        )?;
     }
 
     let target_root = resolve_target(&args.to)?;
@@ -130,11 +200,17 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     if let Some(agent) = selected_coding_agent {
         obj.insert("coding_agent".into(), agent.as_wire().into());
     }
-    if let Some(m) = args.cc_model {
+    if let Some(m) = args.coding_agent_model {
         obj.insert("cc_model".into(), m.into());
     }
     if let Some(m) = args.model {
         obj.insert("model".into(), m.into());
+    }
+    // Pins this spawn's reasoning level, ahead of the backend's own default.
+    // The engine resolves the payload value first (`run_direct_agent`), then
+    // hands it to the subprocess as `CLAUDE_CODE_EFFORT_LEVEL`.
+    if let Some(e) = args.reasoning_effort {
+        obj.insert("reasoning_effort".into(), e.into());
     }
     if let Some(r) = repo {
         obj.insert("repo_id".into(), r.into());
@@ -208,6 +284,42 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let label = link_label(args.title.as_deref(), &args.message);
     println!("[{}](thread:{}/{})", label, target_basename, thread_id);
     Ok(())
+}
+
+/// Refuse a level the spawn cannot actually run at.
+///
+/// Only the backend's own menu decides. Claude Code restricts no level, so this
+/// only ever fires for Codex, whose `max` names three models.
+///
+/// An UNNAMED model is refused too, which is the non-obvious half. The engine
+/// tests the restriction with `model.is_some_and(...)`. So a restricted level
+/// with no model is dropped before Codex is consulted, whatever that config
+/// would have picked. Sending it gains nothing.
+fn check_effort_fits_model(
+    agent: Option<crate::CliCodingAgent>,
+    model: Option<&str>,
+    effort: &str,
+) -> Result<(), BoxError> {
+    let menu = match agent {
+        Some(crate::CliCodingAgent::Codex) => CODEX_MENU,
+        _ => CC_MENU,
+    };
+    let Some(allowed) = models_offering(menu, effort) else {
+        return Ok(());
+    };
+    // Empty and the `default` sentinel both mean "let the backend config pick",
+    // and neither can match a name in the list.
+    let named = model.filter(|m| !m.is_empty() && *m != "default");
+    if named.is_some_and(|m| allowed.iter().any(|a| a == m)) {
+        return Ok(());
+    }
+    Err(format!(
+        "--reasoning-effort {} runs only on: {}. Pass --coding-agent-model with one of them; \
+         on any other model the backend drops the level and runs at its own default.",
+        effort,
+        allowed.join(", ")
+    )
+    .into())
 }
 
 /// Pick the markdown link label: the explicit title if given, otherwise the
@@ -294,9 +406,127 @@ fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{link_label, workspaces_root};
+    use super::{
+        check_effort_fits_model, effort_rows, link_label, models_offering, workspaces_root,
+        CC_MENU, CODEX_MENU, EFFORT_LEVELS,
+    };
+    use crate::CliCodingAgent;
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    fn menu_levels(menu: &str) -> BTreeSet<String> {
+        let rows = effort_rows(menu);
+        assert!(!rows.is_empty(), "menu file must parse and declare rows");
+        rows.iter()
+            .map(|e| {
+                e["value"]
+                    .as_str()
+                    .expect("every effort row has a value")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The flag must accept exactly what both backends offer.
+    ///
+    /// The engine's `is_valid_effort` reads these same files, and this crate
+    /// cannot call it. Drift either way is a real bug. A level the flag refuses
+    /// is unreachable from the CLI. One it accepts but no menu has reaches the
+    /// subprocess as an env var nothing honours.
+    ///
+    /// If the two backends ever diverge, this fails rather than silently taking
+    /// a union. Make the flag backend-aware at that point.
+    #[test]
+    fn effort_levels_match_the_backend_menus() {
+        let ours: BTreeSet<String> = EFFORT_LEVELS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            menu_levels(CC_MENU),
+            ours,
+            "cc_menu_options.json moved: update EFFORT_LEVELS"
+        );
+        assert_eq!(
+            menu_levels(CODEX_MENU),
+            ours,
+            "codex_menu_options.json moved: update EFFORT_LEVELS"
+        );
+    }
+
+    /// The restriction the refusal is built on. Codex names three models for
+    /// `max`; every other level, and every Claude Code level, is universal.
+    ///
+    /// `system-knowhow/lucidos-cli.md` tells the reader exactly this, so a menu
+    /// that restricts a second level has to fail here rather than silently make
+    /// that page wrong.
+    #[test]
+    fn only_codex_max_names_the_models_that_offer_it() {
+        let codex_max = models_offering(CODEX_MENU, "max").expect("codex max names its models");
+        assert!(
+            codex_max.iter().all(|m| m.starts_with("gpt-5.6")),
+            "unexpected models for codex max: {:?}",
+            codex_max
+        );
+        for level in EFFORT_LEVELS.iter().filter(|l| **l != "max") {
+            assert_eq!(
+                models_offering(CODEX_MENU, level),
+                None,
+                "only Codex `max` is restricted, so {} must stay universal",
+                level
+            );
+        }
+        for level in EFFORT_LEVELS {
+            assert_eq!(
+                models_offering(CC_MENU, level),
+                None,
+                "Claude Code restricts no level, so {} must stay universal",
+                level
+            );
+        }
+    }
+
+    /// The engine drops a level the model rejects, and the session still
+    /// records the level asked for. So a pin the CLI knows cannot hold is
+    /// refused here, where the message can name the models that do offer it.
+    #[test]
+    fn an_effort_the_named_codex_model_lacks_is_refused() {
+        let err = check_effort_fits_model(Some(CliCodingAgent::Codex), Some("gpt-5.5"), "max")
+            .expect_err("gpt-5.5 does not offer max");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gpt-5.6-sol"),
+            "names a model that fits: {msg}"
+        );
+    }
+
+    /// A model that does offer the level, and every Claude Code pairing, pass.
+    #[test]
+    fn a_supported_pairing_is_accepted() {
+        assert!(
+            check_effort_fits_model(Some(CliCodingAgent::Codex), Some("gpt-5.6-sol"), "max")
+                .is_ok()
+        );
+        assert!(
+            check_effort_fits_model(Some(CliCodingAgent::ClaudeCode), Some("opus"), "max").is_ok()
+        );
+        assert!(check_effort_fits_model(None, Some("opus"), "max").is_ok());
+        assert!(check_effort_fits_model(Some(CliCodingAgent::Codex), None, "high").is_ok());
+    }
+
+    /// The engine tests a restricted level with `model.is_some_and(...)`, so an
+    /// unnamed model drops it before Codex is consulted. Whatever that config
+    /// would have picked never gets a say, so the CLI refuses rather than
+    /// letting a pin through that provably cannot hold.
+    #[test]
+    fn a_restricted_level_needs_a_named_model() {
+        for model in [None, Some(""), Some("default")] {
+            let err = check_effort_fits_model(Some(CliCodingAgent::Codex), model, "max")
+                .expect_err("codex max always drops without a named model");
+            assert!(
+                err.to_string().contains("--coding-agent-model"),
+                "must say what to pass: {model:?}"
+            );
+        }
+    }
 
     fn os(s: &str) -> OsString {
         OsString::from(s)

@@ -63,6 +63,19 @@ impl LucidosEngine {
         request_id: Uuid,
         thread_id: Uuid,
         response_channel: Option<crate::engine::thread_events::EventChannel>,
+        // Whether somebody is at the other end of this turn who could answer a
+        // question card. Read only by the prose-question nudge. A trigger run
+        // is the one case with nobody waiting.
+        //
+        // Deliberately NOT re-derived here from `response_channel`. That field
+        // is `Some(Trigger)` for a trigger and `None` for a chat turn, never
+        // `Some(Chat)`. A plausible-looking `== Some(Chat)` test therefore
+        // leaves this whole nudge dead for the turns it exists for.
+        //
+        // A live call is deliberately NOT a second case. ADR 0149 says the doer
+        // is never told a voice session is live. A card raised on a call is
+        // already read out with its options, for the caller to answer.
+        human_can_answer: bool,
         mut message_budget: usize,
         extraction_ctx: &str,
         // `(description, model)` — the model name is needed so the
@@ -198,6 +211,11 @@ impl LucidosEngine {
         // degrade into a prose typed-reply menu. `forced` bounds it per response.
         let mut question_ask_failed_last_iter = false;
         let mut question_reask_forced = 0usize;
+        // The same guard for the wider case: the model never reached the tool
+        // and just ended its reply on a question. Its own counter, because
+        // `MAX_PROSE_QUESTION_NUDGE` allows one nudge where a broken call gets
+        // two.
+        let mut question_prose_nudges_forced = 0usize;
         // Wake check: how many times this turn has been sent back for leaving
         // todo work open with nothing that would re-open the thread. Bounded by
         // `MAX_TODO_WAKE_NUDGE`, so a model that answers and still walks away
@@ -1176,31 +1194,40 @@ impl LucidosEngine {
                 // classifier below. Requiring `Some(answer)` also keeps
                 // alternation valid: the assistant message is always pushed
                 // before the forcing user message, never a lone user-after-user.
-                //
-                // Two causes reach here, sharing one budget. A rejected call is
-                // the case above. The other is a tag the model typed as text
-                // whose body carried no dispatchable payload: no call was made
-                // at all, so the user would read the question as prose and get
-                // no card. Claude Code already redirects its own plaintext
-                // questions back to the tool, from the Stop hook in
-                // `cc_stop_reminder.rs`. This is the chat-side equivalent. It
-                // keys on the leaked tag rather than on a trailing `?`, which
-                // is the stronger signal the engine has and the hook does not.
-                let reask = question_reask_cause(
-                    question_ask_failed_last_iter,
-                    question_leaked_as_text,
-                    question_reask_forced,
-                )
-                .and_then(|cause| {
-                    response
-                        .content
-                        .as_deref()
-                        .map(|c| self.clean_response(c))
-                        .filter(|c| !c.is_empty())
-                        .map(|answer| (cause, answer))
+
+                // Three causes reach here, each meaning the user got no card.
+                // The two above are a rejected call and a tag typed as text.
+                // The third is the widest: the model simply ended its reply on
+                // a question. Claude Code has long redirected that one from its
+                // Stop hook in `cc_stop_reminder.rs`, and this is the chat-side
+                // equivalent. The measurement behind widening it is in
+                // `docs/plans/2026-09-22-a-prose-question-gets-a-card.md`.
+                let answer = response
+                    .content
+                    .as_deref()
+                    .map(|c| self.clean_response(c))
+                    .filter(|c| !c.is_empty());
+                let reask = answer.and_then(|answer| {
+                    question_reask_cause(QuestionReaskInputs {
+                        ask_failed_last_iter: question_ask_failed_last_iter,
+                        leaked_as_text: question_leaked_as_text,
+                        ends_in_a_question: reply_ends_in_a_question(&answer),
+                        human_can_answer,
+                        reask_forced: question_reask_forced,
+                        prose_nudges_forced: question_prose_nudges_forced,
+                    })
+                    .map(|cause| (cause, answer))
                 });
                 if let Some((cause, answer)) = reask {
-                    question_reask_forced += 1;
+                    // Each cause spends its own budget: the two broken-call
+                    // ones share `MAX_QUESTION_REASK`, the prose nudge has
+                    // `MAX_PROSE_QUESTION_NUDGE` to itself.
+                    match cause {
+                        QuestionReaskCause::AskedInProse => question_prose_nudges_forced += 1,
+                        QuestionReaskCause::CallRejected | QuestionReaskCause::LeakedAsText => {
+                            question_reask_forced += 1
+                        }
+                    }
                     // Mirror the injection-continue path's message handling.
                     // Preserve the drafted prose as assistant context so the
                     // model sees what it just said before re-asking.
@@ -1212,14 +1239,7 @@ impl LucidosEngine {
                         role: "user".to_string(),
                         content: MessageContent::Text(cause.instruction().to_string()),
                     });
-                    let reason = match cause {
-                        QuestionReaskCause::CallRejected => {
-                            "ask_user_question had no question text, forcing re-ask"
-                        }
-                        QuestionReaskCause::LeakedAsText => {
-                            "ask_user_question was typed as text, forcing re-ask"
-                        }
-                    };
+                    let reason = cause.retry_reason();
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {

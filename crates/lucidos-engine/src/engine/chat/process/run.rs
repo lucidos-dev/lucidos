@@ -1707,6 +1707,9 @@ impl LucidosEngine {
                 request_id,
                 thread_id,
                 response_channel,
+                // A trigger run has nobody waiting, so it is never sent back
+                // for a question card.
+                !is_trigger,
                 message_budget,
                 &extraction_ctx,
                 description_handle,

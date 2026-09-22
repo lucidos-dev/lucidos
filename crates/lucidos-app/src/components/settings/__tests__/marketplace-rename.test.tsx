@@ -15,6 +15,9 @@ const catalogOf = (name: string) => ({
   marketplaces: [marketplace(name)],
   plugins: [],
   errors: [],
+  scanned_at: '2026-09-22T10:00:00Z',
+  scanning: false,
+  scan_error: null,
 });
 
 const mockFetchPluginCatalog = vi.fn(async () => catalogOf('Example plugins'));

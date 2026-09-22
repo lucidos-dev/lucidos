@@ -11,8 +11,8 @@ use crate::engine::agent_session::spawn::{
 };
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
-    add_paths_to_worktree_exclude, catchup_with_main, install_coding_agent_diff_hook,
-    resolve_worktree_base, worktree_add, worktree_current_branch, BranchScope,
+    add_paths_to_worktree_exclude, install_coding_agent_diff_hook, resolve_worktree_base,
+    worktree_add, worktree_current_branch, BranchScope,
 };
 use crate::engine::LucidosEngine;
 use std::path::{Path, PathBuf};
@@ -577,35 +577,11 @@ impl LucidosEngine {
                 );
             }
 
-            // Resumed/reused worktrees may be behind main. Catch them up so they
-            // run the latest scripts/, configs, and source rather than stale
-            // copies that pre-date recent fixes. New worktrees branched from
-            // origin/main are already up to date and skip this.
-            // App spawns skip catchup — the workspace git has no `origin` by
-            // default, and catchup_with_main would noisily fail.
-            if !is_external_repo && !is_app_spawn && (reusing_branch || existing_worktree.is_some())
-            {
-                if let Err(e) = catchup_with_main(&wt_path).await {
-                    log!(
-                        "[AgentSession] catchup_with_main failed for {} ({}) -- worktree is behind main; surfacing to the session instead of running stale",
-                        wt_path.display(),
-                        e
-                    );
-                    // Don't SILENTLY run a stale worktree. `catchup_with_main`
-                    // aborted the merge (it can't auto-resolve conflicts), so
-                    // the branch is now behind main with conflicting changes —
-                    // the resumed session would otherwise build on pre-merge
-                    // scripts/config with no signal. Surface it via the
-                    // adoption note, which is injected into the session's next
-                    // prompt AND recorded in the timeline, so CC resolves the
-                    // merge with main before relying on shared tooling.
-                    let note = build_catchup_conflict_note(&e.to_string());
-                    adoption_note = Some(match adoption_note.take() {
-                        Some(existing) => format!("{existing}\n{note}"),
-                        None => note,
-                    });
-                }
-            }
+            // A reused worktree keeps exactly the tree its session left. The
+            // engine never merges `main` in here: `main` moves only at Apply,
+            // and Apply catches the branch up itself because a fast-forward
+            // needs `main` as an ancestor. See
+            // docs/adr/0241-session-spawn-does-not-merge-main.md.
 
             // Copy node_modules from main repo to worktree so frontend tests work.
             // Much faster than `npm ci` (~1-2s hardlink vs 2-10min install).
@@ -789,44 +765,5 @@ impl LucidosEngine {
             worktree_created,
             branch_created,
         })
-    }
-}
-
-/// Engine-injected resume note for when `catchup_with_main` aborted on a
-/// resumed/reused worktree because `main` advanced and the auto-merge hit
-/// conflicts. Prepended to the session's next prompt (and recorded in the
-/// timeline) so the worktree is never *silently* run stale — CC resolves the
-/// merge with `main` before relying on shared scripts/config. `err` is the
-/// underlying `catchup_with_main` error for context.
-fn build_catchup_conflict_note(err: &str) -> String {
-    format!(
-        "[Note from engine: `main` advanced while this thread was idle, and \
-         auto-merging it into your worktree's branch hit conflicts ({err}). \
-         Your worktree is now BEHIND main — its scripts/, configs, and source \
-         may be stale. Before relying on shared tooling, run `git merge main`, \
-         resolve the conflicts, and commit. Don't assume the worktree is \
-         up to date.]"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::build_catchup_conflict_note;
-
-    #[test]
-    fn catchup_conflict_note_surfaces_staleness_and_error() {
-        let note = build_catchup_conflict_note("New conflicts from concurrent main changes: x");
-        // Must name the situation so CC (and the user, via the timeline) acts.
-        assert!(note.contains("main"), "note must mention main");
-        assert!(
-            note.to_lowercase().contains("conflict"),
-            "note must mention the conflict"
-        );
-        assert!(
-            note.contains("git merge main"),
-            "note must tell CC how to recover"
-        );
-        // The underlying error is carried through for context.
-        assert!(note.contains("concurrent main changes"));
     }
 }

@@ -557,6 +557,36 @@
     margin-left: auto;
 }
 
+/* How old the plugin rows are, and the control that refreshes them. Quiet on
+   purpose: it reports on content the user is already reading, so it must not
+   compete with it. One element in two states (a button, or a plain status while
+   a scan runs), which is why the base rule carries no button chrome. */
+.plugins-freshness {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color var(--duration-fast) ease;
+}
+
+.plugins-freshness:hover {
+    color: var(--text-secondary);
+}
+
+/* The busy state is a status, not a target. It keeps the same box so the row
+   does not shift when a scan starts. */
+.plugins-freshness-busy {
+    cursor: default;
+}
+
+.plugins-freshness-busy:hover {
+    color: var(--text-muted);
+}
+
 .apps-search-bar {
     display: flex;
     align-items: center;

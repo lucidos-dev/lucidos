@@ -1124,9 +1124,9 @@ export async function startSetupInterview(): Promise<boolean> {
  *
  *  The gesture behind every button that starts a conversation on the user's
  *  behalf: the first-run welcome's setup interview, a *release notice* action,
- *  and Discuss on a notification. Each hands the reader a sentence they can see,
- *  reword and re-send by typing, which is the prompt-first side of
- *  `docs/philosophy.md` principle 3.
+ *  and Discuss on a notification or on either webhook bar. Each hands the
+ *  reader a sentence they can see, reword and re-send by typing, which is the
+ *  prompt-first side of `docs/philosophy.md` principle 3.
  *
  *  It never disturbs a draft in progress: `seedSuggestion` steps onto a fresh
  *  one rather than borrowing an occupied composer.

@@ -17,11 +17,13 @@
 //! an error — it resolves to `IrreversibleDanger` (ask), per the design's
 //! tie-break.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use crate::engine::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
 use crate::engine::command_judge_questions;
-use crate::engine::LucidosEngine;
+use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::judgment::JudgmentProvider;
 use crate::llm::provider::{LlmProvider, Message, MessageContent};
 use crate::llm::tool_names as tn;
@@ -226,27 +228,46 @@ fn extract_json_object(text: &str) -> Option<String> {
 ///
 /// Returns `Err` on infra failure (the call errors or the response is empty); a
 /// non-empty but unclear response is `Ok(JudgeVerdict::uncertain())` (ask).
+///
+/// The capture is recorded before the response is read, so an empty answer is
+/// accounted too. The call was paid for whatever came back.
+///
+/// **`deadline` covers the provider call alone.** Around the whole function it
+/// would cover the capture too. A call answering just inside the deadline could
+/// then have its row cancelled mid-write, losing the accounting for a call the
+/// user paid for.
 pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
     provider: &P,
     input: &JudgeInput,
     // The `reasoning_command_judge` preference, the other half of the judge's
     // *model selection*.
     reasoning_effort: &str,
+    deadline: Duration,
+    capture: Option<&AuxCapture>,
 ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
+    let prompt = build_judge_user_prompt(input);
+    let request_chars = JUDGE_SYSTEM_PROMPT.chars().count() + prompt.chars().count();
     let messages = vec![Message {
         role: "user".to_string(),
-        content: MessageContent::Text(build_judge_user_prompt(input)),
+        content: MessageContent::Text(prompt),
     }];
-    let response = provider
-        .chat(
-            messages,
-            vec![],
-            None,
-            Some(JUDGE_SYSTEM_PROMPT),
-            None,
-            Some(reasoning_effort),
-        )
-        .await?;
+    let call = provider.chat(
+        messages,
+        vec![],
+        None,
+        Some(JUDGE_SYSTEM_PROMPT),
+        None,
+        Some(reasoning_effort),
+    );
+    let response = match tokio::time::timeout(deadline, call).await {
+        Ok(result) => result?,
+        Err(_) => return Err(format!("command judge timed out after {:?}", deadline).into()),
+    };
+    if let Some(capture) = capture {
+        capture
+            .record(provider.default_model(), request_chars, &response)
+            .await;
+    }
     let raw = response.content.unwrap_or_default();
     if raw.trim().is_empty() {
         return Err("command judge returned an empty response".into());
@@ -261,16 +282,31 @@ pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
 /// response to tolerate here, because the answers are typed. What replaces it
 /// is [`command_judge_questions::read`], which resolves a weak distribution to
 /// *ask*.
+///
+/// Both paths record under one purpose. The backend is the user's choice, and a
+/// switch of backend must not read as a switch of job in a cost rollup.
+///
+/// **`deadline` covers the ask alone**, for the reason [`judge_with_provider`]
+/// gives. A timeout surfaces as a boxed [`tokio::time::error::Elapsed`], which
+/// is how the caller tells it apart from a failure: one falls through to the
+/// chat path and the other does not.
 pub(crate) async fn judge_with_jev<J: JudgmentProvider + ?Sized>(
     jev: &J,
     input: &JudgeInput,
+    deadline: Duration,
+    capture: Option<&AuxCapture>,
 ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
-    let judgment = jev
-        .ask(
-            command_judge_questions::state(input),
-            command_judge_questions::questions(),
-        )
-        .await?;
+    let ask = jev.ask(
+        command_judge_questions::state(input),
+        command_judge_questions::questions(),
+    );
+    let judgment = match tokio::time::timeout(deadline, ask).await {
+        Ok(result) => result?,
+        Err(elapsed) => return Err(Box::new(elapsed)),
+    };
+    if let Some(capture) = capture {
+        capture.record_judgment(&judgment).await;
+    }
     Ok(command_judge_questions::read(&judgment.answers))
 }
 
@@ -286,12 +322,17 @@ impl LucidosEngine {
     /// set it. A Jev call that fails falls through to the rubric prompt, which
     /// is a better answer than the static list. Both paths end at the same
     /// `Err`, so the caller's fallback is unchanged either way.
+    ///
+    /// `thread_id` anchors the capture. Every caller runs inside a turn and
+    /// holds one, so the judge's spend is never filed against nothing.
     pub(crate) async fn judge_command(
         &self,
         model: &str,
         input: &JudgeInput,
+        thread_id: uuid::Uuid,
     ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
-        let budget = crate::engine::aux_purpose::UNCAPTURED_CALL_BUDGET;
+        let budget = crate::engine::aux_purpose::budget_for(ContextPurpose::CommandJudge);
+        let capture = AuxCapture::new(&self.event_bus, thread_id, ContextPurpose::CommandJudge);
         if let Some(jev) = crate::llm::judgment::jev_for(
             &self.pool,
             crate::llm::judgment::JudgmentSite::CommandGuard,
@@ -303,17 +344,17 @@ impl LucidosEngine {
             // little and answers better than the static list. A TIMEOUT does
             // not: a user is waiting on the permission card, and a second
             // full deadline behind the first is worse than the static answer.
-            match tokio::time::timeout(budget.deadline, judge_with_jev(&jev, input)).await {
-                Ok(Ok(verdict)) => return Ok(verdict),
-                Ok(Err(e)) => log!(
-                    "[CommandGuard] Jev judge failed: {}. Using the chat path",
-                    e
-                ),
-                Err(_) => {
+            match judge_with_jev(&jev, input, budget.deadline, Some(&capture)).await {
+                Ok(verdict) => return Ok(verdict),
+                Err(e) if e.is::<tokio::time::error::Elapsed>() => {
                     return Err(
                         format!("Jev command judge timed out after {:?}", budget.deadline).into(),
                     )
                 }
+                Err(e) => log!(
+                    "[CommandGuard] Jev judge failed: {}. Using the chat path",
+                    e
+                ),
             }
         }
 
@@ -325,23 +366,30 @@ impl LucidosEngine {
         // Under the budget's whole-call deadline. A user waits on the
         // permission card this verdict fills in, and the caller's fallback to
         // the static list beats an open-ended wait.
-        tokio::time::timeout(
+        judge_with_provider(
+            provider.as_ref(),
+            input,
+            &effort,
             budget.deadline,
-            judge_with_provider(provider.as_ref(), input, &effort),
+            Some(&capture),
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(format!("command judge timed out after {:?}", budget.deadline).into())
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, Question};
+    use crate::engine::event_bus::EventBus;
+    use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentUsage, Question};
     use crate::llm::provider::{LlmResponse, ToolDefinition};
     use crate::llm::TokenCallback;
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+    use uuid::Uuid;
+
+    /// A deadline no offline test can reach. The stubs answer instantly, so
+    /// what these tests exercise is the call and its capture, never the bound.
+    const TEST_DEADLINE: Duration = Duration::from_secs(30);
 
     fn ji(tool: &str, cmd: &str, oow: bool) -> JudgeInput {
         JudgeInput {
@@ -416,6 +464,8 @@ mod tests {
             &stub(r#"{"lane":"irreversible","category":"external_api","summary":"Posts data to an API.","reason":"POST"}"#),
             &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
             "none",
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -428,6 +478,8 @@ mod tests {
             &stub(r#"{"lane":"safe","summary":"Reads a URL.","reason":"GET"}"#),
             &ji(tn::RUN_BASH, "curl https://api/data", false),
             "none",
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -442,6 +494,8 @@ mod tests {
             ),
             &ji(tn::RUN_BASH, "weird-tool --send", false),
             "none",
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -452,6 +506,8 @@ mod tests {
             &stub(r#"{"lane":"reversible","summary":"Deletes workspace files.","reason":"in-ws"}"#),
             &ji(tn::RUN_BASH, "rm -rf data/tmp", false),
             "none",
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -461,7 +517,14 @@ mod tests {
     #[tokio::test]
     async fn stubbed_judge_empty_response_is_infra_error() {
         // Empty content → Err, so the caller falls back to the static list.
-        let v = judge_with_provider(&stub("   "), &ji(tn::RUN_BASH, "x", false), "none").await;
+        let v = judge_with_provider(
+            &stub("   "),
+            &ji(tn::RUN_BASH, "x", false),
+            "none",
+            TEST_DEADLINE,
+            None,
+        )
+        .await;
         assert!(v.is_err(), "empty response must be an infra error");
     }
 
@@ -470,7 +533,14 @@ mod tests {
         let provider = StubProvider {
             response: Err("network down".to_string()),
         };
-        let v = judge_with_provider(&provider, &ji(tn::RUN_BASH, "x", false), "none").await;
+        let v = judge_with_provider(
+            &provider,
+            &ji(tn::RUN_BASH, "x", false),
+            "none",
+            TEST_DEADLINE,
+            None,
+        )
+        .await;
         assert!(v.is_err(), "provider error must propagate as Err");
     }
 
@@ -589,6 +659,9 @@ mod tests {
 
     /// A stubbed [`JudgmentProvider`] that records what it was asked, so the
     /// Jev glue is exercised offline the way `StubProvider` does the chat one.
+    ///
+    /// It reports the usage and the model a real response carries, because the
+    /// capture the glue emits is built out of both.
     struct StubJudge {
         answers: Answers,
         asked: std::sync::Mutex<Vec<AskedCall>>,
@@ -597,6 +670,16 @@ mod tests {
     /// One recorded call: the state and the questions the glue sent.
     type AskedCall = (serde_json::Value, Vec<(String, Question)>);
 
+    /// What [`StubJudge`] reports having spent. Any non-zero pair does, since
+    /// what the tests assert is that the numbers reach the row unchanged.
+    const STUB_USAGE: JudgmentUsage = JudgmentUsage {
+        input_tokens: 312,
+        output_tokens: 48,
+    };
+
+    /// The version a real response names, where the request asks for an alias.
+    const STUB_MODEL: &str = "jev-1.13.0";
+
     #[async_trait::async_trait]
     impl JudgmentProvider for StubJudge {
         async fn ask(
@@ -604,10 +687,19 @@ mod tests {
             state: serde_json::Value,
             questions: Vec<(String, Question)>,
         ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+            // Sized through the real builder, so the stub cannot disagree with
+            // the provider about what one request weighs.
+            let request_chars =
+                crate::llm::judgment::jev::build_request_body(STUB_MODEL, &state, &questions)
+                    .to_string()
+                    .chars()
+                    .count();
             self.asked.lock().unwrap().push((state, questions));
             Ok(Judgment {
                 answers: self.answers.clone(),
-                usage: Default::default(),
+                usage: STUB_USAGE,
+                model: Some(STUB_MODEL.to_string()),
+                request_chars,
             })
         }
     }
@@ -651,6 +743,8 @@ mod tests {
         let v = judge_with_jev(
             &jev,
             &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -674,6 +768,8 @@ mod tests {
                 "psql postgresql://lucidos:hunter2@db.example.com:5432/app -c 'select 1'",
                 false,
             ),
+            TEST_DEADLINE,
+            None,
         )
         .await
         .unwrap();
@@ -703,18 +799,203 @@ mod tests {
                 Err("TypeSafe returned 429".into())
             }
         }
-        assert!(judge_with_jev(&Failing, &ji(tn::RUN_BASH, "ls", false))
-            .await
-            .is_err());
+        assert!(judge_with_jev(
+            &Failing,
+            &ji(tn::RUN_BASH, "ls", false),
+            TEST_DEADLINE,
+            None
+        )
+        .await
+        .is_err());
+    }
+
+    /// The caller declines the chat path after a timeout and takes it after a
+    /// failure, so the two must not arrive as the same error. A timeout is a
+    /// boxed `Elapsed` and nothing else is.
+    #[tokio::test]
+    async fn a_jev_timeout_is_told_apart_from_a_failure() {
+        struct Slow;
+        #[async_trait::async_trait]
+        impl JudgmentProvider for Slow {
+            async fn ask(
+                &self,
+                _state: serde_json::Value,
+                _questions: Vec<(String, Question)>,
+            ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(Judgment::default())
+            }
+        }
+        struct Failing;
+        #[async_trait::async_trait]
+        impl JudgmentProvider for Failing {
+            async fn ask(
+                &self,
+                _state: serde_json::Value,
+                _questions: Vec<(String, Question)>,
+            ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+                Err("TypeSafe returned 429".into())
+            }
+        }
+
+        let timed_out = judge_with_jev(
+            &Slow,
+            &ji(tn::RUN_BASH, "ls", false),
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .expect_err("it ran out of time");
+        assert!(timed_out.is::<tokio::time::error::Elapsed>());
+
+        let failed = judge_with_jev(
+            &Failing,
+            &ji(tn::RUN_BASH, "ls", false),
+            TEST_DEADLINE,
+            None,
+        )
+        .await
+        .expect_err("the backend refused");
+        assert!(
+            !failed.is::<tokio::time::error::Elapsed>(),
+            "a refusal must still fall through to the chat path"
+        );
     }
 
     /// An empty answer set is *ask*, not an error. The typed path has no
     /// "unclear response" to detect, so this is where that tolerance lives.
     #[tokio::test]
     async fn a_jev_answer_with_no_lane_asks() {
-        let v = judge_with_jev(&stub_judge(vec![]), &ji(tn::RUN_BASH, "ls", false))
-            .await
-            .unwrap();
+        let v = judge_with_jev(
+            &stub_judge(vec![]),
+            &ji(tn::RUN_BASH, "ls", false),
+            TEST_DEADLINE,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(v, JudgeVerdict::uncertain());
+    }
+
+    // --- what the judge spends ----------------------------------------------
+    //
+    // The judge runs in front of every ambiguous command, on whichever backend
+    // the user chose. Both paths reach the cost rollup, under one purpose.
+
+    /// The purpose these rows are filed under, as the wire spells it.
+    const CAPTURE_PURPOSE: &str = "command_judge";
+
+    #[tokio::test]
+    async fn the_jev_path_records_what_the_judgment_cost() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::CommandJudge);
+
+        let jev = stub_judge(vec![choice(
+            command_judge_questions::LANE,
+            &[("safe", 0.99)],
+        )]);
+        let verdict = judge_with_jev(
+            &jev,
+            &ji(tn::RUN_BASH, "curl https://api/data", false),
+            TEST_DEADLINE,
+            Some(&capture),
+        )
+        .await
+        .expect("the stub answers");
+        assert_eq!(verdict.lane, RiskLane::Safe, "the verdict is unchanged");
+
+        let captures = aux_captures(&pool, thread_id, CAPTURE_PURPOSE).await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(
+            captures[0]["usage"]["input_tokens"],
+            STUB_USAGE.input_tokens
+        );
+        assert_eq!(
+            captures[0]["usage"]["output_tokens"],
+            STUB_USAGE.output_tokens
+        );
+        assert_eq!(
+            captures[0]["model"], STUB_MODEL,
+            "the version that answered, not the alias the request asked for"
+        );
+        assert!(
+            captures[0]["sections"][0]["content_chars"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "the row is sized by what the provider sent: {captures:?}"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The chat path is the DEFAULT one, since `judgment_command_guard` is
+    /// `chat` unless the user moved it. Capturing only Jev would make a change
+    /// of backend read as a rise in spend.
+    #[tokio::test]
+    async fn the_chat_path_records_what_the_call_cost() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::CommandJudge);
+
+        let provider = ScriptedProvider::new(
+            crate::core::DEFAULT_COMMAND_JUDGE_MODEL,
+            vec![r#"{"lane":"safe","summary":"Reads a URL.","reason":"GET"}"#],
+        );
+        let verdict = judge_with_provider(
+            &provider,
+            &ji(tn::RUN_BASH, "curl https://api/data", false),
+            "none",
+            TEST_DEADLINE,
+            Some(&capture),
+        )
+        .await
+        .expect("the scripted reply parses");
+        assert_eq!(verdict.lane, RiskLane::Safe, "the verdict is unchanged");
+
+        let captures = aux_captures(&pool, thread_id, CAPTURE_PURPOSE).await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(
+            captures[0]["model"],
+            crate::core::DEFAULT_COMMAND_JUDGE_MODEL
+        );
+        assert_eq!(captures[0]["usage"]["input_tokens"], 210);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// An empty response is the infra error the caller falls back on, and it
+    /// was paid for all the same. The row is written before the answer is read.
+    #[tokio::test]
+    async fn an_empty_chat_answer_is_still_recorded() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::CommandJudge);
+
+        let provider = ScriptedProvider::new(crate::core::DEFAULT_COMMAND_JUDGE_MODEL, vec!["   "]);
+        assert!(judge_with_provider(
+            &provider,
+            &ji(tn::RUN_BASH, "x", false),
+            "none",
+            TEST_DEADLINE,
+            Some(&capture),
+        )
+        .await
+        .is_err());
+
+        assert_eq!(
+            aux_captures(&pool, thread_id, CAPTURE_PURPOSE).await.len(),
+            1
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 }

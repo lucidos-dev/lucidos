@@ -1174,6 +1174,9 @@ pub(crate) enum QuestionReaskCause {
     /// dispatchable payload, so no call was ever made. Detected by
     /// [`crate::engine::inline_question_repair`].
     LeakedAsText,
+    /// The model never reached for the tool at all: it just ended its reply on
+    /// a question. Detected by [`reply_ends_in_a_question`].
+    AskedInProse,
 }
 
 impl QuestionReaskCause {
@@ -1197,29 +1200,110 @@ impl QuestionReaskCause {
                  menu. INVOKE `ask_user_question` AS A TOOL CALL now, with the full question \
                  text and 2-4 options."
             }
+            Self::AskedInProse => {
+                "You ended your turn with a question typed as prose, so the user got no \
+                 clickable card. Prose does not park the thread: it reads as finished, nothing \
+                 lights the needs-attention badge, and nobody is told you are waiting. Re-issue \
+                 the question now as an `ask_user_question` TOOL CALL with 2-4 options, and do \
+                 NOT inline them as a typed-reply menu. Reserve plaintext for a genuinely \
+                 open-ended question (e.g. \"what should I name this?\") where pre-baked options \
+                 would be guesses. If yours is one, KEEP it: say why options would be guesses, \
+                 and ask it again here, because this reply replaces the draft above. You are not \
+                 asked a second time."
+            }
         }
     }
+
+    /// What the `LlmCallRetried` this force emits says it was for. Lives beside
+    /// the instruction so a new cause cannot ship observable in the transcript
+    /// but anonymous in the event log.
+    pub(crate) fn retry_reason(self) -> &'static str {
+        match self {
+            Self::CallRejected => "ask_user_question had no question text, forcing re-ask",
+            Self::LeakedAsText => "ask_user_question was typed as text, forcing re-ask",
+            Self::AskedInProse => "the reply ended on a question with no card, forcing re-ask",
+        }
+    }
+}
+
+/// How many times one turn may be sent back for ending on a question typed as
+/// prose. One, on its own counter rather than the budget above.
+///
+/// The bound matters more here than for [`MAX_QUESTION_REASK`], for the reason
+/// [`MAX_TODO_WAKE_NUDGE`] also caps at one. A model that reads this nudge and
+/// still wants prose has made a choice. Asking twice would only spend a round
+/// to hear it again.
+pub(crate) const MAX_PROSE_QUESTION_NUDGE: usize = 1;
+
+/// Whether a finished reply hands the turn back on a question.
+///
+/// The test is the trailing `?` alone. It mirrors `detect_plaintext_question`
+/// in `lucidos-cli`'s Claude Code Stop hook. That hook has redirected
+/// coding-agent sessions on this exact signal since long before the chat side
+/// had a gate.
+///
+/// Only the END of the reply counts. A question mid-paragraph is usually
+/// rhetorical or quoted, while a reply whose last character is `?` is asking
+/// the user something and then going silent.
+pub(crate) fn reply_ends_in_a_question(text: &str) -> bool {
+    text.trim_end().ends_with('?')
+}
+
+/// Everything the re-ask decision reads. A struct rather than six positional
+/// arguments, four of them booleans: `(true, false, true, …)` at the call site
+/// says nothing about which is which.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuestionReaskInputs {
+    /// The previous iteration's `ask_user_question` call was rejected.
+    pub(crate) ask_failed_last_iter: bool,
+    /// The model typed an `<ask_user_question>` tag as ordinary text.
+    pub(crate) leaked_as_text: bool,
+    /// The prose the model just finished ends on a question.
+    pub(crate) ends_in_a_question: bool,
+    /// Somebody is at the other end of this turn who could tap a card.
+    /// Resolved by the caller, never re-derived here: see the parameter of the
+    /// same name on `run_agentic_loop`.
+    pub(crate) human_can_answer: bool,
+    /// Forces already spent this turn on a broken `ask_user_question` call.
+    pub(crate) reask_forced: usize,
+    /// Nudges already spent this turn on a question typed as prose.
+    pub(crate) prose_nudges_forced: usize,
 }
 
 /// Why the no-tool-calls termination branch must force a re-ask instead of
 /// finalizing the turn, or `None` to finalize normally.
 ///
-/// The two causes share one `MAX_QUESTION_REASK` budget, so they cannot
-/// alternate past the cap. A rejected call wins when both hold: it is the more
-/// specific diagnosis, since the model did reach the tool. Pure, so the bound
-/// is unit-testable without driving the whole loop.
-pub(crate) fn question_reask_cause(
-    ask_failed_last_iter: bool,
-    leaked_as_text: bool,
-    reask_forced: usize,
-) -> Option<QuestionReaskCause> {
-    if reask_forced >= MAX_QUESTION_REASK {
-        return None;
+/// The two broken-call causes share one `MAX_QUESTION_REASK` budget, so they
+/// cannot alternate past the cap. A rejected call wins when both hold: it is
+/// the more specific diagnosis, since the model did reach the tool. Pure, so
+/// every bound is unit-testable without driving the whole loop.
+///
+/// [`QuestionReaskCause::AskedInProse`] sits last and carries its own budget.
+/// It is the widest of the three, and the only one that fires when the model
+/// never reached the tool. Anything more specific outranks it.
+pub(crate) fn question_reask_cause(inputs: QuestionReaskInputs) -> Option<QuestionReaskCause> {
+    if inputs.reask_forced < MAX_QUESTION_REASK {
+        if inputs.ask_failed_last_iter {
+            return Some(QuestionReaskCause::CallRejected);
+        }
+        if inputs.leaked_as_text {
+            return Some(QuestionReaskCause::LeakedAsText);
+        }
     }
-    if ask_failed_last_iter {
-        return Some(QuestionReaskCause::CallRejected);
-    }
-    leaked_as_text.then_some(QuestionReaskCause::LeakedAsText)
+    asked_in_prose(inputs).then_some(QuestionReaskCause::AskedInProse)
+}
+
+/// Whether to nudge a turn that ended on a question nobody can tap.
+///
+/// Three guards beyond the question itself. `reask_forced == 0` keeps it to
+/// one diagnosis per turn: a turn already corrected for a broken call is not
+/// also corrected for prose. `human_can_answer` spares the runs where a card
+/// is the wrong answer, and the caller decides which those are.
+fn asked_in_prose(inputs: QuestionReaskInputs) -> bool {
+    inputs.ends_in_a_question
+        && inputs.human_can_answer
+        && inputs.reask_forced == 0
+        && inputs.prose_nudges_forced < MAX_PROSE_QUESTION_NUDGE
 }
 
 /// How many times one turn may be sent back for leaving work open with nothing

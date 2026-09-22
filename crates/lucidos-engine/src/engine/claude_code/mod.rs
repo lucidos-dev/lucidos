@@ -418,9 +418,9 @@ fn entry_matches_path(entry: &str, path: &str) -> bool {
 
 /// Parameters for spawning a new CC thread.
 ///
-/// `caller_title` — if Some(non-empty), used as the thread title and LLM
-/// title generation is skipped. If None, a truncated-prompt placeholder is
-/// emitted and an LLM-generated title replaces it asynchronously.
+/// `caller_title`: Some(non-empty) becomes the thread's name and keeps the
+/// title model out. None leaves the naming to the model, and the parent's
+/// sub-thread row shows the prompt's opening words until it lands.
 pub(crate) struct SpawnAgentThreadParams {
     pub prompt: String,
     pub user_images: Option<Vec<crate::api::ChatImage>>,

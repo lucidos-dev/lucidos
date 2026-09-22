@@ -215,11 +215,22 @@ pub struct JudgmentUsage {
     pub output_tokens: u32,
 }
 
-/// The answers to one request, with what the request cost.
+/// The answers to one request, with everything a caller needs to record it.
+///
+/// The provider fills `model` and `request_chars` rather than the caller. The
+/// request id we ask for is an alias, `jev-latest`, and the response names the
+/// version that answered. A caller stamping the alias would open a second model
+/// line for one model. The size is the serialized body, which only the provider
+/// has: a caller measuring its own state misses the questions riding with it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Judgment {
     pub answers: Answers,
     pub usage: JudgmentUsage,
+    /// What the response says answered, or `None` when it named nothing. The
+    /// caller then falls back to the alias it asked for.
+    pub model: Option<String>,
+    /// Chars in the request body the provider sent.
+    pub request_chars: usize,
 }
 
 /// A backend that answers typed questions about one state.

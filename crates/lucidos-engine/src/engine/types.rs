@@ -341,6 +341,30 @@ pub enum ContextPurpose {
     /// live socket, so a row is written per reply and the purpose's
     /// `AuxBudget` is never asked for.
     Voice,
+    /// The *command guard*'s judge over the ambiguous middle (ADR 0002).
+    ///
+    /// It owns `model_command_judge` and `reasoning_command_judge`, per the
+    /// standing invariant above. Both backends stamp this one purpose. The user
+    /// can point the judge at Jev with `judgment_command_guard`, and a switch of
+    /// backend must not read as a switch of job.
+    CommandJudge,
+    /// One call of the agent's own `judge` tool.
+    ///
+    /// It owns no model preference, because the tool is Jev or nothing. See
+    /// `aux_purpose`, which names that case rather than exempting it.
+    JudgeTool,
+    /// One round of the `execute_intent` sub-loop.
+    ///
+    /// It runs the agent's own chat model, so it owns no preference either.
+    /// Auxiliary rather than a turn: the row carries no section breakdown, and
+    /// a trigger scoped to `purpose: "turn"` asked for the agent's own turns.
+    IntentLoop,
+    /// The verdict behind `correct_memory`, which asks which stored entries
+    /// carry the fact the user rejected. Runs the agent's own chat model.
+    MemoryCorrection,
+    /// The summary written for one file the `import_file` tool imported. Runs
+    /// the agent's own chat model, once per imported file.
+    ArtifactSummary,
 }
 
 impl ContextPurpose {
@@ -362,6 +386,11 @@ impl ContextPurpose {
             Self::QueryClassification => "Query Classification Request",
             Self::ImageGen => "Image Generation Request",
             Self::Voice => "Voice Reply",
+            Self::CommandJudge => "Command Judge Request",
+            Self::JudgeTool => "Judge Tool Request",
+            Self::IntentLoop => "Intent Loop Request",
+            Self::MemoryCorrection => "Memory Correction Request",
+            Self::ArtifactSummary => "Artifact Summary Request",
         }
     }
 }

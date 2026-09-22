@@ -204,6 +204,42 @@ fn build_command_sets_lucidos_workspace_env() {
     );
 }
 
+/// The last hop of the effort chain, and the only one that leaves the engine.
+///
+/// A spawn request's `reasoning_effort` is resolved in `run_direct_agent` and
+/// arrives here as `SpawnArgs::reasoning_effort`. `CLAUDE_CODE_EFFORT_LEVEL` is
+/// how Claude Code learns it, so a caller asking for `max` is only honoured if
+/// this env var says so. `lucidos spawn-thread --reasoning-effort max` is one
+/// such caller.
+#[test]
+fn build_command_sets_cc_effort_level_env_from_reasoning_effort() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.reasoning_effort = Some("max");
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    let value = env
+        .get(std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"))
+        .expect("a requested effort must reach the subprocess");
+    assert_eq!(value, std::ffi::OsStr::new("max"));
+}
+
+/// With nothing resolved, the var must stay unset. Claude Code then reads its
+/// own settings files, which is the inherit-the-default behavior a spawn keeps
+/// when it passes no flag.
+#[test]
+fn build_command_omits_cc_effort_level_env_when_no_effort_resolved() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let env = collect_envs(&cmd);
+    assert!(
+        !env.contains_key(std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL")),
+        "an unset effort must not pin a level on the subprocess"
+    );
+}
+
 #[test]
 fn build_command_sets_lucidos_event_id_when_spawning_event_id_set() {
     // The Claude Code subprocess needs `LUCIDOS_EVENT_ID` so the `lucidos spawn-thread`

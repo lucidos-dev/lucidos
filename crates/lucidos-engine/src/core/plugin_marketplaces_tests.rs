@@ -210,3 +210,112 @@ fn update_candidates_returns_newest_update_per_plugin() {
     assert_eq!(candidates[0].version, "0.2.0");
     assert_eq!(candidates[0].marketplace_id, "community");
 }
+
+/// Install state is live, never cached. The *plugin catalog cache* holds rows
+/// scanned minutes ago, so a plugin installed since then still reads
+/// `Available` in the cache. Serving that unchanged puts an Install button on a
+/// plugin already on disk, for as long as the TTL lasts.
+mod installed_state_overlay {
+    use super::*;
+
+    fn cached_row(id: &str, version: &str) -> MarketplacePlugin {
+        MarketplacePlugin {
+            marketplace_id: "community".to_string(),
+            marketplace_name: "Community".to_string(),
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            version: version.to_string(),
+            source: "https://example.test/community".to_string(),
+            manifest: serde_json::json!({}),
+            content: vec![],
+            categories: vec![],
+            files_count: 1,
+            status: MarketplacePluginStatus::Available,
+            installed_version: None,
+            setup_thread_id: None,
+            setup_complete: false,
+            app_id: None,
+            modified: false,
+            modified_paths: vec![],
+        }
+    }
+
+    fn installed(id: &str, version: &str) -> InstalledPluginSummary {
+        InstalledPluginSummary {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: version.to_string(),
+            source: None,
+            setup_thread_id: Some("thread-1".to_string()),
+            app_id: Some("an-app".to_string()),
+            content: vec![],
+            files: vec![],
+            modified: true,
+            modified_paths: vec!["apps/an-app/index.html".to_string()],
+        }
+    }
+
+    fn catalog_of(plugins: Vec<MarketplacePlugin>) -> MarketplaceCatalog {
+        MarketplaceCatalog {
+            marketplaces: vec![],
+            plugins,
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn a_plugin_installed_since_the_scan_stops_offering_install() {
+        let mut catalog = catalog_of(vec![cached_row("browser-learning", "0.1.0")]);
+
+        apply_installed_state_to_catalog(&mut catalog, &[installed("browser-learning", "0.1.0")]);
+
+        let row = &catalog.plugins[0];
+        assert_eq!(row.status, MarketplacePluginStatus::Installed);
+        assert_eq!(row.installed_version.as_deref(), Some("0.1.0"));
+        assert_eq!(row.app_id.as_deref(), Some("an-app"));
+        assert_eq!(row.setup_thread_id.as_deref(), Some("thread-1"));
+        assert!(row.modified);
+        assert_eq!(row.modified_paths, vec!["apps/an-app/index.html"]);
+    }
+
+    /// An older install against a newer catalog row is an update, not a plain
+    /// install: the card offers Update rather than Install.
+    #[test]
+    fn an_older_install_reads_as_an_update() {
+        let mut catalog = catalog_of(vec![cached_row("browser-learning", "0.2.0")]);
+
+        apply_installed_state_to_catalog(&mut catalog, &[installed("browser-learning", "0.1.0")]);
+
+        assert_eq!(
+            catalog.plugins[0].status,
+            MarketplacePluginStatus::UpdateAvailable
+        );
+        assert_eq!(
+            catalog.plugins[0].installed_version.as_deref(),
+            Some("0.1.0")
+        );
+    }
+
+    /// The overlay also has to CLEAR state, not only set it. A cache written
+    /// while the plugin was installed must not keep saying so after uninstall.
+    #[test]
+    fn a_plugin_uninstalled_since_the_scan_goes_back_to_available() {
+        let mut stale = cached_row("browser-learning", "0.1.0");
+        stale.status = MarketplacePluginStatus::Installed;
+        stale.installed_version = Some("0.1.0".to_string());
+        stale.app_id = Some("an-app".to_string());
+        stale.modified = true;
+        stale.modified_paths = vec!["apps/an-app/index.html".to_string()];
+        let mut catalog = catalog_of(vec![stale]);
+
+        apply_installed_state_to_catalog(&mut catalog, &[]);
+
+        let row = &catalog.plugins[0];
+        assert_eq!(row.status, MarketplacePluginStatus::Available);
+        assert_eq!(row.installed_version, None);
+        assert_eq!(row.app_id, None);
+        assert!(!row.modified);
+        assert!(row.modified_paths.is_empty());
+    }
+}

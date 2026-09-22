@@ -357,7 +357,7 @@ impl SchedulerManager {
                 let engine = engine_plugin_updates.clone();
                 let pool = pool_plugin_updates.clone();
                 Box::pin(async move {
-                    run_plugin_marketplace_update_check(engine, pool).await;
+                    run_plugin_marketplace_update_check(engine, pool, ScanCause::Routine).await;
                 })
             })?;
         self.scheduler.add(plugin_update_job).await?;
@@ -369,7 +369,8 @@ impl SchedulerManager {
         let startup_engine = self.engine.clone();
         let startup_pool = self.pool.clone();
         tokio::spawn(async move {
-            run_plugin_marketplace_update_check(startup_engine, startup_pool).await;
+            run_plugin_marketplace_update_check(startup_engine, startup_pool, ScanCause::Routine)
+                .await;
         });
 
         // Probe the public webhook path, so an ingress that stopped carrying
@@ -1343,7 +1344,9 @@ pub(crate) fn handle_trigger_group_event(
 mod backup;
 use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
-use plugin_updates::{run_plugin_marketplace_update_check, MARKETPLACE_UPDATE_CHECK_CRON};
+use plugin_updates::{
+    run_plugin_marketplace_update_check, ScanCause, MARKETPLACE_UPDATE_CHECK_CRON,
+};
 use webhook_ingress::{run_webhook_ingress_check, WEBHOOK_INGRESS_CRON};
 use webhook_refusal::{run_webhook_refusal_check, WEBHOOK_REFUSAL_CRON};
 

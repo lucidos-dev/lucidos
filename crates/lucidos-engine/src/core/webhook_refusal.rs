@@ -155,13 +155,23 @@ pub fn judge(hook: &Webhook) -> RefusalVerdict {
     if run_secs < REFUSAL_RUN_BEFORE_DEGRADED_SECS || gone_quiet(run) {
         return RefusalVerdict::Clear;
     }
-    // The live flag has to still agree with what the run is evidence of. A
-    // disabled run on a hook somebody switched back on names a fault that is
-    // over, whatever the tally behind it says.
-    let floor = match cause {
-        RefusalCause::Disabled if !hook.enabled => DISABLED_REFUSALS_BEFORE_DEGRADED,
-        RefusalCause::Verification if hook.enabled => REFUSALS_BEFORE_DEGRADED,
-        _ => return RefusalVerdict::Clear,
+    // **The live flag wins over the stored cause, in BOTH directions.** The
+    // flag is a fact this cycle reads. The cause is what the run was evidence
+    // of when it was written, and a switch moves under it.
+    //
+    // Off, the hook throws every delivery away before reading it, so no run on
+    // it can support "none of them verified". Saying otherwise sends the reader
+    // at the secret, and re-pointing a hook drops the whole config with it. So
+    // a one-click fix becomes a real outage. The floor is the reported cause's:
+    // the certainty comes from the flag, not from the count.
+    //
+    // On, a disabled run names a fault that is over, whatever its tally says.
+    let (cause, floor) = if !hook.enabled {
+        (RefusalCause::Disabled, DISABLED_REFUSALS_BEFORE_DEGRADED)
+    } else if cause == RefusalCause::Verification {
+        (RefusalCause::Verification, REFUSALS_BEFORE_DEGRADED)
+    } else {
+        return RefusalVerdict::Clear;
     };
     if run.refusals >= floor {
         RefusalVerdict::Refusing(cause)
@@ -234,7 +244,12 @@ fn resolution(declared: &Declared, hook: Option<&Webhook>) -> Resolution {
     if hook.last_accepted_at.is_some_and(|at| at > declared.since) {
         return Resolution::Accepted;
     }
-    if gone_quiet(&hook.refusal_run) {
+    // A run that is GONE, with no acceptance to date it, was ended by the flag
+    // moving: `WebhookStore::update` clears it in that same statement. Quiet
+    // has to read the run's own silence, so a cleared run must not reach it.
+    // An absent age answers `gone_quiet` yes, which would report a deliberate
+    // switch-off as a sender that went away.
+    if hook.refusal_run.is_running() && gone_quiet(&hook.refusal_run) {
         return Resolution::Quiet;
     }
     // Nothing verified and deliveries are still arriving, so the run must have

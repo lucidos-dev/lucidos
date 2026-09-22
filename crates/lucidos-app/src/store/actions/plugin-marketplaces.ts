@@ -3,6 +3,7 @@ import {
   fetchPluginCatalog,
   isTransportError,
   removePluginMarketplace,
+  rescanPluginCatalog,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { marketplaceCatalog, marketplaceScanning, showToast } from '../store';
@@ -23,17 +24,16 @@ export const OFFICIAL_MARKETPLACE = {
 // refresh — each cloning every registered marketplace repo.
 let catalogLoadInFlight: Promise<void> | null = null;
 
-// The catalog scan clones every registered marketplace repo, so on a flaky link
-// (an iOS PWA resuming over Tailscale) the GET can fail at the transport layer
-// — Safari surfaces this as `TypeError: "Load failed"` — or time out client-side
-// before the engine answers. Both recover on their own moments later: the user
-// sees exactly this when they navigate away and back and the panel then loads
-// fine. So retry these transient failures with a short backoff before settling
-// the Loadable to `failed`, keeping it in `loading` (skeleton) meanwhile, rather
-// than leaving a terminal error that only a manual remount clears. A genuine
-// server error (the engine's `{error}` body, an `ApiError`) is NOT transient and
-// surfaces immediately. The service worker already retries GETs once, but only
-// immediately — too soon for a connection that needs a beat to re-establish.
+// A flaky link fails this GET at the transport layer, or times it out
+// client-side. Safari surfaces the first as `TypeError: "Load failed"`,
+// typically on an iOS PWA resuming over Tailscale. Both recover on their own
+// moments later. So retry a transient failure with a short backoff, keeping the
+// Loadable in `loading` meanwhile. Settling to `failed` leaves a terminal error
+// that only a remount clears.
+//
+// A genuine server error (the engine's `{error}` body, an `ApiError`) is NOT
+// transient and surfaces at once. The service worker retries a GET once, but
+// only immediately, too soon for a link that needs a beat to re-establish.
 const CATALOG_RETRY_BACKOFFS_MS = [800, 1600, 3200];
 
 function isTransientCatalogError(e: unknown): boolean {
@@ -99,9 +99,13 @@ export function loadPluginCatalog(force = false): Promise<void> {
   if (catalogLoadInFlight) return catalogLoadInFlight;
   catalogLoadInFlight = (async () => {
     setLoadingIfFresh(marketplaceCatalog);
-    marketplaceScanning.value = true;
     try {
       const catalog = await fetchCatalogWithRetry();
+      // The engine owns this flag now, because the scan runs on its scheduler.
+      // So the cue must be right for a scan this client never asked for, and
+      // for one another device started. The two SSE arms in
+      // `entityReferences.ts` move it between fetches.
+      marketplaceScanning.value = catalog.scanning;
       if (scanRanBehindAMutation(catalog.marketplaces)) {
         // Queue the re-scan here rather than trust the caller to have queued
         // one, so a dropped result can never leave the panel with none coming.
@@ -120,11 +124,7 @@ export function loadPluginCatalog(force = false): Promise<void> {
     if (catalogRefreshQueued) {
       catalogRefreshQueued = false;
       void loadPluginCatalog(true);
-      return;
     }
-    // Cleared only when nothing follows, so a trailing scan reads as one
-    // continuous scan rather than blinking the flag off between the two.
-    marketplaceScanning.value = false;
   });
   return catalogLoadInFlight;
 }
@@ -134,6 +134,22 @@ export function loadPluginCatalog(force = false): Promise<void> {
  *  is no specific change it has to be newer than. */
 export async function refreshPluginCatalog(): Promise<void> {
   await loadPluginCatalog(true);
+}
+
+/** The Plugins panel's refresh control. Asks the engine for a fresh scan.
+ *
+ *  Raises the cue here rather than waiting for the `PluginCatalogScanStarted`
+ *  frame, so the button responds to the click that pressed it. The frame and
+ *  the next fetch both agree with it moments later. A failed request lowers the
+ *  cue again, or it would claim a scan that never started. */
+export async function rescanPluginCatalogAction(): Promise<void> {
+  marketplaceScanning.value = true;
+  try {
+    await rescanPluginCatalog();
+  } catch (e) {
+    marketplaceScanning.value = false;
+    showToast(`Failed to start a marketplace scan: ${errorDetail(e)}`, 'error');
+  }
 }
 
 /** Re-scan for a caller reacting to a mutation that has ALREADY landed: a
@@ -186,6 +202,9 @@ function applyMarketplaceMutation(marketplaces: PluginMarketplace[]): void {
     marketplaceCatalog.value = {
       status: 'loaded',
       data: {
+        // Freshness carries over untouched: the mutation changed the registry,
+        // not the scan behind these plugins, so the age on screen stays true.
+        ...current.data,
         marketplaces,
         plugins: current.data.plugins.filter((p) => registered.has(p.marketplace_id)),
         errors: current.data.errors.filter((e) => registered.has(e.marketplace_id)),

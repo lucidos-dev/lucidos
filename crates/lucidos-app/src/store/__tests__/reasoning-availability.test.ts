@@ -45,6 +45,19 @@ describe('availableReasoningLevels', () => {
     }
   });
 
+  // Same prefix rule on the Opus side: `claude-opus-5` matches Opus 5.5 too,
+  // so the point release inherits the full ladder without a new branch.
+  it('exposes full set for both Opus 5 generations', () => {
+    for (const id of [
+      'claude-opus-5@default',
+      'claude-opus-5-5',
+      'claude-opus-5-5[1m]',
+    ]) {
+      const values = availableReasoningLevels(id).map(l => l.value);
+      expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
   it('drops xhigh for non-Opus-4.7 Claude models', () => {
     const values = availableReasoningLevels('claude-opus-4-6').map(l => l.value);
     expect(values).toEqual(['none', 'low', 'medium', 'high', 'max']);

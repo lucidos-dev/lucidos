@@ -21,6 +21,7 @@ import {
   morphStateOf,
   faceName,
   shouldNudgeUntouched,
+  nudgeIsTooSoon,
   shouldReportSilence,
   type LandingFacts,
   type ProbeViewport,
@@ -705,6 +706,28 @@ describe('shouldReportSilence: the wedge whose signature is silence', () => {
     // The bound that keeps the line rare. A live commit face says the composer
     // has something to send, which is the state a user taps at.
     expect(shouldReportSilence({ ...wedged, hasCommitFace: false })).toBe(false);
+  });
+});
+
+describe('nudgeIsTooSoon: two triggers, one relayout', () => {
+  // The keystroke timer and the scheduled tick can come due together, and a
+  // relayout is worth nothing twice.
+  it('takes the first nudge, since nothing has been spent', () => {
+    expect(nudgeIsTooSoon(null, 1000)).toBe(false);
+  });
+
+  it('refuses a second in the same millisecond', () => {
+    expect(nudgeIsTooSoon(1000, 1000)).toBe(true);
+  });
+
+  it('refuses one a few frames behind the first', () => {
+    expect(nudgeIsTooSoon(1000, 1200)).toBe(true);
+  });
+
+  it('takes one a whole scheduled interval later, which is the repeat rate', () => {
+    // Every earlier ledger reads that cadence, so the window must clear well
+    // inside it.
+    expect(nudgeIsTooSoon(1000, 4000)).toBe(false);
   });
 });
 

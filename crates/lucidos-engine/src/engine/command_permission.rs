@@ -643,7 +643,7 @@ impl LucidosEngine {
             summary,
             category,
         }) = self
-            .resolve_command_lane(ctx, tool_name, input, cancel_token)
+            .resolve_command_lane(ctx, tool_name, input, thread_id, cancel_token)
             .await
         else {
             return GuardDecision::Refuse(canceled_refusal());
@@ -930,6 +930,7 @@ impl LucidosEngine {
         ctx: &mut CommandGuardCtx<'_>,
         tool_name: &str,
         input: &Value,
+        thread_id: Uuid,
         cancel_token: &CancellationToken,
     ) -> Option<JudgedClassification> {
         match command_guard::static_classify(tool_name, input) {
@@ -944,7 +945,7 @@ impl LucidosEngine {
                 tokio::select! {
                     biased;
                     _ = cancel_token.cancelled() => None,
-                    resolved = self.judge_or_fallback(ctx, ji) => Some(resolved),
+                    resolved = self.judge_or_fallback(ctx, ji, thread_id) => Some(resolved),
                 }
             }
         }
@@ -952,17 +953,21 @@ impl LucidosEngine {
 
     /// Resolve one ambiguous command via the judge (or the static fallback when
     /// the judge is off / unavailable), memoized in the per-turn cache.
+    ///
+    /// `thread_id` is the turn the judge's own spend is recorded against. A
+    /// cache hit spends nothing and records nothing.
     async fn judge_or_fallback(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
         ji: JudgeInput,
+        thread_id: Uuid,
     ) -> JudgedClassification {
         let key = ji.cache_key();
         if let Some(hit) = ctx.judge_cache.get(&key) {
             return hit.clone();
         }
         let resolved = if ctx.judge_enabled {
-            match self.judge_command(ctx.judge_model, &ji).await {
+            match self.judge_command(ctx.judge_model, &ji, thread_id).await {
                 Ok(verdict) => JudgedClassification {
                     lane: verdict.lane,
                     summary: Some(verdict.summary),

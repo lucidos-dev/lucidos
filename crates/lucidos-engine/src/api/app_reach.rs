@@ -193,6 +193,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/oauth/reauthorize", Host, &[]),
     ("/pinned-apps", Host, &[]),
     ("/plugins/catalog", Host, &[]),
+    ("/plugins/catalog/rescan", Host, &[]),
     ("/plugins/install-request", Host, &[]),
     ("/plugins/install/:install_id/cancel", Host, &[]),
     ("/plugins/install/:install_id/confirm", Host, &[]),

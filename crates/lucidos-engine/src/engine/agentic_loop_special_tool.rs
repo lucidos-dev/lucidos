@@ -448,8 +448,11 @@ impl LucidosEngine {
                     Ok(m) => m,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
+                // Validated model, not the raw arg: a tier Codex restricts is
+                // checked against the id the spawn will actually carry.
                 let spawn_effort = match crate::runtime::validate_coding_agent_effort(
                     coding_agent,
+                    spawn_model.as_deref(),
                     tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
                 ) {
                     Ok(e) => e,
@@ -872,6 +875,7 @@ impl LucidosEngine {
         };
         let reasoning_effort = match crate::runtime::validate_coding_agent_effort(
             coding_agent,
+            model.as_deref(),
             tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
         ) {
             Ok(e) => e,
@@ -985,6 +989,11 @@ impl LucidosEngine {
         // Pin ONE provider Arc for this whole intent sub-loop — a runtime swap
         // (credential added/removed) must not change the in-flight provider.
         let provider = self.current_provider();
+        let capture = crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::IntentLoop,
+        );
 
         let mut messages = vec![Message {
             role: "user".to_string(),
@@ -1031,6 +1040,7 @@ impl LucidosEngine {
             );
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
+            let request_chars = intent_request_chars(system_prompt, &messages, &tools);
             let response = provider
                 .chat(
                     messages.clone(),
@@ -1041,6 +1051,12 @@ impl LucidosEngine {
                     None, // no reasoning effort override
                 )
                 .await?;
+            // One row per round. The sub-loop runs up to `MAX_INTENT_ITERATIONS`
+            // of them on the agent's own model, and none of that spend reached
+            // a cost rollup before.
+            capture
+                .record(provider.default_model(), request_chars, &response)
+                .await;
 
             // No tool calls → final answer
             if response.tool_calls.is_empty() {
@@ -1232,6 +1248,24 @@ impl LucidosEngine {
     }
 }
 
+/// Chars in what one intent sub-loop round sends.
+///
+/// The same three parts a turn's own capture counts: the system prompt, the
+/// messages, and the tool schemas. The tools are included because they are
+/// resent on every round and they dominate a short prompt.
+fn intent_request_chars(
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[crate::llm::provider::ToolDefinition],
+) -> usize {
+    system_prompt.chars().count()
+        + messages
+            .iter()
+            .map(crate::engine::context::estimate_message_chars)
+            .sum::<usize>()
+        + crate::engine::context::tool_definitions_chars(tools)
+}
+
 /// Decide whether an intent sub-loop LLM response carries narrative prose worth
 /// surfacing to the parent thread as a `TextStreamed` event. Returns the text to
 /// emit, or `None` for absent / whitespace-only content (a turn that is a pure
@@ -1259,6 +1293,29 @@ fn removed_repo_alias_error(tool_args: &serde_json::Value) -> Option<&'static st
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The sub-loop resends its whole tool set every round, so a request sized
+    /// on the messages alone would under-report a short prompt several times
+    /// over. The capture counts all three parts, as a turn's own does.
+    #[test]
+    fn a_sub_loop_request_is_sized_including_its_tools() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("Task: tidy the inbox".to_string()),
+        }];
+        let tools = build_intent_tools(&crate::llm::ToolCapabilities::default());
+        let sized = intent_request_chars("You are the Director.", &messages, &tools);
+
+        let without_tools = intent_request_chars("You are the Director.", &messages, &[]);
+        assert!(
+            sized > without_tools,
+            "the tool schemas are part of what was sent"
+        );
+        assert!(
+            without_tools > "You are the Director.".chars().count(),
+            "the messages are counted too"
+        );
+    }
 
     /// `repo` was removed as an alias for `folder`. A straggler still passing
     /// it must get a loud rename error, never a silent misroute.

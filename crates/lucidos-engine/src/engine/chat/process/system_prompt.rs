@@ -73,6 +73,25 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 /// Nudges the Lucidos chat agent to use the `ask_user_question` tool for any
 /// choice-shaped question instead of writing the options as plaintext markdown.
 ///
+/// The DANGLING ITEM paragraph extends the QUESTION-SHAPE test above, which is
+/// syntactic: it fires on a question mark or a bulleted list. A decision
+/// phrased as a plain statement carries neither and passes straight through.
+/// That declarative form is the common failure, not the rare one. Naming an
+/// outstanding, parked, or newly unblocked item is such a decision, so the
+/// paragraph routes it to a card in the same turn.
+///
+/// ANSWER FIRST closes with the menu-as-addendum clause because the paragraph
+/// used to be one-sided. Its heading promised "then offer choices" while its
+/// body carried only the ban on bouncing a what-next menu back. A model that
+/// had just answered fully could read that as discouraging the card. Every
+/// measured failure had exactly that shape: a complete report, then a trailing
+/// "want me to X?" in prose. The counts are in
+/// `docs/plans/2026-09-22-a-prose-question-gets-a-card.md`.
+///
+/// The deterministic half of that fix is `QuestionReaskCause::AskedInProse` in
+/// `agentic_loop::helpers`, which sends such a turn back once. This clause is
+/// what stops the loop paying for the round.
+///
 /// The "NEVER OFFER AN \"OTHER\" OPTION" paragraph is load-bearing, not
 /// stylistic. Lucidos has no text-entry option kind, and
 /// `agent_question::answer_kind_to_hook_value` resolves a `Selected` answer to
@@ -100,6 +119,16 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      Reserve plaintext for genuinely open-ended questions (\"what should I \
      name this?\") where pre-baked options would be guesses.\n\
      \n\
+     A DANGLING ITEM IS A DECISION IN A STATEMENT'S CLOTHES. Naming something \
+     outstanding, unstarted, parked, or newly unblocked hands the user a fork \
+     in prose and gives them no way to take it. \"The only thing still pending \
+     is X\", \"X is still open\", \"that leaves X\", \"the blocker on X just \
+     cleared\" all carry a decision and none of them contains a question mark, \
+     which is exactly why the test above misses them. Write the sentence, then \
+     put the decision on a card in the SAME turn, with the options you would \
+     have accepted as a typed reply. The tell is that you can predict what the \
+     user will say next.\n\
+     \n\
      SET `multiSelect` WHEN THE ANSWERS STACK. The card is single-pick by \
      default, and the test is mechanical: could a reasonable person want two \
      of these at once? Then set it. A checklist is multi-select; a genuine \
@@ -121,7 +150,11 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      them. If they just gave you what you asked for last turn, that is a green \
      light to PROCEED, not to re-ask \"should I do it?\" with the options you \
      already offered. None of this conflicts with ACTION FIRST, which is about \
-     not pausing to clarify what they already told you clearly.\n\
+     not pausing to clarify what they already told you clearly. Read the ban as \
+     covering the menu as a REPLACEMENT, not as an addendum: once you have \
+     answered in full, a trailing \"want me to X?\" is exactly what the card is \
+     for. Typing that as prose is the commonest way this whole rule gets \
+     broken, so answer, then raise the card in the SAME turn.\n\
      \n\
      INVOKE IT AS A TOOL CALL, NEVER AS TEXT: a wrapper tag such as \
      `<ask_user_question>…</ask_user_question>` is not parsed out of assistant \
@@ -235,7 +268,7 @@ const NO_IMPERSONATION_RULE: &str = "NEVER ACT AS THE USER, AND NEVER ROUTE \
      one, however well it appears to succeed.\n\
      ANOTHER WORKSPACE IS NOT ONE OF THOSE CASES: `run_bash` with `lucidos \
      spawn-thread --to <ws> --message '<text>'` starts a thread there, plus \
-     `--cc` or `--codex` for a coding-agent one. Never call it impossible.";
+     `--coding-agent claude-code|codex` for one. Never call it impossible.";
 
 /// Routes "tell me here when X happens" to `await_event` rather than a
 /// trigger, at the moment the mechanism is chosen.
@@ -1195,7 +1228,23 @@ mod tests {
     /// which now says the call is refused while its thread is unsettled. The
     /// refusal was the bug (ADR 0233). An agent that learns it only by trying
     /// has already asked to merge a branch somebody is still writing to.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 118_085;
+    ///
+    /// Raised by 599 to a measured 118,684 for the DANGLING ITEM paragraph in
+    /// `ASK_USER_QUESTION_RULE`. A decision phrased as a plain statement carries
+    /// no question mark, so the syntactic QUESTION-SHAPE test above it never
+    /// fires. The paragraph routes an outstanding, parked, or newly unblocked
+    /// item to a card in the same turn.
+    ///
+    /// Raised by 284 to a measured 118,968 for the menu-as-addendum clause
+    /// closing ANSWER FIRST in the same rule. That paragraph banned a what-next
+    /// menu without ever saying when to raise one. A model reading it after a
+    /// full answer suppressed the card it owed. The clause pays for itself: the
+    /// gate that otherwise catches this costs a whole extra round.
+    ///
+    /// Raised by 40 to a measured 119,008 for Claude Opus 5.5 in the
+    /// coding-agent pickers, on the same terms as the Fable 5.1 clause above.
+    /// Two rows again, the pinned id and its 1M variant.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 119_008;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///

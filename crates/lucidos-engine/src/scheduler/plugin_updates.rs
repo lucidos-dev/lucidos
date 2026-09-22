@@ -9,18 +9,20 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+use chrono::Utc;
 
 use crate::api::SharedEngine;
 use crate::core::git_auth::GitCredentials;
+use crate::core::plugin_catalog_cache::{self, SCAN_STALL_CUTOFF_SECS};
 use crate::core::plugin_marketplaces::{
-    clone_urls, load_registry, scan_catalog, update_candidates, MarketplacePlugin,
-    MarketplaceScanError,
+    clone_urls, load_registry, scan_catalog, update_candidates, MarketplaceCatalog,
+    MarketplacePlugin, MarketplaceScanError,
 };
+use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::tools::plugins::installed_plugin_summaries;
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
-
-static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const MARKETPLACE_UPDATE_CHECK_CRON: &str = "0 */5 * * * *";
 
@@ -55,20 +57,79 @@ impl PluginUpdateCheckReport {
     }
 }
 
-struct UpdateCheckGuard;
+/// Why a scan was asked for. Decides what a caller does when another scan
+/// already holds the single-flight guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanCause {
+    /// The scheduler's tick, or a reader wanting current data. Joining the
+    /// running scan is good enough: there is no change to be newer than.
+    Routine,
+    /// The registry just changed. The running scan may have read it before the
+    /// write, so this one leaves a trailing pass behind rather than joining.
+    RegistryChanged,
+}
+
+/// A scan is owed because the registry changed. Set BEFORE reaching for the
+/// slot, and cleared by whichever pass takes it.
+///
+/// Claim-then-clear-on-acquire is what makes it race-free. The pass that clears
+/// the claim is a pass that reads the registry afterwards, so it sees the
+/// write. A claim arriving while a pass is mid-scan stays set, and that pass
+/// goes round again on the way out.
+///
+/// Without it, a scan that read the registry BEFORE the write republishes the
+/// old contents under a fresh `scanned_at`. That suppresses a page-open rescan
+/// for the whole TTL, so a newly registered marketplace stays invisible. A
+/// single flag, not a queue, so a burst of registrations collapses into one
+/// follow-up.
+static SCAN_REQUEUE: AtomicBool = AtomicBool::new(false);
+
+/// Epoch seconds when the running scan took the guard. Zero means free.
+static UPDATE_CHECK_STARTED: AtomicI64 = AtomicI64::new(0);
+
+struct UpdateCheckGuard(i64);
 
 impl UpdateCheckGuard {
-    fn try_acquire() -> Option<Self> {
-        UPDATE_CHECK_RUNNING
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-            .map(|_| Self)
+    fn try_acquire(now: i64) -> Option<Self> {
+        loop {
+            let held = UPDATE_CHECK_STARTED.load(Ordering::SeqCst);
+            // A clone has no timeout, so a wedged scan holds this for ever. It
+            // would freeze the catalog for good, now that a page open reads
+            // what the last scan left rather than scanning itself. Past the
+            // stall cutoff the slot is taken over: nothing waits on the wedged
+            // task, and the alternative is a workspace that never updates again.
+            if held != 0 && now.saturating_sub(held) < SCAN_STALL_CUTOFF_SECS {
+                return None;
+            }
+            if UPDATE_CHECK_STARTED
+                .compare_exchange(held, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if held != 0 {
+                    log!("[PluginUpdateCheck] Taking over a scan slot held since {held}");
+                }
+                return Some(Self(now));
+            }
+        }
+    }
+
+    /// Is this still the live scan, or has a newer one taken the slot over?
+    ///
+    /// A wedged clone's task eventually unwinds, long after the takeover above
+    /// gave its slot away. By then its result is older than what replaced it.
+    /// Writing it would republish stale rows under a fresh `scanned_at` and
+    /// clear the live scan's own stamp. So a loser writes nothing.
+    fn still_held(&self) -> bool {
+        UPDATE_CHECK_STARTED.load(Ordering::SeqCst) == self.0
     }
 }
 
 impl Drop for UpdateCheckGuard {
     fn drop(&mut self) {
-        UPDATE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+        // Only clear the slot while we still hold it. A taken-over slot belongs
+        // to a live scan, and clearing it would let a third one in beside it.
+        let _ =
+            UPDATE_CHECK_STARTED.compare_exchange(self.0, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -80,71 +141,190 @@ impl Drop for UpdateCheckGuard {
 pub(crate) async fn run_plugin_marketplace_update_check(
     engine: SharedEngine,
     pool: sqlx::PgPool,
+    cause: ScanCause,
 ) -> PluginUpdateCheckReport {
-    let report = check_marketplaces_for_updates(engine, pool).await;
-    for line in report.failure_log_lines() {
-        log!("[PluginUpdateCheck] {line}");
+    if cause == ScanCause::RegistryChanged {
+        // Claimed before reaching for the slot, so it cannot matter whether we
+        // get it. Whoever does clears the claim and then reads the registry.
+        SCAN_REQUEUE.store(true, Ordering::SeqCst);
+    }
+    let (mut report, mut scanned) = run_one_pass(&engine, &pool).await;
+    // ONLY the pass that held the slot goes round again. A refused caller
+    // draining here would clear the very claim it just made, and the running
+    // scan would then find nothing owed: both reviewers caught that shape.
+    // A claim still set after our pass arrived while we were scanning. So it
+    // landed after we read the registry, and our result does not reflect it.
+    while scanned && SCAN_REQUEUE.load(Ordering::SeqCst) && !engine.is_shutting_down() {
+        (report, scanned) = run_one_pass(&engine, &pool).await;
     }
     report
 }
 
-async fn check_marketplaces_for_updates(
-    engine: SharedEngine,
-    pool: sqlx::PgPool,
-) -> PluginUpdateCheckReport {
-    let Some(_guard) = UpdateCheckGuard::try_acquire() else {
-        log!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
-        return PluginUpdateCheckReport::default();
+/// One pass, plus whether it actually ran: `false` means another scan held the
+/// slot, so this caller neither scanned nor owns the claim.
+async fn run_one_pass(
+    engine: &SharedEngine,
+    pool: &sqlx::PgPool,
+) -> (PluginUpdateCheckReport, bool) {
+    let (report, scanned) = check_marketplaces_for_updates(engine.clone(), pool.clone()).await;
+    for line in report.failure_log_lines() {
+        log!("[PluginUpdateCheck] {line}");
+    }
+    (report, scanned)
+}
+
+/// Stamp the *plugin catalog cache* as scanning, before the scan's own task has
+/// had a chance to run.
+///
+/// `tokio::spawn` returns before its body does. So a caller that spawns a scan
+/// and then answers an HTTP request can serve `scanning: false` for a scan it
+/// just queued. On a workspace with nothing cached that reads as "No plugins
+/// found", at the exact moment the user registered their first marketplace.
+/// Every site that spawns a scan calls this first, synchronously.
+pub(crate) fn note_scan_queued(workspace: &Path) {
+    plugin_catalog_cache::mark_scan_started(workspace, Utc::now());
+}
+
+/// Run one scan and leave the *plugin catalog cache* holding its outcome.
+///
+/// `None` means the scan could not complete at all, which is distinct from a
+/// scan whose individual marketplaces failed: those ride in the catalog's own
+/// `errors` and still produce a result. Either way the cache settles here, so
+/// no caller can leave a start stamp behind and pin the cue on.
+async fn scan_into_cache(
+    pool: &sqlx::PgPool,
+    workspace: &Path,
+    guard: &UpdateCheckGuard,
+    report: &mut PluginUpdateCheckReport,
+) -> Option<MarketplaceCatalog> {
+    let mut fail = |what: String| -> Option<MarketplaceCatalog> {
+        if guard.still_held() {
+            plugin_catalog_cache::record_scan_failure(workspace, &what);
+        }
+        report.errors.push(what);
+        None
     };
 
-    if engine.is_shutting_down() {
-        return PluginUpdateCheckReport::default();
-    }
-
-    let mut report = PluginUpdateCheckReport::default();
-    let workspace = engine.workspace_path().to_path_buf();
-    let registry = match load_registry(&workspace) {
+    let registry = match load_registry(workspace) {
         Ok(registry) => registry,
-        Err(e) => {
-            report
-                .errors
-                .push(format!("read marketplace registry: {e}"));
-            return report;
-        }
+        Err(e) => return fail(format!("read marketplace registry: {e}")),
     };
     report.marketplaces = registry.marketplaces.len();
     if registry.marketplaces.is_empty() {
-        // No marketplaces → nothing can have an update. Clear any stale marker
-        // so a future re-registration starts from a clean slate.
-        write_notified_signature(&workspace, &BTreeSet::new());
-        return report;
+        // Nothing to clone, so skip the DB read and the blocking pass. The
+        // empty result still lands in the cache: a catalog that kept the last
+        // registry's plugins would offer plugins from nowhere.
+        let empty = MarketplaceCatalog {
+            marketplaces: vec![],
+            plugins: vec![],
+            errors: vec![],
+        };
+        record_scan_if_live(workspace, guard, &empty);
+        return Some(empty);
     }
 
-    let installed = match installed_plugin_summaries(&pool, &workspace).await {
+    let installed = match installed_plugin_summaries(pool, workspace).await {
         Ok(installed) => installed,
-        Err(e) => {
-            report.errors.push(format!("read installed plugins: {e}"));
-            return report;
-        }
+        Err(e) => return fail(format!("read installed plugins: {e}")),
     };
 
-    let scan_workspace = workspace.clone();
+    let scan_workspace = workspace.to_path_buf();
     let scan_registry = registry.clone();
     // The scan is synchronous, so its credentials are resolved out here.
-    let credentials = GitCredentials::resolve_many(&pool, &clone_urls(&registry)).await;
+    let credentials = GitCredentials::resolve_many(pool, &clone_urls(&registry)).await;
     let catalog = match tokio::task::spawn_blocking(move || {
         scan_catalog(&scan_workspace, &scan_registry, &installed, &credentials)
     })
     .await
     {
         Ok(catalog) => catalog,
-        Err(e) => {
-            report
-                .errors
-                .push(format!("scan marketplaces task panicked: {e}"));
-            return report;
-        }
+        Err(e) => return fail(format!("scan marketplaces task panicked: {e}")),
     };
+
+    record_scan_if_live(workspace, guard, &catalog);
+    Some(catalog)
+}
+
+/// Publish a result only while this scan still owns the slot.
+///
+/// A scan taken over past the stall cutoff finishes eventually, and its rows
+/// are older than the ones that replaced them. Writing them would stamp stale
+/// content as fresh and clear the live scan's own start stamp.
+fn record_scan_if_live(workspace: &Path, guard: &UpdateCheckGuard, catalog: &MarketplaceCatalog) {
+    if guard.still_held() {
+        plugin_catalog_cache::record_scan(workspace, catalog, Utc::now());
+    } else {
+        log!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
+    }
+}
+
+/// Broadcast one scan frame. Both variants are transient, so this reaches SSE
+/// and writes no row.
+async fn announce_scan(engine: &SharedEngine, event: SystemEvent, what: &str) {
+    engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::System(event),
+            &format!("[PluginUpdateCheck] PluginCatalogScan{what}"),
+        )
+        .await;
+}
+
+/// The boolean says whether this call HELD the slot, which is what decides who
+/// drains a pending claim. See [`SCAN_REQUEUE`].
+async fn check_marketplaces_for_updates(
+    engine: SharedEngine,
+    pool: sqlx::PgPool,
+) -> (PluginUpdateCheckReport, bool) {
+    if engine.is_shutting_down() {
+        return (PluginUpdateCheckReport::default(), false);
+    }
+    let Some(guard) = UpdateCheckGuard::try_acquire(Utc::now().timestamp()) else {
+        log!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
+        return (PluginUpdateCheckReport::default(), false);
+    };
+    // Cleared here, at the top of the pass that holds the slot, so everything
+    // below reads a registry newer than any claim already made.
+    SCAN_REQUEUE.store(false, Ordering::SeqCst);
+
+    let mut report = PluginUpdateCheckReport::default();
+    let workspace = engine.workspace_path().to_path_buf();
+
+    // The scan is the only producer of the plugin catalog cache, so it bookends
+    // itself: a start stamp, then either a result or a recorded failure. Both
+    // ends announce, which is what raises and lowers the Plugins panel's
+    // "Updating…" cue on every connected client. The stamp is re-taken here
+    // rather than trusted from `note_scan_queued`, so the scheduler's own run
+    // (which nobody queued) is stamped too.
+    note_scan_queued(&workspace);
+    announce_scan(&engine, SystemEvent::PluginCatalogScanStarted {}, "Started").await;
+
+    let scanned = scan_into_cache(&pool, &workspace, &guard, &mut report).await;
+
+    // A slot taken over mid-scan means a newer pass owns the cache and the cue.
+    // Announcing here would lower that pass's "Updating…" and send every client
+    // to re-read a result this one was not allowed to write.
+    if !guard.still_held() {
+        return (report, false);
+    }
+    announce_scan(
+        &engine,
+        SystemEvent::PluginCatalogScanned {
+            failed: scanned.is_none(),
+        },
+        "Scanned",
+    )
+    .await;
+
+    let Some(catalog) = scanned else {
+        return (report, true);
+    };
+    if catalog.marketplaces.is_empty() {
+        // No marketplaces → nothing can have an update. Clear any stale marker
+        // so a future re-registration starts from a clean slate.
+        write_notified_signature(&workspace, &BTreeSet::new());
+        return (report, true);
+    }
 
     for error in &catalog.errors {
         report.errors.push(format_scan_error(error));
@@ -166,7 +346,7 @@ async fn check_marketplaces_for_updates(
     if candidates.is_empty() {
         // Clear the marker so a future re-appearance of any version is "new".
         write_notified_signature(&workspace, &current);
-        return report;
+        return (report, true);
     }
 
     if !has_new {
@@ -177,7 +357,7 @@ async fn check_marketplaces_for_updates(
             "[PluginUpdateCheck] {} update(s) available; already notified",
             candidates.len()
         );
-        return report;
+        return (report, true);
     }
 
     let (title, message) = build_update_notification(&candidates);
@@ -214,7 +394,7 @@ async fn check_marketplaces_for_updates(
         }
     }
 
-    report
+    (report, true)
 }
 
 /// Title + body for the "updates available" notification. Singular and plural

@@ -115,6 +115,16 @@ repair was the only thing a cover refused, and the `covered` line survives it.
 the silence rather than removing it, and it pays for that on every page in every
 session. The transition costs nothing on a healthy page.
 
+**REAFFIRMED in round 20, after it was re-proposed and shipped.** That round cut
+`UNTOUCHED_QUIET_MS` from 3000 to 1000, citing this ADR as its authority, and
+review caught it. The user was asked again with the new episode in hand and kept
+3000. What was actually late was the scheduled PHASE, not this bound: the
+recovery waited for the next tick after the bound, so it landed three to six
+seconds in. A keystroke-armed debounce answers that and loosens nothing
+(`armKeystrokeNudge`, and
+[`docs/plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md`](../plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md)).
+Read this paragraph before proposing a faster tick or a smaller bound again.
+
 **Relayout on the keyboard OPEN as well.** Symmetrical and cheap. Rejected on
 the evidence: every episode with a keyboard reading opens on a close, and a
 layout per focus buys no reading anybody has asked for.

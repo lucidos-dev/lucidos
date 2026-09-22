@@ -916,7 +916,7 @@ A webhook is reported when it has refused at least three deliveries, and has bee
 
 The two cases are never described in the same words, and that matters more than it sounds. A switched-off webhook verified nothing, so its signature and its secret are fine and the fix is the Enable button. Reporting it as a signature problem sends you somewhere there is nothing to find.
 
-You see it as a bar across the app and a line on the webhook's own row in **Settings > Webhooks**. It clears when a delivery verifies, when you switch the webhook back on, when you delete it, or when nothing has arrived for a fortnight. It emits `WebhookDeliveriesRefused` and `WebhookDeliveriesRecovered` for a *trigger* to act on, and fixes nothing itself.
+You see it as a bar across the app and a line on the webhook's own row in **Settings > Webhooks**. The bar's **Discuss** button hands the whole declaration to the agent: which webhook, which of the two cases, how many deliveries and for how long. Use it for the verification case, where the answer is whether the secret here still matches the sender's. It clears when a delivery verifies, when you switch the webhook back on, when you delete it, or when nothing has arrived for a fortnight. It emits `WebhookDeliveriesRefused` and `WebhookDeliveriesRecovered` for a *trigger* to act on, and fixes nothing itself.
 See also: *webhook*, *ingress probe*, *trigger*.
 
 ### Workspace
@@ -1019,6 +1019,8 @@ Anthropic's coding-agent CLI; the default *coding agent* product Lucidos integra
 ### Codex
 OpenAI's coding-agent CLI; the second *coding agent* product Lucidos integrates. Modeled in code as `CodingAgent::Codex` (enum, wire value `"codex"`). Picked per thread via the coding-agent chip on the *compose destination* picker (default: *Claude Code*, remembered per workspace via the `coding_agent_default` preference); the choice is locked at the thread's first message — an existing thread can never switch backends. Codex sessions run inside an OS sandbox scoped to the thread's *worktree*, plus two deliberate extras: the workspace's `data/` tree (so `lucidos data write` works) and the worktree's shared git dir (so `git commit` works). Nothing else in the *workspace* is writable — not `.lucidos/`, not a sibling worktree. User questions work the same as for Claude Code (Codex asks via the `ask_user_question` tool and the answer renders as the usual question card); permission cards appear when a Codex command or file change needs to escalate past the sandbox (default protocol — the `exec` escape-hatch protocol instead runs non-interactively with the sandbox as the only guard). The Apply / Discard flow, *changes*, and *hardening* work the same as for Claude Code.
 
+A Codex command card is narrower than the sentence above suggests. Lucidos classifies the command first, and a plain read it recognises raises no card. See *coding-agent permission card*.
+
 ### Coding agent
 Role: a subprocess driving a *thread* to make code changes inside an isolated git *worktree* (dev). Lucidos integrates two coding agents: *Claude Code* (default) and *Codex*. Modeled in code as `CodingAgent` (enum). The thread it drives is a *coding-agent thread*; which agent drives it is chosen at the thread's first message and locked thereafter.
 
@@ -1029,6 +1031,8 @@ The name is fixed when the thread's branch is created. Renaming the thread after
 
 ### Coding-agent permission card
 The approval card a *coding-agent thread* shows when its agent wants to do something the engine won't wave through: Deny, Allow once, Allow for this thread, or Always allow. Until answered, the thread waits on the user. Most of the agent's work never reaches a card — anything it writes **inside its own worktree** is allowed automatically, because that worktree is disposable and you review every change in the diff before you Apply it. A card appears for a shell command the agent's own gate escalates, a write **outside** the worktree (somewhere else on your machine), or a write into the worktree's hidden `.git` folder — the one in-worktree place whose contents don't show up in the diff you review. **"Allow for this thread" is remembered for the life of that thread**, including across an Apply that restarts Lucidos; "Always allow" is remembered for every future thread, in an editable list under **Settings → Permissions**. A *trigger* fires unattended, so it never shows this card — see *side-effect grant*.
+
+One kind of escalated command is answered for you. When Codex asks to step outside its sandbox, Lucidos reads the command first. A plain read it recognises runs with no card. That is why a Codex thread watching a process no longer asks on every `ps`. Anything it cannot place as plainly safe still asks. So does anything reaching for another user's rights.
 
 **Working directories**, plural: the "outside" above is about those, not the worktree alone. Two folders join it. This workspace's `data` folder, holding artifacts, apps, knowhow and triggers, and the OS temp dir, for throwaway files. Reading or writing a file in either raises no card. A shell command still can, and four `cd` shapes always do. The `auto` *coding-agent permission mode* goes further still: Claude Code's own classifier approves routine actions, so most of the rest never reaches you.
 

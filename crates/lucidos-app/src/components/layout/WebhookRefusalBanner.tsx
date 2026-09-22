@@ -5,7 +5,9 @@ import {
   currentWebhookRefusals,
   loudestWebhookRefusal,
 } from '../../store/actions/webhookRefusals';
+import { discussWebhookRefusal } from '../../store/actions/webhook-refusal-discuss';
 import { openWebhookSettings } from '../../store/actions/menu';
+import { composeHandlers } from '../chat/promptFocus';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { webhookRefusalNotice } from '../../utils/webhookRefusalNotice';
 import { viewportIsMobile } from '../../utils/viewport';
@@ -44,11 +46,11 @@ export function otherRefusalsPhrase(refusals: WebhookRefusal[]): string | null {
  *  `connectionBannerBody` idiom). `elRef` lands on the bar ITSELF, so the flex
  *  child the shell lays out is the same box the ResizeObserver measures.
  *
- *  One button, and it is the one that reaches the fix. A switched-off hook is
- *  re-enabled from the Webhooks page in a single click, and a signature fault
- *  is repaired from the same row. There is no Discuss here, unlike the ingress
- *  bar: that fault needs a diagnosis worked out address by address, and this
- *  one already names its own cause.
+ *  Neither button repairs anything, and the bar names a SYMPTOM rather than a
+ *  cause. Nothing it can draw says whether the secret here differs from the
+ *  sender's hook config, or whether anything between them strips the header.
+ *  One button navigates to the page. The other hands the whole declaration to
+ *  the agent, which is where that comparison gets worked out.
  *
  *  Not dismissable. The bar retracts itself the moment a delivery verifies, so
  *  a dismiss would only hide a live loss of data.
@@ -60,10 +62,15 @@ export function refusalBannerBody(props: {
   refusal: WebhookRefusal | null;
   others: string | null;
   onOpenWebhooks: () => void;
+  onDiscuss: () => void;
   elRef?: Ref<HTMLDivElement>;
 }): VNode | null {
   if (!props.refusal) return null;
   const notice = webhookRefusalNotice(props.refusal);
+  // `composeHandlers` with NO focus nudge, the shape the ingress bar's Discuss
+  // uses. The wrapper is here for its touch and click dedup, and the iOS
+  // reason is written out in `IngressBanner.tsx`.
+  const discussHandlers = composeHandlers(props.onDiscuss, () => {});
   return (
     <div
       ref={props.elRef}
@@ -76,6 +83,9 @@ export function refusalBannerBody(props: {
         <b>{notice.title}</b>{' '}{notice.detail}
         {props.others ? ` ${props.others}` : ''}
       </span>
+      <button class="action-btn" {...discussHandlers}>
+        Discuss
+      </button>
       <button class="action-btn" onClick={props.onOpenWebhooks}>
         Open Webhooks
       </button>
@@ -106,6 +116,7 @@ export function WebhookRefusalBanner({ layout }: { layout: BannerLayout }) {
   // The shared clock, so the bar's age and every Webhooks row's agree exactly.
   const refusals = currentWebhookRefusals(useCoarseClock());
   const refusal = loudestWebhookRefusal(refusals);
+  const others = otherRefusalsPhrase(refusals);
   const show = shouldRenderRefusalBanner({
     layout,
     mobileViewport: viewportIsMobile.value,
@@ -119,8 +130,12 @@ export function WebhookRefusalBanner({ layout }: { layout: BannerLayout }) {
   return refusalBannerBody({
     layout,
     refusal,
-    others: otherRefusalsPhrase(refusals),
+    others,
     elRef: ref,
     onOpenWebhooks: openWebhookSettings,
+    // Non-null inside `show`. Both are read here so the message quotes the bar
+    // exactly as it draws it: the age it rendered, and the hooks it is not
+    // speaking for, which is the evidence one rotated secret broke them all.
+    onDiscuss: () => { void discussWebhookRefusal(refusal!, others); },
   });
 }

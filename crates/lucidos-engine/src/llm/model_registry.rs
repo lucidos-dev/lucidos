@@ -440,10 +440,19 @@ mod tests {
             provider_kind_for(&reg, "claude-opus-4-7[1m]"),
             ProviderKind::Vertex
         );
-        // Opus 5 and Sonnet 5 are not in the table here; the prefix heuristic
-        // routes any non-fable `claude-*` to Vertex, matching the seeded provider.
+        // The Opus and Sonnet rows are absent from the table here. The prefix
+        // heuristic routes any non-fable `claude-*` to Vertex, matching the
+        // seeded provider.
         assert_eq!(
             provider_kind_for(&reg, "claude-opus-5@default"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-opus-5-5"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-opus-5-5[1m]"),
             ProviderKind::Vertex
         );
         assert_eq!(

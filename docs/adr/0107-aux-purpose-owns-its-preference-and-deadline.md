@@ -85,6 +85,8 @@ never both.
 - The command guard's judge is an auxiliary call with NO purpose, so it emits no
   `ContextCaptured` and its tokens go unaccounted. The invariant does not cover
   it, and the module says so. Giving it a purpose is the obvious follow-up.
+  **Done in ADR 0242**, which took the other five silent calls with it and made
+  the invariant name why a purpose reads no preference.
 - Historical rows keep `purpose = memory`, including for summariser calls made
   before the split. `core::aux_context_backfill` deliberately grew no
   `ConversationSummary` arm: reconstructing old calls under the newer purpose

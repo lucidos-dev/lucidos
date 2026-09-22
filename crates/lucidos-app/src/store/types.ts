@@ -968,10 +968,23 @@ export interface MarketplaceScanError {
   error: string;
 }
 
+/** The Plugins panel's whole data source, from GET /plugins/catalog.
+ *
+ *  `marketplaces` is read live from the registry on every request, so it is
+ *  always current. `plugins` and `errors` come from the *plugin catalog cache*
+ *  and can be minutes old, which is why the last three fields exist: they are
+ *  what the panel shows instead of a skeleton. */
 export interface MarketplaceCatalog {
   marketplaces: PluginMarketplace[];
   plugins: MarketplacePlugin[];
   errors: MarketplaceScanError[];
+  /** RFC 3339, when the scan behind `plugins` finished. Null until one has. */
+  scanned_at: string | null;
+  /** A scan is running now, so these plugins may be about to change. */
+  scanning: boolean;
+  /** Why the last scan could not run at all. Distinct from `errors`, which is
+   *  per marketplace and still ships a usable catalog. */
+  scan_error: string | null;
 }
 
 /** Plugin install awaiting user confirmation in the install panel. Mirrors

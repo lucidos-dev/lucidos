@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { marketplaceCatalog, marketplaceScanning } from '../store';
 import { ApiError } from '../../api/client/_core';
+import type { MarketplaceCatalog } from '../types';
 
 // Mock the API client barrel. `fetchPluginCatalog` is the slow catalog scan
 // (clones every registered marketplace repo) that the bug surfaces on; the rest
@@ -26,19 +27,36 @@ import {
   removePluginMarketplaceAction,
 } from './plugin-marketplaces';
 
-const emptyCatalog = { marketplaces: [], plugins: [], errors: [] };
+/** A catalog response the way the engine sends it. Typed, so a new wire field
+ *  fails here instead of arriving as `undefined` in every test at once. */
+function catalogOf(over: Partial<MarketplaceCatalog> = {}): MarketplaceCatalog {
+  return {
+    marketplaces: [],
+    plugins: [],
+    errors: [],
+    scanned_at: '2026-09-22T10:00:00Z',
+    scanning: false,
+    scan_error: null,
+    ...over,
+  };
+}
 
-/** A scan whose resolution the test controls, so work can be done while one is
- *  genuinely in flight. Left unreleased, it stands in for the seconds a real
- *  scan spends cloning every registered marketplace. */
-function deferredCatalog(marketplaces: Array<{ id: string; name: string; source: string }>) {
+const emptyCatalog = catalogOf();
+
+/** A catalog fetch the test releases by hand. `scanning` is the engine's own
+ *  answer, which is what drives the panel's cue: the client no longer decides
+ *  it (see `loadPluginCatalog`). */
+function deferredCatalog(
+  marketplaces: Array<{ id: string; name: string; source: string }>,
+  scanning = false,
+) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   return {
     release,
     scan: async () => {
       await gate;
-      return { marketplaces, plugins: [], errors: [] };
+      return catalogOf({ marketplaces, scanning });
     },
   };
 }
@@ -104,12 +122,12 @@ describe('catalog refresh coalescing', () => {
     vi.useRealTimers();
   });
 
-  // The Store tab tells "no plugins" from "not scanned yet" off this flag. A dip
-  // between a scan and its trailing re-scan would flash "No plugins found" in
-  // the middle of one continuous scan.
-  it('holds the scanning flag up across the trailing re-scan', async () => {
-    const first = deferredCatalog([]);
-    const trailing = deferredCatalog([]);
+  // The Store tab tells "no plugins" from "not scanned yet" off this flag, and
+  // the engine is what knows: the scan runs on its scheduler, so a scan nobody
+  // here started still has to raise the cue. Every fetch carries the answer.
+  it('takes the scanning flag from the engine, not from its own fetch', async () => {
+    const first = deferredCatalog([], true);
+    const trailing = deferredCatalog([], false);
     mockFetchPluginCatalog
       .mockImplementationOnce(first.scan)
       .mockImplementationOnce(trailing.scan);
@@ -121,7 +139,7 @@ describe('catalog refresh coalescing', () => {
     await vi.runAllTimersAsync();
     await firstRefresh;
 
-    // The trailing scan is the one cloning now, so the flag must still be up.
+    // The engine said a scan was still running, so the cue stays up.
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(2);
     expect(marketplaceScanning.value).toBe(true);
 
@@ -142,13 +160,11 @@ describe('catalog refresh coalescing', () => {
     ]);
     mockFetchPluginCatalog
       .mockImplementationOnce(before.scan)
-      .mockResolvedValueOnce({
+      .mockResolvedValueOnce(catalogOf({
         marketplaces: [
           { id: 'm1', name: "Example's plugins", source: 'https://github.com/example-org/example-repo' },
         ],
-        plugins: [],
-        errors: [],
-      });
+      }));
 
     // Registration event: scan starts and reads the pre-rename registry.
     const first = refreshPluginCatalogAfterMutation();
@@ -172,7 +188,7 @@ describe('catalog refresh coalescing', () => {
     const gate = deferredCatalog([]);
     mockFetchPluginCatalog
       .mockImplementationOnce(gate.scan)
-      .mockResolvedValue({ marketplaces: [], plugins: [], errors: [] });
+      .mockResolvedValue(emptyCatalog);
 
     const first = refreshPluginCatalogAfterMutation();
     void refreshPluginCatalogAfterMutation();
@@ -194,7 +210,7 @@ describe('catalog refresh coalescing', () => {
     const gate = deferredCatalog([]);
     mockFetchPluginCatalog
       .mockImplementationOnce(gate.scan)
-      .mockResolvedValue({ marketplaces: [], plugins: [], errors: [] });
+      .mockResolvedValue(emptyCatalog);
 
     const first = refreshPluginCatalogAfterMutation();
     void loadPluginCatalog();
@@ -247,7 +263,10 @@ describe('a marketplace mutation shows its own result', () => {
     plugins: ReturnType<typeof plugin>[] = [],
     errors: Array<{ marketplace_id: string; marketplace_name: string; source: string; error: string }> = [],
   ) {
-    marketplaceCatalog.value = { status: 'loaded', data: { marketplaces, plugins, errors } };
+    marketplaceCatalog.value = {
+      status: 'loaded',
+      data: catalogOf({ marketplaces, plugins, errors }),
+    };
   }
 
   // A scan left unresolved would outlive its test: the in-flight handle is
@@ -298,6 +317,10 @@ describe('a marketplace mutation shows its own result', () => {
 
   // The registered marketplace is listed with no plugins under it yet. So the
   // Store tab must know a scan is running before it says "No plugins found".
+  //
+  // The engine stamps the scan as queued inside the registration itself, before
+  // it spawns the scanning task, so the refetch below cannot outrun it. That is
+  // what makes a server-owned flag safe here (`note_scan_queued`).
   it('reports a scan running from the registration until its catalog lands', async () => {
     loadedWith([OTHER_MARKETPLACE]);
     mockAddPluginMarketplace.mockResolvedValue({
@@ -306,13 +329,22 @@ describe('a marketplace mutation shows its own result', () => {
       created: true,
       commit: 'abc123',
     });
-    const scan = deferredCatalog([NEW_MARKETPLACE, OTHER_MARKETPLACE]);
-    mockFetchPluginCatalog.mockImplementation(scan.scan);
+    const scanning = deferredCatalog([NEW_MARKETPLACE, OTHER_MARKETPLACE], true);
+    const settled = deferredCatalog([NEW_MARKETPLACE, OTHER_MARKETPLACE], false);
+    mockFetchPluginCatalog
+      .mockImplementationOnce(scanning.scan)
+      .mockImplementationOnce(settled.scan);
 
     await addPluginMarketplaceAction(NEW_MARKETPLACE.source);
+    scanning.release();
+    await vi.runAllTimersAsync();
+
     expect(marketplaceScanning.value).toBe(true);
 
-    scan.release();
+    // The scan lands and the panel re-reads, which is the SSE arm's job in the
+    // real app and a plain refresh here.
+    void refreshPluginCatalog();
+    settled.release();
     await vi.runAllTimersAsync();
 
     expect(marketplaceScanning.value).toBe(false);
@@ -353,11 +385,7 @@ describe('a marketplace mutation shows its own result', () => {
     const stale = deferredCatalog([OTHER_MARKETPLACE]);
     mockFetchPluginCatalog
       .mockImplementationOnce(stale.scan)
-      .mockResolvedValue({
-        marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE],
-        plugins: [],
-        errors: [],
-      });
+      .mockResolvedValue(catalogOf({ marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] }));
     // The Plugins panel's own re-scan, already cloning when the user hits Add.
     void refreshPluginCatalog();
 
@@ -391,7 +419,7 @@ describe('a marketplace mutation shows its own result', () => {
     const stale = deferredCatalog([OTHER_MARKETPLACE]);
     mockFetchPluginCatalog
       .mockImplementationOnce(stale.scan)
-      .mockResolvedValue({ marketplaces: [renamed], plugins: [], errors: [] });
+      .mockResolvedValue(catalogOf({ marketplaces: [renamed] }));
     void refreshPluginCatalog();
 
     mockAddPluginMarketplace.mockResolvedValue({
@@ -422,11 +450,7 @@ describe('a marketplace mutation shows its own result', () => {
     const current = deferredCatalog([NEW_MARKETPLACE, OTHER_MARKETPLACE]);
     mockFetchPluginCatalog
       .mockImplementationOnce(current.scan)
-      .mockResolvedValue({
-        marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE],
-        plugins: [],
-        errors: [],
-      });
+      .mockResolvedValue(catalogOf({ marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] }));
     // The SSE frame this device's own registration produced, answered before
     // the POST resolved.
     void refreshPluginCatalogAfterMutation();

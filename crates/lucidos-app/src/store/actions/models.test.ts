@@ -92,6 +92,16 @@ describe('chatModelOptions', () => {
     );
   });
 
+  // Seeded at sort_order 2/3, between Fable 5 and Opus 5, so the newest Opus
+  // surfaces first while Opus 5 stays enabled below it.
+  it('offers Opus 5.5 above Opus 5', () => {
+    expect(MODELS).toContainEqual({ value: 'claude-opus-5-5', label: 'Opus 5.5' });
+    expect(MODELS).toContainEqual({ value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' });
+    expect(MODELS.findIndex((m) => m.value === 'claude-opus-5-5')).toBeLessThan(
+      MODELS.findIndex((m) => m.value === 'claude-opus-5@default'),
+    );
+  });
+
   it('returns only enabled models, mapped to {value,label}, when loaded', () => {
     chatModels.value = {
       status: 'loaded',
@@ -273,6 +283,17 @@ describe('displayModelName', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('claude-fable-5-1')).toBe('Fable 5.1');
     expect(displayModelName('claude-fable-5-1[1m]')).toBe('Fable 5.1 (1M)');
+  });
+
+  // `claude-opus-5` is a prefix of `claude-opus-5-5`, the same trap the Fable
+  // pair sets. It also covers the bare id Claude Code echoes for the
+  // `@default` row, which the registry knows only under the pinned spelling.
+  it('tells the two Opus 5 generations apart', () => {
+    chatModels.value = { status: 'not-loaded' };
+    expect(displayModelName('claude-opus-5-5')).toBe('Opus 5.5');
+    expect(displayModelName('claude-opus-5-5[1m]')).toBe('Opus 5.5 (1M)');
+    expect(displayModelName('claude-opus-5')).toBe('Opus 5');
+    expect(displayModelName('claude-opus-5[1m]')).toBe('Opus 5 (1M)');
   });
 
   it('prefers the loaded registry label for a user-added model', () => {

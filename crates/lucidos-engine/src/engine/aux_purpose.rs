@@ -1,6 +1,6 @@
 //! What an *auxiliary model call* resolves from its [`ContextPurpose`]: the
 //! *model selection* it runs under, and the wall-clock budget it runs inside.
-//! `ContextPurpose::Turn` has no entry, being an agent's own round trip.
+//! Four purposes read no preference pair, and [`AuxModelSource`] says why.
 //!
 //! **One purpose per auxiliary model preference.** The standing invariant this
 //! module exists to hold, enforced by
@@ -14,17 +14,21 @@
 //! unless the loop is wrapped. Title generation resamples twice and fact
 //! extraction three times, and both escaped a per-call bound until they were.
 //!
-//! **The command guard's judge has no purpose here**, and so no capture,
-//! though it spends real tokens. `engine::command_judge` reads its pair.
+//! **A purpose that reads no preference says WHICH kind it is.**
+//! [`AuxModelSource`] carries an arm per reason, and the invariant test asserts
+//! the membership of each. An `Option` said only "no pair". It could not tell a
+//! turn from a purpose with nothing to choose, so the second such purpose would
+//! have joined the first in silence.
 
 use std::time::Duration;
 
 use sqlx::PgPool;
 
 use crate::core::{
-    PreferenceStore, PREF_IMAGE_MODEL, PREF_MODEL_CONVERSATION_SUMMARY,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION,
-    PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER, PREF_REASONING_CONVERSATION_SUMMARY,
+    PreferenceStore, DEFAULT_COMMAND_JUDGE_REASONING, PREF_IMAGE_MODEL, PREF_MODEL_COMMAND_JUDGE,
+    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
+    PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
+    PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
     PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_QUERY_CLASSIFICATION,
     PREF_REASONING_TITLE,
 };
@@ -74,10 +78,44 @@ pub(crate) struct AuxSelection {
     pub(crate) reasoning: Option<String>,
 }
 
-/// The preference pair `purpose` reads, or `None` for `Turn`.
-pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
+/// Where one purpose's model comes from.
+///
+/// Three arms read no preference, for three different reasons, and the reason
+/// is what a reader needs. Collapsing them into one `Option` is what let the
+/// command guard's judge sit outside the invariant unnoticed.
+pub(crate) enum AuxModelSource {
+    /// An agent's own round trip, which is not an auxiliary call.
+    Turn,
+    /// Pinned to one backend, so there is nothing to choose. The `judge` tool
+    /// is Jev or nothing: unlike the two classification sites it has no chat
+    /// path to fall back to, so a model preference would name nothing.
+    BackendPinned,
+    /// Runs the agent's own chat model. It owns no preference, and no reachable
+    /// budget either: the call goes out through the agent's provider, under the
+    /// timeout that provider was built with.
+    AgentModel,
+    /// The pair the user sets.
+    Preferences(AuxModelPrefs),
+}
+
+impl AuxModelSource {
+    /// The pair, for a caller that only handles the settable case.
+    pub(crate) fn prefs(self) -> Option<AuxModelPrefs> {
+        match self {
+            Self::Preferences(prefs) => Some(prefs),
+            _ => None,
+        }
+    }
+}
+
+/// Where `purpose` gets its model.
+pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
     let prefs = match purpose {
-        ContextPurpose::Turn => return None,
+        ContextPurpose::Turn => return AuxModelSource::Turn,
+        ContextPurpose::JudgeTool => return AuxModelSource::BackendPinned,
+        ContextPurpose::IntentLoop
+        | ContextPurpose::MemoryCorrection
+        | ContextPurpose::ArtifactSummary => return AuxModelSource::AgentModel,
         ContextPurpose::Title => AuxModelPrefs {
             model_key: PREF_MODEL_TITLE,
             model_fallback_key: None,
@@ -139,8 +177,22 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
             model_fallback_key: None,
             reasoning: None,
         },
+        // Declared here so the uniqueness invariant covers the pair, but
+        // RESOLVED by `PreferenceStore::command_judge_model`, which the judge
+        // keeps calling. Its default is a named model where `AuxSelection`'s is
+        // the extractor's own, and moving it would change the safety gate's
+        // default model. The effort default is the same constant either way.
+        ContextPurpose::CommandJudge => AuxModelPrefs {
+            model_key: PREF_MODEL_COMMAND_JUDGE,
+            model_fallback_key: None,
+            reasoning: Some(AuxReasoningPref {
+                key: PREF_REASONING_COMMAND_JUDGE,
+                fallback_key: None,
+                default: DEFAULT_COMMAND_JUDGE_REASONING,
+            }),
+        },
     };
-    Some(prefs)
+    AuxModelSource::Preferences(prefs)
 }
 
 /// Read `purpose`'s *model selection* out of the preference store.
@@ -148,8 +200,11 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
 /// Total by construction. A missing row and a database error both resolve to
 /// the default. A background call that refuses to run over a preference read
 /// is strictly worse than one running at its default.
+///
+/// A purpose reading no preference gets the empty selection, which no such
+/// purpose asks for: each already knows its own provider.
 pub(crate) async fn resolve_selection(pool: &PgPool, purpose: ContextPurpose) -> AuxSelection {
-    let Some(prefs) = model_prefs(purpose) else {
+    let Some(prefs) = model_source(purpose).prefs() else {
         return AuxSelection {
             model: String::new(),
             reasoning: None,
@@ -256,18 +311,41 @@ const SHORT_CALL_BUDGET: AuxBudget = AuxBudget {
     attempt_timeout: Duration::from_secs(20),
 };
 
-/// The budget for an auxiliary call that has no [`ContextPurpose`] of its own.
-/// The command guard's judge is the only one, and the module doc says why.
-pub(crate) const UNCAPTURED_CALL_BUDGET: AuxBudget = SHORT_CALL_BUDGET;
+/// The `judge` tool's budget. It is the only auxiliary call an agent asks for
+/// by name, and the schema pushes it toward batches: a hundred questions in one
+/// request is the shape the tool exists for.
+///
+/// The attempt cap is generous for that reason. Jev retries nothing, so the cap
+/// is the whole call in practice, and the deadline is the outer bound the
+/// caller applies on top.
+const JUDGE_TOOL_BUDGET: AuxBudget = AuxBudget {
+    deadline: Duration::from_secs(75),
+    attempt_timeout: Duration::from_secs(60),
+};
 
 /// The budget `purpose` runs inside.
 ///
-/// `Turn` takes the short budget as an unreachable default: an agent's own
-/// round trip is not an auxiliary call and never asks.
+/// Exhaustive on purpose, with no wildcard arm. A new variant then fails the
+/// build here until somebody decides how long its call may take. ADR 0107
+/// promised that, and a `_` arm quietly took it back.
 pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
     match purpose {
         ContextPurpose::ConversationSummary => SUMMARY_BUDGET,
-        _ => SHORT_CALL_BUDGET,
+        ContextPurpose::JudgeTool => JUDGE_TOOL_BUDGET,
+        ContextPurpose::Title
+        | ContextPurpose::ImageDescribe
+        | ContextPurpose::Memory
+        | ContextPurpose::QueryClassification
+        | ContextPurpose::ImageGen
+        | ContextPurpose::CommandJudge => SHORT_CALL_BUDGET,
+        // Five that never ask. None is an auxiliary HTTP call this module
+        // times: a turn and the three `AgentModel` purposes run on the agent's
+        // own provider and its timeout, and the talker holds a socket.
+        ContextPurpose::Turn
+        | ContextPurpose::Voice
+        | ContextPurpose::IntentLoop
+        | ContextPurpose::MemoryCorrection
+        | ContextPurpose::ArtifactSummary => SHORT_CALL_BUDGET,
     }
 }
 
@@ -293,7 +371,8 @@ impl AuxCall {
     /// every production caller has a pool and must read what the user set.
     #[cfg(test)]
     pub(crate) fn defaults(purpose: ContextPurpose) -> Self {
-        let reasoning = model_prefs(purpose)
+        let reasoning = model_source(purpose)
+            .prefs()
             .and_then(|p| p.reasoning)
             .map(|r| r.default.to_string());
         Self {
@@ -335,6 +414,11 @@ const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::QueryClassification,
     ContextPurpose::ImageGen,
     ContextPurpose::Voice,
+    ContextPurpose::CommandJudge,
+    ContextPurpose::JudgeTool,
+    ContextPurpose::IntentLoop,
+    ContextPurpose::MemoryCorrection,
+    ContextPurpose::ArtifactSummary,
 ];
 
 #[cfg(test)]
@@ -355,29 +439,58 @@ mod tests {
                 | ContextPurpose::ConversationSummary
                 | ContextPurpose::QueryClassification
                 | ContextPurpose::ImageGen
-                | ContextPurpose::Voice => {}
+                | ContextPurpose::Voice
+                | ContextPurpose::CommandJudge
+                | ContextPurpose::JudgeTool
+                | ContextPurpose::IntentLoop
+                | ContextPurpose::MemoryCorrection
+                | ContextPurpose::ArtifactSummary => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 8);
+        assert_eq!(ALL_PURPOSES.len(), 13);
     }
 
     /// The invariant this module exists for. Two purposes sharing one model
     /// preference is exactly what made the summariser unnameable.
+    ///
+    /// Every arm is asserted, not just the settable one. A purpose reading
+    /// nothing must name which kind of nothing. So a new variant cannot join a
+    /// no-preference arm without a reviewer seeing the membership change.
     #[test]
     fn every_purpose_owns_exactly_one_model_preference() {
         let mut seen: Vec<&'static str> = vec![];
         for purpose in ALL_PURPOSES {
-            let Some(prefs) = model_prefs(*purpose) else {
-                assert_eq!(*purpose, ContextPurpose::Turn, "only Turn has no prefs");
-                continue;
-            };
-            assert!(
-                !seen.contains(&prefs.model_key),
-                "{:?} reuses the model preference {}",
-                purpose,
-                prefs.model_key
-            );
-            seen.push(prefs.model_key);
+            match model_source(*purpose) {
+                AuxModelSource::Turn => assert_eq!(
+                    *purpose,
+                    ContextPurpose::Turn,
+                    "a turn is the only thing that is not an auxiliary call"
+                ),
+                AuxModelSource::BackendPinned => assert_eq!(
+                    *purpose,
+                    ContextPurpose::JudgeTool,
+                    "the judge tool is the only backend-pinned purpose"
+                ),
+                AuxModelSource::AgentModel => assert!(
+                    matches!(
+                        purpose,
+                        ContextPurpose::IntentLoop
+                            | ContextPurpose::MemoryCorrection
+                            | ContextPurpose::ArtifactSummary
+                    ),
+                    "{:?} claims to run the agent's own model",
+                    purpose
+                ),
+                AuxModelSource::Preferences(prefs) => {
+                    assert!(
+                        !seen.contains(&prefs.model_key),
+                        "{:?} reuses the model preference {}",
+                        purpose,
+                        prefs.model_key
+                    );
+                    seen.push(prefs.model_key);
+                }
+            }
         }
     }
 
@@ -386,7 +499,7 @@ mod tests {
     fn every_reasoning_preference_belongs_to_one_purpose() {
         let mut seen: Vec<&'static str> = vec![];
         for purpose in ALL_PURPOSES {
-            let Some(reasoning) = model_prefs(*purpose).and_then(|p| p.reasoning) else {
+            let Some(reasoning) = model_source(*purpose).prefs().and_then(|p| p.reasoning) else {
                 continue;
             };
             assert!(
@@ -405,7 +518,7 @@ mod tests {
     #[test]
     fn every_reasoning_default_is_a_tier() {
         for purpose in ALL_PURPOSES {
-            let Some(reasoning) = model_prefs(*purpose).and_then(|p| p.reasoning) else {
+            let Some(reasoning) = model_source(*purpose).prefs().and_then(|p| p.reasoning) else {
                 continue;
             };
             assert!(
@@ -420,7 +533,9 @@ mod tests {
     /// Image generation renders no effort control, so it stores no effort.
     #[test]
     fn image_generation_has_no_reasoning_half() {
-        let prefs = model_prefs(ContextPurpose::ImageGen).expect("image generation reads a model");
+        let prefs = model_source(ContextPurpose::ImageGen)
+            .prefs()
+            .expect("image generation reads a model");
         assert!(prefs.reasoning.is_none());
     }
 
@@ -428,7 +543,9 @@ mod tests {
     /// of them has a `model_memory` value and no `model_conversation_summary`.
     #[test]
     fn the_summary_falls_back_to_the_memory_model() {
-        let prefs = model_prefs(ContextPurpose::ConversationSummary).expect("prefs");
+        let prefs = model_source(ContextPurpose::ConversationSummary)
+            .prefs()
+            .expect("prefs");
         assert_eq!(prefs.model_key, PREF_MODEL_CONVERSATION_SUMMARY);
         assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_MEMORY));
     }
@@ -439,7 +556,9 @@ mod tests {
     /// the model it already used.
     #[test]
     fn query_classification_falls_back_to_the_memory_model() {
-        let prefs = model_prefs(ContextPurpose::QueryClassification).expect("prefs");
+        let prefs = model_source(ContextPurpose::QueryClassification)
+            .prefs()
+            .expect("prefs");
         assert_eq!(prefs.model_key, PREF_MODEL_QUERY_CLASSIFICATION);
         assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_MEMORY));
     }
@@ -448,9 +567,46 @@ mod tests {
     /// classification only, and a fallback here would mean the key moved.
     #[test]
     fn fact_extraction_still_owns_the_memory_model() {
-        let prefs = model_prefs(ContextPurpose::Memory).expect("prefs");
+        let prefs = model_source(ContextPurpose::Memory).prefs().expect("prefs");
         assert_eq!(prefs.model_key, PREF_MODEL_MEMORY);
         assert_eq!(prefs.model_fallback_key, None);
+    }
+
+    /// The `judge` tool is Jev or nothing, so a model preference would name a
+    /// model nothing reads. It says that in the type rather than by absence.
+    #[test]
+    fn the_judge_tool_owns_no_model_preference() {
+        assert!(matches!(
+            model_source(ContextPurpose::JudgeTool),
+            AuxModelSource::BackendPinned
+        ));
+    }
+
+    /// The command guard declares the pair it reads, which is what brings it
+    /// under the uniqueness invariant. `PreferenceStore` still resolves it, so
+    /// the declared effort default must be the constant that store falls back
+    /// to. Two spellings of one default is the drift this catches.
+    #[test]
+    fn the_command_judge_declares_the_pair_it_reads() {
+        let prefs = model_source(ContextPurpose::CommandJudge)
+            .prefs()
+            .expect("the command judge reads a pair");
+        assert_eq!(prefs.model_key, PREF_MODEL_COMMAND_JUDGE);
+        assert_eq!(prefs.model_fallback_key, None);
+        let reasoning = prefs.reasoning.expect("it runs at an effort");
+        assert_eq!(reasoning.key, PREF_REASONING_COMMAND_JUDGE);
+        assert_eq!(reasoning.default, DEFAULT_COMMAND_JUDGE_REASONING);
+    }
+
+    /// The `judge` tool asks for batches, so its attempt cap is the generous
+    /// one its call site used before the budget moved here. Lowering it turns a
+    /// hundred-question request into a timeout.
+    #[test]
+    fn the_judge_tool_keeps_its_generous_attempt_cap() {
+        assert_eq!(
+            budget_for(ContextPurpose::JudgeTool).attempt_timeout,
+            Duration::from_secs(60)
+        );
     }
 
     /// Both halves inherit, or the split is only half invisible. A workspace
@@ -458,7 +614,8 @@ mod tests {
     /// falling straight to the default would quietly lower it.
     #[test]
     fn query_classification_inherits_the_memory_effort_too() {
-        let reasoning = model_prefs(ContextPurpose::QueryClassification)
+        let reasoning = model_source(ContextPurpose::QueryClassification)
+            .prefs()
             .and_then(|p| p.reasoning)
             .expect("query classification has a reasoning half");
         assert_eq!(reasoning.key, PREF_REASONING_QUERY_CLASSIFICATION);
@@ -469,7 +626,8 @@ mod tests {
     /// Inheriting `reasoning_memory` would LOWER it, so it has no fallback.
     #[test]
     fn the_summary_inherits_no_effort() {
-        let reasoning = model_prefs(ContextPurpose::ConversationSummary)
+        let reasoning = model_source(ContextPurpose::ConversationSummary)
+            .prefs()
             .and_then(|p| p.reasoning)
             .expect("the summary has a reasoning half");
         assert_eq!(reasoning.fallback_key, None);
@@ -481,10 +639,15 @@ mod tests {
     fn every_effort_fallback_names_an_effort_key() {
         let efforts: Vec<&'static str> = ALL_PURPOSES
             .iter()
-            .filter_map(|p| model_prefs(*p).and_then(|m| m.reasoning).map(|r| r.key))
+            .filter_map(|p| {
+                model_source(*p)
+                    .prefs()
+                    .and_then(|m| m.reasoning)
+                    .map(|r| r.key)
+            })
             .collect();
         for purpose in ALL_PURPOSES {
-            let Some(reasoning) = model_prefs(*purpose).and_then(|p| p.reasoning) else {
+            let Some(reasoning) = model_source(*purpose).prefs().and_then(|p| p.reasoning) else {
                 continue;
             };
             let Some(fallback) = reasoning.fallback_key else {
@@ -503,7 +666,8 @@ mod tests {
     /// the deadline fix can be judged on its own.
     #[test]
     fn the_summary_still_defaults_to_low() {
-        let reasoning = model_prefs(ContextPurpose::ConversationSummary)
+        let reasoning = model_source(ContextPurpose::ConversationSummary)
+            .prefs()
             .and_then(|p| p.reasoning)
             .expect("the summary has a reasoning half");
         assert_eq!(reasoning.default, "low");

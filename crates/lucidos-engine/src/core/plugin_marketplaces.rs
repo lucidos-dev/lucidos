@@ -66,7 +66,7 @@ pub struct InstalledPluginSummary {
     pub modified_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketplacePluginStatus {
     Available,
@@ -74,7 +74,13 @@ pub enum MarketplacePluginStatus {
     UpdateAvailable,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// One installable plugin, as a scan found it.
+///
+/// `Deserialize` is here for the *plugin catalog cache*
+/// (`core::plugin_catalog_cache`), which reads back what a scan wrote. Every
+/// `skip_serializing_if` field therefore also carries `default`, or a row that
+/// omitted one could not be read back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplacePlugin {
     pub marketplace_id: String,
     pub marketplace_name: String,
@@ -93,20 +99,21 @@ pub struct MarketplacePlugin {
     pub categories: Vec<String>,
     pub files_count: usize,
     pub status: MarketplacePluginStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     /// Setup thread spawned for this plugin at install (installed plugins that
     /// shipped a `setup` field only). The card's "Setup" button opens it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<String>,
     /// True once the setup thread has finished (no longer running or waiting on
     /// the user) — flips the card button from "Setup" to "Open". Filled by the
     /// catalog handler from thread state; always `false` for available plugins
     /// and for installs that spawned no setup thread.
+    #[serde(default)]
     pub setup_complete: bool,
     /// The plugin's primary app (`data/apps/<id>/`), if it ships one. The card's
     /// "Open" button launches it; `None` → nothing to open.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
     /// True when the user has locally modified the plugin's shipped content since
     /// install — overlaid from the matching installed summary. Always false for an
@@ -120,7 +127,7 @@ pub struct MarketplacePlugin {
     pub modified_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceScanError {
     pub marketplace_id: String,
     pub marketplace_name: String,
@@ -269,6 +276,49 @@ pub fn scan_catalog(
     }
 }
 
+/// Stamp one catalog row with what is installed on this workspace right now.
+///
+/// Every install-derived field is set here and nowhere else. So a scan and a
+/// re-served cache cannot disagree about whether a plugin is installed. That
+/// matters because the *plugin catalog cache* is minutes old. Its rows were
+/// scanned before the user's last install. A row still reading `Available`
+/// would offer an Install button for a plugin already on disk. Pass `None` for
+/// a plugin this workspace does not have.
+pub fn apply_installed_state(
+    plugin: &mut MarketplacePlugin,
+    installed: Option<&InstalledPluginSummary>,
+) {
+    plugin.status = match installed {
+        Some(inst)
+            if compare_versions(&inst.version, &plugin.version) == UpdateDecision::Update =>
+        {
+            MarketplacePluginStatus::UpdateAvailable
+        }
+        Some(_) => MarketplacePluginStatus::Installed,
+        None => MarketplacePluginStatus::Available,
+    };
+    plugin.installed_version = installed.map(|p| p.version.clone());
+    plugin.setup_thread_id = installed.and_then(|p| p.setup_thread_id.clone());
+    plugin.app_id = installed.and_then(|p| p.app_id.clone());
+    plugin.modified = installed.map(|p| p.modified).unwrap_or(false);
+    plugin.modified_paths = installed
+        .map(|p| p.modified_paths.clone())
+        .unwrap_or_default();
+}
+
+/// Re-stamp a whole catalog against the installed list, for a caller serving
+/// cached rows. See [`apply_installed_state`] for why this is not optional.
+pub fn apply_installed_state_to_catalog(
+    catalog: &mut MarketplaceCatalog,
+    installed: &[InstalledPluginSummary],
+) {
+    let by_id: BTreeMap<&str, &InstalledPluginSummary> =
+        installed.iter().map(|p| (p.id.as_str(), p)).collect();
+    for plugin in &mut catalog.plugins {
+        apply_installed_state(plugin, by_id.get(plugin.id.as_str()).copied());
+    }
+}
+
 pub fn update_candidates(catalog: &MarketplaceCatalog) -> Vec<MarketplacePlugin> {
     let mut by_plugin_id: BTreeMap<String, MarketplacePlugin> = BTreeMap::new();
 
@@ -361,18 +411,7 @@ fn scan_one_marketplace(
                 ),
             });
         }
-        let installed = installed_by_id.get(&manifest.id);
-        let status = match installed {
-            Some(inst)
-                if compare_versions(&inst.version, &manifest.version) == UpdateDecision::Update =>
-            {
-                MarketplacePluginStatus::UpdateAvailable
-            }
-            Some(_) => MarketplacePluginStatus::Installed,
-            None => MarketplacePluginStatus::Available,
-        };
-
-        out.push(MarketplacePlugin {
+        let mut plugin = MarketplacePlugin {
             marketplace_id: marketplace.id.clone(),
             marketplace_name: marketplace.name.clone(),
             id: manifest.id,
@@ -384,18 +423,21 @@ fn scan_one_marketplace(
             content,
             categories,
             files_count: planned.len(),
-            status,
-            installed_version: installed.map(|p| p.version.clone()),
-            setup_thread_id: installed.and_then(|p| p.setup_thread_id.clone()),
+            // Every install-derived field is filled by the one overlay below,
+            // so a served catalog and a fresh scan cannot disagree.
+            status: MarketplacePluginStatus::Available,
+            installed_version: None,
+            setup_thread_id: None,
             // Completion is a thread-state lookup the pure scan can't do; the
             // catalog handler fills it in after the scan returns.
             setup_complete: false,
-            app_id: installed.and_then(|p| p.app_id.clone()),
-            modified: installed.map(|p| p.modified).unwrap_or(false),
-            modified_paths: installed
-                .map(|p| p.modified_paths.clone())
-                .unwrap_or_default(),
-        });
+            app_id: None,
+            modified: false,
+            modified_paths: Vec::new(),
+        };
+        let installed = installed_by_id.get(&plugin.id).cloned();
+        apply_installed_state(&mut plugin, installed.as_ref());
+        out.push(plugin);
     }
 
     if out.is_empty() {

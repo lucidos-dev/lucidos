@@ -934,7 +934,8 @@ mod tests {
             crate::engine::ContextPurpose::ConversationSummary,
             crate::engine::ContextPurpose::QueryClassification,
         ] {
-            let reasoning = crate::engine::aux_purpose::model_prefs(purpose)
+            let reasoning = crate::engine::aux_purpose::model_source(purpose)
+                .prefs()
                 .and_then(|p| p.reasoning)
                 .expect("every background purpose has a reasoning half");
             let spec = lookup(reasoning.key)
@@ -976,7 +977,9 @@ mod tests {
             crate::engine::ContextPurpose::QueryClassification,
             crate::engine::ContextPurpose::ImageGen,
         ] {
-            let prefs = crate::engine::aux_purpose::model_prefs(purpose).expect("prefs");
+            let prefs = crate::engine::aux_purpose::model_source(purpose)
+                .prefs()
+                .expect("prefs");
             assert!(
                 lookup(prefs.model_key).is_some(),
                 "{} is read by {:?} but is not settable",

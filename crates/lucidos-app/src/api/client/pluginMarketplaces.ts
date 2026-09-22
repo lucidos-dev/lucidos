@@ -37,13 +37,22 @@ export function removePluginMarketplace(id: string): Promise<RemoveMarketplaceRe
   });
 }
 
+/** The plugin catalog. Two small file reads on the engine, no git work: the
+ *  scan runs on the scheduler and this serves what it left behind. So the
+ *  default timeout is right, where the old clone-per-request needed 30s. */
 export function fetchPluginCatalog(): Promise<MarketplaceCatalog> {
-  // The catalog scan shallow-clones every registered marketplace repo, so it can
-  // run well past the 10s default on a slow link — give it more headroom before
-  // the client aborts (a premature timeout flips the Loadable to a spurious
-  // "Failed to load plugin catalog"). The action layer retries a timeout anyway,
-  // but a fair first attempt avoids the user-visible retry delay.
-  return json(`${API}/plugins/catalog`, undefined, 30000);
+  return json(`${API}/plugins/catalog`);
+}
+
+/** Ask for a fresh marketplace scan. Returns once the scan is QUEUED, not once
+ *  it lands: the result arrives as a `PluginCatalogScanned` frame. A scan
+ *  already running absorbs the request engine-side. */
+export function rescanPluginCatalog(): Promise<{ queued: boolean }> {
+  return json(`${API}/plugins/catalog/rescan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
 }
 
 /** Installed plugins from the event projection (no marketplace scan). Backs the

@@ -995,7 +995,33 @@ export function SettingsView() {
     const judgeOn = currentCommandGuardJudge();
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="command-safety">Command safety</div>
+        {/* On the section title, not on the Command guard row: the copy is
+            about what the whole section reaches, and the LLM judge below now
+            reaches one thing the guard's own tools do not. Matches the two
+            allowlist sections under it, which also explain from their title. */}
+        <div class="settings-section-title" data-search-anchor="command-safety">
+          Command safety
+          <Explainer title="Command safety">
+            <p>
+              The command guard gates the <strong>Lucidos Agent's</strong> own shell and
+              Python tools, in chat and in triggers. It classifies each command before it
+              runs. In chat a risky one asks you first. A trigger has nobody to ask, so it
+              runs against the side-effect grant it declared, and fails when that grant
+              does not cover the command. With the guard off it classifies nothing, and
+              every command the agent runs goes straight through.
+            </p>
+            <p>
+              It does not gate a coding agent's tools. Claude Code asks through its own
+              permissions list below. Codex asks when a command has to escape its sandbox.
+              Lucidos answers the plain reads for you, whatever these toggles say.
+            </p>
+            <p>
+              The <strong>LLM judge</strong> places the commands the static check cannot.
+              That is where it reaches past the Lucidos Agent: it can answer an unusual
+              Codex sandbox escape too. Turn the guard off and those ask you instead.
+            </p>
+          </Explainer>
+        </div>
         <div class="settings-row" data-search-anchor="command-safety:guard">
           <span class="settings-row-label">Command guard</span>
           <LoadableToggle

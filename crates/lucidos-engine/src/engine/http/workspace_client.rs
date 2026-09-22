@@ -151,8 +151,8 @@ pub struct CrossWorkspaceSpawn<'a> {
 /// Build the `/api/v1/chat/stream` body for a cross-workspace coding-agent spawn.
 ///
 /// Pre-generates `thread_id` (caller-supplied) so the caller can return a
-/// workspace-qualified link without a second request. Mirrors `lucidos
-/// spawn-thread --cc` / `--codex` body shape (see
+/// workspace-qualified link without a second request. Mirrors the body shape of
+/// `lucidos spawn-thread --coding-agent <backend>` (see
 /// `crates/lucidos-cli/src/spawn_thread.rs`) so both paths land equivalent
 /// threads in the receiving engine.
 pub(crate) fn build_cross_workspace_coding_agent_body(

@@ -105,6 +105,25 @@ fn a_response_reads_back_as_answers_and_usage() {
     assert_eq!(judgment.usage.output_tokens, 48);
 }
 
+/// The request asks for an alias and the response names the version that
+/// answered. The caller records the version, so one model keeps one line in a
+/// cost rollup instead of opening a second under its alias.
+#[test]
+fn the_response_names_the_version_that_answered() {
+    let body = r#"{"model":"jev-1.13.0","answers":{},"usage":{"input_tokens":5}}"#;
+    let judgment = parse_response(body).expect("a readable response");
+    assert_eq!(judgment.model.as_deref(), Some("jev-1.13.0"));
+    assert_ne!(judgment.model.as_deref(), Some(JEV_DEFAULT_MODEL));
+}
+
+/// A response naming no model leaves the caller to fall back to the alias it
+/// asked for. Inventing a version here would be a guess about what ran.
+#[test]
+fn a_response_naming_no_model_reads_as_none() {
+    let judgment = parse_response(r#"{"answers":{}}"#).expect("a readable response");
+    assert_eq!(judgment.model, None);
+}
+
 /// One answer the enum cannot read must not cost the caller the others. The
 /// caller sees the unreadable id as absent, which is the case it already
 /// handles.

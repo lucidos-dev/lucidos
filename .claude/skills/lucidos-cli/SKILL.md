@@ -187,9 +187,9 @@ discarded (ADR 0106). It is not final: you will wake and may commit again. So
 park freely, but do not tell the user their change is ready to Apply until you
 have stopped watching.
 
-### `lucidos spawn-thread --to <ws> [--relation child|top] [--cc] [--repo <name>] --message <text> --title <text>`
+### `lucidos spawn-thread --to <ws> [--relation child|top] [--coding-agent <backend>] [--repo <name>] --message <text> --title <text>`
 
-Spawn a new Lucidos thread (chat or Claude Code session). Use this when:
+Spawn a new Lucidos thread (chat or coding-agent session). Use this when:
 
 - The user asks you to send a task to another workspace ("send to dev", "do this in test ws") → omit `--relation` (default `top`, cross-workspace fire-and-forget)
 - The user asks for the work to live as its own top-level thread in *this* workspace — they'll follow it themselves → `--relation top` against the same workspace
@@ -223,10 +223,11 @@ Unknown repo names return a 400 from the receiving engine, surfaced as a clean C
 
 #### Examples
 
-Same-workspace CC child thread (parent-with-callback) — inherits caller's repo automatically:
+Same-workspace coding-agent child thread (parent-with-callback), inheriting the caller's repo automatically:
 
 ```bash
-lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
+lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" \
+  --coding-agent claude-code \
   --message "task description here" --title "Short title"
 ```
 
@@ -237,18 +238,27 @@ lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" \
   --message "question or task" --title "Short title"
 ```
 
-Same-workspace CC top-thread (user follows it themselves, no callback):
+Same-workspace coding-agent top-thread (user follows it themselves, no callback):
 
 ```bash
-lucidos spawn-thread --relation top --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
+lucidos spawn-thread --relation top --to "$(basename "$LUCIDOS_WORKSPACE")" \
+  --coding-agent claude-code \
   --message "task description" --title "Short title"
 ```
 
-Cross-workspace CC spawn into a specific repo (top, no callback — `--relation top` is the default for cross-workspace so omitted here):
+Cross-workspace coding-agent spawn into a specific repo. `--relation top` is the default for cross-workspace, so it is omitted here:
 
 ```bash
-lucidos spawn-thread --to myws --cc --repo example-repo \
+lucidos spawn-thread --to myws --coding-agent claude-code --repo example-repo \
   --message "task description" --title "Short title"
+```
+
+Pin the thinking level for one spawn, ahead of the backend's own default:
+
+```bash
+lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" \
+  --coding-agent claude-code --reasoning-effort max \
+  --message "Explore three designs and argue for one." --title "Ideation"
 ```
 
 The CLI prints a `[title](thread:workspace/uuid)` markdown link on stdout — include it verbatim in your response so the user can click through to the spawned thread.
@@ -260,11 +270,12 @@ The CLI prints a `[title](thread:workspace/uuid)` markdown link on stdout — in
 | `--to <name\|path>` | **Required.** Target workspace name (resolved against `~/workspaces/<name>` or `$LUCIDOS_WORKSPACES_ROOT`) or absolute path. |
 | `--message <text>` | **Required.** Task prompt — must be self-contained; the spawned session has zero context from yours. |
 | `--title <text>` | **Required in practice** — the thread list shows titles, not message text. |
-| `--cc` | Spawn a Claude Code session instead of a chat thread. Use for any code changes; chat threads are for research/questions. |
+| `--coding-agent <backend>` | Spawn a coding-agent session instead of a chat thread: `claude-code` or `codex`. Use for any code changes; chat threads are for research/questions. `--cc` and `--codex` are legacy shorthands for the two backends. |
 | `--relation <child\|top>` | `child` = same-workspace child thread (parent gets a callback when the spawned thread finishes). `top` (default) = independent top-level thread, no callback. (`sub` is accepted as a back-compat alias for `child`.) |
 | `--parent` | DEPRECATED alias for `--relation child`. Still works; prints a stderr warning. |
 | `--repo <name>` | Repo (name or UUID) the spawned worktree is created from. Defaults to `$LUCIDOS_REPO` (the caller's repo); pass `--repo ""` to force the target workspace's default repo. |
-| `--cc-model <m>` | Optional CC model (`sonnet`, `opus`, `haiku`). |
+| `--coding-agent-model <m>` | Optional coding-agent model, either backend (`sonnet`, `opus`, `gpt-5.6-sol`). `--cc-model` is the old name, still accepted. |
+| `--reasoning-effort <level>` | Optional thinking level for the coding agent: `low`, `medium`, `high`, `xhigh`, `max`. Overrides the backend's own default for this spawn only. Needs a coding-agent flag. Codex offers `max` on the GPT-5.6 models only, so `--coding-agent codex --reasoning-effort max` also needs `--coding-agent-model` naming one of them. The CLI refuses the spawn otherwise. |
 | `--model <m>` | Optional chat model. |
 | `--mode <m>` | Override actor mode (defaults to `agent`, correct for CC-driven spawns). |
 
@@ -281,7 +292,7 @@ The spawned session is a fresh CC instance in a different worktree with none of 
 
 - **Always ask the user before spawning** — never create threads without approval.
 - **Default to fixing in-thread, not spawning.** A related bug discovered mid-task belongs in the current changeset unless it's cross-repo, would balloon the changeset past reviewable size, or the user explicitly asked for a separate thread. Don't reflexively offer a sub-thread for every adjacent fix — just do it.
-- **Bug tickets and fixes → always `--cc`.** Plain chat threads are only for research/questions/planning with no code changes expected.
+- **Bug tickets and fixes → always `--coding-agent`.** Plain chat threads are only for research/questions/planning with no code changes expected.
 - **Cross-workspace is fire-and-forget.** Do not promise the user "I'll let you know when it's done" — you have no way to know. Tell them the thread was created in the target workspace and they can check there.
 
 ## Common pattern: write an artifact and announce completion

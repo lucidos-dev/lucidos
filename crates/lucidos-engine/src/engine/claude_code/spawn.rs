@@ -307,14 +307,11 @@ impl LucidosEngine {
                 .expect("pending_app_spawn poisoned");
             guard.insert(cc_thread_id, a.clone());
         }
-        let explicit_title = caller_title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string);
-        let has_explicit_title = explicit_title.is_some();
-        let initial_title =
-            explicit_title.unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
+        // Naming is decided here and carried out by `process_message_with_steps`
+        // below, which writes the caller's name after the thread's row exists.
+        // A title this spawn emitted itself would land before the row and be
+        // dropped.
+        let naming = crate::engine::chat::spawn_naming(caller_title.as_deref(), &prompt);
 
         let engine = self;
         let prompt_owned = prompt;
@@ -323,61 +320,9 @@ impl LucidosEngine {
         let repo_id_owned = repo_id;
 
         {
-            // Emit placeholder title + spawn LLM title gen. Matches
-            // `spawn_thread` (chat parallel) — the placeholder shows up
-            // before the LLM-generated title arrives, and
-            // `process_message_with_steps`' follow-up title gen sees
-            // `thread_has_title=true` and skips its own LLM call.
-            if let Err(e) = engine
-                .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id: cc_thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::ThreadTitleGenerated {
-                        title: initial_title.clone(),
-                    },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
-                })
-                .await
-            {
-                log!("[ClaudeCode] Failed to emit title: {}", e);
-            }
-
-            // Generate the LLM title unless the caller supplied one. Built
-            // here in the async task (rather than synchronously before the
-            // spawn) so it can honor the `model_title` preference, matching
-            // the chat path; an unset/empty preference falls back to the
-            // extractor's default model.
-            if !has_explicit_title {
-                if let Some(ref extractor) = engine.extractor {
-                    match crate::engine::title_call(&engine.pool, extractor).await {
-                        Ok(call) => {
-                            let bus = engine.event_bus.clone();
-                            let msg = prompt_owned.clone();
-                            tokio::spawn(async move {
-                                // Title is text-only: CC threads never generate
-                                // image descriptions (no ImageDescribed event),
-                                // so there's none to fold in even when the
-                                // prompt carried images.
-                                crate::engine::chat::emit_generated_title(
-                                    &bus,
-                                    &call,
-                                    cc_thread_id,
-                                    &msg,
-                                    None,
-                                    None,
-                                    0,
-                                )
-                                .await;
-                            });
-                        }
-                        Err(e) => {
-                            log!("[ClaudeCode] Failed to build title provider: {}", e)
-                        }
-                    }
-                }
-            }
-
             // Transient: parent's UI immediately renders the new CC sub-thread.
+            // It carries the placeholder because the thread has no row yet, so
+            // nothing durable can hold a name for it either.
             engine
                 .event_bus
                 .emit_or_log(
@@ -386,7 +331,7 @@ impl LucidosEngine {
                         event:
                             crate::engine::thread_events::ThreadEvent::CodingAgentThreadSpawned {
                                 cc_thread_id: cc_thread_id.to_string(),
-                                title: initial_title,
+                                title: naming.placeholder,
                                 coding_agent,
                             },
                         meta: crate::engine::thread_events::EventMeta::NONE,
@@ -434,7 +379,10 @@ impl LucidosEngine {
                     model.as_deref(),
                     Some(coding_agent),
                     None, // pre_emitted_origin — router emits MR itself
-                    None, // title — already emitted placeholder above
+                    // The caller's chosen name. `maybe_emit_titles` writes it
+                    // after `MessageReceived` creates the row, and skips the
+                    // title model. `None` here reads as "nobody named this".
+                    naming.caller_title.as_deref(),
                     origin,
                     None,
                     crate::engine::FollowUpUrgency::Normal,

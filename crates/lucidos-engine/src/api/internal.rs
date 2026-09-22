@@ -80,6 +80,9 @@ pub(super) async fn permission_prompt(
         &state.engine.trigger_configs,
         &state.workspace_path,
         worktree_path.as_deref(),
+        // Claude Code's lane. The escalation classifier is Codex-only, so this
+        // path never reaches its LLM half and needs no judge handle.
+        None,
         CodingAgentPermissionInput {
             thread_id,
             tool_use_id: body.tool_use_id,

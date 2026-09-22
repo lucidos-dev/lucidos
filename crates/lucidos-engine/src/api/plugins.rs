@@ -22,9 +22,9 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::core::git_auth::GitCredentials;
+use crate::core::plugin_catalog_cache;
 use crate::core::plugin_marketplaces::{
-    clone_urls, load_registry, scan_catalog, InstalledPluginSummary, MarketplaceCatalog,
+    apply_installed_state_to_catalog, load_registry, InstalledPluginSummary, MarketplaceCatalog,
     PluginMarketplace,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
@@ -242,9 +242,36 @@ pub(super) async fn remove_marketplace_handler(
     }))
 }
 
+/// The catalog plus what a client needs to say how fresh it is.
+///
+/// Flattened, so the wire shape stays the one object the frontend's
+/// `MarketplaceCatalog` mirrors. `MarketplaceCatalog` itself stays a pure scan
+/// result: freshness is a property of the answer, not of the scan.
+#[derive(Debug, Serialize)]
+pub(super) struct CatalogResponse {
+    #[serde(flatten)]
+    catalog: MarketplaceCatalog,
+    /// When the scan behind `plugins` finished. Absent until the first one has.
+    scanned_at: Option<String>,
+    /// A scan is running now, so these plugins may be about to change.
+    scanning: bool,
+    /// Why the last scan could not run at all. Distinct from `errors`, which is
+    /// per marketplace and still ships a usable catalog.
+    scan_error: Option<String>,
+}
+
+/// `GET /api/v1/plugins/catalog`, serving the Plugins panel and Settings.
+///
+/// **Does no git work.** It reads the *plugin catalog cache* and the registry,
+/// both small files, and returns. A scan clones every registered marketplace,
+/// so running one per request is what made both pages take seconds to paint
+/// (`docs/plans/2026-09-22-plugin-catalog-served-from-cache.md`).
+///
+/// A stale or absent cache starts a scan in the background and answers anyway.
+/// The scan announces when it lands, and the client re-reads then.
 pub(super) async fn catalog(
     State(state): State<AppState>,
-) -> Result<Json<MarketplaceCatalog>, (StatusCode, Json<JsonValue>)> {
+) -> Result<Json<CatalogResponse>, (StatusCode, Json<JsonValue>)> {
     let registry = load_registry(&state.workspace_path).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -259,21 +286,62 @@ pub(super) async fn catalog(
                 &format!("read installed plugins: {e}"),
             )
         })?;
-    let workspace_path = state.workspace_path.clone();
-    // The scan is synchronous, so its credentials are resolved out here.
-    let credentials = GitCredentials::resolve_many(&state.pool, &clone_urls(&registry)).await;
-    let mut catalog = tokio::task::spawn_blocking(move || {
-        scan_catalog(&workspace_path, &registry, &installed, &credentials)
-    })
-    .await
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("scan marketplaces: {e}"),
-        )
-    })?;
+    let cached = plugin_catalog_cache::load(&state.workspace_path);
+    let now = chrono::Utc::now();
+
+    let due = plugin_catalog_cache::needs_rescan(&cached, now);
+    if due {
+        spawn_rescan(&state);
+    }
+    // A scan this request just queued counts as running. Otherwise a cold
+    // workspace answers "nothing cached, nothing scanning", which the panel
+    // renders as "No plugins found".
+    let scanning = due || plugin_catalog_cache::scan_is_running(cached.scan_started_at, now);
+
+    let mut catalog = plugin_catalog_cache::merge_with_registry(&cached, &registry);
+    // Two overlays, both live state a minutes-old scan cannot have known.
+    // Without the first, a plugin installed since the last scan keeps offering
+    // its Install button until the next one lands.
+    apply_installed_state_to_catalog(&mut catalog, &installed);
     mark_setup_complete(&state.pool, &mut catalog).await;
-    Ok(Json(catalog))
+    Ok(Json(CatalogResponse {
+        catalog,
+        scanned_at: cached.scanned_at.map(|t| t.to_rfc3339()),
+        scanning,
+        scan_error: cached.scan_error,
+    }))
+}
+
+/// `POST /api/v1/plugins/catalog/rescan`, the panel's manual refresh.
+///
+/// Returns as soon as the scan is queued. A scan already running absorbs the
+/// request through the same single-flight guard the scheduler uses, so leaning
+/// on the button cannot stack clone passes.
+pub(super) async fn rescan_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
+    let _actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    spawn_rescan(&state);
+    Ok(Json(serde_json::json!({ "queued": true })))
+}
+
+/// Kick off a marketplace scan without waiting for it.
+///
+/// The cache is stamped BEFORE the spawn, so this request and the next one both
+/// already know a scan is under way. See `note_scan_queued`.
+fn spawn_rescan(state: &AppState) {
+    crate::scheduler::plugin_updates::note_scan_queued(&state.workspace_path);
+    let engine = state.engine.clone();
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
+            engine,
+            pool,
+            crate::scheduler::plugin_updates::ScanCause::Routine,
+        )
+        .await;
+    });
 }
 
 /// `GET /api/v1/plugins/installed` — the Plugins → Installed list. Unlike
@@ -691,6 +759,7 @@ pub(super) fn router() -> Router<AppState> {
             delete(remove_marketplace_handler),
         )
         .route("/plugins/catalog", get(catalog))
+        .route("/plugins/catalog/rescan", post(rescan_catalog))
         .route("/plugins/installed", get(installed))
         .route("/plugins/install-request", post(stage_install))
         .route("/plugins/uninstall-request", post(stage_uninstall))

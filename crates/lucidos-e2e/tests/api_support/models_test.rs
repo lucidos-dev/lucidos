@@ -418,6 +418,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
     for id in [
         "claude-fable-5-1[1m]",
         "claude-fable-5[1m]",
+        "claude-opus-5-5[1m]",
         "claude-opus-5@default[1m]",
         "claude-opus-4-8@default[1m]",
         "claude-opus-4-7[1m]",
@@ -449,6 +450,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
     for id in [
         "claude-fable-5-1",
         "claude-fable-5",
+        "claude-opus-5-5",
         "claude-opus-5@default",
         "claude-opus-4-8@default",
         "claude-opus-4-7",

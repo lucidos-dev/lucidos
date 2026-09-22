@@ -274,9 +274,13 @@ That container is the **glibc 2.35 floor**. A binary built on the raw 24.04 runn
 
 `release_draft_wait_then_publish` is where the two meet, so both Phase B entry points get it from one function. It calls `release_draft_attach_from_rc_run` first and then waits exactly as before. **The pin is the commit.** `release_tarball_rc_run_id` returns a run only when its `head_sha` equals the object being published and its head branch begins `rc/`. It re-asserts the `head_sha` the caller already filtered on, so a filter that silently stops applying cannot promote an unrelated build. Then it proves the bytes: every expected name resolves to exactly one file, and every tarball verifies against the sidecar its own build wrote.
 
+**A run still BUILDING is waited for, not thrown away (v0.39.1).** The adopt verdict refused anything but a completed success. A check-window miss therefore cost Phase B a four-triple rebuild: 38 of its 40 minutes, for a run that was nearly done.
+
+`release_tarball_rc_run_resolve` polls a `queued` or `in_progress` run to completion, bounded by `RELEASE_TARBALL_RC_WAIT_SECS` (default 1200 s). The ceiling is the rebuild it replaces, measured at 34 to 38 minutes, so waiting can never be the slower choice. **It widens nothing.** The wait starts only when exactly one rc run matches the published commit. Adoption still goes through `release_tarball_rc_run_id`, so every refusal above still refuses, and a terminal conclusion costs no poll.
+
 **The updater trio has no route from CI onto a release.** The uploaded set is derived from `release_draft_expected_assets`, which names only the eight tarball assets. Anything else in the downloaded artifact is reported and left where it is.
 
-**Every refusal is a fallback, never a failed release.** No rc run, a run still going, a failed one, expired artifacts, a sha256 that does not verify, a missing platform: each says why, and the tag-triggered wait takes over unchanged. Degrade to slow, never to wrong.
+**Every refusal is a fallback, never a failed release.** No rc run, a run that failed, expired artifacts, a sha256 that does not verify, a missing platform. A run still building when the wait budget runs out joins them. Each says why, and the tag-triggered wait takes over unchanged. Degrade to slow, never to wrong.
 
 Two consequences hold that together. `release_tarball_run_verdict` **ignores `rc/`-branch runs**, because both runs carry the same head commit. A finished rc run beside an unregistered tag run would otherwise read as success-with-nothing-attached, and dispatch a needless backfill.
 
@@ -343,6 +347,29 @@ exactly how the 2026-07-28 leak came back.
    See ADR 0036, which also covers why `dmg-verify` must keep
    `permissions: contents: write` (a draft is invisible to a `contents: read`
    token).
+
+**That dispatch must ARRIVE WITH ITS REASON when it fails (v0.39.1).** It sent
+gh's stderr to `/dev/null`, so Phase A died on "Could not dispatch the DMG gate"
+and nothing else. The identical command then worked from a shell seconds later,
+and nobody can say why. `dispatch_dmg_verify` now prints gh's own words, and
+classifies them through `release_dispatch_failure_class`, the one definition it
+shares with `release_draft_backfill_dispatch`. Structural exits 2 and is
+attempted once. Retryable exits 1 after four attempts with growing sleeps, sized
+for a ref the Actions endpoint has not caught up with yet.
+
+**One verdict is overruled, and only one.** A dispatch answering `No ref found
+for: <ref>` is a 422, so the shared classifier calls it structural. It cannot
+know better, because it has no probe. This caller does, and an absent ref has
+already returned by then, so git holds the ref and the Actions endpoint is
+merely behind. That 422 is therefore retried. Any other 422 stays structural and
+still costs one attempt.
+
+It also asks `release_ref_state` first, so a ref that is genuinely absent is
+reported as one. The honest 422 for that case is `No ref found for: <ref>`,
+which reads like a gh problem and is not one. An **unknown** probe answer never
+blocks the dispatch: a read-only diagnostic may not become a new way to fail a
+release. The severity split is unchanged, and it lives in the callers: fatal in
+Phase A, a warning in `--attach-notarized`.
 
 A **notarize resume** reaches both steps too. **`release.sh --push-rc <version>`**
 re-arms the gate from the recorded release commit with no rebuild (a failed

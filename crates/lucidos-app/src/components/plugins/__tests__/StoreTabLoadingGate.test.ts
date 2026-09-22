@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { emptyCatalogMessage, pluginRowsSettled } from '../StoreTab';
+import { loadingIfFresh } from '../../../store/types';
 import type { Loadable } from '../../../store/types';
 
 const NOT_LOADED: Loadable<unknown> = { status: 'not-loaded' };
@@ -40,6 +41,26 @@ describe('pluginRowsSettled — the loading-skeleton gate for the Plugins list',
     expect(pluginRowsSettled(NOT_LOADED, NOT_LOADED)).toBe(false);
     expect(pluginRowsSettled(NOT_LOADED, LOADED)).toBe(false);
     expect(pluginRowsSettled(LOADED, NOT_LOADED)).toBe(false);
+  });
+});
+
+// Stale-while-revalidate: a refresh must never raise the skeleton over rows the
+// client is already holding. The two halves compose, so test them composed.
+// `loadingIfFresh` is what keeps a re-fetched Loadable at `loaded`, and the gate
+// above is what reads it.
+describe('a refresh never covers rows the panel already holds', () => {
+  it('stays settled while an already-loaded catalog re-fetches', () => {
+    expect(pluginRowsSettled(loadingIfFresh(LOADED), loadingIfFresh(LOADED))).toBe(true);
+  });
+
+  it('still shows the skeleton on a genuinely cold load', () => {
+    expect(pluginRowsSettled(loadingIfFresh(NOT_LOADED), loadingIfFresh(NOT_LOADED))).toBe(false);
+  });
+
+  // Half-warm: the fast installed list is cached, the catalog is not. The panel
+  // owes a skeleton, because the rows it could draw are not their final shape.
+  it('shows the skeleton when only one source is warm', () => {
+    expect(pluginRowsSettled(loadingIfFresh(NOT_LOADED), loadingIfFresh(LOADED))).toBe(false);
   });
 });
 

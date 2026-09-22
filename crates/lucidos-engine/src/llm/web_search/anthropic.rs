@@ -240,6 +240,8 @@ mod tests {
         for model in [
             "claude-opus-5",
             "claude-opus-5[1m]",
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
             "claude-opus-4-8",
             "claude-sonnet-4-6",
         ] {

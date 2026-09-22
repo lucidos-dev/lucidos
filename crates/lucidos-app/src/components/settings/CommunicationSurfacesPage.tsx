@@ -131,6 +131,7 @@ export function CommunicationSurfacesPage() {
             refusal: SAMPLE_WEBHOOK_REFUSAL,
             others: null,
             onOpenWebhooks: () => {},
+            onDiscuss: () => {},
           })}
         </div>
         <div class="surfaces-banner-preview">
@@ -139,6 +140,7 @@ export function CommunicationSurfacesPage() {
             refusal: SAMPLE_WEBHOOK_VERIFICATION_REFUSAL,
             others: null,
             onOpenWebhooks: () => {},
+            onDiscuss: () => {},
           })}
         </div>
       </div>

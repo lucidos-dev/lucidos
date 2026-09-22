@@ -15,7 +15,7 @@
  * See `docs/adr/0235-a-refused-delivery-is-an-outage.md`.
  */
 
-import type { WebhookRefusal } from '../api/client';
+import type { WebhookRefusal, WebhookRefusalCause } from '../api/client';
 import { formatDurationPhrase } from './formatTime';
 
 /** How often the engine looks again. Matches `WEBHOOK_REFUSAL_CRON` in
@@ -81,6 +81,27 @@ export function refusalReasonsPhrase(refusal: WebhookRefusal): string | null {
   return named.join(', ');
 }
 
+/** The cause every surface speaks from, which is not always the stored one.
+ *
+ *  The live flag wins, the rule `judge` applies in the engine. A hook that is
+ *  off threw the delivery away before reading it, so no run on it can support
+ *  "none of them verified".
+ *
+ *  Stated again here on purpose. The verification words send the reader at the
+ *  secret, and re-pointing a hook replaces its whole config and drops the
+ *  secret with it. So a stale record must not reach those words for a hook
+ *  this page can see is off.
+ *
+ *  Every surface reads it HERE rather than off the record, or the bar and the
+ *  Discuss message name different causes for one hook. */
+export function reportedRefusalCause(refusal: WebhookRefusal): WebhookRefusalCause {
+  return refusal.enabled ? refusal.cause : 'disabled';
+}
+
+function switchedOff(refusal: WebhookRefusal): boolean {
+  return reportedRefusalCause(refusal) === 'disabled';
+}
+
 /** What the app bar states while a hook is throwing deliveries away.
  *
  *  The title is the fact and the detail is the consequence, matching the two
@@ -94,7 +115,7 @@ export function refusalReasonsPhrase(refusal: WebhookRefusal): string | null {
 export function webhookRefusalNotice(
   refusal: WebhookRefusal,
 ): { title: string; detail: string } {
-  if (refusal.cause === 'disabled') {
+  if (switchedOff(refusal)) {
     return {
       title: `"${refusal.webhook_name}" is switched off and deliveries are being thrown away`,
       detail:
@@ -120,7 +141,7 @@ export function webhookRefusalNotice(
  *  The row already names the hook, so this states what is happening to its
  *  deliveries and nothing else. */
 export function webhookRefusalRowLine(refusal: WebhookRefusal): string {
-  const what = refusal.cause === 'disabled'
+  const what = switchedOff(refusal)
     ? 'thrown away, because this webhook is switched off'
     : 'refused, because none of them verified';
   return `${lost(refusal)} ${what}, over ${age(refusal)}`;

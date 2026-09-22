@@ -1787,6 +1787,34 @@ fn is_benign_prefix(tok: &str) -> bool {
     ) || (!tok.starts_with('-') && tok.contains('='))
 }
 
+/// Words that run the rest of the segment as another user.
+const PRIVILEGE_WORDS: [&str; 3] = ["sudo", "doas", "su"];
+
+/// True when any segment of `command` runs as another user.
+///
+/// [`is_benign_prefix`] SKIPS `sudo` when it resolves a head, so
+/// `sudo cat /etc/shadow` settles `Safe` on the strength of `cat`. That is
+/// right for the head walk, whose job is to find what actually runs. It is not
+/// a statement about whose rights it runs with, so a caller that cares has to
+/// ask separately.
+///
+/// The one caller is the attended Codex escalation gate
+/// (`cc_permission::attended_escalation_allowed`), which waves a `Safe` command
+/// past its permission card. Reading a root-only file is not the same act as
+/// reading the agent's own, so that gate asks this first.
+///
+/// Scans the command word of each segment, past any `VAR=value` preamble. A
+/// privilege word later in a segment is an argument (`grep sudo /etc/sudoers`),
+/// not an escalation.
+pub fn command_escalates_privilege(command: &str) -> bool {
+    command_segments(&unwrap_shell_command(command)).any(|segment| {
+        segment
+            .split_whitespace()
+            .find(|tok| tok.starts_with('-') || !tok.contains('='))
+            .is_some_and(|word| PRIVILEGE_WORDS.contains(&normalized_head(word)))
+    })
+}
+
 /// Process wrappers that exec the command named in their own arguments. The
 /// head walk stops on the wrapper. Every danger scan then reads the wrapper
 /// where the real command runs, and the line matches no danger table.

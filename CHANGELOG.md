@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.39.2 — 2026-09-22
+
+### Changed
+
+- Claude Opus 5.5 in the model picker, for chat and for Claude Code sessions.
+- Discuss a refusing webhook. The refusal bar has a Discuss button beside Open Webhooks. One tap starts a Lucidos Agent thread that quotes the hook, its state, the refusal reasons with their counts, and any other hooks refusing at the same time.
+- `lucidos spawn-thread --reasoning-effort` sets a coding agent's reasoning level. `--cc-model` is now `--coding-agent-model`, and the old name still works.
+- A question the agent types as prose becomes a card. When a chat reply ends on a question, the agent is sent back once to ask it with clickable options.
+- Plugins opens at once from a cached catalog. A small cue shows while the list refreshes in the background.
+- Every model call the engine makes records its token cost, including the command guard's judge, the judge tool, intents, memory corrections and file-import summaries.
+- Settings > Permissions says where the command guard applies, and which check is always on.
+- A Codex command that needs to leave its sandbox goes through the command guard first. Only a command judged safe skips the permission card, and a privileged one is refused.
+- A resumed coding-agent session keeps its worktree as it was. Main merges in at Apply.
+
+### Fixed
+
+- On the iOS home-screen app, a dead Submit recovers sooner. The composer also recovers when the keyboard closes without a resize event, for example when the app resumes.
+- A spawned coding-agent thread keeps the name its caller gave it.
+- A coding-agent spawn refuses a reasoning level its model cannot run, from both the agent and the CLI.
+- The webhook refusal bar follows the hook's live on/off switch, so a switched-off hook no longer reads as failing verification.
 ## v0.39.1 — 2026-09-21
 
 ### Changed

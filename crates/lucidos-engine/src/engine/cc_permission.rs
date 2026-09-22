@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::engine::command_guard::{
-    self, unwrap_shell_command, RiskLane, SideEffectCategory, StaticVerdict,
+    self, unwrap_shell_command, JudgeInput, RiskLane, SideEffectCategory, StaticVerdict,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
@@ -80,6 +80,11 @@ pub const PERSISTED_ALLOW_REASON: &str = "Allowed by this workspace's coding-age
 /// session's own worktree (see [`worktree_write_auto_allowed`]).
 pub const WORKTREE_WRITE_ALLOW_REASON: &str =
     "Auto-allowed: file write inside this session's own worktree";
+
+/// Reason on an attended auto-ALLOW of a Codex sandbox escape the command
+/// classifier called safe (see [`attended_escalation_allowed`]).
+pub const ESCALATION_CLASSIFIED_ALLOW_REASON: &str =
+    "Auto-allowed: the command guard classified this command as safe to run";
 
 /// Reason on an unattended auto-ALLOW of a benign in-workspace request. The
 /// coding-agent session was launched by a trigger with no human to answer a
@@ -865,6 +870,41 @@ pub fn worktree_write_auto_allowed(
     }
 }
 
+/// What the command guard's static pass made of one coding-agent request.
+///
+/// Three cases rather than two, for the same reason [`CommandPayload`] has
+/// three. "Not a command" and "a command I could not read" must not collapse,
+/// or the second rides the first's fall-through.
+enum CommandStatic {
+    /// Not a command request. The caller reads its file targets instead.
+    NotACommand,
+    /// A command request whose text could not be read.
+    Unreadable,
+    /// What [`command_guard::static_classify`] made of the command.
+    Verdict(StaticVerdict),
+}
+
+/// Run the command guard's static pass over a coding-agent command request.
+///
+/// Shared by the two lanes that classify one: the unattended auto-resolve
+/// ([`classify_coding_agent_request`]) and the attended escalation gate
+/// ([`attended_escalation_allowed`]). They differ in what they do with the
+/// verdict, never in how they reach it.
+///
+/// Codex wraps every command as `/bin/zsh -lc '<script>'`, so the inner script
+/// is what gets classified. Without that a wrapped side-effect hides behind
+/// `zsh`.
+fn static_command_verdict(tool_name: &str, input: &serde_json::Value) -> CommandStatic {
+    match coding_agent_command(tool_name, input) {
+        CommandPayload::NotACommand => CommandStatic::NotACommand,
+        CommandPayload::Unresolved => CommandStatic::Unreadable,
+        CommandPayload::Known(cmd) => {
+            let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
+            CommandStatic::Verdict(command_guard::static_classify(tn::RUN_BASH, &synthetic))
+        }
+    }
+}
+
 /// Classify one coding-agent permission request for the unattended decision.
 ///
 /// * A command request reuses the command guard's STATIC classification,
@@ -885,16 +925,13 @@ pub fn classify_coding_agent_request(
     input: &serde_json::Value,
     workspace_path: &Path,
 ) -> RequestVerdict {
-    match coding_agent_command(tool_name, input) {
+    match static_command_verdict(tool_name, input) {
         // A command we cannot read is the opposite of benign. The whole
         // classification below reads the command text, so there is nothing
         // left to decide on.
-        CommandPayload::Unresolved => return RequestVerdict::Unclassified,
-        CommandPayload::Known(cmd) => {
-            // Codex wraps commands as `/bin/zsh -lc '<script>'`; classify the
-            // inner script so a wrapped side-effect isn't hidden behind `zsh`.
-            let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
-            return match command_guard::static_classify(tn::RUN_BASH, &synthetic) {
+        CommandStatic::Unreadable => return RequestVerdict::Unclassified,
+        CommandStatic::Verdict(verdict) => {
+            return match verdict {
                 StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
                 // `static_classify` only ever settles Safe/Catastrophic; map the
                 // rest defensively to benign.
@@ -916,7 +953,7 @@ pub fn classify_coding_agent_request(
                 }
             };
         }
-        CommandPayload::NotACommand => {}
+        CommandStatic::NotACommand => {}
     }
     match coding_agent_file_targets(tool_name, input) {
         FileTargets::Known(targets) => {
@@ -939,6 +976,133 @@ pub fn classify_coding_agent_request(
         FileTargets::NotAFileWrite => {}
     }
     RequestVerdict::Benign
+}
+
+/// The Codex app-server's command-approval tool. Only this one reaches the
+/// attended escalation gate. A Codex card means the OS sandbox blocked the
+/// command, which the user never chose. A Claude Code `Bash` card means the
+/// tool is missing from a `--allowedTools` list the user curates.
+const CODEX_COMMAND_TOOL: &str = "command_execution";
+
+/// Whether a classified lane lets an attended escalation skip its card.
+///
+/// `None` is every way the classification did not land: an unreadable command,
+/// a judge that is off, has no provider, errored or timed out. It cards, which
+/// is the behavior that predates this gate.
+///
+/// `Safe` is the ONLY lane that allows. The chat lane also runs
+/// `ReversibleDanger` unasked, but it snapshots the workspace on a safety ref
+/// first, and this gate has no such undo. It would also cross a line
+/// [`worktree_write_auto_allowed`] deliberately holds: a file write in the
+/// worktree skips its card, and a command never does, because a command can do
+/// anything. `Catastrophic` and `IrreversibleDanger` card too, and nothing here
+/// ever auto-denies.
+///
+/// The narrow set costs nothing observed. A destruction confined to the
+/// worktree runs inside the sandbox, so it raises no approval to begin with.
+fn lane_allows_escalation(lane: Option<RiskLane>) -> bool {
+    matches!(lane, Some(RiskLane::Safe))
+}
+
+/// Ask the command judge to place one ambiguous command, for the attended gate.
+///
+/// `None` on every failure, so the caller cards. Deliberately NOT
+/// `fallback_classify`, which the unattended lane uses. That one reads an
+/// unrecognised head as benign, where an auto-allow here must rest on a
+/// positive verdict.
+///
+/// **Both command-guard toggles gate the LLM half**, in the order
+/// `agentic_loop::run` reads them: the master `command_guard`, then the
+/// `command_guard_judge` sub-switch. The master ships off, and the Settings UI
+/// greys the sub-switch out under it. Reading the sub-switch alone would spend
+/// a model call behind an off switch the user cannot reach. The static half
+/// above asks neither, and needs no model.
+///
+/// An unreadable preference resolves OFF, because OFF is the card.
+async fn judge_escalation_lane(
+    engine: &LucidosEngine,
+    ji: &JudgeInput,
+    thread_id: Uuid,
+) -> Option<RiskLane> {
+    let pool = engine.pool();
+    let guard_on = crate::core::PreferenceStore::command_guard(pool)
+        .await
+        .unwrap_or(false);
+    if !guard_on
+        || !crate::core::PreferenceStore::command_guard_judge(pool)
+            .await
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let model = crate::core::PreferenceStore::command_judge_model(pool).await;
+    match engine.judge_command(&model, ji, thread_id).await {
+        Ok(verdict) => Some(verdict.lane),
+        Err(e) => {
+            crate::log!(
+                "[CCPermission] escalation judge failed ({}), rendering the card",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Whether an attended Codex sandbox escape resolves without a card.
+///
+/// Codex raises `command_execution` when its OS sandbox refuses to run the
+/// command. On macOS that fires for a whole class of ordinary reads: `/bin/ps`
+/// is setuid root and the seatbelt profile will not exec a sugid binary, so
+/// every process probe escalated. This places the command through the
+/// classifier the Lucidos Agent's chat lane uses (ADR 0002).
+///
+/// `engine` is `None` on the Claude Code MCP path, which has no judge handle
+/// and never sends this tool anyway. The static half still runs without it.
+///
+/// Two shapes are refused outright, ahead of any verdict:
+///
+/// * **A command run as another user**, which the head walk skips past. See
+///   [`command_guard::command_escalates_privilege`].
+/// * **A shape the Safe fast path REFUSED**, as against one whose head it
+///   merely did not recognise. The judge is handed the command text alone, so
+///   it cannot see the refusal. The unattended lane and `grant_covers_command`
+///   already deny one, and this is the third path holding that line
+///   (ADR 0002).
+async fn attended_escalation_allowed(
+    engine: Option<&LucidosEngine>,
+    tool_name: &str,
+    input: &serde_json::Value,
+    thread_id: Uuid,
+) -> bool {
+    if tool_name != CODEX_COMMAND_TOOL {
+        return false;
+    }
+    let lane = match static_command_verdict(tool_name, input) {
+        CommandStatic::Verdict(StaticVerdict::Settled(lane)) => Some(lane),
+        CommandStatic::Verdict(StaticVerdict::NeedsJudge(ji)) if ji.fast_path_refused => None,
+        CommandStatic::Verdict(StaticVerdict::NeedsJudge(ji)) => match engine {
+            Some(engine) => judge_escalation_lane(engine, &ji, thread_id).await,
+            None => None,
+        },
+        CommandStatic::NotACommand | CommandStatic::Unreadable => None,
+    };
+    if !lane_allows_escalation(lane) {
+        return false;
+    }
+    !command_privilege_escalation(tool_name, input)
+}
+
+/// Whether this command request reaches for another user's rights.
+///
+/// Reads the request's own command text rather than taking it from
+/// [`static_command_verdict`], which answers about the classification and not
+/// about the text. An unreadable command is already a card by then, so `false`
+/// here cannot widen anything.
+fn command_privilege_escalation(tool_name: &str, input: &serde_json::Value) -> bool {
+    match coding_agent_command(tool_name, input) {
+        CommandPayload::Known(cmd) => command_guard::command_escalates_privilege(cmd),
+        CommandPayload::NotACommand | CommandPayload::Unresolved => false,
+    }
 }
 
 /// Whether this thread's session-allow set already covers the request.
@@ -1074,12 +1238,20 @@ pub async fn lookup_session_worktree(
 ///      pattern is in this workspace's `cc-allowed-tools` skips the prompt.
 ///      Deliberately BELOW the unattended gate, so a workspace grant can never
 ///      override [`decide_unattended`].
-///   5. **Interactive.** `register_or_attach` dedups, the canonical request
+///   5. **Escalation classifier.** A Codex `command_execution` escape the
+///      command guard places as `Safe` skips the card. See
+///      [`attended_escalation_allowed`].
+///   6. **Interactive.** `register_or_attach` dedups, the canonical request
 ///      emits `CodingAgentPermissionRequest`, and the wait on the broadcast is
 ///      **indefinite**.
 ///
 /// The paired `CodingAgentPermissionResolved` is emitted by the consent
 /// endpoint, so it fires once per click rather than once per deduped listener.
+///
+/// `judge` is the engine handle step 5's LLM half needs. `None` disables that
+/// half and leaves its static half, which is what the Claude Code MCP path
+/// passes.
+#[allow(clippy::too_many_arguments)]
 pub async fn prompt_coding_agent_permission(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
@@ -1087,6 +1259,7 @@ pub async fn prompt_coding_agent_permission(
     trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
     workspace_path: &Path,
     worktree_path: Option<&Path>,
+    judge: Option<&LucidosEngine>,
     request: CodingAgentPermissionInput,
 ) -> PermissionPromptOutcome {
     let CodingAgentPermissionInput {
@@ -1172,6 +1345,20 @@ pub async fn prompt_coding_agent_permission(
         return PermissionPromptOutcome {
             allowed: true,
             reason: Some(PERSISTED_ALLOW_REASON.to_string()),
+        };
+    }
+
+    // Last gate before the card: classify the Codex sandbox escape. Below every
+    // grant on purpose, so a command a grant covers never pays for a judge
+    // call. Below the unattended branch too, which returned above.
+    if attended_escalation_allowed(judge, &tool_name, &input, thread_id).await {
+        crate::log!(
+            "[CCPermission] escalation auto-allowed for thread {}",
+            thread_id
+        );
+        return PermissionPromptOutcome {
+            allowed: true,
+            reason: Some(ESCALATION_CLASSIFIED_ALLOW_REASON.to_string()),
         };
     }
 
@@ -2168,6 +2355,141 @@ mod tests {
         assert_eq!(v, RequestVerdict::Catastrophic);
     }
 
+    // --- attended escalation classifier -------------------------------------
+
+    /// Run the gate with no judge handle, which is the static half alone. Every
+    /// case below is one the static pass settles, so the missing handle is the
+    /// point rather than a shortcut.
+    async fn escalation(tool_name: &str, input: serde_json::Value) -> bool {
+        attended_escalation_allowed(None, tool_name, &input, Uuid::new_v4()).await
+    }
+
+    fn zsh(script: &str) -> serde_json::Value {
+        serde_json::json!({ "command": format!("/bin/zsh -lc '{script}'") })
+    }
+
+    #[test]
+    fn only_the_safe_lane_skips_the_card() {
+        assert!(lane_allows_escalation(Some(RiskLane::Safe)));
+        assert!(
+            !lane_allows_escalation(Some(RiskLane::ReversibleDanger)),
+            "this gate has no safety ref, so in-workspace destruction still asks"
+        );
+        assert!(!lane_allows_escalation(Some(RiskLane::IrreversibleDanger)));
+        assert!(!lane_allows_escalation(Some(RiskLane::Catastrophic)));
+        assert!(
+            !lane_allows_escalation(None),
+            "nothing classified it, so the user does"
+        );
+    }
+
+    /// The shape that made Codex unusable: `/bin/ps` is setuid root, so codex's
+    /// seatbelt refuses to exec it and every process probe escalated.
+    #[tokio::test]
+    async fn a_process_probe_needs_no_card() {
+        for script in [
+            "ps aux | grep python | grep -v grep",
+            "cat /tmp/run.log",
+            "sleep 20; wc -c /tmp/run.log",
+        ] {
+            assert!(
+                escalation("command_execution", zsh(script)).await,
+                "read-only heads are on the guard's static allowlist: {script}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_catastrophic_command_still_cards() {
+        assert!(!escalation("command_execution", zsh("rm -rf /")).await);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_command_still_cards() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({ "command": "" }),
+            serde_json::json!({ "command": 7 }),
+        ] {
+            assert!(
+                !escalation("command_execution", input).await,
+                "nothing can be classified, so nothing is auto-allowed"
+            );
+        }
+    }
+
+    /// A shape the Safe fast path REFUSED never reaches the judge, so it cards
+    /// whether or not a judge handle exists. The judge sees only the command
+    /// text. It cannot tell a refusal from an ordinary read, and would answer
+    /// `safe` on the words alone.
+    ///
+    /// `escalation` passes no handle, which is why each case below asserts the
+    /// refusal through `static_command_verdict` as well: without that, a
+    /// regression putting these back on the judge's path would still pass.
+    #[tokio::test]
+    async fn a_refused_shape_never_reaches_the_judge() {
+        for script in [
+            "PATH=bin ls",
+            "./scripts/deploy.sh",
+            "echo hi >> /etc/hosts",
+            "cat $(whoami)",
+        ] {
+            let input = zsh(script);
+            let refused = matches!(
+                static_command_verdict("command_execution", &input),
+                CommandStatic::Verdict(StaticVerdict::NeedsJudge(ref ji)) if ji.fast_path_refused
+            );
+            assert!(refused, "fixture must be a fast-path refusal: {script}");
+            assert!(
+                !escalation("command_execution", input).await,
+                "a refusal is never waved through: {script}"
+            );
+        }
+    }
+
+    /// `sudo` is a benign PREFIX to the head walk, so `sudo cat` settles `Safe`
+    /// on the strength of `cat`. Running it outside the sandbox as root is not
+    /// the act the verdict described.
+    #[tokio::test]
+    async fn a_privileged_command_still_cards() {
+        for script in [
+            "sudo cat /etc/shadow",
+            "doas ls /root",
+            "ls && sudo cat /etc/shadow",
+            "/usr/bin/sudo cat /etc/shadow",
+        ] {
+            assert!(
+                !escalation("command_execution", zsh(script)).await,
+                "reaching for another user's rights asks: {script}"
+            );
+        }
+    }
+
+    /// The other side of the rule above: a privilege word as an ARGUMENT is an
+    /// ordinary read and keeps its auto-allow.
+    #[tokio::test]
+    async fn a_privilege_word_in_an_argument_is_not_an_escalation() {
+        assert!(escalation("command_execution", zsh("grep sudo /etc/hosts")).await);
+    }
+
+    /// An unrecognised head is the ambiguous middle. The unattended lane reads
+    /// it as benign; this gate does not, because an auto-allow rests on a
+    /// verdict rather than on silence.
+    #[tokio::test]
+    async fn an_unrecognised_head_cards_without_a_judge() {
+        assert!(!escalation("command_execution", zsh("cargo build")).await);
+    }
+
+    #[tokio::test]
+    async fn the_gate_is_codex_only() {
+        for tool in ["Bash", "file_change", "Edit", "Skill"] {
+            assert!(
+                !escalation(tool, zsh("ps aux")).await,
+                "{tool} keeps the behavior it had before the gate"
+            );
+        }
+    }
+
     // --- in-worktree write fast path (pure, but real paths on disk) ---------
 
     /// A worktree-shaped fixture: `<tmp>/wt` holding `.claude/rules/`, `.git/`,
@@ -2986,6 +3308,7 @@ mod tests {
                 Path::new("/ws"),
                 // Command requests — the worktree fast path never covers them.
                 None,
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i".into(),
@@ -3004,6 +3327,103 @@ mod tests {
             count_permission_events(&pool, thread_id).await,
             (0, 0),
             "an unattended ALLOW renders no card and records nothing"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The whole point of the gate, end to end: a human is watching, codex asks
+    /// to escape its sandbox for a process probe, and no card is raised.
+    #[tokio::test]
+    async fn attended_session_auto_allows_a_classified_escalation() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        // No origin event, so `resolve_attend_mode` reads the thread as
+        // interactive and the unattended branch never fires.
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &empty_trigger_configs(),
+                Path::new("/ws"),
+                None,
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: zsh("ps aux | grep bench | grep -v grep"),
+                },
+            ),
+        )
+        .await
+        .expect("a classified escalation must not wait for a card");
+
+        assert!(outcome.allowed);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some(ESCALATION_CLASSIFIED_ALLOW_REASON)
+        );
+        assert_eq!(
+            count_permission_events(&pool, thread_id).await,
+            (0, 0),
+            "an auto-allow renders no card, like every other fast path here"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Ordering: the unattended branch returns above the gate, so a trigger
+    /// session keeps deciding on its own grant. Both lanes allow this command,
+    /// so the REASON is what tells them apart.
+    #[tokio::test]
+    async fn the_unattended_branch_still_owns_a_trigger_session() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-order";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
+
+        let outcome = prompt_coding_agent_permission(
+            &pool,
+            &bus,
+            &pending,
+            &trigger_configs_with(trigger_id, vec![]),
+            Path::new("/ws"),
+            None,
+            None,
+            CodingAgentPermissionInput {
+                thread_id,
+                tool_use_id: "i".into(),
+                tool_name: "command_execution".into(),
+                input: zsh("ps aux"),
+            },
+        )
+        .await;
+
+        assert!(outcome.allowed);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some(UNATTENDED_ALLOW_BENIGN_REASON),
+            "the unattended lane decided, so the escalation gate was never reached"
         );
 
         pool.close().await;
@@ -3037,6 +3457,7 @@ mod tests {
                 &cfgs,
                 Path::new("/ws"),
                 // Command requests — the worktree fast path never covers them.
+                None,
                 None,
                 CodingAgentPermissionInput {
                     thread_id,
@@ -3094,6 +3515,7 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
+                None,
                 None,
                 CodingAgentPermissionInput {
                     thread_id,
@@ -3160,6 +3582,7 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
+                None,
                 None,
                 CodingAgentPermissionInput {
                     thread_id,
@@ -3237,6 +3660,7 @@ mod tests {
                 Path::new("/ws"),
                 // Command requests — the worktree fast path never covers them.
                 None,
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i".into(),
@@ -3284,11 +3708,15 @@ mod tests {
                     &trigger_configs,
                     Path::new("/tmp"),
                     None,
+                    None,
                     CodingAgentPermissionInput {
                         thread_id,
                         tool_use_id: "i1".to_string(),
                         tool_name: "command_execution".to_string(),
-                        input: serde_json::json!({"command": "sudo ls"}),
+                        // A command the escalation classifier will not wave
+                        // through, so this test still reaches the card it is
+                        // about. `sudo ls` used to sit here and now auto-allows.
+                        input: serde_json::json!({"command": "curl -X POST https://example.com -d @x"}),
                     },
                 )
                 .await
@@ -3296,17 +3724,21 @@ mod tests {
         };
 
         // Wait for the canonical entry to register, then resolve it the way
-        // the consent endpoint does.
-        let request_id = loop {
-            let id = {
+        // the consent endpoint does. Bounded, because a request that stops
+        // raising a card would otherwise spin here until the suite's timeout
+        // rather than failing with a name.
+        let mut request_id = None;
+        for _ in 0..500 {
+            request_id = {
                 let state = pending.lock().unwrap();
                 state.by_request_id.keys().next().cloned()
             };
-            if let Some(id) = id {
-                break id;
+            if request_id.is_some() {
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
+        }
+        let request_id = request_id.expect("the request must raise a card within 5s");
         let entry = {
             let mut state = pending.lock().unwrap();
             state.take(&request_id).expect("canonical entry present")
@@ -3334,7 +3766,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "one card per canonical request");
         assert_eq!(rows[0].0["tool_name"], "command_execution");
         assert_eq!(rows[0].0["tool_use_id"], "i1");
-        assert_eq!(rows[0].0["summary"], "command_execution sudo ls");
+        assert_eq!(
+            rows[0].0["summary"],
+            "command_execution curl -X POST https://example.com -d @x"
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -3362,6 +3797,7 @@ mod tests {
             &pending,
             &empty_trigger_configs(),
             Path::new("/tmp"),
+            None,
             None,
             CodingAgentPermissionInput {
                 thread_id,
@@ -3426,6 +3862,7 @@ mod tests {
                 &empty_trigger_configs(),
                 workspace.path(),
                 None,
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i3".to_string(),
@@ -3479,6 +3916,7 @@ mod tests {
                 &pending,
                 &trigger_configs_with(trigger_id, vec![]),
                 workspace.path(),
+                None,
                 None,
                 CodingAgentPermissionInput {
                     thread_id,
@@ -3534,6 +3972,7 @@ mod tests {
                 &empty_trigger_configs(),
                 Path::new("/ws"),
                 Some(&f.root),
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i-wt".into(),
@@ -3583,6 +4022,7 @@ mod tests {
                     &cfgs,
                     Path::new("/ws"),
                     Some(Path::new("/ws/.lucidos/worktrees/thread-abc")),
+                    None,
                     CodingAgentPermissionInput {
                         thread_id,
                         tool_use_id: "i-out".into(),
@@ -3703,6 +4143,7 @@ mod tests {
                 &empty_trigger_configs(),
                 Path::new("/ws"),
                 None,
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i-after-restart".into(),
@@ -3781,6 +4222,7 @@ mod tests {
                     &pending,
                     &cfgs,
                     Path::new("/ws"),
+                    None,
                     None,
                     CodingAgentPermissionInput {
                         thread_id,

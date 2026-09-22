@@ -197,6 +197,9 @@ mod frontend_preview_test;
 #[path = "api_support/mcp_servers_test.rs"]
 mod mcp_servers_test;
 
+#[path = "api_support/plugin_catalog_test.rs"]
+mod plugin_catalog_test;
+
 #[path = "api_support/webhook_delivery_test.rs"]
 mod webhook_delivery_test;
 

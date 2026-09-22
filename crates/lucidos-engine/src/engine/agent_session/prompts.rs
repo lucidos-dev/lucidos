@@ -332,6 +332,13 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// dialogue with the user. Pinned by
 /// `chat_style_prompts_nudge_use_of_ask_user_question`.
 ///
+/// The DANGLING ITEM paragraph catches a decision phrased as a plain
+/// statement. A report that names an outstanding, parked, or newly unblocked
+/// item reads as finished. It hands the user a fork with no way to act. The
+/// real case was a session ending on a parked item whose blocker had just
+/// cleared. It is carved from the finished-work confirmation ban below,
+/// because such an item is a genuine fork, not a "does this look good?".
+///
 /// The "NEVER AUTHOR AN \"OTHER\" OPTION" paragraph exists to CONTRADICT Claude
 /// Code's own built-in tool description, which promises that an "Other" option
 /// is provided automatically. CC's TUI provides one; Lucidos does not. The card
@@ -372,6 +379,15 @@ const ASK_USER_QUESTION_RULE: &str =
      changed\", which is the escape every card already has. `Approve` stays first either way. \
      Picking a fork is still an approval: it approves that variant of the plan, and is not a \
      rejection.\n\n\
+     A DANGLING ITEM IS A DECISION IN A STATEMENT'S CLOTHES. Naming something outstanding, \
+     unstarted, parked, or newly unblocked hands the user a fork in prose and gives them no way \
+     to take it. \"The only thing still pending is X\", \"X is still open\", \"that leaves X\", \
+     \"the blocker on X just cleared\" all carry a decision, and none of them is a question, so \
+     a report that ends on one reads as finished and slips through. This is NOT the finished-work \
+     confirmation the rule below forbids: an outstanding or newly unblocked item is a real fork, \
+     not a \"does this look good?\". Write the sentence, then put the decision on a card in the \
+     SAME turn, with the options you would have accepted as a typed reply. The tell is that you \
+     can predict what the user will say next.\n\n\
      NEVER AUTHOR AN \"OTHER\" OPTION: do not add an option meaning \"Other\", \"Something \
      else\", \"Let me type it\" or \"I'll write my own answer\". Your tool description says an \
      \"Other\" option is provided automatically. In Lucidos it is NOT: the card renders exactly \
@@ -554,9 +570,9 @@ const CODEX_CLI_RULE: &str = "\n\n\
     - `lucidos changes list` / `lucidos changes apply <id>` — list / apply a pending change. \
     Never hand-roll the HTTP call with curl — the CLI forwards the subprocess-origin headers \
     so the action is attributed to the agent, not the user.\n\
-    - `lucidos spawn-thread --to <workspace> [--cc|--codex|--coding-agent <backend>] --message ... \
-    --title ...` — spawn a new Lucidos thread. Use `--codex` when the user asks for Codex \
-    (always ask the user before spawning).\n\
+    - `lucidos spawn-thread --to <workspace> [--coding-agent claude-code|codex] --message ... \
+    --title ...`: spawn a thread (always ask the user first). \
+    `--reasoning-effort low|medium|high|xhigh|max` pins its thinking level.\n\
     - `lucidos await-event --on <EventType> --timeout-secs <n> --reason \"...\"`: subscribe \
     this thread to a Lucidos event, then FINISH your session. It returns immediately and \
     blocks nothing. The engine re-opens this thread with a follow-up message when the event \
@@ -608,6 +624,11 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     complete?\" question about a change you've already made. A held-open question just parks \
     the thread and stalls hand-off, and the user can't judge a visual result until it's \
     landed and running — finish and hand it off instead so they can review it. \
+    A DANGLING ITEM IS A DECISION IN DISGUISE: naming something outstanding, parked, or newly \
+    unblocked (\"the only thing still pending is X\", \"the blocker on X just cleared\") hands the \
+    user a fork with no way to act, and reads as finished because it is not a question. That is a \
+    real decision, not the finished-work confirmation above, so put it on a card in the same turn \
+    with the options you would have accepted as a reply. \
     Approving a plan BEFORE you implement it is the opposite case: a DECISION you cannot \
     proceed without, about work you have NOT done. Always ask for plan approval through this \
     tool, with `Approve` and `Request changes` as the options, never in plain prose. That pair \
@@ -1624,8 +1645,8 @@ mod tests {
     /// of every session of that flavor.
     ///
     /// Per BACKEND as well as per flavor, because the two tails differ enough
-    /// to hide each other. Codex swaps the 5,767-char `ASK_USER_QUESTION_RULE`
-    /// for a 3,245-char one and then appends `CODEX_CLI_RULE` +
+    /// to hide each other. Codex swaps the 7,162-char `ASK_USER_QUESTION_RULE`
+    /// for a 4,017-char one and then appends `CODEX_CLI_RULE` +
     /// `CODEX_SLASH_COMMANDS_RULE`, while Claude Code appends
     /// `PERMISSION_CONFIG_RULE`. One shared number per flavor would let either
     /// backend grow into the other's slack unnoticed.
@@ -1637,27 +1658,32 @@ mod tests {
     /// screenshot read into the agent's own context reaches the user on no
     /// backend and in no worktree shape.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
+        // The twelve chat-style rows rose for the DANGLING ITEM paragraph in
+        // the ask rule: Claude Code by 758 bytes, Codex by 422. The two
+        // conflict_resolution rows stay put, because they carry no ASKING
+        // USERS section and so no ask rule.
+        //
         // The four Lucidos-source rows (worktree + recovery, both backends)
         // are 549 bytes higher than they were, for `NO_MEMORY_FILES_RULE`.
         // Only these flavors carry it: a fact about THIS repo has to land in
         // git, where Codex and the next session on another machine read it.
-        ("worktree", "claude-code", 25245),
-        ("worktree", "codex", 23704),
+        ("worktree", "claude-code", 26003),
+        ("worktree", "codex", 24126),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 18190),
-        ("external_repo", "codex", 16649),
-        ("recovery", "claude-code", 23840),
-        ("recovery", "codex", 22299),
-        ("external_repo_recovery", "claude-code", 18066),
-        ("external_repo_recovery", "codex", 16525),
-        ("app_worktree", "claude-code", 20832),
-        ("app_worktree", "codex", 19291),
-        ("app_worktree_recovery", "claude-code", 19396),
-        ("app_worktree_recovery", "codex", 17855),
+        ("external_repo", "claude-code", 18948),
+        ("external_repo", "codex", 17071),
+        ("recovery", "claude-code", 24598),
+        ("recovery", "codex", 22721),
+        ("external_repo_recovery", "claude-code", 18824),
+        ("external_repo_recovery", "codex", 16947),
+        ("app_worktree", "claude-code", 21590),
+        ("app_worktree", "codex", 19713),
+        ("app_worktree_recovery", "claude-code", 20154),
+        ("app_worktree_recovery", "codex", 18277),
         ("conflict_resolution", "claude-code", 5811),
         ("conflict_resolution", "codex", 7083),
     ];

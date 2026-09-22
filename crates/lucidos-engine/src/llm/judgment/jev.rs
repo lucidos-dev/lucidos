@@ -64,11 +64,14 @@ pub(crate) fn build_request_body(
     json!({ "state": state, "model": model, "questions": Value::Object(map) })
 }
 
-/// Parse one response body into the answers and what they cost.
+/// Parse one response body into the answers, what they cost, and what answered.
 ///
 /// An answer whose type the enum does not recognize is dropped rather than
 /// failing the whole call. The caller reads a missing id the same way it reads
 /// a transport failure, so one unreadable answer never decides anything.
+///
+/// `request_chars` is left at zero here, because a response body cannot say how
+/// big the request was. [`JevProvider::ask`] fills it from what it sent.
 pub(crate) fn parse_response(
     body: &str,
 ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
@@ -101,6 +104,11 @@ pub(crate) fn parse_response(
             input_tokens: count("input_tokens"),
             output_tokens: count("output_tokens"),
         },
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        request_chars: 0,
     })
 }
 
@@ -115,6 +123,7 @@ impl JudgmentProvider for JevProvider {
             return Ok(Judgment::default());
         }
         let body = build_request_body(JEV_DEFAULT_MODEL, &state, &questions);
+        let request_chars = body.to_string().chars().count();
         let response = self
             .client
             .post(format!("{TYPESAFE_API_BASE_URL}/systemone"))
@@ -130,7 +139,9 @@ impl JudgmentProvider for JevProvider {
             // surface. The key is in the header, never here.
             return Err(format!("TypeSafe returned {}: {}", status.as_u16(), text.trim()).into());
         }
-        parse_response(&text)
+        let mut judgment = parse_response(&text)?;
+        judgment.request_chars = request_chars;
+        Ok(judgment)
     }
 }
 

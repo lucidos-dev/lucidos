@@ -441,8 +441,10 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 
 - `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
 - `crates/lucidos-app/src/**/*.rs` → also `cargo test --locked -p lucidos-app --lib` (`make test` runs the ENGINE crate alone, so the client's own unit tests run nowhere else; seconds, no Postgres)
+- `crates/lucidos-cli/**` OR `crates/lucidos-engine/src/runtime/*_menu_options.json` → also `cargo test --locked -p lucidos-cli` (same reason as the row above, plus the menu-file trigger below; seconds, no Postgres)
 - `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
 - `install.sh`, `uninstall.sh`, `scripts/lib/{service,stage_runtime,headless_tarball,install_common}.sh` → also `bash scripts/lib/install_test.sh` (20 s, offline)
+- `scripts/release.sh`, `scripts/lib/release_draft.sh` → also `bash scripts/lib/release_draft_test.sh` (25 s) and `bash scripts/lib/release_rc_gate_test.sh` (5 s), both offline against a stubbed `gh`
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
 - `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
@@ -461,6 +463,14 @@ broke the one-liner. `install_test.sh` holds the line instead: it scans for
 constructs bash 3.2 cannot run, then parses each file under bash-as-sh. Nothing
 else in the local gate runs it.
 
+**The release path needs a row for the same reason: nothing else runs its
+suites.** `make lint` parses those scripts and says nothing about what they do.
+The two suites are offline and take seconds, driving stubbed `gh` state that no
+other gate models: the DMG-gate dispatch and its failure classification, and the
+draft wait that decides whether Phase B adopts the rc build's tarballs or
+rebuilds all four. Both halves are release-only code, so a regression there is
+invisible until someone is mid-release.
+
 **The Locale dropdown is gated by an ENGINE test, so a `.tsx`-only edit needs
 its row.** `voice/language.rs` maps that dropdown's names to the ISO-639-1 codes
 a call's transcriber is pinned with. Its guard `include_str!`s
@@ -477,6 +487,17 @@ mirror, and editing the mirror alone is a frontend-only diff.
 Both are the same shape as the `sdk_iframe.css` row, in the other direction.
 Neither is in `CLAUDE.md`'s table: that file is always-loaded and had 31 bytes of headroom
 under `CONTEXT_BUDGET_CEILING`, and this gate is what enforces the table anyway.
+
+**A menu JSON is the CLI row's real trigger, and it is an ENGINE-crate path.**
+`crates/lucidos-cli` owns no engine code, so nothing ran its tests: `make test`
+is the engine crate alone, and `make lint` compiles the CLI tests without
+running them. `spawn_thread::tests::effort_levels_match_the_backend_menus`
+`include_str!`s `cc_menu_options.json` and `codex_menu_options.json` to pin
+`--reasoning-effort` against the engine's own pickers. Editing a menu file is a
+diff in `crates/lucidos-engine/`, which routes to `make lint && make test`. So
+the one guard watching those files never fired for the change it watches. Same
+shape as the two rows above: the guard lives on the other side of the diff that
+breaks it.
 
 **A `system-knowhow/**` edit is not a docs-only skip.** Its frontmatter `name`
 and `description` are spliced into the chat agent's routing list, which is

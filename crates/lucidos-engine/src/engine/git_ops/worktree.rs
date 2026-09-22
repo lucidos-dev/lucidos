@@ -967,15 +967,14 @@ pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]
 ///
 /// Why skip-worktree is safe here even though it was abandoned for VERSION
 /// files (see `c7c941b49` "Removed all skip-worktree/reset-version hacks"): that
-/// failure needed `main` to keep *mutating* the skip-worktree'd path, so
-/// `catchup_with_main`'s `git merge main` hit "local changes would be
-/// overwritten" — and `build.rs` re-committed VERSION on every build. Neither
-/// holds for the skill: app coding-agent threads skip `catchup_with_main`
-/// entirely (the real trigger for this guard), and skip-worktree blocks
-/// `git add -A` from ever committing the divergent copy, so no guarded session
-/// can push a change to this path onto `main` — main's copy stays frozen and the
-/// merge never sees an incoming change. Even a worst-case conflict is non-fatal:
-/// `catchup_with_main` self-aborts and its caller only logs.
+/// failure needed a `git merge main` over the skip-worktree'd path while `main`
+/// kept *mutating* it, so the merge hit "local changes would be overwritten".
+/// `build.rs` re-committed VERSION on every build. Neither half holds for the
+/// skill. No session spawn merges `main` at all now (ADR 0241). The only merge
+/// reaching this path is Apply's, on a branch the user chose to land. And
+/// skip-worktree blocks `git add -A` from ever committing the divergent copy,
+/// so no guarded session can push a change to this path onto `main`: main's
+/// copy stays frozen and the merge never sees an incoming change.
 ///
 /// `cwd` is the directory the engine wrote the file relative to — CC's cwd: the
 /// app folder for app coding-agent threads, the worktree root otherwise.

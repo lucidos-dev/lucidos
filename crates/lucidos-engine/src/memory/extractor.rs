@@ -1,6 +1,5 @@
 use crate::engine::aux_purpose::AuxCall;
-use crate::engine::ApiUsage;
-use crate::llm::judgment::{jev_for, JudgmentProvider, JudgmentSite, JEV_DEFAULT_MODEL};
+use crate::llm::judgment::{jev_for, JudgmentProvider, JudgmentSite};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
 use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
@@ -432,20 +431,9 @@ impl MemoryExtractor {
         capture: Option<&crate::engine::AuxCapture>,
     ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
         let state = query_judgment::state(query, conversation_context);
-        let request_chars = state.to_string().chars().count();
         let judgment = jev.ask(state, query_judgment::questions()).await?;
         if let Some(capture) = capture {
-            capture
-                .record_usage(
-                    JEV_DEFAULT_MODEL,
-                    request_chars,
-                    Some(ApiUsage {
-                        input_tokens: judgment.usage.input_tokens,
-                        output_tokens: judgment.usage.output_tokens,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            capture.record_judgment(&judgment).await;
         }
 
         let mut classification = query_judgment::read(&judgment.answers);

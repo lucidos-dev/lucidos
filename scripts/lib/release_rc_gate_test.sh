@@ -42,6 +42,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_SH="$PROJECT_DIR/scripts/release.sh"
+# dispatch_dmg_verify classifies a failed dispatch and probes the ref through
+# release_draft.sh, so the subject needs that lib. It is withheld from the
+# public mirror alongside release.sh, which is why the skip below tests both.
+DRAFT_LIB="$PROJECT_DIR/scripts/lib/release_draft.sh"
 WORKFLOW="$PROJECT_DIR/.github/workflows/install-smoke.yml"
 
 PASS=0
@@ -128,13 +132,19 @@ workflow_assertions() {
 # contributor running the suite from a clone of the mirror must not get a run of
 # failures for a file that was never published. The install-smoke.yml half below
 # still runs there, because that workflow does ship.
-if [ ! -r "$RELEASE_SH" ]; then
+if [ ! -r "$RELEASE_SH" ] || [ ! -r "$DRAFT_LIB" ]; then
   echo "  skip: scripts/release.sh is not present (stripped from the public mirror),"
   echo "        so the gate-function assertions cannot run. The workflow half still can."
   workflow_assertions
   summary
   exit
 fi
+
+# The real classifier and the real ref probe, not stubs. Both are the subject:
+# a copy here would let release.sh and this file drift on what "structural"
+# means, which is the duplication the shared helper exists to remove.
+# shellcheck source=scripts/lib/release_draft.sh
+source "$DRAFT_LIB"
 
 # ── extraction ────────────────────────────────────────────────────────────────
 EXTRACT="$(mktemp)"
@@ -189,6 +199,25 @@ GH_CREATE_OK=1
 GH_DELETE_OK=1
 GH_DISPATCH_OK=1
 RC_BRANCH_ON_REMOTE=1
+# The dispatch half, which is what the retry and the classifier are driven by.
+# GH_DISPATCH_FAILS is how many LEADING attempts fail before one is queued, so
+# a transient failure and a permanent one are the same stub with two numbers.
+GH_DISPATCH_FAILS=0
+GH_DISPATCH_ERR=""
+# What the ref probe finds: present, absent, or unreadable. The third is its own
+# answer, because a probe that cannot be read must not refuse a release.
+# REF_ABSENT_PROBES makes the first N probes 404 whatever REF_STATE says, which
+# is how a REST read racing our own force-push is modelled.
+REF_STATE=present
+REF_ABSENT_PROBES=0
+# Which namespace the ref lives in. `heads` is an rc branch, `tags` is the
+# v<version> shape --attach-notarized passes as both tag and ref.
+REF_NAMESPACE=heads
+
+# Retries must cost no wall-clock here. The ATTEMPT COUNT is left at the real
+# default, so the suite exercises the shipped number rather than a test one.
+# shellcheck disable=SC2034 # read by dispatch_dmg_verify, extracted at runtime
+RELEASE_DMG_DISPATCH_BACKOFF_SECS=0
 
 # gh stub: records every invocation, then answers from the state above.
 gh() {
@@ -202,13 +231,58 @@ gh() {
         *)      return 0 ;;
       esac
       ;;
-    # The only gh api call on these paths is the tag-ref delete, which 404s when
-    # no ref exists. That 404 is exactly what --cleanup-tag turned into a failed
-    # command, so the stub must reproduce it rather than always succeeding.
-    api)      [ "$RC_TAG_REF" = 1 ] && { RC_TAG_REF=0; return 0; }; return 1 ;;
-    workflow) [ "$GH_DISPATCH_OK" = 1 ] ;;
+    api)      gh_api_stub "$@" ;;
+    workflow) gh_workflow_stub ;;
     *)        return 0 ;;
   esac
+}
+
+# Two gh api shapes reach this stub, and they are opposites, so they are split
+# by the DELETE rather than by the path: the tag-ref delete MUTATES, while the
+# ref probe only reads. Conflating them made the probe consume RC_TAG_REF.
+gh_api_stub() {
+  case "$*" in
+    *"-X DELETE"*)
+      # A tag-ref delete 404s when no ref exists. That 404 is exactly what
+      # --cleanup-tag turned into a failed command, so the stub reproduces it
+      # rather than always succeeding.
+      [ "$RC_TAG_REF" = 1 ] && { RC_TAG_REF=0; return 0; }
+      return 1
+      ;;
+  esac
+  # The heads call is logged first in every probe, so its running count IS the
+  # 1-based probe index, and it does not move again while the tags call of the
+  # same probe is answered.
+  local probe
+  probe="$(grep -c '/git/ref/heads/' "$GH_LOG")"
+  if [ "$probe" -le "$REF_ABSENT_PROBES" ]; then
+    printf 'gh: Not Found (HTTP 404)\n' >&2
+    return 1
+  fi
+  case "$REF_STATE" in
+    present)
+      case "$*" in *"/git/ref/$REF_NAMESPACE/"*) return 0 ;; esac
+      # The OTHER namespace answers exactly as GitHub does for a ref that is
+      # not in it, so a tags-only ref still has to survive a heads 404.
+      printf 'gh: Not Found (HTTP 404)\n' >&2
+      return 1
+      ;;
+    absent)  printf 'gh: Not Found (HTTP 404)\n' >&2; return 1 ;;
+    *)       printf 'error connecting to api.github.com\n' >&2; return 1 ;;
+  esac
+}
+
+# The dispatch. It counts its own attempts out of the log rather than out of a
+# variable: every subject runs inside run_fn's subshell, so a counter assigned
+# here would be discarded, while the log is a file and survives.
+gh_workflow_stub() {
+  local attempts
+  attempts="$(grep -c 'workflow run' "$GH_LOG")"
+  if [ "$GH_DISPATCH_OK" = 1 ] && [ "$attempts" -gt "$GH_DISPATCH_FAILS" ]; then
+    return 0
+  fi
+  [ -n "$GH_DISPATCH_ERR" ] && printf '%s\n' "$GH_DISPATCH_ERR" >&2
+  return 1
 }
 git() { printf 'git %s\n' "$*" >> "$GH_LOG"; return 0; }
 release_rc_remote_sha() { [ "$RC_BRANCH_ON_REMOTE" = 1 ] && echo "deadbeef"; return 0; }
@@ -224,6 +298,11 @@ new_case() {
   GH_CREATE_OK=1
   GH_DELETE_OK=1
   GH_DISPATCH_OK=1
+  GH_DISPATCH_FAILS=0
+  GH_DISPATCH_ERR=""
+  REF_STATE=present
+  REF_ABSENT_PROBES=0
+  REF_NAMESPACE=heads
   RC_BRANCH_ON_REMOTE=1
 }
 
@@ -238,6 +317,7 @@ run_fn() {
 
 logged()     { grep -qF -- "$1" "$GH_LOG"; }
 log_line_of() { grep -nF -- "$1" "$GH_LOG" | head -1 | cut -d: -f1; }
+count_logged() { grep -cF -- "$1" "$GH_LOG" 2>/dev/null || true; }
 
 # Assertion helpers. They exist so no assertion is written as `cond && pass ||
 # fail_t`, which is not if-then-else: a `pass` that ever returned non-zero would
@@ -452,7 +532,211 @@ else
   fail_t "release.sh's fail no longer ends in exit 1; this file's stub is stale"
 fi
 
-# ── 11. the CI side of the same gate ──────────────────────────────────────────
+# ── 11. a failed dispatch arrives WITH ITS REASON ─────────────────────────────
+# The v0.39.1 defect. The dispatch sent gh's stderr to /dev/null, so the whole
+# diagnosis of a failed gate was "Could not dispatch the DMG gate". The run
+# aborted at the end of Phase A and the identical command worked from a shell
+# seconds later, and nobody can say why.
+echo
+echo "test: a failed dispatch carries gh's own words to the operator"
+new_case 0 0
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR='HTTP 503: Service Unavailable (api.github.com)'
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+assert_fail "a dispatch that never queues still returns non-zero" \
+            "an unqueued dispatch returned 0"
+case "$RUN_OUT" in
+  *"HTTP 503: Service Unavailable"*) pass "gh's stderr reaches the operator, not /dev/null" ;;
+  *)                                 fail_t "the reason was discarded: $RUN_OUT" ;;
+esac
+
+# Retrying is the point of the split, so the two classes must differ in COST as
+# well as in exit code. 4 is the shipped default, asserted rather than
+# overridden, so a change to it is a decision somebody takes on purpose.
+echo
+echo "test: a RETRYABLE failure is retried, a STRUCTURAL one is not"
+if [ "$(count_logged 'workflow run')" -eq 4 ]; then
+  pass "a retryable failure spends all four attempts"
+else
+  fail_t "expected 4 dispatch attempts, got $(count_logged 'workflow run')"
+fi
+if [ "$RUN_STATUS" = 1 ]; then
+  pass "a retryable failure exits 1, the class that is worth a re-run"
+else
+  fail_t "a retryable failure exited $RUN_STATUS, not 1"
+fi
+new_case 0 0
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR='HTTP 422: Unexpected inputs provided: ["dmg_tag"]'
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+if [ "$RUN_STATUS" = 2 ]; then
+  pass "a structural failure exits 2, the class no retry can fix"
+else
+  fail_t "a structural failure exited $RUN_STATUS, not 2: $RUN_OUT"
+fi
+if [ "$(count_logged 'workflow run')" -eq 1 ]; then
+  pass "a structural failure is attempted exactly once"
+else
+  fail_t "a 422 cost $(count_logged 'workflow run') attempts; no retry can fix it"
+fi
+
+echo
+echo "test: a retryable failure that clears on a later attempt still arms the gate"
+# The v0.39.1 shape: a ref force-pushed moments earlier is not always resolvable
+# by the Actions dispatch endpoint yet, and Phase A dispatches soon after the
+# push. Two failures then a queued run must be a SUCCESS, not a dead release.
+new_case 0 0
+GH_DISPATCH_FAILS=2
+GH_DISPATCH_ERR='HTTP 502: Bad Gateway'
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+assert_ok "the third attempt queues the gate" \
+          "a transient failure killed a dispatch that would have worked"
+if [ "$(count_logged 'workflow run')" -eq 3 ]; then
+  pass "it stopped retrying the moment one was queued"
+else
+  fail_t "expected 3 attempts, got $(count_logged 'workflow run')"
+fi
+case "$RUN_OUT" in
+  *"Retrying in"*) pass "the operator is told it is retrying, and why" ;;
+  *)               fail_t "the retry was silent: $RUN_OUT" ;;
+esac
+
+echo
+echo "test: a dispatch endpoint lagging behind the push is RETRIED, not called structural"
+# The v0.39.1 shape end to end, and the one verdict the ref probe overrules.
+# `No ref found for: <ref>` is a 422, so the shared classifier calls it
+# structural. The probe already found the ref, so it is the Actions endpoint
+# lagging a push made seconds ago, which is exactly what a retry clears.
+new_case 0 0
+GH_DISPATCH_FAILS=2
+GH_DISPATCH_ERR="HTTP 422: No ref found for: $RC_BRANCH"
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+assert_ok "the lag cleared and the gate is armed" \
+          "the retry never ran, so Phase A died on a lag that clears itself"
+if [ "$(count_logged 'workflow run')" -eq 3 ]; then
+  pass "it kept trying until the endpoint caught up"
+else
+  fail_t "expected 3 attempts, got $(count_logged 'workflow run')"
+fi
+case "$RUN_OUT" in
+  *"does not yet"*) pass "the operator is told git has the ref and the endpoint does not" ;;
+  *)                fail_t "the overrule was silent: $RUN_OUT" ;;
+esac
+# And it is still BOUNDED. A 422 naming the ref that never clears must end, and
+# as a retryable failure, so the caller reads it as worth one more run.
+new_case 0 0
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR="HTTP 422: No ref found for: $RC_BRANCH"
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+if [ "$RUN_STATUS" = 1 ] && [ "$(count_logged 'workflow run')" -eq 4 ]; then
+  pass "a lag that never clears exits 1 after the four attempts, not forever"
+else
+  fail_t "exit $RUN_STATUS after $(count_logged 'workflow run') attempts: $RUN_OUT"
+fi
+# An UNCONFIRMED ref is the other half. The retries still run, because they are
+# cheap, but the verdict does not become retryable: the probe never found the
+# ref, so the dispatch saying it is missing is the only evidence there is, and
+# the operator should go and fix the ref rather than re-run the release.
+new_case 0 0
+REF_STATE=error
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR="HTTP 422: No ref found for: $RC_BRANCH"
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+if [ "$RUN_STATUS" = 2 ] && [ "$(count_logged 'workflow run')" -eq 4 ]; then
+  pass "an unreadable probe still tries, then reports the missing ref as structural"
+else
+  fail_t "exit $RUN_STATUS after $(count_logged 'workflow run') attempts: $RUN_OUT"
+fi
+
+# The overrule is NARROW. A 422 about anything else stays structural, so a
+# workflow the mirror cannot accept is still refused on the first attempt.
+new_case 0 0
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR='HTTP 422: Unexpected inputs provided: ["dmg_tag"]'
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+if [ "$RUN_STATUS" = 2 ] && [ "$(count_logged 'workflow run')" -eq 1 ]; then
+  pass "a 422 that is not about the ref is still structural, and still costs one attempt"
+else
+  fail_t "the overrule widened: exit $RUN_STATUS after $(count_logged 'workflow run') attempts"
+fi
+
+echo
+echo "test: an absent ref is reported as an absent ref, not as a dispatch failure"
+# The honest 422 for this case is `No ref found for: rc/<version>`, which reads
+# like a gh problem and is not one. Dispatching at a ref that is not there can
+# only fail, so it is not attempted at all.
+new_case 0 0
+REF_STATE=absent
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+if [ "$RUN_STATUS" = 2 ]; then
+  pass "an absent ref exits 2: no retry puts a ref on the mirror"
+else
+  fail_t "an absent ref exited $RUN_STATUS, not 2: $RUN_OUT"
+fi
+case "$RUN_OUT" in
+  *"$RC_BRANCH does not exist"*) pass "the message names the ref that is missing" ;;
+  *)                             fail_t "the message does not name the absent ref: $RUN_OUT" ;;
+esac
+assert_not_logged "workflow run" \
+  "nothing is dispatched at a ref that is not there" \
+  "a dispatch was attempted at an absent ref"
+
+echo
+echo "test: ONE 404 from the ref probe is a race with our own push, not proof"
+# Phase A force-pushes rc/<version> and arms the gate seconds later. A REST read
+# taken that soon can miss it, and believing the first answer would tell the
+# operator to re-push a ref that is already there.
+new_case 0 0
+REF_ABSENT_PROBES=1
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+assert_ok "the re-probe found the ref and the gate was armed" \
+          "one stale 404 killed Phase A over a ref that was already pushed"
+assert_logged "workflow run install-smoke.yml" \
+  "the dispatch went ahead once the probe caught up" \
+  "nothing was dispatched after the ref appeared"
+
+echo
+echo "test: the probe reads the TAG namespace too, which is the --attach-notarized shape"
+# That path passes v<version> as both the tag and the ref, so a probe that only
+# ever asked heads/ would call every published tag an absent ref.
+new_case 0 0
+REF_NAMESPACE=tags
+run_fn dispatch_dmg_verify "v$VERSION" "v$VERSION"
+assert_ok "a ref that exists only as a tag is present" \
+          "a tag ref was read as absent, so --attach-notarized could never re-verify"
+
+echo
+echo "test: a ref probe that cannot be READ never blocks the dispatch"
+# The probe is a diagnostic. Refusing on an unreadable one would turn a blip on
+# a read-only call into a failed Phase A, which is strictly worse than the 422
+# it exists to explain.
+new_case 0 0
+REF_STATE=error
+run_fn dispatch_dmg_verify "$RC_TAG" "$RC_BRANCH"
+assert_ok "an unreadable probe still dispatches" \
+          "a probe outage became a release outage"
+assert_logged "workflow run install-smoke.yml" \
+  "the dispatch went ahead on an unknown ref state" \
+  "the dispatch was skipped because the probe could not be read"
+
+echo
+echo "test: Phase A's fatal carries the reason, not just the verdict"
+# The whole chain: gh's stderr, through dispatch_dmg_verify, out of the caller
+# that turns it into a fatal. That caller is what an operator actually sees.
+new_case 0 0
+GH_DISPATCH_OK=0
+GH_DISPATCH_ERR='HTTP 403: Resource not accessible by integration'
+run_fn refresh_release_candidate_draft
+assert_fail "the arming step still dies on a gate it could not arm" \
+            "a failed dispatch no longer fails Phase A"
+case "$RUN_OUT" in
+  *"HTTP 403: Resource not accessible"*)
+    pass "the operator gets the diagnosis, not just 'could not dispatch'" ;;
+  *)
+    fail_t "the fatal arrived with no reason attached: $RUN_OUT" ;;
+esac
+
+# ── 12. the CI side of the same gate ──────────────────────────────────────────
 workflow_assertions
 
 summary

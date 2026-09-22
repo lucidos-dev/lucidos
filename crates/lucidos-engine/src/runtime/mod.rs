@@ -153,35 +153,67 @@ fn unique_match_after<'a>(
     matches.next().is_none().then_some(first.value.as_str())
 }
 
-/// Validate a caller-supplied reasoning effort against the backend that will
-/// run it. Refuses an out-of-vocabulary tier for the same reason
-/// [`validate_coding_agent_model`] refuses an unknown model.
+/// Validate a caller-supplied reasoning effort against the backend AND the
+/// model that will run it. Refuses an out-of-vocabulary tier for the same
+/// reason [`validate_coding_agent_model`] refuses an unknown model.
 ///
-/// Codex adds a second constraint its own driver already enforces
-/// (`validate_codex_effort`): some tiers are model-specific. That check stays
-/// where it is, because it needs the RESOLVED model; this one only rejects a
-/// tier the backend does not know at all.
+/// The model half exists because Codex declares some tiers per model, and its
+/// driver DROPS a tier the model does not offer rather than failing: an
+/// unsupported value kills the turn outright. The session still records the
+/// tier that was asked for, so the picker would show one the turn never ran at.
+/// Refusing the caller here is what keeps the two honest.
+///
+/// **An absent model is refused for such a tier, not waved through.** The
+/// driver tests the restriction against the model in the request. So a
+/// restricted tier with no model is dropped before the backend is consulted,
+/// whatever its own config would have picked.
+///
+/// `validate_codex_effort` stays as the driver's last-resort guard. A
+/// mid-session `set_reasoning_effort` and a resumed thread both reach it
+/// without passing here.
 pub fn validate_coding_agent_effort(
     agent: CodingAgent,
+    model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Option<String>, String> {
     let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
         return Ok(None);
     };
     let options = coding_agent_reasoning_effort_options(agent);
-    if options.iter().any(|o| o.value == effort) {
+    // An absent model and the `default` sentinel both mean "the backend's own
+    // config picks", and neither can match a name in `supported_models`.
+    let model = model.map(str::trim).unwrap_or("");
+    if claude_code::efforts_for_model(model, options)
+        .iter()
+        .any(|o| o == effort)
+    {
         return Ok(Some(effort.to_string()));
     }
-    let offered = options
-        .iter()
-        .map(|o| o.value.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let Some(row) = options.iter().find(|o| o.value == effort) else {
+        let offered = options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "reasoning_effort '{}' is not offered by {}. Choose one of: {}",
+            effort,
+            agent.as_str(),
+            offered
+        ));
+    };
+    // A row with no `supported_models` was already admitted above, so reaching
+    // here means the tier names its models. Accept rather than render a refusal
+    // with an empty list, which would be the one message a caller cannot act on.
+    let Some(runs_on) = row.supported_models.as_ref() else {
+        return Ok(Some(effort.to_string()));
+    };
     Err(format!(
-        "reasoning_effort '{}' is not offered by {}. Choose one of: {}",
+        "reasoning_effort '{}' runs only on these {} models: {}. Pass one as `model`; \
+         on any other the backend drops the tier and runs at its own default.",
         effort,
         agent.as_str(),
-        offered
+        runs_on.join(", ")
     ))
 }
 
@@ -900,14 +932,14 @@ mod tests {
     #[test]
     fn effort_validation_mirrors_the_model_rules() {
         assert_eq!(
-            validate_coding_agent_effort(CodingAgent::ClaudeCode, Some("low")),
+            validate_coding_agent_effort(CodingAgent::ClaudeCode, None, Some("low")),
             Ok(Some("low".to_string()))
         );
         assert_eq!(
-            validate_coding_agent_effort(CodingAgent::Codex, None),
+            validate_coding_agent_effort(CodingAgent::Codex, None, None),
             Ok(None)
         );
-        let err = validate_coding_agent_effort(CodingAgent::ClaudeCode, Some("xxhigh"))
+        let err = validate_coding_agent_effort(CodingAgent::ClaudeCode, None, Some("xxhigh"))
             .expect_err("an unknown tier must fail rather than silently drop");
         assert!(err.contains("xxhigh"), "{err}");
     }
@@ -919,11 +951,50 @@ mod tests {
     fn a_chat_only_effort_tier_is_not_accepted_for_a_coding_agent() {
         for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
             assert!(
-                validate_coding_agent_effort(agent, Some("none")).is_err(),
+                validate_coding_agent_effort(agent, None, Some("none")).is_err(),
                 "{} does not offer 'none'",
                 agent.as_str()
             );
         }
+    }
+
+    /// Codex declares `max` per model, and its driver DROPS the tier for any
+    /// other model rather than failing. The session still records the tier
+    /// asked for, so the picker would show one the turn never ran at.
+    #[test]
+    fn a_model_restricted_tier_is_refused_for_a_model_that_lacks_it() {
+        let err = validate_coding_agent_effort(CodingAgent::Codex, Some("gpt-5.5"), Some("max"))
+            .expect_err("gpt-5.5 does not offer max");
+        assert!(
+            err.contains("gpt-5.6-sol"),
+            "names a model that fits: {err}"
+        );
+        assert_eq!(
+            validate_coding_agent_effort(CodingAgent::Codex, Some("gpt-5.6-sol"), Some("max")),
+            Ok(Some("max".to_string()))
+        );
+    }
+
+    /// The non-obvious half. `validate_codex_effort` tests the restriction with
+    /// `model.is_some_and(...)`, so a restricted tier with no model is dropped
+    /// before Codex is consulted. Accepting it would promise a tier that
+    /// provably cannot hold, whatever the backend config would have picked.
+    #[test]
+    fn a_model_restricted_tier_needs_the_model_named() {
+        for model in [None, Some(""), Some("default")] {
+            let err = validate_coding_agent_effort(CodingAgent::Codex, model, Some("max"))
+                .expect_err("codex max always drops without a named model");
+            assert!(err.contains("model"), "must say what to pass: {model:?}");
+        }
+        // An unrestricted tier is unaffected, on either backend.
+        assert_eq!(
+            validate_coding_agent_effort(CodingAgent::Codex, None, Some("xhigh")),
+            Ok(Some("xhigh".to_string()))
+        );
+        assert_eq!(
+            validate_coding_agent_effort(CodingAgent::ClaudeCode, None, Some("max")),
+            Ok(Some("max".to_string()))
+        );
     }
 
     // ── The backend's own context window ───────────────────────────────────
@@ -943,6 +1014,10 @@ mod tests {
         );
         assert_eq!(
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5-1"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-opus-5-5"),
             Some(1_000_000)
         );
     }
@@ -975,6 +1050,10 @@ mod tests {
         );
         assert_eq!(
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5-1[1m]"),
+            None
+        );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-opus-5-5[1m]"),
             None
         );
     }

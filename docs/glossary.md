@@ -12,13 +12,17 @@ If a needed concept genuinely isn't in either glossary, add it here (if dev-only
 The `CLAUDE_CONFIG_DIR` (provider/account) a *coding-agent thread* is permanently bound to — the config dir its **first** session was created under. Resolved by `lookup_pinned_cc_config_dir` (the earliest recorded `claude_config_dir` across the thread's `CodingAgentSettingsChanged` / `CodingAgentIdled` events) and re-injected on *every* later spawn (resume, fresh, post-stale-resume retry, recovery), so a live `CLAUDE_CONFIG_DIR` toggle change never moves an existing thread to another provider — only a thread's very first turn adopts the live toggle (and thereby establishes the pin). The auto-detected resume session id is likewise scoped to the pinned account (`lookup_latest_cc_session_id_for_config_dir`), so a thread that a mid-thread flip mis-recorded onto another account still resumes the session belonging to its original account. Claude-Code-specific (Codex records no config dir → no pin). See `crates/lucidos-engine/src/engine/agent_session/resume.rs` + `run_session/run.rs`.
 
 ### Auxiliary model call
-A model call the engine makes for itself rather than as an agent's turn: a
-thread title, an image description, a memory call (fact extraction, query
-classification, history summarization), an image generation, one spoken reply
-from a *voice session*'s talker. Each emits a `ContextCaptured` stamped
+A model call the engine makes for itself rather than as an agent's turn. Twelve
+of them, listed with what each one is in `system-knowhow/thread-events.md`
+§ Which call each purpose names. Each emits a `ContextCaptured` stamped
 `producer: auxiliary`, plus a `purpose` naming which one it was. Token
 accounting then sees the engine's own spend, instead of undercounting by
-everything on this list.
+everything on that list.
+
+**Every model call the engine makes is one of these or a turn** (ADR 0242).
+`every_file_that_calls_a_model_records_the_cost` holds that per FILE over the
+source tree, and its exemption table is empty. Six calls were silent until that
+ADR, the command guard's judge since ADR 0107 named the gap and left it open.
 
 **`voice` is the one that is not a single HTTP call.** The talker holds a
 socket, so a row is written per spoken reply and the purpose's `AuxBudget` is
@@ -915,6 +919,16 @@ Reuses *AllowScope* (Narrow / Broad / Session). `derive_command_allow_pattern` p
 
 The persisted file is a per-row list under **Settings → Permissions → Lucidos Agent permissions**, read and overwritten whole via `GET`/`PUT /api/v1/agent-allowed-commands`. The guard re-reads it per command, so an edit needs no restart. Code: `engine/command_permission.rs`, `api/command_permission.rs`, `api/settings.rs`.
 
+### Escalation classifier
+
+The fifth and last gate in `cc_permission::prompt_coding_agent_permission` (`attended_escalation_allowed`, ADR 0005's 2026-09-21 addendum). Alone among the five it reads what a command DOES, rather than what was granted. It places an attended Codex `command_execution` sandbox escape through the *command classifier*, and skips the *coding-agent permission card* on `Settled(Safe)`. Every other outcome cards, and nothing here auto-denies.
+
+Scoped to `command_execution` by tool name, so it is Codex-only by construction. A Codex card means the OS sandbox blocked the command. A Claude Code `Bash` card means something else: the tool is missing from a `--allowedTools` list the user curates. `file_change` is excluded with it.
+
+Three deliberate narrowings, each closing a way a `Safe` verdict could mean less than it says. `ReversibleDanger` cards, unlike on the chat lane, because that lane brackets it with a *command checkpoint* and this gate has no undo. A `fast_path_refused` shape never reaches the *judge*, which is handed the command text alone and cannot see the refusal. And `command_guard::command_escalates_privilege` cards a command run as another user: the head walk treats `sudo` as a benign prefix, settling `sudo cat` on the strength of `cat`.
+
+The static half always runs and needs no model. The *ambiguous middle* reaches the judge only under BOTH command-guard toggles (`command_guard`, then `command_guard_judge`), so it ships off with the master. A judge that is off, absent, erroring or timed out leaves the card. Position matters: the gate sits below every grant, so a granted command never pays for a judge call, and below the unattended branch, which returns above it.
+
 ### App frame
 
 The isolated iframe an *app UI* runs in inside the host shell (ADR 0227). Its sandbox drops `allow-same-origin`, so the browser gives it its own renderer process and an opaque origin. The process is why a busy app cannot freeze the shell. The origin is why it can read neither the shell nor a sibling app.
@@ -1669,6 +1683,13 @@ A commit known to sit on the public mirror's `main` without a release of its own
 The desktop pane-resize contract (`crates/lucidos-app/src/components/layout/splitHelpers.ts`; ADR 0056): a divider drag is clamped to the pane minimums AS IT MOVES, so the divider stops at the wall while the pointer keeps going, and nothing corrects it on release. The width the user drops is the width that persists. Both dividers work this way, the thread drawer's (`clampDrawerWidth`) and the split one between the Conversation and Canvas panes (`clampSplitRatio`), and so does the keyboard resize (`computeStepRatio` / `computeDrawerStepWidth`), which clamped first and which the drag was brought into line with. The minimums are all DERIVED from the root font size and live together in `store/paneMinimums.ts` (`minDrawerWidth` / `minThreadPanePx` / `minContentPanePx`, 312px, 300px and 360px at a 16px root): reading one is a DOM read, so the caller measures (`splitBounds()`) and the helpers stay pure. All three are the same on every desktop client, the drawer's included: it is sized around the packaged macOS build's traffic-lights lead in the browser too, so one workspace stops the drawer at one width wherever it is opened (ADR 0058). Scaled, the three stop summing under a 1280px screen from 150% ui-scale, which is what `clampToRange`'s empty-range branch answers: the leading pane keeps its minimum and the trailing one takes what is left. **A drag never collapses a pane** (collapse belongs to the toggles, `⌘⇧1` / `⌘⇧↵`, and the double-clicks), and that pairing is what makes the clamp safe rather than dangerous: the collapse states (`data-thread-collapsed` / `data-content-collapsed` / `data-thread-drawer-open`) flip at a ratio of exactly 0 or 1, a clamped drag cannot reach either, so the header icon groups they swap cannot dance between hosts mid-drag. While a drag is live, `data-pane-resizing` on `:root` disables the header/drawer geometry transitions so the header regions track the panes 1:1; an explicit ratio change (a toggle, a maximize, a keyboard step, a layout reset) animates through `.pane-animate` instead. Replaced the **deferred snap** on 2026-08-09: that contract let a drag land anywhere and corrected a below-minimum pane ~400ms after release, to its minimum or to hidden, which meant the divider moved after the user let go and a minimum could only be discovered by violating it.
 See also: `.claude/rules/frontend.md` § "Pane Resize".
 
+### Close path
+Which of three routes saw the software keyboard close. Carried as `path` on `keyboardCloseState()`, and written onto a `silent-since-keyboard` ledger line as `closePath` (`components/layout/keyboardCloseRelayout.ts`; ADR 0245). `resize` is the `visualViewport` event, the first responder. `wake` is the app ruling the keys gone on a resume, which iOS performs without firing a resize. `poll` is the scheduled reading finding a transition nothing announced.
+
+The third value is what the composer-wedge investigation reads for. Every other signal the page takes comes from an event. So "the page was never told" and "nothing happened" have been one silence for nineteen rounds. A wedged page keeps its timers while it takes no touch, which makes a reading possible where an event is not. A `poll` close is therefore direct evidence that WKWebView stopped delivering to the page.
+
+The poll rides the *Perf instrumentation* toggle and is off by default. The other two paths always run. A close is retired when a cover reading returns, so the field never describes a keyboard that has come back up.
+
 ### Composer fold
 The `.prompt-actions-row` contract: it is ONE row, nothing leaves its box, and the way it gives way is to move members into a `⋯` overflow menu. Three mechanisms used to disagree about that. A sub-row lift and a `flex-wrap` on the right-hand cluster are gone, and the fold is the only one left.
 
@@ -2020,6 +2041,8 @@ See also: *refusal cause*, *ingress probe* (user-facing), *delivery outcome stam
 ### Refusal cause
 Which of two shapes a *refusal run* has, and therefore which words it is reported in (`RefusalCause`, `core/webhook_refusal.rs`). `disabled` means the hook is switched off, so nothing was read. `verification` means the delivery reached the verifier and failed it. Stored on the run, so a reader never has to re-derive it from the tally.
 
+**The live `enabled` flag outranks the stored value.** The flag is one of the two causes. So `WebhookStore::update` ends the run in the statement that moves it, and a reported cause matches the flag by construction. For a row written before that, `judge` and the wording table each report `disabled` when the flag is off. A hook that is off threw the delivery away before reading it, so no run on it can support "none of them verified".
+
 **The split is one predicate**, `DeliveryRefusal::examined_the_delivery()`, the mirror of `Stage::measured_the_ingress` from ADR 0172. One arm answers no, and `DeliveryRefusal::cause` is derived from it alone. `deliver` checks `enabled` before it reads the body, so a disabled hook's 401 says nothing about the signature or the secret. Telling its owner to check the HMAC sends them where there is nothing to find, a wrong turn that has cost a long investigation once.
 
 Carried on `WebhookDeliveriesRefused` and on its retraction, which also names a `Resolution`: `accepted`, `reconfigured`, `quiet` or `removed`. Those four are exhaustive over the ways a hook can stop refusing, which is what keeps a declaration from stranding. `accepted` is read off `last_accepted_at`, never inferred from an empty run: a fresh refusal refills the run within minutes of the delivery that verified.
@@ -2358,6 +2381,11 @@ The enumerated half of the deterministic private-data guard: the exact tokens (c
 
 ### Private-data exceptions list
 The `private-data-exceptions` block of the *private-data denylist*: `<ERE token> => <space-separated paths>`, meaning the token is legitimate **only** at those paths. It exists for project identity — a contributor's real name is legitimate as the copyright holder, governance owner, code-of-conduct contact, or credited contributor, and illegitimate everywhere else (fixtures, examples, device labels, home paths, incidental mentions). Each such name is denied outright and its attribution sites enumerated beside it, so the same name anywhere else is a release-blocking hit. Deliberately preferred over narrowing the token to a possessive/path form, which silently permits every other bare use. Each entry is scanned in its own `git grep` pass with its paths excluded.
+
+### Plugin catalog cache
+What the last marketplace scan found, kept at `.lucidos/plugin-catalog.json` so a page open never waits for one. A scan git-clones every registered marketplace, which costs seconds per repo. `GET /api/v1/plugins/catalog` used to run one per request, and now reads this file instead. The scan runs on the scheduler (`scheduler::plugin_updates`), whose identical five-minute pass previously kept only the update candidates.
+
+Holds `plugins`, `errors`, `scanned_at`, `scan_started_at` and `scan_error`. Deliberately NOT the marketplace list, which is read live from the registry on every request, so a rename needs no scan behind it. The merge drops a cached plugin whose marketplace has since been unregistered, so a stale cache can never offer plugins from nowhere. Under `.lucidos/`, the rebuildable runtime cache: losing it costs one scan, so the loader treats a missing, truncated or invalid file as empty rather than failing the page. Implementation and the rejected clone-mirror alternative: `core/plugin_catalog_cache.rs` and ADR 0243.
 
 ### Plan fork
 A substantive alternative to a plan as written, offered as its own option on the plan-approval question card: a narrower scope, one layer instead of two, a different approach. Nothing to do with a git fork. Named because it is what makes the `Approve` / `Request changes` pair a **floor** rather than a fixed shape (see *plan marker*): the question tool requires at least two options, so `Request changes` exists to fill the mandatory second slot when there is no fork, and a fork fills that slot better because it satisfies the minimum AND carries a decision the agent can act on. Carrying `Request changes` as a *third* option beside a fork is the banned shape, since it then means only "I will type what I want changed", which is the free-text escape every card already has. Picking a fork **is** an approval, of that variant: the agent revises the plan file to match, re-commits, then runs `lucidos planned approve`. Spelled the same way on every surface (`prompts.rs`'s two ask rules and `IMPLEMENTATION_PLAN_RULE`, `cc_plan_gate`'s deny text, `lucidos planned mark` output, the `implementation-plan` skill, `CLAUDE.md`, `system-knowhow/lucidos-cli.md`); the shared ask rules deliberately state the option shape only, since they also reach external-repo prompts that have no marker.

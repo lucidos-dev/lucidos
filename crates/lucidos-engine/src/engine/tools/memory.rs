@@ -1,12 +1,74 @@
 use super::super::LucidosEngine;
 use crate::engine::memory::MEMORY_CORRECTION_THRESHOLD;
+use crate::engine::AuxCapture;
+use crate::llm::provider::LlmProvider;
 use crate::llm::{Message, MessageContent};
 use crate::memory::{cosine_similarity, EmbeddingProvider};
 
+/// Which candidate entries express the wrong fact, 0-indexed, or `None` when
+/// the call failed. A failure aborts the correction: deleting a memory on a
+/// guess is the one outcome worse than deleting nothing.
+///
+/// A free function so a stubbed provider drives it offline. The handler around
+/// it needs an index, an embedder and a live engine.
+///
+/// The capture is recorded before the answer is read, so a verdict nobody could
+/// parse is still accounted. The call was paid for either way.
+pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
+    provider: &P,
+    prompt: String,
+    candidates: usize,
+    capture: Option<&AuxCapture>,
+) -> Option<Vec<usize>> {
+    let request_chars = prompt.chars().count();
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: MessageContent::Text(prompt),
+    }];
+    let response = match provider
+        .chat(messages, vec![], None, None, None, None)
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            log!(@Memory, "[correct_memory] LLM batch verification failed: {}. Aborting to be safe", e);
+            return None;
+        }
+    };
+    if let Some(capture) = capture {
+        capture
+            .record(provider.default_model(), request_chars, &response)
+            .await;
+    }
+
+    let answer = response
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    log!(@Memory, "[correct_memory] LLM batch verdict: '{}'", &answer[..answer.floor_char_boundary(100)]);
+    if answer.starts_with("none") || answer.is_empty() {
+        return Some(vec![]);
+    }
+    // Comma-separated and 1-indexed, as the prompt asked for.
+    Some(
+        answer
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= candidates)
+            .map(|n| n - 1)
+            .collect(),
+    )
+}
+
 impl LucidosEngine {
+    /// `thread_id` anchors the capture for the verdict call this makes. The
+    /// tool dispatcher holds it, so the spend is never filed against nothing.
     pub(crate) async fn execute_memory_tool(
         &self,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let search_query = args["search_query"].as_str().unwrap_or("");
         let wrong_fact = args
@@ -120,41 +182,20 @@ If NONE should be deleted, reply with "none"."#,
             verify_list = verify_list,
         );
 
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(verify_prompt),
-        }];
-
-        let verified_indices: Vec<usize> = match self
-            .current_provider()
-            .chat(messages, vec![], None, None, None, None)
-            .await
-        {
-            Ok(response) => {
-                let answer = response
-                    .content
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .to_lowercase();
-                log!(@Memory, "[correct_memory] LLM batch verdict: '{}'", &answer[..answer.floor_char_boundary(100)]);
-
-                if answer.starts_with("none") || answer.is_empty() {
-                    vec![]
-                } else {
-                    // Parse comma-separated numbers (1-indexed)
-                    answer
-                        .split(|c: char| c == ',' || c.is_whitespace())
-                        .filter_map(|s| s.trim().parse::<usize>().ok())
-                        .filter(|&n| n >= 1 && n <= candidates.len())
-                        .map(|n| n - 1) // Convert to 0-indexed
-                        .collect()
-                }
-            }
-            Err(e) => {
-                log!(@Memory, "[correct_memory] LLM batch verification failed: {} — aborting to be safe", e);
-                return Ok("Memory correction aborted: could not verify which entries to delete. Please try again.".to_string());
-            }
+        let capture = crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+        let Some(verified_indices) = verify_entries(
+            self.current_provider().as_ref(),
+            verify_prompt,
+            candidates.len(),
+            Some(&capture),
+        )
+        .await
+        else {
+            return Ok("Memory correction aborted: could not verify which entries to delete. Please try again.".to_string());
         };
 
         if verified_indices.is_empty() {
@@ -490,11 +531,74 @@ pub(crate) async fn correct_memory_by_id_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::event_bus::EventBus;
     use crate::memory::{MemorySource, PgVectorIndex};
-    use crate::test_support::{setup_test_db, teardown_test_db};
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
     use async_trait::async_trait;
     use serde_json::json;
     use uuid::Uuid;
+
+    /// The verdict call decides which memories get deleted, and it spent real
+    /// tokens doing it on the agent's own chat model.
+    #[tokio::test]
+    async fn the_correction_verdict_records_what_it_cost() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+
+        let provider = ScriptedProvider::new("claude-opus-4-5", vec!["1, 3"]);
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, Some(&capture))
+            .await
+            .expect("the scripted reply parses");
+        assert_eq!(
+            verified,
+            vec![0, 2],
+            "the numbers are 1-indexed on the wire"
+        );
+
+        let captures = aux_captures(&pool, thread_id, "memory_correction").await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(captures[0]["model"], "claude-opus-4-5");
+        assert_eq!(captures[0]["usage"]["input_tokens"], 210);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A verdict of "none" still cost what it cost. Only a call that never
+    /// reached the provider leaves no row.
+    #[tokio::test]
+    async fn a_verdict_of_none_is_still_recorded() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture = AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::MemoryCorrection,
+        );
+
+        let provider = ScriptedProvider::new("claude-opus-4-5", vec!["none"]);
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, Some(&capture))
+            .await
+            .expect("the scripted reply parses");
+        assert!(verified.is_empty());
+        assert_eq!(
+            aux_captures(&pool, thread_id, "memory_correction")
+                .await
+                .len(),
+            1
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
 
     // --- parse_memory_entry_id (pure) ---
 

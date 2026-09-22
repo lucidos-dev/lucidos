@@ -200,6 +200,8 @@ mod tests {
     #[test]
     fn claude_tiers_split_on_the_adaptive_thinking_path() {
         for adaptive in [
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
             "claude-opus-5@default",
             "claude-opus-5@default[1m]",
             "claude-opus-4-8@default",

@@ -168,3 +168,71 @@ is allowed, an irreversible side-effect is allowed iff the originating trigger's
 no card, never hangs. `approvalPolicy` stays `on-request` (an auto-**allowed**
 escalation must still `accept` so Codex re-runs the command escalated). Full
 decision: ADR 0002 (Phase 5 addendum, 2026-06-25).
+
+## Addendum (2026-09-21): an attended escalation is classified before it cards
+
+The §2 bridge raised a card for **every** sandbox escape an attended session hit,
+and a user reported Codex unusable because of it. Every one of the 11
+`command_execution` cards raised in the preceding 30 days was a process probe:
+`ps`, `caffeinate`, `wc`, `sleep` or `cat` watching a background benchmark.
+
+**Why `ps` escalates at all.** `/bin/ps` is setuid root, and codex's macOS
+seatbelt profile refuses to exec a sugid binary.
+`codex sandbox --log-denials -- /bin/zsh -lc 'ps aux | head -3'` prints
+`zsh:1: operation not permitted: ps` and names the denial `forbidden-exec-sugid`.
+So the escalation is legitimate and no sandbox setting removes it. The cards were
+not noise on codex's side.
+
+**Decision.** `prompt_coding_agent_permission` gains a fifth gate, below every
+grant and below the unattended branch: a `command_execution` request goes through
+the same hybrid classifier ADR 0002 built for the Lucidos Agent's chat lane. The
+static pass answers first, and `ps`, `cat`, `wc` and `sleep` are already on its
+read-only head list, so the common case costs nothing. The ambiguous middle goes
+to the LLM judge under the existing `command_guard_judge` preference.
+
+**An auto-allow rests on a positive `Safe` verdict, never on a fallback.**
+Static or judged, that one lane. A judge that is off, has no provider, errors or
+times out leaves the card. That is stricter than the unattended lane, which
+reads an unrecognised head as benign. Catastrophic still cards, and nothing here
+auto-denies.
+
+`ReversibleDanger` cards here, where the chat lane runs it unasked. That lane
+snapshots the workspace on a safety ref first, and this gate has no such undo.
+`worktree_write_auto_allowed` holds the same line, by excluding commands from
+its own carve-out. It costs nothing: a destruction confined to the worktree runs
+inside the sandbox, so it raises no approval at all.
+
+**Two shapes are refused ahead of any verdict.** A `fast_path_refused` command
+never reaches the judge, which is handed the command text alone and cannot see
+the refusal. And a command reaching for another user's rights cards whatever the
+lane says: the head walk treats `sudo` as a benign prefix, so `sudo cat` settles
+`Safe` on the strength of `cat`. Both are recorded in ADR 0002's 2026-09-21
+addendum, which is where the judge-on-the-permission-path narrowing lives.
+
+**Both command-guard toggles gate the LLM half**, in the order
+`agentic_loop::run` reads them. `command_guard` ships off, so the judge half of
+this gate ships off with it, and turning on Command safety turns it on. The
+static half asks neither and needs no model, which is what answers the reported
+case: every one of the 11 cards is a `READ_ONLY_HEADS` command.
+
+Scope is the `command_execution` tool name, so Claude Code is untouched by
+construction. A CC card means the tool is missing from a `--allowedTools` list
+the user curates; a Codex card means the OS sandbox blocked the command.
+
+**Two upstream mechanisms rejected.** `approvalPolicy` stays `on-request`.
+Codex 0.155 accepts `{granular: {request_permissions: false}}`, which drops the
+escalation request entirely, and `ps` would then fail silently, the outcome §3
+rejected. It also accepts `approvalsReviewer: "auto_review"` (the
+`--approve-for-me` flag), a codex subagent that decides on its own.
+
+Three counts against that one. Every guardian type in the app-server schema is
+marked `[UNSTABLE]`. Its decisions bypass the card machinery, so nothing is
+recorded and nothing can be overridden. And it spends a model call where the
+static list answers for free.
+
+The `acceptWithExecpolicyAmendment` decision was rejected on the same footing: it
+persists a rule into `~/.codex`, per exact argv prefix, where the engine's own
+gate cannot see it.
+
+Full reconnaissance and invariants:
+`docs/plans/2026-09-21-codex-sandbox-escapes-are-classified-before-carding.md`.

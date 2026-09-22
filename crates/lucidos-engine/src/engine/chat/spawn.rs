@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use super::title::emit_generated_title;
 use super::PreEmittedOrigin;
 use crate::engine::thread_events::ActorMode;
 use crate::engine::LucidosEngine;
@@ -13,9 +12,8 @@ impl LucidosEngine {
     /// Non-async to avoid Send issues with `&self` across await points in
     /// nested spawn contexts.
     ///
-    /// `caller_title` — Some(non-empty) is used as the title and skips LLM
-    /// title generation; None falls back to a truncated-prompt placeholder
-    /// followed by an LLM-generated replacement.
+    /// `caller_title`: Some(non-empty) becomes the thread's name and keeps the
+    /// title model out. None leaves the naming to the model.
     /// `pre_emitted_origin` — Some skips re-emitting MessageReceived (the
     /// caller already emitted it and incremented active_children_count).
     /// `model` / `reasoning_effort` — chat-mode prefs to inherit; `None` falls
@@ -42,50 +40,11 @@ impl LucidosEngine {
         reasoning_effort: Option<String>,
         origin: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
-        let explicit_title = caller_title
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string);
-
-        let bus = self.event_bus.clone();
-        let has_explicit_title = explicit_title.is_some();
-        let msg = prompt.to_string();
-        let initial_title =
-            explicit_title.unwrap_or_else(|| prompt.chars().take(60).collect::<String>());
-        let title_engine = self.clone_arc();
-        tokio::spawn(async move {
-            if let Err(e) = bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id: child_thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::ThreadTitleGenerated {
-                        title: initial_title,
-                    },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
-                })
-                .await
-            {
-                log!("[FanOut] Failed to emit title: {}", e);
-            }
-
-            // Build the title provider here (in the async task) so it can
-            // honor the `model_title` preference, matching the chat and CC
-            // paths; an unset/empty preference falls back to the extractor's
-            // default model.
-            if !has_explicit_title {
-                if let Some(ref extractor) = title_engine.extractor {
-                    match super::title_call(&title_engine.pool, extractor).await {
-                        Ok(call) => {
-                            // Spawned child threads carry no images on their first prompt.
-                            emit_generated_title(&bus, &call, child_thread_id, &msg, None, None, 0)
-                                .await;
-                        }
-                        Err(e) => {
-                            log!("[FanOut] Failed to build title provider: {}", e)
-                        }
-                    }
-                }
-            }
-        });
+        // `process_message_with_steps` does the naming, once the child's row
+        // exists to hold it. The placeholder is dropped: a chat child has no
+        // parent-side row to render before it is real, and the thread list
+        // shows its first message until a title lands.
+        let caller_title = super::spawn_naming(caller_title, prompt).caller_title;
 
         let engine = self.clone_arc();
         let prompt_owned = prompt.to_string();
@@ -123,7 +82,7 @@ impl LucidosEngine {
                         // MessageReceived at admission time; it is a real message,
                         // just one this task didn't emit.
                         pre_emitted_origin.map(PreEmittedOrigin::Message),
-                        None,
+                        caller_title.as_deref(),
                         origin,
                         None,
                         crate::engine::FollowUpUrgency::Normal,

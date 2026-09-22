@@ -55,10 +55,11 @@ follow-up, and it needs a version-free label plus round-trip handling, the same
 as `opus`.
 
 **An alias resolves per provider, and it moves.** On the Anthropic API (what
-Lucidos spawns against) `sonnet` resolves to **Sonnet 5** and `opus` to **Opus 5**
-as of CC v2.1.219; on Bedrock / Google Cloud those same aliases land on older
-versions. So an alias row's *label* goes stale silently whenever Anthropic
-repoints it. Two consequences for this file:
+Lucidos spawns against) `opus` and `default` resolve to **Opus 5.5** as of CC
+v2.1.280, and `sonnet` to **Sonnet 5**. Elsewhere they lag: Claude Platform on
+AWS, Amazon Bedrock and Google Cloud keep `sonnet` on an older version, and
+Microsoft Foundry keeps both there. So an alias row's *label* goes stale
+silently whenever Anthropic repoints it. Two consequences for this file:
 
 - Re-check what each alias resolves to on every resync (the model-config docs
   page has the per-provider table), and fix the label if it moved. The `opus` /

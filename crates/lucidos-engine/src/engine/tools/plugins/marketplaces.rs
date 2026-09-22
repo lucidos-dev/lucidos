@@ -226,12 +226,19 @@ impl LucidosEngine {
             .await?
         };
 
+        // Stamped before the spawn, because the caller's own catalog refetch
+        // races the spawned task. A new marketplace with no plugins yet must
+        // read as "Scanning marketplaces…", never "No plugins found".
+        crate::scheduler::plugin_updates::note_scan_queued(&self.workspace_path);
         let update_engine = self.clone_arc();
         let update_pool = self.pool.clone();
         tokio::spawn(async move {
             crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
                 update_engine,
                 update_pool,
+                // The registry just changed, so a scan already running may have
+                // read it beforehand. That caller queues a trailing pass.
+                crate::scheduler::plugin_updates::ScanCause::RegistryChanged,
             )
             .await;
         });

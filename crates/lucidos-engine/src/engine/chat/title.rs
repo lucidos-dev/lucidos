@@ -54,6 +54,43 @@ pub(crate) async fn title_call(
     })
 }
 
+/// How much of the prompt stands in for a name the caller did not give.
+const SPAWN_PLACEHOLDER_CHARS: usize = 60;
+
+/// How a spawn names the thread it is about to create.
+///
+/// Two fields, because they are consumed in different places and must not be
+/// conflated. `caller_title` is handed to `process_message_with_steps`, which
+/// writes it once the thread's row exists and keeps the title model out.
+/// `placeholder` is only what a parent's sub-thread row shows in the moment
+/// before the thread is real, and it never becomes the thread's name.
+pub(crate) struct SpawnNaming {
+    pub(crate) caller_title: Option<String>,
+    pub(crate) placeholder: String,
+}
+
+/// Resolve a spawn's naming from what its caller asked for.
+///
+/// A blank or whitespace-only title is no title. The thread then stands in the
+/// prompt's opening words and the title model names it a moment later.
+pub(crate) fn spawn_naming(caller_title: Option<&str>, prompt: &str) -> SpawnNaming {
+    let caller_title = caller_title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let placeholder = caller_title.clone().unwrap_or_else(|| {
+        prompt
+            .trim()
+            .chars()
+            .take(SPAWN_PLACEHOLDER_CHARS)
+            .collect()
+    });
+    SpawnNaming {
+        caller_title,
+        placeholder,
+    }
+}
+
 /// Replace markdown thread references — `[Title text](thread:UUID)` or
 /// `[Title text](thread:workspace/UUID)` — with a neutral placeholder before
 /// titling. The link's visible text is the *referenced* thread's title; left
@@ -514,6 +551,91 @@ mod capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name the caller chose reaches the pipeline, which is the whole
+    /// point: `process_message_with_steps` reads a `None` here as "nobody
+    /// named this thread" and hands it to the title model.
+    #[test]
+    fn a_caller_that_names_its_thread_is_obeyed() {
+        let naming = spawn_naming(
+            Some("Ask-card rule for dangling items"),
+            "One prompt-wording change in the Lucidos source checkout",
+        );
+        assert_eq!(
+            naming.caller_title.as_deref(),
+            Some("Ask-card rule for dangling items")
+        );
+        assert_eq!(naming.placeholder, "Ask-card rule for dangling items");
+    }
+
+    #[test]
+    fn a_blank_title_is_no_title() {
+        for blank in [Some(""), Some("   \n "), None] {
+            let naming = spawn_naming(blank, "Pin every GitHub Action to a commit sha");
+            assert_eq!(naming.caller_title, None, "blank input {blank:?}");
+            assert_eq!(
+                naming.placeholder, "Pin every GitHub Action to a commit sha",
+                "an unnamed thread stands in the prompt's opening words"
+            );
+        }
+    }
+
+    #[test]
+    fn a_surrounding_space_is_not_part_of_the_name() {
+        let naming = spawn_naming(Some("  Pin Actions and safe minor bumps  "), "irrelevant");
+        assert_eq!(
+            naming.caller_title.as_deref(),
+            Some("Pin Actions and safe minor bumps")
+        );
+    }
+
+    /// A spawn hands its caller's name onward. It does not write it.
+    ///
+    /// The projection drops a title event for a thread whose row is not there
+    /// yet, and a spawn runs before its thread's first `MessageReceived`. So a
+    /// spawn that names its own thread loses the name, and then earns the
+    /// thread a model-generated one instead.
+    ///
+    /// Read off the source because the slot is positional.
+    /// `process_message_with_steps` takes two dozen arguments, and the bug was
+    /// a bare `None` sitting in the title one. No type can catch that, and the
+    /// crate has no harness that builds an engine to drive the call. The
+    /// end-to-end half is `a_caller_that_names_its_thread_keeps_that_name` in
+    /// the API e2e suite.
+    #[test]
+    fn a_spawn_does_not_name_its_own_thread() {
+        for site in ["engine/chat/spawn.rs", "engine/claude_code/spawn.rs"] {
+            let text = crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join(site),
+            );
+            assert!(
+                !text.contains("ThreadTitleGenerated"),
+                "{site} must leave naming to `process_message_with_steps`, which \
+                 writes the title once the thread's row exists"
+            );
+            assert!(
+                text.contains("caller_title.as_deref()"),
+                "{site} must pass its caller's title to `process_message_with_steps`. \
+                 A `None` in that slot reads as \"nobody named this thread\" and \
+                 spends a title-model call renaming it"
+            );
+        }
+    }
+
+    /// A placeholder is a glance, not a name, so it is cut to fit a row.
+    #[test]
+    fn a_long_prompt_is_cut_down_to_a_placeholder() {
+        let naming = spawn_naming(None, &"p".repeat(SPAWN_PLACEHOLDER_CHARS + 40));
+        assert_eq!(naming.placeholder.chars().count(), SPAWN_PLACEHOLDER_CHARS);
+    }
+
+    /// Cutting by character, never by byte: a prompt opening in another
+    /// script would panic on a byte slice.
+    #[test]
+    fn a_placeholder_is_cut_by_character() {
+        let naming = spawn_naming(None, &"æ".repeat(SPAWN_PLACEHOLDER_CHARS + 10));
+        assert_eq!(naming.placeholder.chars().count(), SPAWN_PLACEHOLDER_CHARS);
+    }
 
     #[test]
     fn user_content_text_only() {

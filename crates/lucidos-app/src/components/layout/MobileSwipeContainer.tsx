@@ -11,7 +11,13 @@ import {
   viewportIsKeyboardShrunk,
 } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
-import { noteViewportResize } from './keyboardCloseRelayout';
+import {
+  noteKeyboardClosed,
+  notePolledViewport,
+  noteViewportResize,
+  noteWakeViewport,
+} from './keyboardCloseRelayout';
+import { onPerfEnabledChange, perfRecordingOn } from '../../utils/perfQueue';
 import { reportNavigation } from '../../utils/navigationMarks';
 import { useFocusedFieldVisible } from '../../hooks/useFocusedFieldVisible';
 
@@ -190,6 +196,11 @@ export function keyboardBandPx(args: {
  *  An iPhone's portrait keyboard is a little under half the screen, and
  *  over-reserving costs only scrollable slack nobody scrolls into. */
 const ASSUMED_KEYBOARD_FRACTION = 0.45;
+
+/** How often the gated viewport poll reads the keyboard's state.
+ *  The composer probe's scheduled cadence, which the ledger shows still
+ *  running throughout a wedge. */
+const KEYBOARD_POLL_MS = 3000;
 
 /** Check if an element or any ancestor (up to pane boundary) scrolls horizontally. */
 function isHorizontallyScrollable(el: Element | null): boolean {
@@ -555,7 +566,12 @@ export function MobileSwipeContainer() {
       setBand(seenBand || Math.round(window.innerHeight * ASSUMED_KEYBOARD_FRACTION));
     };
 
+    /** The last height ANY observer here acted on. See the poll below, whose
+     *  whole job is the change nothing else saw. */
+    let observedHeight = vv.height;
+
     const onResize = () => {
+      observedHeight = vv.height;
       // The keyboard opening or closing changes --app-height, which shortens or
       // lengthens the transcript's viewport. The reader is left exactly where
       // they are: the content above them has not moved, so the same scrollTop
@@ -570,6 +586,7 @@ export function MobileSwipeContainer() {
       noteViewportResize({ height: vv.height, layoutViewport: window.innerHeight });
     };
     const onOrientationChange = () => {
+      observedHeight = vv.height;
       setHeight(currentAppHeight());
       syncBand();
     };
@@ -623,12 +640,61 @@ export function MobileSwipeContainer() {
         active.blur();
       }
       lastSetHeight = -1;
+      observedHeight = vv.height;
       setHeight(currentAppHeight());
       syncBand();
+      // A resume is a keyboard close the fold would otherwise never see: the
+      // comment above says iOS fires no resize here. Told after the height is
+      // written, so the bounce starts from the restored one, as `onResize`
+      // does.
+      //
+      // Which half depends on whether iOS left the height PINNED. A pinned one
+      // offers the fold no edge, so the stamp goes on this handler's word. A
+      // corrected one already carries the restored reading the fold wants.
+      // Handing it over is the only way that close is ever seen.
+      if (vvLooksShrunk) noteKeyboardClosed();
+      else noteWakeViewport({ height: vv.height, layoutViewport: window.innerHeight });
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') onWake();
     };
+    // The backstop for a close iOS announces to nobody. It stands in for the
+    // resize that never came, so it runs `onResize`'s own three steps in the
+    // same order.
+    //
+    // It lives HERE because those steps need the height owner. A poll parked
+    // elsewhere would bounce off the keyboard-shrunk --app-height and restore
+    // it. The shell would stay at half height, with the black band `onWake`
+    // documents above. This effect is mobile-only, so no desktop pays for it.
+    //
+    // Behind the perf gate (utils/perfQueue.ts), which owns every timer a
+    // diagnostic costs. Read live, so the toggle needs no reload.
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const stopPoll = () => {
+      if (pollTimer === null) return;
+      clearInterval(pollTimer);
+      pollTimer = null;
+    };
+    const pollViewport = () => {
+      if (document.visibilityState === 'hidden') return;
+      // The gate can drop with nothing announcing it, so an active tick reads
+      // it. Without this the interval outlives what armed it.
+      if (!perfRecordingOn()) { stopPoll(); return; }
+      // The change NOTHING else saw, which is the silent close this exists for.
+      // A handled one already moved `observedHeight`. Acting on it again would
+      // run `syncBand` with the keys down inside a live focus window, wiping
+      // the reserve `armBand` just made.
+      if (vv.height === observedHeight) return;
+      observedHeight = vv.height;
+      setHeight(currentAppHeight());
+      syncBand();
+      notePolledViewport({ height: vv.height, layoutViewport: window.innerHeight });
+    };
+    const startPoll = () => {
+      if (pollTimer === null) pollTimer = setInterval(pollViewport, KEYBOARD_POLL_MS);
+    };
+    const unsubscribeGate = onPerfEnabledChange((on) => (on ? startPoll() : stopPoll()));
+    if (perfRecordingOn()) startPoll();
     vv.addEventListener('resize', onResize);
     window.addEventListener('orientationchange', onOrientationChange);
     document.addEventListener('visibilitychange', onVisibilityChange);
@@ -638,6 +704,8 @@ export function MobileSwipeContainer() {
     setHeight(currentAppHeight());
     syncBand();
     return () => {
+      stopPoll();
+      unsubscribeGate();
       vv.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onOrientationChange);
       document.removeEventListener('visibilitychange', onVisibilityChange);

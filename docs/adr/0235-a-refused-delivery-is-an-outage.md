@@ -105,6 +105,39 @@ it, a hook switched off after an hour of signature failures reports forty-one
 deliveries "thrown away before they were read". It would tell its owner the
 secret is fine, while forty of them had failed exactly that check.
 
+**Amended 2026-09-21: a run ends when the enabled flag moves, and the live flag
+outranks the stored cause.** The homogeneous-run rule is right. It was enforced
+in one place too few.
+
+A refusal of the other cause restarts the run. The **flag** is one of the two
+causes, and it was not doing the same thing. So moving it left the run
+describing a fault that was over. A run reading `verification` could sit on a
+hook that is off, with its count and its HMAC tally intact.
+
+That is this section's own named failure, reached the other way round. Report
+those 42 under the switched-off words, and the owner reads "every one was
+refused before it was read". Every one of them failed exactly the check that
+sentence calls fine.
+
+**So `WebhookStore::update` ends the run in the statement that moves the flag**,
+the way an acceptance does. The count, the start and the tally describe one
+fault again, and the next delivery starts an honest run. A write that resends
+the flag unchanged leaves a live run alone.
+
+Two guards sit behind that, for a row written before it. `judge` reports
+`disabled` whenever the flag is off, on the disabled floor, and the wording
+table applies the same rule (`utils/webhookRefusalNotice.ts`). Both read the
+flag rather than the stored cause.
+
+**The asymmetry in the harm is what orders them.** The verification words tell
+the reader to rotate or re-point the secret.
+`data/knowhow/github-workflow-run-webhook.md` records that re-pointing replaces
+the whole config object and drops the secret with it. One click becomes a
+multi-day outage, where the opposite error costs one look at a switch.
+
+The recovery table below is unchanged and stays true: an on-to-off switch
+retracts as `reconfigured`, because the run it named is gone.
+
 **The engine's own probe never reaches the tally at all.** It presents a bearer
 this engine minted for the cycle, and `api::webhooks::is_probe_delivery` skips
 the stamp on a match. That mechanism already existed for the same reason
@@ -191,6 +224,25 @@ wedged while a hook is also switched off. They also want different actions.
 A bar that had to say both would say neither clearly. The ingress bar's Discuss
 button suits a fault diagnosed address by address, and this one already names
 its own cause.
+
+**Amended 2026-09-21: the refusal bar takes a Discuss button too.** The clause
+above is wrong and is reversed here. The rest of the section stands: the two
+bars remain separate, for the reasons given.
+
+The bar names a SYMPTOM, not a cause. "No readable signature" leaves three
+questions open. Does the secret on this side differ from the sender's hook
+config? Does the sender emit the signature header at all? Does something in
+between strip it?
+
+Nothing the bar can draw answers any of them, and the Webhooks page cannot
+either: it holds this side of the comparison and never the sender's. That is a
+diagnosis, the same shape as the ingress one, and the agent is where it gets
+worked out.
+
+The change keeps the cause split rather than softening it. The message quotes
+`webhookRefusalNotice` instead of writing a second sentence. So a switched-off
+hook reaches the agent in the words that say the signature is irrelevant. See
+`store/actions/webhook-refusal-discuss.ts`.
 
 ## Consequences
 

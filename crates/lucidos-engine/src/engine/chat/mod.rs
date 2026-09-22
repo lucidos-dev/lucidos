@@ -15,7 +15,7 @@ pub(crate) use events::make_message_received;
 pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;
 pub(crate) use process::PreEmittedOrigin;
 pub(crate) use title::{
-    emit_generated_title, exchange_has_both_speakers, generate_thread_title,
+    emit_generated_title, exchange_has_both_speakers, generate_thread_title, spawn_naming,
     spoken_exchange_as_title_input, title_call,
 };
 

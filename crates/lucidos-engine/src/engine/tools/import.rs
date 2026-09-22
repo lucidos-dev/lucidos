@@ -177,11 +177,14 @@ fn walk_dir(
 }
 
 impl LucidosEngine {
+    /// `thread_id` anchors the capture for the summary call an `import_file`
+    /// makes. The tool dispatcher holds it, so that spend has a home.
     pub(crate) async fn execute_import_tool(
         &self,
         name: &str,
         args: &serde_json::Value,
         extraction_ctx: &str,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "import_file" => {
@@ -324,7 +327,9 @@ impl LucidosEngine {
                         .await?;
 
                     // Generate summary for text files
-                    let summary = self.summarize_artifact(&dest_relative, &content).await;
+                    let summary = self
+                        .summarize_artifact(&dest_relative, &content, thread_id)
+                        .await;
                     (summary, size, main_commit)
                 };
 

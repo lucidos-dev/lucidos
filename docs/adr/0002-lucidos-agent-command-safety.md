@@ -420,3 +420,38 @@ Implementation: `engine/command_guard.rs` (`FastPathDecline`, `segment_safety`,
 `bash_fast_path`), `engine/cc_permission.rs` (`CommandPayload`,
 `RequestVerdict::Unclassified`, `record_unattended_denial`). Plan:
 `docs/plans/2026-08-24-command-guard-bypass-cluster.md`.
+
+## Addendum (2026-09-21): the ATTENDED coding-agent lane may reach the judge
+
+Two earlier non-goals here said "no LLM judge in the permission path". Both were
+written about the **unattended** lane, where the rule was that a trigger session
+must never stall on a model call. They read wider than they were meant to, and
+ADR 0005's 2026-09-21 addendum now puts a judge on the **attended** Codex lane.
+This records the narrowing.
+
+**What changed.** An attended Codex `command_execution` escalation is classified
+before it raises a card, and skips the card on a `Safe` verdict. The static pass
+answers first. Only the ambiguous middle reaches
+`LucidosEngine::judge_command`, the same judge the chat lane uses.
+
+**The stall rule still holds, and the unattended lane is untouched.** It returns
+above the new gate, so nothing a trigger session does can reach a model call
+here. The attended lane can afford one: the alternative on that lane is a card,
+which waits for a human indefinitely, so a bounded model call is strictly the
+faster branch. `judge_command` runs under `UNCAPTURED_CALL_BUDGET`, and its
+deadline, its `Err` and a disabled toggle all resolve to the card.
+
+**A refusal is still not judgeable.** The rule three paragraphs up stands: a
+`fast_path_refused` shape never reaches the judge on the attended lane either.
+The judge is handed the command text alone, so it cannot see the refusal.
+`attended_escalation_allowed` is now the third permissive path denying it, after
+the unattended lane and `grant_covers_command`.
+
+**Both command-guard toggles gate the LLM half.** The master `command_guard` and
+the `command_guard_judge` sub-switch, in the order `agentic_loop::run` reads
+them. The master ships off, so the judge half of this gate ships off with it.
+The static half does not ask, and needs no model.
+
+Implementation: `engine/cc_permission.rs` (`attended_escalation_allowed`,
+`judge_escalation_lane`, `lane_allows_escalation`). Full reconnaissance:
+`docs/plans/2026-09-21-codex-sandbox-escapes-are-classified-before-carding.md`.

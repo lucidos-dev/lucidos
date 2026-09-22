@@ -92,6 +92,29 @@ async fn a_call_makes_the_thread_real(
     })
 }
 
+/// Write a thread's name, and answer whether there was a row to take it.
+///
+/// **A title event must never create the row.** It carries no identity, and
+/// `MessageReceived`'s conflict arm fills none of it in: `parent_thread_id`,
+/// `depth`, `initiator` and `spawning_event_id` are written on the insert path
+/// only. A row conjured here would send the real `MessageReceived` down the
+/// conflict arm and leave a spawned sub-thread unlinked from its parent.
+///
+/// So an early title is dropped, and the `false` is what stops that being
+/// silent. The rejected upsert and its cost are in ADR 0240.
+async fn write_thread_title(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    thread_id: Uuid,
+    title: &str,
+) -> Result<bool, sqlx::Error> {
+    let applied = sqlx::query("UPDATE thread_summaries SET title = $2 WHERE thread_id = $1")
+        .bind(thread_id)
+        .bind(title)
+        .execute(&mut **tx)
+        .await?;
+    Ok(applied.rows_affected() > 0)
+}
+
 fn compose_cleared_broadcast(thread_id: Uuid, compose_epoch: i64) -> BusEvent {
     BusEvent::System(
         crate::engine::event_bus::SystemEvent::ThreadComposeChanged {
@@ -721,13 +744,15 @@ impl EventBus {
 
             // Title events
             ThreadEvent::ThreadTitleGenerated { title } | ThreadEvent::ThreadTitleRenamed { title } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET title = $2 WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .bind(title)
-                .execute(&mut **tx)
-                .await?;
+                if !write_thread_title(tx, thread_id, title).await? {
+                    crate::log!(
+                        "[EventBus] Dropped the name {:?} for {}: no thread_summaries row. \
+                         A title event has to follow the thread's first MessageReceived \
+                         (ADR 0240), and a deleted thread has no row to name.",
+                        title,
+                        thread_id
+                    );
+                }
                 Vec::new()
             }
 
@@ -1716,3 +1741,7 @@ impl EventBus {
         Ok((match_side_effects, affected_ancestors))
     }
 }
+
+#[cfg(test)]
+#[path = "event_bus_projection_thread_tests.rs"]
+mod tests;

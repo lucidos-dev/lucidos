@@ -178,22 +178,58 @@ fn a_run_nothing_has_added_to_for_a_fortnight_stops_being_news() {
     );
 }
 
-/// The run's own cause names the fault, and the live flag has to agree with it.
+/// A re-enabled hook's disabled run names a fault that is over.
+///
+/// One of the two directions the live flag decides. Nothing is reported here,
+/// however long the run is, because the switch is back on.
 #[test]
-fn the_run_names_its_cause_and_the_flag_has_to_agree() {
-    // Switched back on, carrying a disabled run. That run is evidence of a
-    // fault that is over, so nothing is reported however long it is.
+fn a_re_enabled_hooks_disabled_run_names_a_fault_that_is_over() {
     let re_enabled = refusing(true, &[(DeliveryRefusal::Disabled, 42)], 97_000, 300);
     assert_eq!(judge(&re_enabled), CLEAR);
+}
 
-    // Switched off, carrying a verification run. The mirror case.
+/// A switched-off hook is never reported as a verification fault.
+///
+/// The other direction, and the one that cost a live outage. A run
+/// forms while the hook is on, somebody switches the hook off, and the stored
+/// cause still says `verification`. The flag is the fact; the cause is a
+/// reading of what the run WAS.
+///
+/// Reporting the stored cause sends the reader at the secret. Re-pointing a
+/// hook replaces the whole config object and drops the secret with it, so the
+/// wrong words turn one click into a multi-day outage.
+#[test]
+fn a_switched_off_hook_is_never_reported_as_a_verification_fault() {
+    for reason in [
+        DeliveryRefusal::SignatureMissing,
+        DeliveryRefusal::SignatureMismatch,
+        DeliveryRefusal::Token,
+        DeliveryRefusal::CredentialMissing,
+    ] {
+        let switched_off = refusing(false, &[(reason, 5)], 97_000, 300);
+        assert_eq!(
+            judge(&switched_off),
+            RefusalVerdict::Refusing(RefusalCause::Disabled),
+            "{} on a hook that is off is still a switched-off hook",
+            reason.key()
+        );
+    }
+
+    // It declares rather than going quiet. Clearing here was the old answer,
+    // and silence on a hook throwing deliveries away is the failure ADR 0235
+    // exists to prevent.
+    let said = standing(RefusalCause::Verification, 97_000);
     let switched_off = refusing(
         false,
-        &[(DeliveryRefusal::SignatureMismatch, 42)],
+        &[(DeliveryRefusal::SignatureMissing, 5)],
         97_000,
         300,
     );
-    assert_eq!(judge(&switched_off), CLEAR);
+    assert_eq!(
+        decide(judge(&switched_off), Some(&said), Some(&switched_off)),
+        Decision::Declare(RefusalCause::Disabled),
+        "the standing verification declaration has to be said again, in the other words"
+    );
 }
 
 /// A run whose cause this engine cannot read judges nothing.
@@ -270,14 +306,15 @@ fn a_declaration_is_never_stranded() {
         Decision::Recover(Resolution::Reconfigured)
     );
 
-    // Switched off while a verification declaration stood. The fault named is
-    // not the live one any more, so it is retracted rather than left.
-    let switched_off = refusing(
-        false,
-        &[(DeliveryRefusal::SignatureMismatch, 42)],
-        97_000,
-        300,
-    );
+    // Switched off while a verification declaration stood. `update` ends the
+    // run in the same statement that moves the flag, so the row the next cycle
+    // reads carries no run at all.
+    //
+    // It names the SWITCH, not silence. A cleared run has no age, which reads
+    // as quiet, and that would report a deliberate switch-off as a sender that
+    // went away. A trigger routing on the resolution would act on the wrong one.
+    let switched_off = refusing(false, &[], 0, 0);
+    assert_eq!(judge(&switched_off), CLEAR);
     assert_eq!(
         decide(CLEAR, Some(&said), Some(&switched_off)),
         Decision::Recover(Resolution::Reconfigured)

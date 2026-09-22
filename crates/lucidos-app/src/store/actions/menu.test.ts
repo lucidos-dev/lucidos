@@ -41,7 +41,10 @@ vi.mock('../../api/client', () => ({
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
   listTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
   listAppsApi: vi.fn().mockResolvedValue([]),
-  fetchPluginCatalog: vi.fn().mockResolvedValue({ marketplaces: [], plugins: [], errors: [] }),
+  fetchPluginCatalog: vi.fn().mockResolvedValue({
+    marketplaces: [], plugins: [], errors: [],
+    scanned_at: null, scanning: false, scan_error: null,
+  }),
   fetchInstalledPlugins: vi.fn().mockResolvedValue({ plugins: [] }),
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
@@ -336,9 +339,9 @@ describe('openWebhookSettings', () => {
   });
 
   it('lands on Settings > Webhooks and reveals the content pane', () => {
-    // The ingress bar's "Open Webhooks" button. Without the reveal the tap does
-    // nothing visible for a mobile user on the thread pane, and leaves a desktop
-    // user's collapsed split shut.
+    // The "Open Webhooks" button both webhook bars carry. Without the reveal
+    // the tap does nothing visible for a mobile user on the thread pane, and
+    // leaves a desktop user's collapsed split shut.
     openWebhookSettings();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('webhooks');

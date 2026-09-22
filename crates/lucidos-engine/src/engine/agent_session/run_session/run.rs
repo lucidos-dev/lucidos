@@ -2269,6 +2269,13 @@ impl LucidosEngine {
                             // the MCP path resolves, and reading it here keeps
                             // the arm lock-free.
                             let session_worktree = worktree_path.clone();
+                            // The escalation classifier's LLM half runs off the
+                            // engine, inside the spawned task below. Taken as an
+                            // Arc for the same reason the title task does, and
+                            // the select arm stays free of the classification.
+                            // `try_` so a bare test engine gets the static half
+                            // rather than a panic.
+                            let judge = self.try_clone_arc();
                             // Disarm the watchdog while the card waits. The
                             // approval may arrive BEFORE the item's ToolUse,
                             // so the paired tool counter alone cannot cover
@@ -2285,6 +2292,7 @@ impl LucidosEngine {
                                         &trigger_configs,
                                         &workspace_path,
                                         session_worktree.as_deref(),
+                                        judge.as_deref(),
                                         crate::engine::cc_permission::CodingAgentPermissionInput {
                                             thread_id,
                                             tool_use_id: req.id,

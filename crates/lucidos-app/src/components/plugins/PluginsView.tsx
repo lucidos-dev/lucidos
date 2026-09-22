@@ -19,6 +19,7 @@ import {
   availableMarketplaces,
   resolveActiveMarketplace,
 } from './StoreTab';
+import { CatalogFreshness } from './CatalogFreshness';
 
 function PluginSearchBar() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -102,6 +103,11 @@ export function PluginsView() {
             Installed
           </button>
         </div>
+
+        {/* How old the plugin rows are, beside the controls that filter them.
+            The list comes from a cache the engine refreshes on a timer, so the
+            panel says its age rather than pretending the rows are live. */}
+        <CatalogFreshness />
 
         <Dropdown
           class="plugins-marketplace-filter"

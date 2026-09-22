@@ -88,6 +88,7 @@ const GATED_ROUTES: &[&str] = &[
     "/oauth/complete",
     "/oauth/reauthorize",
     "/pinned-apps",
+    "/plugins/catalog/rescan",
     "/plugins/install-request",
     "/plugins/install/:install_id/cancel",
     "/plugins/install/:install_id/confirm",

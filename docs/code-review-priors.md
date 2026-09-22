@@ -1061,6 +1061,40 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if `standing_verdict` stops matching on status first, or if
   `working_thread_ids` and `SWEEPABLE_THREAD_STATUSES` diverge.
 
+- **`AuxModelSource` collapsing to `Option` at every production call site is
+  the point, not dead structure.** A reviewer sees `resolve_selection` and
+  `AuxCall::defaults` both call `.prefs()`, treating `Turn`, `BackendPinned`
+  and `AgentModel` alike. The enum then reads as an `Option` with extra steps.
+  Its consumer is the invariant test, not the resolver:
+  `every_purpose_owns_exactly_one_model_preference` matches every arm with no
+  wildcard, so a purpose reading no model preference has to name WHICH kind of
+  nothing it reads. ADR 0242 records why an exemption line was refused.
+
+  Re-flag only if the test stops asserting per-arm membership, which is the one
+  thing that would leave the enum carrying nothing.
+
+- **`UNRECORDED` being empty, plus a test asserting it is empty, is not a dead
+  filter.** A reviewer sees `const UNRECORDED: &[(&str, &str)] = &[]` in
+  `engine/aux_capture.rs`, a filter that removes nothing, and a second test
+  whose whole body is `assert!(UNRECORDED.is_empty())`. Both are deliberate:
+  the table is the audit's escape hatch, and writing the current count down is
+  what makes adding a row a decision somebody has to defend. Deleting the
+  emptiness test is easier than earning a row, which is the shape intended.
+
+  Re-flag if a row ever lands without a reason beside it, never for the
+  emptiness itself.
+
+- **`MODEL_CALL_SHAPES` over-matching any method named `chat`, `ask` or
+  `generate` is the chosen trade.** A reviewer notices the audit's bare
+  substrings hit `voice`'s own `self.ask(session, open)`, which opens a
+  decision card and calls no model. A false hit is loud and costs a reader a
+  minute; a miss is spend nobody sees, which is the failure the audit exists
+  for. The failure message names both ways out, and `UNWALKED` takes a file
+  whose name only looks like a provider method.
+
+  Re-flag with a tighter matcher that still catches a call through a fresh
+  local binding. That is the shape a receiver-aware check tends to miss.
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -3525,6 +3559,32 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   that decision made, or if an agent path is found that reaches them without a
   token.
   (`crates/lucidos-engine/src/api/threads/actions.rs`, ADR 0052.)
+
+- **The *plugin catalog cache* clones its rows on the way out, and that is the
+  cheap side of the trade.** `merge_with_registry` clones every cached plugin
+  that survives the registry filter, and a reviewer reaches for a borrow or an
+  `Arc`. The caller consumes the result at once and then mutates it twice, so a
+  borrow buys nothing. An `Arc` in the cache would add an atomic to every access
+  to dodge a clone the request pays anyway. Re-flag only with a measurement
+  showing the clone dominates.
+  (`crates/lucidos-engine/src/core/plugin_catalog_cache.rs`, ADR 0243.)
+
+- **`applyMarketplaceMutation` spreading the previous `scanning` and
+  `scanned_at` forward is deliberate.** A reviewer reads the spread as carrying
+  a stale flag. The mutation changed the registry, not the scan behind the
+  plugins, so the engine's last answer is still the client's truest. Blanking it
+  would claim the rows have no age, and the refresh it fires corrects it anyway.
+  Re-flag only if the spread starts carrying a field the mutation invalidates.
+  (`crates/lucidos-app/src/store/actions/plugin-marketplaces.ts`.)
+
+- **A scan that fails outright still leaves the update-notice marker alone, and
+  that ordering is unchanged.** A reviewer tracing `scan_into_cache`'s early
+  returns reads the empty-registry marker clear as newly unreachable. That
+  branch still runs before the installed-plugins read and before the scan,
+  exactly as it did when the code was one function. Only a registry the engine
+  cannot READ skips the clear, which was true before too. Re-flag only if the
+  empty-registry check moves after another fallible step.
+  (`crates/lucidos-engine/src/scheduler/plugin_updates.rs`.)
 
 ## Settled architecture questions
 

@@ -109,6 +109,7 @@ for calling a category clean.
 | `download-link` | a download link, which needs `sdk.js` in a frame | 2 |
 | `media-capture` | the camera or the microphone, from an app frame | 2 |
 | `web-share` | the OS share sheet, from an app frame | 2 |
+| `url-mutation` | the frame writing its own session-history URL | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
 | `cred-env` | a credential read from the environment | 7 |
@@ -143,6 +144,8 @@ scan download-link "<a [^>]*download" --include=*.html apps
 scan media-capture "getUserMedia" $inc apps
 
 scan web-share "navigator\.share" $inc apps
+
+scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|replace)[[:space:]]*=|window\.location[[:space:]]*=" $inc apps
 
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
@@ -263,6 +266,11 @@ Per `system-knowhow/js-sdk.md`:
   - **`<a href="<the app's own file>" download>`**, in an app whose `index.html` loads no `/api/v1/sdk.js`. A browser ignores `download` on a cross-origin link, so the click navigates the frame to the file instead. Severity: **broken**.
   - **The camera or the microphone.** `navigator.mediaDevices.getUserMedia`. Both browsers refuse media capture to an opaque origin outright, whatever the frame is granted, so no remedy exists inside a frame. Severity: **broken**. Say the app has to run in its own tab. Reference: `system-knowhow/js-sdk.md` § Setup, which lists what the frame is granted.
   - **The OS share sheet.** `navigator.share` called directly. The frame is not granted `web-share`, and iOS refuses the delegation anyway. Severity: **broken**. The remedy is `lucidos.ui.openExternal(url)`, which opens the link through the host. A hit inside a vendored copy of `sdk.js` is the SDK's own fallback, not the app's, so read the call site before reporting it.
+  - **Session-history URL writes.** `history.replaceState`, `history.pushState`, or assignment to `location.href` / `window.location` / `location.assign()` / `location.replace()`. The frame is sandboxed without `allow-same-origin`, so the browser refuses any session-history URL write whose path or fragment differs from the frame's real URL. The error reads "Paths and fragments must match for a sandboxed document". Split the severity the way the failure does:
+    - **broken** where the call sits outside a `try`. It throws, and if it is anywhere in the render or boot path the app renders nothing.
+    - **stale** where a `try` / `catch` wraps it. The app runs and the URL simply stops reflecting state, so deep links out of the app stop working while nothing looks wrong.
+
+    The remedy: an app must not write its own URL. Reading a fragment still works: apply `location.hash` at boot and subscribe to `hashchange`, which is how inbound deep links arrive. There is no app-side way to write the URL back. To share its current state, the app constructs the link string and copies or shows it. Reference: `system-knowhow/js-sdk.md` § Setup (which lists what the frame is granted) and § "fragment: opening at a place inside the app".
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only: a user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. The read is untouched. Severity: **broken**, since the call answers 403 and the app's own settings never persist. § Remediation carries the replacement.
   - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path rather than an absolute URL. The frame's origin is opaque, so the browser refuses it exactly as it refuses an engine call. WebKit words that refusal `Load failed` and Chromium raises a `TypeError`. The path being one of the app's own files is what makes it read as safe, and the engine-fetch pattern above cannot see it: nothing in the string says `/api/v1`. Split the severity the way the failure does:
     - **broken** where the throw escapes setup, or the fetch is the app's only data path. The app renders an error banner, or nothing.
@@ -451,6 +459,8 @@ this table and the two rules under it:
 | a call to a route the engine keeps from apps | nothing. Report it and name what it reaches for |
 | `<a href="report.pdf" download>` on the app's own file | load `/api/v1/sdk.js`, which rewrites the click, or build a `blob:` URL |
 | a `<base href>` the app declares | delete it. It replaces the pass the engine stamps for the app's own files |
+| `history.replaceState(...)` / `history.pushState(...)` writing the app's own state into the URL | delete the write. Keep the read: apply `location.hash` at boot and on `hashchange` |
+| `location.href = ...` / `location.assign(...)` navigating the frame itself | `lucidos.ui.navigate(...)` for a Lucidos destination, `lucidos.ui.openExternal(url)` for anything outside |
 
 - **The read becomes asynchronous.** A synchronous `localStorage.getItem` at
   module top level becomes an `await`, so the first paint has to tolerate not

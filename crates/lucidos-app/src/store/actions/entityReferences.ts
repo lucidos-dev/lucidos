@@ -5,7 +5,7 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
@@ -331,6 +331,22 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // that call joins this one's in-flight scan rather than starting a second.
     case 'PluginMarketplaceRegistered':
     case 'PluginMarketplaceRemoved':
+      if (marketplaceCatalog.value.status === 'loaded') void refreshPluginCatalogAfterMutation();
+      break;
+    // A marketplace scan bookends itself, and these two frames are how every
+    // client learns about one it did not start: the scheduler's five-minute
+    // pass, or another device's refresh. They drive the panel's "Updating…"
+    // cue, which is what the user sees instead of a skeleton over rows the
+    // client already holds.
+    case 'PluginCatalogScanStarted':
+      marketplaceScanning.value = true;
+      break;
+    // `AfterMutation`, not the plain refresh. A fetch already in flight was
+    // issued BEFORE the scan landed. Joining it would settle on pre-scan
+    // plugins, and on the `scanning: true` that came with them. Queue a
+    // trailing fetch instead, which is now one file read on the engine.
+    case 'PluginCatalogScanned':
+      marketplaceScanning.value = false;
       if (marketplaceCatalog.value.status === 'loaded') void refreshPluginCatalogAfterMutation();
       break;
     // Settings-page caches — gated on `status === 'loaded'` (same as Plugin*

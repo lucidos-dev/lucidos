@@ -18,7 +18,7 @@ import {
   refusalBannerBody,
   shouldRenderRefusalBanner,
 } from '../WebhookRefusalBanner';
-import { INGRESS_BANNER_HEIGHT_VAR } from '../IngressBanner';
+import { INGRESS_BANNER_HEIGHT_VAR, ingressBannerBody } from '../IngressBanner';
 import { CONNECTION_BANNER_HEIGHT_VAR } from '../ConnectionBanner';
 import { BANNER_HEIGHT_VAR } from '../BackupReminderBanner';
 import { webhookRefusalNotice } from '../../../utils/webhookRefusalNotice';
@@ -103,7 +103,8 @@ describe('refusalBannerBody renders the bar', () => {
     r: WebhookRefusal | null = refusal(),
     others: string | null = null,
     onOpenWebhooks = () => {},
-  ) => refusalBannerBody({ layout: 'desktop', refusal: r, others, onOpenWebhooks });
+    onDiscuss = () => {},
+  ) => refusalBannerBody({ layout: 'desktop', refusal: r, others, onOpenWebhooks, onDiscuss });
 
   it('states the notice, from the table the Webhooks row reads too', () => {
     const notice = webhookRefusalNotice(refusal());
@@ -132,13 +133,51 @@ describe('refusalBannerBody renders the bar', () => {
       .toContain('2 other webhooks are too.');
   });
 
-  it('offers one button, and it is the one that reaches the fix', () => {
+  it('offers two buttons: one navigates, one starts a conversation', () => {
     const onOpenWebhooks = vi.fn();
-    const buttons = findByType(body(refusal(), null, onOpenWebhooks), 'button');
-    expect(buttons.map((b) => textOf(b))).toEqual(['Open Webhooks']);
+    const onDiscuss = vi.fn();
+    const buttons = findByType(body(refusal(), null, onOpenWebhooks, onDiscuss), 'button');
+    expect(buttons.map((b) => textOf(b))).toEqual(['Discuss', 'Open Webhooks']);
 
-    (buttons[0].props.onClick as () => void)();
+    (buttons[1].props.onClick as () => void)();
     expect(onOpenWebhooks).toHaveBeenCalledTimes(1);
+    expect(onDiscuss).not.toHaveBeenCalled();
+  });
+
+  it('offers the same row the ingress bar does, in the same order', () => {
+    // The two bars mirror each other everywhere else, down to one shared CSS
+    // rule whose own test fails on a second copy. Nothing bound the rows
+    // together until this, so they could drift apart silently.
+    const ingress = ingressBannerBody({
+      layout: 'desktop',
+      outage: {
+        webhook_name: 'github-ci',
+        host: 'node.tailnet.ts.net',
+        port: 8443,
+        families: ['ipv4'],
+        addresses: [],
+        down_since: '2026-08-26T22:10:00Z',
+        down_secs: 28_800,
+      },
+      onOpenWebhooks: () => {},
+      onDiscuss: () => {},
+    });
+    expect(findByType(body(), 'button').map((b) => textOf(b)))
+      .toEqual(findByType(ingress, 'button').map((b) => textOf(b)));
+  });
+
+  it('fires Discuss from the Discuss button, for either cause', () => {
+    // The component decides which record it carries, and the scan in
+    // `webhook-refusal-discuss.test.ts` pins that. What belongs here is that
+    // the button reaches the action at all, and reaches only it.
+    for (const r of [refusal(), refusal({ cause: 'verification', enabled: true })]) {
+      const onOpenWebhooks = vi.fn();
+      const onDiscuss = vi.fn();
+      const buttons = findByType(body(r, null, onOpenWebhooks, onDiscuss), 'button');
+      (buttons[0].props.onClick as () => void)();
+      expect(onDiscuss).toHaveBeenCalledTimes(1);
+      expect(onOpenWebhooks).not.toHaveBeenCalled();
+    }
   });
 
   it('promises no repair, because the engine performs none', () => {
@@ -156,7 +195,7 @@ describe('refusalBannerBody renders the bar', () => {
     // It retracts itself the moment a delivery verifies, so a dismiss would
     // only offer a way to hide a live loss of data.
     expect(findByClass(body(), 'icon-btn')).toHaveLength(0);
-    expect(findByType(body(), 'button')).toHaveLength(1);
+    expect(findByType(body(), 'button')).toHaveLength(2);
   });
 
   it('borrows no word from the connection light', () => {

@@ -231,11 +231,12 @@ impl LucidosEngine {
             tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args).await),
             // Already an outcome: this handler distinguishes a refusal from a
             // judgment, so it must not be laundered through `to_outcome`.
-            tn::JUDGE => self.execute_judgment_tool(args).await,
+            tn::JUDGE => self.execute_judgment_tool(args, thread_id).await,
             tn::RELOAD_PROXY_MODULES => to_outcome(self.execute_reload_proxy_modules_tool().await),
-            tn::IMPORT_FILE | tn::GIT_CLONE => {
-                to_outcome(self.execute_import_tool(name, args, extraction_ctx).await)
-            }
+            tn::IMPORT_FILE | tn::GIT_CLONE => to_outcome(
+                self.execute_import_tool(name, args, extraction_ctx, thread_id)
+                    .await,
+            ),
             // Grouped manifest tools (consolidated surface the model sees).
             tn::TRIGGERS | tn::TRIGGER_GROUPS => self.execute_scheduler_grouped(name, args).await,
             tn::PREFERENCES => self.execute_preferences_grouped(args, device_id).await,
@@ -287,7 +288,7 @@ impl LucidosEngine {
             tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
             tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
             tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
-            tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args).await),
+            tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args, thread_id).await),
             tn::CORRECT_MEMORY_BY_ID => to_outcome(self.execute_correct_memory_by_id(args).await),
             tn::SEARCH_MEMORY => to_outcome(self.execute_search_memory(args).await),
             tn::MEMORY_SOURCE => to_outcome(self.execute_memory_source(args).await),

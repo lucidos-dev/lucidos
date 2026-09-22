@@ -6,7 +6,14 @@ use std::time::{Duration, Instant};
 
 /// Re-merge main into a branch to catch up with any concurrent changes.
 /// No-op when main hasn't moved. Aborts and returns Err on conflicts.
-pub(crate) async fn catchup_with_main(
+///
+/// Private to this module ON PURPOSE, which is what keeps ADR 0241 true rather
+/// than merely remembered. Apply is the only thing that may merge `main` into a
+/// thread's branch, and both callers below are Apply's. A session-path caller
+/// would have to widen this visibility first, and that is the moment to re-read
+/// the ADR. `git_ops/mod.rs` re-exports `merge::*`, so private here also means
+/// absent from the crate-wide surface.
+async fn catchup_with_main(
     worktree_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = git_cmd(&["merge", "main", "--no-edit"], worktree_path).await;

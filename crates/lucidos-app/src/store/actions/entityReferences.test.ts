@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, marketplaceScanning, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
 import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 
 // Mock loader functions to prevent API calls
@@ -300,7 +300,14 @@ describe('processSSEForReferences', () => {
   describe('PluginMarketplace* events', () => {
     const loadedCatalog = {
       status: 'loaded' as const,
-      data: { marketplaces: [], plugins: [], errors: [] },
+      data: {
+        marketplaces: [],
+        plugins: [],
+        errors: [],
+        scanned_at: '2026-09-22T10:00:00Z',
+        scanning: false,
+        scan_error: null,
+      },
     };
 
     it('refreshes the catalog when a marketplace is registered', () => {
@@ -347,6 +354,61 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('PluginMarketplaceRemoved', {
         marketplace_id: 'example-repo-1a2b3c4d',
       });
+      expect(refreshPluginCatalogAfterMutation).not.toHaveBeenCalled();
+    });
+  });
+
+  // The two frames that replaced the per-request clone. The scan runs on the
+  // engine's scheduler now. So these are the only way a client learns one is
+  // under way, including one another device started.
+  describe('PluginCatalogScan* events', () => {
+    const loadedCatalog = {
+      status: 'loaded' as const,
+      data: {
+        marketplaces: [],
+        plugins: [],
+        errors: [],
+        scanned_at: '2026-09-22T10:00:00Z',
+        scanning: false,
+        scan_error: null,
+      },
+    };
+
+    beforeEach(() => {
+      marketplaceScanning.value = false;
+    });
+
+    it('raises the updating cue when a scan starts', () => {
+      processSSEForReferences('PluginCatalogScanStarted', {});
+      expect(marketplaceScanning.value).toBe(true);
+    });
+
+    it('lowers the cue and re-reads when a scan lands', () => {
+      marketplaceScanning.value = true;
+      marketplaceCatalog.value = loadedCatalog;
+
+      processSSEForReferences('PluginCatalogScanned', { failed: false });
+
+      expect(marketplaceScanning.value).toBe(false);
+      expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
+    });
+
+    // A failed scan still ends. Leaving the cue up would claim the data is
+    // about to move when nothing is coming.
+    it('lowers the cue for a scan that failed', () => {
+      marketplaceScanning.value = true;
+      marketplaceCatalog.value = loadedCatalog;
+
+      processSSEForReferences('PluginCatalogScanned', { failed: true });
+
+      expect(marketplaceScanning.value).toBe(false);
+    });
+
+    // Same rule as the marketplace arms above: a device that never opened the
+    // panel is not made to fetch a catalog it is not showing.
+    it('does not re-read when the catalog was never loaded', () => {
+      marketplaceCatalog.value = { status: 'not-loaded' };
+      processSSEForReferences('PluginCatalogScanned', { failed: false });
       expect(refreshPluginCatalogAfterMutation).not.toHaveBeenCalled();
     });
   });

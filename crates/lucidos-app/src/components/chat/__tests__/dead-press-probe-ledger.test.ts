@@ -13,7 +13,7 @@ const postClientLog = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/store', () => ({ showToast }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 
-import { installDeadPressProbe } from '../deadPressProbe';
+import { installDeadPressProbe, _resetNudgeStateForTesting } from '../deadPressProbe';
 import {
   noteViewportResize,
   resetKeyboardCloseState,
@@ -167,7 +167,7 @@ interface Line {
   verdict: string;
   rowRect?: Box;
   faceRect?: Box;
-  /** Written by the scheduled check, which has no gesture behind it. */
+  /** Written with no gesture behind it, by either nudge trigger. */
   scheduled?: boolean;
   /** Why no watchable face took a press attributed to the row. */
   under?: string;
@@ -185,6 +185,8 @@ interface Line {
    *  input. Only `silent-since-keyboard` carries them. */
   sinceKeyboardMs?: number;
   sinceInputMs?: number | null;
+  /** Which path saw that close: the resize event, a wake, or the poll. */
+  closePath?: string | null;
   /** The row's own state, read at the PRESS. See `PressContext`. */
   morph?: string;
   viewport?: { appHeight: string; keyboardActive: boolean };
@@ -206,6 +208,8 @@ interface Line {
   cover?: string;
   /** Set only on a repair line. */
   nudged?: boolean;
+  /** Which trigger spent the recovery: the tick, or the keystroke timer. */
+  nudgeTrigger?: string;
   connected?: boolean;
   /** The touch's screen-to-client offset. See `screenOffset`. */
   screenOff?: { x: number; y: number };
@@ -263,6 +267,10 @@ afterEach(() => {
   // Drain every grace window, so one case's settling press cannot rule inside
   // the next one and be read as its result.
   vi.advanceTimersByTime(5000);
+  // The probe installs once and is never torn down, so its nudge counters
+  // outlive a case. One case's relayout rode onto the next case's press line
+  // as `nudgesSinceKeystroke`, across a describe boundary.
+  _resetNudgeStateForTesting();
 });
 
 /** A whole tap: down, then up. The caller advances the grace window. */
@@ -515,6 +523,11 @@ describe('a click with no touch behind it', () => {
 
 /** The scheduled check's period, mirrored from the module. */
 const TICK = 3000;
+
+/** How long after the last keystroke the recovery is owed, mirrored from the
+ *  module. Round 20 armed it from the keystroke rather than the scheduled
+ *  phase, and left the bound alone: ADR 0228 records cutting it as rejected. */
+const UNTOUCHED_QUIET_MS = 3000;
 
 /** Let the row answer once. A healthy reading forgets both latches. They are
  *  keyed by face NAME, so they outlive the fresh `FakeEl` each case builds. */
@@ -808,6 +821,33 @@ describe('a touch the composer never saw still leaves a line', () => {
     fire('touchstart', touch(elsewhere, 40, 140));
     expect(verdicts().filter((v) => v === 'keyboard-touch')).toHaveLength(1);
   });
+
+  it('says how far it fell from the face it could have pressed', () => {
+    // Round 20. This is the only line the wedge can produce, so it is the one
+    // place a displacement can show. It carried the point and not the distance.
+    // A repeating dx and dy across an episode is the page hit-testing away
+    // from the glass, and scatter is aim.
+    settleHealthy();
+    root().hasAttribute = (name: string) => name === 'data-keyboard-active';
+    atPoint = elsewhere;
+    fire('touchstart', touch(elsewhere, 40, 120));
+    const stray = lines().find((l) => l.verdict === 'keyboard-touch');
+    expect(stray?.missedBy?.face).toBe('Send message');
+    // Send sits at x 330..374, y 400..444, so the finger fell short on both.
+    expect(stray?.missedBy?.dx).toBe(-290);
+    expect(stray?.missedBy?.dy).toBe(-280);
+  });
+
+  it('carries a null vector when the row holds no face to reach', () => {
+    settleHealthy();
+    root().hasAttribute = (name: string) => name === 'data-keyboard-active';
+    atPoint = elsewhere;
+    faces = [];
+    fire('touchstart', touch(elsewhere, 40, 120));
+    const stray = lines().find((l) => l.verdict === 'keyboard-touch');
+    expect(stray?.verdict).toBe('keyboard-touch');
+    expect(stray?.missedBy ?? null).toBeNull();
+  });
 });
 
 describe('every press line carries the one reading layout cannot fake', () => {
@@ -1014,6 +1054,9 @@ describe('a press line describes one instant, not two', () => {
 
   it('carries the silence the press ended, not a later one', () => {
     settleHealthy();
+    // Anchor the window in this case. A quiet window measures from the previous
+    // input, and the first input of a run has none to measure from.
+    fire('touchstart', touch(elsewhere, 10, 90));
     vi.advanceTimersByTime(5000);
     fire('touchstart', touch(send, 350, 420));
     fire('touchend', touch(send, 350, 420));
@@ -1122,6 +1165,30 @@ describe('the recovery a composer nobody can touch still gets', () => {
     type();
     vi.advanceTimersByTime(2000);
     expect(untouched()).toHaveLength(0);
+  });
+
+  it('reaches the pause at its bound, not a tick later', () => {
+    // What round 20 actually fixed. The bound was always three seconds, but the
+    // recovery waited on the scheduled PHASE too, so it landed three to six
+    // seconds in. The reporter had dismissed the keyboard by hand before then.
+    settleTouched();
+    type();
+    vi.advanceTimersByTime(UNTOUCHED_QUIET_MS - 1);
+    expect(untouched()).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(untouched()).toHaveLength(1);
+  });
+
+  it('names the tick when the tick is what spent it', () => {
+    // Both triggers write `untouched`, so without this field a later round
+    // cannot say which one relaid the shell out.
+    settleTouched();
+    type();
+    // Past the keystroke timer and its coalescing window, so the next line is
+    // the scheduled one.
+    vi.advanceTimersByTime(TICK * 3);
+    const byTick = untouched().filter((l) => l.nudgeTrigger === 'tick');
+    expect(byTick).not.toHaveLength(0);
   });
 
   it('stays quiet on a composer nobody has typed into', () => {
@@ -1236,7 +1303,11 @@ describe('the recovery a composer nobody can touch still gets', () => {
     tapSend();
     vi.advanceTimersByTime(1000);
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
-    expect(press?.quiet?.nudges).toBe(0);
+    // The contract is that ONE of the two counts survives a touch, not that the
+    // window count reaches exactly zero. A tick landing between the touch and
+    // the press may legitimately nudge again. Whether one does is a question
+    // about the scheduled phase, not about this rule.
+    expect(press?.quiet?.nudges ?? 0).toBeLessThan(press?.nudgesSinceKeystroke ?? 0);
     expect(press?.nudgesSinceKeystroke ?? 0).toBeGreaterThan(0);
   });
 
@@ -1383,6 +1454,26 @@ describe('the silence that follows a keyboard close', () => {
   });
 
   it('stays quiet when no keyboard has closed at all', () => {
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 4);
+    expect(silences()).toEqual([]);
+  });
+
+  it('names the path that saw the close', () => {
+    // The reading the nineteenth round adds. `poll` on this field says the page
+    // was never told the keys went. No other line can establish that, and it is
+    // the mechanism the investigation is looking for.
+    closeKeyboard();
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(TICK * 2);
+    expect(silences()[0].closePath).toBe('resize');
+  });
+
+  it('stays quiet once the keys come back, rather than citing a stale close', () => {
+    // The verdict is named for a keyboard that has GONE. A line citing a close
+    // a minute old contradicts the keyboard-up viewport printed beside it.
+    closeKeyboard();
+    noteViewportResize(UP, Date.now());
     postClientLog.mockClear();
     vi.advanceTimersByTime(TICK * 4);
     expect(silences()).toEqual([]);

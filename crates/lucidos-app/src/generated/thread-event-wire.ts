@@ -162,7 +162,12 @@ export type ContextPurpose =
   | 'conversation_summary'
   | 'query_classification'
   | 'image_gen'
-  | 'voice';
+  | 'voice'
+  | 'command_judge'
+  | 'judge_tool'
+  | 'intent_loop'
+  | 'memory_correction'
+  | 'artifact_summary';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume

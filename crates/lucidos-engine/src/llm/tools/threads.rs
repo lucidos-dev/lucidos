@@ -139,6 +139,12 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                         "enum": coding_agent_model_vocabulary(),
                         "description": "An id the chosen backend does not offer is REFUSED, never swapped for the default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
                     },
+                    // Deliberately silent about the per-model restriction on a
+                    // tier. `validate_coding_agent_effort` refuses the pairing
+                    // and its message names the models that do offer it, which
+                    // teaches the caller in the turn it matters. Saying it here
+                    // instead is billed on every request of every thread, and
+                    // `always_loaded_context_stays_under_budget` has no room.
                     "reasoning_effort": {
                         "type": "string",
                         "enum": coding_agent_effort_vocabulary(),

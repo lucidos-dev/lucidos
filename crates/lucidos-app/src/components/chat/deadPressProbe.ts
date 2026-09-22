@@ -2,7 +2,7 @@ import { showToast } from '../../store/store';
 import { isMobile, isTouchDevice } from '../../utils/viewport';
 import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
-import { relayoutShell, keyboardCloseState } from '../layout/keyboardCloseRelayout';
+import { relayoutShell, keyboardCloseState, type ClosePath } from '../layout/keyboardCloseRelayout';
 import { readViewport, type ProbeViewport } from './probeViewport';
 
 // Re-exported so this module stays the one import for a press report's types.
@@ -12,7 +12,7 @@ export type { ProbeViewport };
 /** Reports a tap on a composer action button that produced nothing.
  *
  *  A DIAGNOSTIC, registered in `docs/temporary-measures.md` § 1 and removed once
- *  a report names the cause. The bug behind it has been reported eighteen times
+ *  a report names the cause. The bug behind it has been reported twenty times
  *  and nobody can reproduce it: it strikes now and then on an iOS PWA and kills
  *  the composer's buttons wherever the finger presses. No emulator reproduces
  *  it, so the app has to be the one that says what happened.
@@ -442,10 +442,18 @@ function recordPress({ at, ...facts }: {
   /** Which cover the app had up when it declined to judge the press. Only the
    *  `covered` branch fills it. */
   cover?: string;
-  /** Written with no user input behind it, by the scheduled check. */
+  /** Written with no GESTURE behind it. Two triggers qualify since round 20, so
+   *  read `nudgeTrigger` for which one. */
   scheduled?: boolean;
+  /** Which trigger spent the recovery: the 3s `tick`, or the `keystroke` timer
+   *  armed when typing stops. Both write `untouched`, and attributing the
+   *  relayout is the whole point of arming the second one. */
+  nudgeTrigger?: NudgeTrigger;
   /** How long ago the keyboard closed. Only `silent-since-keyboard` fills it. */
   sinceKeyboardMs?: number;
+  /** Which path saw that close. `poll` is the reading to look for: it says the
+   *  page was never told, which is the mechanism this investigation chases. */
+  closePath?: ClosePath | null;
   /** How long ago the document last took a touch or a click, and null when it
    *  has taken none at all. Read AGAINST `sinceKeyboardMs`: a smaller number
    *  means an input arrived after the close, and no other line named it. */
@@ -502,16 +510,54 @@ function touchLanding(t: ProbeTouch, rowRect: ProbeRect | null) {
   };
 }
 
+/** Every watchable face with its box, the one read three questions share. */
+function faceBoxes(): { name: string; rect: ProbeRect }[] {
+  return watchableFaces().map((f) => ({
+    name: nameOf(f),
+    rect: roundRect(f.getBoundingClientRect()) as ProbeRect,
+  }));
+}
+
+/** The wire shape for a near miss, so the two lines carrying it cannot drift. */
+function missedByOf(nearest: ReturnType<typeof nearestFaceMiss<{ name: string; rect: ProbeRect }>>) {
+  return nearest && {
+    face: nearest.face.name,
+    px: nearest.px,
+    dx: nearest.dx,
+    dy: nearest.dy,
+    rect: nearest.face.rect,
+  };
+}
+
 function noteStrayTouch(t: ProbeTouch, target: Element | null, rowRect: ProbeRect | null): void {
   if (!readViewport().keyboardActive) return;
   const now = Date.now();
   if (now - lastStrayTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
   lastStrayTouchAt = now;
+  const landing = touchLanding(t, rowRect);
+  // How far this touch fell from the face it could have pressed.
+  //
+  // The reading round 20 found missing. This is the only line the wedge can
+  // produce: a touch reaching the composer writes a different verdict, and one
+  // reaching nothing writes none at all. So it is the one place a displacement
+  // can show, and it carried the point without the distance.
+  //
+  // Read it as `missed` is read. A repeating dx and dy across an episode is
+  // the page hit-testing away from the glass. Scatter is aim.
+  //
+  // Past the throttle and the keyboard test, so a healthy page pays no
+  // geometry for it.
+  //
+  // Only against a row that HAS a box. This is also called where no row is laid
+  // out. A zero-measuring face would then report a distance from the viewport
+  // origin, which reads as the very displacement the vector exists to find.
+  const nearest = rowRect ? nearestFaceMiss(faceBoxes(), landing.point) : null;
   recordPress({
     face: describe(target) ?? 'nothing',
     verdict: 'keyboard-touch',
     movedPx: 0,
-    ...touchLanding(t, rowRect),
+    ...landing,
+    missedBy: missedByOf(nearest),
   });
 }
 
@@ -902,8 +948,14 @@ const SCHEDULED_CHECK_MS = 3000;
 /** How long after the last keystroke the composer counts as waiting for a press.
  *
  *  The gap the wedge lives in. A healthy send follows the last character by well
- *  under a second, so this never reaches the user who types and taps. A user
- *  tapping against a dead composer passes it on the first tick. */
+ *  under a second, so this rarely reaches the user who types and taps. One that
+ *  does costs a relayout nothing paints.
+ *
+ *  NOT to be cut. ADR 0228 records loosening this as rejected outright by the
+ *  user. It shortens the silence rather than removing it, and every page in
+ *  every session pays for that. Round 20 cut it to 1000 and reverted: the
+ *  scheduled phase was what made the recovery late, not this bound.
+ *  `armKeystrokeNudge` answers the phase without touching the gate. */
 const UNTOUCHED_QUIET_MS = 3000;
 
 /** How long the composer keeps counting as waiting, before the user is taken to
@@ -916,6 +968,27 @@ const UNTOUCHED_QUIET_MS = 3000;
  *  then find it empty. An elapsed window cannot be spent early, and it ends
  *  only where the user has plainly stopped. */
 const UNTOUCHED_WINDOW_MS = 60_000;
+
+/** Which trigger spent a recovery. See `nudgeTrigger`. */
+type NudgeTrigger = 'tick' | 'keystroke';
+
+/** How close two nudges may come before the second is taken as the same one.
+ *  Only ever collapses a tick colliding with the keystroke timer. */
+const NUDGE_COALESCE_MS = 250;
+
+/** Is this nudge the same one the last trigger already spent?
+ *
+ *  Two triggers reach the recovery and can come due in the same millisecond. A
+ *  relayout is worth nothing twice. Far under `SCHEDULED_CHECK_MS`, so the
+ *  repeat rate every earlier ledger reads is untouched.
+ *
+ *  Pure, so it tests without a DOM, as the other decisions here do. */
+export function nudgeIsTooSoon(lastAt: number | null, now: number): boolean {
+  return lastAt !== null && now - lastAt < NUDGE_COALESCE_MS;
+}
+
+/** When the recovery last relaid the shell out. See `runUntouchedNudge`. */
+let lastNudgeAt: number | null = null;
 
 /** Should the recovery run with no gesture behind it at all?
  *
@@ -957,15 +1030,18 @@ export function shouldNudgeUntouched(f: {
  *
  *  The line is what the next episode reads. `nudged` says whether the shell was
  *  relaid out, and the count rides on every later press as `quiet.nudges`. */
-function runUntouchedNudge(face: HTMLButtonElement | null): void {
+function runUntouchedNudge(face: HTMLButtonElement | null, trigger: NudgeTrigger): void {
   const typed = lastKeystrokeAt !== null
     && (lastComposerInputAt === null || lastKeystrokeAt > lastComposerInputAt);
+  const now = Date.now();
+  if (nudgeIsTooSoon(lastNudgeAt, now)) return;
   const run = shouldNudgeUntouched({
     hasCommitFace: !!face,
     typedSinceComposerInput: typed,
-    msSinceKeystroke: lastKeystrokeAt === null ? 0 : Date.now() - lastKeystrokeAt,
+    msSinceKeystroke: lastKeystrokeAt === null ? 0 : now - lastKeystrokeAt,
   });
   if (!face || !run) return;
+  lastNudgeAt = now;
   nudgesSinceInput += 1;
   nudgesSinceKeystroke += 1;
   const nudged = relayoutShell();
@@ -974,6 +1050,7 @@ function runUntouchedNudge(face: HTMLButtonElement | null): void {
     verdict: 'untouched',
     movedPx: 0,
     scheduled: true,
+    nudgeTrigger: trigger,
     nudged,
     faceRect: roundRect(face.getBoundingClientRect()),
   });
@@ -1051,6 +1128,7 @@ function reportSilence(face: HTMLButtonElement | null): void {
     nudged: close.relaidOut,
     sinceKeyboardMs: Math.round(now - close.at),
     sinceInputMs: msSinceInput === null ? null : Math.round(msSinceInput),
+    closePath: close.path,
     faceRect: roundRect(face.getBoundingClientRect()),
   });
 }
@@ -1080,7 +1158,55 @@ function runScheduledCheck(): void {
   // The reading first, then the recovery. The line then describes the state as
   // the check found it, rather than the state the relayout left behind.
   reportSilence(face);
-  runUntouchedNudge(face);
+  runUntouchedNudge(face, 'tick');
+}
+
+let keystrokeNudgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Reach the pre-send moment without waiting for the next scheduled tick.
+ *
+ *  Round 20 is why. The check runs every `SCHEDULED_CHECK_MS`, so a wedge that
+ *  opens when typing stops waited a whole tick beyond `UNTOUCHED_QUIET_MS`
+ *  before the recovery ran. The episode put that at three to six seconds, and
+ *  the reporter had dismissed the keyboard by hand before it arrived.
+ *
+ *  A debounce, restarted by every keystroke, so a sentence arms one timer
+ *  rather than one per character.
+ *
+ *  It takes the caller bounds the scheduled check takes, and NOT its census.
+ *  `quiet.checks` counts scheduled checks, and every earlier ledger is read
+ *  against that number. It leaves `reportSilence` alone too, which answers a
+ *  keyboard close rather than a keystroke. */
+function armKeystrokeNudge(): void {
+  if (keystrokeNudgeTimer !== null) clearTimeout(keystrokeNudgeTimer);
+  keystrokeNudgeTimer = setTimeout(() => {
+    keystrokeNudgeTimer = null;
+    if (!isMobile()) return;
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    if (!watchableRow() || watchableFaces().length === 0) return;
+    if (coveredOnPurpose()) return;
+    runUntouchedNudge(liveCommitFace(), 'keystroke');
+  }, UNTOUCHED_QUIET_MS);
+}
+
+/** Test-only: forget what the recovery has spent.
+ *
+ *  This module installs once and is never torn down, so its nudge counters
+ *  outlive a test. One case's relayout then rides onto the next case's press
+ *  line, which is how a count from one describe reached another. */
+export function _resetNudgeStateForTesting(): void {
+  lastNudgeAt = null;
+  lastKeystrokeAt = null;
+  lastComposerInputAt = null;
+  nudgesSinceKeystroke = 0;
+  // The quiet window and its census. `quiet.nudges` is the other carrier of a
+  // relayout onto a line, so a snapshot left here rides onto the next case.
+  nudgesSinceInput = 0;
+  quiet = null;
+  lastInputAt = null;
+  checksSinceInput = 0;
+  coveredSinceInput = 0;
+  if (keystrokeNudgeTimer !== null) { clearTimeout(keystrokeNudgeTimer); keystrokeNudgeTimer = null; }
 }
 
 /** This event's entry for one finger, or null when another finger moved. */
@@ -1433,13 +1559,7 @@ export function installDeadPressProbe(): void {
         rowRect: roundRect(rowRect),
         faceRect: roundRect(aimedAt?.rect ?? null),
         point,
-        missedBy: nearest && {
-          face: nearest.face.name,
-          px: nearest.px,
-          dx: nearest.dx,
-          dy: nearest.dy,
-          rect: nearest.face.rect,
-        },
+        missedBy: missedByOf(nearest),
         screenOff: screenOffset(touch),
         fingers: e.touches.length,
         at: pressAt,
@@ -1689,6 +1809,7 @@ export function installDeadPressProbe(): void {
     // in the previous one belong to it and not to this. Deliberately NOT tied
     // to `noteInput`, whose window this must outlive.
     nudgesSinceKeystroke = 0;
+    armKeystrokeNudge();
   }, { capture: true, passive: true });
 
   // The one reading that needs no gesture. Everything above waits to be

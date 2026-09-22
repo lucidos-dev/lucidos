@@ -813,3 +813,88 @@ async fn a_request_aimed_at_this_workspace_passes_through() {
         "an assertion naming this engine's own workspace must not block anything"
     );
 }
+
+/// A caller that names its thread keeps that name.
+///
+/// This is the seam every spawn now depends on. Both spawn sites hand their
+/// caller's title to `process_message_with_steps` rather than writing it
+/// themselves, so `maybe_emit_titles` is the single place a thread is named.
+/// It has to write the name after `MessageReceived` creates the projection
+/// row, and it has to keep the title model out.
+///
+/// The caller mints the thread id, which is what a spawn does and what puts
+/// this on the branch a spawn takes. A supplied id reads as a follow-up
+/// however new the thread is, and an unnamed follow-up spends a title-model
+/// call. That is what makes the count below mean something.
+///
+/// The failure it guards is silent: the name is replaced about a second later
+/// by a model-generated one, and nothing errors. So the assertion waits for
+/// the turn to finish, which far outlasts titling.
+#[tokio::test]
+async fn a_caller_that_names_its_thread_keeps_that_name() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let marker = unique_marker("api-title");
+    let chosen = format!("Ask-card rule {marker}");
+    let thread_id = Uuid::new_v4();
+
+    let resp = client
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&serde_json::json!({
+            "message": format!("Say exactly: \"named {marker}\""),
+            "mode": "human",
+            "thread_id": thread_id.to_string(),
+            "new_thread": true,
+            "title": chosen,
+        }))
+        .send()
+        .await
+        .expect("Chat stream request failed");
+    assert_eq!(resp.status(), 200, "got {}", resp.status());
+
+    // Outlast the window the title model would have renamed the thread in. A
+    // turn is a real model call, so waiting for it is several times longer
+    // than titling takes. Best effort: a slow turn must not fail this test,
+    // because the window has passed either way.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let done: Option<bool> =
+            sqlx::query_scalar("SELECT has_response FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("thread_summaries query failed");
+        if done == Some(true) || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT title FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("thread_summaries query failed");
+    assert_eq!(
+        stored.as_deref(),
+        Some(chosen.as_str()),
+        "the name the caller chose must survive the turn"
+    );
+
+    let title_calls: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE thread_id = $1 AND event_type = 'ContextCaptured' \
+           AND payload->>'purpose' = 'title'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("events query failed");
+    assert_eq!(
+        title_calls, 0,
+        "a named thread must not spend a title-model call"
+    );
+}

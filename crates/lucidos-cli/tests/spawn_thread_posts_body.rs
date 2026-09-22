@@ -632,6 +632,383 @@ async fn spawn_thread_folder_requires_cc() {
     );
 }
 
+/// The flag must land in the body as `reasoning_effort`. That is the field the
+/// engine resolves first, then hands the subprocess as
+/// `CLAUDE_CODE_EFFORT_LEVEL`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_reasoning_effort_lands_in_body() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--coding-agent",
+            "claude-code",
+            "--reasoning-effort",
+            "max",
+            "--message",
+            "think hard",
+            "--title",
+            "Ideation",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(body["reasoning_effort"], "max");
+    assert_eq!(body["use_coding_agent"], true);
+}
+
+/// No flag means no field, so the engine keeps falling through to the thread's
+/// previous effort and then to the backend default. A `null` would be a
+/// different request, and the omission is what preserves today's behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_omits_reasoning_effort_when_not_asked() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let status = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--codex",
+            "--message",
+            "no pin",
+            "--title",
+            "Plain",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .status()
+        .expect("spawn cli");
+    assert!(status.success());
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "no --reasoning-effort ⇒ the field is absent, not null"
+    );
+}
+
+/// An unknown level is refused at parse time, so nothing is sent. The caller
+/// sees the accepted levels, not an opaque 400 from the far engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_rejects_an_unknown_reasoning_effort() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--cc",
+            "--reasoning-effort",
+            "ludicrous",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must reject a level no backend menu offers"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ludicrous") && stderr.contains("xhigh") && stderr.contains("max"),
+        "stderr must name the rejected value and the accepted levels, got: {}",
+        stderr
+    );
+}
+
+/// `none` belongs to the chat ladder, not to either coding-agent menu. Passing
+/// it here would set an env var no backend honours, so the flag refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_rejects_the_chat_only_none_level() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--cc",
+            "--reasoning-effort",
+            "none",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "`none` is a chat tier and no coding-agent menu offers it"
+    );
+}
+
+/// A chat-thread spawn reads a different effort ladder, so the flag would mean
+/// something else there. Refuse before the round-trip, like `--folder` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_reasoning_effort_requires_a_coding_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--reasoning-effort",
+            "max",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must reject --reasoning-effort on a chat-thread spawn"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--reasoning-effort") && stderr.contains("--coding-agent"),
+        "stderr must name the flag and what satisfies it, got: {}",
+        stderr
+    );
+}
+
+/// Codex offers `max` on three models only, and drops it on any other rather
+/// than failing. The session still records the level asked for, so the picker
+/// would show `max` for a turn that never ran at it. Refuse before sending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_rejects_an_effort_the_named_model_lacks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--coding-agent",
+            "codex",
+            "--coding-agent-model",
+            "gpt-5.5",
+            "--reasoning-effort",
+            "max",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must reject max on a Codex model that does not offer it"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gpt-5.6-sol"),
+        "stderr must name a model that does offer max, got: {}",
+        stderr
+    );
+}
+
+/// Codex tests `max` with `model.is_some_and(...)`, so an unnamed model drops
+/// it before Codex is consulted, whatever that config would have picked. The
+/// spawn would report success and run at the default, so refuse it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_rejects_codex_max_with_no_model_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, 1);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--codex",
+            "--reasoning-effort",
+            "max",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "codex max with no model always drops, so the CLI must refuse it"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--coding-agent-model"),
+        "stderr must say what to pass, got: {}",
+        stderr
+    );
+}
+
+/// The same spawn at a level Codex does not restrict must still go through.
+/// Only `max` names models, so nothing below it needs a `--coding-agent-model`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_thread_allows_codex_xhigh_with_no_model_named() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
+
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--codex",
+            "--reasoning-effort",
+            "xhigh",
+            "--message",
+            "unrestricted level",
+            "--title",
+            "XHigh",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(body["reasoning_effort"], "xhigh");
+}
+
+/// `--coding-agent-model` is the current name; `--cc-model` is the alias kept
+/// so existing recipes keep working. Both must send the same `cc_model` field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_model_flag_spellings_send_cc_model() {
+    for flag in ["--coding-agent-model", "--cc-model"] {
+        let (port, captured) = start_capture_server().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let caller = tmp.path().join("dev");
+        write_ports_file(&caller, port);
+
+        let bin = env!("CARGO_BIN_EXE_lucidos");
+        let output = std::process::Command::new(bin)
+            .args([
+                "spawn-thread",
+                "--to",
+                "dev",
+                "--cc",
+                flag,
+                "opus",
+                "--message",
+                "pick a model",
+                "--title",
+                "Model",
+                "--insecure-http",
+            ])
+            .env("LUCIDOS_WORKSPACE", &caller)
+            .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+            .env_remove("LUCIDOS_REPO")
+            .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+            .current_dir(&caller)
+            .output()
+            .expect("spawn cli");
+        assert!(
+            output.status.success(),
+            "{} must be accepted, stderr: {}",
+            flag,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server received body");
+        assert_eq!(body["cc_model"], "opus", "{} must send cc_model", flag);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
     // `--repo ""` is the explicit "use the target workspace's default repo"

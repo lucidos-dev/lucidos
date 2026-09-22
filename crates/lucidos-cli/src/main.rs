@@ -247,7 +247,9 @@ enum Command {
     /// inherits the calling thread's repo without callers passing it explicitly.
     /// `--folder <path>` instead targets an app folder (`data/apps/<id>`),
     /// spawning an app coding-agent thread (mutually exclusive with `--repo`;
-    /// requires `--cc`, `--codex`, or `--coding-agent`).
+    /// requires `--coding-agent`, `--codex`, or `--cc`).
+    /// `--reasoning-effort <level>` pins the coding agent's thinking level for
+    /// this spawn, ahead of the backend's own default.
     #[command(name = "spawn-thread")]
     SpawnThread(SpawnThreadArgs),
     /// Call a backend configured in `data/config/apis.json` through the
@@ -828,7 +830,7 @@ pub(crate) struct SpawnThreadArgs {
     /// Optional thread title (shown in the target workspace's UI).
     #[arg(long)]
     pub(crate) title: Option<String>,
-    /// Spawn a Claude Code coding-agent session instead of a chat thread.
+    /// Legacy shorthand for `--coding-agent claude-code`. Prefer that spelling.
     #[arg(long)]
     pub(crate) cc: bool,
     /// Spawn a Codex coding-agent session. Shortcut for
@@ -838,12 +840,23 @@ pub(crate) struct SpawnThreadArgs {
     /// Coding-agent backend to launch. Implies coding-agent mode.
     #[arg(long, value_enum)]
     pub(crate) coding_agent: Option<CliCodingAgent>,
-    /// CC model override (e.g. "sonnet", "opus", "haiku").
-    #[arg(long)]
-    pub(crate) cc_model: Option<String>,
+    /// Coding-agent model override, for either backend (e.g. "sonnet",
+    /// "opus", "gpt-5.6-sol"). `--cc-model` is the old name, still accepted.
+    ///
+    /// That alias is a sunset deprecation, not permanent back-compat. Its
+    /// removal condition is in `docs/temporary-measures.md`.
+    #[arg(long = "coding-agent-model", alias = "cc-model")]
+    pub(crate) coding_agent_model: Option<String>,
     /// Chat model override.
     #[arg(long)]
     pub(crate) model: Option<String>,
+    /// Coding-agent thinking level for this spawn, for either backend.
+    /// Overrides the backend's own default, and needs a coding-agent flag.
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(crate::spawn_thread::EFFORT_LEVELS)
+    )]
+    pub(crate) reasoning_effort: Option<String>,
     /// Repo name (or UUID) the spawned worktree should be created from.
     /// Defaults to `$LUCIDOS_REPO` (the engine sets it on every coding-agent
     /// subprocess to the calling thread's repo name) so a coding-agent sidequest
@@ -855,7 +868,7 @@ pub(crate) struct SpawnThreadArgs {
     /// Target a folder instead of a repo — creates an *app coding-agent
     /// thread*. Accepts a workspace-relative path (`data/apps/habit-tracker`), an
     /// absolute path, or a registered repo name; resolved on the TARGET
-    /// workspace (`--to`). With `--cc`, `--codex`, or `--coding-agent`, a
+    /// workspace (`--to`). With `--coding-agent`, `--codex`, or `--cc`, a
     /// `data/apps/<id>` value spawns a sparse-checkout worktree narrowed to
     /// that app folder whose Apply ff-merges into the workspace's main (no
     /// `/harden`, no engine restart) —

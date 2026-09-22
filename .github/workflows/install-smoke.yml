@@ -254,7 +254,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # The from-source install compiles the engine, and this leg is on the RC
       # gate's critical path, 12m07s on the last release candidate. rust-cache
@@ -436,7 +436,7 @@ jobs:
 
       - name: Upload installer log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: install-log-${{ matrix.os }}
           path: ${{ runner.temp }}/install.log
@@ -519,7 +519,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # Fail loudly if a future image ships a non-bash /bin/sh. The job would
       # then be exercising a shell no macOS user has, and its green tick would
@@ -1028,7 +1028,7 @@ jobs:
       WS_HEALTH_TIMEOUT_SECS: '600'   # cold engine boot warms the embedding model
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # Mirror release-tarballs.yml's build setup: pgvector compiles via PGXS (make +
       # a C toolchain), the engine statically vendors OpenSSL (perl + cc), and the
@@ -1041,7 +1041,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential perl pkg-config curl
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'   # install.sh requires Node 18+; 20 is the current LTS
 
@@ -1222,7 +1222,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: tarball-smoke-logs
           path: |
@@ -4050,7 +4050,7 @@ jobs:
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
     steps:
       - name: Checkout (the harness only; the route sets come from the origins)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Both front doors serve the same publish routes
         shell: bash

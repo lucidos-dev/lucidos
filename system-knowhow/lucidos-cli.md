@@ -10,7 +10,7 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - write files into the workspace's `data/` directory
 - emit a domain event, or query the workspace's event store (which holds engine thread/system events alongside domain events, and `events query` returns both)
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
-- spawn a new *thread* — a chat thread, or a *coding-agent thread* on a repo or an app folder (`--cc` for Claude Code, `--codex` / `--coding-agent codex` for Codex, `--folder data/apps/<id>` for app worktrees) — `lucidos spawn-thread`
+- spawn a new *thread* with `lucidos spawn-thread`: a chat thread, or a *coding-agent thread* on a repo or an app folder. `--coding-agent claude-code|codex` picks the backend, `--folder data/apps/<id>` targets an app worktree
 - subscribe the calling thread to an event instead of polling for it, and finish, letting the engine re-open the thread when the event lands: `lucidos await-event`
 - read what this thread is currently subscribed to, and stop watching: `lucidos event-waits list` / `lucidos event-waits cancel`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
@@ -358,7 +358,7 @@ Five things worth knowing:
 
 **A cancellation is not done when the ack returns.** The ack says the message is on the child's timeline, nothing more: even with `--urgent` the child still has to pick it up, read it, and do the work of stopping. If you told a child to kill a running job, verify the job is actually gone (no processes, no lock file) before you report the cancellation as complete. Reporting off the ack is how a nightly pipeline once announced a clean host while its e2e suite ran on for another seven minutes.
 
-### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
+### `lucidos spawn-thread --to <WS> --message <M> [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
 Start a new *thread* in another (or this same) workspace: a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` takes an absolute path, or a bare workspace name. A bare name resolves against `$LUCIDOS_WORKSPACES_ROOT` when set, else the directory holding your own workspace, else `~/workspaces`. So a sibling of the calling workspace is always reachable by name. Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
 
@@ -368,30 +368,43 @@ A top-thread sits directly under the workspace rather than under you, so creatin
 
 **Coding-agent backend:**
 
-- `--cc` — legacy shortcut for a Claude Code coding-agent thread.
-- `--codex` — shortcut for a Codex coding-agent thread; implies coding-agent mode and sends `coding_agent: "codex"` to the engine.
-- `--coding-agent <backend>` — explicit backend selector. Valid values are `claude-code` (alias `claude_code`) and `codex`; this also implies coding-agent mode.
+- `--coding-agent <backend>`: the backend selector, and the spelling to use. Valid values are `claude-code` (alias `claude_code`) and `codex`. Passing it implies coding-agent mode.
+- `--cc` and `--codex` are legacy shorthands for the two backends. They still work, and `--coding-agent` is what to write.
+
+**Model and reasoning level (either backend):**
+
+- `--coding-agent-model <m>`: the model the coding agent runs on (`sonnet`, `opus`, `gpt-5.6-sol`). `--cc-model` is the old name, still accepted.
+- `--reasoning-effort <level>`: how hard the coding agent thinks. One of `low`, `medium`, `high`, `xhigh`, `max`. It pins the level for this spawn only, overriding the backend's own default. It needs a coding-agent flag, and the CLI refuses an unknown level before sending anything. A chat-thread spawn reads a different ladder and does not take this flag.
+
+**Codex offers `max` on the GPT-5.6 models only, so pair the two.** `--reasoning-effort max --coding-agent codex` needs `--coding-agent-model` naming one of those models, and the CLI refuses the spawn otherwise. That includes naming no model at all: the engine tests the restriction against the model in the request, so `max` with no model is dropped before Codex is ever asked. Every level below `max` is unrestricted on both backends and needs no model.
 
 **Worktree targeting for coding-agent threads:**
 
 - `--repo <name|uuid>` — create the worktree from a registered *repository*. Defaults from `$LUCIDOS_REPO` (the engine sets it to the calling thread's repo) so a coding-agent sidequest stays in its caller's repo. Pass `--repo ""` to force the target workspace's default repo.
 - `--folder <path>` — target an app folder instead, spawning an **app coding-agent thread**. A `data/apps/<id>` value (workspace-relative, resolved on the *target* workspace) creates a sparse-checkout worktree narrowed to that app folder whose *Apply* ff-merges into the workspace's `main` — no `/harden`, no engine restart. This is the same machinery the `run_coding_agent` tool's `folder` argument produces. Only whole app folders are valid; the engine rejects other `data/` subtrees, app subpaths, and non-existent folders.
 
-`--folder` and `--repo` are mutually exclusive, and `--folder` requires a coding-agent flag (`--cc`, `--codex`, or `--coding-agent`; the CLI errors before any HTTP round-trip otherwise). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed — the engine rejects a request that carries both a repo and a folder.
+`--folder` and `--repo` are mutually exclusive, and `--folder` requires a coding-agent flag (`--coding-agent`, `--codex`, or `--cc`; the CLI errors before any HTTP round-trip otherwise). When `--folder` is set the `$LUCIDOS_REPO` default is suppressed: the engine rejects a request that carries both a repo and a folder.
 
 ```bash
 # Spawn an app coding-agent thread to work on an app in this workspace.
-$ lucidos spawn-thread --to myws --cc --relation top \
+$ lucidos spawn-thread --to myws --coding-agent claude-code \
     --folder data/apps/habit-tracker \
     --title "Research session" \
-    --message "Run one research session per data/apps/habit-tracker/knowhow."
+    --message "Run one research session per app knowhow."
 [Research session](thread:myws/2f1c…)
 
 # Spawn a Codex coding-agent thread in the dev workspace.
-$ lucidos spawn-thread --to dev --codex --relation top \
+$ lucidos spawn-thread --to dev --coding-agent codex \
     --title "Codex review" \
-    --message "Review the current app folder and fix the failing test."
+    --message "Review the app folder and fix the failing test."
 [Codex review](thread:dev/7a42…)
+
+# Ask for the hardest thinking the backend offers, for this spawn only.
+$ lucidos spawn-thread --to dev --coding-agent claude-code \
+    --reasoning-effort max \
+    --title "Ideation session" \
+    --message "Explore three designs for the capacity policy."
+[Ideation session](thread:dev/9b07…)
 ```
 
 ### `lucidos await-event --on <EventType> [--on <EventType> ...] [--condition <JSON>] --timeout-secs <N> --reason <R>`

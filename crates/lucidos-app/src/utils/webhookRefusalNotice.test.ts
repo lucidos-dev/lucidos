@@ -67,6 +67,24 @@ describe('webhookRefusalNotice', () => {
     expect(notice.detail).not.toContain('Switch it back on');
   });
 
+  it('never sends a hook that is OFF at the secret, whatever the cause says', () => {
+    // A run forms while the hook is on, then somebody switches the hook off.
+    // The stored cause still says verification, and the live flag says the
+    // delivery was thrown away before anything read it.
+    //
+    // `judge` settles this in the engine, and this is the second layer. The
+    // verification words tell the reader to rotate or re-point the hook, and
+    // re-pointing replaces the whole config object and drops the secret. So
+    // the wrong words turn one click into a multi-day outage.
+    const off = verifying({ enabled: false });
+    const notice = webhookRefusalNotice(off);
+    expect(notice.detail).not.toContain('the secret or the signature config');
+    expect(notice.title).toContain('switched off');
+    expect(notice.detail).toContain('Nothing is wrong with the signature or the secret');
+    // The Webhooks row reads the same flag, so the two surfaces agree.
+    expect(webhookRefusalRowLine(off)).toContain('switched off');
+  });
+
   it('names how many were lost and over how long', () => {
     const detail = webhookRefusalNotice(refusal()).detail;
     expect(detail).toContain('42 deliveries');

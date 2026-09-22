@@ -234,6 +234,47 @@ fn sonnet_5_round_trips_through_cc_model_helpers() {
 }
 
 #[test]
+fn every_opus_5_generation_round_trips_through_cc_model_helpers() {
+    // Opus 5.5 is the trap Fable 5.1 was: `claude-opus-5` is a prefix of
+    // `claude-opus-5-5`, so a prefix-shaped fold would rewrite one generation
+    // into the other. Both are pinned picker values, so both normalize to
+    // themselves and neither collapses onto the `opus` alias.
+    for base in ["claude-opus-5-5", "claude-opus-5@default"] {
+        assert_eq!(normalize_cc_model_id(base), base);
+    }
+    for one_m in ["claude-opus-5-5[1m]", "claude-opus-5[1m]"] {
+        assert_eq!(normalize_cc_model_id(one_m), one_m);
+    }
+    // CC strips the suffix when it echoes the model, so reconcile re-attaches it.
+    assert_eq!(
+        reconcile_cc_model(Some("claude-opus-5-5[1m]"), "claude-opus-5-5"),
+        "claude-opus-5-5[1m]"
+    );
+    // Picking the `opus` alias lands on Opus 5.5: CC resolves the alias and
+    // reports the concrete id, which is a picker value.
+    assert_eq!(
+        reconcile_cc_model(Some("opus"), "claude-opus-5-5"),
+        "claude-opus-5-5"
+    );
+    // Opus 4.6 still folds back to the alias (unchanged behaviour).
+    assert_eq!(normalize_cc_model_id("claude-opus-4-6"), "opus");
+    // The /model picker offers both generations, each with its 1M variant.
+    let defs = cc_command_definitions();
+    assert_command_options(
+        &defs,
+        "set_model",
+        "model",
+        &[
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-opus-5@default",
+            "claude-opus-5[1m]",
+            "opus",
+        ],
+    );
+}
+
+#[test]
 fn reconcile_cc_model_preserves_1m_suffix_when_cc_strips_it() {
     // CC strips the [1m] suffix when echoing the model in stream-json
     // (both Init and per-message Usage frames). The engine pinned the

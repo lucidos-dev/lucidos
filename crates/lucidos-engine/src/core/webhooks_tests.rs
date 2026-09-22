@@ -920,3 +920,84 @@ async fn a_refusal_run_accumulates_and_one_probe_cannot_erase_it() {
 
     crate::test_support::teardown_test_db(&db).await;
 }
+
+/// Moving the enabled flag ends the run, because the flag IS one of the causes.
+///
+/// A run left standing across a switch describes a fault that is over. Its
+/// count and tally then get re-reported under the other cause's words. That is
+/// how a hook switched off after an hour of signature failures comes to read
+/// "every one was refused before it was read".
+#[tokio::test]
+async fn moving_the_enabled_flag_ends_the_refusal_run() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let (hook, _) = WebhookStore::create(
+        &pool,
+        &bus,
+        "github",
+        "GithubWorkflowRunStateChanged",
+        WebhookConfig::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    async fn read(pool: &PgPool, id: Uuid) -> Webhook {
+        WebhookStore::get(pool, id).await.unwrap().unwrap()
+    }
+
+    fn patch(enabled: Option<bool>) -> WebhookPatch {
+        WebhookPatch {
+            enabled,
+            ..WebhookPatch::default()
+        }
+    }
+
+    for _ in 0..42 {
+        WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::SignatureMismatch)
+            .await
+            .unwrap();
+    }
+    assert_eq!(read(&pool, hook.id).await.refusal_run.refusals, 42);
+
+    // A PUT that touches something else leaves the run alone. So does one
+    // resending the flag the row already carries.
+    WebhookStore::update(&pool, &bus, hook.id, patch(None), None)
+        .await
+        .unwrap();
+    WebhookStore::update(&pool, &bus, hook.id, patch(Some(true)), None)
+        .await
+        .unwrap();
+    let untouched = read(&pool, hook.id).await.refusal_run;
+    assert_eq!(
+        untouched.refusals, 42,
+        "an unrelated write must not erase a live outage's evidence"
+    );
+    assert_eq!(untouched.cause, Some(RefusalCause::Verification));
+
+    // Switching it off ends the run whole, exactly as an acceptance does.
+    WebhookStore::update(&pool, &bus, hook.id, patch(Some(false)), None)
+        .await
+        .unwrap();
+    let off = read(&pool, hook.id).await;
+    assert!(!off.enabled);
+    assert!(!off.refusal_run.is_running());
+    assert_eq!(off.refusal_run.refusals, 0);
+    assert_eq!(off.refusal_run.since, None);
+    assert_eq!(off.refusal_run.cause, None);
+    assert!(off.refusal_run.reasons.is_empty());
+    assert!(
+        off.last_refused_at.is_some(),
+        "the stamps are a history, so ending the run does not erase them"
+    );
+
+    // The next delivery starts an honest one, in the words the flag earns.
+    WebhookStore::record_refused(&pool, hook.id, DeliveryRefusal::Disabled)
+        .await
+        .unwrap();
+    let fresh = read(&pool, hook.id).await.refusal_run;
+    assert_eq!(fresh.refusals, 1);
+    assert_eq!(fresh.cause, Some(RefusalCause::Disabled));
+
+    crate::test_support::teardown_test_db(&db).await;
+}

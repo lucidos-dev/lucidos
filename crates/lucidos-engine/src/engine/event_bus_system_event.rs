@@ -700,6 +700,23 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A marketplace scan began. Raises the Plugins panel's "Updating…" cue.
+    ///
+    /// TRANSIENT (never persisted), like `MemoryRebuildProgress`. The scan runs
+    /// at startup and every five minutes. Persisting it would add a heartbeat
+    /// row and say nothing an audit wants. What a marketplace IS stays audited
+    /// by `PluginMarketplaceRegistered` / `Removed`.
+    PluginCatalogScanStarted {},
+    /// A marketplace scan ended, and the *plugin catalog cache* now holds its
+    /// result. Clients re-read `GET /api/v1/plugins/catalog`, which is a file
+    /// read rather than the clone pass it used to be.
+    ///
+    /// TRANSIENT, for the same reason as its sibling above. `failed` reports a
+    /// scan that could not complete at all, as opposed to the per-marketplace
+    /// failures the catalog carries in its `errors`.
+    PluginCatalogScanned {
+        failed: bool,
+    },
     /// A device pinned an app to its home / dock surface. Audit-worthy because
     /// the pinned set is what powers the app launcher on that device.
     PinnedAppPinned {
@@ -1551,6 +1568,8 @@ impl SystemEvent {
             Self::PluginUninstallCanceled { .. } => "PluginUninstallCanceled",
             Self::PluginMarketplaceRegistered { .. } => "PluginMarketplaceRegistered",
             Self::PluginMarketplaceRemoved { .. } => "PluginMarketplaceRemoved",
+            Self::PluginCatalogScanStarted {} => "PluginCatalogScanStarted",
+            Self::PluginCatalogScanned { .. } => "PluginCatalogScanned",
             Self::ThreadComposeChanged { .. } => "ThreadComposeChanged",
             Self::PinnedAppPinned { .. } => "PinnedAppPinned",
             Self::PinnedAppUnpinned { .. } => "PinnedAppUnpinned",
@@ -1689,6 +1708,8 @@ impl SystemEvent {
         "PluginUninstallCanceled",
         "PluginMarketplaceRegistered",
         "PluginMarketplaceRemoved",
+        "PluginCatalogScanStarted",
+        "PluginCatalogScanned",
         "ThreadComposeChanged",
         "PinnedAppPinned",
         "PinnedAppUnpinned",
@@ -1803,9 +1824,11 @@ impl SystemEvent {
             // Its own aggregate, not "plugin": a marketplace is the source a
             // plugin can be installed FROM, and registering one installs
             // nothing.
-            Self::PluginMarketplaceRegistered { .. } | Self::PluginMarketplaceRemoved { .. } => {
-                "plugin_marketplace"
-            }
+            Self::PluginMarketplaceRegistered { .. }
+            | Self::PluginMarketplaceRemoved { .. }
+            // A scan reports on the marketplaces, so it shares their aggregate.
+            | Self::PluginCatalogScanStarted {}
+            | Self::PluginCatalogScanned { .. } => "plugin_marketplace",
             Self::ThreadComposeChanged { .. } => "thread",
             Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
             Self::DeviceRegistered { .. }

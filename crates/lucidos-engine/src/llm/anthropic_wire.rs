@@ -1050,6 +1050,10 @@ mod tests {
             parse_context_suffix("claude-fable-5-1[1m]"),
             ("claude-fable-5-1", true)
         );
+        assert_eq!(
+            parse_context_suffix("claude-opus-5-5[1m]"),
+            ("claude-opus-5-5", true)
+        );
     }
 
     #[test]
@@ -1085,18 +1089,29 @@ mod tests {
     }
 
     #[test]
-    fn opus_5_is_adaptive_thinking() {
-        // Opus 5 is adaptive-only (extended `thinking.type:"enabled"` 400s). The
-        // real registry ids carry the `@default` alias and the `[1m]` suffix, so
-        // both gates must fire for those exact strings — otherwise Opus 5 falls
-        // into the no-thinking 8192-cap path or the deprecated budget_tokens path.
+    fn every_opus_5_generation_is_adaptive_thinking() {
+        // The Opus 5 line is adaptive-only (extended `thinking.type:"enabled"`
+        // 400s). The real registry ids carry the `@default` alias and the `[1m]`
+        // suffix, so both gates must fire for those exact strings. Otherwise an
+        // Opus turn falls into the no-thinking 8192-cap path or the deprecated
+        // budget_tokens path.
+        //
+        // Opus 5.5 rides the same `claude-opus-5` fragment, the way Fable 5.1
+        // rides `claude-fable-5`. It is asserted here rather than assumed,
+        // because a later arm written as a prefix or an equality would drop it
+        // silently.
         for id in [
             "claude-opus-5",
             "claude-opus-5@default",
             "claude-opus-5@default[1m]",
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
         ] {
             assert!(supports_extended_thinking(id), "extended: {id}");
             assert!(requires_adaptive_thinking(id), "adaptive: {id}");
+            // The ceiling the API accepts for the turn. A higher value fails
+            // every request on the model, not just a long one.
+            assert_eq!(adaptive_max_output_tokens(id), Some(128_000), "{id}");
         }
     }
 

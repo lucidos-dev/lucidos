@@ -761,12 +761,32 @@ impl WebhookStore {
             HmacChange::Set(cfg) => (true, Some(serde_json::to_value(cfg)?), None),
             HmacChange::Clear => (true, None, Some(mint_token()?)),
         };
+        // **Moving the enabled flag ends the run**, in the same statement, the
+        // way an acceptance does. A run is homogeneous in its cause. The flag
+        // is one of the two causes, so a run that outlived a switch describes
+        // a fault that is over.
+        //
+        // Left standing, its count and tally get re-reported under the other
+        // cause's words. A hook switched off after an hour of signature
+        // failures would read "every one was refused before it was read". That
+        // tells its owner the secret is fine, while every one of them failed
+        // exactly that check.
+        //
+        // `IS DISTINCT FROM` against the bare column compares the new value to
+        // the OLD one. So an unrelated PUT resending the same flag keeps a live
+        // run, and the next delivery starts an honest one.
+        let flag_moved = "$4 IS NOT NULL AND $4 IS DISTINCT FROM enabled";
         let row: Option<WebhookRow> = sqlx::query_as(&format!(
             "UPDATE webhooks SET name = COALESCE($2, name), \
              event_type = COALESCE($3, event_type), enabled = COALESCE($4, enabled), \
              dedupe = COALESCE($5, dedupe), headers = COALESCE($6, headers), \
              hmac = CASE WHEN $7 THEN $8 ELSE hmac END, \
              token_hash = CASE WHEN $7 THEN $9 ELSE token_hash END, \
+             refusal_run_count = CASE WHEN {flag_moved} THEN 0 ELSE refusal_run_count END, \
+             refusal_run_since = CASE WHEN {flag_moved} THEN NULL ELSE refusal_run_since END, \
+             refusal_run_cause = CASE WHEN {flag_moved} THEN NULL ELSE refusal_run_cause END, \
+             refusal_run_reasons = CASE WHEN {flag_moved} \
+                 THEN '{{}}'::jsonb ELSE refusal_run_reasons END, \
              updated_at = NOW() WHERE id = $1 RETURNING {WEBHOOK_COLUMNS}"
         ))
         .bind(id)

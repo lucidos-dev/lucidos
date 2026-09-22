@@ -313,6 +313,11 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   // cover — map them so coding-agent exchanges don't render the bare id.
   ['claude-opus-5[1m]', 'Opus 5 (1M)'],
   ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
+  // CC also drops `@default` when it echoes the bare row, so a session pinned
+  // to `claude-opus-5@default` stores `claude-opus-5`. The registry knows only
+  // the pinned spelling, so without these two the transcript showed a raw id.
+  ['claude-opus-5', 'Opus 5'],
+  ['claude-opus-4-8', 'Opus 4.8'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
   // Mirrors the picker rows, deliberately version-free: `opus` and `sonnet`

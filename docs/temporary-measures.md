@@ -148,6 +148,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `src/components/chat/__tests__/dead-press-probe-ledger.test.ts`. The `PressOutcome`
   pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
   served press from a swallowed one, so each consumer says which it was.
+
+  The *close path* in `src/components/layout/keyboardCloseRelayout.ts` is part
+  of it too, on the same grounds: `ClosePath`, the `closePath` variable, and
+  `KeyboardCloseState.path`. The recovery reads none of them. Their one reader
+  is this probe's `silent-since-keyboard` line.
 - **Impermanent because:** It chases one bug and produces no feature. On an iOS
   PWA the composer's buttons go dead now and then, wherever the finger presses,
   until the keyboard is dismissed. Six reports so far, each able to say only
@@ -249,6 +254,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   first: a single-digit `px` is a near miss on a small target, and a large one
   is a press that was never aimed at a face.
 
+  **Round 20 put `missedBy` on a `keyboard-touch` line too**, which is the only
+  line a wedge can produce. It is absent there when no row was laid out, since
+  a zero-measuring face would report a distance from the viewport origin.
+
   **Read `quiet.covered` before concluding anything from a silence.** It counts
   the scheduled checks in the preceding gap that asked nothing, because the app
   had a cover up. A run of them across a long `quiet.ms` says the composer was
@@ -267,7 +276,16 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   **`quiet.closes` is the score for the transition-driven recovery.** It counts
   the keyboard closes in the preceding silence, each of which spent a relayout.
   Kept apart from `nudges` so that count keeps meaning what every earlier ledger
-  reads it as.
+  reads it as. It counts MORE from round 19 on, which saw two closes the resize
+  event never reported. Do not compare it across that change.
+
+  **`closePath` on a `silent-since-keyboard` line names the close path**, one of
+  `resize`, `wake` or `poll` ([ADR 0245](adr/0245-a-keyboard-close-is-seen-without-an-event.md)).
+  `poll` is the reading worth hunting: it says the page was never told the keys
+  went. Every other signal here arrives as an event, so nothing else can tell
+  "the platform delivered nothing" from "nothing happened". The poll runs only
+  with **Perf instrumentation** on, so its absence on a default phone says
+  nothing either way.
 
   **`fingers` and `fingersAtLift` count the contacts on the glass.** The first
   is the running maximum while the press was armed, and the second is what was
@@ -277,9 +295,13 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
   evidence again rather than confirmation. Then delete the module, its install
-  call, its two tests, the `PressOutcome` pair and its two callers. Flip this
-  row to `removed`. Verify with a tree-wide search for `deadPressProbe` and
-  `notePressOutcome`, which must return nothing.
+  call, its two tests, the `PressOutcome` pair and its two callers, and the
+  *close path* named under **Lives in**. Dropping the close path means
+  `ClosePath`, the `closePath` variable, `KeyboardCloseState.path` and the
+  argument `recordClose` takes. The three close paths themselves are the
+  RECOVERY and stay: only the record of which one fired goes. Flip this row to
+  `removed`. Verify with a tree-wide search for `deadPressProbe`,
+  `notePressOutcome` and `ClosePath`, which must return nothing.
 - **Investigation:** none. It is narrow enough to stand alone. The three plans
   behind it are
   [`docs/plans/2026-08-27-the-composer-row-reports-which-face-died.md`](plans/2026-08-27-the-composer-row-reports-which-face-died.md),
@@ -491,6 +513,78 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   with the new module counted in. Both are named in
   [ADR 0228](adr/0228-composer-recovers-on-the-keyboard-close.md) and in
   [its plan](plans/2026-09-20-the-composer-recovers-when-the-keyboard-closes.md).
+- **What the nineteenth report found: the close itself went unseen.** The user
+  typed and tapped Submit, and nothing happened. The draft writes put the last
+  keystroke four seconds before the press that finally served. That press reads
+  `keyboardActive: false` at full height, so the keys went inside those four
+  seconds, and it carries `quiet.closes: 0`.
+
+  The round-18 relayout therefore never ran for the episode it was built for.
+  `noteViewportResize` had ONE caller, the app's `visualViewport` resize
+  handler. `onWake` and `onOrientationChange` both restore `--app-height`
+  without folding a reading. `onWake`'s own comment already said iOS dismisses
+  the keyboard on resume with no resize at all.
+
+  **The ledger also proved a timer outlives the wedge.** A second episode that
+  hour took nothing for 36.4 seconds while twelve scheduled checks ran through
+  it. So a polled reading can see a transition no event delivers, which is the
+  one channel this investigation has never used.
+
+  Three things shipped. The wake path stamps a close on its own word, ungated. A
+  poll reads the viewport beside the resize handler, behind the **Perf
+  instrumentation** toggle, since a recovery must not cost every phone an
+  interval. And every close records its *close path*, `resize`, `wake` or
+  `poll`, which rides on the `silent-since-keyboard` line as `closePath`.
+
+  All three observers sit with the height owner. A poll-seen close is one no
+  resize settled the height for. A poll anywhere else would bounce off the
+  keyboard-shrunk `--app-height` and put it straight back.
+
+  **`closePath: poll` is the line to look for.** It says the page was never told
+  the keys went, and no other reading in the app can establish that. The plan is
+  [`docs/plans/2026-09-22-the-keyboard-close-is-seen-without-an-event.md`](plans/2026-09-22-the-keyboard-close-is-seen-without-an-event.md),
+  and the decision is
+  [ADR 0245](adr/0245-a-keyboard-close-is-seen-without-an-event.md).
+
+  **One reporting defect went with it.** A `silent-since-keyboard` line carried
+  `sinceKeyboardMs: 62915` with the keyboard UP, because nothing retired a
+  close when the keys came back. A cover reading retires it now.
+- **What the twentieth report found: the TOUCH pipeline is what dies.** The
+  first episode read with round 19 running, hours after it shipped. The whole
+  wedge is in the ledger, and the poll answered the question it was built for.
+
+  Typing ran to 20:03:59. The composer then took nothing for 16.5 seconds,
+  through five scheduled checks that all found the row healthy. The keyboard
+  close WAS seen: the served line carries `closes: 1`, and the silence line
+  names `closePath: resize`.
+
+  **Perf instrumentation was on, so the poll was running, and it found no close
+  the resize missed.** Viewport events were being delivered the whole time
+  touches were not. That is far narrower than "WKWebView stops delivering to
+  the page", which is the theory the poll was built to test. A negative answer
+  is the finding here: the fault is in the touch pipeline, not in event
+  delivery at large. Twenty rounds in, it is the first real narrowing.
+
+  **The recovery cannot be credited with this one.** The single touch the page
+  took landed on the transcript at 20:04:03, which is how this reporter
+  dismisses the keyboard. The relayout came at 20:04:04, a second behind the
+  manual fix, and the next press served at 20:04:06.
+
+  Two things shipped. The recovery is armed from the keystroke rather than the
+  scheduled phase, so it lands at its three-second bound. It had been arriving
+  three to six seconds in. And a `keyboard-touch` line carries `missedBy`, the
+  signed vector round 14 gave a `missed` line.
+
+  **The bound itself was cut to a second and reverted.** ADR 0228 records
+  loosening `shouldNudgeUntouched` as rejected outright by the user, and the
+  round-20 diff cut it while citing that same ADR as its authority. The phase
+  was the whole lateness: the keystroke timer removes it without touching the
+  gate. Every `untouched` line now names its trigger, `tick` or `keystroke`.
+
+  That verdict is the ONLY line this wedge can produce. So it is the one place
+  a displacement can show, and it carried the point without the distance. The
+  plan is
+  [`docs/plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md`](plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md).
 - **Status:** `active`, and now carrying one recovery as well as evidence. The
   cause is still NOT named. So the removal condition needs a quiet period with
   the transition relayout running, or an episode that names the mechanism.
@@ -498,10 +592,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   costs.** The transition relayout is outside the module, so deleting the probe
   cannot delete the fix. What remains inside is the typing-driven relayout,
   which covers a wedge with no keyboard close in front of it. Removal therefore
-  means moving `liveCommitFace`, `commitFace`, `shouldNudgeUntouched` and
-  `runUntouchedNudge` to a permanent home first, and dropping only the reporting
-  around them. The keystroke stamp goes with them: `runUntouchedNudge` is the
-  only reader of it.
+  means moving `liveCommitFace`, `commitFace`, `shouldNudgeUntouched`,
+  `runUntouchedNudge` and, since round 20, `armKeystrokeNudge` with
+  `nudgeIsTooSoon` and `lastNudgeAt`, to a permanent home first. Only the
+  reporting around them is dropped. The keystroke stamp goes with them, and so
+  does the `input` listener that arms the timer: `runUntouchedNudge` and
+  `armKeystrokeNudge` are its only readers.
 - **Still consumes no gesture, and presses nothing.** Every listener stays
   passive, and none calls `preventDefault` or `stopPropagation`. No path
   dispatches a click, a tap, a pointer event or a submit.
@@ -1380,6 +1476,47 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   origin, a third capability it took away. Tracked apart because the answer was
   a routing decision rather than an SDK surface.
 
+### `glib` held at 0.18 by the Tauri Linux stack
+
+- **Added:** 2026-09-21
+- **Lives in:** the `glib` `ignore` entry in
+  [`.github/dependabot.yml`](../.github/dependabot.yml), plus the `not_used`
+  dismissal on alert 12 of the public mirror
+  (`repos/lucidos-dev/lucidos/dependabot/alerts/12`).
+- **Impermanent because:** GHSA-wrw7-89jp-8q8g wants `glib >= 0.20`, and this
+  tree cannot resolve it. Tauri reaches glib only on Linux, through tao, wry and
+  webkit2gtk, and all three require the gtk-rs 0.18 generation, which pins glib
+  to 0.18. gtk3-rs itself has moved on, and `gtk 0.19` takes `glib ^0.22`. But no
+  wry or tao release accepts gtk 0.19, so that generation is out of range for us.
+  Dependabot retried the impossible upgrade every other day and painted the run
+  red, which is what the `ignore` entry stops.
+
+  **Exact versions live in the config comment, on purpose.** They are third-party
+  numbers that collide with our own release numbers, and
+  `scripts/lib/version_sources_test.sh` excludes `.github/dependabot.yml` for
+  exactly that reason. Restating them here would put a release-version literal in
+  a scanned file, which blocks the release that happens to match it.
+
+  The advisory is also unreachable in everything we publish, which is what makes
+  the dismissal honest rather than convenient. `scripts/build-headless.sh` is
+  Tauri-free and builds only `lucidos-engine`, `lucidos-gateway` and
+  `lucidos-cli` for the four release triples. None of the three resolves `glib`
+  on any target, Linux included. The only Tauri artifact is the macOS
+  `.app`/`.dmg`, where Tauri uses WKWebView and `glib` is absent from the graph.
+  There is no Linux desktop build. Nothing in the tree calls
+  `glib::Variant::array_iter_str`, the one way to get a `VariantStrIter`.
+- **Removal / resolution condition:** The Tauri Linux stack moves to the gtk-rs
+  0.19+ generation, so `glib >= 0.20` becomes resolvable. Verify after a `tauri`
+  bump with
+  `cargo tree -i glib --target x86_64-unknown-linux-gnu -p lucidos-app`, which
+  must report glib 0.20 or newer, or no glib at all. Do NOT check with
+  `cargo update -p glib`. It reports 0 packages locked in both cases: when the
+  bump is impossible, and when the `tauri` bump has already moved glib. Then
+  delete the `ignore` entry and let the update run. Reopen mirror alert 12 rather
+  than renewing the dismissal, because the fix is an ordinary bump by then.
+- **Status:** active
+- **Investigation:** n/a. An upstream version constraint, not an open question.
+
 ---
 
 ## 2. Model-tolerance measures
@@ -2255,6 +2392,29 @@ event that retires it.
   catches its own stragglers.
 - **Status:** removed
 
+### `--cc-model` alias on `lucidos spawn-thread`
+
+- **Added:** 2026-09-21, with the rename to `--coding-agent-model`.
+- **Lives in:** one `#[arg(long = "coding-agent-model", alias = "cc-model")]` in
+  `crates/lucidos-cli/src/main.rs`, pinned by
+  `both_model_flag_spellings_send_cc_model`.
+- **Why:** the flag was never Claude-Code-specific. The same value reaches Codex
+  through the same parameter, so the `cc-` prefix named the wrong thing. The
+  alias keeps a recipe or trigger that already types `--cc-model` working, since
+  a workspace's own scripts are outside this repo. It is a hidden clap alias:
+  `--help` teaches the new name only.
+- **Removal condition:** one release has shipped with `--coding-agent-model`
+  documented. Plus a tree grep for `cc-model` over `crates/**`,
+  `system-knowhow/**`, `.claude/**` and `scripts/**` returns nothing but this row
+  and the alias itself. A fleet-wide "no recipe passes it" is unverifiable, so it
+  is deliberately NOT part of the condition. Follow the two siblings below and
+  ship the removal with a release notice whose action runs a workspace audit.
+- **Sibling rows:** `lucidos spawn-thread --parent` and the `repo` alias on
+  `run_coding_agent`, both registered on the same reasoning and retired together.
+  The `sub` alias for `--relation child` is the contrast: permanent back-compat,
+  deliberately untracked.
+- **Status:** active
+
 ### `tailscale serve` pre-1.52 positional-syntax fallback
 
 - **Added:** 2026-08-02
@@ -2435,7 +2595,8 @@ measure now eligible for removal** — search this file for the id to find them 
   `docs/plans/2026-06-25-surface-coding-agent-reasoning-in-timeline.md`) is wired
   end-to-end but produces **zero events** for the current models. Anthropic's
   `thinking.display` defaults to `"omitted"` on every current model: Fable 5.1
-  and 5, Opus 5, Opus 4.8 and 4.7, Sonnet 5. So thinking blocks stream with
+  and 5, Opus 4.7 through 5.5, Sonnet 5. Opus 5.5 is the family default rather
+  than a fresh measurement. So thinking blocks stream with
   EMPTY text (encrypted signature only) and no `thinking_delta` arrives. **Opus 5 does not
   resolve it** — re-checked 2026-07-25 against Opus 5 specifically, not CC in
   aggregate: the dev workspace has 15 CC threads whose selected model is
