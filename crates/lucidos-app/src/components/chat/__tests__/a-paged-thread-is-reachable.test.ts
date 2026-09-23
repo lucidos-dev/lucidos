@@ -153,7 +153,7 @@ describe('pressing the chevron on a paged thread', () => {
 
     /** The same arming, cleared when the reader leaves. */
     it('drops a jump the thread never consumed', () => {
-        const from = threadViewSource.indexOf('if (threadId) pendingBackfillByThread.delete(threadId);');
+        const from = threadViewSource.indexOf('if (threadId) historyHoldByThread.delete(threadId);');
         const teardown = threadViewSource.slice(from, threadViewSource.indexOf('}, [threadId]);', from));
         expect(teardown).toContain('pendingScrollTopRef.current = false;');
     });
@@ -189,7 +189,10 @@ describe('a page landing on a re-pointed window', () => {
         const from = threadViewSource.indexOf('const hold = isElementVisible(el) ? pend : null;');
         expect(from, 'the hold must come from the request, and only while visible')
             .toBeGreaterThan(-1);
-        const repoint = threadViewSource.slice(from, threadViewSource.indexOf('}, [threadId, backfillArrived]);', from));
+        const end = threadViewSource.indexOf('}, [threadId, historyFolded]);', from);
+        expect(end, 'the re-point effect must close on its own deps')
+            .toBeGreaterThan(from);
+        const repoint = threadViewSource.slice(from, end);
         expect(repoint).toContain('prevScrollTop: hold.prevScrollTop');
         expect(repoint).toContain('prevScrollHeight: hold.prevScrollHeight');
     });

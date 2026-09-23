@@ -1517,7 +1517,11 @@ function noteHistoryFloor(thread: ThreadState, snapshot: ThreadEventsSnapshot): 
   thread.hasOlderEvents = snapshot.hasMore === true;
 }
 
-/** Put a page of OLDER events in front of the ones already held.
+/** Put a page of OLDER events in front of the ones already held, and report
+ *  whether anything NEW landed.
+ *
+ *  That answer tells a caller holding the reader's place whether the fold
+ *  really happened. A read that added nothing cannot be mistaken for one.
  *
  *  Deliberately not `applyEventRows`. That walks `handleEvent`, which is the
  *  live path: it moves `updatedAt`, clears the streaming buffer and claims
@@ -1530,16 +1534,17 @@ function noteHistoryFloor(thread: ThreadState, snapshot: ThreadEventsSnapshot): 
  *  arriving at the end but belonging at the start would be read as a suffix,
  *  and serve stale exchanges with no failure signal. A fresh Map misses the
  *  WeakMap and rebuilds cleanly. */
-function prependEventRows(thread: ThreadState, rows: ThreadEventRow[]): void {
-  if (rows.length === 0) return;
+function prependEventRows(thread: ThreadState, rows: ThreadEventRow[]): boolean {
+  if (rows.length === 0) return false;
   const merged = new Map<number, StoredEvent>();
   for (const row of rows) {
     if (thread.events.has(row.sequence)) continue;
     merged.set(row.sequence, storedFromRow(row));
   }
-  if (merged.size === 0) return;
+  if (merged.size === 0) return false;
   for (const [seq, stored] of thread.events) merged.set(seq, stored);
   thread.events = merged;
+  return true;
 }
 
 /** One row in the shape `handleEvent` stores, and it must stay that shape.
@@ -1628,7 +1633,7 @@ async function backfillOnePage(threadId: string): Promise<boolean> {
     const current = threadMap.value.get(threadId);
     if (!current) return false;
     const applyStart = performance.now();
-    prependEventRows(current, snapshot.events);
+    const grew = prependEventRows(current, snapshot.events);
     const applyMs = performance.now() - applyStart;
     // Only the floor moves. `lastDbSeq` is the high-water mark of the NEWEST
     // event seen. This page is older than everything already held, so touching
@@ -1643,7 +1648,7 @@ async function backfillOnePage(threadId: string): Promise<boolean> {
       applyMs: Math.round(applyMs),
       hasMore: current.hasOlderEvents,
     });
-    return snapshot.events.length > 0;
+    return grew;
   } catch {
     showToast('Could not load older messages. Scroll up again to retry.', 'error');
     return false;
@@ -1661,27 +1666,35 @@ async function backfillOnePage(threadId: string): Promise<boolean> {
  *
  *  It merges rather than replacing outright, so an event that arrived over SSE
  *  while the request was in flight is not dropped. A no-op once the thread is
- *  loaded to its start, which is every short thread. */
-export async function ensureWholeThreadLoaded(threadId: string): Promise<void> {
+ *  loaded to its start, which is every short thread.
+ *
+ *  Reports whether history actually folded in, like `loadOlderThreadEvents`.
+ *  The transcript grows at the FRONT when it does, so the caller holding the
+ *  reader's place must know whether it grew. */
+export async function ensureWholeThreadLoaded(threadId: string): Promise<boolean> {
   // WAITS for a backfill rather than skipping past one. A deep link that
   // arrived mid-scroll would otherwise find nobody fetching the history it
   // needs, and land on a transcript without its target.
-  await afterHistoryRead(threadId, () => loadWholeThread(threadId));
+  let added = false;
+  await afterHistoryRead(threadId, () => loadWholeThread(threadId).then(r => { added = r; }));
+  return added;
 }
 
-async function loadWholeThread(threadId: string): Promise<void> {
+async function loadWholeThread(threadId: string): Promise<boolean> {
   const thread = threadMap.value.get(threadId);
-  if (!thread || !thread.hasOlderEvents) return;
+  if (!thread || !thread.hasOlderEvents) return false;
   try {
     const snapshot = await fetchThreadEvents(threadId);
     const current = threadMap.value.get(threadId);
-    if (!current) return;
-    prependEventRows(current, snapshot.events);
+    if (!current) return false;
+    const grew = prependEventRows(current, snapshot.events);
     noteHistoryFloor(current, snapshot);
     threadMap.value = new Map(threadMap.value);
     bumpThreadEvents(threadId);
+    return grew;
   } catch {
     showToast('Could not load the rest of this thread.', 'error');
+    return false;
   }
 }
 

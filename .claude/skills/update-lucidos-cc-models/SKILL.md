@@ -30,13 +30,25 @@ Each entry has:
 
 The JSON file also carries the `reasoning_efforts` list (`/effort` picker entries) under the same schema.
 
+## Where a row goes
+
+Rows run **newest version first**. `default` heads the list, and the
+version-free aliases (`opus`, `opus[1m]`, `sonnet`, `haiku`) sit at the tail.
+Two rows of the same version keep their relative order, and a `[1m]` twin sits
+beside its base.
+
+`the_model_rows_run_newest_version_first` enforces it, reading the version out
+of each pinned id. Order by capability tier instead and the newest model sinks.
+Opus 5.5 shipped below Fable 5.1, Fable 5 and Sonnet 5, under a panel showing
+about three rows.
+
 ## Update Procedure
 
 1. **Open the JSON file** `crates/lucidos-engine/src/runtime/cc_menu_options.json`.
 2. **Compare with CC's picker**: run `claude` interactively and type `/model`, or check the model-config docs page.
-3. **Edit the JSON**: add/remove/modify entries to match. No Rust source touch required.
+3. **Edit the JSON**: add/remove/modify entries to match, placing each row by version (see "Where a row goes"). No Rust source touch required.
 4. **Mirror the change** into `crates/lucidos-app/src/api/client/chat.ts` (`CodingAgentModelValue`) and `crates/lucidos-app/src/store/thread-events/exchange.ts` (`STATIC_MODEL_LABELS`). Both are hand-maintained, with no codegen. A value added or removed in the JSON must reach the union; a label change must reach the fallback map. Do both in the same commit.
-5. **Run tests**: `cargo test -p lucidos-engine --lib -- cc_model` — `command_definitions_include_model_options` validates that the standard aliases stay present.
+5. **Run tests**: `./scripts/test-engine.sh -- -- commands_tests`. That module covers the standard aliases and the row order.
 6. **Commit**: `fix: update CC model list to match current /model picker`.
 
 ## Known Aliases

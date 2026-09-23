@@ -121,6 +121,66 @@ fn every_claude_code_model_offers_every_tier() {
     }
 }
 
+/// The `major.minor` a pinned model id spells, or `None` for an alias.
+///
+/// Reads the id, not the label. `Opus (latest, 1M)` carries a digit that is not
+/// a version, and `Sonnet (latest)` carries none at all.
+///
+/// Strips BOTH decorations, which `likely_intended_model` refuses to do. That
+/// rule tells two rows apart; this one places them. `claude-opus-5@default` and
+/// `claude-opus-5[1m]` are both Opus 5, so they share a slot.
+fn pinned_model_version(value: &str) -> Option<(u32, u32)> {
+    let id = crate::runtime::strip_version_pin(value);
+    let id = id.strip_suffix("[1m]").unwrap_or(&id);
+    let (_family, version) = id.strip_prefix("claude-")?.split_once('-')?;
+    let mut parts = version.split('-');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
+}
+
+/// Where a new model row goes: newest version first.
+///
+/// Ordering by capability tier is what put Opus 5.5 below Fable 5.1, Fable 5
+/// and Sonnet 5. The panel shows about three rows at phone width, so the picker
+/// opened on three older models and the newest one needed a scroll.
+///
+/// Only a pinned id carries a version. `default` heads the list, because that
+/// is the row a thread with no pick already sits on. The version-free aliases
+/// trail, because there is no version to place them by.
+#[test]
+fn the_model_rows_run_newest_version_first() {
+    let values: Vec<&str> = cc_model_options()
+        .iter()
+        .map(|m| m.value.as_str())
+        .collect();
+    assert_eq!(
+        values.first(),
+        Some(&"default"),
+        "the Default row heads the list"
+    );
+
+    let mut previous: Option<(u32, u32)> = None;
+    let mut alias_seen = false;
+    for value in &values[1..] {
+        let Some(version) = pinned_model_version(value) else {
+            alias_seen = true;
+            continue;
+        };
+        assert!(
+            !alias_seen,
+            "{value} carries a version, so it belongs above every alias row"
+        );
+        if let Some(above) = previous {
+            assert!(
+                version <= above,
+                "{value} is newer than the row above it: {version:?} under {above:?}"
+            );
+        }
+        previous = Some(version);
+    }
+}
+
 #[test]
 fn control_request_deserializes_all_variants() {
     let cases = vec![

@@ -1338,6 +1338,15 @@ A turn the *reading position* names must render WHOLE, not merely be present, be
 
 **A turn the loaded pages do not hold is ABANDONED** (ADR 0234). The walk grows the window and never fetches, so a position behind the newest page opens the thread at the top of that page. Chasing it would spend exactly what paging bought, worst on a phone over a slow link. The record survives, so a client holding the history still lands on the turn. A position INSIDE the loaded pages is honoured exactly, and that is what the walk is for.
 
+### History hold
+Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the whole-history fetch a *deep-link anchor*'s render-all needs.
+
+**It records the reader's TURN as well as the frame**, and `holdTargetTop` prefers the turn. A height delta says only how much taller the transcript got, so the correction has to assume every pixel landed above the reader. A live thread drawing a reply BELOW them breaks that, and it fires no scroll event, so the refresh never sees it. A whole-history fetch runs for seconds, which is long enough for that to be a screenful.
+
+**Distinct from the WINDOW's own re-point** (`anchorKey`, `anchorAfterBackfill`), which a backfill needs and a render-all must not have: the *render window* is already drawing every turn and has to keep them.
+
+**It is advisory.** `requestBackfill` asks the store whether a read is running, rather than reading that off the hold. So a hold nothing consumed cannot refuse pages for the rest of a visit.
+
 ### Continuation fragment
 The exchange the fold opens to hold steps whose turn starts off the loaded page (`Exchange.continuationFragment`, written by `openContinuationFragment` in `store/thread-events/exchange-grouping.ts`). A long thread opens on its newest page, and that page routinely begins mid-turn. Without a fragment the fold drops every step ahead of the page's first boundary, and a page holding none draws nothing at all.
 

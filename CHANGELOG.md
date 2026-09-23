@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.39.3 — 2026-09-23
+
+### Fixed
+
+- The Claude Code model picker lists models newest version first. Opus 5.5 is at the top.
+- A notification link to a long thread stays on the event it opened while the rest of the history loads, on iPhone and iPad too.
 ## v0.39.2 — 2026-09-22
 
 ### Changed

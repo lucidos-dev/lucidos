@@ -17,6 +17,7 @@ import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents
 import { statusLabel } from '../../store/exchange-status';
 import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, markAnchorScroll, deepLinkRenderAll } from './scrollState';
 import { MAX_FILL_BACKFILLS, MAX_FILL_EXPANSIONS, WHOLE_THREAD, anythingAbove, atScrollTop, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachIndex, exchangeRenderCost, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, transcriptScrolls, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type WindowEdge } from './threadWindow';
+import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from './scrollAnchor';
 import { useScrollMemory, threadScrollKey, readSavedScroll } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
@@ -120,7 +121,8 @@ function growRenderWindow(
     return true;
 }
 
-/** A backfill in flight, and what the reader was looking at when it started.
+/** A read of older history in flight, and what the reader was looking at when
+ *  it started.
  *
  *  `anchorKey` is the `exchangeKey` of the exchange the window rested on. The
  *  edge is an INDEX. A page of older history grows the array at the front, so
@@ -130,10 +132,11 @@ function growRenderWindow(
  *  Identity rather than a count of what arrived. The fold can merge a page's
  *  last turn into the first one held. So the array does not grow by the number
  *  of exchanges the page carried. */
-type PendingBackfill = {
-    /** Null when the window rests on no turn at all, which a page folding to
-     *  nothing renderable produces. There is no reader's place to hold, so the
-     *  re-point has nothing to do and the page is pure gain. */
+type HistoryHold = {
+    /** The turn to re-point the WINDOW onto, and null when there is none to
+     *  re-point against: a page that folded to nothing renderable, or a
+     *  whole-history hold (see `wholeHistoryHold`). Either way the landing
+     *  holds the reader by pixels and leaves the window alone. */
     anchorKey: string | null;
     /** The turn BELOW the anchor, as a second chance at re-pointing.
      *
@@ -149,11 +152,62 @@ type PendingBackfill = {
     rowsHidden: number;
     prevScrollHeight: number;
     prevScrollTop: number;
-} | null;
+    /** The TURN the reader is parked on, when one can be named, and the offset
+     *  its top sat at. What `holdTargetTop` prefers, because it survives growth
+     *  the two numbers above cannot describe.
+     *
+     *  Those two say only how much taller the transcript got, so the correction
+     *  has to assume every pixel of it landed above the reader. A live thread
+     *  drawing a reply BELOW them breaks that, and it fires no scroll event, so
+     *  the refresh never sees it. The correction then pushes the reader down by
+     *  whatever the agent wrote. A whole-history fetch runs for seconds, which
+     *  is long enough for that to be a screenful.
+     *
+     *  Null where no turn can be named, and for a scroll-driven backfill, whose
+     *  read is one short round trip. */
+    anchor: ScrollAnchor | null;
+};
 
-/** Backfills in flight, per thread, for the same reason the window Map is
- *  module-scoped: a switch away and back must not start a second one. */
-const pendingBackfillByThread = new Map<string, PendingBackfill>();
+/** Reads of older history in flight, per thread, for the same reason the window
+ *  Map is module-scoped: a switch away and back must not start a second one. */
+const historyHoldByThread = new Map<string, HistoryHold>();
+
+/** Where the container must sit to leave the reader on the content they were
+ *  reading, once older history has folded in above them.
+ *
+ *  The hold's TURN first, measured afresh in the layout the fold left. Failing
+ *  that the height delta, which is all a hold naming no turn has. */
+export function holdTargetTop(el: HTMLElement, hold: HistoryHold): number {
+    const anchored = hold.anchor ? anchorTargetTop(el, hold.anchor) : null;
+    if (anchored !== null) return anchored;
+    return hold.prevScrollTop + (el.scrollHeight - hold.prevScrollHeight);
+}
+
+/** The hold a WHOLE-HISTORY fetch takes, and why it names no turn to re-point.
+ *
+ *  A deep link renders the thread whole, so `ensureWholeThreadLoaded` pulls the
+ *  history behind the newest page. That history folds in at the FRONT, seconds
+ *  after the link has already landed the reader on their event. WebKit
+ *  implements no scroll anchoring, so the transcript grows above them and
+ *  carries them up into history nobody asked for.
+ *
+ *  It is the same hold a scroll-driven backfill takes, so the scroll listener
+ *  keeps it current while the link's own glide moves the reader.
+ *
+ *  NO ANCHOR KEY, where `requestBackfill` names one. That key re-points the
+ *  WINDOW, and a render-all draws every turn and must go on drawing them. The
+ *  `anchor` beside it is a different thing, and this hold DOES carry one: it
+ *  positions the reader rather than the window. */
+export function wholeHistoryHold(el: HTMLElement): HistoryHold {
+    return {
+        anchorKey: null,
+        nextKey: null,
+        rowsHidden: 0,
+        prevScrollTop: el.scrollTop,
+        prevScrollHeight: el.scrollHeight,
+        anchor: readScrollAnchor(el),
+    };
+}
 
 /** Where the window should sit once a page of older history has folded in.
  *
@@ -201,29 +255,81 @@ function requestBackfill(
     threadId: string,
     exchanges: readonly Exchange[],
     edge: WindowEdge,
-    onArrived: () => void,
+    onSettled: (added: boolean) => void,
 ): boolean {
-    if (pendingBackfillByThread.get(threadId)) return false;
+    // The STORE's own answer, rather than "is a hold recorded". The two agree
+    // while a hold belongs to a running read. Asking the store is what stops a
+    // hold nothing consumed from refusing pages for ever.
+    if (threadHistoryReadInFlight(threadId)) return false;
     const anchor = exchanges[edge.exchange];
     const next = exchanges[edge.exchange + 1];
-    pendingBackfillByThread.set(threadId, {
+    historyHoldByThread.set(threadId, {
         anchorKey: anchor ? exchangeKey(anchor) : null,
         nextKey: next ? exchangeKey(next) : null,
         rowsHidden: edge.rowsHidden,
         prevScrollHeight: el.scrollHeight,
         prevScrollTop: el.scrollTop,
+        anchor: null,
     });
-    void loadOlderThreadEvents(threadId).then((added: boolean) => {
-        // Nothing arrived, so nothing moved and the capture is spent. Clearing
-        // it here is what lets the next scroll ask again.
-        if (!added) { pendingBackfillByThread.delete(threadId); return; }
-        // THIS is what tells the re-point its page has landed. An `exchanges`
-        // change alone would not: a live turn on an active thread changes it
-        // too. Consuming the capture there spends it on an update the reader
-        // never asked for, and leaves nothing for the page that follows.
-        onArrived();
-    });
+    settleOn(loadOlderThreadEvents(threadId), threadId, onSettled);
     return true;
+}
+
+/** What a read of older history does when it settles, either way. Both readers
+ *  end here, `requestBackfill` above and `requestWholeHistory` below.
+ *
+ *  A fold tells the landing through `onSettled`, never through `exchanges`
+ *  changing. A live turn on an active thread changes those too. Consuming the
+ *  hold there spends it on an update the reader never asked for, and leaves
+ *  nothing for the read that follows.
+ *
+ *  Nothing arrived means nothing moved and the hold is spent, so dropping it is
+ *  what lets the next scroll ask again.
+ *
+ *  A read whose thread the reader has LEFT says nothing at all. Its callbacks
+ *  belong to the component, which is showing another thread by now. A
+ *  whole-history read runs for seconds, so it would spend that thread's hold.
+ *  The switch has already dropped this thread's own. Same guard the up chevron
+ *  keeps on its own late read. */
+function settleHistoryRead(threadId: string, added: boolean, onSettled: (added: boolean) => void): void {
+    if (!added) historyHoldByThread.delete(threadId);
+    if (focusedThreadId.value !== threadId) return;
+    onSettled(added);
+}
+
+/** Settle `read` when it answers, and settle it as "nothing arrived" if it
+ *  throws. Neither read rejects today, each catching its own transport failure,
+ *  and settling on one anyway is what keeps a hold from outliving its read. A
+ *  hold nothing consumes blocks every later page for the rest of the visit. */
+function settleOn(read: Promise<boolean>, threadId: string, onSettled: (added: boolean) => void): void {
+    void read.then(
+        added => settleHistoryRead(threadId, added, onSettled),
+        () => settleHistoryRead(threadId, false, onSettled),
+    );
+}
+
+/** Threads whose whole history this visit has already asked for, so the retry
+ *  below cannot ask twice. Module-scoped like the maps above, and cleared by
+ *  the same teardown: a later visit is free to ask again. */
+const wholeHistoryAskedByThread = new Set<string>();
+
+/** Pull the history behind the newest page for a deep link's render-all,
+ *  holding the reader's place across the fold. `wholeHistoryHold` carries what
+ *  the hold is for and why it re-points no window.
+ *
+ *  Its caller stands it down while a read is already running, so this never
+ *  queues behind one. A queued read would fold with no hold at all: the hold it
+ *  would take is the running read's, still in the map.
+ *
+ *  ONCE per visit, and that is what bounds the retry. A fetch that FAILS toasts
+ *  inside the store and leaves `hasOlderEvents` true. Asking again on its own
+ *  settle is then a loop, one toast a round. The chevron and the reader's own
+ *  scroll are the ways back from a failure. */
+function requestWholeHistory(el: HTMLElement, threadId: string, onSettled: (added: boolean) => void): void {
+    if (wholeHistoryAskedByThread.has(threadId)) return;
+    wholeHistoryAskedByThread.add(threadId);
+    historyHoldByThread.set(threadId, wholeHistoryHold(el));
+    settleOn(ensureWholeThreadLoaded(threadId), threadId, onSettled);
 }
 
 /** Escalating retry delays for the empty-thread safety retry. */
@@ -620,6 +726,11 @@ export function ThreadView() {
         });
     });
 
+    // The transcript itself. Declared here rather than beside the render.
+    // Every effect below that positions the reader reaches for it, the first
+    // being the deep link's own history fetch.
+    const areaRef = useRef<HTMLDivElement>(null);
+
     // --- Thread-render windowing (perf) ---
     // A large focused thread used to render — and markdown-parse — every exchange
     // synchronously on open and on every re-render (measured ~270–500ms of pure
@@ -634,11 +745,18 @@ export function ThreadView() {
     // keeps it full, so clearing the claim doesn't snap the user back.
     // See threadWindow.ts + scrollState.deepLinkRenderAll.
     const [winTick, bumpWin] = useState(0);
-    // Bumped only when a page of older history has LANDED, which is what the
-    // re-point effect keys on. An `exchanges` change is not the same event: a
-    // live turn on an active thread produces one too.
-    const [backfillArrived, setBackfillArrived] = useState(0);
-    const bumpBackfill = () => setBackfillArrived(n => n + 1);
+    // Bumped only when older history has FOLDED IN, which is what the re-point
+    // effect keys on. An `exchanges` change is not the same event: a live turn
+    // on an active thread produces one too.
+    const [historyFolded, setHistoryFolded] = useState(0);
+    // And bumped whenever a read of older history SETTLES, however it settled.
+    // The deep-link retry needs the empty and failed cases too, which the fold
+    // count deliberately does not carry.
+    const [historyReadSettled, setHistoryReadSettled] = useState(0);
+    const onHistoryRead = (added: boolean) => {
+        if (added) setHistoryFolded(n => n + 1);
+        setHistoryReadSettled(n => n + 1);
+    };
     // Re-render after a window write. `bumpWin` is stable, so an effect holding
     // an older copy of this still reaches the current component.
     const bumpWindow = () => bumpWin(n => n + 1);
@@ -683,11 +801,39 @@ export function ThreadView() {
     // open runs that one before the first page has landed, when the thread
     // still reports nothing older. A single call there would ask for nothing
     // and never be repeated. This asks again once the load settles the answer,
-    // and is a no-op on a thread already whole.
+    // and stands down on a thread already whole.
+    //
+    // It HOLDS the reader across the fold. See `requestWholeHistory`: that
+    // history arrives at the FRONT, seconds after the deep link placed the
+    // reader, and nothing else answers for content growing above them.
+    //
+    // `historyReadSettled` is what RETRIES it. The ask stands down while
+    // another read is running, and that read's settle is the moment asking can
+    // hold the reader. `hasOlderEvents` does not always move with it.
     useEffect(() => {
-        if (!threadId || !deepLinkRenderAll.value) return;
-        void ensureWholeThreadLoaded(threadId);
-    }, [threadId, deepLinkRenderAll.value, eventThread?.hasOlderEvents]);
+        if (!threadId || !hasOlderEvents) return;
+        // Only the `!eventThread` return draws no transcript, and
+        // `hasOlderEvents` above has already excluded it. The check narrows the
+        // type rather than covering a state.
+        const el = areaRef.current;
+        if (!el) return;
+        // A read ALREADY RUNNING will fold, whoever started it and whether or
+        // not a link still claims this open. So hold the reader for it and ask
+        // for nothing more.
+        //
+        // The claim is not asked here, and that is what covers a reader who
+        // left and came back inside a long fetch. The teardown drops the hold
+        // with the visit, and a re-entry finds the read it was taken for still
+        // running.
+        if (threadHistoryReadInFlight(threadId)) {
+            if (!historyHoldByThread.get(threadId)) {
+                historyHoldByThread.set(threadId, wholeHistoryHold(el));
+            }
+            return;
+        }
+        if (!deepLinkRenderAll.value) return;
+        requestWholeHistory(el, threadId, onHistoryRead);
+    }, [threadId, deepLinkRenderAll.value, hasOlderEvents, historyReadSettled]);
 
     // Fix the window once the event load settles, so later renders read a stored
     // value instead of re-deriving one. The seed is a function of the exchange
@@ -759,7 +905,6 @@ export function ThreadView() {
     // to avoid subscribing the render to the signal (prevents extra re-renders).
     const shouldReveal = shouldRevealThread(threadId, animating, hasContent);
 
-    const areaRef = useRef<HTMLDivElement>(null);
     const isUp = awayFromBottom.value;
     const isNotAtTop = notAtTop.value;
 
@@ -1154,7 +1299,7 @@ export function ThreadView() {
                 // which on a long thread is not the oldest turn there is. Fetch
                 // the page behind it; the effect below re-points the edge, and
                 // the reader's next scroll grows into what arrived.
-                requestBackfill(el, threadId, exchangesRef.current, current, bumpBackfill);
+                requestBackfill(el, threadId, exchangesRef.current, current, onHistoryRead);
                 return;
             }
             growRenderWindow(el, threadId, costs, current, rows, pendingExpandRef, bumpWindow);
@@ -1172,10 +1317,18 @@ export function ThreadView() {
             // writes are exactly the ones the landing must not undo. The layout
             // read costs a forced reflow, and it is paid only while a page is
             // actually in flight.
-            const inFlight = pendingBackfillByThread.get(threadId);
+            const inFlight = historyHoldByThread.get(threadId);
             if (inFlight) {
                 inFlight.prevScrollTop = el.scrollTop;
                 inFlight.prevScrollHeight = el.scrollHeight;
+                // The turn travels with the two numbers, for a hold that named
+                // one. It describes where the reader is, so it goes stale the
+                // moment they move, exactly as the offset does.
+                //
+                // A read answering null KEEPS the turn it had. Null is what a
+                // momentarily unmeasurable container answers, and a stale turn
+                // still beats the delta this exists to avoid.
+                if (inFlight.anchor) inFlight.anchor = readScrollAnchor(el) ?? inFlight.anchor;
             }
             // Only the READER asking for older turns may grow the window.
             // Our own positioning fires scroll events too. Opening a thread
@@ -1295,7 +1448,8 @@ export function ThreadView() {
     // An arming the old thread never consumed would fire on the next thread's
     // first window write, and yank a reader who pressed nothing.
     useEffect(() => () => {
-        if (threadId) pendingBackfillByThread.delete(threadId);
+        if (threadId) historyHoldByThread.delete(threadId);
+        if (threadId) wholeHistoryAskedByThread.delete(threadId);
         pendingScrollTopRef.current = false;
         // The VISIT ends here, however it ends: a switch, a New chat that
         // unmounts the pane, or the layout swapping at the breakpoint. Leaving
@@ -1304,7 +1458,7 @@ export function ThreadView() {
         if (lastSeededVisit === threadId) lastSeededVisit = null;
     }, [threadId]);
 
-    // A backfill landed, so the array grew at the FRONT and the edge index now
+    // History folded in, so the array grew at the FRONT and the edge index now
     // names an older turn than the reader was on. Put it back on the turn it
     // named, by identity, then grow ONCE into what arrived.
     //
@@ -1320,10 +1474,10 @@ export function ThreadView() {
     // expansion already rides.
     useLayoutEffect(() => {
         if (!threadId) return;
-        const pend = pendingBackfillByThread.get(threadId);
+        const pend = historyHoldByThread.get(threadId);
         const el = areaRef.current;
         if (!pend || !el) return;
-        pendingBackfillByThread.delete(threadId);
+        historyHoldByThread.delete(threadId);
         // A transcript laid out at 0x0 measures nothing, the same guard the
         // growers keep. A pane collapsed between the request and the landing
         // gives one, and a height read there is zero rather than absent: the
@@ -1332,10 +1486,10 @@ export function ThreadView() {
         const hold = isElementVisible(el) ? pend : null;
         const anchored = anchorAfterBackfill(exchanges, pend);
         if (!anchored) {
-            // Neither anchor survived the fold. Nothing can be re-pointed
-            // against turns that are gone, so hold the viewport by pixels and
-            // leave the window alone.
-            if (hold) markAnchorScroll(el, hold.prevScrollTop + (el.scrollHeight - hold.prevScrollHeight));
+            // No turn to re-point the WINDOW onto: either none survived the
+            // fold, or the hold named none. So hold the reader where they are
+            // and leave the window alone.
+            if (hold) markAnchorScroll(el, holdTargetTop(el, hold));
             return;
         }
         renderFloorByThread.set(threadId, anchored);
@@ -1358,7 +1512,7 @@ export function ThreadView() {
         // still owes the effect above its round, the hold being armed either
         // way.
         if (!grew) bumpWindow();
-    }, [threadId, backfillArrived]);
+    }, [threadId, historyFolded]);
 
     // After the up-chevron sets a whole-thread render floor, jump to the genuine
     // top once the expanded list commits. `scrollToTop()` starts a tween, and
@@ -1436,7 +1590,7 @@ export function ThreadView() {
             if (threadHistoryReadInFlight(threadId)) return;
             // Counted only when the capture was taken, the rule the grow below
             // keeps.
-            if (requestBackfill(el, threadId, exchangesRef.current, current, bumpBackfill)) {
+            if (requestBackfill(el, threadId, exchangesRef.current, current, onHistoryRead)) {
                 fillBackfillsByThread.set(threadId, pages + 1);
             }
             return;
@@ -1456,17 +1610,21 @@ export function ThreadView() {
     // Measure after every commit that can change the answer. A grow changes
     // `edgeKey`, so the rounds run off these deps.
     //
-    // `backfillArrived` is what carries the PAGE rounds, and it is not a
+    // `historyFolded` is what carries the PAGE rounds, and it is not a
     // duplicate of the two beside it. A page can land without changing either:
     // its turns merge into the fragment already on screen, so the count holds,
     // and the re-point can land on the same edge.
+    //
+    // The FOLD count, never `historyReadSettled`. A read that folded nothing
+    // mutated nothing, so the fill has no new answer and would only re-ask a
+    // failing endpoint, one toast a round.
     //
     // `winTick` is what asks AGAIN once a capture is consumed. This effect runs
     // in the same commit the re-point arms one in, so it stands down on the
     // re-entrancy guard. No other dep has to change afterwards.
     useLayoutEffect(() => { fillWindowRef.current(); },
         [threadId, canSeedWindow, eventsLoaded, eventsLoadFailed, hasOlderEvents,
-            edgeKey, exchanges.length, backfillArrived, winTick]);
+            edgeKey, exchanges.length, historyFolded, winTick]);
 
     // The window must also reach the turn the reader PARKED on, which the seed
     // has no reason to have taken. A *reading position* names a turn, and the
@@ -1709,7 +1867,14 @@ export function ThreadView() {
                             // landing that thread had in flight. The teardown
                             // below cannot cover it: it runs at switch time,
                             // which is before this resolves.
-                            void ensureWholeThreadLoaded(threadId).then(() => {
+                            //
+                            // It settles like every other read of older
+                            // history, so a hold taken for ITS fold is
+                            // consumed. This press is not the only way into
+                            // one: a reader returning mid-fetch takes a hold
+                            // for whatever read is running.
+                            void ensureWholeThreadLoaded(threadId).then((added) => {
+                                settleHistoryRead(threadId, added, onHistoryRead);
                                 if (focusedThreadId.value !== threadId) return;
                                 pendingScrollTopRef.current = true;
                                 bumpWin(n => n + 1);

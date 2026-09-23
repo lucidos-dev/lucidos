@@ -2834,6 +2834,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag only if `exchangeStarterId` starts answering for a fragment.
 
+- **A page of older history reporting whether it GREW the map cannot stall the
+  fill, because a duplicate-only page is unreachable.** A reviewer sees
+  `backfillOnePage` return `prependEventRows`'s answer rather than
+  `snapshot.events.length > 0`. They note that `noteHistoryFloor` advances the
+  cursor either way. They then read a page of rows the client already holds as
+  a fold that reports nothing and freezes the walk.
+
+  The cursor forbids that page. `get_thread_events_page`
+  (`core/store/mod.rs`) selects `(created, sequence) < ($2, $3)` strictly. The
+  floor is always the oldest row the client holds: `noteHistoryFloor` takes
+  `events[0]`, and the live path only ever appends newer. So every row a page
+  carries is older than everything held, and the two answers coincide. An EMPTY
+  page cannot claim more either, `has_more` being `rows.len() > limit`.
+
+  Re-flag if the cursor becomes inclusive, if a page is ever fetched without
+  `before`, or if anything starts inserting events older than the floor.
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
