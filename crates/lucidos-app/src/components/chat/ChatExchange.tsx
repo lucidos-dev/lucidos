@@ -787,7 +787,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
   return (
     <div class="chat-exchange" data-event-id={exchangeStarterId(exchange)} data-change-id={changeId || undefined}
-         data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}>
+         data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}
+         data-head-clamped={rowsHidden > 0 ? '' : undefined}>
       {/* Keyed, because a fragment omits this one and both panels animate.
           Preact does hold the slot an `&&`-guarded child leaves behind, so
           index matching survives this particular omission on its own. The keys

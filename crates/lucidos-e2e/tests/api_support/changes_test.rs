@@ -778,6 +778,222 @@ async fn sequential_apply_two_changes_succeeds() {
     pool.close().await;
 }
 
+/// Read a branch's plan or harden marker state over the internal HTTP surface.
+async fn marker_state(
+    client: &reqwest::Client,
+    route: &str,
+    repo_root: &str,
+    branch: &str,
+) -> String {
+    let resp = client
+        .get(format!("{}/api/v1/internal/{}", base_url(), route))
+        .query(&[("repo_root", repo_root), ("branch_name", branch)])
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{route} GET failed: {e}"));
+    let body: serde_json::Value = resp.json().await.expect("marker state non-JSON");
+    body["state"].as_str().unwrap_or_default().to_string()
+}
+
+/// POST one change's Apply and return the JSON body, asserting a 200.
+async fn apply_ok(client: &reqwest::Client, change_id: Uuid) -> serde_json::Value {
+    let resp = client
+        .post(format!("{}/api/v1/changes/{}/apply", base_url(), change_id))
+        .send()
+        .await
+        .expect("apply request failed");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("apply non-JSON");
+    assert_eq!(
+        status, 200,
+        "apply of {change_id} returned {status}: {body:?}"
+    );
+    assert_eq!(body["status"], "applied", "apply of {change_id}: {body:?}");
+    body
+}
+
+/// **The case ADR 0106 feared, end to end (ADR 0249).** A delegating parent,
+/// idle apart from a running child, has its change applied. It then commits
+/// again on the same branch, as it would after the child's completion wakes
+/// it.
+///
+/// That later work must come back as a NEW pending change that applies on its
+/// own: not lost, not folded into the applied one, and not refused as already
+/// merged. The worktree is kept, so the apply takes Tier 2, the path an idle
+/// thread's apply takes. The apply must also clear the branch's plan and
+/// harden markers, so the next change has to earn both gates again.
+#[tokio::test]
+async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
+    let client = user_client().await;
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/parent-{}", suffix);
+    let file1 = format!("e2e-parent-first-{}.txt", suffix);
+    let file2 = format!("e2e-parent-second-{}.txt", suffix);
+    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-parent-{}", suffix));
+    let wt = wt_dir.to_str().unwrap();
+
+    let _tree = crate::support::workspace_tree_lock().write().await;
+
+    git(&["worktree", "add", wt, "-b", &branch, "main"]);
+    std::fs::write(wt_dir.join(&file1), "first round").unwrap();
+    git_in(&wt_dir, &["add", &file1]);
+    git_in(&wt_dir, &["commit", "-m", "e2e parent: first round"]);
+
+    // A delegating parent: idle, with a sub-thread still running.
+    let parent = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, parent, "idle").await;
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("give the parent a running child");
+
+    let first = Uuid::new_v4();
+    seed_change_for_test(
+        &client,
+        first,
+        parent,
+        &branch,
+        repo_root,
+        "E2E parent first round",
+        &[&file1],
+        false,
+        true,
+    )
+    .await;
+    let head = String::from_utf8(git_in(&wt_dir, &["rev-parse", "HEAD"]).stdout).unwrap();
+    let mark = client
+        .post(format!("{}/api/v1/internal/mark-hardened", base_url()))
+        .json(&json!({ "repo_root": repo_root, "branch_name": branch, "head_sha": head.trim() }))
+        .send()
+        .await
+        .expect("mark-hardened POST failed");
+    assert!(
+        mark.status().is_success(),
+        "mark-hardened returned {}",
+        mark.status()
+    );
+    assert_eq!(
+        marker_state(&client, "planned-state", repo_root, &branch).await,
+        "SATISFIED"
+    );
+    assert_ne!(
+        marker_state(&client, "hardened-state", repo_root, &branch).await,
+        "MISSING"
+    );
+
+    // The running child does not withhold the parent's Apply.
+    apply_ok(&client, first).await;
+
+    assert_eq!(
+        marker_state(&client, "planned-state", repo_root, &branch).await,
+        "MISSING",
+        "an apply must clear the branch's plan marker"
+    );
+    assert_eq!(
+        marker_state(&client, "hardened-state", repo_root, &branch).await,
+        "MISSING",
+        "an apply must clear the branch's harden marker"
+    );
+
+    // The parent wakes and commits again on the same branch, in the same
+    // worktree the apply kept and reset to main.
+    std::fs::write(wt_dir.join(&file2), "second round").unwrap();
+    git_in(&wt_dir, &["add", &file2]);
+    git_in(&wt_dir, &["commit", "-m", "e2e parent: second round"]);
+
+    // The proposal path mints a new id, because no pending change is left on
+    // the branch. The one-pending-per-branch index must not trip on the
+    // applied row.
+    let second = Uuid::new_v4();
+    seed_change_for_test(
+        &client,
+        second,
+        parent,
+        &branch,
+        repo_root,
+        "E2E parent second round",
+        &[&file2],
+        false,
+        true,
+    )
+    .await;
+
+    let body2 = apply_ok(&client, second).await;
+    assert_eq!(body2["files_changed"], 1, "second apply: {body2:?}");
+    // What the second apply landed on main. A catchup merge from a concurrent
+    // test can add a merge commit here, so read subjects, not a count.
+    let range = format!(
+        "{}..{}",
+        body2["previous_commit"].as_str().expect("previous_commit"),
+        body2["applied_commit"].as_str().expect("applied_commit"),
+    );
+    let landed = String::from_utf8(git(&["log", "--format=%s", &range]).stdout).unwrap();
+    assert!(
+        landed.contains("e2e parent: second round"),
+        "the second apply lands the new commit: {landed}"
+    );
+    assert!(
+        !landed.contains("e2e parent: first round"),
+        "the second apply must not re-land the applied commit: {landed}"
+    );
+    assert!(ws.join(&file1).exists() && ws.join(&file2).exists());
+
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, status FROM changes WHERE id = ANY($1) ORDER BY created_at")
+            .bind(&[first, second][..])
+            .fetch_all(&pool)
+            .await
+            .expect("read the change rows");
+    assert_eq!(
+        rows,
+        vec![
+            (first, "applied".to_string()),
+            (second, "applied".to_string())
+        ],
+        "two changes, each applied on its own"
+    );
+
+    // Clean up: files, worktree, branch, rows, markers.
+    std::fs::remove_file(ws.join(&file1)).unwrap();
+    std::fs::remove_file(ws.join(&file2)).unwrap();
+    git(&["add", &file1, &file2]);
+    git(&[
+        "commit",
+        "-m",
+        &format!("chore: clean up e2e parent files ({})", suffix),
+    ]);
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", wt])
+        .current_dir(&ws)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(&ws)
+        .output();
+    let _ = sqlx::query("DELETE FROM changes WHERE id = ANY($1)")
+        .bind(&[first, second][..])
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await;
+    for table in ["planned_branches", "hardened_branches"] {
+        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE branch_name = $1"))
+            .bind(&branch)
+            .execute(&pool)
+            .await;
+    }
+    pool.close().await;
+}
+
 /// An in-workspace CC thread with a pending change is NOT archivable — the
 /// archive endpoint returns 409 `parent_has_pending_changes` and emits
 /// nothing. The user must Apply or Discard the change first. Without this

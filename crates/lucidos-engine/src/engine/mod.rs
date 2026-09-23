@@ -47,6 +47,7 @@ pub(crate) mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
 pub(crate) mod preferences;
+pub(crate) mod question_card_gate;
 pub mod release_notices;
 mod session_seed;
 pub mod standing_apply;

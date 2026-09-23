@@ -67,6 +67,7 @@ fn thread_event_type_name_extraction() {
     let cases: Vec<(ThreadEvent, &str)> = vec![
         (
             ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: "hi".into(),
                 user_image_hashes: vec![],
@@ -247,6 +248,7 @@ fn thread_event_type_name_extraction() {
         (ThreadEvent::ThreadArchived, "ThreadArchived"),
         (
             ThreadEvent::TriggerStarted {
+                provider: None,
                 trigger_id: "id".into(),
                 trigger_name: None,
                 prompt: None,

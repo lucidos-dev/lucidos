@@ -23,7 +23,7 @@ import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
 import { showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
-import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle } from '../../utils/webkitRepaint';
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, repaintNudgeShift, settledScrollTop } from '../../utils/webkitRepaint';
 import { isWebKit } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
 import { threadDisplayTitle } from '../../utils/threadTitle';
@@ -115,7 +115,7 @@ function growRenderWindow(
 ): boolean {
     const next = expandWindowEdge(current, costs, rowCountAt);
     if (next.exchange === current.exchange && next.rowsHidden === current.rowsHidden) return false;
-    pending.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+    pending.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: settledScrollTop(el) };
     renderFloorByThread.set(threadId, next);
     bump();
     return true;
@@ -203,10 +203,18 @@ export function wholeHistoryHold(el: HTMLElement): HistoryHold {
         anchorKey: null,
         nextKey: null,
         rowsHidden: 0,
-        prevScrollTop: el.scrollTop,
+        prevScrollTop: settledScrollTop(el),
         prevScrollHeight: el.scrollHeight,
-        anchor: readScrollAnchor(el),
+        anchor: readSettledAnchor(el),
     };
+}
+
+/** The turn the reader is parked on, for a hold applied in a later frame. A
+ *  nudge in flight has scrolled the content a pixel off where the reader is, so
+ *  the offset is read that pixel off too. See `settledScrollTop`. */
+function readSettledAnchor(el: HTMLElement): ScrollAnchor | null {
+    const anchor = readScrollAnchor(el);
+    return anchor && { ...anchor, relTop: anchor.relTop + repaintNudgeShift(el) };
 }
 
 /** Where the window should sit once a page of older history has folded in.
@@ -268,7 +276,7 @@ function requestBackfill(
         nextKey: next ? exchangeKey(next) : null,
         rowsHidden: edge.rowsHidden,
         prevScrollHeight: el.scrollHeight,
-        prevScrollTop: el.scrollTop,
+        prevScrollTop: settledScrollTop(el),
         anchor: null,
     });
     settleOn(loadOlderThreadEvents(threadId), threadId, onSettled);
@@ -1319,7 +1327,7 @@ export function ThreadView() {
             // actually in flight.
             const inFlight = historyHoldByThread.get(threadId);
             if (inFlight) {
-                inFlight.prevScrollTop = el.scrollTop;
+                inFlight.prevScrollTop = settledScrollTop(el);
                 inFlight.prevScrollHeight = el.scrollHeight;
                 // The turn travels with the two numbers, for a hold that named
                 // one. It describes where the reader is, so it goes stale the
@@ -1328,7 +1336,7 @@ export function ThreadView() {
                 // A read answering null KEEPS the turn it had. Null is what a
                 // momentarily unmeasurable container answers, and a stale turn
                 // still beats the delta this exists to avoid.
-                if (inFlight.anchor) inFlight.anchor = readScrollAnchor(el) ?? inFlight.anchor;
+                if (inFlight.anchor) inFlight.anchor = readSettledAnchor(el) ?? inFlight.anchor;
             }
             // Only the READER asking for older turns may grow the window.
             // Our own positioning fires scroll events too. Opening a thread

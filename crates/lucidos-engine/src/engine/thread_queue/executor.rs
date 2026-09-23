@@ -86,6 +86,7 @@ pub(crate) fn eager_sub_thread_message(
         ActorMode::Agent,
         model.as_deref(),
         reasoning_effort.as_deref(),
+        None,
         origin.clone(),
         None,
     ))
@@ -450,6 +451,7 @@ impl LucidosEngine {
                 device_id,
                 model,
                 reasoning_effort,
+                provider,
                 use_coding_agent,
                 repo_id,
                 cc_model,
@@ -479,6 +481,7 @@ impl LucidosEngine {
                         None,
                         None,
                         reasoning_effort.as_deref(),
+                        provider.as_deref(),
                         images.as_deref(),
                         device_id.as_deref(),
                         use_coding_agent,
@@ -703,7 +706,7 @@ mod tests {
 
     /// THE hop that dropped the model. `ThreadQueueRequest::CodingAgent` had no
     /// field for it, so a caller's `model: "claude-sonnet-5"` died at the tool
-    /// boundary and the session took the `cc-settings.json` default. Nothing
+    /// boundary and the session took the backend default. Nothing
     /// failed: the spawn returned success and the executor card showed Opus
     /// under a spawn call that said Sonnet.
     ///

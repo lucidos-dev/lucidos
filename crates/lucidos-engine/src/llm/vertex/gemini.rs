@@ -345,6 +345,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         cache_creation_tokens: None,
         cache_read_tokens: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
+        thinking_blocks: None,
         unknown_sse_dropped: 0,
         // Mutually exclusive with `content` by construction above: `narration`
         // is `Some` only on a tool-call turn, which is exactly when `content`

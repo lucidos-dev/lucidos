@@ -30,6 +30,9 @@
 # together. A ratio BETWEEN models does not: Opus used to cost 3x Sol on a
 # cache read and now costs the same. The OpenAI and stealth rows never moved.
 #
+# The Opus 5 rows are keyed by the bare ids the registry uses now. A run
+# recorded before the re-spell named them `claude-opus-5@default`.
+#
 # Add a row for any model the eval may run against, including the cheap model
 # the smoke configuration uses. A missing row fails the run rather than
 # defaulting to zero.
@@ -45,7 +48,7 @@
 [[model]]
 # Cache creation is the 5-minute write, which Anthropic bills at 1.25x input.
 # Cache read is 0.1x input. Both hold for every Anthropic row below.
-id = "claude-opus-5@default"
+id = "claude-opus-5"
 input_per_mtok = 5.0
 output_per_mtok = 25.0
 cache_read_per_mtok = 0.5
@@ -55,7 +58,7 @@ cache_creation_per_mtok = 6.25
 # Identical to the row above, and deliberately so. Anthropic prices the full
 # 1M window at the standard rate for Claude 4.6 and later, so the `[1m]` tier
 # carries no premium. The row stays because a missing id fails the run.
-id = "claude-opus-5@default[1m]"
+id = "claude-opus-5[1m]"
 input_per_mtok = 5.0
 output_per_mtok = 25.0
 cache_read_per_mtok = 0.5

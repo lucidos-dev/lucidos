@@ -21,6 +21,7 @@ const NOTE: &str = "[Engine note] Your previous attempt was interrupted.";
 
 fn message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.to_string(),
         user_image_hashes: vec![],
@@ -428,6 +429,7 @@ async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
         &bus,
         thread_id,
         ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "morning-digest".into(),
             trigger_name: Some("Morning digest".into()),
             prompt: Some("summarize overnight".into()),
@@ -528,6 +530,7 @@ async fn a_recovered_attachment_reaches_the_resumed_turn() {
         &bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "what is wrong with this?".into(),
             user_image_hashes: vec![blob.hash.clone()],

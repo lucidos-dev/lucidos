@@ -19,6 +19,7 @@ fn no_blobs() -> &'static Path {
 
 fn message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.to_string(),
         user_image_hashes: vec![],
@@ -297,6 +298,7 @@ async fn a_message_sent_during_a_call_is_owed_like_any_other() {
     let turn = emit(&bus, thread_id, message("start")).await;
     let during_a_call = match message("and the closed ones") {
         ThreadEvent::MessageReceived { text, mode, .. } => ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: Some(Uuid::new_v4()),
             text,
             user_image_hashes: vec![],
@@ -396,6 +398,7 @@ async fn a_recovered_message_carries_its_attachment() {
         &bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "what is wrong with this?".into(),
             user_image_hashes: vec![blob.hash.clone()],
@@ -444,6 +447,7 @@ async fn a_missing_blob_does_not_cost_the_message() {
         &bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "and this one?".into(),
             user_image_hashes: vec!["f".repeat(64)],
@@ -489,6 +493,7 @@ async fn the_rebuilt_prompt_keeps_the_message_identity() {
         &bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "and the closed ones".into(),
             user_image_hashes: vec![],

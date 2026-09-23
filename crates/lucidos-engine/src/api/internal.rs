@@ -796,6 +796,10 @@ struct AskUserQuestionResponse {
     questions: serde_json::Value,
     /// `{question_text: chosen_label}` — the hook's `updatedInput.answers`.
     answers: serde_json::Value,
+    /// Set when the card was refused and never shown. The CLI hands it back
+    /// to the agent as a denied tool call. See `engine::question_card_gate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<&'static str>,
 }
 
 /// POST /api/v1/internal/ask-user-question — two callers, same contract:
@@ -822,6 +826,25 @@ pub(super) async fn ask_user_question(
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
+
+    if crate::engine::question_card_gate::refuse_coding_agent_card(
+        &state.pool,
+        thread_id,
+        &body.tool_use_id,
+    )
+    .await
+    {
+        crate::log!(
+            "[AskUserQuestion] refused {thread_id}/{}: nothing said since the last input",
+            body.tool_use_id
+        );
+        return Json(AskUserQuestionResponse {
+            questions: body.questions,
+            answers: serde_json::Value::Object(serde_json::Map::new()),
+            refusal: Some(crate::engine::question_card_gate::CARD_REFUSAL),
+        })
+        .into_response();
+    }
 
     let outcome = state
         .engine
@@ -861,6 +884,7 @@ pub(super) async fn ask_user_question(
         return Json(AskUserQuestionResponse {
             questions: body.questions,
             answers: serde_json::Value::Object(serde_json::Map::new()),
+            refusal: None,
         })
         .into_response();
     }
@@ -869,6 +893,7 @@ pub(super) async fn ask_user_question(
     Json(AskUserQuestionResponse {
         questions: body.questions,
         answers,
+        refusal: None,
     })
     .into_response()
 }

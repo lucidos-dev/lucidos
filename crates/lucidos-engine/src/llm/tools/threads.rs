@@ -422,7 +422,7 @@ mod tests {
     ///
     /// `model`, `allowed_tools` and `append_system_prompt` were declared here
     /// and read by nothing: `ThreadQueueRequest::CodingAgent` had no field for
-    /// any of them, so every session ran on the `cc-settings.json` default while
+    /// any of them, so every session ran on the backend default while
     /// the tool result came back a plain success. An agent told to match model
     /// to task obeyed, reported "I picked Sonnet", and ran Opus every time.
     ///

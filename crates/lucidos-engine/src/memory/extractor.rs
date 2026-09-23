@@ -295,7 +295,13 @@ impl MemoryExtractor {
             content: MessageContent::Text(user_content.to_string()),
         }];
         let response = provider
-            .chat(messages, vec![], None, Some(system), None, reasoning_effort)
+            .chat(
+                messages,
+                vec![],
+                crate::llm::ModelSelection::default().with_effort(reasoning_effort),
+                Some(system),
+                None,
+            )
             .await?;
         if let Some(capture) = capture {
             let request_chars = system.chars().count() + user_content.chars().count();

@@ -367,6 +367,7 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         url_context: None,
         repo_file_context: None,
         reasoning_effort: None,
+        provider: None,
         images: None,
         image_hashes: None,
         device_id: None,
@@ -970,6 +971,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
             mode: ActorMode::Human,
             model: None,
             reasoning_effort: None,
+            provider: None,
             origin: None,
         },
         meta: EventMeta {
@@ -1011,6 +1013,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
             mode: ActorMode::Human,
             model: None,
             reasoning_effort: None,
+            provider: None,
             origin: None,
         },
         meta: EventMeta {
@@ -1075,6 +1078,7 @@ async fn persist_message(
             mode: ActorMode::Human,
             model: None,
             reasoning_effort: None,
+            provider: None,
             origin: None,
         },
         meta: EventMeta {

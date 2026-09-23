@@ -22,9 +22,9 @@
 //!
 //! **What each set is derived from**, so a new model lands in the right arm:
 //!
-//! - **Claude, adaptive** (`anthropic_wire::requires_adaptive_thinking`): the
-//!   effort string is sent verbatim in `output_config.effort`, so every tier is
-//!   distinct.
+//! - **Claude, adaptive** (`anthropic_wire::thinking_mode`): the effort string
+//!   is sent verbatim in `output_config.effort`, so every tier is distinct. A
+//!   model that always thinks (Opus 5.5, Fable 5.x) has no `none`.
 //! - **Claude, budget path**: `llm::thinking_budget_for_effort` maps each tier
 //!   to a distinct `budget_tokens`, except that `xhigh` is not offered (a
 //!   deliberate, pre-existing product choice, kept so no Claude model's offered
@@ -46,7 +46,7 @@
 //!   conservative set. The matrix is in
 //!   `docs/plans/2026-08-22-keyless-opencode-free-provider.md`.
 
-use crate::llm::anthropic_wire::requires_adaptive_thinking;
+use crate::llm::anthropic_wire::{thinking_mode, ThinkingMode};
 use crate::llm::model_registry::ProviderKind;
 use crate::llm::vertex::VertexProvider;
 
@@ -62,6 +62,9 @@ pub const EFFORT_LADDER: &[&str] = &["none", "low", "medium", "high", "xhigh", "
 
 /// Claude on the adaptive-thinking path, and GPT-5.6: every tier is distinct.
 const ALL_TIERS: &[&str] = EFFORT_LADDER;
+/// Claude models that always think (Opus 5.5, Fable 5.x): `none` is not a tier
+/// they have, so a stored `none` snaps to `low`.
+const LOW_THROUGH_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Claude on the `budget_tokens` path: `xhigh` is deliberately not offered.
 const NO_XHIGH: &[&str] = &["none", "low", "medium", "high", "max"];
 /// OpenAI before GPT-5.6: tops out at `xhigh`.
@@ -69,6 +72,9 @@ const THROUGH_XHIGH: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 /// Gemini, OpenRouter, xAI and local servers: nothing above `high` is distinct
 /// (Gemini) or universally accepted (the OpenAI-compatible third parties).
 const THROUGH_HIGH: &[&str] = &["none", "low", "medium", "high"];
+/// An always-thinking Claude model behind OpenRouter: its conservative set,
+/// less the `none` the model cannot honour.
+const LOW_THROUGH_HIGH: &[&str] = &["low", "medium", "high"];
 /// Ox Alpha on the keyless free tier: the only three levels it accepts. It
 /// always reasons, so `none` is a 400 rather than a way to switch thinking off.
 /// `medium` and `xhigh` are not in its vocabulary at all.
@@ -114,15 +120,20 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
                 THROUGH_HIGH
             }
         }
+        // OpenRouter can front Claude under its own id (`anthropic/claude-opus-5-5`),
+        // which the substring match in `thinking_mode` still recognises.
+        ProviderKind::OpenRouter if thinking_mode(model) == Some(ThinkingMode::AlwaysOn) => {
+            LOW_THROUGH_HIGH
+        }
         ProviderKind::OpenRouter | ProviderKind::XAi | ProviderKind::Local => THROUGH_HIGH,
     }
 }
 
 fn claude_tiers(model: &str) -> &'static [&'static str] {
-    if requires_adaptive_thinking(model) {
-        ALL_TIERS
-    } else {
-        NO_XHIGH
+    match thinking_mode(model) {
+        Some(ThinkingMode::AlwaysOn) => LOW_THROUGH_MAX,
+        Some(ThinkingMode::OffByDefault | ThinkingMode::OnByDefault) => ALL_TIERS,
+        None => NO_XHIGH,
     }
 }
 
@@ -178,9 +189,11 @@ mod tests {
     fn every_set_is_an_ordered_subset_of_the_ladder() {
         for set in [
             ALL_TIERS,
+            LOW_THROUGH_MAX,
             NO_XHIGH,
             THROUGH_XHIGH,
             THROUGH_HIGH,
+            LOW_THROUGH_HIGH,
             LOW_HIGH_MAX,
         ] {
             assert!(!set.is_empty());
@@ -196,18 +209,23 @@ mod tests {
     }
 
     /// The Claude arms. Adaptive models send the effort string verbatim, so
-    /// they get every tier; the budget path keeps its pre-existing set.
+    /// they get every tier, except `none` where thinking cannot be turned off.
+    /// The budget path keeps its pre-existing set.
     #[test]
     fn claude_tiers_split_on_the_adaptive_thinking_path() {
+        for always_on in ["claude-opus-5-5", "claude-opus-5-5[1m]"] {
+            assert_eq!(
+                supported_efforts(ProviderKind::Vertex, always_on),
+                LOW_THROUGH_MAX,
+                "{always_on} always thinks, so `none` is not a tier it has"
+            );
+        }
         for adaptive in [
-            "claude-opus-5-5",
-            "claude-opus-5-5[1m]",
-            "claude-opus-5@default",
-            "claude-opus-5@default[1m]",
-            "claude-opus-4-8@default",
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-5",
-            "claude-fable-5[1m]",
         ] {
             assert_eq!(
                 supported_efforts(ProviderKind::Vertex, adaptive),
@@ -222,15 +240,35 @@ mod tests {
                 "{budget} is on the budget path"
             );
         }
-        // Fable is served by the direct Anthropic provider, and is adaptive.
+        // Fable is served by the direct Anthropic provider, and always thinks.
         // Every generation of it, since the adaptive gate matches the family.
         for fable in ["claude-fable-5", "claude-fable-5-1", "claude-fable-5-1[1m]"] {
             assert_eq!(
                 supported_efforts(ProviderKind::Anthropic, fable),
-                ALL_TIERS,
-                "{fable} accepts every tier through output_config.effort"
+                LOW_THROUGH_MAX,
+                "{fable} accepts every tier but `none` through output_config.effort"
             );
         }
+    }
+
+    /// A stored `none` (a side-call default, or a value remembered from another
+    /// model) must reach an always-thinking model as its lowest real tier.
+    #[test]
+    fn none_snaps_to_low_on_a_model_that_cannot_stop_thinking() {
+        for (provider, model) in [
+            (ProviderKind::Vertex, "claude-opus-5-5"),
+            (ProviderKind::Anthropic, "claude-fable-5-1[1m]"),
+        ] {
+            assert_eq!(
+                clamp_effort("none", provider, model),
+                Some("low"),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            clamp_effort("none", ProviderKind::Vertex, "claude-opus-5"),
+            Some("none")
+        );
     }
 
     /// A non-`claude` Vertex id is a Gemini id as far as `VertexProvider` is
@@ -306,6 +344,27 @@ mod tests {
         }
     }
 
+    /// An OpenRouter route to a Claude model that always thinks keeps the
+    /// conservative set, less `none`: that model cannot turn thinking off.
+    #[test]
+    fn openrouter_never_offers_none_to_a_model_that_always_thinks() {
+        for model in ["anthropic/claude-opus-5-5", "anthropic/claude-fable-5-1"] {
+            assert_eq!(
+                supported_efforts(ProviderKind::OpenRouter, model),
+                LOW_THROUGH_HIGH,
+                "{model}"
+            );
+            assert_eq!(
+                clamp_effort("none", ProviderKind::OpenRouter, model),
+                Some("low")
+            );
+        }
+        assert_eq!(
+            supported_efforts(ProviderKind::OpenRouter, "anthropic/claude-opus-5"),
+            THROUGH_HIGH
+        );
+    }
+
     /// The free tier is the one provider whose accepted levels differ per
     /// model, so every seeded id is pinned against what the relay answered.
     /// Ox Alpha rejects `none`, `medium` and `xhigh`; the rest take the
@@ -366,7 +425,7 @@ mod tests {
     #[test]
     fn a_supported_tier_passes_through() {
         assert_eq!(
-            clamp_effort("xhigh", ProviderKind::Vertex, "claude-opus-5@default"),
+            clamp_effort("xhigh", ProviderKind::Vertex, "claude-opus-5"),
             Some("xhigh")
         );
         assert_eq!(
@@ -421,7 +480,7 @@ mod tests {
         for (provider, model) in [
             (ProviderKind::Local, "muse-glimmer:30b-mlx"),
             (ProviderKind::OpenAi, "gpt-5.4"),
-            (ProviderKind::Vertex, "claude-opus-5@default"),
+            (ProviderKind::Vertex, "claude-opus-5"),
         ] {
             for junk in ["", "ultra", "MAX", "High", "  high  "] {
                 assert_eq!(
@@ -439,7 +498,7 @@ mod tests {
     #[test]
     fn clamping_never_lands_outside_the_supported_set() {
         let cases = [
-            (ProviderKind::Vertex, "claude-opus-5@default"),
+            (ProviderKind::Vertex, "claude-opus-5"),
             (ProviderKind::Vertex, "claude-sonnet-4-6"),
             (ProviderKind::Vertex, "gemini-3.1-pro-preview"),
             (ProviderKind::Anthropic, "claude-fable-5"),

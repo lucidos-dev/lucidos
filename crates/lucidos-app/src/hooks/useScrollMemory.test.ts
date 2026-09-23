@@ -2548,31 +2548,6 @@ describe('a reading position that names a turn', () => {
     detach();
   });
 
-  it('writes NOTHING until the content below the anchor has its height', () => {
-    // The anchored turn is rendered, but the turns below it have not settled.
-    // The transcript therefore cannot hold the offset that turn needs. An image
-    // or a font decoding is the ordinary cause. The reader stays at the top of
-    // what is rendered and the wait goes on.
-    //
-    // Detecting the browser's CLAMP after writing is NOT the same test, and is
-    // the bug this replaces. A clamped write comes to rest at the container's
-    // maximum. That is the live edge (ADR 0064), and at the two sites that
-    // write once and stop it rests there for good.
-    const obs = liveObservers();
-    localStorage.setItem('k', 'anchor:-150:t4'); // needs scrollTop 150
-    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: 200, clientHeight: 400 });
-
-    const detach = attachScrollMemory(el, 'k', opts);
-    expect(el.scrollTop).toBe(0);            // never the live edge, never partway
-    expect(obs.armed()).toBeGreaterThan(0);  // still waiting for the height
-
-    el.setTurnHeight(400); // the content below settles
-    obs.fire();
-    expect(el.scrollTop).toBe(150);
-    expect(obs.armed()).toBe(0);
-    detach();
-  });
-
   it('extends the wait across a SHRINK, not only across growth', async () => {
     // Progress is any CHANGE in height. The walk prepends turns, but the
     // transcript shrinks under it too, a live Thinking row folding into its
@@ -2600,19 +2575,20 @@ describe('a reading position that names a turn', () => {
     }
   });
 
-  it('lands a RESOLVED anchor the content shrank under, rather than the top', async () => {
+  it('lands a RESOLVED anchor the content shrank under AT ONCE, and never moves again', async () => {
     // The turn is found and measured; only the content BELOW it got shorter, so
-    // the offset it wants is now past the container's maximum. Refusing gives
-    // the top of the window, which is further from that turn than the clamp is.
-    // No growth can help either: the walk is over, the turn being in the window.
+    // the offset it wants is now past the container's maximum. The nearest
+    // reachable offset still shows the turn, so that is where the reader goes.
+    //
+    // At once, and nothing moves them later. No wait can help: the window
+    // renders everything below a rendered turn already.
     //
     // Distinct from the offset form, which keeps refusing. An offset that
     // overshoots names no content, so clamping it invents the live edge
-    // (ADR 0064). A located turn taller than the part scrolled past is still on
-    // screen at the clamp. ADR 0152 (docs/adr/) carries the distinction.
+    // (ADR 0064). ADR 0152 (docs/adr/) carries the distinction.
     vi.useFakeTimers();
     try {
-      inertObservers();
+      const obs = liveObservers();
       // Parked at the bottom of six 400px turns: at 1600, t4's top is exactly
       // on the viewport top.
       localStorage.setItem('k', 'anchor:0:t4');
@@ -2620,17 +2596,43 @@ describe('a reading position that names a turn', () => {
       el.setTurnHeightOf('t5', 100); // its live Thinking row folded away
 
       const detach = attachScrollMemory(el, 'k', opts);
-      expect(el.scrollTop).toBe(0); // the wait parks at the top
-
-      await vi.advanceTimersByTimeAsync(4000);
 
       // t4 still wants 1600, and the shortened transcript can only reach 1300.
       expect(el.scrollHeight).toBe(2100);
+      expect(el.scrollTop).toBe(1300);
+      expect(obs.armed()).toBe(0); // nothing left waiting to move them later
+
+      el.setTurnHeightOf('t5', 400); // an image below decodes after the landing
+      obs.fire();
+      await vi.advanceTimersByTimeAsync(25_000); // past every restore deadline
       expect(el.scrollTop).toBe(1300);
       detach();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('waits for a turn drawn with its HEAD CLAMPED, then lands on it exactly', () => {
+    // The window edge sits inside the turn while the walk is still drawing it.
+    // Its top is real, but the rows under it are missing, so the reader's
+    // offset inside it is out of reach. Landing at the clamp then would settle
+    // the restore and stop the walk, leaving them short of their place.
+    const obs = liveObservers();
+    localStorage.setItem('k', 'anchor:-600:t4'); // deep inside a long turn
+    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, clientHeight: 400 });
+    el.setTurnHeightOf('t4', 300); // most of its rows are still clamped off
+    el.setHeadClamped('t4', true);
+
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(0);
+    expect(obs.armed()).toBeGreaterThan(0); // still waiting for the walk
+
+    el.setTurnHeightOf('t4', 1200); // the walk draws the rest of it
+    el.setHeadClamped('t4', false);
+    obs.fire();
+    expect(el.scrollTop).toBe(600);
+    expect(obs.armed()).toBe(0);
+    detach();
   });
 
   it('lands a bottom-parked anchor at once when only ROUNDING puts it out of reach', async () => {

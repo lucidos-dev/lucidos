@@ -171,6 +171,7 @@ fn cc_tool_called_backward_compat_no_description() {
 #[test]
 fn message_received_with_image_hashes() {
     let event = ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: "look at this".into(),
         user_image_hashes: vec!["abcd1234".into(), "ef567890".into()],
@@ -200,6 +201,7 @@ fn message_received_with_image_hashes() {
 #[test]
 fn message_received_without_optional_fields() {
     let event = ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: "hello".into(),
         user_image_hashes: vec![],
@@ -229,6 +231,7 @@ fn message_received_without_optional_fields() {
 #[test]
 fn trigger_started_with_details() {
     let event = ThreadEvent::TriggerStarted {
+        provider: None,
         trigger_id: "t-1".into(),
         trigger_name: Some("daily-report".into()),
         prompt: Some("Run the daily report".into()),
@@ -249,6 +252,7 @@ fn trigger_started_with_details() {
 fn trigger_started_event_invocation_serializes_event_type_and_id() {
     let event_id = uuid::Uuid::new_v4();
     let event = ThreadEvent::TriggerStarted {
+        provider: None,
         trigger_id: "t-2".into(),
         trigger_name: Some("sleep-import".into()),
         prompt: Some("Import overnight sleep data".into()),

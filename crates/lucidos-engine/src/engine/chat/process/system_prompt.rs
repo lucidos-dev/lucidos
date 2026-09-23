@@ -90,7 +90,8 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 ///
 /// The deterministic half of that fix is `QuestionReaskCause::AskedInProse` in
 /// `agentic_loop::helpers`, which sends such a turn back once. This clause is
-/// what stops the loop paying for the round.
+/// what stops the loop paying for the round. The opposite failure, a card with
+/// no answer before it, is caught by `engine::question_card_gate`.
 ///
 /// The "NEVER OFFER AN \"OTHER\" OPTION" paragraph is load-bearing, not
 /// stylistic. Lucidos has no text-entry option kind, and
@@ -583,7 +584,7 @@ CRITICAL RULES:
 2. When a request needs a tool action, call the tool instead of describing a plan.
 3. For specific data (numbers, ids, dates), read the file. Don't answer from a summary.
 4. NEVER show code in a response unless the user asked for code.
-5. Asked to create N files, call write_file N times IN THE SAME RESPONSE.
+5. Independent tool calls go IN THE SAME RESPONSE: N file writes, or several reads and searches you already have the inputs for. Only a call that needs an earlier result waits for it.
 
 __REPEATED_ACTION_RULE__"#;
 
@@ -1244,7 +1245,20 @@ mod tests {
     /// Raised by 40 to a measured 119,008 for Claude Opus 5.5 in the
     /// coding-agent pickers, on the same terms as the Fable 5.1 clause above.
     /// Two rows again, the pinned id and its 1M variant.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 119_008;
+    ///
+    /// Raised by 110 to a measured 119,118 for CRITICAL RULE 5, which widened
+    /// from N file writes to every independent call. 85% of rounds carried a
+    /// single tool call, and each removed round saves a full context resend.
+    ///
+    /// Raised to a measured 119,865 for one model over many providers.
+    /// `triggers` gains the `provider` pin, a null-union over the seven
+    /// provider names. `manage_models` gains `routes`, an LLM `update` action
+    /// with `preferred_provider`, and a window that `null` clears.
+    ///
+    /// Knowhow cannot carry either: the model writes the argument from the
+    /// enum and the route shape. Editing routes from the prompt is the parity
+    /// the plan settled (philosophy rule 2).
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 119_865;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1473,7 +1487,7 @@ mod tests {
         ),
         (
             "triggers",
-            2_980,
+            3_250,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1484,7 +1498,19 @@ mod tests {
              effort enum), and they are declared once, on create, because the \
              union across operations is first-wins. Raised from 2,950 by ADR \
              0119: `on` carries the condition operator set, so three new names \
-             and the field-path rule land here rather than in the knowhow",
+             and the field-path rule land here rather than in the knowhow. \
+             Raised from 2,980 by the trigger `provider` pin: a null-union over \
+             the seven provider names, declared once on create like `model`",
+        ),
+        (
+            "manage_models",
+            1_970,
+            "six actions, the seven-value provider enum, and `routes`: an array \
+             of objects whose item shape (provider, wire id, window) is what \
+             the model writes a multi-backend model from. The context-window \
+             warning stays, because an omitted window silently budgets a large \
+             non-Claude model at 200k. Its type is a null-union, so update can \
+             clear a window",
         ),
         (
             "navigate_ui",
@@ -1977,6 +2003,31 @@ mod tests {
         assert!(
             on.contains("[TODO]"),
             "the mode-on body has to say where the list goes instead"
+        );
+    }
+
+    /// The batch rule removes rounds only if the model reads it as general.
+    /// Its two carve-outs are what keep "batch" from reaching a question card
+    /// or a spawn that depends on the one before it.
+    #[test]
+    fn the_batch_rule_is_general_and_keeps_both_carve_outs() {
+        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+
+        assert!(
+            body.contains("Independent tool calls go IN THE SAME RESPONSE"),
+            "the batch rule must cover every independent call, not only file writes"
+        );
+        assert!(
+            body.contains("Only a call that needs an earlier result waits for it."),
+            "the batch rule must say which calls do not batch"
+        );
+        assert!(
+            body.contains("NEVER parallel-call it alongside other tools"),
+            "a question card must never share a response with another call"
+        );
+        assert!(
+            body.contains("Never batch sequential spawns into one response."),
+            "a spawn that depends on the one before it must go alone"
         );
     }
 

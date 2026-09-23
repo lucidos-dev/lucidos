@@ -216,6 +216,7 @@ impl TurnStarter for ThreadTurn {
                     None,
                     None,
                     None,
+                    None, // provider_override
                     None,
                     device_id.as_deref(),
                     None,

@@ -254,10 +254,9 @@ pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
     let call = provider.chat(
         messages,
         vec![],
-        None,
+        crate::llm::ModelSelection::default().with_effort(Some(reasoning_effort)),
         Some(JUDGE_SYSTEM_PROMPT),
         None,
-        Some(reasoning_effort),
     );
     let response = match tokio::time::timeout(deadline, call).await {
         Ok(result) => result?,
@@ -435,10 +434,9 @@ mod tests {
             &self,
             _messages: Vec<Message>,
             _tools: Vec<ToolDefinition>,
-            _model_override: Option<&str>,
+            _selection: crate::llm::ModelSelection<'_>,
             _system_prompt: Option<&str>,
             _on_token: Option<TokenCallback>,
-            _reasoning_effort: Option<&str>,
         ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
             match &self.response {
                 Ok(content) => Ok(serde_json::from_value(serde_json::json!({

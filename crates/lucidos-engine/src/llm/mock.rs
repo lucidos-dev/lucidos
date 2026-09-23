@@ -1,6 +1,6 @@
 use crate::llm::provider::{
-    ContentBlock, LlmProvider, LlmResponse, Message, MessageContent, TokenCallback, ToolCall,
-    ToolDefinition,
+    ContentBlock, LlmProvider, LlmResponse, Message, MessageContent, ModelSelection, TokenCallback,
+    ToolCall, ToolDefinition,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -37,6 +37,13 @@ pub const MOCK_AWAIT_EVENT_SENTINEL: &str = "MOCK_SUBSCRIBE_ON:";
 /// seeding the outcome, which is exactly what leaves the guard untested.
 pub const MOCK_RUN_PYTHON_SENTINEL: &str = "MOCK_RUN_PYTHON:";
 
+/// Sentinel that makes the mock issue one `read_file` call per path, all in
+/// one response. The paths are whitespace-separated to the end of the line.
+///
+/// A batch of reads is what the agent loop runs as a parallel run (ADR 0246),
+/// and only a real multi-call response reaches that path.
+pub const MOCK_READ_FILES_SENTINEL: &str = "MOCK_READ_FILES:";
+
 /// What the mock says on any turn whose message array already carries the
 /// `await_event` call: the iteration right after it subscribes, and the
 /// re-entered turn later. Distinct from [`MOCK_RESPONSE`] so a test can tell those from a
@@ -49,8 +56,9 @@ pub const MOCK_REENTRY_RESPONSE: &str = "Picked the watch back up and finished t
 /// between tokens. Activate with `LUCIDOS_MODEL=mock`.
 ///
 /// It issues a tool call only when scripted to, behind
-/// [`MOCK_AWAIT_EVENT_SENTINEL`] (see [`scripted_await_event`]) and
-/// [`MOCK_RUN_PYTHON_SENTINEL`] (see [`scripted_run_python`]).
+/// [`MOCK_AWAIT_EVENT_SENTINEL`] (see [`scripted_await_event`]),
+/// [`MOCK_RUN_PYTHON_SENTINEL`] (see [`scripted_run_python`]) and
+/// [`MOCK_READ_FILES_SENTINEL`] (see [`scripted_read_files`]).
 pub struct MockProvider {
     default_model: String,
 }
@@ -122,23 +130,35 @@ pub fn scripted_run_python(messages: &[Message]) -> Option<String> {
     if already_called(messages, crate::llm::tool_names::RUN_PYTHON) {
         return None;
     }
-    let last = messages.last()?;
-    match &last.content {
-        MessageContent::Text(text) => sentinel_python_code(text),
+    sentinel_line(messages, MOCK_RUN_PYTHON_SENTINEL)
+}
+
+/// Decide whether this turn should read files, and which. Same two halves as
+/// [`scripted_await_event`]: the request line only, and never twice.
+pub fn scripted_read_files(messages: &[Message]) -> Option<Vec<String>> {
+    if already_called(messages, crate::llm::tool_names::READ_FILE) {
+        return None;
+    }
+    let line = sentinel_line(messages, MOCK_READ_FILES_SENTINEL)?;
+    Some(line.split_whitespace().map(str::to_string).collect())
+}
+
+/// The rest of the request line after `sentinel`, read from this turn's
+/// assembled prompt only.
+fn sentinel_line(messages: &[Message], sentinel: &str) -> Option<String> {
+    let from_text = |text: &str| {
+        let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
+        let rest = request.split(sentinel).nth(1)?;
+        let line = rest.lines().next()?.trim();
+        (!line.is_empty()).then(|| line.to_string())
+    };
+    match &messages.last()?.content {
+        MessageContent::Text(text) => from_text(text),
         MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
-            ContentBlock::Text { text } => sentinel_python_code(text),
+            ContentBlock::Text { text } => from_text(text),
             _ => None,
         }),
     }
-}
-
-/// Pull the code off `MOCK_RUN_PYTHON:<code to end of line>` on the request
-/// line.
-fn sentinel_python_code(text: &str) -> Option<String> {
-    let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
-    let rest = request.split(MOCK_RUN_PYTHON_SENTINEL).nth(1)?;
-    let code = rest.lines().next()?.trim();
-    (!code.is_empty()).then(|| code.to_string())
 }
 
 /// True when the array already carries a call to `tool_name`: this turn has
@@ -168,10 +188,9 @@ impl LlmProvider for MockProvider {
         &self,
         messages: Vec<Message>,
         _tools: Vec<ToolDefinition>,
-        _model_override: Option<&str>,
+        _selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        _reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         // Small initial delay to simulate network round-trip
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -198,6 +217,7 @@ impl LlmProvider for MockProvider {
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
                 thinking_chars: None,
+                thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
             });
@@ -218,6 +238,32 @@ impl LlmProvider for MockProvider {
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
                 thinking_chars: None,
+                thinking_blocks: None,
+                unknown_sse_dropped: 0,
+                model_only_text: None,
+            });
+        }
+
+        if let Some(paths) = scripted_read_files(&messages) {
+            return Ok(LlmResponse {
+                content: None,
+                tool_calls: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| ToolCall {
+                        id: format!("toolu_mock_read_file_{i}"),
+                        name: crate::llm::tool_names::READ_FILE.to_string(),
+                        arguments: serde_json::json!({ "path": path }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+                stop_reason: Some("tool_use".to_string()),
+                output_tokens: None,
+                input_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                thinking_chars: None,
+                thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
             });
@@ -251,6 +297,7 @@ impl LlmProvider for MockProvider {
             cache_creation_tokens: None,
             cache_read_tokens: None,
             thinking_chars: None,
+            thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
         })
@@ -269,7 +316,7 @@ mod tests {
     async fn mock_returns_fixed_response() {
         let provider = MockProvider::new("mock".to_string());
         let resp = provider
-            .chat(vec![], vec![], None, None, None, None)
+            .chat(vec![], vec![], ModelSelection::default(), None, None)
             .await
             .unwrap();
         assert!(resp.content.is_some());
@@ -348,8 +395,7 @@ mod tests {
             .chat(
                 assembled("", "MOCK_SUBSCRIBE_ON:ReleasePublished"),
                 vec![],
-                None,
-                None,
+                ModelSelection::default(),
                 None,
                 None,
             )
@@ -367,6 +413,36 @@ mod tests {
         );
     }
 
+    /// One response carrying every read is what makes it a batch. The second
+    /// iteration sees the calls in its array and answers in prose instead.
+    #[tokio::test]
+    async fn mock_reads_every_path_in_one_response_and_only_once() {
+        let provider = MockProvider::new("mock".to_string());
+        let mut msgs = assembled("", "MOCK_READ_FILES: a.txt b.txt c.txt");
+        let resp = provider
+            .chat(msgs.clone(), vec![], ModelSelection::default(), None, None)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = resp
+            .tool_calls
+            .iter()
+            .map(|c| c.arguments["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["a.txt", "b.txt", "c.txt"]);
+        assert!(resp.tool_calls.iter().all(|c| c.name == "read_file"));
+
+        msgs.push(Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "toolu_mock_read_file_0".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "a.txt" }),
+                thought_signature: None,
+            }]),
+        });
+        assert_eq!(scripted_read_files(&msgs), None);
+    }
+
     #[tokio::test]
     async fn mock_streams_tokens() {
         let provider = MockProvider::new("mock".to_string());
@@ -376,7 +452,7 @@ mod tests {
             tokens_clone.lock().unwrap().push(token.to_string());
         });
         let resp = provider
-            .chat(vec![], vec![], None, None, Some(cb), None)
+            .chat(vec![], vec![], ModelSelection::default(), None, Some(cb))
             .await
             .unwrap();
         assert!(resp.content.is_some());

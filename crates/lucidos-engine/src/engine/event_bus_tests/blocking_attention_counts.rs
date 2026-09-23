@@ -102,6 +102,7 @@ async fn message_received_on_child_bumps_parent_blocking_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "follow up".into(),
             user_image_hashes: vec![],
@@ -144,6 +145,7 @@ async fn response_generated_decrements_parent_blocking_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "ping".into(),
             user_image_hashes: vec![],
@@ -450,6 +452,7 @@ async fn mixed_siblings_attention_counts_only_wfua_not_running() {
     bus.emit(BusEvent::Thread {
         thread_id: wfua_child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "second child".into(),
             user_image_hashes: vec![],
@@ -523,6 +526,7 @@ async fn three_level_tree_propagates_to_grandparent() {
     bus.emit(BusEvent::Thread {
         thread_id: grandparent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "root task".into(),
             user_image_hashes: vec![],
@@ -547,6 +551,7 @@ async fn three_level_tree_propagates_to_grandparent() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "mid task".into(),
             user_image_hashes: vec![],
@@ -591,6 +596,7 @@ async fn three_level_tree_propagates_to_grandparent() {
     bus.emit(BusEvent::Thread {
         thread_id: grandchild_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
@@ -629,6 +635,7 @@ async fn three_level_tree_propagates_to_grandparent() {
     bus.emit(BusEvent::Thread {
         thread_id: grandchild_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "wake".into(),
             user_image_hashes: vec![],
@@ -679,6 +686,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "parent".into(),
             user_image_hashes: vec![],
@@ -706,6 +714,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
     bus.emit(BusEvent::Thread {
         thread_id: running_child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "running".into(),
             user_image_hashes: vec![],
@@ -731,6 +740,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
     bus.emit(BusEvent::Thread {
         thread_id: running_child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "wake".into(),
             user_image_hashes: vec![],
@@ -756,6 +766,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
     bus.emit(BusEvent::Thread {
         thread_id: idle_child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "idle".into(),
             user_image_hashes: vec![],

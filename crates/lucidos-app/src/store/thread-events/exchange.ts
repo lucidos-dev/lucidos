@@ -308,16 +308,16 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['gpt-5.2-codex', 'GPT-5.2 Codex'],
   ['gpt-5.3-codex-spark', 'Codex Spark'],
   ['claude-opus-4-1', 'Opus 4.1'],
-  // The Claude Code picker stamps the 1M Opus variants without the `@default`
-  // alias (e.g. `claude-opus-5[1m]`), which the registry-backed labels don't
-  // cover — map them so coding-agent exchanges don't render the bare id.
   ['claude-opus-5[1m]', 'Opus 5 (1M)'],
   ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
-  // CC also drops `@default` when it echoes the bare row, so a session pinned
-  // to `claude-opus-5@default` stores `claude-opus-5`. The registry knows only
-  // the pinned spelling, so without these two the transcript showed a raw id.
   ['claude-opus-5', 'Opus 5'],
   ['claude-opus-4-8', 'Opus 4.8'],
+  // The `@default` spellings the chat registry used to carry. They still reach
+  // the transcript from two places the re-spell deliberately left alone: the
+  // Claude Code picker, whose own vocabulary still says `claude-opus-5@default`,
+  // and the cost ledger, which records what a past request literally named.
+  ['claude-opus-5@default', 'Opus 5'],
+  ['claude-opus-5@default[1m]', 'Opus 5 (1M)'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
   // Mirrors the picker rows, deliberately version-free: `opus` and `sonnet`

@@ -49,6 +49,49 @@ impl LucidosEngine {
         .await;
     }
 
+    /// Refresh every app touched during the tool loop, once per app at end of
+    /// turn (coalesced, not per write). Two distinct signals:
+    ///   - AppUiRefreshRequested → reload the open app iframe.
+    ///   - AppUpdated → refresh the disk-backed apps LIST (name/icon/
+    ///     description may have changed via a manifest edit). The list
+    ///     re-scans disk, so this also surfaces an app freshly created
+    ///     this turn via raw write_file. Guard on app_exists so an app
+    ///     deleted during the turn doesn't emit a spurious AppUpdated.
+    async fn refresh_apps_modified_this_turn(
+        &self,
+        thread_id: Uuid,
+        modified_app_uis: &std::collections::HashSet<String>,
+    ) {
+        for app_id in modified_app_uis {
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::AppUiRefreshRequested {
+                            app_id: app_id.clone(),
+                        },
+                        meta: crate::engine::thread_events::EventMeta::NONE,
+                    },
+                    "[AgenticLoop] AppUiRefreshRequested (post-loop)",
+                )
+                .await;
+            if self.app_manager.app_exists(app_id) {
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::System(
+                            crate::engine::event_bus::SystemEvent::AppUpdated {
+                                app_id: app_id.clone(),
+                                name: self.app_manager.app_name(app_id),
+                                actor: None,
+                            },
+                        ),
+                        "[AgenticLoop] AppUpdated (post-loop)",
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// The agentic loop: call LLM → parse response → execute tools → repeat.
     ///
     /// Returns ProcessResult on completion.
@@ -85,8 +128,7 @@ impl LucidosEngine {
         proposed_change: &mut bool,
         user_images: Option<&[crate::api::ChatImage]>,
         device_id: Option<&str>,
-        model_override: Option<&str>,
-        reasoning_effort: Option<&str>,
+        selection: crate::llm::ModelSelection<'_>,
         cancel_token: &CancellationToken,
         injection_rx: &mut mpsc::UnboundedReceiver<super::super::InjectedPrompt>,
         // This turn's registration generation, so a drain reported after a
@@ -136,10 +178,10 @@ impl LucidosEngine {
         // Pin ONE provider Arc for this whole response — a mid-response runtime
         // swap (credential added/removed) must not change the in-flight provider.
         let provider = self.current_provider();
-        let model_str = model_override.unwrap_or(provider.default_model());
+        let model_str = selection.model.unwrap_or(provider.default_model());
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
-        let effective_effort = reasoning_effort.map(|s| s.to_string());
-        let capture_window = self.context_window_for(capture_seed.model);
+        let effective_effort = selection.reasoning_effort.map(|s| s.to_string());
+        let capture_window = self.context_window_for(capture_seed.model, selection.provider);
 
         // Command guard (ADR 0002): off unless the workspace turned on the
         // `command_guard` preference. Read once per response — the toggles can't
@@ -680,10 +722,9 @@ impl LucidosEngine {
                 provider.chat(
                     messages.clone(),
                     call_tools,
-                    model_override,
+                    selection,
                     Some(system_prompt),
                     token_cb,
-                    reasoning_effort,
                 ),
             );
             let cancel_future = cancel_token.cancelled();
@@ -1142,6 +1183,9 @@ impl LucidosEngine {
                     .map(str::to_string);
                 (cloned, remaining)
             };
+            // Known here rather than read back: the background persist task
+            // may not have written this round's deltas yet.
+            let spoke_this_round = flush_text.as_deref().is_some_and(|t| !t.trim().is_empty());
             if let Some(flush) = flush_text {
                 self.event_bus
                     .emit_or_log(
@@ -1175,6 +1219,43 @@ impl LucidosEngine {
 
             // No more tool calls - we have the final answer
             if response.tool_calls.is_empty() {
+                // A reply declined partway ends the turn here, before any path
+                // below can send the refused text back to the model. The text
+                // already persisted as `TextStreamed` stays beside the failure.
+                // The stop reason is checked first, so an ordinary turn does
+                // not pay for a second `clean_response`.
+                if let Some(error) =
+                    declined_partway_error(response.stop_reason.as_deref()).filter(|_| {
+                        response
+                            .content
+                            .as_deref()
+                            .is_some_and(|c| !self.clean_response(c).is_empty())
+                    })
+                {
+                    self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
+                        .await;
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                    error: error.to_string(),
+                                },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ResponseFailed (declined partway)",
+                        )
+                        .await;
+                    *terminator_settled = true;
+                    return Ok(terminal_result(
+                        String::new(),
+                        images,
+                        request_id,
+                        thread_id,
+                        *proposed_change,
+                    ));
+                }
+
                 // Force a re-ask: the previous iteration's `ask_user_question`
                 // call errored (typically the model dropped the required
                 // `question` field and put the text in the optional `header`
@@ -1430,42 +1511,8 @@ impl LucidosEngine {
                     continue;
                 }
 
-                // Refresh anything touched during the tool loop, once per app at
-                // end of turn (coalesced — not per write). Two distinct signals:
-                //   - AppUiRefreshRequested → reload the open app iframe.
-                //   - AppUpdated → refresh the disk-backed apps LIST (name/icon/
-                //     description may have changed via a manifest edit). The list
-                //     re-scans disk, so this also surfaces an app freshly created
-                //     this turn via raw write_file. Guard on app_exists so an app
-                //     deleted during the turn doesn't emit a spurious AppUpdated.
-                for app_id in &modified_app_uis {
-                    self.event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event: crate::engine::thread_events::ThreadEvent::AppUiRefreshRequested {
-                                    app_id: app_id.clone(),
-                                },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            },
-                            "[AgenticLoop] AppUiRefreshRequested (post-loop)",
-                        )
-                        .await;
-                    if self.app_manager.app_exists(app_id) {
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::System(
-                                    crate::engine::event_bus::SystemEvent::AppUpdated {
-                                        app_id: app_id.clone(),
-                                        name: self.app_manager.app_name(app_id),
-                                        actor: None,
-                                    },
-                                ),
-                                "[AgenticLoop] AppUpdated (post-loop)",
-                            )
-                            .await;
-                    }
-                }
+                self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
+                    .await;
                 let cleaned = response
                     .content
                     .as_deref()
@@ -1513,7 +1560,8 @@ impl LucidosEngine {
                 // neutral "empty response" note instead of a red error).
                 let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
                 let output_tokens_n = response.output_tokens.unwrap_or(0);
-                let thinking_chars_n = response.thinking_chars.unwrap_or(0);
+                let model_thought = response.thinking_chars.unwrap_or(0) > 0
+                    || response.thinking_blocks.unwrap_or(0) > 0;
                 let unknown_sse_dropped = response.unknown_sse_dropped;
                 let output_tokens = response
                     .output_tokens
@@ -1526,7 +1574,7 @@ impl LucidosEngine {
                 let class = classify_empty_completion(
                     stop_reason,
                     output_tokens_n,
-                    thinking_chars_n,
+                    model_thought,
                     unknown_sse_dropped,
                 );
                 let dropped_suffix = if unknown_sse_dropped > 0 {
@@ -1863,45 +1911,115 @@ impl LucidosEngine {
                 last_call_was_error = false;
             }
 
-            for tool_call in response.tool_calls.iter() {
+            // What a parallel run left for each of its calls, keyed by call
+            // index. The run executes at its first call.
+            let mut parallel_reads: std::collections::HashMap<usize, ParallelRead> =
+                std::collections::HashMap::new();
+            for (call_index, tool_call) in response.tool_calls.iter().enumerate() {
                 // Count the CALL, not the round. One response can carry several
-                // tool calls (the system prompt asks for exactly that when
-                // writing N files), so counting rounds would let a cap of
+                // tool calls (the system prompt asks for every independent
+                // call to batch), so counting rounds would let a cap of
                 // 500 pass well over 500 calls while every user-facing string
                 // says "tool calls".
                 tool_calls_made += 1;
-                // Mask any postgres password the LLM hardcoded into a `bash`
-                // command (or other tool) BEFORE it reaches the log line, the
-                // persisted `description`, or the persisted `args` — the
-                // description renders in the steps UI just like the args, so
-                // both must be built from the redacted copy; see
-                // `core::redact_postgres_secrets_in_json`.
-                let mut redacted_args = tool_call.arguments.clone();
-                crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
-                let tool_desc = self.describe_tool(&tool_call.name, &redacted_args);
-                log!(
-                    "[AgentLoop] Step {}/{}: {}",
-                    tool_calls_made,
-                    max_tool_calls,
-                    tool_desc
-                );
 
-                // Persist + broadcast ToolCalled. Capture the event_id so spawn-style
-                // tools (run_thread, run_coding_agent) can record which tool call
-                // triggered the spawn — this becomes the new thread's
+                // A block of pure reads runs at once, and each call emits its
+                // own ToolCalled and ToolResult as it starts and ends (ADR
+                // 0246). None of them is guarded or intercepted below, so only
+                // the bookkeeping is left for the loop to do.
+                if !parallel_reads.contains_key(&call_index) {
+                    let run_end = parallel_run_end(&response.tool_calls, call_index);
+                    if run_end - call_index >= 2 {
+                        let reads = self
+                            .run_parallel_reads(
+                                &response.tool_calls[call_index..run_end],
+                                tool_calls_made,
+                                max_tool_calls,
+                                thread_id,
+                                &meta,
+                                extraction_ctx,
+                                request_id,
+                                device_id,
+                                cancel_token,
+                            )
+                            .await;
+                        parallel_reads.extend((call_index..run_end).zip(reads));
+                    }
+                }
+                if let Some(read) = parallel_reads.remove(&call_index) {
+                    if read.is_error {
+                        had_errors = true;
+                        note_failure(&mut failed, read.tool_called_event_id, curated.mode);
+                        log!(
+                            "[AgentLoop] Step {}/{}: Error, will retry: {}",
+                            tool_calls_made,
+                            max_tool_calls,
+                            read.result
+                        );
+                    } else {
+                        if tool_call.name == tn::LIST_FILES {
+                            cached_list_files = Some(read.result);
+                        }
+                        log!(
+                            "[AgentLoop] Step {}/{}: Success",
+                            tool_calls_made,
+                            max_tool_calls
+                        );
+                    }
+                    tool_outputs.push(ToolOutput {
+                        tool_use_id: tool_call.id.clone(),
+                        text: read.llm_text,
+                        event_id: read.tool_called_event_id,
+                    });
+                    continue;
+                }
+
+                // The id lets spawn-style tools (run_thread, run_coding_agent)
+                // record which call triggered the spawn: the new thread's
                 // `spawning_event_id`.
                 let tool_called_event_id = self
-                    .event_bus
-                    .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ToolCalled {
-                            name: tool_call.name.clone(),
-                            description: tool_desc,
-                            args: redacted_args,
-                        },
-                        meta: meta.clone(),
-                    })
+                    .emit_tool_called(thread_id, &meta, tool_call, tool_calls_made, max_tool_calls)
                     .await;
+
+                if tool_call.name == tn::ASK_USER_QUESTION
+                    && human_can_answer
+                    && !spoke_this_round
+                    && crate::engine::question_card_gate::refuse_card(
+                        &self.pool,
+                        thread_id,
+                        &tool_call.id,
+                    )
+                    .await
+                {
+                    // Not an error: flagging it would trip the CallRejected
+                    // re-ask, which tells the model its `question` was empty.
+                    if response.tool_calls.len() == 1 {
+                        last_call_was_error = false;
+                    }
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                    name: tool_call.name.clone(),
+                                    result: crate::engine::question_card_gate::CARD_REFUSAL
+                                        .to_string(),
+                                    images: vec![],
+                                    success: false,
+                                    tool_called_event_id,
+                                },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ToolResult (question card refused, silent work)",
+                        )
+                        .await;
+                    tool_outputs.push(ToolOutput {
+                        tool_use_id: tool_call.id.clone(),
+                        text: crate::engine::question_card_gate::CARD_REFUSAL.to_string(),
+                        event_id: tool_called_event_id,
+                    });
+                    continue;
+                }
 
                 // The mode withdraws `todo_write` from the tools array, so a
                 // call for it can only come from a cached prompt or a
@@ -2264,37 +2382,15 @@ impl LucidosEngine {
                     (m.label, m.event)
                 });
 
-                // Persist + broadcast ToolResult
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ToolResult {
-                                name: tool_call.name.clone(),
-                                result: crate::core::sanitize_for_jsonb(split.event_text()),
-                                images: std::mem::take(&mut split.images),
-                                success: !is_error,
-                                // Always stamp the originating ToolCalled's
-                                // event id so `groupIntoExchanges` (frontend)
-                                // routes this result to the call's exchange
-                                // via `chatToolCallOwners`, not via the
-                                // post-`UserQuestionAsked` request_id
-                                // redirect. Without explicit pairing, an
-                                // `ask_user_question` call's ToolResult
-                                // followed the redirect into the question
-                                // divider and the original MR exchange's
-                                // "Executing ask_user_question..." spinner
-                                // never resolved. Chronological name pairing
-                                // for in-process resume blocks still works
-                                // regardless of this field — see
-                                // `core::store::messages::collect_tool_pairs_chronological`.
-                                tool_called_event_id,
-                            },
-                            meta: meta.clone(),
-                        },
-                        "[AgenticLoop] ToolResult",
-                    )
-                    .await;
+                self.emit_tool_result(
+                    thread_id,
+                    &meta,
+                    &tool_call.name,
+                    &mut split,
+                    !is_error,
+                    tool_called_event_id,
+                )
+                .await;
 
                 if let Some((label, event)) = sentinel_event {
                     use crate::engine::event_bus::BusEvent;
@@ -2449,7 +2545,7 @@ impl LucidosEngine {
                     .await;
                 "Error occurred. Review the error messages above and try a different approach."
             } else {
-                "Results above. Do NOT repeat analysis you already gave — the user already read it. Proceed directly to your next action or final answer."
+                TOOL_RESULTS_INSTRUCTION
             };
 
             let result_blocks = build_tool_result_blocks(&tool_outputs, instruction);

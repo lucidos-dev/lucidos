@@ -575,6 +575,14 @@ const TRIGGER_REASONING_EFFORT_ARG: Arg = Arg {
     description:
         "Thinking budget for this trigger's intent runs. Omit or null for the account default.",
 };
+const TRIGGER_PROVIDER_ARG: Arg = Arg {
+    name: "provider",
+    ty: ArgType::Str,
+    enum_values: MODEL_PROVIDER_ENUM,
+    required: false,
+    loc: ArgIn::Body,
+    description: "Backend for the pinned model when it has more than one route. Requires a model pin and must be one of its routes. Omit or null for the model's own preferred provider.",
+};
 const TRIGGER_SLUG_ARG: Arg = Arg {
     name: "slug",
     ty: ArgType::Str,
@@ -597,9 +605,10 @@ const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
   "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Chat model id for the intent, e.g. 'claude-sonnet-5'. Null = account default (on update, clears a pin). Set only if asked."},
-  "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."}
+  "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."},
+  "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
 }"#;
-// `model` / `reasoning_effort` are deliberately NOT repeated here. Properties
+// `model` / `reasoning_effort` / `provider` are deliberately NOT repeated here. Properties
 // are unioned across a domain's operations first-wins (see `build_llm_tool`), so
 // a second copy under the same name is dropped before the model ever sees it,
 // and only the create schema's wording would ship. Update's null-clears
@@ -627,6 +636,7 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_SLUG_ARG,
             TRIGGER_MODEL_ARG,
             TRIGGER_REASONING_EFFORT_ARG,
+            TRIGGER_PROVIDER_ARG,
         ],
         cli_name: "create",
         sdk_name: "create",
@@ -671,6 +681,7 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_SLUG_ARG,
             TRIGGER_MODEL_ARG,
             TRIGGER_REASONING_EFFORT_ARG,
+            TRIGGER_PROVIDER_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",
@@ -1230,13 +1241,16 @@ const CHANGES_DOMAIN: Domain = Domain {
 // SSOT, replacing misc::get_manage_models_tool) AND adds a generated `lucidos
 // models` CLI over the /models CRUD. execute_tool keeps routing manage_models →
 // the unchanged execute_manage_models handler (it reads `action` itself, so no
-// grouped-alias delegation). LLM actions (list/add/enable/disable/remove) and
-// CLI ops (list/add/update/delete) diverge: enable/disable are LLM-only PUT
-// conveniences; `update` is the CLI-only generic PUT. `id` is a Body arg for
-// `add` and a Query arg for update/delete (two Args, same name/type). See
+// grouped-alias delegation). LLM actions (list/add/enable/disable/update/remove)
+// and CLI ops (list/add/update/delete) diverge: enable/disable are LLM-only PUT
+// conveniences. `id` is a Body arg for `add` and a Query arg for update/delete
+// (two Args, same name/type). `routes` is a Json arg, which the LLM tool never
+// derives, so `add` and `update` carry a raw `llm_schema`. See
 // engine/tools/models.rs + api/settings.rs.
 // ---------------------------------------------------------------------------
 
+/// Every provider name, in `ProviderKind::ALL` order. A test holds the two in
+/// lockstep, and holds every raw `llm_schema` spelling of it to this list.
 const MODEL_PROVIDER_ENUM: &[&str] = &[
     "vertex",
     "anthropic",
@@ -1275,17 +1289,26 @@ const MODEL_PROVIDER_ARG: Arg = Arg {
     name: "provider",
     ty: ArgType::Str,
     enum_values: MODEL_PROVIDER_ENUM,
-    required: true,
+    required: false,
     loc: ArgIn::Body,
-    description: "Backend that serves the model.",
+    description:
+        "Backend that serves the model: the single-route shorthand, applied to the first route.",
 };
-const MODEL_PROVIDER_OPT_ARG: Arg = Arg {
-    name: "provider",
+const MODEL_ROUTES_ARG: Arg = Arg {
+    name: "routes",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Every backend that serves the model, in priority order, e.g. [{\"provider\":\"vertex\"},{\"provider\":\"openrouter\",\"id\":\"anthropic/claude-opus-5-5\",\"context_window\":200000}]. `id` defaults to the model id. Replaces provider and context_window when given.",
+};
+const MODEL_PREFERRED_PROVIDER_ARG: Arg = Arg {
+    name: "preferred_provider",
     ty: ArgType::Str,
     enum_values: MODEL_PROVIDER_ENUM,
     required: false,
     loc: ArgIn::Body,
-    description: "Backend that serves the model.",
+    description: "The backend to use for this model when more than one route is configured. Must be one of its routes.",
 };
 const MODEL_SORT_ORDER_ARG: Arg = Arg {
     name: "sort_order",
@@ -1312,6 +1335,24 @@ const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.",
 };
 
+// `routes` is a Json arg, so the LLM shape of `add` is spelled out here. `id`
+// keeps the structure `args` would derive, since enable / disable / remove still
+// derive it and the union must agree. Only the top-level `provider` spells the
+// enum: the handler refuses an unknown name in a route with the list.
+const MODELS_ADD_LLM_SCHEMA: &str = r#"{
+  "id": {"type":"string","description":"Model id, also the API string unless a route overrides it. Needed by all but list."},
+  "label": {"type":"string","description":"Display name; defaults to the id."},
+  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"],"description":"Single-route shorthand, for the first route. Adding needs this or routes."},
+  "sort_order": {"type":"integer","description":"Lower sorts first."},
+  "context_window": {"anyOf":[{"type":"null"},{"type":"integer"}],"description":"The first route's window in tokens. Set it: omitted, most non-Claude ids are guessed at 200k. On update, null clears it."},
+  "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}}
+}"#;
+// The properties `add` already declares are not repeated: the union is
+// first-wins, so a second copy would be dropped unseen.
+const MODELS_UPDATE_LLM_SCHEMA: &str = r#"{
+  "preferred_provider": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Backend to use when several routes are configured, one of them. Null clears."}
+}"#;
+
 const MODELS_OPS: &[Operation] = &[
     Operation {
         action: "list",
@@ -1330,7 +1371,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "add",
-        summary: "Register a new model in the picker.",
+        summary: "Register a new model; needs provider or routes.",
         method: Method::Post,
         path: "/models",
         args: &[
@@ -1339,12 +1380,13 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_PROVIDER_ARG,
             MODEL_SORT_ORDER_ARG,
             MODEL_CONTEXT_WINDOW_ARG,
+            MODEL_ROUTES_ARG,
         ],
         cli_name: "add",
         sdk_name: "add",
         mutating: true,
         llm_alias: None,
-        llm_schema: None,
+        llm_schema: Some(MODELS_ADD_LLM_SCHEMA),
         llm: None,
         cli: None,
         sdk: None,
@@ -1383,24 +1425,25 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Edit label, provider, sort_order or enabled.",
+        summary: "Edit routes or preferred_provider; label and sort_order on user models only.",
         method: Method::Put,
         path: "/models",
         args: &[
             MODEL_ID_QUERY_ARG,
             MODEL_LABEL_ARG,
-            MODEL_PROVIDER_OPT_ARG,
+            MODEL_PROVIDER_ARG,
             MODEL_SORT_ORDER_ARG,
             MODEL_ENABLED_ARG,
             MODEL_CONTEXT_WINDOW_ARG,
+            MODEL_ROUTES_ARG,
+            MODEL_PREFERRED_PROVIDER_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",
         mutating: true,
         llm_alias: None,
-        llm_schema: None,
-        // CLI-only: the LLM uses enable/disable; a generic update isn't exposed.
-        llm: Some(false),
+        llm_schema: Some(MODELS_UPDATE_LLM_SCHEMA),
+        llm: None,
         cli: None,
         sdk: Some(false),
     },
@@ -3270,7 +3313,7 @@ mod tests {
         assert!(models.llm && models.cli && !models.sdk);
         assert_eq!(
             models.actions(),
-            vec!["list", "add", "enable", "disable", "remove"]
+            vec!["list", "add", "enable", "disable", "update", "remove"]
         );
         let cli_ops: Vec<&str> = models
             .operations
@@ -3284,7 +3327,16 @@ mod tests {
         let tool = build_llm_tool(models);
         assert_eq!(tool.name, "manage_models");
         let props = &tool.parameters["properties"];
-        for p in ["action", "id", "label", "provider", "sort_order"] {
+        for p in [
+            "action",
+            "id",
+            "label",
+            "provider",
+            "sort_order",
+            "context_window",
+            "routes",
+            "preferred_provider",
+        ] {
             assert!(
                 props.get(p).is_some(),
                 "manage_models missing property `{p}`"
@@ -3293,6 +3345,11 @@ mod tests {
         assert_eq!(
             props["provider"]["enum"],
             serde_json::json!(MODEL_PROVIDER_ENUM)
+        );
+        assert_eq!(props["routes"]["type"], "array");
+        assert_eq!(
+            props["routes"]["items"]["required"],
+            serde_json::json!(["provider"])
         );
         assert_eq!(domain_for_tool("manage_models").unwrap().name, "models");
 
@@ -3322,5 +3379,66 @@ mod tests {
             domain_for_tool("manage_repositories").unwrap().name,
             "repositories"
         );
+    }
+
+    /// The CLI and SDK read `args`, so the route editing surface lives there:
+    /// `routes` on add and update, `preferred_provider` on update.
+    #[test]
+    fn model_route_args_reach_the_cli() {
+        let models = domains().iter().find(|d| d.name == "models").unwrap();
+        let args_of = |action: &str| -> Vec<&str> {
+            let op = models.operations.iter().find(|o| o.action == action);
+            op.unwrap().args.iter().map(|a| a.name).collect()
+        };
+        assert!(args_of("add").contains(&"routes"));
+        assert!(args_of("update").contains(&"routes"));
+        assert!(args_of("update").contains(&"preferred_provider"));
+        // `routes` alone can add a model, so `provider` must not be required.
+        let add = models.operations.iter().find(|o| o.action == "add");
+        let provider = add.unwrap().args.iter().find(|a| a.name == "provider");
+        assert!(!provider.unwrap().required);
+    }
+
+    /// The trigger provider pin reaches every surface: CLI and SDK through
+    /// `args`, the LLM tool through the create schema.
+    #[test]
+    fn trigger_provider_pin_reaches_every_surface() {
+        let triggers = domains().iter().find(|d| d.name == "triggers").unwrap();
+        for action in ["create", "update"] {
+            let op = triggers.operations.iter().find(|o| o.action == action);
+            let arg = op.unwrap().args.iter().find(|a| a.name == "provider");
+            assert_eq!(
+                arg.expect("provider arg").enum_values,
+                MODEL_PROVIDER_ENUM,
+                "{action}"
+            );
+        }
+        let tool = build_llm_tool(triggers);
+        let provider = &tool.parameters["properties"]["provider"];
+        assert_eq!(
+            provider["anyOf"][1]["enum"],
+            serde_json::json!(MODEL_PROVIDER_ENUM)
+        );
+    }
+
+    /// One provider list: the manifest's enum is `ProviderKind::ALL`, and every
+    /// raw schema that spells the list out spells exactly it.
+    #[test]
+    fn provider_enums_match_provider_kind() {
+        let names: Vec<&str> = crate::llm::ProviderKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(MODEL_PROVIDER_ENUM, names.as_slice());
+        let spelled = serde_json::to_string(MODEL_PROVIDER_ENUM).unwrap();
+        for schema in [TRIGGER_CREATE_LLM_SCHEMA, MODELS_ADD_LLM_SCHEMA] {
+            assert!(schema.contains("\"vertex\""), "the schema names providers");
+            for (i, _) in schema.match_indices("\"vertex\"") {
+                assert!(
+                    schema[..i].ends_with('[') && schema[i..].starts_with(&spelled[1..]),
+                    "a provider enum drifted from ProviderKind::ALL"
+                );
+            }
+        }
     }
 }

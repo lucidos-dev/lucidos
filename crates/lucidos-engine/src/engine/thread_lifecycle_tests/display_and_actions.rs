@@ -442,7 +442,6 @@ fn chat_inbox_idle_shows_archive_then_save() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Archive, Action::Save]);
 }
@@ -453,7 +452,6 @@ fn chat_archived_idle_shows_only_save() {
         ThreadType::Chat,
         ThreadStatus::Idle,
         ArchiveState::Archived,
-        false,
         false,
         false,
         false,
@@ -475,7 +473,6 @@ fn chat_running_shows_no_close_actions() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Save]);
 }
@@ -487,7 +484,6 @@ fn cc_inbox_with_changes_shows_apply_discard() {
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
         true,
-        false,
         false,
         false,
         false,
@@ -507,7 +503,6 @@ fn cc_inbox_no_changes_shows_archive() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Archive, Action::Save]);
 }
@@ -521,7 +516,6 @@ fn external_repo_cc_no_pending_change_shows_archive() {
         ThreadType::CodingAgent,
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
-        false,
         false,
         false,
         false,
@@ -546,7 +540,6 @@ fn cc_archived_no_changes_shows_only_save() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Save]);
 }
@@ -566,7 +559,6 @@ fn cc_archived_with_pending_changes_shows_apply_discard() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
 }
@@ -579,7 +571,6 @@ fn chat_inbox_descendants_block_archive_hides_archive() {
         ArchiveState::Inbox,
         false,
         true,
-        false,
         false,
         false,
         false,
@@ -599,7 +590,6 @@ fn cc_inbox_descendants_block_archive_hides_archive() {
         ArchiveState::Inbox,
         false,
         true,
-        false,
         false,
         false,
         false,
@@ -624,7 +614,6 @@ fn cc_inbox_pending_changes_still_show_apply_discard_when_descendants_block() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
 }
@@ -638,7 +627,6 @@ fn draft_is_front_most_close_layer() {
         ThreadType::Chat,
         ThreadStatus::Idle,
         ArchiveState::Inbox,
-        false,
         false,
         false,
         false,
@@ -662,7 +650,6 @@ fn draft_discard_available_while_running() {
         false,
         false,
         false,
-        false,
         true, // has_unsent_draft
         false,
     );
@@ -678,7 +665,6 @@ fn full_cascade_draft_change_then_save() {
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
         true,
-        false,
         false,
         false,
         true, // has_unsent_draft
@@ -705,7 +691,6 @@ fn saved_thread_shows_unsave_not_save() {
         false,
         false,
         false,
-        false,
         true, // is_saved
     );
     assert_eq!(actions, vec![Action::Archive, Action::Unsave]);
@@ -718,7 +703,6 @@ fn saved_cc_pending_shows_unsave() {
         ThreadStatus::Waiting,
         ArchiveState::Inbox,
         true,
-        false,
         false,
         false,
         false,
@@ -785,15 +769,15 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
         true, // has_live_event_waits
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::Archive, Action::Save]);
 }
 
 // ── a parked thread's change is not resolvable ── the thread wakes on its
 // delivery and commits on to the same branch. Apply would merge work still
-// being produced. Both waiting causes gate it, and neither leaves a close
-// action behind.
+// being produced, so a live event wait leaves no close action behind. An active
+// sub-thread is not an input at all (ADR 0249); `api::threads::tests` pins that
+// a parent with a running child still reads Apply.
 
 /// The headline case: a coding-agent thread that proposed a change and then
 /// parked on an event wait. This is the `e2e-lock-wait` shape.
@@ -813,7 +797,6 @@ fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
         true,  // has_live_event_waits
         false,
         false,
-        false,
     );
     assert_eq!(parked, vec![Action::Save]);
 
@@ -826,31 +809,12 @@ fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(
         running,
         vec![Action::ApplyWhenSettled, Action::Save],
         "a Running thread offers no close action either, plus the standing apply"
     );
-}
-
-/// An active sub-thread gates the change the same way: its completion wakes the
-/// parent through the ADR 0011 fan-in, which may then commit again.
-#[test]
-fn an_active_sub_thread_also_withholds_apply_and_discard() {
-    let actions = available_thread_actions(
-        ThreadType::CodingAgent,
-        ThreadStatus::Idle,
-        ArchiveState::Inbox,
-        true,
-        false,
-        false,
-        true, // has_active_children
-        false,
-        false,
-    );
-    assert_eq!(actions, vec![Action::Save]);
 }
 
 /// The way out before the 24 h ceiling. Stop waiting clears the subscription,
@@ -864,7 +828,6 @@ fn clearing_the_last_wait_restores_apply_and_discard() {
         true,
         false,
         false, // the wait was stopped
-        false,
         false,
         false,
     );
@@ -881,7 +844,6 @@ fn a_parked_thread_can_still_discard_its_unsent_draft() {
         true,
         false,
         true,
-        false,
         true, // has_unsent_draft
         false,
     );
@@ -897,7 +859,6 @@ fn a_parked_chat_thread_keeps_archive() {
         ArchiveState::Inbox,
         true, // ignored off a coding-agent thread
         false,
-        true,
         true,
         false,
         false,

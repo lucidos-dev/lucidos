@@ -11,6 +11,7 @@ async fn emit_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, tex
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
@@ -310,6 +311,7 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
     bus.emit(BusEvent::Thread {
         thread_id: cc_child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "coding task".into(),
             user_image_hashes: vec![],
@@ -1046,6 +1048,7 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "task B".into(),
             user_image_hashes: vec![],
@@ -1144,6 +1147,7 @@ async fn follow_up_marks_the_callback_pending() {
             bus.emit(BusEvent::Thread {
                 thread_id: child,
                 event: ThreadEvent::MessageReceived {
+                    provider: None,
                     voice_session_id: None,
                     text: "child task".into(),
                     user_image_hashes: vec![],
@@ -1220,6 +1224,7 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "coding task".into(),
             user_image_hashes: vec![],

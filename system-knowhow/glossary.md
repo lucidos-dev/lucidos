@@ -364,13 +364,29 @@ The engine reaching into long-term memory **for** the *Lucidos Agent*, automatic
 The *Lucidos Agent* looking through long-term memory itself, mid-turn, with a query it wrote. It is a tool call (the `memory` tool's `search` action) and shows in the transcript as "Searching memory for ...". It exists as the backstop for a *memory recall* that missed: the recall runs once, from queries derived before the agent had read anything, and without a search of its own the agent would have no way to ask again. Both rank the same corpus the same way, so a search never returns a different ordering from the facts already in context.
 
 ### Model registry
-The database-backed list of chat models the user manages in **Settings → Models**. It drives the *Lucidos Agent* model picker and tells the engine which *provider* serves each model. Known models are seeded by the engine; the user can add their own (id + label + provider, and optionally the model's *context window*) and enable/disable or delete them (builtins are disable-only). Separate from the *Claude Code* model picker, which keeps its own list.
+The database-backed list of chat models the user manages in **Settings → Models**. It drives the *Lucidos Agent* model picker and tells the engine which *provider* serves each model. Known models are seeded by the engine. The user can add their own, and enable, disable or delete them (builtins are disable-only). Adding one takes an id, a label and a provider, plus the model's *context window* if it has an unusual one.
+
+A model can list more than one provider. It is then served by whichever the workspace has credentials for: see *preferred provider*. Separate from the *Claude Code* model picker, which keeps its own list.
+
+### Reasoning effort
+How hard a *model* is told to think before it answers, chosen beside the model in the picker and in **Settings → Models**. Six levels: Off, Low, Med, High, X-High, Max.
+
+Not every model offers all six, and which it offers depends on the *provider* serving it as much as on the model. Gemini stops at High, because everything above it sends an identical request. OpenAI before GPT-5.6 stops at X-High. An OpenAI-compatible server that is not OpenAI's stops at High, because X-High is OpenAI's own word and a third party answers 400.
+
+Asking for a level a model does not offer snaps to the nearest one it does, ties going upward. So switching model never quietly spends less thought than you asked for.
 
 ### Response style
 How much comes back in an answer, chosen in **Settings → Models → Response style**. It applies to chat and to every *trigger*, from the next message onward, and changes nothing about a *coding-agent thread*. **Standard** is the default and adds nothing at all, so answers come back the way they always have. Whatever a style asks for, Lucidos still keeps every warning, every caveat that changes the answer, and every step the user has to take: that rule sits outside the editable text and cannot be written away.
 
 ### Style library
 The list of *response styles* a workspace can pick between. Lucidos ships three. **Standard** is the off switch and cannot be edited or deleted. **Concise** and **Minimal** can be edited, and an edited one keeps a *Reset* that brings the shipped wording back. The user can add as many of their own as they like, each a name plus an instruction written in their own words. One style is selected at a time.
+
+### Preferred provider
+The *provider* a *model* was last picked on, remembered per model. Choosing a provider in the model picker stores it on that model's row. So Grok stays on xAI and Opus stays on Anthropic, neither choice overwriting the other.
+
+The picker asks for a provider last, after the model and its *reasoning effort*, and only when there is a choice: two of the model's providers are set up. A workspace with one set up is never asked, but the picker still names the provider a model runs on. A pick also sticks to the thread or draft it was made in, so a later pick elsewhere does not move a conversation already running. A *trigger* can pin its own. Settings → Models → Routes shows and edits which providers serve each model, in the order they are tried.
+
+A model with no stored choice runs on the first of its backends the workspace has credentials for. If the stored choice is later removed or switched off, the turn is refused rather than quietly moved to another backend. The picker shows it badged "not set up", so one click fixes it.
 
 ### Provider
 The backend that serves a *model*. Each entry in the *model registry* names its provider, and that provider's credentials are configured once under Settings → Models → Providers.
@@ -381,7 +397,9 @@ The backend that serves a *model*. Each entry in the *model registry* names its 
 
 **OpenCode Free** is `opencode.ai/zen/v1`, and it is the one provider with no credential at all. The relay serves a set of free models anonymously, so the engine sends no key and no account exists. It is off by default and switched on with a toggle rather than a key. Requests leave the machine to a third party. Several of those free models may train on what they receive, so the toggle states that where it is flipped.
 
-OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Completions wire format but are distinct backends. Grok ids are bare on xAI (`grok-4.6`) and prefixed on OpenRouter (`x-ai/grok-4.6`). So the same model can sit in the picker twice, on two providers and two keys. The same Claude model can also be offered through more than one provider (e.g. Fable 5 via direct Anthropic, other Claude models via Vertex).
+OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Completions wire format but are distinct backends.
+
+One model can name several of them, and then it stays ONE entry in the picker, served by whichever the workspace has credentials for. The first-party Claude models list Vertex and Anthropic, since their ids are identical on both. A backend that spells a model differently says so per provider. Grok is bare on xAI (`grok-4.6`) and prefixed on OpenRouter (`x-ai/grok-4.6`).
 
 ### Builtin provider proxy
 A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. The builtin names are `vertex`, `openai`, `openrouter`, `xai`, `anthropic` and `local`. When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root. It injects the credential configured under Settings → Models → Providers server-side, so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first).
@@ -594,7 +612,7 @@ See also: *event subscription*, *trigger*, *waiting indicator*, `system-knowhow/
 ### Waiting indicator
 The control on the prompt bar showing what the open *thread* is currently waiting for. It appears whenever the thread is parked, and two things park one: a live *thread subscription* (an *event wait*), or *sub-threads* still working. A subscription is listed with the agent's reason, the event it watches, a countdown to its deadline, and a **Stop waiting** button. A sub-thread is listed by title, and tapping it opens that thread. It answers "is this thread stuck, or is it asleep on purpose?", without scrolling back through the conversation. The thread's **Waiting** status says *that* it is waiting, on every list; this says *what for*, on the thread you have open.
 
-One control covers both because the **Waiting** status already merges them. Either way the thread is not finished, and something else will re-open it. A sub-thread row links rather than stops: ending one is done on the sub-thread itself.
+One control covers both because the **Waiting** status already merges them. Either way the thread is not finished, and something else will re-open it. A sub-thread row links rather than stops: ending one is done on the sub-thread itself. A thread with a proposed change that waits only on sub-threads reads **Changes to review** instead, because its change can be applied.
 
 An event watched under a `condition` says **(filtered)**, and tapping that opens the condition itself. The transcript's own record of the wait opens the same thing.
 
@@ -998,6 +1016,8 @@ The owner's instruction to *Apply* a *change* once its thread finishes. Pressed 
 Two forms. **Apply as it settles** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply as they settle**, the *Apply All* checkbox, arms every thread still working. Both read the same rule and both are one-shot.
 
 It goes wherever *Apply* goes, and nowhere else. An *external-repo coding-agent thread* is never offered one: Lucidos does not merge into that repo, and the thread proposes no *change* to arm. So its prompt row draws no flag, the sweep passes it over, and the engine refuses an arm anything else asks for.
+
+A change whose *Apply* hit merge conflicts is not offered one either. Its thread works only to resolve that merge, and the resolver lands the change itself. So the apply is already in flight: its Changes panel row reads **Applying...** with "Resolving merge conflicts", and its prompt row draws no flag.
 
 It always ends. The change applies the moment the thread finishes. A thread that parks or fails never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
 

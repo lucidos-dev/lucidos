@@ -37,32 +37,51 @@ const ADMISSION_ATTEMPTS: u32 = 2;
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
     registry: &crate::llm::ModelRegistry,
+    // Which backends the router holds, so the clamp measures the route the
+    // router will actually take.
+    is_configured: impl Fn(crate::llm::ProviderKind) -> bool,
     use_coding_agent: Option<bool>,
     thread_id: Option<Uuid>,
     exclude_event_id: Option<Uuid>,
-    model_override: Option<&str>,
-    reasoning_effort: Option<&str>,
-) -> (Option<String>, Option<String>) {
+    // What the caller asked for, per field. Each absent field is resolved
+    // below; the provider is honoured or refused, never substituted.
+    overrides: crate::core::ResolvedModelSelection,
+) -> crate::core::ResolvedModelSelection {
     if use_coding_agent == Some(true) {
         // A coding-agent effort belongs to Claude Code / Codex, whose models are
         // not in the chat registry and whose own drivers validate it
         // (`validate_codex_effort`). Clamping it against a chat model would be
-        // answering a question about the wrong agent.
-        return (None, reasoning_effort.map(str::to_string));
+        // answering a question about the wrong agent. Its backend is the agent,
+        // not a chat provider, so nothing here resolves one.
+        return crate::core::ResolvedModelSelection {
+            reasoning_effort: overrides.reasoning_effort,
+            ..crate::core::ResolvedModelSelection::default()
+        };
     }
 
     // Chat: honor per-thread memory — a follow-up with no explicit override
     // reuses the model/effort this thread last ran with. `exclude_event_id`
     // drops the current turn's own MessageReceived when it was pre-emitted
     // upstream, so the thread never reads itself as its "previous" value.
-    let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+    let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
         pool,
         thread_id,
         exclude_event_id,
-        model_override.map(str::to_string),
-        reasoning_effort.map(str::to_string),
+        overrides,
     )
     .await;
+    let crate::core::ResolvedModelSelection {
+        model,
+        reasoning_effort: effort,
+        provider,
+    } = resolved;
+    // A provider the model has no route on is not stamped. The router would
+    // treat it as stale and fall through, so stamping it would record a
+    // backend the turn never reached.
+    let provider = provider.filter(|p| match (&model, crate::llm::ProviderKind::from_name(p)) {
+        (Some(m), Some(kind)) => crate::llm::model_registry::route_on(registry, m, kind).is_some(),
+        _ => false,
+    });
 
     // Clamp the pair HERE, not only at the wire, so the effort this turn
     // STAMPS on its events is the effort it actually SENDS.
@@ -80,16 +99,29 @@ pub(super) async fn resolve_route_overrides(
     //
     // With no resolved model there is nothing to clamp against (the provider
     // default applies, and only `RoutingProvider` knows it), so leave it.
+    //
+    // The clamp reads the ROUTE the turn will take, so a model served by two
+    // backends is measured against the one that will answer.
     let effort = match (&model, effort) {
-        (Some(m), Some(e)) => crate::llm::reasoning::clamp_effort(
-            &e,
-            crate::llm::model_registry::provider_kind_for(registry, m),
-            m,
-        )
-        .map(str::to_string),
+        (Some(m), Some(e)) => {
+            let chosen = provider
+                .as_deref()
+                .and_then(crate::llm::ProviderKind::from_name);
+            match crate::llm::model_registry::resolve_route(registry, m, chosen, &is_configured) {
+                Ok(route) => {
+                    crate::llm::reasoning::clamp_effort(&e, route.provider, &route.wire_id)
+                        .map(str::to_string)
+                }
+                Err(_) => Some(e),
+            }
+        }
         (_, e) => e,
     };
-    (model, effort)
+    crate::core::ResolvedModelSelection {
+        model,
+        reasoning_effort: effort,
+        provider,
+    }
 }
 
 /// Whether a typed-instead-of-clicked message is eligible to answer a pending
@@ -176,15 +208,19 @@ impl LucidosEngine {
         app_context: Option<AppContext>, // app context if chatting from within an app
         file_context: Option<String>,    // file path if user is viewing a file
         reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
+        // Backend to serve the model, when it has more than one route. Honoured
+        // or refused, never substituted. `None` lets the row's own preferred
+        // provider decide, then its first configured route.
+        provider_override: Option<&str>,
         user_images: Option<&[crate::api::ChatImage]>, // base64-encoded images pasted by user
-        device_id: Option<&str>,         // device that sent this message
-        use_coding_agent: Option<bool>,  // bypass LLM and spawn a coding agent directly
-        event_id: Option<&str>,          // client-generated UUID for reliable matching
-        thread_id: Option<Uuid>,         // None = new thread, Some = follow-up
+        device_id: Option<&str>,                       // device that sent this message
+        use_coding_agent: Option<bool>, // bypass LLM and spawn a coding agent directly
+        event_id: Option<&str>,         // client-generated UUID for reliable matching
+        thread_id: Option<Uuid>,        // None = new thread, Some = follow-up
         conflict_change_id: Option<Uuid>, // change ID for merge conflict resolution
-        repo_id: Option<&str>,           // external repository ID for CC worktree
+        repo_id: Option<&str>,          // external repository ID for CC worktree
         url_context: Option<crate::api::UrlContext>, // webpage content from Tauri panel webview
-        parent_thread_id: Option<Uuid>,  // parent thread if spawned by run_thread
+        parent_thread_id: Option<Uuid>, // parent thread if spawned by run_thread
         spawning_event_id: Option<Uuid>, // event in parent thread that triggered the spawn (mode != Human only)
         mode: ActorMode,
         cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
@@ -220,18 +256,25 @@ impl LucidosEngine {
         // turn's already-persisted MessageReceived (`events.id`); exclude it so
         // the per-thread lookup reads the PRIOR message, not this one. In the
         // normal path it's `None` and the current turn isn't emitted until later.
-        let (resolved_model, resolved_effort) = resolve_route_overrides(
+        let configured = self.current_provider().configured_providers();
+        let resolved = resolve_route_overrides(
             &self.pool,
             &self.model_registry,
+            |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
             use_coding_agent,
             thread_id,
             pre_emitted_origin.map(PreEmittedOrigin::event_id),
-            model_override,
-            reasoning_effort,
+            crate::core::ResolvedModelSelection {
+                model: model_override.map(str::to_string),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                provider: provider_override.map(str::to_string),
+            },
         )
         .await;
-        let model_override = resolved_model.as_deref();
-        let reasoning_effort = resolved_effort.as_deref();
+        let model_override = resolved.model.as_deref();
+        let reasoning_effort = resolved.reasoning_effort.as_deref();
+        let provider_override = resolved.provider.as_deref();
+        let chosen_provider = resolved.as_selection().provider;
 
         // Resolve device tooltip info for the MessageReceived event
         let device_name = if let Some(did) = device_id {
@@ -624,6 +667,7 @@ impl LucidosEngine {
                                 mode,
                                 None,
                                 None,
+                                None,
                                 origin.clone(),
                                 voice_session_id,
                             ),
@@ -781,6 +825,7 @@ impl LucidosEngine {
                                 mode,
                                 model_override,
                                 reasoning_effort,
+                                provider_override,
                                 origin.clone(),
                                 voice_session_id,
                             ),
@@ -916,10 +961,9 @@ impl LucidosEngine {
                     user_message,
                     tc.go_to_review,
                     // Already resolved above (trigger pin, else account
-                    // preference), the same values the loop is about to call
-                    // with, so the starter event records the actual run.
-                    model_override,
-                    reasoning_effort,
+                    // preference). The same three values the loop is about to
+                    // call with, so the starter event records the actual run.
+                    &resolved,
                 )
             } else {
                 let is_cc = use_coding_agent == Some(true);
@@ -940,6 +984,7 @@ impl LucidosEngine {
                         mode,
                         req_model,
                         req_effort,
+                        provider_override,
                         origin.clone(),
                         voice_session_id,
                     ),
@@ -1424,7 +1469,8 @@ impl LucidosEngine {
         // OpenRouter / xAI / Gemini / local ids and would hand them all 200k.
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
-        let total_budget = agent_context_char_budget(self.context_window_for(resolved_model));
+        let total_budget =
+            agent_context_char_budget(self.context_window_for(resolved_model, chosen_provider));
         let prompt_overhead: usize = system_prompt.len() + tools.defs_chars();
         let message_budget = total_budget.saturating_sub(prompt_overhead);
 
@@ -1717,8 +1763,9 @@ impl LucidosEngine {
                 &mut proposed_change,
                 user_images,
                 device_id,
-                model_override,
-                reasoning_effort,
+                // The whole resolved selection, so the provider this turn was
+                // pinned to is the one the router honours or refuses.
+                resolved.as_selection(),
                 &cancel_token,
                 &mut injection_rx,
                 guard.generation(),

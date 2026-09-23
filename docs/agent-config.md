@@ -245,7 +245,8 @@ Two settings files register hooks, and both apply.
 - **`.lucidos/cc-settings.json`** (generated per workspace by
   `crates/lucidos-engine/src/engine/cc_settings.rs`, passed with `--settings`):
   `PreToolUse` on `AskUserQuestion`, `Bash`, `Read`, `Edit` and `Write`, a
-  `Stop` hook, the default model, and `permissions.additionalDirectories`.
+  `Stop` hook, and `permissions.additionalDirectories`. It sets no model or
+  effort: CC ranks this file above the user's own settings.
   The hooks call `lucidos` subcommands.
 
 `permissions.deny` in `.claude/settings.json` blocks reads of build output and

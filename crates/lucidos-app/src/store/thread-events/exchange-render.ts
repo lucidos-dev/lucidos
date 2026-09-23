@@ -7,10 +7,10 @@ import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardo
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
-import type { ActorMode, EventSubscription, EventWaitCancelCause, SequencedEvent, ThreadEvent } from './thread-event-types';
+import type { ActorMode, EventSubscription, EventWaitCancelCause, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
-type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string };
+type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string; call_event_id?: string };
 
 /** How an exchange ended, as far as its pending steps are concerned.
  *  `null` = no terminator yet, or the agent resumed past one.
@@ -27,8 +27,8 @@ function pendingOutcomeFor(terminal: TerminalKind): StepOutcome {
   return terminal === 'unclean' ? 'unfinished' : 'success';
 }
 
-/** Resolve the last pending step. Backwards, so parallel tool calls resolve in
- *  LIFO order as their results arrive. */
+/** Resolve the last pending step matching `pred`. Backwards, so legacy
+ *  parallel results with no call id resolve in LIFO order as they arrive. */
 function resolveLastPendingStep(
   steps: StepLike[],
   pred?: (s: StepLike) => boolean,
@@ -39,6 +39,19 @@ function resolveLastPendingStep(
       return;
     }
   }
+}
+
+/** Which row a chat `ToolResult` resolves. A result names its call, because a
+ *  parallel run answers in completion order (ADR 0246), so it resolves that
+ *  call's row and no other. A legacy result carries no id and keeps `legacy`,
+ *  the positional rule. The id narrows `legacy` rather than replacing it, so
+ *  `await_event` still resolves only its own step. */
+function answeredBy(
+  event: StoredEvent,
+  legacy: (s: StepLike) => boolean,
+): (s: StepLike) => boolean {
+  const callId = (event as { tool_called_event_id?: string }).tool_called_event_id;
+  return callId ? s => s.call_event_id === callId && legacy(s) : legacy;
 }
 
 /** Force ALL pending steps to `outcome`, so spinners don't persist on finished
@@ -158,7 +171,8 @@ const isAwaitEventStep = (s: StepLike) => s.tool_name === AWAIT_EVENT_TOOL;
  *
  *  Only the FIRST action of a pass takes the row: naming it stops it matching
  *  `isThinking`. Parallel calls behind it must push rows of their own, since a
- *  result pairs back by `tool_use_id`. False means no claimable row, so the
+ *  result pairs back by its call's id (`call_event_id` for chat, `tool_use_id`
+ *  for a coding agent). False means no claimable row, so the
  *  caller pushes a fresh one. An `unfinished` marker is not claimable: that
  *  turn died, so a later call is not the pass's own. */
 function nameThinkingRow<T extends StepLike>(rows: T[], naming: Partial<T>): boolean {
@@ -427,12 +441,13 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         const naming = {
           description: e.description || describeEngineTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
+          ...(event._eventId ? { call_event_id: event._eventId } : {}),
         };
         if (!nameThinkingRow(steps, naming)) steps.push({ ...naming });
         break;
       }
       case 'ToolResult':
-        resolveLastPendingStep(steps, isNotThinking);
+        resolveLastPendingStep(steps, answeredBy(event, isNotThinking));
         break;
       case 'CodingAgentPromptSent':
         steps.push({ description: 'Thinking', outcome: 'pending' });
@@ -546,15 +561,16 @@ function lastPendingStepIndex(events: ResponseEvent[], pred?: (s: StepLike) => b
 
 /** The denied step an arriving chat `ToolResult` belongs to, or null.
  *
- *  The chat lanes pair a result to the last PENDING step, and a denied one is
- *  no longer pending. So the refusal the guard hands back would land nowhere,
+ *  The chat lanes pair a result to its PENDING step, and a denied one is no
+ *  longer pending. So the refusal the guard hands back would land nowhere,
  *  and the step detail would show a refused command with no explanation. Only
- *  a step still missing its result can claim one, and the chat agentic loop is
- *  sequential, so at most one is ever waiting. */
+ *  a step still missing its result can claim one. A gated call never joins a
+ *  parallel run, so at most one is ever waiting; `answers` still pins it. */
 function lastDeniedStepAwaitingResult(
   events: ResponseEvent[],
+  answers: (s: StepLike) => boolean,
 ): Extract<ResponseEvent, { type: 'step' }> | null {
-  const idx = lastStepIndex(events, s => s.outcome === 'denied');
+  const idx = lastStepIndex(events, s => s.outcome === 'denied' && answers(s));
   const step = idx >= 0 ? events[idx] : undefined;
   if (!step || step.type !== 'step' || step.result !== undefined) return null;
   return step;
@@ -750,10 +766,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // generic walk would tick off whatever call the re-entered turn has
         // since started. It still resolves the real thing on the
         // rejected-subscription path, where no row replaced the step.
-        const resolved = resolveLastPendingResponseStep(
-          events,
-          toolResult.name === AWAIT_EVENT_TOOL ? isAwaitEventStep : isNotThinking,
-        ) ?? lastDeniedStepAwaitingResult(events);
+        const answers = answeredBy(event, toolResult.name === AWAIT_EVENT_TOOL ? isAwaitEventStep : isNotThinking);
+        const resolved = resolveLastPendingResponseStep(events, answers)
+          ?? lastDeniedStepAwaitingResult(events, answers);
         if (resolved) {
           if (toolResult.result !== undefined) resolved.result = toolResult.result;
           // Always stamp the source event id so a re-fetch path can address

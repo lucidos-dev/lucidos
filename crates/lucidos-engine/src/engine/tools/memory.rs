@@ -26,7 +26,13 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
         content: MessageContent::Text(prompt),
     }];
     let response = match provider
-        .chat(messages, vec![], None, None, None, None)
+        .chat(
+            messages,
+            vec![],
+            crate::llm::ModelSelection::default(),
+            None,
+            None,
+        )
         .await
     {
         Ok(response) => response,

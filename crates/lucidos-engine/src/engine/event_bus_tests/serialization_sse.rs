@@ -6,6 +6,7 @@ fn bus_event_variants_are_constructable() {
     let thread_event = BusEvent::Thread {
         thread_id: Uuid::new_v4(),
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "hello".into(),
             user_image_hashes: vec![],
@@ -154,6 +155,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
         typed: BusEvent::Thread {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: "hello".into(),
                 user_image_hashes: vec![],
@@ -197,6 +199,7 @@ fn thread_event_sse_json_includes_meta_channel() {
         typed: BusEvent::Thread {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: "fix bug".into(),
                 user_image_hashes: vec![],
@@ -237,6 +240,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
         typed: BusEvent::Thread {
             thread_id: tid,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: "hello".into(),
                 user_image_hashes: vec![],

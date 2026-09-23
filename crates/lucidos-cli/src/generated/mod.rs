@@ -165,6 +165,9 @@ pub enum TriggersCmd {
         /// Thinking budget for this trigger's intent runs. Omit or null for the account default.
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// Backend for the pinned model when it has more than one route. Requires a model pin and must be one of its routes. Omit or null for the model's own preferred provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Every trigger with its schedule, subscriptions and what it runs.
     List,
@@ -209,6 +212,9 @@ pub enum TriggersCmd {
         /// Thinking budget for this trigger's intent runs. Omit or null for the account default.
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// Backend for the pinned model when it has more than one route. Requires a model pin and must be one of its routes. Omit or null for the model's own preferred provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Delete a trigger; it orphans the run history, so prefer update for tweaks.
     Delete {
@@ -239,6 +245,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             slug,
             model,
             reasoning_effort,
+            provider,
         } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut body = serde_json::Map::new();
@@ -287,6 +294,9 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             if let Some(v) = reasoning_effort {
                 body.insert("reasoning_effort".into(), serde_json::json!(v));
             }
+            if let Some(v) = provider {
+                body.insert("provider".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -309,6 +319,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             slug,
             model,
             reasoning_effort,
+            provider,
         } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
@@ -365,6 +376,9 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             }
             if let Some(v) = reasoning_effort {
                 body.insert("reasoning_effort".into(), serde_json::json!(v));
+            }
+            if let Some(v) = provider {
+                body.insert("provider".into(), serde_json::json!(v));
             }
             let req = client()?
                 .put(&url)
@@ -784,7 +798,7 @@ pub fn dispatch_env_vars(ws: &Workspace, cmd: EnvVarsCmd) -> Result<(), BoxError
 pub enum ModelsCmd {
     /// Every model, enabled and disabled, builtin and user.
     List,
-    /// Register a new model in the picker.
+    /// Register a new model; needs provider or routes.
     Add {
         /// The string sent in API requests (e.g. 'z-ai/glm-5.2').
         #[arg(long)]
@@ -792,17 +806,20 @@ pub enum ModelsCmd {
         /// Display name; defaults to the id.
         #[arg(long)]
         label: Option<String>,
-        /// Backend that serves the model.
+        /// Backend that serves the model: the single-route shorthand, applied to the first route.
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
         /// Lower sorts first; user models default to 1000.
         #[arg(long)]
         sort_order: Option<i64>,
         /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
+        /// Every backend that serves the model, in priority order, e.g. [{"provider":"vertex"},{"provider":"openrouter","id":"anthropic/claude-opus-5-5","context_window":200000}]. `id` defaults to the model id. Replaces provider and context_window when given.
+        #[arg(long)]
+        routes: Option<String>,
     },
-    /// Edit label, provider, sort_order or enabled.
+    /// Edit routes or preferred_provider; label and sort_order on user models only.
     Update {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]
@@ -810,7 +827,7 @@ pub enum ModelsCmd {
         /// Display name; defaults to the id.
         #[arg(long)]
         label: Option<String>,
-        /// Backend that serves the model.
+        /// Backend that serves the model: the single-route shorthand, applied to the first route.
         #[arg(long)]
         provider: Option<String>,
         /// Lower sorts first; user models default to 1000.
@@ -822,6 +839,12 @@ pub enum ModelsCmd {
         /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
+        /// Every backend that serves the model, in priority order, e.g. [{"provider":"vertex"},{"provider":"openrouter","id":"anthropic/claude-opus-5-5","context_window":200000}]. `id` defaults to the model id. Replaces provider and context_window when given.
+        #[arg(long)]
+        routes: Option<String>,
+        /// The backend to use for this model when more than one route is configured. Must be one of its routes.
+        #[arg(long)]
+        preferred_provider: Option<String>,
     },
     /// Delete a user-added model.
     Delete {
@@ -845,6 +868,7 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             provider,
             sort_order,
             context_window,
+            routes,
         } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut body = serde_json::Map::new();
@@ -852,12 +876,21 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             if let Some(v) = label {
                 body.insert("label".into(), serde_json::json!(v));
             }
-            body.insert("provider".into(), serde_json::json!(provider));
+            if let Some(v) = provider {
+                body.insert("provider".into(), serde_json::json!(v));
+            }
             if let Some(v) = sort_order {
                 body.insert("sort_order".into(), serde_json::json!(v));
             }
             if let Some(v) = context_window {
                 body.insert("context_window".into(), serde_json::json!(v));
+            }
+            if let Some(v) = routes {
+                body.insert(
+                    "routes".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--routes must be valid JSON: {}", e))?,
+                );
             }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
@@ -869,6 +902,8 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             sort_order,
             enabled,
             context_window,
+            routes,
+            preferred_provider,
         } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
@@ -888,6 +923,16 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             }
             if let Some(v) = context_window {
                 body.insert("context_window".into(), serde_json::json!(v));
+            }
+            if let Some(v) = routes {
+                body.insert(
+                    "routes".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--routes must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = preferred_provider {
+                body.insert("preferred_provider".into(), serde_json::json!(v));
             }
             let req = client()?
                 .put(&url)

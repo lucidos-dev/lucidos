@@ -46,7 +46,6 @@ fn cc_running_shows_no_close_actions() {
         false,
         false,
         false,
-        false,
     );
     assert_eq!(actions, vec![Action::ApplyWhenSettled, Action::Save]);
 }
@@ -234,7 +233,6 @@ fn waiting_for_user_answer_returns_no_actions() {
                 ThreadStatus::WaitingForUserAnswer,
                 section,
                 has_changes,
-                false,
                 false,
                 false,
                 false,

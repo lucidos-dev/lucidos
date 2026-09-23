@@ -64,7 +64,7 @@ async fn context_window_round_trips_over_http() {
 
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(
-        listed["context_window"], 1_048_576,
+        listed["routes"][0]["context_window"], 1_048_576,
         "the declared window must survive the create round trip"
     );
 
@@ -82,7 +82,7 @@ async fn context_window_round_trips_over_http() {
         true
     );
     let listed = find_model(&client, &api, &id).await.expect("model listed");
-    assert_eq!(listed["context_window"], 262_144);
+    assert_eq!(listed["routes"][0]["context_window"], 262_144);
 
     // A PUT that doesn't mention the field must LEAVE IT ALONE — otherwise
     // toggling `enabled` from the Settings row would silently wipe the window
@@ -97,7 +97,7 @@ async fn context_window_round_trips_over_http() {
     assert_eq!(resp.status(), 200);
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(
-        listed["context_window"], 262_144,
+        listed["routes"][0]["context_window"], 262_144,
         "an unrelated PUT must not clear the declared window"
     );
     assert_eq!(listed["enabled"], false);
@@ -113,7 +113,7 @@ async fn context_window_round_trips_over_http() {
     assert_eq!(resp.status(), 200);
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert!(
-        listed["context_window"].is_null(),
+        listed["routes"][0]["context_window"].is_null(),
         "an explicit null must clear the declaration"
     );
 
@@ -143,13 +143,18 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
     for (id, expected) in [
         // Adaptive Claude sends the effort verbatim, so every tier is distinct.
         (
-            "claude-opus-5@default",
+            "claude-opus-5",
             vec!["none", "low", "medium", "high", "xhigh", "max"],
         ),
-        // The same answer on the direct Anthropic provider, not just Vertex.
+        // A model that always thinks has no `none`, on the direct Anthropic
+        // provider as on Vertex.
         (
             "claude-fable-5-1",
-            vec!["none", "low", "medium", "high", "xhigh", "max"],
+            vec!["low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "claude-opus-5-5",
+            vec!["low", "medium", "high", "xhigh", "max"],
         ),
         // The Claude budget path deliberately omits xhigh.
         (
@@ -182,9 +187,9 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
         let m = find_model(&client, &api, id)
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
-        let tiers: Vec<&str> = m["reasoning_efforts"]
+        let tiers: Vec<&str> = m["routes"][0]["reasoning_efforts"]
             .as_array()
-            .unwrap_or_else(|| panic!("{id} must carry reasoning_efforts at the top level"))
+            .unwrap_or_else(|| panic!("{id} must carry reasoning_efforts on its route"))
             .iter()
             .map(|v| v.as_str().expect("tier is a string"))
             .collect();
@@ -212,7 +217,7 @@ async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
 
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(
-        listed["reasoning_efforts"],
+        listed["routes"][0]["reasoning_efforts"],
         json!(["none", "low", "medium", "high"])
     );
 
@@ -242,10 +247,10 @@ async fn seeded_grok_models_report_xai_and_their_declared_windows() {
         let m = find_model(&client, &api, id)
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
-        assert_eq!(m["provider"], "xai", "{id}");
+        assert_eq!(m["routes"][0]["provider"], "xai", "{id}");
         assert_eq!(m["source"], "builtin", "{id}");
         assert_eq!(m["enabled"], enabled, "{id}");
-        assert_eq!(m["context_window"], window, "{id}");
+        assert_eq!(m["routes"][0]["context_window"], window, "{id}");
     }
 }
 
@@ -285,8 +290,8 @@ async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
     let via_openrouter = find_model(&client, &api, prefixed)
         .await
         .expect("the prefixed id must list as its own row");
-    assert_eq!(bare["provider"], "xai");
-    assert_eq!(via_openrouter["provider"], "openrouter");
+    assert_eq!(bare["routes"][0]["provider"], "xai");
+    assert_eq!(via_openrouter["routes"][0]["provider"], "openrouter");
 
     delete_model(&client, &api, prefixed).await;
     assert!(
@@ -322,14 +327,14 @@ async fn the_keyless_provider_is_accepted_at_the_models_api() {
     );
 
     let listed = find_model(&client, &api, &id).await.expect("model listed");
-    assert_eq!(listed["provider"], "opencode-free");
+    assert_eq!(listed["routes"][0]["provider"], "opencode-free");
 
     // The seed ships six of these, with their windows declared.
     let seeded = find_model(&client, &api, "laguna-s-2.1-free")
         .await
         .expect("the seeded free models must be listed");
-    assert_eq!(seeded["provider"], "opencode-free");
-    assert_eq!(seeded["context_window"], 256_000);
+    assert_eq!(seeded["routes"][0]["provider"], "opencode-free");
+    assert_eq!(seeded["routes"][0]["context_window"], 256_000);
 
     delete_model(&client, &api, &id).await;
 }
@@ -351,7 +356,7 @@ async fn omitted_context_window_is_null() {
     assert_eq!(resp.status(), 200);
 
     let listed = find_model(&client, &api, &id).await.expect("model listed");
-    assert!(listed["context_window"].is_null());
+    assert!(listed["routes"][0]["context_window"].is_null());
 
     delete_model(&client, &api, &id).await;
 }
@@ -385,7 +390,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert_eq!(m["source"], "builtin");
         assert_eq!(
-            m["context_window"], 1_048_576,
+            m["routes"][0]["context_window"], 1_048_576,
             "{id} must declare its real 1M window — the prefix map gives it 200k"
         );
     }
@@ -407,7 +412,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert_eq!(m["source"], "builtin");
         assert_eq!(
-            m["context_window"], 1_050_000,
+            m["routes"][0]["context_window"], 1_050_000,
             "{id} must declare its real window — the prefix map understates it at 400k"
         );
     }
@@ -419,40 +424,41 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-fable-5-1[1m]",
         "claude-fable-5[1m]",
         "claude-opus-5-5[1m]",
-        "claude-opus-5@default[1m]",
-        "claude-opus-4-8@default[1m]",
+        "claude-opus-5[1m]",
+        "claude-opus-4-8[1m]",
         "claude-opus-4-7[1m]",
         "claude-opus-4-6[1m]",
         "claude-sonnet-5[1m]",
         "claude-sonnet-4-6[1m]",
+        // Bare rows of the families whose DEFAULT window is 1M: their bare
+        // request needs no beta, so it is 1M as well.
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-5-5",
+        "claude-opus-5",
     ] {
         let m = find_model(&client, &api, id)
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert_eq!(m["source"], "builtin");
         assert_eq!(
-            m["context_window"], 1_000_000,
-            "{id} requests 1M mode, so its declared window must say so"
+            m["routes"][0]["context_window"], 1_000_000,
+            "{id} runs a 1M window, so its declared window must say so"
         );
     }
 
     // Undeclared on purpose, and this is the load-bearing half of the contract:
-    //   * bare `claude-*` — 1M mode is gated on Lucidos's own `[1m]` suffix, so a
-    //     bare id sends no `context-1m-2025-08-07` beta and 200k really is the
-    //     window of the request the engine makes. Declaring 1M here would let the
-    //     packer build a prompt larger than the API mode selected — the dangerous
-    //     direction, since the provider then rejects it outright.
+    //   * the other bare `claude-*` rows: 1M mode is gated on Lucidos's own
+    //     `[1m]` suffix, and 1M is not their default. So 200k really is the
+    //     window of the request the engine makes. Declaring 1M here would let
+    //     the packer build a prompt the provider then rejects outright.
     //   * the older GPT rows — windows unverified, and under-declaring only trims
     //     early while over-declaring breaks the request.
     // (`claude-opus-4-5@20251101` is deliberately absent: it is the row
     // `builtin_accepts_context_window_but_keeps_its_identity` mutates, and these
     // tests share one database within a run.)
     for id in [
-        "claude-fable-5-1",
-        "claude-fable-5",
-        "claude-opus-5-5",
-        "claude-opus-5@default",
-        "claude-opus-4-8@default",
+        "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-sonnet-5",
@@ -466,7 +472,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert!(
-            m["context_window"].is_null(),
+            m["routes"][0]["context_window"].is_null(),
             "{id} must stay undeclared — the prefix map is authoritative for it"
         );
     }
@@ -475,8 +481,9 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
 /// A **builtin** must accept a context-window correction while keeping its
 /// identity fields. The window is a factual property of the model — the vendor
 /// can raise it, and a seeded value can simply be wrong — so refusing the edit
-/// would strand a builtin on a bad window forever. Identity (label / provider /
-/// sort_order) stays engine-owned.
+/// would strand a builtin on a bad window forever. Identity (label and
+/// sort_order) stays engine-owned. Its routes are not identity, so the test
+/// leaves them alone rather than asserting a provider edit is ignored.
 ///
 /// Runs against a real migration-seeded builtin, and restores its declared
 /// window at the end: the database is recreated per run, but the registry is
@@ -495,18 +502,18 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
         .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
     assert_eq!(seeded["source"], "builtin");
     let label = seeded["label"].clone();
-    let provider = seeded["provider"].clone();
+    let provider = seeded["routes"][0]["provider"].clone();
     let sort_order = seeded["sort_order"].clone();
-    let seeded_window = seeded["context_window"].clone();
+    let seeded_window = seeded["routes"][0]["context_window"].clone();
 
     let resp = client
         .put(format!("{}/api/v1/models", api))
         .query(&[("id", id)])
         .json(&json!({
             "context_window": 1_048_576,
-            // These must be ignored — a builtin's identity is engine-owned.
+            // Ignored: a builtin's label is engine-owned. Its routes are not,
+            // so a `provider` here would re-route it, and this test sends none.
             "label": "Hijacked",
-            "provider": "local",
         }))
         .send()
         .await
@@ -519,11 +526,14 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
 
     let listed = find_model(&client, &api, id).await.expect("model listed");
     assert_eq!(
-        listed["context_window"], 1_048_576,
+        listed["routes"][0]["context_window"], 1_048_576,
         "a builtin's context window must be correctable"
     );
     assert_eq!(listed["label"], label, "identity must not change");
-    assert_eq!(listed["provider"], provider, "identity must not change");
+    assert_eq!(
+        listed["routes"][0]["provider"], provider,
+        "a window edit must not move the route"
+    );
     assert_eq!(listed["sort_order"], sort_order, "identity must not change");
     assert_eq!(listed["source"], "builtin");
 
@@ -541,7 +551,7 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
     );
     let listed = find_model(&client, &api, id).await.expect("model listed");
     assert_eq!(
-        listed["context_window"], 1_048_576,
+        listed["routes"][0]["context_window"], 1_048_576,
         "rejected edit changes nothing"
     );
 
@@ -559,7 +569,7 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
     );
     let listed = find_model(&client, &api, id).await.expect("model listed");
     assert_eq!(
-        listed["context_window"], seeded_window,
+        listed["routes"][0]["context_window"], seeded_window,
         "the seeded window must be restored for the rest of the run"
     );
 }

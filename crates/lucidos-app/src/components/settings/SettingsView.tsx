@@ -27,6 +27,7 @@ import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import {
   loadChatModels, lucidosModelChoices, modelReasoningEfforts, LUCIDOS_TIER_VOCABULARY,
+  rememberProvider,
 } from '../../store/actions/models';
 import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
@@ -1171,7 +1172,10 @@ export function SettingsView() {
             vocabulary={LUCIDOS_TIER_VOCABULARY}
             model={currentModel.value}
             effort={reasoningEffort.value}
-            onChange={(p) => void setChatModelSelection(p)}
+            onChange={(p) => {
+              void setChatModelSelection(p);
+              if (p.provider) void rememberProvider(p.model, p.provider);
+            }}
           />
           <div class="settings-row" data-search-anchor="models:max-tool-calls">
             <span class="settings-row-label">

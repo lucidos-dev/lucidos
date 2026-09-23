@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 fn message_received(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.to_string(),
         user_image_hashes: vec![],

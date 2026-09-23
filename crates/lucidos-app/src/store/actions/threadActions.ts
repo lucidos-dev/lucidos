@@ -102,7 +102,6 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     hasPendingChanges,
     descendantsBlockArchive,
     thread.meta.liveEventWaitCount > 0,
-    thread.meta.activeChildrenCount > 0,
     hasUnsentDraft,
     isSaved,
   );
@@ -133,8 +132,9 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     });
   }
   // The standing apply is an Apply the owner presses early, so it goes wherever
-  // Apply goes. An external repo has no Apply to arm.
-  if (isExternalRepo) {
+  // Apply goes. An external repo has no Apply to arm, and a change resolving
+  // merge conflicts is already mid-apply.
+  if (isExternalRepo || pendingChange?.resolving_conflict) {
     kinds = kinds.filter((a) => a !== 'apply_when_settled');
   }
 

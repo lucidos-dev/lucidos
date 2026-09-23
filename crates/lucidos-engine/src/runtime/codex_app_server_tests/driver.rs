@@ -73,6 +73,7 @@ fn stub_driver(turn_body: &str, resume: Option<&str>, continuation: bool) -> Stu
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
         env: vec![(
             std::ffi::OsString::from("STUB_LOG"),
             requests_log.clone().into_os_string(),
@@ -518,6 +519,7 @@ done
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
         env: vec![(
             std::ffi::OsString::from("STUB_LOG"),
             requests_log.clone().into_os_string(),

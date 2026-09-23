@@ -86,6 +86,8 @@ mod ws_echo;
 /// rest of `proxy` stays crate-internal.
 pub use proxy::{load_proxy_config, InsecureTransport, ProxyConfigLoad, RejectedProvider};
 pub use proxy_builtin::local_upstream_base_url;
+/// The model write rules, re-exported so `manage_models` applies the same ones.
+pub(crate) use settings::{apply_model_update, routes_for_create};
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -118,8 +120,8 @@ use uuid::Uuid;
 
 use crate::core::oauth::OAuthFlowResult;
 use crate::core::{
-    AppManager, ArtifactManager, ConversationSnapshot, CredentialInfo, EventStore, Model,
-    OAuthAccountInfo, SessionMessage,
+    AppManager, ArtifactManager, ConversationSnapshot, CredentialInfo, EventStore,
+    OAuthAccountInfo, Route, SessionMessage,
 };
 use crate::engine::{CaptureResult, LucidosEngine};
 use crate::memory::{EmbedderSlot, PgVectorIndex};
@@ -494,6 +496,12 @@ pub struct ChatRequest {
     pub repo_file_context: Option<RepoFileContext>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Backend to serve the model on this turn, when it has more than one
+    /// route. Honoured or refused, never substituted: a value naming an
+    /// unconfigured backend errors rather than running somewhere else. Absent
+    /// lets the model's own preferred provider decide.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
     /// Forward-compat: when set, the handler resolves each hash against the
@@ -742,19 +750,44 @@ where
 
 // Model registry types
 
-/// A registry row plus what the engine derives about it. Flattened, so the wire
-/// shape is the `Model` row's own fields with the derived ones alongside.
+/// One of a model's routes, plus what the engine derives about it.
 ///
 /// `reasoning_efforts` exists so the Lucidos Agent picker filters against the
-/// tiers the engine will actually send rather than deriving its own answer from
-/// the model id. Both used to derive it separately and disagreed, which is how
-/// a local model was offered a tier its server rejected. See
+/// efforts the engine will actually send rather than deriving its own answer
+/// from the model id. Both used to derive it separately and disagreed, which is
+/// how a local model was offered a tier its server rejected. See
 /// `llm::reasoning::supported_efforts`, the single source of truth.
+///
+/// It sits on the ROUTE because the answer depends on the backend as much as on
+/// the model. The same Claude id offers six efforts on Vertex and four through
+/// OpenRouter, whose server has no `xhigh`.
+#[derive(Serialize)]
+pub struct RouteInfo {
+    pub provider: String,
+    /// The id this route puts on the wire, always spelled out here even when
+    /// the stored route leaves it to default. A client comparing routes should
+    /// not have to re-derive it.
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
+    pub reasoning_efforts: &'static [&'static str],
+}
+
+/// A registry row as the API serves it: its own fields, with `routes` replaced
+/// by the derived [`RouteInfo`] list.
+///
+/// Spelled out rather than flattened over `Model`, because the served `routes`
+/// carry a field the stored ones do not. A flatten would emit the key twice.
 #[derive(Serialize)]
 pub struct ModelInfo {
-    #[serde(flatten)]
-    pub model: Model,
-    pub reasoning_efforts: &'static [&'static str],
+    pub id: String,
+    pub label: String,
+    pub routes: Vec<RouteInfo>,
+    pub preferred_provider: Option<String>,
+    pub sort_order: i32,
+    pub source: String,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize)]
@@ -781,19 +814,29 @@ pub struct CreateModelRequest {
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
     /// "openrouter" | "xai" | "opencode-free" | "local". Validated by
     /// `settings::valid_provider`.
-    pub provider: String,
+    ///
+    /// The single-route shorthand, and what nearly every caller sends. With
+    /// `routes` given it is ignored; with neither, the request is refused.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
     pub sort_order: Option<i32>,
     /// Context window in tokens. Omit to let the engine infer it from the model
     /// id — only worth setting for ids the id-shape fallback gets wrong (every
     /// OpenRouter / xAI / Gemini / local model, which otherwise takes 200k).
+    /// The other half of the single-route shorthand, ignored with `routes`.
     #[serde(default)]
     pub context_window: Option<i32>,
+    /// Every backend that can serve this model, in priority order. Use it for a
+    /// model reachable more than one way, such as a Claude id served by both
+    /// Vertex and the direct Anthropic API.
+    #[serde(default)]
+    pub routes: Option<Vec<Route>>,
 }
 
-/// PUT body for a model. For builtin rows only `enabled` is applied (disable-only);
-/// for user rows any provided field is updated, omitted fields keep their value.
+/// PUT body for a model, and the `manage_models` update args. A builtin row
+/// ignores `label` and `sort_order`. Omitted fields keep their value.
 #[derive(Deserialize)]
 pub struct UpdateModelRequest {
     #[serde(default)]
@@ -808,8 +851,24 @@ pub struct UpdateModelRequest {
     /// `null` CLEARS it, handing the model back to the id-shape fallback. The
     /// double `Option` is what distinguishes those two cases — serde maps a
     /// missing key to `None` and a literal `null` to `Some(None)`.
+    ///
+    /// Applies to the row's FIRST route, which is the single-route shorthand.
+    /// A row with several routes sets a window per route through `routes`.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub context_window: Option<Option<i32>>,
+    /// Replace the whole route list, in priority order. Accepted on a builtin
+    /// too: which backends serve a model is a fact the vendor can change, like
+    /// `context_window`, not part of the row's engine-owned identity.
+    #[serde(default)]
+    pub routes: Option<Vec<Route>>,
+    /// The provider to remember for this model. Absent keeps the stored pick;
+    /// an explicit `null` clears it back to the first configured route. Must
+    /// name one of the row's routes.
+    ///
+    /// This is the model picker's write path, so it is accepted on a builtin.
+    /// Refusing it there would leave every seeded model stuck on one backend.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub preferred_provider: Option<Option<String>>,
 }
 
 /// The engine's read-back on a trigger's cron after a create or update: the fire

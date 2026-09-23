@@ -30,6 +30,7 @@ import {
   resolveCodingAgent,
   resolveModel,
   resolveReasoningEffort,
+  resolveProvider,
   resolveCcModel,
   resolveCcReasoningEffort,
   type ComposeSelectionOverride,
@@ -1308,6 +1309,7 @@ export async function sendCompose(
   // when an override is absent (raw-new sends + follow-ups keep the old path).
   const modelOverride = resolveModel(threadId);
   const reasoningEffortOverride = resolveReasoningEffort(threadId);
+  const providerOverride = resolveProvider(threadId) ?? undefined;
   const ccModelOverride = resolveCcModel(threadId);
   const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);
   // Must run before the draft clear — see `markHashesAsSent`.
@@ -1336,6 +1338,7 @@ export async function sendCompose(
       focus: shouldFocus,
       modelOverride,
       reasoningEffortOverride,
+      providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
     });

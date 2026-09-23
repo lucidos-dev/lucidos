@@ -3,8 +3,8 @@ use super::*;
 use crate::core::environment_variables::validate_name;
 use crate::core::grants::{self, GrantFile};
 use crate::core::{
-    AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore, ModelStore,
-    OAuthStore, PinnedAppStore, PreferenceStore,
+    validate_routes, AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore,
+    ModelFields, ModelStore, OAuthStore, PinnedAppStore, PreferenceStore,
 };
 use crate::llm::{supported_efforts, ProviderKind};
 
@@ -537,36 +537,110 @@ pub(super) async fn delete_env_var(
 
 // ===== Model Registry Endpoints =====
 
-/// Provider values the registry accepts. Kept in lockstep with
-/// `crate::llm::model_registry::ProviderKind`.
-fn valid_provider(p: &str) -> bool {
-    matches!(
-        p,
-        "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "opencode-free" | "local"
-    )
+/// Resolve a `preferred_provider` against the routes it will sit beside.
+///
+/// A pick naming a backend the row cannot serve is refused rather than stored.
+/// `resolve_route` would treat it as stale and fall through, so nothing breaks,
+/// but a stored pick nothing honours is a setting that silently does nothing.
+fn preferred_provider_error(preferred: Option<&str>, routes: &[Route]) -> Option<String> {
+    let pick = preferred?;
+    routes
+        .iter()
+        .all(|r| r.provider != pick)
+        .then(|| format!("Model has no '{pick}' route to prefer"))
 }
 
-const PROVIDER_ERR: &str =
-    "Provider must be one of: vertex, anthropic, openai, openrouter, xai, opencode-free, local";
+/// The route list a new model stores. Shared with the `manage_models` tool.
+///
+/// `routes` wins; `provider` + `context_window` is the single-route shorthand
+/// every existing caller sends. Neither is a refusal, since a row with no route
+/// reaches no backend at all.
+pub(crate) fn routes_for_create(
+    routes: Option<Vec<Route>>,
+    provider: Option<String>,
+    context_window: Option<i32>,
+) -> Result<Vec<Route>, String> {
+    let routes = match (routes, provider) {
+        (Some(routes), _) => routes,
+        (None, Some(provider)) => vec![Route {
+            provider,
+            id: None,
+            context_window,
+        }],
+        (None, None) => return Err("A model needs a provider or routes".to_string()),
+    };
+    validate_routes(&routes)?;
+    Ok(routes)
+}
 
-const CONTEXT_WINDOW_ERR: &str =
-    "context_window must be a positive number of tokens (omit it to infer from the model id)";
-
-/// A declared context window must be positive — a zero or negative value would
-/// produce a zero (or, once cast, an enormous) trim budget. Absent is fine: the
-/// engine falls back to the id-shape guess.
-fn valid_context_window(w: Option<i32>) -> bool {
-    w.is_none_or(|w| w > 0)
+/// Apply an edit to a stored model: the fields to store, and `enabled`.
+/// Shared with the `manage_models` tool, so the two apply one rule set.
+///
+/// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
+/// there. Routes, the preferred pick and `enabled` apply to every row.
+///
+/// `provider` and `context_window` apply to the FIRST route, which is what the
+/// single-route shorthand means. Neither is identity: a vendor can raise a
+/// window, and a seeded value can simply be wrong.
+pub(crate) fn apply_model_update(
+    existing: &crate::core::Model,
+    request: UpdateModelRequest,
+) -> Result<(ModelFields, bool), String> {
+    let builtin = existing.is_builtin();
+    let mut routes = request.routes.unwrap_or_else(|| existing.routes.clone());
+    if request.provider.is_some() || request.context_window.is_some() {
+        let Some(first) = routes.first_mut() else {
+            return Err("A model needs at least one route".to_string());
+        };
+        if let Some(provider) = request.provider {
+            first.provider = provider;
+        }
+        if let Some(window) = request.context_window {
+            first.context_window = window;
+        }
+    }
+    validate_routes(&routes)?;
+    // An explicit pick is checked below. A stored one the new routes no longer
+    // serve is dropped instead: removing a route must not be refused for a pick
+    // the caller never mentioned.
+    let preferred_provider = match request.preferred_provider {
+        Some(pick) => pick,
+        None => existing
+            .preferred_provider
+            .clone()
+            .filter(|p| routes.iter().any(|r| &r.provider == p)),
+    };
+    if let Some(err) = preferred_provider_error(preferred_provider.as_deref(), &routes) {
+        return Err(err);
+    }
+    let label = match builtin {
+        true => existing.label.clone(),
+        false => request.label.unwrap_or_else(|| existing.label.clone()),
+    };
+    let sort_order = match builtin {
+        true => existing.sort_order,
+        false => request.sort_order.unwrap_or(existing.sort_order),
+    };
+    let fields = ModelFields {
+        label,
+        routes,
+        preferred_provider,
+        sort_order,
+    };
+    Ok((fields, request.enabled.unwrap_or(existing.enabled)))
 }
 
 /// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
 /// filters to `enabled`; the Settings → Models manager shows all.
 ///
-/// Each row carries the reasoning tiers its provider supports, derived here so
-/// the picker offers exactly what `RoutingProvider` will send. Derived per
-/// request rather than stored: it is a pure function of the row's provider and
-/// id, so a re-providered model is right immediately and a user adding a local
-/// model is never asked to declare tiers they cannot know.
+/// Each ROUTE carries the reasoning efforts its backend supports, derived here
+/// so the picker offers exactly what `RoutingProvider` will send. Per route
+/// rather than per row, because the answer depends on the backend: the same
+/// Claude id offers six efforts on Vertex and four through OpenRouter.
+///
+/// Derived per request rather than stored. It is a pure function of the route's
+/// provider and wire id. So a re-routed model is right immediately, and a user
+/// adding a local model is never asked to declare efforts they cannot know.
 pub(super) async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsListResponse>, (StatusCode, String)> {
@@ -576,14 +650,35 @@ pub(super) async fn list_models(
             format!("Failed to list models: {}", e),
         )
     })?;
-    let models = models
-        .into_iter()
-        .map(|model| ModelInfo {
-            reasoning_efforts: supported_efforts(ProviderKind::parse(&model.provider), &model.id),
-            model,
+    let models = models.into_iter().map(model_info).collect();
+    Ok(Json(ModelsListResponse { models }))
+}
+
+/// Serve one registry row, deriving each route's reasoning efforts.
+fn model_info(model: crate::core::Model) -> ModelInfo {
+    let routes = model
+        .routes
+        .iter()
+        .map(|r| {
+            let wire_id = r.wire_id(&model.id);
+            RouteInfo {
+                provider: r.provider.clone(),
+                id: wire_id.to_string(),
+                context_window: r.context_window,
+                reasoning_efforts: supported_efforts(ProviderKind::parse(&r.provider), wire_id),
+            }
         })
         .collect();
-    Ok(Json(ModelsListResponse { models }))
+    ModelInfo {
+        id: model.id,
+        label: model.label,
+        routes,
+        preferred_provider: model.preferred_provider,
+        sort_order: model.sort_order,
+        source: model.source,
+        enabled: model.enabled,
+        created_at: model.created_at,
+    }
 }
 
 /// GET /api/v1/response-styles: the merged *style library*.
@@ -610,7 +705,7 @@ pub(super) async fn create_model(
     headers: HeaderMap,
     Json(request): Json<CreateModelRequest>,
 ) -> Json<ApiResult> {
-    let id = request.id.trim();
+    let id = request.id.trim().to_string();
     if id.is_empty() {
         return ApiResult::err("Model id cannot be empty");
     }
@@ -618,32 +713,25 @@ pub(super) async fn create_model(
     // `manage_models` LLM handler and the `lucidos models add` CLI, whose --label
     // is optional). The Settings UI always supplies one.
     let label = match request.label.trim() {
-        l if !l.is_empty() => l,
-        _ => id,
+        l if !l.is_empty() => l.to_string(),
+        _ => id.clone(),
     };
-    if !valid_provider(&request.provider) {
-        return ApiResult::err(PROVIDER_ERR);
-    }
-    if !valid_context_window(request.context_window) {
-        return ApiResult::err(CONTEXT_WINDOW_ERR);
-    }
+    let routes = match routes_for_create(request.routes, request.provider, request.context_window) {
+        Ok(routes) => routes,
+        Err(err) => return ApiResult::err(err),
+    };
     // User models sort after the builtins by default.
     let sort_order = request.sort_order.unwrap_or(1000);
+    let fields = ModelFields {
+        label,
+        routes,
+        preferred_provider: None,
+        sort_order,
+    };
     // The store emits `ModelCreated` from inside its write path (the in-memory
     // ModelRegistry reloads on it), so resolve the device actor and hand it over.
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match ModelStore::create(
-        &state.pool,
-        &state.engine.event_bus,
-        id,
-        label,
-        &request.provider,
-        sort_order,
-        request.context_window,
-        actor,
-    )
-    .await
-    {
+    match ModelStore::create(&state.pool, &state.engine.event_bus, &id, &fields, actor).await {
         Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!(
             "Failed to create model (id may already exist): {}",
@@ -652,8 +740,16 @@ pub(super) async fn create_model(
     }
 }
 
-/// PUT /api/v1/models?id= — edit a model. Builtins keep their identity (id,
-/// label, provider, sort_order) but accept `enabled` and `context_window`.
+/// PUT /api/v1/models?id= to edit a model.
+///
+/// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
+/// there. They still accept `enabled`, `routes` and `preferred_provider`.
+///
+/// None of those three is identity. Which backends serve a model is a fact that
+/// changes, and `preferred_provider` is the model picker's own write path.
+/// Refusing it on a builtin would pin every seeded model to whichever backend
+/// the migration listed first.
+///
 /// User models update any provided field.
 pub(super) async fn update_model(
     State(state): State<AppState>,
@@ -666,64 +762,22 @@ pub(super) async fn update_model(
         Ok(None) => return ApiResult::err(format!("Model '{}' not found", query.id)),
         Err(e) => return ApiResult::err(format!("Failed to load model: {}", e)),
     };
-    // The store owns the `ModelUpdated` emit for both arms below.
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
-
-    let result = if existing.is_builtin() {
-        // Builtins keep their IDENTITY — label / provider / sort_order are
-        // engine-owned. `context_window` is not identity: it's a factual
-        // property of the model that the vendor can raise, and whose seeded
-        // value can simply be wrong. Refusing it would strand a builtin on a
-        // bad window with no way to correct it (and would silently no-op the
-        // documented `lucidos models update --id z-ai/glm-5.2 --context-window`).
-        let enabled = request.enabled.unwrap_or(existing.enabled);
-        let context_window = request.context_window.unwrap_or(existing.context_window);
-        if !valid_context_window(context_window) {
-            return ApiResult::err(CONTEXT_WINDOW_ERR);
-        }
-        ModelStore::update(
-            &state.pool,
-            &state.engine.event_bus,
-            &existing.id,
-            &existing.label,
-            &existing.provider,
-            existing.sort_order,
-            enabled,
-            context_window,
-            actor,
-        )
-        .await
-    } else {
-        let label = request.label.unwrap_or_else(|| existing.label.clone());
-        let provider = request
-            .provider
-            .unwrap_or_else(|| existing.provider.clone());
-        if !valid_provider(&provider) {
-            return ApiResult::err(PROVIDER_ERR);
-        }
-        let sort_order = request.sort_order.unwrap_or(existing.sort_order);
-        let enabled = request.enabled.unwrap_or(existing.enabled);
-        // Absent keeps the stored window; an explicit `null` clears it back to
-        // the id-shape fallback (see `UpdateModelRequest::context_window`).
-        let context_window = request.context_window.unwrap_or(existing.context_window);
-        if !valid_context_window(context_window) {
-            return ApiResult::err(CONTEXT_WINDOW_ERR);
-        }
-        ModelStore::update(
-            &state.pool,
-            &state.engine.event_bus,
-            &existing.id,
-            &label,
-            &provider,
-            sort_order,
-            enabled,
-            context_window,
-            actor,
-        )
-        .await
+    let (fields, enabled) = match apply_model_update(&existing, request) {
+        Ok(applied) => applied,
+        Err(err) => return ApiResult::err(err),
     };
-
-    match result {
+    // The store owns the `ModelUpdated` emit.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match ModelStore::update(
+        &state.pool,
+        &state.engine.event_bus,
+        &existing.id,
+        &fields,
+        enabled,
+        actor,
+    )
+    .await
+    {
         Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to update model: {}", e)),
     }
@@ -2214,38 +2268,6 @@ mod email_oauth_tests {
         );
 
         crate::test_support::teardown_test_db(&db_name).await;
-    }
-}
-
-#[cfg(test)]
-mod provider_validation_tests {
-    use super::*;
-
-    /// `valid_provider` must accept exactly the `ProviderKind` column values and
-    /// reject anything else. The accepted list is spelled through `as_str`.
-    /// Renaming a column value on the enum then fails here, rather than making
-    /// the API reject rows the registry itself writes.
-    #[test]
-    fn valid_provider_accepts_known_and_rejects_unknown() {
-        for kind in [
-            ProviderKind::Vertex,
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAi,
-            ProviderKind::OpenRouter,
-            ProviderKind::XAi,
-            ProviderKind::OpenCodeFree,
-            ProviderKind::Local,
-        ] {
-            let ok = kind.as_str();
-            assert!(valid_provider(ok), "{ok} must be accepted");
-            assert!(
-                PROVIDER_ERR.contains(ok),
-                "the error message must name {ok} as an option"
-            );
-        }
-        for bad in ["", "Vertex", "openai ", "ollama", "bogus"] {
-            assert!(!valid_provider(bad), "{bad:?} must be rejected");
-        }
     }
 }
 

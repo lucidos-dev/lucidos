@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-22
+- **Amended by**: [0249: A thread waiting only on its sub-threads can have its change applied](0249-a-sub-thread-does-not-park-its-parents-change.md).
+  An active sub-thread no longer gates Apply or Discard. The event-wait half
+  below stands.
 
 ## Context
 

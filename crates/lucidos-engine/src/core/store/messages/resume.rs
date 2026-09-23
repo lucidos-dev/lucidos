@@ -61,6 +61,18 @@ pub(crate) fn parse_event_address(raw: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(stripped).ok()
 }
 
+/// The `ToolCalled` a `ToolResult` payload answers, when the row says so.
+///
+/// Every reader that pairs a result with its call asks this first. A parallel
+/// run answers in completion order, so position cannot pair it (ADR 0246).
+/// `None` is a legacy row, which keeps each reader's positional rule.
+pub(crate) fn tool_called_event_id_of(result_payload: &serde_json::Value) -> Option<uuid::Uuid> {
+    result_payload
+        .get("tool_called_event_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
+
 /// One reconstructed `(ToolCalled, ToolResult)` pair, with the originating
 /// `ToolCalled` event id preserved so the caller can deduplicate the
 /// stringified `[tools: ...]` summary on the same assistant turn.
@@ -129,14 +141,21 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                // Pair with the most recent pending ToolCalled of the same
-                // name. If names don't match (legacy events, racing tools),
-                // fall back to the most recent pending entry — same forgiving
-                // rule build_session_messages applies via `last_mut()`.
-                let idx = pending
-                    .iter()
-                    .rposition(|(_, n)| n == result_name)
-                    .or_else(|| pending.len().checked_sub(1));
+                let idx = match tool_called_event_id_of(&event.payload) {
+                    // A parallel run answers in completion order, so only the
+                    // id pairs it. An id whose call is not pending pairs
+                    // nothing: guessing would hand it to another call.
+                    Some(call_id) => pending
+                        .iter()
+                        .position(|(slot_idx, _)| slots[*slot_idx].tool_called_event_id == call_id),
+                    // Legacy rows carry no id. Pair with the most recent
+                    // pending ToolCalled of the same name, else the most
+                    // recent pending entry, as `build_session_messages` does.
+                    None => pending
+                        .iter()
+                        .rposition(|(_, n)| n == result_name)
+                        .or_else(|| pending.len().checked_sub(1)),
+                };
                 if let Some(i) = idx {
                     let (slot_idx, _) = pending.remove(i);
                     let result = event

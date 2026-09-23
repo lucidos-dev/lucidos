@@ -12,7 +12,9 @@
 //! `read_location` / `vertex_host` / `get_cached_access_token` helpers) is
 //! unchanged and still reachable at `crate::llm::vertex::*`.
 
-use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::provider::{
+    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
@@ -527,11 +529,15 @@ impl LlmProvider for VertexProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model_override: Option<&str>,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let ModelSelection {
+            model: model_override,
+            reasoning_effort,
+            ..
+        } = selection;
         let model = model_override.unwrap_or(&self.model);
         if Self::is_claude_model(model) {
             self.chat_claude(

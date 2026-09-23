@@ -342,6 +342,54 @@ describe('step completion — no eternal spinners', () => {
     }
   });
 
+  // A parallel run answers in completion order (ADR 0246). Here the first call
+  // finishes first, so resolving the newest pending row would tick off the
+  // second call and leave the finished first one spinning.
+  it('a parallel result resolves the row of the call it names, in any order', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'search', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
+      [2, { type: 'ToolCalled', name: 'web_search', args: { query: 'a' }, _eventId: 'call-a', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'web_search', args: { query: 'b' }, _eventId: 'call-b', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [4, { type: 'ToolResult', name: 'web_search', result: 'res-a', tool_called_event_id: 'call-a', _eventId: 'result-a', created: '2026-04-04T10:00:02Z' } as StoredEvent],
+    ]);
+
+    const midRun = exchangeResponseEvents(groupIntoExchanges(events)[0])
+      .filter(e => e.type === 'step') as { call_event_id?: string; outcome: StepOutcome; result?: string }[];
+    expect(midRun.map(s => [s.call_event_id, s.outcome, s.result])).toEqual([
+      ['call-a', 'success', 'res-a'],
+      ['call-b', 'pending', undefined],
+    ]);
+    const midSteps = exchangeSteps(groupIntoExchanges(events)[0]);
+    expect(midSteps.map(s => [s.call_event_id, s.outcome])).toEqual([
+      ['call-a', 'success'],
+      ['call-b', 'pending'],
+    ]);
+
+    events.set(5, { type: 'ToolResult', name: 'web_search', result: 'res-b', tool_called_event_id: 'call-b', _eventId: 'result-b', created: '2026-04-04T10:00:03Z' } as StoredEvent);
+    const settled = exchangeResponseEvents(groupIntoExchanges(events)[0])
+      .filter(e => e.type === 'step') as { call_event_id?: string; result?: string; result_event_id?: string }[];
+    expect(settled.map(s => [s.call_event_id, s.result, s.result_event_id])).toEqual([
+      ['call-a', 'res-a', 'result-a'],
+      ['call-b', 'res-b', 'result-b'],
+    ]);
+  });
+
+  // Old rows carry no call id, so they keep the positional walk.
+  it('a legacy result with no call id still resolves the newest pending row', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'search', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
+      [2, { type: 'ToolCalled', name: 'web_search', args: { query: 'a' }, _eventId: 'call-a', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'web_search', args: { query: 'b' }, _eventId: 'call-b', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [4, { type: 'ToolResult', name: 'web_search', result: 'res', created: '2026-04-04T10:00:02Z' } as ThreadEvent],
+    ]);
+    const steps = exchangeResponseEvents(groupIntoExchanges(events)[0])
+      .filter(e => e.type === 'step') as { call_event_id?: string; outcome: StepOutcome }[];
+    expect(steps.map(s => [s.call_event_id, s.outcome])).toEqual([
+      ['call-a', 'pending'],
+      ['call-b', 'success'],
+    ]);
+  });
+
   it('exchangeSteps also resolves pending steps on completed exchange', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';

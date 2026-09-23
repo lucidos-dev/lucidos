@@ -228,6 +228,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   // rather than null so the <Dropdown> value round-trips as a plain string.
   const [model, setModel] = useServerBackedField(existingTrigger?.model ?? '');
   const [triggerEffort, setTriggerEffort] = useServerBackedField(existingTrigger?.reasoning_effort ?? '');
+  const [triggerProvider, setTriggerProvider] = useServerBackedField(existingTrigger?.provider ?? '');
   // The picker reads the DB-backed registry; kick a load if nothing has yet
   // (loadChatModels single-flights via setLoadingIfFresh). Until it lands,
   // chatModelOptions() falls back to the static list, so the field is never
@@ -355,6 +356,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       // '' is the Default option; null is how it reaches the engine.
       model: model || null,
       reasoningEffort: triggerEffort || null,
+      provider: triggerProvider || null,
     });
   }
 
@@ -733,9 +735,13 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   vocabulary={LUCIDOS_TIER_VOCABULARY}
                   model={model}
                   effort={triggerEffort || null}
+                  provider={triggerProvider || null}
                   onChange={(patch) => {
                     setModel(patch.model);
                     setTriggerEffort(patch.reasoningEffort ?? '');
+                    // A trigger pins its own backend. It does not touch the
+                    // model's remembered one, which is the chat picker's.
+                    setTriggerProvider(patch.provider ?? '');
                   }}
                 />
               </div>

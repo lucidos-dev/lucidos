@@ -316,6 +316,7 @@ mod tests {
             cache_creation_tokens: cache_write,
             cache_read_tokens: cache_read,
             thinking_chars: None,
+            thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
         }

@@ -26,6 +26,8 @@ export interface ThreadModelOverride {
   model?: string;
   /** Lucidos Agent reasoning effort. */
   reasoningEffort?: string;
+  /** The backend picked for `model`. Absent means the model's own default. */
+  provider?: string;
 }
 
 /** Pending, not-yet-sent active-thread picks, keyed by thread id. */
@@ -99,10 +101,44 @@ export function lastThreadReasoningEffort(threadId: string | null | undefined): 
   return lastThreadMessageField(threadId, 'reasoning_effort');
 }
 
+/** The backend this thread last pinned for `model`. Mirrors the backend's
+ *  `last_thread_chat_settings`: a pick is remembered WITH its model, so a
+ *  thread switched to another model does not carry the old backend along. */
+export function lastThreadProvider(
+  threadId: string | null | undefined,
+  model: string,
+): string | undefined {
+  if (!threadId) return undefined;
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return undefined;
+  let bestSeq = -Infinity;
+  let bestValue: string | undefined;
+  for (const [seq, event] of thread.events) {
+    if (event.type !== 'MessageReceived' && event.type !== 'TriggerStarted') continue;
+    if (event.model !== model || typeof event.provider !== 'string' || event.provider === '') continue;
+    if (seq > bestSeq) {
+      bestSeq = seq;
+      bestValue = event.provider;
+    }
+  }
+  return bestValue;
+}
+
 // --- Resolvers: pending pick ?? thread's last message ?? account default ---
 
 export function resolveActiveThreadModel(threadId: string | null | undefined): string {
   return getThreadModelOverride(threadId).model ?? lastThreadModel(threadId) ?? currentModel.value;
+}
+
+/** The backend the next send on this thread pins, or `null` for the model's
+ *  own default: this thread's pending pick, then its memory for `model`. */
+export function resolveActiveThreadProvider(
+  threadId: string | null | undefined,
+  model: string,
+): string | null {
+  const pending = getThreadModelOverride(threadId);
+  if (pending.model === model && pending.provider) return pending.provider;
+  return lastThreadProvider(threadId, model) ?? null;
 }
 
 export function resolveActiveThreadReasoningEffort(threadId: string | null | undefined): string {

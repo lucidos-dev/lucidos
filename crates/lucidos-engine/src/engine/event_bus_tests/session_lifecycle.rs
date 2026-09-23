@@ -12,6 +12,7 @@ async fn test_session_started_updates_source_in_projection() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix something".into(),
             user_image_hashes: vec![],
@@ -108,6 +109,7 @@ async fn test_last_user_and_agent_action_attributed_separately() {
     let human_message = || BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
@@ -176,6 +178,7 @@ async fn test_session_started_does_not_update_last_activity() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix it".into(),
             user_image_hashes: vec![],
@@ -259,6 +262,7 @@ async fn test_session_ended_transitions_to_terminal_status() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix it".into(),
             user_image_hashes: vec![],
@@ -340,6 +344,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "include the ios suite too".into(),
             user_image_hashes: vec![],
@@ -436,6 +441,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "edit my skill".into(),
             user_image_hashes: vec![],
@@ -555,6 +561,7 @@ async fn test_session_started_stores_repo_id() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "analyze this repo".into(),
             user_image_hashes: vec![],
@@ -654,6 +661,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "parent task".into(),
             user_image_hashes: vec![],
@@ -679,6 +687,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "child task".into(),
             user_image_hashes: vec![],
@@ -843,6 +852,7 @@ async fn chat_continuation_started_does_not_flip_thread_to_coding_agent() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "what's the weather".into(),
             user_image_hashes: vec![],
@@ -893,6 +903,7 @@ async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "morning-report".into(),
             trigger_name: Some("Morning report".into()),
             prompt: None,
@@ -1036,6 +1047,7 @@ async fn chat_continuation_started_preserves_the_stored_draft() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "what's the weather".into(),
             user_image_hashes: vec![],

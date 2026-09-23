@@ -116,7 +116,7 @@ pub enum ThreadQueueRequest {
         coding_agent: CodingAgent,
         /// Backend model the session runs on, already validated against that
         /// backend's picker at the tool boundary. `None` inherits the backend
-        /// default (for Claude Code, the `model` in `cc-settings.json`).
+        /// default (for Claude Code, whatever its own settings resolve to).
         ///
         /// Persisted with the request so a spawn that queues across a restart
         /// re-fires on the model the caller asked for. Absent on rows written
@@ -154,6 +154,12 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// The backend this turn was pinned to, carried so a queued turn
+        /// re-executes on the one it was submitted for. Dropping it here would
+        /// substitute the model's own preferred provider on a requeue, which is
+        /// the silent move the honoured-or-refused rule exists to prevent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
@@ -299,6 +305,7 @@ mod tests {
             device_id: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             use_coding_agent: Some(cc),
             repo_id: None,
             cc_model: None,

@@ -40,11 +40,15 @@ INSERT INTO preferences (key, value, device_id, updated_at) VALUES
 -- cannot resolve to a different model between arms or between repeats.
 DELETE FROM models;
 -- `context_window` is the budget-pressure knob (ADR 0110 decision 9). It is
--- substituted UNQUOTED so an unset run gets a real NULL, and the engine then
--- infers the window from the model id exactly as it does in production.
-INSERT INTO models (id, label, provider, sort_order, source, enabled, context_window,
+-- substituted UNQUOTED so an unset run gets a real NULL. `jsonb_strip_nulls`
+-- then leaves the route undeclared, and the engine infers the window from the
+-- model id exactly as it does in production.
+INSERT INTO models (id, label, routes, sort_order, source, enabled,
                     created_at, updated_at)
-VALUES (:'model', :'model_label', :'model_provider', 0, 'builtin', TRUE, :context_window,
+VALUES (:'model', :'model_label',
+        jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
+          'provider', :'model_provider', 'context_window', :context_window::int))),
+        0, 'builtin', TRUE,
         '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00');
 
 DELETE FROM memory_entries;

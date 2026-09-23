@@ -177,18 +177,16 @@ export function availableThreadActions(
   hasPendingChanges: boolean,
   descendantsBlockArchive: boolean,
   hasLiveEventWaits: boolean,
-  hasActiveChildren: boolean,
   hasUnsentDraft: boolean,
   isSaved: boolean,
 ): Action[] {
   const actions: Action[] = [];
   const live = status === 'running' || status === 'waiting_for_user_answer';
-  const willResume = hasLiveEventWaits || hasActiveChildren;
   const codingAgentPending = hasPendingChanges && threadType === 'claude_code';
   if (hasUnsentDraft) actions.push('discard_draft');
   if (!live) {
     if (codingAgentPending) {
-      if (!willResume) actions.push('discard', 'apply');
+      if (!hasLiveEventWaits) actions.push('discard', 'apply');
     } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
       actions.push('archive');
     }

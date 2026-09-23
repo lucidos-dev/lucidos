@@ -1045,10 +1045,11 @@ impl LucidosEngine {
                 .chat(
                     messages.clone(),
                     tools.clone(),
-                    None, // no model override — use default
+                    // No model, provider or effort pick: the sub-loop runs on
+                    // the agent's own default, and streams nothing.
+                    crate::llm::ModelSelection::default(),
                     Some(system_prompt),
-                    None, // no token streaming callback
-                    None, // no reasoning effort override
+                    None,
                 )
                 .await?;
             // One row per round. The sub-loop runs up to `MAX_INTENT_ITERATIONS`
@@ -1415,10 +1416,7 @@ mod tests {
 
     /// The account preferences, as `user_chat_settings` hands them over.
     fn chat_prefs() -> (Option<String>, Option<String>) {
-        (
-            Some("claude-opus-5@default".to_string()),
-            Some("xhigh".to_string()),
-        )
+        (Some("claude-opus-5".to_string()), Some("xhigh".to_string()))
     }
 
     fn resolved(args: serde_json::Value) -> (Option<String>, Option<String>) {
@@ -1432,10 +1430,7 @@ mod tests {
     fn run_thread_without_pins_inherits_both_chat_preferences() {
         assert_eq!(
             resolved(json!({"prompt": "summarize this"})),
-            (
-                Some("claude-opus-5@default".to_string()),
-                Some("xhigh".to_string())
-            )
+            (Some("claude-opus-5".to_string()), Some("xhigh".to_string()))
         );
     }
 
@@ -1456,10 +1451,7 @@ mod tests {
     fn run_thread_effort_pin_leaves_the_preference_model_inherited() {
         assert_eq!(
             resolved(json!({"prompt": "p", "reasoning_effort": "low"})),
-            (
-                Some("claude-opus-5@default".to_string()),
-                Some("low".to_string())
-            )
+            (Some("claude-opus-5".to_string()), Some("low".to_string()))
         );
     }
 
@@ -1626,6 +1618,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let explicit = crate::engine::chat::make_message_received(
             workspace,
@@ -1636,6 +1629,7 @@ mod tests {
             parent_thread_id,
             spawning_event_id,
             ActorMode::Agent,
+            None,
             None,
             None,
             spawn_origin(spawning_thread, Some(tool_call)),

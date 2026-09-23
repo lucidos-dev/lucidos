@@ -146,6 +146,9 @@ mod trigger_event_type_test;
 #[path = "api_support/command_safety_test.rs"]
 mod command_safety_test;
 
+#[path = "api_support/parallel_reads_test.rs"]
+mod parallel_reads_test;
+
 #[path = "api_support/cascade_archive_test.rs"]
 mod cascade_archive_test;
 

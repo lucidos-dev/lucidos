@@ -8,6 +8,7 @@ fn test_config(worktree: &Path) -> CodexConfig {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
         env: vec![
             (
                 std::ffi::OsString::from("LUCIDOS_WORKSPACE"),

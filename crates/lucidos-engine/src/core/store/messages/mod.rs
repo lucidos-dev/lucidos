@@ -11,8 +11,8 @@ pub use build::format_child_thread_completed_block;
 pub(crate) use build::{build_session_messages, newest_conversation_summary, CachedSummary};
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
-    find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id, with_event_address,
-    RESUME_VERBATIM_TOOL_TAIL,
+    find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id,
+    tool_called_event_id_of, with_event_address, RESUME_VERBATIM_TOOL_TAIL,
 };
 
 impl EventStore {

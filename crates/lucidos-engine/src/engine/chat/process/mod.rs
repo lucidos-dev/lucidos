@@ -146,6 +146,10 @@ impl LucidosEngine {
         side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        // The backend this trigger pinned, or `None` to let the model's own
+        // preferred provider decide. A pin naming an unconfigured backend
+        // refuses the fire rather than running it somewhere else.
+        provider: Option<&str>,
         external_cancel: Option<CancellationToken>,
         // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
@@ -169,6 +173,7 @@ impl LucidosEngine {
             None, // app_context
             None, // file_context
             reasoning_effort,
+            provider,
             None,
             None,
             None,
@@ -203,6 +208,9 @@ impl LucidosEngine {
         app_context: Option<AppContext>,
         file_context: Option<String>,
         reasoning_effort: Option<&str>,
+        // Backend to serve the model. See the internal orchestrator's own
+        // parameter: honoured or refused, never substituted.
+        provider_override: Option<&str>,
         images: Option<&[crate::api::ChatImage]>,
         device_id: Option<&str>,
         use_coding_agent: Option<bool>,
@@ -239,6 +247,7 @@ impl LucidosEngine {
             app_context,
             file_context,
             reasoning_effort,
+            provider_override,
             images,
             device_id,
             use_coding_agent,

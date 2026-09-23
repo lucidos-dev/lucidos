@@ -41,7 +41,7 @@ pub fn coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::
 ///
 /// `None` means nothing is declared, and the caller falls back to
 /// `context_window_for`. That fallback is right for the engine's own calls and
-/// wrong for these: it answers 200k for a bare `claude-` id, because LUCIDOS
+/// wrong for these: it answers 200k for most bare `claude-` ids, because LUCIDOS
 /// gates 1M mode on its own `[1m]` suffix. Claude Code does not. A Sonnet 5
 /// session runs 1M whatever we spell, so a capture rendered a real 240k prompt
 /// as "203k / 200k (100%)" before this existed.
@@ -247,10 +247,16 @@ pub fn validate_coding_agent_effort(
 /// all of it. Folding that increment into the else arm on the reading that a
 /// question tool_use is a no-op would euthanize the session mid-question.
 pub fn is_user_question_tool(name: &str) -> bool {
-    name == CC_NATIVE_ASK_USER_QUESTION_TOOL
-        || name == CC_MCP_ASK_USER_QUESTION_TOOL
-        || name == CODEX_ASK_USER_QUESTION_TOOL
+    USER_QUESTION_TOOLS.contains(&name)
 }
+
+/// Every coding-agent question tool name, the one list `is_user_question_tool`
+/// and the question-card gate both read.
+pub const USER_QUESTION_TOOLS: [&str; 3] = [
+    CC_NATIVE_ASK_USER_QUESTION_TOOL,
+    CC_MCP_ASK_USER_QUESTION_TOOL,
+    CODEX_ASK_USER_QUESTION_TOOL,
+];
 
 /// Whether the engine is running inside a packaged build (the macOS `.app` /
 /// headless tarball / `install.sh` service all set `LUCIDOS_PACKAGED=1` — see
@@ -847,7 +853,7 @@ mod tests {
     // ── Spawn pin validation ───────────────────────────────────────────────
     // Both validators REFUSE rather than fall back. That is the whole contract:
     // `run_coding_agent` advertised a `model` argument that no layer read, so
-    // every session silently ran on the `cc-settings.json` default while the
+    // every session silently ran on the backend default while the
     // spawn reported success. Falling back to the default on a bad id would
     // rebuild exactly that failure, one layer higher up.
 

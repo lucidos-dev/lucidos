@@ -36,6 +36,7 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>, continuation: bool) -> St
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
         env: Vec::new(),
     };
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -338,6 +339,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
         env: Vec::new(),
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();

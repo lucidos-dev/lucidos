@@ -163,13 +163,13 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
             const storedSection = (step.expected.stored_section || 'archived') as ArchiveState;
             const threadType = scenario.thread_type as ThreadType;
             // These scenarios park on none of the gating axes: no blocking
-            // descendants, no live event wait, no active sub-thread. All three
-            // are exercised exhaustively by the cross-validation contract
+            // descendants and no live event wait. Both are exercised
+            // exhaustively by the cross-validation contract
             // (see generated/cross-validation*).
             // Scenarios assert the CLOSE set (archive/apply/discard); the
             // Save/Unsave toggle and draft layer postdate these fixtures, so
             // filter them out of the comparison.
-            const actions = availableThreadActions(threadType, status, storedSection, hasPendingChanges, false, false, false, false, false)
+            const actions = availableThreadActions(threadType, status, storedSection, hasPendingChanges, false, false, false, false)
               .filter((a) => a === 'archive' || a === 'apply' || a === 'discard');
             expect(actions, `step ${i} (${step.emit}): actions`).toEqual(step.expected.expected_actions);
           }

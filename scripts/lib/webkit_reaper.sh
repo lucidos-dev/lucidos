@@ -44,6 +44,10 @@
 # In-memory handle to the running reaper loop (set by start_webkit_reaper).
 WEBKIT_REAPER_PID="${WEBKIT_REAPER_PID:-}"
 
+# For `proc_env_has_entry`: a candidate must carry this run's e2e run marker.
+# shellcheck source=proc_env.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_env.sh"
+
 # ── config resolution ──────────────────────────────────────────────────
 _reaper_cap_mb() { printf '%s' "${E2E_WEBKIT_RSS_CAP_MB:-6144}"; }
 
@@ -64,6 +68,8 @@ _reaper_interval_s() {
 # Networking XPC services launched by Playwright's WebKit all live under
 # <browsers>/ms-playwright/webkit-NNNN/, so their argv[0] contains this token;
 # Playwright's chromium lives under ms-playwright/chromium-NNNN/ and is excluded.
+# The token NARROWS only: every Playwright on the host shares the cache, so
+# reap_once also requires this run's e2e run marker (ADR 0251).
 #
 # This token is tested against argv[0] ONLY, never the whole command line. See
 # the candidate loop in reap_once for why that distinction is load-bearing.
@@ -136,6 +142,12 @@ reap_once() {
             *) continue ;;
         esac
         [ "$rss" -gt "$cap_kb" ] || continue
+        # The cache path says only "some Playwright launched this"; every
+        # Playwright on the host shares it. Only THIS run's e2e run marker in
+        # the process environment makes it ours to kill (ADR 0251). Read after
+        # the cap, so only an over-cap process costs an environment read.
+        [ -n "${LUCIDOS_E2E_RUN_ID:-}" ] || continue
+        proc_env_has_entry "$pid" "LUCIDOS_E2E_RUN_ID=$LUCIDOS_E2E_RUN_ID" || continue
         # Backstop: never SIGKILL a protected host process (any workspace's live
         # engine/frontend). The path match already excludes them, so this is
         # defense-in-depth — the canary if the matcher ever broadens. Guarded by
@@ -208,6 +220,11 @@ start_webkit_reaper() {
             echo "[webkit-reaper] WARNING: match token '$match' contains whitespace, so it can never match argv[0]. The host-memory guard is effectively OFF. Use a browsers path without spaces."
             ;;
     esac
+    # Same disarming, other cause. `acquire_e2e_lock` exports the marker, so
+    # only a reaper started outside a held lock can reach this.
+    if [ -z "${LUCIDOS_E2E_RUN_ID:-}" ]; then
+        echo "[webkit-reaper] WARNING: LUCIDOS_E2E_RUN_ID is not set, so no process can be proven this run's. The host-memory guard is effectively OFF. Start the reaper after acquire_e2e_lock."
+    fi
 
     _reaper_loop "$interval" &
     WEBKIT_REAPER_PID=$!

@@ -224,25 +224,25 @@ describe('judgmentPickWrites', () => {
   /** Both halves, because the site may have been on Jev. Writing the model
    *  alone would leave the engine on Jev under a field showing Haiku. */
   it('moves the backend back to chat and writes the pair', () => {
-    expect(judgmentPickWrites({ model: 'claude-haiku-4-5', reasoningEffort: 'low' })).toEqual({
+    expect(judgmentPickWrites({ model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null })).toEqual({
       judgment: CHAT,
-      selection: { model: 'claude-haiku-4-5', reasoningEffort: 'low' },
+      selection: { model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null },
     });
   });
 
   /** The stored model is what switching back restores, so a Jev pick must not
    *  touch it. */
   it('writes only the judgment key when Jev is picked', () => {
-    expect(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null })).toEqual({
+    expect(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null, provider: null })).toEqual({
       judgment: JEV,
       selection: null,
     });
   });
 
   it('writes only the two literals the engine reads', () => {
-    const chat = judgmentPickWrites({ model: 'gemini-3.5-flash', reasoningEffort: null });
+    const chat = judgmentPickWrites({ model: 'gemini-3.5-flash', reasoningEffort: null, provider: null });
     expect(wantsJev(chat.judgment)).toBe(false);
-    expect(wantsJev(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null }).judgment))
+    expect(wantsJev(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null, provider: null }).judgment))
       .toBe(true);
   });
 });

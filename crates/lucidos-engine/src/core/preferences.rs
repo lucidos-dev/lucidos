@@ -126,7 +126,7 @@ pub const PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE: &str = "coding_agent_claude_
 
 /// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
 /// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
-pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5@default";
+pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5";
 
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";
@@ -266,6 +266,37 @@ pub const MIN_MAX_TOOL_CALLS: usize = 1;
 ///
 /// See `core::announced_surfaces`.
 pub struct PreferenceStore;
+
+/// The *model selection* a turn resolved to, owned.
+///
+/// The same three fields as the borrowed `llm::ModelSelection` that goes to the
+/// wire. This form crosses an await and is stamped on a starter event. So it
+/// holds `String`s, and names its provider by the registry's own value.
+///
+/// Every field is resolved INDEPENDENTLY, so a turn can take its model from the
+/// thread's memory and its effort from the account preference.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedModelSelection {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// The backend to serve it. `None` lets the model's own *preferred
+    /// provider* decide, then its first configured route.
+    pub provider: Option<String>,
+}
+
+impl ResolvedModelSelection {
+    /// Borrow this into the wire-side selection the provider trait takes.
+    pub fn as_selection(&self) -> crate::llm::ModelSelection<'_> {
+        crate::llm::ModelSelection {
+            model: self.model.as_deref(),
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            provider: self
+                .provider
+                .as_deref()
+                .and_then(crate::llm::model_registry::ProviderKind::from_name),
+        }
+    }
+}
 
 impl PreferenceStore {
     /// Defensive double-write — the migration owns this CREATE TABLE
@@ -783,15 +814,24 @@ impl PreferenceStore {
     /// it was pre-emitted upstream (`pre_emitted_origin` == `events.id`), so we
     /// never read the current turn as its own "previous" value. DB errors are
     /// logged and treated as "no record" — callers fall through to preferences.
+    ///
+    /// The provider is remembered WITH its model. It is the newest one stamped
+    /// beside the model this turn runs on: `model_override` when the caller
+    /// named one, else the remembered model. So a thread switched from Opus to
+    /// Sonnet drops the backend picked for Opus, and Sonnet's own row decides.
     pub async fn last_thread_chat_settings(
         pool: &PgPool,
         thread_id: Uuid,
         exclude_event_id: Option<Uuid>,
-    ) -> (Option<String>, Option<String>) {
+        model_override: Option<&str>,
+    ) -> ResolvedModelSelection {
         // Starter thread-event payloads are flat (see `ThreadEvent::to_payload`),
         // so `payload->>'model'` reads the field directly on both variants.
         // `aggregate_id` is text; bind the thread id as its string.
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        //
+        // One sub-select per field, because each is remembered independently: a
+        // thread can carry a model from one turn and an effort from another.
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             r#"
             SELECT
               (SELECT payload->>'model'
@@ -811,53 +851,110 @@ impl PreferenceStore {
                   AND payload->>'reasoning_effort' <> ''
                   AND ($2::uuid IS NULL OR id <> $2)
                 ORDER BY sequence DESC
-                LIMIT 1) AS effort
+                LIMIT 1) AS effort,
+              (SELECT payload->>'provider'
+                 FROM events
+                WHERE aggregate_id = $1
+                  AND event_type IN ('MessageReceived', 'TriggerStarted')
+                  AND payload->>'provider' IS NOT NULL
+                  AND payload->>'provider' <> ''
+                  AND payload->>'model' = COALESCE($3, (
+                        SELECT payload->>'model'
+                          FROM events
+                         WHERE aggregate_id = $1
+                           AND event_type IN ('MessageReceived', 'TriggerStarted')
+                           AND payload->>'model' IS NOT NULL
+                           AND payload->>'model' <> ''
+                           AND ($2::uuid IS NULL OR id <> $2)
+                         ORDER BY sequence DESC
+                         LIMIT 1))
+                  AND ($2::uuid IS NULL OR id <> $2)
+                ORDER BY sequence DESC
+                LIMIT 1) AS provider
             "#,
         )
         .bind(thread_id.to_string())
         .bind(exclude_event_id)
+        .bind(model_override)
         .fetch_one(pool)
         .await;
         match row {
-            Ok((model, effort)) => (model, effort),
+            Ok((model, reasoning_effort, provider)) => ResolvedModelSelection {
+                model,
+                reasoning_effort,
+                provider,
+            },
             Err(e) => {
                 log!(
                     "[Preferences] Failed to read last thread chat settings for {}: {}",
                     thread_id,
                     e
                 );
-                (None, None)
+                ResolvedModelSelection::default()
             }
         }
     }
 
-    /// Resolve the (model, effort) pair stamped on a chat exchange when the
-    /// caller didn't fully specify them, honoring per-thread memory. Order per
-    /// field: explicit caller override → the thread's last recorded value →
-    /// the user's account chat preference. Skips each DB read it doesn't need.
+    /// Resolve the *model selection* stamped on a chat exchange when the caller
+    /// did not fully specify it, honoring per-thread memory.
+    ///
+    /// Order per field: explicit caller override → the thread's last recorded
+    /// value → the user's account chat preference. Each DB read it does not
+    /// need is skipped.
+    ///
+    /// The provider has no account preference of its own, deliberately. It is
+    /// remembered per MODEL, on the registry row, because a global one means
+    /// nothing across families that share no backend: picking Grok on xAI would
+    /// otherwise move Opus off Anthropic. So an unpinned turn leaves it `None`
+    /// and the row decides.
     pub async fn resolve_chat_overrides_for_thread(
         pool: &PgPool,
         thread_id: Option<Uuid>,
         exclude_event_id: Option<Uuid>,
-        model_override: Option<String>,
-        effort_override: Option<String>,
-    ) -> (Option<String>, Option<String>) {
-        if model_override.is_some() && effort_override.is_some() {
-            return (model_override, effort_override);
+        overrides: ResolvedModelSelection,
+    ) -> ResolvedModelSelection {
+        let ResolvedModelSelection {
+            model: model_override,
+            reasoning_effort: effort_override,
+            provider: provider_override,
+        } = overrides;
+        if model_override.is_some() && effort_override.is_some() && provider_override.is_some() {
+            return ResolvedModelSelection {
+                model: model_override,
+                reasoning_effort: effort_override,
+                provider: provider_override,
+            };
         }
         // Per-thread memory: reuse what this thread last ran with. Only worth a
         // query for a follow-up (a new thread has no prior message).
-        let (thread_model, thread_effort) = match thread_id {
-            Some(tid) => Self::last_thread_chat_settings(pool, tid, exclude_event_id).await,
-            None => (None, None),
+        let remembered = match thread_id {
+            Some(tid) => {
+                Self::last_thread_chat_settings(
+                    pool,
+                    tid,
+                    exclude_event_id,
+                    model_override.as_deref(),
+                )
+                .await
+            }
+            None => ResolvedModelSelection::default(),
         };
-        let model = model_override.or(thread_model);
-        let effort = effort_override.or(thread_effort);
+        let model = model_override.or(remembered.model);
+        let effort = effort_override.or(remembered.reasoning_effort);
+        let provider = provider_override.or(remembered.provider);
         if model.is_some() && effort.is_some() {
-            return (model, effort);
+            return ResolvedModelSelection {
+                model,
+                reasoning_effort: effort,
+                provider,
+            };
         }
         let (pref_model, pref_effort) = Self::user_chat_settings(pool).await;
-        (model.or(pref_model), effort.or(pref_effort))
+        ResolvedModelSelection {
+            model: model.or(pref_model),
+            reasoning_effort: effort.or(pref_effort),
+            provider,
+        }
     }
 }
 
@@ -865,6 +962,16 @@ impl PreferenceStore {
 mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// The override triple a caller passes in. The cases below only ever pin
+    /// a model or an effort, so the provider stays unset.
+    fn overrides(model: Option<&str>, effort: Option<&str>) -> ResolvedModelSelection {
+        ResolvedModelSelection {
+            model: model.map(str::to_string),
+            reasoning_effort: effort.map(str::to_string),
+            provider: None,
+        }
+    }
 
     async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
@@ -1124,10 +1231,15 @@ mod tests {
     async fn resolve_chat_overrides_falls_back_to_prefs_when_none() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let (model, effort) =
-            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
-        assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
-        assert_eq!(effort.as_deref(), Some("xhigh"));
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            None,
+            None,
+            overrides(None, None),
+        )
+        .await;
+        assert_eq!(resolved.model.as_deref(), Some("claude-opus-4-7[1m]"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1136,16 +1248,15 @@ mod tests {
     async fn resolve_chat_overrides_keeps_explicit_caller_values() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             None,
             None,
-            Some("claude-sonnet-4-6".to_string()),
-            Some("medium".to_string()),
+            overrides(Some("claude-sonnet-4-6"), Some("medium")),
         )
         .await;
-        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1154,16 +1265,15 @@ mod tests {
     async fn resolve_chat_overrides_mixes_caller_and_prefs() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             None,
             None,
-            Some("claude-sonnet-4-6".to_string()),
-            None,
+            overrides(Some("claude-sonnet-4-6"), None),
         )
         .await;
-        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(effort.as_deref(), Some("xhigh"));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1171,10 +1281,15 @@ mod tests {
     #[tokio::test]
     async fn resolve_chat_overrides_returns_none_when_no_caller_no_prefs() {
         let (pool, db_name) = setup_test_db().await;
-        let (model, effort) =
-            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            None,
+            None,
+            overrides(None, None),
+        )
+        .await;
+        assert_eq!(resolved.model, None);
+        assert_eq!(resolved.reasoning_effort, None);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1191,8 +1306,22 @@ mod tests {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Uuid {
+        insert_starter(pool, thread_id, model, effort, None).await
+    }
+
+    /// A starter that also carries the backend the turn was pinned to.
+    async fn insert_starter(
+        pool: &PgPool,
+        thread_id: Uuid,
+        model: Option<&str>,
+        effort: Option<&str>,
+        provider: Option<&str>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let mut payload = serde_json::json!({ "text": "hi", "mode": "human" });
+        if let Some(p) = provider {
+            payload["provider"] = serde_json::json!(p);
+        }
         if let Some(m) = model {
             payload["model"] = serde_json::json!(m);
         }
@@ -1221,9 +1350,9 @@ mod tests {
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("model-old"), Some("low")).await;
         insert_message_received(&pool, tid, Some("model-new"), Some("high")).await;
-        let (model, effort) = PreferenceStore::last_thread_chat_settings(&pool, tid, None).await;
-        assert_eq!(model.as_deref(), Some("model-new"));
-        assert_eq!(effort.as_deref(), Some("high"));
+        let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(resolved.model.as_deref(), Some("model-new"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1231,10 +1360,10 @@ mod tests {
     #[tokio::test]
     async fn last_thread_chat_settings_none_for_thread_without_records() {
         let (pool, db_name) = setup_test_db().await;
-        let (model, effort) =
-            PreferenceStore::last_thread_chat_settings(&pool, Uuid::new_v4(), None).await;
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
+        let resolved =
+            PreferenceStore::last_thread_chat_settings(&pool, Uuid::new_v4(), None, None).await;
+        assert_eq!(resolved.model, None);
+        assert_eq!(resolved.reasoning_effort, None);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1247,9 +1376,9 @@ mod tests {
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("model-a"), Some("high")).await;
         insert_message_received(&pool, tid, Some("model-b"), None).await;
-        let (model, effort) = PreferenceStore::last_thread_chat_settings(&pool, tid, None).await;
-        assert_eq!(model.as_deref(), Some("model-b"));
-        assert_eq!(effort.as_deref(), Some("high"));
+        let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(resolved.model.as_deref(), Some("model-b"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1263,10 +1392,10 @@ mod tests {
         insert_message_received(&pool, tid, Some("prior-model"), Some("low")).await;
         let current =
             insert_message_received(&pool, tid, Some("current-model"), Some("high")).await;
-        let (model, effort) =
-            PreferenceStore::last_thread_chat_settings(&pool, tid, Some(current)).await;
-        assert_eq!(model.as_deref(), Some("prior-model"));
-        assert_eq!(effort.as_deref(), Some("low"));
+        let resolved =
+            PreferenceStore::last_thread_chat_settings(&pool, tid, Some(current), None).await;
+        assert_eq!(resolved.model.as_deref(), Some("prior-model"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1277,11 +1406,15 @@ mod tests {
         seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
-        let (model, effort) =
-            PreferenceStore::resolve_chat_overrides_for_thread(&pool, Some(tid), None, None, None)
-                .await;
-        assert_eq!(model.as_deref(), Some("thread-model"));
-        assert_eq!(effort.as_deref(), Some("thread-effort"));
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            Some(tid),
+            None,
+            overrides(None, None),
+        )
+        .await;
+        assert_eq!(resolved.model.as_deref(), Some("thread-model"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("thread-effort"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1292,16 +1425,15 @@ mod tests {
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
         // Override the model only → effort still comes from the thread (per field).
-        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             Some(tid),
             None,
-            Some("override-model".to_string()),
-            None,
+            overrides(Some("override-model"), None),
         )
         .await;
-        assert_eq!(model.as_deref(), Some("override-model"));
-        assert_eq!(effort.as_deref(), Some("thread-effort"));
+        assert_eq!(resolved.model.as_deref(), Some("override-model"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("thread-effort"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1311,21 +1443,65 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
         // A brand-new thread (no messages) → account preference.
-        let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
+        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
             Some(Uuid::new_v4()),
             None,
-            None,
-            None,
+            overrides(None, None),
         )
         .await;
-        assert_eq!(model.as_deref(), Some("pref-model"));
-        assert_eq!(effort.as_deref(), Some("pref-effort"));
+        assert_eq!(resolved.model.as_deref(), Some("pref-model"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("pref-effort"));
         // Thread-less resolve behaves the same (caller override → preference).
-        let (m2, e2) =
-            PreferenceStore::resolve_chat_overrides_for_thread(&pool, None, None, None, None).await;
+        let threadless = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            None,
+            None,
+            overrides(None, None),
+        )
+        .await;
+        let (m2, e2) = (threadless.model, threadless.reasoning_effort);
         assert_eq!(m2.as_deref(), Some("pref-model"));
         assert_eq!(e2.as_deref(), Some("pref-effort"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_remembered_provider_never_outlives_its_model() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_starter(&pool, tid, Some("opus"), Some("high"), Some("vertex")).await;
+
+        // The same model keeps the backend it was pinned to.
+        let same = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            Some(tid),
+            None,
+            overrides(None, None),
+        )
+        .await;
+        assert_eq!(same.provider.as_deref(), Some("vertex"));
+
+        // Switching the model drops it, so the new model's row decides.
+        let switched = PreferenceStore::resolve_chat_overrides_for_thread(
+            &pool,
+            Some(tid),
+            None,
+            overrides(Some("sonnet"), None),
+        )
+        .await;
+        assert_eq!(switched.provider, None);
+
+        // A later turn on the new model reads no pick either.
+        insert_starter(&pool, tid, Some("sonnet"), Some("high"), None).await;
+        let later = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(later.model.as_deref(), Some("sonnet"));
+        assert_eq!(later.provider, None);
+
+        // Switching back finds the pick recorded with that model.
+        let back = PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("opus")).await;
+        assert_eq!(back.provider.as_deref(), Some("vertex"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

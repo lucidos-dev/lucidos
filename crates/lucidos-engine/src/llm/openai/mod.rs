@@ -13,7 +13,7 @@
 use crate::core::AuthType;
 use crate::llm::model_registry::gpt_major_version;
 use crate::llm::provider::{
-    LlmProvider, LlmResponse, Message, TokenCallback, ToolCall, ToolDefinition,
+    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolCall, ToolDefinition,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -346,6 +346,7 @@ impl OpenAiProvider {
             cache_creation_tokens: None,
             cache_read_tokens: meta.cache_read_tokens,
             thinking_chars: None,
+            thinking_blocks: None,
             unknown_sse_dropped: 0,
             // Like Anthropic: text always rides in `content`, printable.
             model_only_text: None,
@@ -443,11 +444,15 @@ impl LlmProvider for OpenAiProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model_override: Option<&str>,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let ModelSelection {
+            model: model_override,
+            reasoning_effort,
+            ..
+        } = selection;
         let model = model_override.unwrap_or(&self.model);
 
         if self.should_use_responses(model) {

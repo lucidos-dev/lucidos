@@ -65,6 +65,10 @@ pub struct TriggerDefinition {
     /// account `chat_reasoning_effort` preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// The backend the pinned model runs on. Omitted (None) = the model's own
+    /// preferred provider, then its first configured route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     // Table / array-of-tables fields LAST (TOML ordering constraint):
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on: Vec<EventSubscription>,
@@ -86,6 +90,7 @@ impl TriggerDefinition {
             side_effect_grant: c.side_effect_grant.clone(),
             model: c.model.clone(),
             reasoning_effort: c.reasoning_effort.clone(),
+            provider: c.provider.clone(),
             on: c.on.clone(),
             run: c.run.clone(),
         }
@@ -111,6 +116,7 @@ impl TriggerDefinition {
             "plugin_id": plugin_id,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "provider": self.provider,
         })
     }
 

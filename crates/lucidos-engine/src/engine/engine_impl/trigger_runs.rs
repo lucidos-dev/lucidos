@@ -262,6 +262,7 @@ mod tests {
 
     fn config(schedule: &[&str], on: &[&str], paused: bool) -> TriggerConfig {
         TriggerConfig {
+            provider: None,
             id: "t-1".to_string(),
             name: "Nightly e2e".to_string(),
             slug: "nightly-e2e".to_string(),

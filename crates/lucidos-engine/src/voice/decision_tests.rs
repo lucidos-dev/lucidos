@@ -344,6 +344,7 @@ async fn a_turn_starts(bus: &EventBus, thread_id: Uuid) {
         bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "clean up the old releases".to_string(),
             user_image_hashes: vec![],

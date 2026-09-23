@@ -8,19 +8,10 @@
 //! `set_preference`; this tool manages which models EXIST in the picker.
 
 use super::super::LucidosEngine;
-use crate::core::models::ModelStore;
+use crate::core::models::{ModelFields, ModelStore, Route};
 
-/// Providers the registry accepts — kept in lockstep with
-/// `api::settings::valid_provider` / `llm::model_registry::ProviderKind`.
-const VALID_PROVIDERS: &[&str] = &[
-    "vertex",
-    "anthropic",
-    "openai",
-    "openrouter",
-    "xai",
-    "opencode-free",
-    "local",
-];
+/// Every action the tool answers, for the refusal that lists them.
+const ACTIONS: &str = "list, add, enable, disable, update, remove";
 
 impl LucidosEngine {
     pub(crate) async fn execute_manage_models(
@@ -33,14 +24,11 @@ impl LucidosEngine {
             "add" => self.manage_models_add(args).await,
             "enable" => self.manage_models_set_enabled(args, true).await,
             "disable" => self.manage_models_set_enabled(args, false).await,
+            "update" => self.manage_models_update(args).await,
             "remove" => self.manage_models_remove(args).await,
-            "" => Ok(
-                "Error: action is required (one of: list, add, enable, disable, remove)"
-                    .to_string(),
-            ),
+            "" => Ok(format!("Error: action is required (one of: {ACTIONS})")),
             other => Ok(format!(
-                "Error: unknown action '{}'. Use one of: list, add, enable, disable, remove.",
-                other
+                "Error: unknown action '{other}'. Use one of: {ACTIONS}."
             )),
         }
     }
@@ -52,20 +40,37 @@ impl LucidosEngine {
         }
         let mut out = format!("{} models in the registry:\n", models.len());
         for m in &models {
-            // Surface the declared context window so the agent can see which
-            // models are still relying on the id-shape guess — that fallback
-            // gives every OpenRouter / xAI / Gemini / local id 200k whatever its
-            // real window, which silently shrinks the context budget.
-            let window = match m.context_window {
-                Some(w) => format!("{w} tokens"),
-                None => "inferred from id".to_string(),
-            };
+            // Surface each route's declared context window so the agent can see
+            // which are still relying on the id-shape guess. That fallback gives
+            // every OpenRouter / xAI / Gemini / local id 200k whatever its real
+            // window, which silently shrinks the context budget.
+            let routes = m
+                .routes
+                .iter()
+                .map(|r| {
+                    let window = match r.context_window {
+                        Some(w) => format!("{w} tokens"),
+                        None => "window inferred from id".to_string(),
+                    };
+                    let preferred = match m.preferred_provider.as_deref() {
+                        Some(p) if p == r.provider => " (preferred)",
+                        _ => "",
+                    };
+                    format!(
+                        "{}{} as '{}', {}",
+                        r.provider,
+                        preferred,
+                        r.wire_id(&m.id),
+                        window
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             out.push_str(&format!(
-                "- {} — \"{}\" | provider: {} | context window: {} | {} | {}\n",
+                "- {}: \"{}\" | routes: {} | {} | {}\n",
                 m.id,
                 m.label,
-                m.provider,
-                window,
+                routes,
                 if m.enabled { "enabled" } else { "disabled" },
                 if m.is_builtin() { "builtin" } else { "user" },
             ));
@@ -86,13 +91,6 @@ impl LucidosEngine {
         };
         if id.is_empty() {
             return Ok("Error: id is required (the model string sent in API requests, e.g. 'z-ai/glm-5.2').".to_string());
-        }
-        if !VALID_PROVIDERS.contains(&provider) {
-            return Ok(format!(
-                "Error: provider must be one of [{}] (got '{}').",
-                VALID_PROVIDERS.join(", "),
-                provider
-            ));
         }
         // User models sort after builtins by default (matches the HTTP create).
         // `try_from`, never `as` — a wrapping cast turns an out-of-range i64
@@ -117,22 +115,35 @@ impl LucidosEngine {
             }
         };
 
-        match ModelStore::create(
-            &self.pool,
-            &self.event_bus,
-            id,
-            label,
-            provider,
+        // The same rule as `POST /api/v1/models`: `routes` wins, and `provider`
+        // plus `context_window` is the single-route shorthand.
+        let routes = match parse_routes(args) {
+            Ok(routes) => routes,
+            Err(e) => return Ok(e),
+        };
+        let provider = Some(provider.to_string()).filter(|p| !p.is_empty());
+        let routes = match crate::api::routes_for_create(routes, provider, context_window) {
+            Ok(routes) => routes,
+            Err(e) => return Ok(format!("Error: {e}")),
+        };
+
+        let fields = ModelFields {
+            label: label.to_string(),
+            routes,
+            preferred_provider: None,
             sort_order,
-            context_window,
-            None,
-        )
-        .await
-        {
+        };
+        match ModelStore::create(&self.pool, &self.event_bus, id, &fields, None).await {
             Ok(model) => {
                 Ok(format!(
                     "[ACTION COMPLETED] Model '{}' ({}) added to the registry and enabled.",
-                    model.id, model.provider
+                    model.id,
+                    model
+                        .routes
+                        .iter()
+                        .map(|r| r.provider.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ))
             }
             // The unique-PK violation is the common case — a clearer message than
@@ -164,6 +175,64 @@ impl LucidosEngine {
                 id
             )),
             Err(e) => Ok(format!("Error: failed to update model '{}': {}", id, e)),
+        }
+    }
+
+    /// Edit a model in place, under exactly the rules `PUT /api/v1/models`
+    /// applies: see [`crate::api::apply_model_update`].
+    async fn manage_models_update(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let id = args["id"].as_str().unwrap_or("").trim();
+        if id.is_empty() {
+            return Ok("Error: id is required.".to_string());
+        }
+        // The args carry the PUT body's field names, so they parse as one, once
+        // `routes` is settled from either of its two spellings.
+        let routes = match parse_routes(args) {
+            Ok(routes) => routes,
+            Err(e) => return Ok(e),
+        };
+        let mut body = args.clone();
+        if let Some(fields) = body.as_object_mut() {
+            fields.insert("routes".to_string(), serde_json::json!(routes));
+        }
+        let edit: crate::api::UpdateModelRequest = match serde_json::from_value(body) {
+            Ok(edit) => edit,
+            Err(e) => return Ok(format!("Error: invalid update arguments: {e}")),
+        };
+        let Some(existing) = ModelStore::get(&self.pool, id).await? else {
+            return Ok(format!(
+                "Error: no model '{id}' in the registry. Use action 'list' to see model ids."
+            ));
+        };
+        let (fields, enabled) = match crate::api::apply_model_update(&existing, edit) {
+            Ok(applied) => applied,
+            Err(e) => return Ok(format!("Error: {e}")),
+        };
+        match ModelStore::update(
+            &self.pool,
+            &self.event_bus,
+            &existing.id,
+            &fields,
+            enabled,
+            None,
+        )
+        .await
+        {
+            Ok(_) => Ok(format!(
+                "[ACTION COMPLETED] Model '{}' updated: routes {}; preferred provider {}.",
+                existing.id,
+                fields
+                    .routes
+                    .iter()
+                    .map(|r| r.provider.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                fields.preferred_provider.as_deref().unwrap_or("none"),
+            )),
+            Err(e) => Ok(format!("Error: failed to update model '{id}': {e}")),
         }
     }
 
@@ -199,5 +268,53 @@ impl LucidosEngine {
             )),
             Err(e) => Ok(format!("Error: failed to remove model '{}': {}", id, e)),
         }
+    }
+}
+
+/// Read the optional `routes` argument: absent or null is `None`.
+///
+/// A JSON string holding the list is accepted too, since that is how the CLI
+/// spells it. Anything else is refused rather than ignored: an ignored list
+/// would quietly fall back to the single-route shorthand.
+fn parse_routes(args: &serde_json::Value) -> Result<Option<Vec<Route>>, String> {
+    let parsed = match &args["routes"] {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(raw) => serde_json::from_str::<Vec<Route>>(raw),
+        value => serde_json::from_value::<Vec<Route>>(value.clone()),
+    };
+    parsed
+        .map(Some)
+        .map_err(|e| format!("Error: routes is malformed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_routes;
+    use serde_json::json;
+
+    #[test]
+    fn parse_routes_reads_absent_and_null_as_none() {
+        assert_eq!(parse_routes(&json!({})), Ok(None));
+        assert_eq!(parse_routes(&json!({ "routes": null })), Ok(None));
+    }
+
+    #[test]
+    fn parse_routes_reads_a_list_or_its_json_string() {
+        let list = json!([{ "provider": "vertex" }, { "provider": "anthropic" }]);
+        let from_list = parse_routes(&json!({ "routes": list })).unwrap().unwrap();
+        let from_string = parse_routes(&json!({ "routes": list.to_string() }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_list, from_string);
+        assert_eq!(from_list.len(), 2);
+    }
+
+    /// A malformed list must be refused, never ignored in favour of `provider`.
+    #[test]
+    fn parse_routes_refuses_a_malformed_list() {
+        let err = parse_routes(&json!({ "routes": { "provider": "vertex" } })).unwrap_err();
+        assert!(err.contains("routes is malformed"), "{err}");
+        let err = parse_routes(&json!({ "routes": "not json" })).unwrap_err();
+        assert!(err.contains("routes is malformed"), "{err}");
     }
 }

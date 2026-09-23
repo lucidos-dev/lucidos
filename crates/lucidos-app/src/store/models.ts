@@ -1,6 +1,6 @@
 /** Default chat model when no preference is set.
  *  Mirrored on the backend in `crates/lucidos-engine/src/core/preferences.rs`. */
-export const DEFAULT_CHAT_MODEL = 'claude-opus-5@default';
+export const DEFAULT_CHAT_MODEL = 'claude-opus-5';
 
 /** Fallback chat model options shown before the DB-backed registry (`/models`)
  *  loads, and used by tests + label lookups. The live picker reads the loaded
@@ -20,8 +20,8 @@ export const MODELS = [
   { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5' },
   { value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' },
-  { value: 'claude-opus-5@default', label: 'Opus 5' },
-  { value: 'claude-opus-5@default[1m]', label: 'Opus 5 (1M)' },
+  { value: 'claude-opus-5', label: 'Opus 5' },
+  { value: 'claude-opus-5[1m]', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
   { value: 'claude-sonnet-5[1m]', label: 'Sonnet 5 (1M)' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
@@ -33,6 +33,23 @@ export const MODELS = [
   { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
 ];
+
+/** Every backend a model route can name, with how the UI names it. Mirrors
+ *  `llm::model_registry::ProviderKind`, whose `as_str` gives the values. */
+export const PROVIDERS = [
+  { value: 'anthropic', label: 'Anthropic (direct)' },
+  { value: 'vertex', label: 'Vertex' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'xai', label: 'xAI' },
+  { value: 'opencode-free', label: 'OpenCode Free (keyless)' },
+  { value: 'local', label: 'Local (OpenAI-compatible)' },
+];
+
+/** How the UI names a provider, falling back to the raw value. */
+export function providerLabel(provider: string): string {
+  return PROVIDERS.find((p) => p.value === provider)?.label ?? provider;
+}
 
 /** Reasoning effort levels for Claude Code thinking budget. */
 export const REASONING_LEVELS = [
@@ -67,7 +84,9 @@ export const REASONING_LEVELS = [
  *    `llm::reasoning::supported_efforts` keeps the same per-family list, since
  *    a family that tops out at `xhigh` answers `max` with a 400.
  *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
- *  - Fable (5 and 5.1) / Opus 4.7+ (incl. Opus 5 and 5.5) / Sonnet 5: full set (the adaptive Anthropic family that
+ *  - Opus 5.5 / Fable (5 and 5.1): every tier except `none`. They always think,
+ *    so the engine snaps a stored `none` to `low`.
+ *  - Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
  *    natively supports `xhigh`). Sonnet 5 is the first Sonnet-tier model with a distinct `xhigh`;
  *    Sonnet 4.6 and older stay on the filtered set below.
  *  - Other Claude / Gemini: drops `xhigh` (not a distinct tier on those backends). */
@@ -86,12 +105,14 @@ export function availableReasoningLevels(
     if (model.startsWith('gpt-5.6') || model === 'gpt-6-astra') return REASONING_LEVELS;
     return REASONING_LEVELS.filter(l => l.value !== 'max');
   }
+  if (model.startsWith('claude-opus-5-5') || model.startsWith('claude-fable-5')) {
+    return REASONING_LEVELS.filter(l => l.value !== 'none');
+  }
   if (
     model.startsWith('claude-opus-4-7') ||
     model.startsWith('claude-opus-4-8') ||
     model.startsWith('claude-opus-5') ||
-    model.startsWith('claude-sonnet-5') ||
-    model.startsWith('claude-fable-5')
+    model.startsWith('claude-sonnet-5')
   ) {
     return REASONING_LEVELS;
   }

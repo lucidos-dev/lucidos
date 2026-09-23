@@ -302,6 +302,9 @@ struct AskUserQuestionRequestBody<'a> {
 #[derive(Deserialize)]
 struct AskUserQuestionResponseBody {
     answers: Value,
+    /// Set when the engine refused the card, which the user never saw.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 /// Translate one MCP `ask_user_question` call into the engine's question-walk
@@ -375,10 +378,21 @@ fn call_ask_user_question(
         .json::<AskUserQuestionResponseBody>()
         .map_err(|e| format!("HTTP body parse: {}", e))?;
 
-    let answer_text = extract_single_answer(&resp.answers, question);
-    Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": answer_text }]
-    }))
+    Ok(ask_tool_result(&resp, question))
+}
+
+/// The MCP tool result: the user's answer, or the engine's refusal as an error
+/// so the agent reads why no card was shown.
+fn ask_tool_result(resp: &AskUserQuestionResponseBody, question: &str) -> Value {
+    match &resp.refusal {
+        Some(refusal) => serde_json::json!({
+            "content": [{ "type": "text", "text": refusal }],
+            "isError": true
+        }),
+        None => serde_json::json!({
+            "content": [{ "type": "text", "text": extract_single_answer(&resp.answers, question) }]
+        }),
+    }
 }
 
 /// Pull the single question's answer out of the engine's
@@ -583,6 +597,29 @@ mod tests {
             text.contains("Other question") && text.contains("Maybe"),
             "fallback must surface the whole map so the model still sees the answer: {text}"
         );
+    }
+
+    #[test]
+    fn a_refused_card_is_an_error_result_carrying_the_reason() {
+        let resp: AskUserQuestionResponseBody = serde_json::from_value(serde_json::json!({
+            "questions": [],
+            "answers": {},
+            "refusal": "Question card not shown. Answer first."
+        }))
+        .unwrap();
+        let result = ask_tool_result(&resp, "Deploy now?");
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "Question card not shown. Answer first."
+        );
+
+        let answered: AskUserQuestionResponseBody =
+            serde_json::from_value(serde_json::json!({ "answers": { "Deploy now?": "Yes" } }))
+                .unwrap();
+        let result = ask_tool_result(&answered, "Deploy now?");
+        assert!(result.get("isError").is_none());
+        assert_eq!(result["content"][0]["text"], "Yes");
     }
 
     #[test]

@@ -470,6 +470,39 @@ html[data-theme="light"] .settings-option.active {
     flex-shrink: 0;
 }
 
+/* The remembered backend's chip reads as the one a turn will reach. */
+.model-provider-badge[data-preferred='true'] {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+/* Settings → Models: one model's route editor, opened under its row. */
+.model-routes-editor {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--space-sm) 0 var(--space-md);
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* One route: backend, wire id, window, then its move and remove buttons. The
+   id takes the spare width, since it is the long field. */
+.model-route-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.model-route-row .settings-text-input {
+    flex: 1 1 10rem;
+    min-width: 0;
+}
+
+.model-route-row .model-route-window {
+    flex: 0 1 7rem;
+}
+
 /* Shown next to the provider chip when that backend isn't configured, so the
    model is hidden from the picker. Muted + dashed to read as "inactive". */
 .model-provider-unconfigured {

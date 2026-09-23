@@ -12,6 +12,7 @@ import {
   lastThreadReasoningEffort,
   patchThreadModelOverride,
   resolveActiveThreadModel,
+  resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
 } from './threadModelSelections';
 import { currentModel, reasoningEffort, threadMap } from './store';
@@ -140,5 +141,24 @@ describe('clearThreadModelOverride', () => {
   it('is a no-op for an unknown / null thread', () => {
     expect(() => clearThreadModelOverride('none')).not.toThrow();
     expect(() => clearThreadModelOverride(null)).not.toThrow();
+  });
+});
+
+describe('resolveActiveThreadProvider: a backend is remembered with its model', () => {
+  it("reads the thread's pick for the model it runs on, and drops it on a switch", () => {
+    seedThread('t-1', [
+      [1, { type: 'MessageReceived', model: 'opus', provider: 'vertex' }],
+      [2, { type: 'MessageReceived', model: 'sonnet' }],
+    ]);
+    expect(resolveActiveThreadProvider('t-1', 'opus')).toBe('vertex');
+    expect(resolveActiveThreadProvider('t-1', 'sonnet')).toBeNull();
+  });
+
+  it("prefers this thread's pending pick for the same model", () => {
+    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'opus', provider: 'vertex' }]]);
+    patchThreadModelOverride('t-1', { model: 'opus', provider: 'anthropic' });
+    expect(resolveActiveThreadProvider('t-1', 'opus')).toBe('anthropic');
+    // Another thread never sees it.
+    expect(resolveActiveThreadProvider('t-2', 'opus')).toBeNull();
   });
 });

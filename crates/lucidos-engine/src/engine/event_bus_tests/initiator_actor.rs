@@ -12,6 +12,7 @@ async fn initiator_user_chat() {
     bus.emit(BusEvent::Thread {
         thread_id: tid,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "hello".into(),
             user_image_hashes: vec![],
@@ -55,6 +56,7 @@ async fn initiator_system_trigger() {
     bus.emit(BusEvent::Thread {
         thread_id: tid,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("daily".into()),
             prompt: None,
@@ -96,6 +98,7 @@ async fn initiator_inherited_system_to_cc_child() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("e2e tests".into()),
             prompt: None,
@@ -117,6 +120,7 @@ async fn initiator_inherited_system_to_cc_child() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "run e2e tests".into(),
             user_image_hashes: vec![],
@@ -169,6 +173,7 @@ async fn initiator_inherited_user_to_cc_child() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "help me".into(),
             user_image_hashes: vec![],
@@ -194,6 +199,7 @@ async fn initiator_inherited_user_to_cc_child() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
@@ -240,6 +246,7 @@ async fn initiator_from_message_source_field() {
     bus.emit(BusEvent::Thread {
         thread_id: tid,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "system message".into(),
             user_image_hashes: vec![],
@@ -285,6 +292,7 @@ async fn initiator_preserved_on_session_started_upsert() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("nightly".into()),
             prompt: None,
@@ -306,6 +314,7 @@ async fn initiator_preserved_on_session_started_upsert() {
     bus.emit(BusEvent::Thread {
         thread_id: cc_thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "run tests".into(),
             user_image_hashes: vec![],
@@ -375,6 +384,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "spawn a child".into(),
             user_image_hashes: vec![],
@@ -399,6 +409,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do work".into(),
             user_image_hashes: vec![],

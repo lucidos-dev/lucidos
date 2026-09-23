@@ -16,8 +16,8 @@
 //! So the cluster is 60pt wide, its centre 16pt below the window's top edge.
 //! The buttons' `origin.y` is AppKit's to set, which is why
 //! [`container_height`] is the arithmetic rather than a y offset. And AppKit
-//! reverts the placement on **every window resize**, so [`watch_resizes`] owns
-//! re-applying it.
+//! reverts the placement on **every window resize** and **every new title**, so
+//! [`watch_resizes`] and [`retitle`] own re-applying it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -209,9 +209,10 @@ pub(crate) fn load_persisted(app: &tauri::AppHandle) {
 
 /// Place the lights on one window at ITS bar height.
 ///
-/// The re-apply path. It runs on every `Resized`, the one revert AppKit is
-/// measured to perform. It runs on every `Moved` too, as the net for a revert
-/// no probe reproduces (ADR 0074).
+/// The re-apply path. It runs on every `Resized`, a revert AppKit is measured
+/// to perform. It runs on every `Moved` too, as the net for a revert the probe
+/// has not found (ADR 0074). A retitle is the other measured revert, and
+/// [`retitle`] handles it.
 pub(crate) fn place(window: &tauri::Window) {
     place_at(window, bar_height_for(window.label()));
 }
@@ -272,38 +273,77 @@ fn place_at(_window: &tauri::Window, _bar_height_px: f64) {}
 
 #[cfg(target_os = "macos")]
 fn place_at(window: &tauri::Window, bar_height_px: f64) {
-    use objc2::MainThreadMarker;
+    let label = window.label().to_string();
+    let placed = on_ns_window(window, move |ns_window| {
+        watch_resizes(&label, ns_window);
+        inset_lights(ns_window, LIGHTS_X_PX, bar_height_px);
+    });
+    if let Err(e) = placed {
+        eprintln!("[Tauri] Could not place the traffic lights: {e}");
+    }
+}
 
-    let Some(_mtm) = MainThreadMarker::new() else {
-        // AppKit may only be touched from the main thread, and a sync
-        // `#[tauri::command]` is not documented to run there, so hop instead of
-        // giving up. `notifications.rs` bails in the same situation, which is
-        // right for a best-effort badge that the next poll re-sends and wrong
-        // here: dropping this would leave the lights where the LAST launch put
-        // them until something resized the window.
+/// Title `window` without losing the lights. Off macOS there are none to keep.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn retitle(window: &tauri::Window, title: String) -> Result<(), String> {
+    window.set_title(&title).map_err(|e| format!("{e}"))
+}
+
+/// Title `window`, and put the lights back where the retitle moved them from.
+///
+/// A NEW title makes AppKit lay the titlebar out afresh, which reverts both
+/// numbers to its own (the probe's `retitle` stop measures it). tao's
+/// `set_title` only queues `setTitle:` for later, so a placement after it would
+/// run before the revert. Both writes therefore happen here, in one step.
+#[cfg(target_os = "macos")]
+pub(crate) fn retitle(window: &tauri::Window, title: String) -> Result<(), String> {
+    let label = window.label().to_string();
+    on_ns_window(window, move |ns_window| {
+        retitle_and_place(ns_window, &title, bar_height_for(&label));
+    })
+}
+
+/// The AppKit half of [`retitle`]: set the title, then place. Its own function
+/// so the probe runs the exact writes the client does.
+#[cfg(target_os = "macos")]
+pub(crate) fn retitle_and_place(ns_window: &objc2_app_kit::NSWindow, title: &str, bar_px: f64) {
+    ns_window.setTitle(&objc2_foundation::NSString::from_str(title));
+    inset_lights(ns_window, LIGHTS_X_PX, bar_px);
+}
+
+/// Run `apply` against `window`'s `NSWindow` on the main thread, the only thread
+/// AppKit may be touched from.
+///
+/// Off the main thread it hops rather than giving up. `notifications.rs` bails
+/// there, which suits a badge the next poll re-sends. Here a dropped write would
+/// leave the lights misplaced until something resized the window.
+#[cfg(target_os = "macos")]
+fn on_ns_window(
+    window: &tauri::Window,
+    apply: impl FnOnce(&objc2_app_kit::NSWindow) + Send + 'static,
+) -> Result<(), String> {
+    let Some(_mtm) = objc2::MainThreadMarker::new() else {
         let deferred = window.clone();
-        if let Err(e) = window.run_on_main_thread(move || place_at(&deferred, bar_height_px)) {
-            eprintln!(
-                "[Tauri] Could not marshal the traffic-light placement to the main thread: {e}"
-            );
-        }
-        return;
+        return window
+            .run_on_main_thread(move || {
+                if let Err(e) = on_ns_window(&deferred, apply) {
+                    eprintln!("[Tauri] {e}");
+                }
+            })
+            .map_err(|e| format!("could not reach the main thread: {e}"));
     };
 
-    let ptr = match window.ns_window() {
-        Ok(ptr) if !ptr.is_null() => ptr,
-        Ok(_) => return,
-        Err(e) => {
-            eprintln!("[Tauri] No NSWindow to place the traffic lights on: {e}");
-            return;
-        }
-    };
+    let ptr = window
+        .ns_window()
+        .map_err(|e| format!("no NSWindow for {}: {e}", window.label()))?;
+    if ptr.is_null() {
+        return Err(format!("no NSWindow for {}", window.label()));
+    }
     // SAFETY: `ns_window` hands back an autoreleased `NSWindow` for this window,
     // valid for the rest of this call. `_mtm` is the evidence that forming a
     // reference to a `MainThreadOnly` type here is sound.
-    let ns_window: &objc2_app_kit::NSWindow = unsafe { &*ptr.cast() };
-    watch_resizes(window.label(), ns_window);
-    inset_lights(ns_window, LIGHTS_X_PX, bar_height_px);
+    apply(unsafe { &*ptr.cast() });
+    Ok(())
 }
 
 /// The opaque token `addObserverForName:object:queue:usingBlock:` hands back,

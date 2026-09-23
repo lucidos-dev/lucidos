@@ -4,9 +4,9 @@ use crate::core::PreferenceStore;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
-    is_valid_trigger_slug, normalize_route_setting, validate_script_extension,
-    validate_trigger_reasoning_effort, EventSubscription, TriggerConfig, TriggerRun,
-    TriggerRunStatus,
+    is_valid_trigger_slug, normalize_route_setting, resolve_trigger_provider_update,
+    validate_script_extension, validate_trigger_provider, validate_trigger_reasoning_effort,
+    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -74,6 +74,10 @@ pub struct TriggerInfo {
     /// `chat_reasoning_effort` preference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// The backend the pinned model runs on. Absent = the model's own
+    /// preferred provider, then its first configured route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 impl TriggerInfo {
@@ -112,6 +116,7 @@ impl TriggerInfo {
             plugin_id: config.plugin_id.clone(),
             model: config.model.clone(),
             reasoning_effort: config.reasoning_effort.clone(),
+            provider: config.provider.clone(),
         }
     }
 }
@@ -184,6 +189,11 @@ pub struct CreateTriggerCronRequest {
     /// `none|low|medium|high|xhigh|max`; anything else is a 400.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// The backend the pinned model runs on, when it has more than one route.
+    /// Omitted, null, or blank = the model's own preferred provider. Requires a
+    /// model pin and must name one of that model's routes.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +240,10 @@ pub struct UpdateTriggerCronRequest {
     /// `none|low|medium|high|xhigh|max`.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub reasoning_effort: Option<Option<String>>,
+    /// Same triple state as [`Self::model`]. A change of model without one
+    /// clears the old pin: see [`resolve_trigger_provider_update`].
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub provider: Option<Option<String>>,
 }
 
 /// Both checks a `run.type = "script"` path has to pass at the boundary.
@@ -464,6 +478,15 @@ pub(super) async fn create_trigger(
         Ok(None) => {}
         Err(e) => return ApiResult::err(e),
     }
+    match validate_trigger_provider(
+        state.engine.model_registry(),
+        request.model.as_deref(),
+        request.provider.as_deref(),
+    ) {
+        Ok(Some(provider)) => payload["provider"] = serde_json::json!(provider),
+        Ok(None) => {}
+        Err(e) => return ApiResult::err(e),
+    }
 
     // Through the trigger write chokepoint: the registry must hold the new
     // trigger before this 200 lands, or the client's next
@@ -630,6 +653,16 @@ pub(super) async fn update_trigger(
             Ok(normalized) => update_payload["reasoning_effort"] = serde_json::json!(normalized),
             Err(e) => return ApiResult::err(e),
         }
+    }
+    match resolve_trigger_provider_update(
+        state.engine.model_registry(),
+        &existing,
+        request.model.as_ref().map(Option::as_deref),
+        request.provider.as_ref().map(Option::as_deref),
+    ) {
+        Ok(Some(provider)) => update_payload["provider"] = serde_json::json!(provider),
+        Ok(None) => {}
+        Err(e) => return ApiResult::err(e),
     }
 
     // Ensure trigger still has at least one firing mechanism after update
@@ -868,5 +901,47 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(req.slug.as_deref(), Some("renamed-trigger"));
+    }
+
+    // --- Request shape: the provider pin ---
+
+    #[test]
+    fn create_request_accepts_a_provider_pin() {
+        let req: CreateTriggerCronRequest = serde_json::from_value(serde_json::json!({
+            "name": "Test",
+            "run": { "type": "intent", "intent": "x" },
+            "cron_expressions": ["0 0 8 * * *"],
+            "model": "claude-opus-5",
+            "provider": "anthropic",
+        }))
+        .unwrap();
+        assert_eq!(req.provider.as_deref(), Some("anthropic"));
+    }
+
+    /// Absent keeps the pin and null clears it, so the two must not collapse.
+    #[test]
+    fn update_request_tells_an_absent_provider_from_a_null_one() {
+        let absent: UpdateTriggerCronRequest =
+            serde_json::from_value(serde_json::json!({ "name": "x" })).unwrap();
+        assert_eq!(absent.provider, None);
+        let null: UpdateTriggerCronRequest =
+            serde_json::from_value(serde_json::json!({ "provider": null })).unwrap();
+        assert_eq!(null.provider, Some(None));
+        let set: UpdateTriggerCronRequest =
+            serde_json::from_value(serde_json::json!({ "provider": "vertex" })).unwrap();
+        assert_eq!(set.provider, Some(Some("vertex".to_string())));
+    }
+
+    #[test]
+    fn trigger_info_serves_the_provider_pin() {
+        let config = TriggerConfig::from_created_payload(&serde_json::json!({
+            "trigger_id": "t", "name": "T", "schedule": [], "timezone": "UTC",
+            "run": { "type": "intent", "intent": "x" },
+            "on": [{ "event_type": "DayEnded" }],
+            "model": "claude-opus-5", "provider": "anthropic",
+        }))
+        .unwrap();
+        let info = serde_json::to_value(TriggerInfo::from_config(&config)).unwrap();
+        assert_eq!(info["provider"], "anthropic");
     }
 }

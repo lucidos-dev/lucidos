@@ -146,15 +146,59 @@ fi
 
 # ── 3. release.sh: the ordering inside run_publish_draft ──────────────────────
 echo ""
-echo "test: run_publish_draft waits, THEN publishes, THEN emits, THEN settles"
+echo "test: run_publish_draft waits, THEN publishes, THEN settles and announces"
 BODY="$(func_body run_publish_draft "$RELEASE_SH")"
 if [ -z "$BODY" ]; then
     fail "run_publish_draft is not defined in release.sh"
 else
     ordered "run_publish_draft" "$BODY" \
         'release_draft_wait_then_publish' \
-        'emit_lucidos_released' \
         'settle_after_publish'
+    # The v0.39.3 bug: this function emitted LucidosReleased itself, BEFORE
+    # settle_after_publish landed the bump, so the site built install.sh from a
+    # main that still named the previous version.
+    if printf '%s\n' "$BODY" | grep -q 'emit_lucidos_released'; then
+        fail "run_publish_draft emits LucidosReleased itself, ahead of the landing"
+    else
+        pass "run_publish_draft leaves the announce to settle_after_publish"
+    fi
+fi
+
+echo ""
+echo "test: settle_after_publish announces only through settle_and_announce_release"
+SETTLE_BODY="$(func_body settle_after_publish "$RELEASE_SH" || true)"
+if printf '%s\n' "$SETTLE_BODY" | grep -q 'settle_and_announce_release "$published_commit" "$dmg_pending"'; then
+    pass "settle_after_publish settles and announces in one call"
+else
+    fail "settle_after_publish does not call settle_and_announce_release with the published commit"
+fi
+ANNOUNCE_BODY="$(func_body settle_and_announce_release "$RELEASE_SH" || true)"
+ordered "settle_and_announce_release" "$ANNOUNCE_BODY" \
+    'settle_source_side' \
+    'emit_lucidos_released' \
+    'fail "$LANDING_CONFLICT"'
+
+echo ""
+echo "test: release.sh tells release-to-lucidos.sh not to announce, on both invocations"
+# Without the flag, release-to-lucidos.sh emits at its end, which is before
+# release.sh lands the bump: the v0.39.3 order.
+if func_body run_publish_verified "$RELEASE_SH" | grep -q -- '--no-released-event'; then
+    pass "Phase B passes --no-released-event"
+else
+    fail "Phase B lets release-to-lucidos.sh announce before the landing"
+fi
+ONESHOT_CALLS="$(grep -vE '^[[:space:]]*#' "$RELEASE_SH" | grep -cF '"$WORKTREE_DIR/scripts/release-to-lucidos.sh" --no-released-event' || true)"
+if [ "$ONESHOT_CALLS" = "2" ]; then
+    pass "both one-shot invocations pass --no-released-event"
+else
+    fail "one-shot invocations carrying --no-released-event: $ONESHOT_CALLS (want 2)"
+fi
+oneshot_publish="$(line_of '"$WORKTREE_DIR/scripts/release-to-lucidos.sh" --no-released-event' "$RELEASE_SH" || true)"
+oneshot_announce="$(grep -vE '^[[:space:]]*#' "$RELEASE_SH" | grep -nE '^settle_and_announce_release ' | head -1 | cut -d: -f1 || true)"
+if [ -n "$oneshot_publish" ] && [ -n "$oneshot_announce" ] && [ "$oneshot_publish" -lt "$oneshot_announce" ]; then
+    pass "the one-shot announces after release-to-lucidos.sh returns"
+else
+    fail "the one-shot tail does not announce after publishing (publish=$oneshot_publish announce=$oneshot_announce)"
 fi
 
 echo ""
@@ -194,10 +238,10 @@ for caller in run_publish_verified run_publish_draft; do
         fail "$caller does not call settle_after_publish"
     fi
 done
-if func_body settle_after_publish "$RELEASE_SH" | grep -q 'settle_source_side'; then
-    pass "the shared tail lands the bump on main"
+if func_body settle_after_publish "$RELEASE_SH" | grep -q 'settle_and_announce_release'; then
+    pass "the shared tail lands the bump on main (and then announces)"
 else
-    fail "the shared tail no longer calls settle_source_side"
+    fail "the shared tail no longer calls settle_and_announce_release"
 fi
 
 echo ""
@@ -235,6 +279,24 @@ PUB_CODE="$(grep -vE '^[[:space:]]*#' "$PUBLISH_SH")"
 ordered "release-to-lucidos.sh" "$PUB_CODE" \
     'release_draft_wait_then_publish' \
     'emit_lucidos_released'
+
+echo ""
+echo "test: release-to-lucidos.sh emits only when its caller did not take the announce"
+if printf '%s\n' "$PUB_CODE" | grep -qE '^\s+--no-released-event\) EMIT_RELEASED=0'; then
+    pass "--no-released-event is parsed"
+else
+    fail "release-to-lucidos.sh does not parse --no-released-event"
+fi
+# Every emit must sit inside the EMIT_RELEASED guard.
+if printf '%s\n' "$PUB_CODE" | awk '
+    /^if \[\[ "\$EMIT_RELEASED" == "1" \]\]; then/ { guard = 1; next }
+    guard && /^else$|^fi$/ { guard = 0 }
+    /emit_lucidos_released/ && !guard { bad = 1 }
+    END { exit bad }'; then
+    pass "every LucidosReleased emit is behind the EMIT_RELEASED guard"
+else
+    fail "release-to-lucidos.sh emits LucidosReleased outside the EMIT_RELEASED guard"
+fi
 
 echo ""
 echo "test: a refused publish is fatal there too, and names the resume"

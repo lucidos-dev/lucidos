@@ -322,7 +322,7 @@ pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     }
 
     let models = sqlx::query(
-        "SELECT id, label, provider, sort_order::text AS sort_order, source, \
+        "SELECT id, label, routes::text AS routes, sort_order::text AS sort_order, source, \
          enabled::text AS enabled FROM models",
     )
     .fetch_all(pool)
@@ -330,7 +330,7 @@ pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     for row in models {
         let id: String = row.try_get("id")?;
         let mut value = String::new();
-        for column in ["label", "provider", "sort_order", "source", "enabled"] {
+        for column in ["label", "routes", "sort_order", "source", "enabled"] {
             let cell: String = row.try_get(column)?;
             value.push_str(&cell);
             value.push('\u{1d}');
@@ -821,9 +821,9 @@ pub struct SeedPins<'a> {
 
 /// Apply `seed.sql` to a freshly migrated database.
 ///
-/// `context_window` is passed as the literal `NULL` when unset, so the row's
-/// column is genuinely null and `context_window_for` falls back to the prefix
-/// map. Quoting it as an empty string would insert one instead.
+/// `context_window` is passed as the literal `NULL` when unset, so the route
+/// declares no window and `context_window_for` falls back to the prefix map.
+/// Quoting it as an empty string would insert one instead.
 pub fn apply_seed_sql(database_url: &str, seed_sql: &Path, pins: &SeedPins) -> Fallible<()> {
     let window = match pins.context_window {
         Some(window) => window.to_string(),

@@ -77,6 +77,21 @@ reported edge. That lands at once. A larger one is content below the anchor
 still rendering, or since shrunk. That waits, and takes the maximum only when
 the wait is over: `onDeadline`, and the dead-link rescue.
 
+> **Amended: a resolved anchor lands at once, whatever the overshoot.** The
+> wait could not succeed. The window draws everything below a rendered turn,
+> and nothing in a turn renders lazily. So "still rendering" meant only an
+> image or a font decoding, and "since shrunk" never recovers.
+
+> Meanwhile the reader sat at the top of the window. Each height change
+> re-armed the deadline, up to the 20s ceiling, and the landing then jumped
+> them to the bottom untouched. The iOS PWA reported it as the thread
+> scrolling a few seconds after it opened. The rounding slack went with the
+> wait, and a bare offset still refuses.
+
+> One turn still waits: one drawn with its head clamped, mid-walk. Its top is
+> real and its rows are still arriving, so it counts as not yet resolved.
+> Landing there would settle the restore and stop the walk short.
+
 ## Alternatives considered
 
 **A bottom-relative offset.** Survives a re-seeded window, because it measures

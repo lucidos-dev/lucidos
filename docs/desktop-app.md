@@ -608,6 +608,18 @@ the never-returning client relaunch. Without the service restart the window woul
 run new code against a still-old gateway/engine (the launchd service keeps the old
 images until something restarts it).
 
+**The teardown waits for the engines before the next start can see them.**
+`GatewayService::shutdown` signals every engine, then waits for each to exit
+before it stops Postgres. An engine still running when launchd's 20 s budget
+nears its end is force-killed (`finish_stopping_engines`). The dev restart has
+the same wait-then-kill shape (`wait_for_engine_shutdown`).
+
+Without the wait, an engine draining a coding-agent session kept answering
+health for about 12 s. The new gateway re-adopted it, and the relaunched window
+loaded the old UI from an engine that was about to exit. An engine in teardown
+also answers `/api/v1/health` with a 503, so no gateway adopts one on any other
+path. See `docs/plans/2026-09-23-update-restart-waits-for-engines.md`.
+
 **A restart brings back the workspaces it stopped** (`crates/lucidos-gateway/src/next_boot.rs`).
 The service teardown stops every workspace engine and the embedded Postgres,
 which is right for a full stop and wrong for a restart: the gateway that comes up

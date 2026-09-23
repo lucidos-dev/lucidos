@@ -18,6 +18,7 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
 
 fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
     TriggerConfig {
+        provider: None,
         id: uuid::Uuid::new_v4().to_string(),
         name: format!("Trigger {slug}"),
         slug: slug.to_string(),
@@ -104,6 +105,29 @@ fn roundtrips_a_trigger_pinned_to_a_model_and_effort() {
     assert_eq!(parsed.reasoning_effort.as_deref(), Some("low"));
 }
 
+/// `provider` is a scalar too, so the same ordering rule binds it.
+#[test]
+fn roundtrips_a_trigger_pinned_to_a_provider() {
+    let mut c = config(
+        "direct-digest",
+        TriggerRun::Intent {
+            intent: "Summarize today".to_string(),
+        },
+    );
+    c.model = Some("claude-opus-5".to_string());
+    c.provider = Some("anthropic".to_string());
+    c.on = vec![EventSubscription {
+        event_type: "DayEnded".to_string(),
+        condition: None,
+    }];
+
+    let def = TriggerDefinition::from_config(&c);
+    let toml = def.to_toml().expect("serialize a provider-pinned trigger");
+    let parsed = TriggerDefinition::from_toml(&toml).expect("parse a provider-pinned trigger");
+    assert_eq!(parsed, def);
+    assert_eq!(parsed.provider.as_deref(), Some("anthropic"));
+}
+
 /// A trigger on the account default writes no model keys at all, so an existing
 /// workspace's projected files are byte-identical after this change.
 #[test]
@@ -117,6 +141,24 @@ fn default_model_is_omitted_from_the_projection() {
     let toml = TriggerDefinition::from_config(&c).to_toml().unwrap();
     assert!(!toml.contains("model"));
     assert!(!toml.contains("reasoning_effort"));
+    assert!(!toml.contains("provider"));
+}
+
+/// A shipped definition's provider pin survives the trip into the payload the
+/// scheduler parses, like its model pin.
+#[test]
+fn to_trigger_payload_carries_the_provider_pin() {
+    let mut c = config(
+        "pinned",
+        TriggerRun::Intent {
+            intent: "react".to_string(),
+        },
+    );
+    c.model = Some("claude-opus-5".to_string());
+    c.provider = Some("anthropic".to_string());
+    let payload = TriggerDefinition::from_config(&c).to_trigger_payload("id", "my-plugin");
+    let parsed = TriggerConfig::from_created_payload(&payload).expect("payload parses");
+    assert_eq!(parsed.provider.as_deref(), Some("anthropic"));
 }
 
 #[test]

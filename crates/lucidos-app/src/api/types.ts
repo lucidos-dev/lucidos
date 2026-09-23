@@ -23,6 +23,9 @@ export interface ChatRequestBody {
   model?: string;
   device_id?: string;
   reasoning_effort?: string;
+  /** The backend to pin for `model`. Absent lets the thread's memory, then
+   *  the model's own default, decide. */
+  provider?: string;
   app_context?: {
     app_id: string;
   };
@@ -176,29 +179,46 @@ export interface AgentBinariesResponse {
   codex: AgentBinaryStatus;
 }
 
+/** One way a model can be served: a backend, the id sent to it, and what that
+ *  backend offers. Mirrors the engine `api::RouteInfo`.
+ *
+ *  A row carries an ordered list, which is what lets one model be served by
+ *  whichever provider the workspace has credentials for. */
+export interface RouteInfo {
+  /** 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' |
+   *  'opencode-free' | 'local'. */
+  provider: string;
+  /** The id this route puts on the wire. The engine always spells it out, even
+   *  where the stored route leaves it to default to the row's own id. */
+  id: string;
+  /** Context window in tokens, or absent when the engine infers it from this
+   *  route's id. The id-shape fallback only knows Claude and GPT-5, so every
+   *  OpenRouter / xAI / Gemini / local route is treated as 200k until set. */
+  context_window?: number;
+  /** Reasoning efforts this BACKEND offers for this model, derived by the
+   *  engine (`llm::reasoning::supported_efforts`) and the SAME set
+   *  `RoutingProvider` clamps a request onto. Per route, because the answer
+   *  depends on the backend: a Claude id offers six on Vertex and four through
+   *  OpenRouter, whose server has no `xhigh`. */
+  reasoning_efforts: string[];
+}
+
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
- *  engine `core::models::Model`. `provider` is the backend that serves it
- *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local'); `source` is
- *  'builtin' (disable-only) or 'user' (deletable). */
+ *  engine `api::ModelInfo`. `source` is 'builtin' (disable-only) or 'user'
+ *  (deletable). */
 export interface ModelInfo {
   id: string;
   label: string;
-  provider: string;
+  /** Backends that can serve this model, in priority order. Never empty. */
+  routes: RouteInfo[];
+  /** The provider last picked for this model, or null for never picked.
+   *  Honoured when its route is configured, and REFUSED rather than
+   *  substituted when it is not. */
+  preferred_provider: string | null;
   sort_order: number;
   source: string;
   enabled: boolean;
-  /** Context window in tokens, or null when the engine infers it from the model
-   *  id. The id-shape fallback only knows Claude and GPT-5, so every OpenRouter
-   *  / xAI / Gemini / local model is treated as 200k until this is set. */
-  context_window: number | null;
   created_at: string;
-  /** Reasoning tiers this model actually supports, derived by the engine from
-   *  the row's provider and id (`llm::reasoning::supported_efforts`) and the
-   *  SAME set `RoutingProvider` clamps a request onto. The picker filters
-   *  `REASONING_LEVELS` against this rather than guessing from the id, which is
-   *  what let it offer a local model a tier its server rejected. Optional only
-   *  for an engine predating the field. */
-  reasoning_efforts?: string[];
 }
 
 export interface ModelsListResponse {

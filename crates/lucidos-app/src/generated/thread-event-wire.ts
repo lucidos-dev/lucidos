@@ -474,6 +474,11 @@ export type ThreadEvent =
       model?: string;
       /** Reasoning effort the engine will use to answer this message. */
       reasoning_effort?: string;
+      /** The backend this message was PINNED to: an explicit pick, or one
+       *  this thread remembered for the same model. Stamped beside the model
+       *  so the pick outlives a later change to the model's *preferred
+       *  provider*. `None` means nothing was pinned, so the row decides. */
+      provider?: string;
       /** Structured origin, captured from HTTP headers / device lookup at
        *  the API boundary. Optional on the wire so old DB rows deserialize
        *  cleanly; the frontend's `legacyOrigin()` synthesizes from the
@@ -1134,6 +1139,10 @@ export type ThreadEvent =
       /** The reasoning effort this fire actually ran with. Same role and same
        *  legacy-`None` caveat as [`Self::TriggerStarted::model`]. */
       reasoning_effort?: string;
+      /** The backend this fire was pinned to, from the trigger's own pin or
+       *  the thread's memory. `None` means nothing was pinned, so the row
+       *  decided. */
+      provider?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

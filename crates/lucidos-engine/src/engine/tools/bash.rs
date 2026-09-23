@@ -302,10 +302,7 @@ impl LucidosEngine {
             // Without kill_on_drop both leak the shell child. With it set,
             // both paths SIGKILL the child correctly.
             .kill_on_drop(true);
-
-        for (key, value) in &env_vars {
-            cmd.env(key, value);
-        }
+        crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
 
         let log_command = redact_postgres_secrets(command);
         log!(

@@ -59,6 +59,8 @@ export interface ComposeSelectionOverride {
   model?: string;
   /** Lucidos Agent reasoning effort. */
   reasoningEffort?: string;
+  /** The backend picked for `model`. Absent means the model's own default. */
+  provider?: string;
   /** Coding-agent model; `null` = an explicit "default" pick (distinct from
    *  absent, which falls back to the global). */
   ccModel?: CodingAgentModelValue | null;
@@ -186,6 +188,12 @@ export function resolveModel(threadId: string | null | undefined): string {
 
 export function resolveReasoningEffort(threadId: string | null | undefined): string {
   return getComposeSelectionOverride(threadId).reasoningEffort ?? reasoningEffort.value;
+}
+
+/** The backend this draft pinned, or `null` for the model's own default. No
+ *  account-wide fallback: the model's row remembers its own. */
+export function resolveProvider(threadId: string | null | undefined): string | null {
+  return getComposeSelectionOverride(threadId).provider ?? null;
 }
 
 // Coding-agent model/effort have no account-wide default (they're per-thread on

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   modelStepCommit, modelStepOptions, pickerFocusTarget, pickerKeyAction,
-  pickerShowsFilter, tierStepOptions,
+  pickerShowsFilter, providerStepCommit, providerStepOptions, tierStepOptions,
 } from '../ModelSelectionPicker';
 import type { ModelRow } from '../../../store/modelSelection';
 
@@ -12,6 +12,9 @@ const OPUS: ModelRow = {
     { value: 'high', label: 'High' },
     { value: 'xhigh', label: 'X-High', description: 'Deeper' },
   ],
+  provider: null,
+  providerLabel: null,
+  providers: [],
 };
 
 const HAIKU: ModelRow = {
@@ -19,9 +22,15 @@ const HAIKU: ModelRow = {
   label: 'Haiku 4.5',
   description: 'Fast',
   tiers: [{ value: 'low', label: 'Low' }],
+  provider: null,
+  providerLabel: null,
+  providers: [],
 };
 
-const IMAGEN: ModelRow = { value: 'imagen-4', label: 'Imagen 4', tiers: [] };
+const IMAGEN: ModelRow = {
+  value: 'imagen-4', label: 'Imagen 4', tiers: [], provider: null, providerLabel: null,
+  providers: [],
+};
 
 const IN_FORCE = { model: 'claude-opus-5', label: 'Opus 5 (1M) · X-High' };
 
@@ -140,5 +149,43 @@ describe('pickerFocusTarget', () => {
 
   it('keeps the tier step on the list, which has no filter to focus', () => {
     expect(pickerFocusTarget({ tierStep: true, searching: true })).toBe('list');
+  });
+});
+
+/** A row with a real choice of backend. OpenRouter has no `xhigh`. */
+const DUAL: ModelRow = {
+  value: 'claude-opus-5-5',
+  label: 'Opus 5.5',
+  tiers: [
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'X-High' },
+  ],
+  provider: 'vertex',
+  providerLabel: 'Vertex',
+  providers: [
+    {
+      value: 'vertex', label: 'Vertex', configured: true,
+      tiers: [{ value: 'high', label: 'High' }, { value: 'xhigh', label: 'X-High' }],
+    },
+    { value: 'openrouter', label: 'OpenRouter', configured: false, tiers: [{ value: 'high', label: 'High' }] },
+  ],
+};
+
+describe('the provider step', () => {
+  it('marks a backend that is not set up, since picking it refuses the turn', () => {
+    expect(providerStepOptions(DUAL).map((o) => [o.value, o.description])).toEqual([
+      ['vertex', undefined],
+      ['openrouter', 'Not set up'],
+    ]);
+  });
+
+  it('snaps the held effort onto what the picked backend accepts', () => {
+    expect(providerStepCommit(DUAL, 'openrouter', 'xhigh')).toBe('claude-opus-5-5|high');
+    expect(providerStepCommit(DUAL, 'vertex', 'xhigh')).toBe('claude-opus-5-5|xhigh');
+  });
+
+  it('opens a step rather than committing, for a model with a choice of backend', () => {
+    expect(modelStepCommit({ ...DUAL, tiers: [] })).toBeNull();
+    expect(modelStepOptions([DUAL], IN_FORCE)[0].drilldown).toBe(true);
   });
 });

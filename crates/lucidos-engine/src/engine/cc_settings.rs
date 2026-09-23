@@ -7,6 +7,8 @@
 //! fail-fast in `ClaudeCodeRuntime::spawn` when the CLI can't be resolved).
 //! Keeps the JSON shape literal; no per-spawn interpolation. See
 //! `claude_code::permission_mcp_config_json` for the same pattern.
+//! It carries hooks and directory grants only, never a model or effort default:
+//! see [`build_cc_settings_json`].
 
 use std::path::{Path, PathBuf};
 
@@ -19,21 +21,6 @@ pub(crate) fn cc_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
 /// Match the 24-hour `MCP_TOOL_TIMEOUT` ceiling we already use for the MCP
 /// permission server. Value is in seconds.
 const HOOK_TIMEOUT_SECONDS: u64 = 86_400;
-
-/// Default model for NEW Claude Code sessions, written into the `--settings`
-/// file as CC's durable `model` default. Mirrors the chat default
-/// (`core::DEFAULT_CHAT_MODEL`), but the two are deliberately independent knobs
-/// (CC has its own picker + backend), so this is a distinct constant rather than
-/// a reference. CC's `model` setting is the LOWEST-priority model source, so:
-///   - a per-thread pick (`--model <value>` on spawn) still overrides it, and
-///   - a RESUMED session keeps its own stored model (settings `model` only
-///     seeds fresh sessions) — the reason this lives in settings, not an
-///     `ANTHROPIC_MODEL` env that would also retarget resumed sessions.
-///
-/// Vertex id form (`@default`), matching the CC `/model` picker's Opus 5 entry
-/// in `runtime/cc_menu_options.json` so it round-trips through
-/// `normalize_cc_model_id`.
-const CC_DEFAULT_MODEL: &str = "claude-opus-5@default";
 
 /// The one working directory a CC session gets beyond its own worktree:
 /// [`crate::core::DATA_DIR`], holding the artifacts, knowhow, apps and triggers
@@ -123,9 +110,14 @@ fn os_tmp_directories() -> Vec<PathBuf> {
 
 /// Render the settings file. The `permissions` key is omitted entirely when the
 /// slice is empty, so the file never names a directory that is not there.
+///
+/// No `model` or `effortLevel` key, ever. CC ranks this file (its
+/// `flagSettings` source) above the user's own settings, so either key would
+/// override the user's CC config for every unpinned session. Without them CC
+/// resolves as it does outside Lucidos: `--model`, then `ANTHROPIC_MODEL`, then
+/// the settings files, then its built-in default.
 pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> String {
     let mut settings = serde_json::json!({
-        "model": CC_DEFAULT_MODEL,
         "hooks": {
             "PreToolUse": [
                 {
@@ -211,18 +203,19 @@ pub(crate) async fn write_cc_settings(
 mod tests {
     use super::*;
 
+    /// The engine's settings file outranks the user's own CC settings, so a
+    /// default here would silently override the model and effort they chose.
+    /// `CcSettingsScope::resolve` also relies on it to skip this file.
     #[test]
-    fn json_sets_default_model_for_new_sessions() {
-        // The `model` key makes Opus 5 the durable default for NEW CC sessions.
-        // It is CC's lowest-priority model source, so a per-thread `--model`
-        // pick still overrides it and a resumed session keeps its own model.
+    fn json_carries_no_model_or_effort_default() {
         let json = build_cc_settings_json(&[]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["model"], "claude-opus-5@default",
-            "cc-settings.json must pin the default CC model to Opus 5"
-        );
-        assert_eq!(parsed["model"], CC_DEFAULT_MODEL);
+        for key in ["model", "effortLevel"] {
+            assert!(
+                parsed.get(key).is_none(),
+                "cc-settings.json must not set `{key}`: it would override the user's CC config"
+            );
+        }
     }
 
     #[test]

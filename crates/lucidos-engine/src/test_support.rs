@@ -57,10 +57,9 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
         &self,
         _messages: Vec<crate::llm::provider::Message>,
         _tools: Vec<crate::llm::provider::ToolDefinition>,
-        _model_override: Option<&str>,
+        _selection: crate::llm::ModelSelection<'_>,
         _system_prompt: Option<&str>,
         _on_token: Option<crate::llm::provider::TokenCallback>,
-        _reasoning_effort: Option<&str>,
     ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let next = self
             .replies
@@ -77,6 +76,7 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             cache_creation_tokens: None,
             cache_read_tokens: None,
             thinking_chars: None,
+            thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
         })

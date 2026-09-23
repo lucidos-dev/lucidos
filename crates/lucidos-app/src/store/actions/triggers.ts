@@ -191,6 +191,9 @@ interface SubmitTriggerParams {
   /** Thinking budget for this trigger's intent fires; `null` = the account
    *  default. Same send semantics as `model`. */
   reasoningEffort: string | null;
+  /** The backend for the pinned model; `null` = the model's own default. Same
+   *  send semantics as `model`. */
+  provider: string | null;
 }
 
 /** Surface the engine's non-fatal advice after a successful save: the cron
@@ -209,7 +212,7 @@ function surfaceWriteWarnings(result: ApiResult): void {
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
   const {
     name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId, sideEffectGrant,
-    model, reasoningEffort,
+    model, reasoningEffort, provider,
   } = params;
   if (!name.trim()) {
     showToast('Trigger name is required', 'error');
@@ -231,6 +234,8 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
   const llmGrant = isIntent ? sideEffectGrant : [];
   const llmModel = isIntent ? model : null;
   const llmEffort = isIntent ? reasoningEffort : null;
+  // A backend pin is meaningless without a model pin, and the engine refuses one.
+  const llmProvider = isIntent && llmModel ? provider : null;
 
   try {
     if (triggerId) {
@@ -249,6 +254,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // the engine, and omitting the field would leave a stale pin in place.
         model: llmModel,
         reasoning_effort: llmEffort,
+        provider: llmProvider,
       };
       // groupId: undefined = unchanged, null = clear, string = set. Same
       // triple-state semantics as the engine's app_id field.
@@ -276,6 +282,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // so a new trigger on the account defaults keeps a clean payload.
         model: llmModel ?? undefined,
         reasoning_effort: llmEffort ?? undefined,
+        provider: llmProvider ?? undefined,
       });
       if (!data.success) {
         showToast(data.error || 'Failed to create trigger', 'error');

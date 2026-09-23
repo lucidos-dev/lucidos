@@ -7,7 +7,12 @@ import {
   modelReasoningEfforts,
   parseContextWindow,
   lucidosModelChoices,
+  resolvedRoute,
+  LUCIDOS_TIER_VOCABULARY,
+  buildRoutes,
+  routeDrafts,
 } from './models';
+import { modelRows } from '../modelSelection';
 import { formatContextWindow } from '../../utils/formatTokens';
 import { MODELS } from '../models';
 import { displayModelName } from '../thread-events/exchange';
@@ -23,18 +28,35 @@ function model(
   return {
     id,
     label,
-    provider,
+    routes: [{ provider, id, reasoning_efforts: reasoning_efforts ?? [] }],
+    preferred_provider: null,
     sort_order: 0,
     source: 'user',
     enabled,
-    context_window: null,
     created_at: '2026-01-01T00:00:00Z',
-    ...(reasoning_efforts ? { reasoning_efforts } : {}),
   };
 }
 
-/** What the engine serves for a `provider = local` row. */
+/** A row served by two backends, which is what the Claude seeds ship. */
+function dualRouted(
+  id: string,
+  label: string,
+  providers: string[],
+  preferred: string | null = null,
+): ModelInfo {
+  return {
+    ...model(id, label),
+    routes: providers.map((provider) => ({ provider, id, reasoning_efforts: [] })),
+    preferred_provider: preferred,
+  };
+}
+
+/** What the engine serves for a `provider = local` row. A third-party
+ *  OpenAI-compatible server stops at `high`, since `xhigh` is OpenAI's own. */
 const LOCAL_TIERS = ['none', 'low', 'medium', 'high'];
+
+/** What an adaptive Claude route offers. */
+const ALL_TIERS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 afterEach(() => {
   chatModels.value = { status: 'not-loaded' };
@@ -54,8 +76,8 @@ describe('chatModelOptions', () => {
   // before `/models` lands, then disappears under the user's cursor.
   it('offers no model a disable migration has retired', () => {
     const retired = [
-      'claude-opus-4-8@default',
-      'claude-opus-4-8@default[1m]',
+      'claude-opus-4-8',
+      'claude-opus-4-8[1m]',
       'claude-opus-4-7',
       'claude-opus-4-7[1m]',
       'claude-sonnet-4-6',
@@ -70,10 +92,86 @@ describe('chatModelOptions', () => {
     expect(MODELS.filter((m) => retired.includes(m.value))).toEqual([]);
   });
 
+  // THE REPORTED BUG. Every Claude Opus and Sonnet row was seeded on `vertex`,
+  // and the filter asked about that one provider. A workspace whose only
+  // credential is an Anthropic key therefore got the Fable rows and nothing
+  // else from the Claude family.
+  it('offers a dual-routed model when ANY of its backends is configured', () => {
+    const opus = dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic']);
+    chatModels.value = { status: 'loaded', data: [opus] };
+
+    configuredProviders.value = ['anthropic'];
+    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-5', label: 'Opus 5.5' }]);
+    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('anthropic');
+
+    // Vertex is listed first, so a workspace holding both keeps Vertex.
+    configuredProviders.value = ['vertex', 'anthropic'];
+    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('vertex');
+
+    // Neither configured: the model leaves the picker, as it always did.
+    configuredProviders.value = [];
+    expect(chatModelOptions()).toEqual([]);
+  });
+
+  // Honoured or refused, never substituted. A model whose PICKED backend is
+  // parked stays listed, because the provider step is the only place the user
+  // can fix it. Hiding the model would be a dead end.
+  it('keeps a model listed when its preferred backend is parked', () => {
+    const opus = dualRouted(
+      'claude-opus-5-5',
+      'Opus 5.5',
+      ['vertex', 'anthropic'],
+      'anthropic',
+    );
+    chatModels.value = { status: 'loaded', data: [opus] };
+    configuredProviders.value = ['vertex'];
+
+    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-5', label: 'Opus 5.5' }]);
+    // And the picker names the PARKED backend, not the one that happens to be
+    // configured, so what it shows is what the turn will do: refuse.
+    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('anthropic');
+  });
+
+  // The refusal is fixable without leaving the picker: the provider step lists
+  // every backend, marks the parked one, and shows it as the one in force.
+  it('offers the parked backend in a provider step beside the configured one', () => {
+    const opus = dualRouted(
+      'claude-opus-5-5',
+      'Opus 5.5',
+      ['vertex', 'anthropic'],
+      'anthropic',
+    );
+    chatModels.value = { status: 'loaded', data: [opus] };
+    configuredProviders.value = ['vertex'];
+
+    const [choice] = lucidosModelChoices();
+    expect(choice.defaultProvider).toBe('anthropic');
+    expect(choice.providers?.map((p) => [p.value, p.configured])).toEqual([
+      ['vertex', true],
+      ['anthropic', false],
+    ]);
+    const [row] = modelRows([choice], LUCIDOS_TIER_VOCABULARY);
+    expect(row.provider).toBe('anthropic');
+    expect(row.providers.map((p) => p.value)).toEqual(['vertex', 'anthropic']);
+  });
+
+  // One configured backend is no choice, so an Anthropic-only workspace picks
+  // Opus in two steps, exactly as before routes.
+  it('offers no provider step when only one backend is configured', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic'])],
+    };
+    configuredProviders.value = ['anthropic'];
+    const [row] = modelRows(lucidosModelChoices(), LUCIDOS_TIER_VOCABULARY);
+    expect(row.provider).toBe('anthropic');
+    expect(row.providers).toEqual([]);
+  });
+
   // Mirrors `DEFAULT_CHAT_MODEL` in core/preferences.rs. A fresh install with no
   // saved preference resolves to it, so the picker has to be able to show it.
   it('offers the default chat model', () => {
-    expect(MODELS.some((m) => m.value === 'claude-opus-5@default')).toBe(true);
+    expect(MODELS.some((m) => m.value === 'claude-opus-5')).toBe(true);
   });
 
   // The newest OpenAI builtin. A seed the fallback list misses is invisible
@@ -98,7 +196,7 @@ describe('chatModelOptions', () => {
     expect(MODELS).toContainEqual({ value: 'claude-opus-5-5', label: 'Opus 5.5' });
     expect(MODELS).toContainEqual({ value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' });
     expect(MODELS.findIndex((m) => m.value === 'claude-opus-5-5')).toBeLessThan(
-      MODELS.findIndex((m) => m.value === 'claude-opus-5@default'),
+      MODELS.findIndex((m) => m.value === 'claude-opus-5'),
     );
   });
 
@@ -167,15 +265,42 @@ describe('modelReasoningEfforts', () => {
     expect(modelReasoningEfforts('muse-glimmer:30b-mlx')).toBeUndefined();
   });
 
-  it('cannot answer for an id with no row, or an engine predating the field', () => {
+  it('cannot answer for an id with no row at all', () => {
     chatModels.value = {
       status: 'loaded',
       data: [model('a', 'A', true, 'local', LOCAL_TIERS), model('older', 'Older')],
     };
     // A saved chat_model naming a model the user has since deleted.
     expect(modelReasoningEfforts('deleted-model')).toBeUndefined();
-    // A row served without the field.
-    expect(modelReasoningEfforts('older')).toBeUndefined();
+    // A row always carries its route's set, so this is never `undefined`. An
+    // EMPTY set falls through to the id-shape heuristic downstream, in
+    // `availableReasoningLevels`, rather than rendering an empty dropdown.
+    expect(modelReasoningEfforts('older')).toEqual([]);
+  });
+
+  // The set is per ROUTE, because the answer depends on the backend as much as
+  // on the model. Resolution picks the route that will serve, so switching the
+  // preferred provider switches which set the picker offers.
+  it('answers for the route that would serve, not the row', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [
+        {
+          ...model('claude-opus-5-5', 'Opus 5.5'),
+          routes: [
+            { provider: 'vertex', id: 'claude-opus-5-5', reasoning_efforts: ALL_TIERS },
+            {
+              provider: 'openrouter',
+              id: 'anthropic/claude-opus-5-5',
+              reasoning_efforts: LOCAL_TIERS,
+            },
+          ],
+          preferred_provider: 'openrouter',
+        },
+      ],
+    };
+    configuredProviders.value = ['vertex', 'openrouter'];
+    expect(modelReasoningEfforts('claude-opus-5-5')).toEqual(LOCAL_TIERS);
   });
 });
 
@@ -286,8 +411,7 @@ describe('displayModelName', () => {
   });
 
   // `claude-opus-5` is a prefix of `claude-opus-5-5`, the same trap the Fable
-  // pair sets. It also covers the bare id Claude Code echoes for the
-  // `@default` row, which the registry knows only under the pinned spelling.
+  // pair sets.
   it('tells the two Opus 5 generations apart', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('claude-opus-5-5')).toBe('Opus 5.5');
@@ -304,5 +428,40 @@ describe('displayModelName', () => {
   it('falls back to the raw id for an unknown model', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('totally-unknown')).toBe('totally-unknown');
+  });
+});
+
+describe('the route editor', () => {
+  const opus = dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic']);
+
+  it('reads a wire id equal to the model id as blank', () => {
+    expect(routeDrafts(opus)).toEqual([
+      { provider: 'vertex', id: '', contextWindow: '' },
+      { provider: 'anthropic', id: '', contextWindow: '' },
+    ]);
+  });
+
+  it('sends only what differs from the defaults', () => {
+    expect(buildRoutes('claude-opus-5-5', [
+      { provider: 'vertex', id: '', contextWindow: '' },
+      { provider: 'openrouter', id: 'anthropic/claude-opus-5-5', contextWindow: '200000' },
+    ])).toEqual({
+      ok: true,
+      routes: [
+        { provider: 'vertex' },
+        { provider: 'openrouter', id: 'anthropic/claude-opus-5-5', context_window: 200000 },
+      ],
+    });
+  });
+
+  it('names the field that is wrong', () => {
+    expect(buildRoutes('m', [])).toEqual({ ok: false, error: 'A model needs at least one route' });
+    const doubled = buildRoutes('m', [
+      { provider: 'vertex', id: '', contextWindow: '' },
+      { provider: 'vertex', id: '', contextWindow: '' },
+    ]);
+    expect(doubled).toEqual({ ok: false, error: 'Vertex appears twice' });
+    const badWindow = buildRoutes('m', [{ provider: 'xai', id: '', contextWindow: 'big' }]);
+    expect(badWindow.ok).toBe(false);
   });
 });

@@ -1029,14 +1029,14 @@ pub fn is_attention_needing(
 ///   `composeDrafts` signal so the cascade doesn't lag the 250 ms compose
 ///   debounce.
 /// - `is_saved` — `thread_summaries.is_saved`.
-/// - `has_live_event_waits` / `has_active_children`: projection facts
-///   (`live_event_wait_count > 0`, `active_children_count > 0`). Either one
-///   means the thread is *parked*, so something will wake it.
+/// - `has_live_event_waits`: projection fact (`live_event_wait_count > 0`). It
+///   means the thread is *parked*: a delivery will wake it on its own branch.
+///   An active sub-thread is deliberately not an input (ADR 0249).
 ///
 /// `descendants_block_archive` is true when any descendant is currently in a
 /// state that prevents archive (Running, WaitingForUserAnswer, or
 /// has_pending_changes && CodingAgent — see `is_blocking`).
-// Six of the nine parameters are `bool`, so the argument swap this lint guards
+// Five of the eight parameters are `bool`, so the argument swap this lint guards
 // against is a live hazard rather than an impossible one. Two things carry it
 // instead of a facts struct, which would have to be mirrored through the TS
 // emitter and the fixture to buy anything. The cross-validation fixture
@@ -1052,7 +1052,6 @@ pub fn available_thread_actions(
     has_pending_changes: bool,
     descendants_block_archive: bool,
     has_live_event_waits: bool,
-    has_active_children: bool,
     has_unsent_draft: bool,
     is_saved: bool,
 ) -> Vec<Action> {
@@ -1060,14 +1059,6 @@ pub fn available_thread_actions(
     // A thread holding an *event wait* is NOT live: the subscription does not
     // hold its turn, so it settles at `idle` and keeps Archive (ADR 0049).
     let live = status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
-    // Parked: the turn ended, but something will wake this thread and it may
-    // commit again on the same branch. Its change is therefore not final.
-    //
-    // A gap survives between the delivery clearing the fact and the wake
-    // reaching `running`, so Apply reappears for it. ADR 0106 records why that
-    // is accepted: the flag needed to close it strands TRUE on a wake lost to a
-    // restart, and withholds Apply for good.
-    let will_resume = has_live_event_waits || has_active_children;
     let coding_agent_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
 
     // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be
@@ -1079,16 +1070,24 @@ pub fn available_thread_actions(
     // the thread is live (mid-turn). A pending change outranks archive: the
     // user must Apply or Discard before the thread can be archived.
     //
-    // A parked thread loses Apply and Discard too, because both resolve a change
-    // the thread has not finished producing: it wakes on its delivery and commits
-    // on to the same branch. That leaves it exactly what a Running thread offers.
-    // Archive is unaffected, because a pending change already outranked it here.
-    // Archiving a parked thread with no change still cancels its waits rather than
-    // stranding them (`EventWaitCancelCause::ThreadArchived`). The way out before
-    // the 24 h ceiling is Stop waiting, which clears the wait and restores both.
+    // A thread parked on an event wait loses Apply and Discard too, because both
+    // resolve a change it has not finished producing: it wakes on its delivery
+    // and commits on to the same branch. That leaves it what a Running thread
+    // offers. Archive is unaffected, because a pending change already outranked
+    // it here. Archiving a parked thread with no change still cancels its waits
+    // (`EventWaitCancelCause::ThreadArchived`). Stop waiting restores both.
+    //
+    // A running sub-thread does not park its parent's change. The child writes
+    // its own worktree. The parent's work is whole at the end of each turn, and
+    // its later commits propose a new change (ADR 0249).
+    //
+    // A gap survives between the delivery clearing the fact and the wake
+    // reaching `running`, so Apply reappears for it. ADR 0106 records why that
+    // is accepted: the flag needed to close it strands TRUE on a wake lost to a
+    // restart, and withholds Apply for good.
     if !live {
         if coding_agent_pending {
-            if !will_resume {
+            if !has_live_event_waits {
                 actions.push(Action::Discard);
                 actions.push(Action::Apply);
             }

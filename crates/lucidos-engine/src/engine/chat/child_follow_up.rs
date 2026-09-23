@@ -470,6 +470,7 @@ pub(crate) fn build_follow_up_message(
         crate::engine::thread_events::ActorMode::Agent,
         None,
         None,
+        None,
         Some(origin.clone()),
         None,
     )
@@ -660,6 +661,7 @@ impl crate::engine::LucidosEngine {
                             None,
                             None,
                             None,
+                            None, // provider_override
                             images.as_deref(),
                             None,
                             Some(use_coding_agent),

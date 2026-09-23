@@ -525,13 +525,14 @@ fn an_untokened_caller_is_left_to_the_ordinary_local_api_rules() {
     assert!(refuse_event_waits_for_another_thread(&HeaderMap::new(), Uuid::new_v4()).is_ok());
 }
 
-// ── the Apply gate reads the parking facts off the row ──
+// ── the Apply gate reads the parking fact off the row ──
 //
 // `guard_change_action` (api/changes.rs) is a thin wrapper: it asks
 // `available_thread_actions_for` and refuses anything absent. So these tests
 // ARE the server-side gate, and they also pin the `SELECT`. Drop a column from
 // it and `ThreadActionFacts` fails to build the row, which no unit test over
-// the pure predicate would ever notice.
+// the pure predicate would ever notice. An active sub-thread is seeded too,
+// because the gate must NOT read it (ADR 0249).
 
 /// Seed the minimum a coding-agent thread with a proposed change needs.
 #[cfg(test)]
@@ -556,7 +557,7 @@ async fn seed_parked_cc_thread(
 }
 
 #[tokio::test]
-async fn a_parked_thread_is_refused_apply_and_discard_server_side() {
+async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
     use crate::engine::thread_lifecycle::Action;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
@@ -573,14 +574,28 @@ async fn a_parked_thread_is_refused_apply_and_discard_server_side() {
         actions
     );
 
+    // A live wait still gates when the thread also has children.
+    let subscribed_parent = Uuid::new_v4();
+    seed_parked_cc_thread(&pool, subscribed_parent, 1, 2).await;
+    let actions = super::available_thread_actions_for(&pool, subscribed_parent)
+        .await
+        .expect("query the subscribed parent's actions");
+    assert!(
+        !actions.contains(&Action::Apply) && !actions.contains(&Action::Discard),
+        "a live event wait must gate whatever the children: {:?}",
+        actions
+    );
+
+    // A delegating parent: idle apart from a running child. Its own change is
+    // whole, and the child writes elsewhere, so both resolutions are offered.
     let with_child = Uuid::new_v4();
     seed_parked_cc_thread(&pool, with_child, 0, 1).await;
     let actions = super::available_thread_actions_for(&pool, with_child)
         .await
         .expect("query the parent's actions");
     assert!(
-        !actions.contains(&Action::Apply),
-        "an active sub-thread must withhold Apply too: {:?}",
+        actions.contains(&Action::Apply) && actions.contains(&Action::Discard),
+        "an active sub-thread alone must not withhold Apply or Discard: {:?}",
         actions
     );
 

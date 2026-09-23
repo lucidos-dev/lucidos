@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { readScrollAnchor, anchorTargetTop } from '../scrollAnchor';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+import { readScrollAnchor, anchorTargetTop, anchorTurnIsClamped, HEAD_CLAMPED_ATTR } from '../scrollAnchor';
 import { mockTranscript } from './scroll-test-helpers';
 
 // WHERE THE READER IS, said as content. The pair has to be exact and it has to
@@ -93,5 +99,31 @@ describe('anchorTargetTop', () => {
     // tests drive. Neither may throw.
     expect(anchorTargetTop({} as HTMLElement, { eventId: 't0', relTop: 0 })).toBeNull();
     expect(readScrollAnchor({} as HTMLElement)).toBeNull();
+  });
+});
+
+describe('anchorTurnIsClamped', () => {
+  // The restore waits on a clamped turn: its top is real, but its rows are
+  // still arriving. Landing there would settle the restore and stop the walk.
+
+  it('answers for a turn drawn with its head clamped off, and only that turn', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN });
+    el.setHeadClamped('t2', true);
+    expect(anchorTurnIsClamped(el, { eventId: 't2', relTop: 0 })).toBe(true);
+    expect(anchorTurnIsClamped(el, { eventId: 't3', relTop: 0 })).toBe(false);
+  });
+
+  it('is false for a turn that is not rendered at all', () => {
+    // Absent is the walk's wait, answered by `anchorTargetTop` returning null.
+    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN });
+    expect(anchorTurnIsClamped(el, { eventId: 't1', relTop: 0 })).toBe(false);
+  });
+
+  it('is the attribute ChatExchange stamps from its rowsHidden', () => {
+    // A tripwire: the stamp is a JSX literal, so a rename on one side alone
+    // would leave the restore landing on clamped turns again.
+    const here: string = dirname(fileURLToPath(import.meta.url));
+    const source: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf8');
+    expect(source).toContain(`${HEAD_CLAMPED_ATTR}={rowsHidden > 0 ? '' : undefined}`);
   });
 });

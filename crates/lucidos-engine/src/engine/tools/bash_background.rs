@@ -437,9 +437,7 @@ impl BackgroundBashRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        crate::core::apply_to_subprocess_env(&mut cmd, env);
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");

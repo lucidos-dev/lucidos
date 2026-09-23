@@ -129,7 +129,7 @@ pub(super) async fn list_mcp_servers(
     // share of it these tools occupy.
     let model =
         resolved_chat_model(&state.pool, state.engine.current_provider().default_model()).await;
-    let context_window = state.engine.context_window_for(&model);
+    let context_window = state.engine.context_window_for(&model, None);
 
     Ok(Json(serde_json::json!({
         "servers": servers,
@@ -441,7 +441,7 @@ mod tests {
     /// The saved preference wins over the boot-time provider default, and the
     /// `[1m]` marker it carries is what decides the window.
     ///
-    /// The page named the provider default instead. A user on `…@default[1m]`
+    /// The page named the provider default instead. A user on a `[1m]` model
     /// was told their tools ate a share of 200k, against a request the packer
     /// sizes at 1M.
     #[tokio::test]
@@ -451,23 +451,23 @@ mod tests {
 
         // Unset: the provider default is all there is to report.
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5@default").await,
-            "claude-opus-5@default"
+            resolved_chat_model(&pool, "claude-opus-5").await,
+            "claude-opus-5"
         );
 
         crate::core::PreferenceStore::set(
             &pool,
             &bus,
             crate::core::PREF_CHAT_MODEL,
-            "claude-opus-5@default[1m]",
+            "claude-opus-5[1m]",
             None,
         )
         .await
         .expect("save the chat model preference");
 
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5@default").await,
-            "claude-opus-5@default[1m]"
+            resolved_chat_model(&pool, "claude-opus-5").await,
+            "claude-opus-5[1m]"
         );
 
         // Blank is unset, not a model id: a stored empty string must not name
@@ -476,8 +476,8 @@ mod tests {
             .await
             .expect("blank the chat model preference");
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5@default").await,
-            "claude-opus-5@default"
+            resolved_chat_model(&pool, "claude-opus-5").await,
+            "claude-opus-5"
         );
 
         crate::test_support::teardown_test_db(&db_name).await;

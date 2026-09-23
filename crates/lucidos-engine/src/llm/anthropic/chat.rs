@@ -2,9 +2,7 @@
 //! The request body + SSE parse are shared with Vertex via `anthropic_wire`.
 
 use super::{AnthropicAuth, AnthropicProvider};
-use crate::llm::anthropic_wire::{
-    build_claude_request, parse_claude_stream, WireTarget, ANTHROPIC_BETA_1M_CONTEXT,
-};
+use crate::llm::anthropic_wire::{build_claude_request, parse_claude_stream, WireTarget};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
 
 /// Body API version sent as an HTTP header on the direct API (Vertex sends its
@@ -27,16 +25,14 @@ pub(crate) fn auth_header(auth: &AnthropicAuth) -> (&'static str, String) {
 }
 
 /// Assemble the `anthropic-beta` header value: the OAuth flag (OAuth auth only)
-/// plus the 1M-context flag (when the model carries `[1m]`). Returns `None` when
-/// neither applies, so the header is omitted entirely.
-fn anthropic_beta_header(auth: &AnthropicAuth, is_1m: bool) -> Option<String> {
+/// plus the betas the request body needs (`build_claude_request`). Returns
+/// `None` when neither applies, so the header is omitted entirely.
+fn anthropic_beta_header(auth: &AnthropicAuth, request_betas: &[&str]) -> Option<String> {
     let mut betas: Vec<&str> = Vec::new();
     if matches!(auth, AnthropicAuth::OAuthBearer(_)) {
         betas.push(super::ANTHROPIC_OAUTH_BETA);
     }
-    if is_1m {
-        betas.push(ANTHROPIC_BETA_1M_CONTEXT);
-    }
+    betas.extend_from_slice(request_betas);
     if betas.is_empty() {
         None
     } else {
@@ -56,7 +52,7 @@ impl AnthropicProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
 
-        let (request, is_1m) = build_claude_request(
+        let (request, request_betas) = build_claude_request(
             messages,
             tools,
             model,
@@ -67,7 +63,8 @@ impl AnthropicProvider {
         );
 
         let (auth_name, auth_value) = auth_header(&self.auth);
-        let beta = anthropic_beta_header(&self.auth, is_1m);
+        let beta = anthropic_beta_header(&self.auth, &request_betas);
+        let display = request.thinking_display();
 
         // Retry loop for connection errors, retryable HTTP status codes, and
         // mid-stream overload errors. Content is accumulated internally by
@@ -123,7 +120,7 @@ impl AnthropicProvider {
                 .into());
             }
 
-            match parse_claude_stream(resp, &on_token, "Anthropic").await {
+            match parse_claude_stream(resp, &on_token, display, "Anthropic").await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();
@@ -140,6 +137,7 @@ impl AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::anthropic_wire::ANTHROPIC_BETA_1M_CONTEXT;
 
     #[test]
     fn api_key_uses_x_api_key_header() {
@@ -158,7 +156,7 @@ mod tests {
     #[test]
     fn api_key_no_1m_omits_beta_header() {
         assert_eq!(
-            anthropic_beta_header(&AnthropicAuth::ApiKey("k".into()), false),
+            anthropic_beta_header(&AnthropicAuth::ApiKey("k".into()), &[]),
             None
         );
     }
@@ -166,7 +164,10 @@ mod tests {
     #[test]
     fn api_key_with_1m_sends_only_context_beta() {
         assert_eq!(
-            anthropic_beta_header(&AnthropicAuth::ApiKey("k".into()), true),
+            anthropic_beta_header(
+                &AnthropicAuth::ApiKey("k".into()),
+                &[ANTHROPIC_BETA_1M_CONTEXT]
+            ),
             Some(ANTHROPIC_BETA_1M_CONTEXT.to_string())
         );
     }
@@ -174,7 +175,7 @@ mod tests {
     #[test]
     fn oauth_no_1m_sends_only_oauth_beta() {
         assert_eq!(
-            anthropic_beta_header(&AnthropicAuth::OAuthBearer("t".into()), false),
+            anthropic_beta_header(&AnthropicAuth::OAuthBearer("t".into()), &[]),
             Some(crate::llm::anthropic::ANTHROPIC_OAUTH_BETA.to_string())
         );
     }
@@ -182,7 +183,10 @@ mod tests {
     #[test]
     fn oauth_with_1m_sends_both_betas_comma_joined() {
         assert_eq!(
-            anthropic_beta_header(&AnthropicAuth::OAuthBearer("t".into()), true),
+            anthropic_beta_header(
+                &AnthropicAuth::OAuthBearer("t".into()),
+                &[ANTHROPIC_BETA_1M_CONTEXT]
+            ),
             Some(format!(
                 "{},{}",
                 crate::llm::anthropic::ANTHROPIC_OAUTH_BETA,

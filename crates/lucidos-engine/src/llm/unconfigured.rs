@@ -1,4 +1,6 @@
-use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::provider::{
+    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+};
 use async_trait::async_trait;
 
 /// The clear, actionable error a no-provider chat returns. Surfaced to the user
@@ -47,10 +49,9 @@ impl LlmProvider for UnconfiguredProvider {
         &self,
         _messages: Vec<Message>,
         _tools: Vec<ToolDefinition>,
-        _model_override: Option<&str>,
+        _selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         _on_token: Option<TokenCallback>,
-        _reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         Err(NO_PROVIDER_MESSAGE.into())
     }
@@ -82,7 +83,9 @@ mod tests {
     #[tokio::test]
     async fn chat_returns_clear_actionable_error_never_mock() {
         let provider = UnconfiguredProvider::new();
-        let result = provider.chat(vec![], vec![], None, None, None, None).await;
+        let result = provider
+            .chat(vec![], vec![], ModelSelection::default(), None, None)
+            .await;
         let err = result.expect_err("unconfigured provider must error, never return content");
         let msg = err.to_string();
         // Clear + actionable: names the problem AND where to fix it.

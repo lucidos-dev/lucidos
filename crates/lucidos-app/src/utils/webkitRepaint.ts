@@ -181,6 +181,27 @@ function restoreNudge(el: HTMLElement, entry: InFlightToggle) {
   }
 }
 
+/** How far a nudge still in its nudged frame has moved `el`'s `scrollTop`, or
+ *  zero. The nudge puts it back a frame later, unless another writer moved it
+ *  first. */
+export function repaintNudgeShift(el: HTMLElement): number {
+  const entry = inFlight.get(el);
+  if (entry?.nudgedTop === undefined || el.scrollTop !== entry.nudgedTop) return 0;
+  return nudgeDelta(entry);
+}
+
+/** The `scrollTop` the reader is at, with a nudge in flight discounted.
+ *
+ *  Read this wherever a position is CAPTURED to be applied in a later frame. A
+ *  capture taken inside the nudged frame is a pixel off. The nudge's restore
+ *  then yields to the write built from it, so the pixel stays.
+ *
+ *  A formula reading `scrollTop` and a child's offset at the SAME instant needs
+ *  none of this: the nudge moves both by the same pixel, and they cancel. */
+export function settledScrollTop(el: HTMLElement): number {
+  return el.scrollTop - repaintNudgeShift(el);
+}
+
 export function forceWebKitRepaint(el: HTMLElement | null | undefined): (() => void) | undefined {
   if (!el?.isConnected || !isWebKit()) return;
 

@@ -13,8 +13,9 @@ pub mod summary;
 pub use crate::core::event_subscription::EventSubscription;
 pub use config::{
     is_valid_reasoning_effort, is_valid_trigger_slug, mint_unique_trigger_slug,
-    normalize_route_setting, slugify_trigger_name_with_fallback, validate_script_extension,
-    validate_trigger_reasoning_effort, TriggerConfig, TriggerRun, TriggerRunStatus,
+    normalize_route_setting, resolve_trigger_provider_update, slugify_trigger_name_with_fallback,
+    validate_script_extension, validate_trigger_provider, validate_trigger_reasoning_effort,
+    TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
@@ -85,6 +86,7 @@ mod tests {
 
     fn make_event_trigger(id: &str, subs: Vec<EventSubscription>) -> TriggerConfig {
         TriggerConfig {
+            provider: None,
             id: id.to_string(),
             name: format!("Trigger {}", id),
             slug: format!("trigger-{}", id),
@@ -295,6 +297,7 @@ mod tests {
     fn cron_only_trigger_does_not_match() {
         let mut configs = HashMap::new();
         let cron_trigger = TriggerConfig {
+            provider: None,
             id: "cron-only".to_string(),
             name: "Cron Only".to_string(),
             slug: "cron-only".to_string(),

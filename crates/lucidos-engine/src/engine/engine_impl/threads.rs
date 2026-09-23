@@ -374,6 +374,7 @@ impl LucidosEngine {
             None,
             None,
             None,
+            None, // provider_override
             None,
             None,
             Some(parent_is_coding_agent),

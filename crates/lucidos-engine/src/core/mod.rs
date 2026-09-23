@@ -290,7 +290,9 @@ pub use credentials::{
 };
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
-pub use environment_variables::{EnvironmentVariable, EnvironmentVariableStore};
+pub use environment_variables::{
+    apply_to_subprocess_env, inherited_env_var, EnvironmentVariable, EnvironmentVariableStore,
+};
 pub use grants::{grants_dir, GrantFile};
 pub use intents::{Intent, IntentStore};
 pub use knowhow::{Knowhow, KnowhowDirs, KnowhowListDepth, KnowhowStore, KnowhowSummary};
@@ -464,9 +466,9 @@ pub fn ensure_state_dir_excluded_from_file_backup(
 pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
-pub use models::{Model, ModelStore};
+pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
 pub use preferences::{
-    PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL,
+    PreferenceStore, ResolvedModelSelection, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL,
     DEFAULT_COMMAND_JUDGE_REASONING, DEFAULT_LOCAL_BASE_URL, DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_VERTEX_REGION, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
     PREF_CODING_AGENT_CLAUDE_PATH, PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
@@ -1848,6 +1850,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             ),
             Some("disable") => format!(
                 "Disabling model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("update") => format!(
+                "Updating model '{}'...",
                 args["id"].as_str().unwrap_or("model")
             ),
             Some("list") => "Listing models...".to_string(),

@@ -252,6 +252,7 @@ async fn seed_thread_opened_by(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "work".into(),
             user_image_hashes: vec![],
@@ -594,6 +595,7 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     bus.emit(BusEvent::Thread {
         thread_id: trigger_thread,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "nightly".into(),
             trigger_name: Some("Nightly release".into()),
             prompt: None,

@@ -225,18 +225,56 @@ fn build_command_sets_cc_effort_level_env_from_reasoning_effort() {
     assert_eq!(value, std::ffi::OsStr::new("max"));
 }
 
-/// With nothing resolved, the var must stay unset. Claude Code then reads its
-/// own settings files, which is the inherit-the-default behavior a spawn keeps
-/// when it passes no flag.
+/// With nothing resolved, the var stays unset. Claude Code then reads its own
+/// settings files, which `CcSettingsScope` already found empty.
 #[test]
 fn build_command_omits_cc_effort_level_env_when_no_effort_resolved() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
     let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
-    let env = collect_envs(&cmd);
     assert!(
-        !env.contains_key(std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL")),
-        "an unset effort must not pin a level on the subprocess"
+        !cmd.as_std()
+            .get_envs()
+            .any(|(k, _)| k == "CLAUDE_CODE_EFFORT_LEVEL"),
+        "an unset effort must not touch the level on the subprocess"
+    );
+}
+
+fn spawned_effort(cmd: &tokio::process::Command) -> Option<std::ffi::OsString> {
+    collect_envs(cmd).remove(std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"))
+}
+
+/// The label records `SpawnArgs::reasoning_effort`, and CC runs at the env var.
+/// They must agree for a default read from the workspace env. They must also
+/// agree for a pin, which a workspace var of the same name used to overwrite.
+#[test]
+fn build_command_runs_at_the_effort_the_thread_records() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let project = tempfile::TempDir::new().unwrap();
+    let user_env = vec![("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "high".to_string())];
+    let recorded = CcSettingsScope {
+        env: &user_env,
+        inherited: |_| None,
+        config_dir: None,
+        project_dir: project.path(),
+    }
+    .default_effort();
+    assert_eq!(recorded.as_deref(), Some("high"));
+
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.user_env_vars = &user_env;
+    args.reasoning_effort = recorded.as_deref();
+    assert_eq!(
+        spawned_effort(&build_command(&args, None)),
+        recorded.as_deref().map(Into::into)
+    );
+
+    args.reasoning_effort = Some("max");
+    assert_eq!(
+        spawned_effort(&build_command(&args, None)).as_deref(),
+        Some(std::ffi::OsStr::new("max")),
+        "a pinned effort must beat the workspace env var"
     );
 }
 

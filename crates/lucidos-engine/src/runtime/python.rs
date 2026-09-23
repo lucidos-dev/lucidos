@@ -491,9 +491,7 @@ impl PythonRuntime {
             // signals the leader on the cancel and shutdown paths, so a
             // group-aware teardown needs a Drop guard, not a call on one arm.
             .kill_on_drop(true);
-        for (key, value) in &env_vars {
-            cmd.env(key, value);
-        }
+        crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
         let output = match tokio::time::timeout(self.execution_timeout, cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => return Err(format!("Failed to execute Python: {}", e)),

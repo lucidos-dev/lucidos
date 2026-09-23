@@ -29,13 +29,19 @@ import type { ModelInfo } from '../../../api/types';
 const LOCAL_MODEL: ModelInfo = {
   id: 'muse-glimmer:30b-mlx',
   label: 'Muse Glimmer 30B (local)',
-  provider: 'local',
+  routes: [
+    {
+      provider: 'local',
+      id: 'muse-glimmer:30b-mlx',
+      context_window: 131072,
+      reasoning_efforts: ['none', 'low', 'medium', 'high'],
+    },
+  ],
+  preferred_provider: null,
   sort_order: 1000,
   source: 'user',
   enabled: true,
-  context_window: 131072,
   created_at: '2026-01-01T00:00:00Z',
-  reasoning_efforts: ['none', 'low', 'medium', 'high'],
 };
 
 describe('Chat model and reasoning effort persist across restarts', () => {
@@ -178,5 +184,18 @@ describe('The chat model selection is written whole', () => {
     // Display only: the stored preference is not rewritten, since the model
     // this was clamped against may itself change again.
     expect(setPreferenceMock).not.toHaveBeenCalled();
+  });
+
+  // A reload follows a `Model*` event, and every provider pick writes one. It
+  // must not narrow the account default that every draft falls back to.
+  it('a registry reload leaves the account effort alone', async () => {
+    reasoningEffort.value = 'max';
+    currentModel.value = 'muse-glimmer:30b-mlx';
+    chatModels.value = { status: 'loaded', data: [LOCAL_MODEL] };
+
+    listModelsMock.mockResolvedValueOnce({ models: [LOCAL_MODEL] });
+    await loadChatModels();
+
+    expect(reasoningEffort.value).toBe('max');
   });
 });

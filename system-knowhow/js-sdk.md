@@ -940,6 +940,8 @@ interface Trigger {
   // Chat & triggers). Intent triggers only: a script trigger runs no LLM.
   model?: string;
   reasoning_effort?: string;
+  // The backend the pinned model runs on. Omitted when the model decides.
+  provider?: string;
 }
 
 interface CreateTrigger {
@@ -956,6 +958,9 @@ interface CreateTrigger {
    *  (`none|low|medium|high|xhigh|max`). Omit either for the account default. */
   model?: string | null;
   reasoning_effort?: string | null;
+  /** The backend for the pinned model. Needs `model`, and must name one of its
+   *  providers. A pin to an unconfigured backend refuses the fire. */
+  provider?: string | null;
 }
 
 interface UpdateTrigger {
@@ -971,10 +976,12 @@ interface UpdateTrigger {
   group_id?: string | null;
   /** Full replacement for the side-effect grant; pass `[]` to clear all. */
   side_effect_grant?: SideEffectCategory[];
-  /** Pin the intent's model / thinking budget (string), clear it back to the
-   *  account default (null), or leave it unchanged (absent). */
+  /** Pin the intent's model / thinking budget / backend (string), clear it
+   *  back to the default (null), or leave it unchanged (absent). Changing the
+   *  model drops a backend pin it cannot use. */
   model?: string | null;
   reasoning_effort?: string | null;
+  provider?: string | null;
 }
 
 interface ApiResult {

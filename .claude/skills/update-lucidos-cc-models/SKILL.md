@@ -88,7 +88,7 @@ with a native 1M window, which is why the picker carries no `sonnet[1m]` row.
 ## Declaring a context window
 
 `context_window` says what window a CC session on that model actually runs
-under. It exists because Lucidos infers 200k for any bare `claude-` id: 1M mode
+under. It exists because Lucidos infers 200k for most bare `claude-` ids: 1M mode
 is gated on our own `[1m]` suffix, which is true of the requests the ENGINE
 makes and false of CC's. CC picks its own context mode. Without the
 declaration, the LLM Context Viewer rendered a real 240k Sonnet 5 prompt as

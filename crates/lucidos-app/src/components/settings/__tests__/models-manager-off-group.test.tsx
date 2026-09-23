@@ -37,17 +37,17 @@ function vnodeToText(node: ComponentChildren): string {
 function model(over: Partial<ModelInfo> & { id: string }): ModelInfo {
   return {
     label: over.id,
-    provider: 'vertex',
+    routes: [{ provider: 'vertex', id: over.id, reasoning_efforts: [] }],
+    preferred_provider: null,
     sort_order: 0,
     source: 'builtin',
     enabled: true,
-    context_window: null,
     created_at: '2026-01-01T00:00:00Z',
     ...over,
   };
 }
 
-const OPUS_5 = model({ id: 'claude-opus-5@default', label: 'Opus 5' });
+const OPUS_5 = model({ id: 'claude-opus-5', label: 'Opus 5' });
 const OPUS_47 = model({ id: 'claude-opus-4-7', label: 'Opus 4.7', enabled: false });
 const OLD_USER = model({ id: 'my/old-model', label: 'My Old Model', source: 'user', enabled: false });
 

@@ -16,6 +16,7 @@ async fn open_turn(bus: &EventBus, thread_id: Uuid, mode: ActorMode, origin: Mes
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "work".into(),
             user_image_hashes: vec![],
@@ -102,6 +103,7 @@ async fn fire_trigger_on(bus: &EventBus, thread_id: Uuid, trigger_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: trigger_id.to_string(),
             trigger_name: Some("Nightly release".into()),
             prompt: None,

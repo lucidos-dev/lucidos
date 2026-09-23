@@ -294,6 +294,7 @@ pub(crate) async fn process_orphan_chain(
                     None,
                     None,
                     None,
+                    None, // provider_override
                     images.as_deref(),
                     None,
                     None,
@@ -800,10 +801,32 @@ pub(super) async fn chat_submit(
         .await?;
     }
 
+    // A provider is a choice, honoured or refused. A name that is not a
+    // backend is refused here, before it can be stamped as thread memory. So is
+    // one the named model has no route on.
+    if let Some(provider) = request.provider.as_deref() {
+        let Some(kind) = crate::llm::ProviderKind::from_name(provider) else {
+            return Err(ApiError::bad_request(
+                crate::llm::model_registry::unknown_provider_message(provider),
+            ));
+        };
+        if let Some(model) = request.model.as_deref() {
+            if crate::llm::model_registry::route_on(state.engine.model_registry(), model, kind)
+                .is_none()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "Model '{model}' has no route on provider '{provider}'. Pick one of the \
+                     model's own providers, or leave provider unset"
+                )));
+            }
+        }
+    }
+
     let engine_clone = state.engine.clone();
     let message = request.message.clone();
     let model = request.model.clone();
     let reasoning_effort = request.reasoning_effort.clone();
+    let provider = request.provider.clone();
     let device_id = request.device_id.clone();
 
     // A cross-workspace caller takes precedence over `device_id` in
@@ -1182,6 +1205,7 @@ pub(super) async fn chat_submit(
             device_id: device_id.clone(),
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
+            provider: provider.clone(),
             use_coding_agent,
             repo_id: repo_id.clone(),
             cc_model: cc_model.clone(),
@@ -1251,6 +1275,7 @@ pub(super) async fn chat_submit(
             device_id.as_deref(),
             model.as_deref(),
             reasoning_effort.as_deref(),
+            provider.as_deref(),
             event_id.as_deref(),
             origin.clone(),
             // Typed. A spoken message arrives on the voice socket instead,
@@ -1282,6 +1307,7 @@ pub(super) async fn chat_submit(
                 app_ctx,
                 file_ctx,
                 reasoning_effort.as_deref(),
+                provider.as_deref(),
                 chat_images.as_deref(),
                 device_id.as_deref(),
                 use_coding_agent,

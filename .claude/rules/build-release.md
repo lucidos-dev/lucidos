@@ -396,8 +396,9 @@ unmoved rc, re-scans that commit's tree (the deterministic floor at the
 irreversible push), and pushes **that same object** to the mirror's `main`
 under a lease + tags it `v<version>` **by SHA**, creates the GA Release as a
 **DRAFT**, attaches the staged artifacts, WAITS for `release-tarballs.yml` to
-attach the four per-platform tarballs, publishes the draft and only then emits
-`LucidosReleased`; the rc branch + rc draft release are deleted afterwards. It
+attach the four per-platform tarballs, and publishes the draft. `release.sh`
+then settles the source side, and only after that emits `LucidosReleased`
+(ADR 0250); the rc branch + rc draft release are deleted afterwards. It
 attaches the rc build's tarballs first, so that wait normally returns on its
 first poll. Where it falls back, the wait is the old 25 to 45 minutes. Either
 way it is resumable: nothing is public while it runs, so an interrupted one
@@ -579,15 +580,25 @@ made `git describe --tags main` report `v0.9.6-4946-gfb4b344cf`, and rendered
 every `PREV_TAG` guard in `release.sh` vacuous.
 
 `scripts/lib/release_main_sync.sh` owns the source side, wired in through ONE
-`settle_source_side` entry point that both Phase B and the one-shot call:
+`settle_and_announce_release` entry point that both Phase B and the one-shot
+call. It runs `settle_source_side`, then emits `LucidosReleased`:
 
 - **The bump is LANDED on main, not attempted.** Fast-forward when possible;
-  **cherry-pick** the single release commit when `main` moved during the build;
-  **hard-fail** (after `cherry-pick --abort`, so nothing is left wedged) on a
-  conflict. Only operator state — not on `main`, or dirty — still skips. The old
+  **merge** the release commit when `main` moved during the build (ADR 0250);
+  **hard-fail** (after `merge --abort`, so nothing is left wedged) on a
+  conflict. Only operator state (not on `main`, or dirty) still skips. The old
   `advance_local_main` warned-and-continued instead, which is how **v0.17.0**
   published while `main` never learned its own version and the site kept serving
   the previous DMG (the site publisher reads the local checkout's `RELEASE`).
+- **The tag names the release commit itself, never a cherry-pick.** A merge
+  keeps it in main's history. A cherry-pick made v0.39.2 and v0.39.3 tag a
+  commit carrying moved-main work, so the next release read that work as
+  shipped.
+- **`LucidosReleased` fires only after the landing, the tag and the `origin`
+  push.** The site builds `install.sh` from main. On v0.39.3 the event fired
+  three seconds early and the site shipped the previous version's installer.
+  `release-to-lucidos.sh --no-released-event` keeps the publisher from emitting.
+  A conflict still announces, then fails, and STILL OWED names the lag.
 - **Skips and failures are reprinted at the END of the run**, in a `STILL OWED`
   block with the exact recovery commands. A warning buried mid-build-log is a
   warning nobody reads — that is the actual v0.17.0 failure.
@@ -607,14 +618,24 @@ deleted-files gate finally diffs two full **internal** trees, it filters out
 paths withheld from the public tree via `release_tree_path_is_excluded`;
 otherwise ordinary `docs/plans/**` churn would start refusing releases over files
 that can never reach a user. `PREV_TAG` resolution stays a **semver sort**, not
-`git describe` — describe answers "nearest *reachable* tag" and so silently picks
+`git describe`: describe answers "nearest *reachable* tag" and so silently picks
 an older one exactly when the newest is an orphan.
+
+**One base for every "new since the last release" question.** Phase A's ahead
+count, its deleted-files gate and `--prep-preflight` all go through
+`release_prev_release_base` and `release_commits_since_release`. The base is the
+tag's commit, except for a tag in `RELEASE_TAG_CUT_OVERRIDES`. That list holds
+v0.39.2 and v0.39.3, tagged on cherry-picks before ADR 0250, and records the
+commit each was cut from. Every run re-verifies an entry, and a stale one
+refuses. It is a registered temporary measure.
 
 Offline-tested by `scripts/lib/release_main_sync_test.sh`: every landing state
 against throwaway repos, the conflict-abort, the by-SHA mirror push into a local
 bare repo (asserting no local tag appears), the unforced `origin` push and its
 non-fast-forward rejection, behaviour under `release.sh`'s `-Eeuo pipefail` +
-exiting ERR trap, and the wiring in both release scripts.
+exiting ERR trap, and the wiring in both release scripts. Its harness puts a
+fake `lucidos` CLI first on PATH, which records main, `origin` and the tag at
+the instant of the emit. No test can reach the real CLI.
 
 ### Notarization is resumable — never a foreground `--wait`
 

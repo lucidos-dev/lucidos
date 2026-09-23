@@ -780,7 +780,9 @@ mod tests {
             "engine1"
         ));
         assert!(!frontend_advance_is_safe(
-            &BuildState::failed_with(None),
+            &BuildState::failed_with(crate::engine::engine_version::BuildFailure::plain(
+                "error: boom".into()
+            )),
             Some("engine1"),
             "engine1"
         ));

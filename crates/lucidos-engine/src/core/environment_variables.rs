@@ -327,6 +327,74 @@ impl EnvironmentVariableStore {
             .map(|v| (v.name, v.value))
             .collect())
     }
+
+    /// [`Self::env_pairs`] for a spawn about to happen, logged under `label`.
+    ///
+    /// A failed read falls back to the startup copy rather than to nothing.
+    /// [`apply_to_subprocess_env`] removes every startup name missing here, so
+    /// an empty fallback would strip live variables on a DB hiccup.
+    pub async fn spawn_pairs(pool: &PgPool, label: &str) -> Vec<(String, String)> {
+        Self::env_pairs(pool).await.unwrap_or_else(|e| {
+            crate::log!(
+                "[{}] Failed to load user environment variables, using the startup copy: {}",
+                label,
+                e
+            );
+            startup_env_vars().to_vec()
+        })
+    }
+}
+
+/// The pairs [`apply_to_process_env`] copied into the engine's own env.
+static STARTUP_ENV_VARS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+fn startup_env_vars() -> &'static [(String, String)] {
+    STARTUP_ENV_VARS.get().map_or(&[], Vec::as_slice)
+}
+
+/// The subprocess half of the store: stamp `pairs` onto `cmd`, first removing
+/// every startup variable `pairs` no longer holds.
+///
+/// A subprocess inherits the engine's env, and [`apply_to_process_env`] filled
+/// that once at startup. Without the removal, a variable deleted since then
+/// still reaches every spawn until the engine restarts. `pairs` is the full env
+/// the caller injects, so an engine-owned var it sets later still wins.
+pub fn apply_to_subprocess_env(cmd: &mut tokio::process::Command, pairs: &[(String, String)]) {
+    apply_env_over_startup(cmd, startup_env_vars(), pairs);
+}
+
+/// What a subprocess inherits for `name` from the engine's own env, when the
+/// spawn's pairs do not set it. A workspace var from startup inherits nothing:
+/// [`apply_to_subprocess_env`] strips it once the store no longer holds it.
+pub fn inherited_env_var(name: &str) -> Option<String> {
+    inherited_over_startup(name, startup_env_vars(), std::env::var(name).ok())
+}
+
+fn inherited_over_startup(
+    name: &str,
+    startup: &[(String, String)],
+    process_value: Option<String>,
+) -> Option<String> {
+    if startup.iter().any(|(k, _)| k == name) {
+        return None;
+    }
+    process_value.filter(|v| !v.is_empty())
+}
+
+fn apply_env_over_startup(
+    cmd: &mut tokio::process::Command,
+    startup: &[(String, String)],
+    pairs: &[(String, String)],
+) {
+    let current: std::collections::HashSet<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+    for (name, _) in startup {
+        if !current.contains(name.as_str()) {
+            cmd.env_remove(name);
+        }
+    }
+    for (key, value) in pairs {
+        cmd.env(key, value);
+    }
 }
 
 /// Strip one layer of matching surrounding single or double quotes from a
@@ -480,8 +548,9 @@ pub async fn migrate_env_file_to_db(
 /// needs a restart. Running once at startup means a caller inside the engine
 /// reads whatever the store held when the engine last started. A `OnceLock`
 /// around such a read pins that value for the process lifetime. The per-spawn
-/// injection (`build_script_env_vars` / `apply_lucidos_env`) is the no-restart
-/// path, and already covers every tool/agent subprocess, where freshness matters.
+/// injection ([`apply_to_subprocess_env`]) is the no-restart path for every
+/// tool and agent subprocess, deletions included, which is why the pairs are
+/// recorded here.
 pub async fn apply_to_process_env(pool: &PgPool) {
     let pairs = match EnvironmentVariableStore::env_pairs(pool).await {
         Ok(pairs) => pairs,
@@ -493,15 +562,18 @@ pub async fn apply_to_process_env(pool: &PgPool) {
             return;
         }
     };
-    for (name, value) in pairs {
+    for (name, value) in &pairs {
         // SAFETY: called once at startup, before the engine begins serving
         // requests or running recovery sweeps. This mirrors the prior
         // `dotenvy::from_path_override` startup load (which also mutated process
         // env via `set_var`); no request-handling thread reads these vars at
         // this point.
         unsafe {
-            std::env::set_var(&name, &value);
+            std::env::set_var(name, value);
         }
+    }
+    if STARTUP_ENV_VARS.set(pairs).is_err() {
+        crate::log!("[EnvVars] apply_to_process_env ran twice; keeping the first startup copy");
     }
 }
 
@@ -629,6 +701,57 @@ mod tests {
         );
 
         crate::test_support::teardown_test_db(&db).await;
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// A subprocess inherits the engine's startup copy of every variable. So a
+    /// variable deleted since startup must be removed, or it still reaches the
+    /// spawn until the engine restarts.
+    #[test]
+    fn a_variable_deleted_since_startup_is_removed_from_the_subprocess() {
+        let startup = pairs(&[("ANTHROPIC_MODEL", "old"), ("MY_FLAG", "1")]);
+        let current = pairs(&[("MY_FLAG", "2"), ("ADDED_LATER", "x")]);
+        let mut cmd = tokio::process::Command::new("true");
+        apply_env_over_startup(&mut cmd, &startup, &current);
+
+        let env: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&None), "deleted: removed");
+        assert_eq!(env.get("MY_FLAG"), Some(&Some("2".to_string())));
+        assert_eq!(env.get("ADDED_LATER"), Some(&Some("x".to_string())));
+    }
+
+    /// The engine records the config dir a session runs under. A deleted
+    /// workspace var is stripped from the spawn, so its startup copy must not
+    /// be recorded either.
+    #[test]
+    fn a_startup_workspace_var_is_not_inherited() {
+        let startup = pairs(&[("CLAUDE_CONFIG_DIR", "/home/u/.claude-personal")]);
+        let stale = Some("/home/u/.claude-personal".to_string());
+        assert_eq!(
+            inherited_over_startup("CLAUDE_CONFIG_DIR", &startup, stale),
+            None
+        );
+        let shell = Some("/home/u/.claude".to_string());
+        assert_eq!(
+            inherited_over_startup("CLAUDE_CONFIG_DIR", &[], shell.clone()),
+            shell,
+            "a value from the engine's own launch env is still inherited"
+        );
     }
 
     #[tokio::test]

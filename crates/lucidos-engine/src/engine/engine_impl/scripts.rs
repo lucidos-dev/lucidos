@@ -90,14 +90,7 @@ impl LucidosEngine {
         // OAUTH_*) is appended after, and the spawn applies the pairs in order
         // via `cmd.env`, so a user var can never override an engine-owned one
         // (`env_pairs` also drops reserved names as a second backstop).
-        let mut env_vars: Vec<(String, String)> = Vec::new();
-        match EnvironmentVariableStore::env_pairs(&self.pool).await {
-            Ok(pairs) => env_vars.extend(pairs),
-            Err(e) => log!(
-                "[Python] Failed to load user environment variables for env injection: {}",
-                e
-            ),
-        }
+        let mut env_vars = EnvironmentVariableStore::spawn_pairs(&self.pool, "Python").await;
 
         // Prepend the bundled PG client dir (packaged: <resources>/postgres/bin)
         // to the script PATH so the advertised bare `psql -c '…'` resolves; it's
@@ -387,10 +380,7 @@ async fn run_shell_script_with_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
+    crate::core::apply_to_subprocess_env(&mut cmd, env_vars);
 
     let child = cmd
         .spawn()

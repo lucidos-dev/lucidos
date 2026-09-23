@@ -28,6 +28,41 @@ const SELECT_CHANGE: &str =
 const MERGE_PAIRING_EVENT_TYPES: &str = "'MergeConflictDetected','MergeResolutionCleared',\
      'ChangeApplyFailed','ChangeApplied','ChangeDiscarded'";
 
+/// Of the given `(thread_id, change_id)` pairs, the change ids whose
+/// conflict-resolution pairing is open: their latest merge-lifecycle event is
+/// `MergeConflictDetected`. One batch query, and the single definition of an
+/// open pairing. It does not check the row is pending; callers do.
+pub async fn resolving_conflict_change_ids(
+    pool: &PgPool,
+    pairs: &[(Uuid, Uuid)],
+) -> sqlx::Result<std::collections::HashSet<Uuid>> {
+    if pairs.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let thread_ids: Vec<String> = pairs.iter().map(|(t, _)| t.to_string()).collect();
+    let change_ids: Vec<String> = pairs.iter().map(|(_, c)| c.to_string()).collect();
+    let open: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT change_id FROM ( \
+            SELECT DISTINCT ON (payload->>'change_id') \
+                   payload->>'change_id' AS change_id, event_type \
+            FROM events \
+            WHERE aggregate_id = ANY($1) \
+              AND payload->>'change_id' = ANY($2) \
+              AND event_type IN ({MERGE_PAIRING_EVENT_TYPES}) \
+            ORDER BY payload->>'change_id', sequence DESC \
+         ) latest \
+         WHERE event_type = 'MergeConflictDetected'"
+    ))
+    .bind(&thread_ids)
+    .bind(&change_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(open
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
+}
+
 #[derive(Clone)]
 pub struct ChangesProjection {
     pool: PgPool,
@@ -388,18 +423,8 @@ impl ChangesProjection {
         thread_id: Uuid,
         change_id: Uuid,
     ) -> sqlx::Result<bool> {
-        let latest: Option<String> = sqlx::query_scalar(&format!(
-            "SELECT event_type FROM events \
-             WHERE aggregate_id = $1 \
-               AND payload->>'change_id' = $2 \
-               AND event_type IN ({MERGE_PAIRING_EVENT_TYPES}) \
-             ORDER BY sequence DESC LIMIT 1"
-        ))
-        .bind(thread_id.to_string())
-        .bind(change_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        if latest.as_deref() != Some("MergeConflictDetected") {
+        let open = resolving_conflict_change_ids(&self.pool, &[(thread_id, change_id)]).await?;
+        if !open.contains(&change_id) {
             return Ok(false);
         }
         Ok(self

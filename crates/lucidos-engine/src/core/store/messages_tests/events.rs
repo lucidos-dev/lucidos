@@ -717,3 +717,65 @@ fn events_capture_result_text_remainder() {
         texts
     );
 }
+
+/// A parallel run answers in completion order. The failing call's step must
+/// show the failure even when its result lands last (ADR 0246).
+#[test]
+fn a_result_resolves_its_own_step_in_any_order() {
+    let call_a = make_event(
+        "ToolCalled",
+        json!({"name": "read_file", "args": {"path": "a.txt"}}),
+        1,
+    );
+    let call_b = make_event(
+        "ToolCalled",
+        json!({"name": "read_file", "args": {"path": "b.txt"}}),
+        2,
+    );
+    let events = vec![
+        make_event("MessageReceived", json!({"text": "read both"}), 0),
+        call_a.clone(),
+        call_b.clone(),
+        make_event(
+            "ToolResult",
+            json!({"name": "read_file", "result": "fine", "success": true, "tool_called_event_id": call_b.id}),
+            3,
+        ),
+        make_event(
+            "ToolResult",
+            json!({"name": "read_file", "result": "Error: missing", "success": false, "tool_called_event_id": call_a.id}),
+            4,
+        ),
+        make_event("ResponseGenerated", json!({"text": "done"}), 5),
+    ];
+    let msgs = build_session_messages(&events);
+    let assistant = &msgs[1];
+
+    let step_outcomes: Vec<(Option<&str>, bool)> = assistant
+        .steps
+        .iter()
+        .map(|s| (s.tool_called_event_id.as_deref(), s.success))
+        .collect();
+    let (a, b) = (call_a.id.to_string(), call_b.id.to_string());
+    assert_eq!(
+        step_outcomes,
+        vec![(Some(a.as_str()), false), (Some(b.as_str()), true)]
+    );
+
+    let event_outcomes: Vec<(Option<&str>, bool)> = assistant
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            ResponseEvent::Step {
+                tool_called_event_id,
+                success,
+                ..
+            } => Some((tool_called_event_id.as_deref(), *success)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        event_outcomes,
+        vec![(Some(a.as_str()), false), (Some(b.as_str()), true)]
+    );
+}

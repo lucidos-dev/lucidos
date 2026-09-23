@@ -36,23 +36,25 @@ describe('availableReasoningLevels', () => {
     expect(values).toContain('xhigh');
   });
 
-  // The branch matches the Fable family by prefix, so a new generation is
-  // offered the full ladder without a new rule. Fable 5.1 accepts every tier.
-  it('exposes full set for both Fable generations', () => {
-    for (const id of ['claude-fable-5', 'claude-fable-5-1', 'claude-fable-5-1[1m]']) {
-      const values = availableReasoningLevels(id).map(l => l.value);
-      expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
-    }
-  });
-
-  // Same prefix rule on the Opus side: `claude-opus-5` matches Opus 5.5 too,
-  // so the point release inherits the full ladder without a new branch.
-  it('exposes full set for both Opus 5 generations', () => {
+  // Models that always think have no `none`: the engine snaps it to `low`.
+  // The branch matches the Fable family by prefix, so a new generation
+  // inherits it without a new rule.
+  it('drops none for the models that always think', () => {
     for (const id of [
-      'claude-opus-5@default',
+      'claude-fable-5',
+      'claude-fable-5-1',
+      'claude-fable-5-1[1m]',
       'claude-opus-5-5',
       'claude-opus-5-5[1m]',
     ]) {
+      const values = availableReasoningLevels(id).map(l => l.value);
+      expect(values).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  // Opus 5 can still turn thinking off, so it keeps the full ladder.
+  it('exposes full set for Opus 5', () => {
+    for (const id of ['claude-opus-5', 'claude-opus-5[1m]']) {
       const values = availableReasoningLevels(id).map(l => l.value);
       expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
     }

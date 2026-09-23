@@ -399,6 +399,7 @@ async fn execute_llm_task(
             // the per-trigger model existed.
             config.model.as_deref(),
             config.reasoning_effort.as_deref(),
+            config.provider.as_deref(),
             external_cancel,
             queue_entry_id,
         )

@@ -33,7 +33,9 @@ pub use openai::{
     resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,
     OPENAI_DEFAULT_BASE_URL,
 };
-pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
+pub use provider::{
+    ContentBlock, LlmProvider, Message, MessageContent, ModelSelection, TokenCallback, ToolCall,
+};
 pub use provider_build::{
     boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
     ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,

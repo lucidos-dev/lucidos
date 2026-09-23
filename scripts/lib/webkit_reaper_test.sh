@@ -51,6 +51,31 @@ _reaper_list_processes() {
     printf '%s\n' "$SYNTHETIC_PS"
 }
 
+# The reaper kills only a process carrying THIS run's e2e run marker (ADR 0251),
+# read through proc_env.sh, whose own suite tests the real reader. SYNTHETIC_ENV
+# holds "PID NAME=VALUE ..." rows. Fails closed: an unlisted pid has no
+# environment, so it is never ours.
+RUN="reaper-test-run"
+export LUCIDOS_E2E_RUN_ID="$RUN"
+SYNTHETIC_ENV=""
+proc_env_has_entry() {
+    local want="$1" pair="$2" pid envs
+    while read -r pid envs; do
+        [ "$pid" = "$want" ] || continue
+        case " $envs " in *" $pair "*) return 0 ;; esac
+        return 1
+    done <<EOF
+$SYNTHETIC_ENV
+EOF
+    return 1
+}
+
+# SYNTHETIC_ENV rows marking each pid as launched by this run.
+own_env() {
+    local pid
+    for pid in "$@"; do printf '%s LUCIDOS_E2E_RUN_ID=%s\n' "$pid" "$RUN"; done
+}
+
 # ── kill shim (ADR 0025; the ports_test.sh pattern) ────────────────────
 # Running a scripts/lib test is in the same hazard class as a broad pkill, so
 # the raw builtin may never send a lethal signal to a pid this test did not
@@ -170,6 +195,7 @@ test_selection() {
 $under 52428 $WEBKIT_PATH
 $safari 9437184 $SAFARI_PATH
 $chromium 9437184 $CHROMIUM_PATH"
+    SYNTHETIC_ENV="$(own_env "$over" "$under" "$safari" "$chromium")"
 
     E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
 
@@ -178,7 +204,7 @@ $chromium 9437184 $CHROMIUM_PATH"
     assert_alive "$safari"   "over-cap user Safari (not under Playwright cache)"
     assert_alive "$chromium" "over-cap Playwright chromium (webkit-only matcher)"
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 2: cap is configurable ────────────────────────────────────────
@@ -187,6 +213,7 @@ test_cap_configurable() {
     local hi lo
     spawn_sleeper; hi=$SLEEPER_PID   # 7168 MB process, but cap raised above it → survives
     spawn_sleeper; lo=$SLEEPER_PID   # 200 MB process, but cap lowered below it → killed
+    SYNTHETIC_ENV="$(own_env "$hi" "$lo")"
 
     SYNTHETIC_PS="$hi 7340032 $WEBKIT_PATH"
     E2E_WEBKIT_RSS_CAP_MB=8192 reap_once >/dev/null 2>&1
@@ -196,7 +223,7 @@ test_cap_configurable() {
     E2E_WEBKIT_RSS_CAP_MB=100 reap_once >/dev/null 2>&1
     assert_dead "$lo" "200MB process over a 100MB cap"
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 3: match is configurable + default excludes others ────────────
@@ -210,6 +237,7 @@ test_match_override() {
     # now be left alone because it lacks the custom token.
     SYNTHETIC_PS="$tagged 7340032 /tmp/custom-reap-token/some-binary
 $untagged 7340032 $WEBKIT_PATH"
+    SYNTHETIC_ENV="$(own_env "$tagged" "$untagged")"
 
     E2E_WEBKIT_RSS_CAP_MB=6144 E2E_WEBKIT_REAP_MATCH="custom-reap-token" \
         reap_once >/dev/null 2>&1
@@ -217,7 +245,7 @@ $untagged 7340032 $WEBKIT_PATH"
     assert_dead  "$tagged"   "process matching custom token"
     assert_alive "$untagged" "WebKit process NOT matching custom token"
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 3b: mentioning the path is not being the process ──────────────
@@ -235,13 +263,14 @@ test_argv0_only_never_matches_a_mention() {
     # may be reaped.
     SYNTHETIC_PS="$cc 9437184 $CLAUDE_CODE_CMD
 $browser 9437184 $WEBKIT_PATH --inspector-pipe"
+    SYNTHETIC_ENV="$(own_env "$cc" "$browser")"
 
     E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
 
     assert_alive "$cc"      "Claude Code process quoting the path in its argv"
     assert_dead  "$browser" "real WebKit child (argv[0] under the cache)"
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 4: never kill init or our own shell ───────────────────────────
@@ -250,6 +279,7 @@ test_skips_self_and_init() {
     # Contrive matching, wildly-over-cap rows for PID 1 and $$ (this shell).
     SYNTHETIC_PS="1 99999999 $WEBKIT_PATH
 $$ 99999999 $WEBKIT_PATH"
+    SYNTHETIC_ENV="$(own_env 1 "$$")"
 
     # If the guard were missing this would SIGKILL the test runner itself.
     E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
@@ -261,7 +291,7 @@ $$ 99999999 $WEBKIT_PATH"
         fail "reap_once touched a protected PID (rc=$rc)"
     fi
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 4b: never kill the reaper's own loop (pidfile-resolved) ───────
@@ -276,12 +306,13 @@ test_skips_reaper_own_pid() {
     WEBKIT_REAPER_PID=""   # force the pidfile-fallback path
 
     SYNTHETIC_PS="$me 7340032 $WEBKIT_PATH"
+    SYNTHETIC_ENV="$(own_env "$me")"
     E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
 
     assert_alive "$me" "reaper loop PID (from pidfile)"
 
     rm -f "$E2E_WEBKIT_REAPER_PIDFILE"
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 4c: interval validation rejects busy-loop values ──────────────
@@ -371,7 +402,7 @@ test_start_stop_lifecycle() {
         fail "stop_webkit_reaper errored when nothing was running"
     fi
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 # ── Test 7: disabled via env ───────────────────────────────────────────
@@ -406,10 +437,65 @@ test_whitespace_match_warns() {
         fail "no warning for a whitespace match token (got: $(cat "$out_file"))"
     fi
 
-    SYNTHETIC_PS=""
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
+}
+
+# ── Test 9: another tool's WebKit process is never ours to kill ────────
+# Every Playwright on the host shares the browsers cache, so a cache argv[0]
+# says only "some Playwright launched this". Only this run's marker in
+# the environment makes an over-cap process a target (ADR 0251).
+test_foreign_webkit_survives() {
+    echo "test: an over-cap WebKit process this run did not launch is left alone"
+    local own unmarked other
+    spawn_sleeper; own=$SLEEPER_PID
+    spawn_sleeper; unmarked=$SLEEPER_PID   # another tool's, no marker at all
+    spawn_sleeper; other=$SLEEPER_PID      # another e2e run's
+    SYNTHETIC_PS="$own 7340032 $WEBKIT_PATH
+$unmarked 7340032 $WEBKIT_PATH
+$other 7340032 $WEBKIT_PATH"
+    SYNTHETIC_ENV="$(own_env "$own")
+$unmarked PATH=/usr/bin VIRTUAL_ENV=/Users/x/venv
+$other PATH=/usr/bin LUCIDOS_E2E_RUN_ID=someone-elses-run"
+
+    E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
+
+    assert_dead  "$own"      "this run's over-cap WebKit process"
+    assert_alive "$unmarked" "another tool's over-cap WebKit process"
+    assert_alive "$other"    "another run's over-cap WebKit process"
+
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
+}
+
+# ── Test 10: no run id means no kill, and the start says so ────────────
+# The reaper is started after the e2e lock is taken, which exports the marker.
+# Without one it cannot tell our processes from anyone else's, so it kills
+# nothing rather than guess, and warns that the guard is off.
+test_no_run_id_kills_nothing() {
+    echo "test: with no LUCIDOS_E2E_RUN_ID the reaper kills nothing and warns"
+    local marked out_file="$SANDBOX/no-run-id-warning.txt"
+    spawn_sleeper; marked=$SLEEPER_PID
+    SYNTHETIC_PS="$marked 7340032 $WEBKIT_PATH"
+    SYNTHETIC_ENV="$marked LUCIDOS_E2E_RUN_ID="
+    LUCIDOS_E2E_RUN_ID="" E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
+    assert_alive "$marked" "over-cap WebKit process with no run id to match"
+
+    WEBKIT_REAPER_PID=""
+    SYNTHETIC_PS="99999 100 /bin/true"
+    LUCIDOS_E2E_RUN_ID="" E2E_WEBKIT_REAP_INTERVAL_S=1 \
+        start_webkit_reaper > "$out_file" 2>&1
+    stop_webkit_reaper >/dev/null 2>&1
+    if grep -q "WARNING.*LUCIDOS_E2E_RUN_ID" "$out_file"; then
+        pass "a start with no run id warns that the guard is off"
+    else
+        fail "no warning for a missing run id (got: $(cat "$out_file"))"
+    fi
+
+    SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 }
 
 test_selection
+test_foreign_webkit_survives
+test_no_run_id_kills_nothing
 test_cap_configurable
 test_match_override
 test_argv0_only_never_matches_a_mention

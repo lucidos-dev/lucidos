@@ -1,7 +1,11 @@
 use crate::llm::anthropic::AnthropicProvider;
-use crate::llm::model_registry::{provider_kind_for, ModelRegistry, ProviderKind};
+use crate::llm::model_registry::{
+    resolve_route, ModelRegistry, ProviderKind, RouteEntry, Unconfigured,
+};
 use crate::llm::openai::OpenAiProvider;
-use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::provider::{
+    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+};
 use crate::llm::reasoning::clamp_effort;
 use crate::llm::vertex::VertexProvider;
 use async_trait::async_trait;
@@ -56,8 +60,31 @@ impl RoutingProvider {
         }
     }
 
-    /// Snap a reasoning effort onto the closest tier the model's resolved
-    /// provider actually supports.
+    /// The backend instance serving `kind`, or `None` when it is not configured.
+    ///
+    /// The single place that maps a [`ProviderKind`] onto a provider, so
+    /// [`Self::is_configured`], [`Self::configured_providers`] and the routing
+    /// itself cannot disagree about what this router holds.
+    fn backend(&self, kind: ProviderKind) -> Option<&dyn LlmProvider> {
+        match kind {
+            ProviderKind::Vertex => self.vertex.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::Anthropic => self.anthropic.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::OpenAi => self.openai.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::XAi => self.xai.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::OpenCodeFree => {
+                self.opencode_free.as_deref().map(|p| p as &dyn LlmProvider)
+            }
+            ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider),
+        }
+    }
+
+    fn is_configured(&self, kind: ProviderKind) -> bool {
+        self.backend(kind).is_some()
+    }
+
+    /// Snap a reasoning effort onto the closest tier the route's backend
+    /// actually supports.
     ///
     /// **This is the chokepoint**, and it is here rather than in each provider
     /// because this is the only layer that knows the [`ProviderKind`]: the
@@ -67,10 +94,13 @@ impl RoutingProvider {
     /// covers every producer of an effort at once, the chat picker, a trigger's
     /// pinned effort, the `preferences` tool, the HTTP API, and a per-thread
     /// value remembered from a model the thread no longer runs on.
-    fn effort_for_model<'a>(&self, model: &str, effort: Option<&'a str>) -> Option<&'a str> {
+    ///
+    /// It reads the ROUTE, so a model served by two backends is clamped against
+    /// the one the turn will actually reach.
+    fn effort_for_route<'a>(&self, route: &RouteEntry, effort: Option<&'a str>) -> Option<&'a str> {
         let effort = effort?;
-        let Some(clamped) = clamp_effort(effort, provider_kind_for(&self.registry, model), model)
-        else {
+        let model = route.wire_id.as_str();
+        let Some(clamped) = clamp_effort(effort, route.provider, model) else {
             // Not one of our tiers at all, so there is nothing to snap it onto.
             // Send no effort and let the provider default apply, rather than
             // guessing a tier a typo would then be billed for.
@@ -92,39 +122,39 @@ impl RoutingProvider {
         Some(clamped)
     }
 
-    fn provider_for_model(
+    /// Resolve which backend serves `model` and what id to send it, or say what
+    /// the user has to configure.
+    ///
+    /// `chosen` is the turn's own provider pick, which outranks the row's
+    /// stored one. Either is honoured or refused, never substituted: a turn
+    /// pinned to a parked backend errors rather than leaving for another vendor.
+    fn route_for(
         &self,
         model: &str,
-    ) -> Result<&dyn LlmProvider, Box<dyn std::error::Error + Send + Sync>> {
-        match provider_kind_for(&self.registry, model) {
-            ProviderKind::OpenAi => self.openai.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "OpenAI model requested but no OpenAI credential is configured (Settings → Models → Providers) and OPENAI_API_KEY is not set".into()
-            }),
-            ProviderKind::Anthropic => self.anthropic.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers) and ANTHROPIC_API_KEY is not set".into()
-            }),
-            ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set".into()
-            }),
-            ProviderKind::XAi => self.xai.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set".into()
-            }),
-            ProviderKind::OpenCodeFree => self.opencode_free.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Free model requested but the keyless OpenCode Free tier is turned off (Settings → Models → Providers)".into()
-            }),
-            ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)".into()
-            }),
-            // The project id is an ALREADY-RESOLVED value (`VERTEX_PROJECT_ID`
-            // › ADC `quota_project_id` / gcloud config file › `gcloud config`
-            // subprocess), so naming only the env var sends a user who
-            // authenticated with ADC to fix the wrong thing.
-            ProviderKind::Vertex => self
-                .vertex
-                .as_deref()
-                .map(|p| p as &dyn LlmProvider)
-                .ok_or_else(|| "Vertex AI model requested but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)".into()),
-        }
+        chosen: Option<ProviderKind>,
+    ) -> Result<RouteEntry, Box<dyn std::error::Error + Send + Sync>> {
+        resolve_route(&self.registry, model, chosen, |kind| {
+            self.is_configured(kind)
+        })
+        .map_err(|Unconfigured(kind)| unconfigured_message(kind).into())
+    }
+}
+
+/// What the user has to set up for `kind` to serve a turn.
+///
+/// The Vertex project id is an ALREADY-RESOLVED value. It comes from
+/// `VERTEX_PROJECT_ID`, then the ADC `quota_project_id` or gcloud config file,
+/// then a `gcloud config` subprocess. Naming only the env var would send a user
+/// who authenticated with ADC to fix the wrong thing.
+fn unconfigured_message(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Vertex => "Vertex AI model requested but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)",
+        ProviderKind::Anthropic => "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers) and ANTHROPIC_API_KEY is not set",
+        ProviderKind::OpenAi => "OpenAI model requested but no OpenAI credential is configured (Settings → Models → Providers) and OPENAI_API_KEY is not set",
+        ProviderKind::OpenRouter => "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set",
+        ProviderKind::XAi => "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set",
+        ProviderKind::OpenCodeFree => "Free model requested but the keyless OpenCode Free tier is turned off (Settings → Models → Providers)",
+        ProviderKind::Local => "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)",
     }
 }
 
@@ -134,23 +164,24 @@ impl LlmProvider for RoutingProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model_override: Option<&str>,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let model = model_override.unwrap_or(&self.default_model);
-        let provider = self.provider_for_model(model)?;
-        let reasoning_effort = self.effort_for_model(model, reasoning_effort);
+        let model = selection.model.unwrap_or(&self.default_model);
+        let route = self.route_for(model, selection.provider)?;
+        // `route_for` already refused an unconfigured backend, so the miss here
+        // is unreachable. It resolves through the same `backend`, and saying
+        // what to configure beats an `expect` if the two ever part company.
+        let provider = self
+            .backend(route.provider)
+            .ok_or_else(|| unconfigured_message(route.provider))?;
+        // The leaf serves ONE backend, so it is handed the resolved route: its
+        // own wire id, and the effort snapped onto what that backend accepts.
+        let resolved = ModelSelection::model(&route.wire_id)
+            .with_effort(self.effort_for_route(&route, selection.reasoning_effort));
         provider
-            .chat(
-                messages,
-                tools,
-                Some(model),
-                system_prompt,
-                on_token,
-                reasoning_effort,
-            )
+            .chat(messages, tools, resolved, system_prompt, on_token)
             .await
     }
 
@@ -159,29 +190,12 @@ impl LlmProvider for RoutingProvider {
     }
 
     fn configured_providers(&self) -> Option<Vec<ProviderKind>> {
-        let mut kinds = Vec::new();
-        if self.vertex.is_some() {
-            kinds.push(ProviderKind::Vertex);
-        }
-        if self.anthropic.is_some() {
-            kinds.push(ProviderKind::Anthropic);
-        }
-        if self.openai.is_some() {
-            kinds.push(ProviderKind::OpenAi);
-        }
-        if self.openrouter.is_some() {
-            kinds.push(ProviderKind::OpenRouter);
-        }
-        if self.xai.is_some() {
-            kinds.push(ProviderKind::XAi);
-        }
-        if self.opencode_free.is_some() {
-            kinds.push(ProviderKind::OpenCodeFree);
-        }
-        if self.local.is_some() {
-            kinds.push(ProviderKind::Local);
-        }
-        Some(kinds)
+        Some(
+            ProviderKind::ALL
+                .into_iter()
+                .filter(|kind| self.is_configured(*kind))
+                .collect(),
+        )
     }
 }
 
@@ -197,15 +211,7 @@ mod tests {
     fn router(rows: &[(&str, ProviderKind)]) -> RoutingProvider {
         let registry: ModelRegistry = Arc::new(RwLock::new(
             rows.iter()
-                .map(|(id, provider)| {
-                    (
-                        id.to_string(),
-                        ModelRouting {
-                            provider: *provider,
-                            context_window: None,
-                        },
-                    )
-                })
+                .map(|(id, provider)| (id.to_string(), ModelRouting::single(*provider, *id)))
                 .collect::<HashMap<_, _>>(),
         ));
         RoutingProvider::new(
@@ -217,8 +223,22 @@ mod tests {
             None,
             None,
             registry,
-            "claude-opus-5@default".to_string(),
+            "claude-opus-5".to_string(),
         )
+    }
+
+    impl RoutingProvider {
+        /// Clamp `effort` for `model` against the route the registry names,
+        /// ignoring what this router has configured.
+        ///
+        /// The clamp itself reads only the route, so the tests below exercise it
+        /// on a provider-less router. `chat` resolves against the configured set
+        /// first, and refuses before reaching the clamp when nothing serves.
+        fn effort_for_model<'a>(&self, model: &str, effort: Option<&'a str>) -> Option<&'a str> {
+            let route = resolve_route(&self.registry, model, None, |_| true)
+                .expect("every provider counts as configured here");
+            self.effort_for_route(&route, effort)
+        }
     }
 
     /// The chokepoint. Each model's effort is snapped using the provider its
@@ -227,7 +247,7 @@ mod tests {
     #[test]
     fn effort_is_clamped_against_the_registry_provider() {
         let router = router(&[
-            ("claude-opus-5@default", ProviderKind::Vertex),
+            ("claude-opus-5", ProviderKind::Vertex),
             ("gemini-3.5-flash", ProviderKind::Vertex),
             ("gpt-5.6-sol", ProviderKind::OpenAi),
             ("gpt-5.4", ProviderKind::OpenAi),
@@ -243,7 +263,7 @@ mod tests {
             ("laguna-s-2.1-free", ProviderKind::OpenCodeFree),
         ]);
         for (model, expected) in [
-            ("claude-opus-5@default", "max"),
+            ("claude-opus-5", "max"),
             ("gemini-3.5-flash", "high"),
             ("gpt-5.6-sol", "max"),
             ("gpt-5.4", "xhigh"),
@@ -287,12 +307,124 @@ mod tests {
     fn a_free_model_is_hidden_and_actionable_while_the_tier_is_off() {
         let router = router(&[("laguna-s-2.1-free", ProviderKind::OpenCodeFree)]);
         assert_eq!(router.configured_providers(), Some(Vec::new()));
-        let Err(err) = router.provider_for_model("laguna-s-2.1-free") else {
+        let Err(err) = router.route_for("laguna-s-2.1-free", None) else {
             panic!("the tier is off, so there is no provider to route to");
         };
         let err = err.to_string();
         assert!(err.contains("OpenCode Free"), "{err}");
         assert!(err.contains("Settings → Models → Providers"), "{err}");
+    }
+
+    /// The honoured-or-refused rule, at the layer that enforces it.
+    ///
+    /// A model routed to both Vertex and Anthropic, with only Anthropic
+    /// configured, runs on Anthropic. Pin it to Vertex and the turn is REFUSED,
+    /// naming Vertex, rather than quietly leaving for the other vendor.
+    #[test]
+    fn a_pinned_provider_is_honoured_or_refused_but_never_substituted() {
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "claude-opus-5".to_string(),
+            ModelRouting {
+                routes: vec![
+                    RouteEntry::new(ProviderKind::Vertex, "claude-opus-5"),
+                    RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5"),
+                ],
+                preferred: None,
+            },
+        )])));
+        let router = RoutingProvider::new(
+            None,
+            None,
+            Some(
+                AnthropicProvider::new(
+                    crate::llm::AnthropicAuth::ApiKey("k".to_string()),
+                    "claude-opus-5".to_string(),
+                )
+                .expect("build the anthropic provider"),
+            ),
+            None,
+            None,
+            None,
+            None,
+            registry,
+            "claude-opus-5".to_string(),
+        );
+
+        // No pick: the first CONFIGURED route wins, so Vertex being listed
+        // first does not strand a workspace holding only an Anthropic key.
+        let route = router
+            .route_for("claude-opus-5", None)
+            .expect("anthropic serves it");
+        assert_eq!(route.provider, ProviderKind::Anthropic);
+
+        // Pinned to the parked backend: refused, and the message names it.
+        let Err(err) = router.route_for("claude-opus-5", Some(ProviderKind::Vertex)) else {
+            panic!("a pin to an unconfigured backend must refuse");
+        };
+        assert!(err.to_string().contains("Vertex AI"), "{err}");
+
+        // The same refusal through `chat`, fed the owned selection a turn
+        // resolves and stamps. That is the seam a turn crosses, so a provider
+        // dropped on the way would run this turn on Anthropic instead.
+        let resolved = crate::core::ResolvedModelSelection {
+            model: Some("claude-opus-5".to_string()),
+            reasoning_effort: None,
+            provider: Some("vertex".to_string()),
+        };
+        let refused = futures::executor::block_on(router.chat(
+            vec![],
+            vec![],
+            resolved.as_selection(),
+            None,
+            None,
+        ));
+        let Err(err) = refused else {
+            panic!("a turn pinned to an unconfigured backend must refuse");
+        };
+        assert!(err.to_string().contains("Vertex AI"), "{err}");
+    }
+
+    /// The wire carries the ROUTE's id, not the row's. That is what lets a row
+    /// keep one identity while a backend spelling it differently still works.
+    #[test]
+    fn the_route_decides_the_id_on_the_wire() {
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "claude-opus-5-5".to_string(),
+            ModelRouting {
+                routes: vec![RouteEntry::new(
+                    ProviderKind::OpenRouter,
+                    "anthropic/claude-opus-5-5",
+                )],
+                preferred: None,
+            },
+        )])));
+        let router = RoutingProvider::new(
+            None,
+            None,
+            None,
+            Some(
+                OpenAiProvider::new_with_base_url(
+                    "k".to_string(),
+                    "x".to_string(),
+                    crate::llm::OPENROUTER_BASE_URL,
+                    Vec::new(),
+                    true,
+                )
+                .expect("build the openrouter provider"),
+            ),
+            None,
+            None,
+            None,
+            registry,
+            "claude-opus-5-5".to_string(),
+        );
+        let route = router
+            .route_for("claude-opus-5-5", None)
+            .expect("openrouter serves it");
+        assert_eq!(route.wire_id, "anthropic/claude-opus-5-5");
+        // And the effort clamp reads that id's backend, so OpenAI's own
+        // `xhigh` is never offered on a third-party server.
+        assert_eq!(router.effort_for_route(&route, Some("xhigh")), Some("high"));
     }
 
     /// A model with no registry row falls back to the same prefix heuristic
@@ -307,7 +439,7 @@ mod tests {
         );
         // Non-fable `claude-` → Vertex Claude, adaptive, so max survives.
         assert_eq!(
-            router.effort_for_model("claude-opus-5@default", Some("max")),
+            router.effort_for_model("claude-opus-5", Some("max")),
             Some("max")
         );
     }

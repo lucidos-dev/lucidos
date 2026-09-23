@@ -52,6 +52,10 @@ mod spoken_aside_unit_tests;
 mod question_reask_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/question_card.rs"]
+mod question_card_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_unit_tests/todo_wake_nudge.rs"]
 mod todo_wake_nudge_unit_tests;
 
@@ -70,6 +74,10 @@ mod tool_result_split_unit_tests;
 #[cfg(test)]
 #[path = "../agentic_loop_unit_tests/turn_tools.rs"]
 mod turn_tools_unit_tests;
+
+#[cfg(test)]
+#[path = "../agentic_loop_unit_tests/parallel_reads.rs"]
+mod parallel_reads_unit_tests;
 
 #[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]

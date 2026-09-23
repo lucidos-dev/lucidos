@@ -203,6 +203,9 @@ fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::proces
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for k in &config.env_removed {
+        cmd.env_remove(k);
+    }
     for (k, v) in &config.env {
         cmd.env(k, v);
     }

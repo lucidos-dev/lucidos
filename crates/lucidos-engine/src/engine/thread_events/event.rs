@@ -108,6 +108,12 @@ pub enum ThreadEvent {
         /// Reasoning effort the engine will use to answer this message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// The backend this message was PINNED to: an explicit pick, or one
+        /// this thread remembered for the same model. Stamped beside the model
+        /// so the pick outlives a later change to the model's *preferred
+        /// provider*. `None` means nothing was pinned, so the row decides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         /// Structured origin, captured from HTTP headers / device lookup at
         /// the API boundary. Optional on the wire so old DB rows deserialize
         /// cleanly; the frontend's `legacyOrigin()` synthesizes from the
@@ -243,11 +249,9 @@ pub enum ThreadEvent {
         /// an `ask_user_question` result followed the post-`UserQuestionAsked`
         /// request_id redirect into the question divider and left the
         /// original exchange's "Executing …" spinner pending forever.
-        /// Server-side resume-block synthesis (LLM-message pairing) still
-        /// uses chronological name matching. See
-        /// `collect_tool_pairs_chronological`. Optional for legacy DB rows
-        /// (pre-field): callers that fall back to chronological pairing
-        /// continue to work when absent.
+        /// Every reader pairs a result with its call by this id, since a
+        /// parallel run answers in completion order (ADR 0246). Optional for
+        /// legacy DB rows, which keep each reader's positional rule.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_called_event_id: Option<uuid::Uuid>,
     },
@@ -667,6 +671,11 @@ pub enum ThreadEvent {
         /// legacy-`None` caveat as [`Self::TriggerStarted::model`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// The backend this fire was pinned to, from the trigger's own pin or
+        /// the thread's memory. `None` means nothing was pinned, so the row
+        /// decided.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     TriggerCompleted {
         #[serde(alias = "task_id")]

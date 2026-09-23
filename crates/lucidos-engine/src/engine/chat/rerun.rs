@@ -408,6 +408,7 @@ impl LucidosEngine {
                         None,
                         None,
                         None,
+                        None, // provider_override
                         recovered_images.as_deref(),
                         None,
                         None,
@@ -598,9 +599,9 @@ async fn events_between(
     thread_id: Uuid,
     from_event_id: Uuid,
     to_event_id: Uuid,
-) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
+) -> Result<Vec<BetweenEvent>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT event_type, payload FROM events \
+        "SELECT id, event_type, payload FROM events \
          WHERE aggregate_id = $1 \
            AND sequence > (SELECT sequence FROM events WHERE id = $2) \
            AND sequence < (SELECT sequence FROM events WHERE id = $3) \
@@ -613,15 +614,18 @@ async fn events_between(
     .await
 }
 
+/// One row of the interrupted turn: event id, event type, payload.
+type BetweenEvent = (Uuid, String, serde_json::Value);
+
 /// Format the side-effect summary for the engine note.
 /// Returns either a non-empty markdown bullet list or an explanatory line.
-fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
+fn build_side_effect_summary(events: &[BetweenEvent]) -> String {
     // Pair ToolCalled + ToolResult by walking forward; the ToolResult event
     // for a call may follow immediately or after ThoughtStreamed/TextStreamed events.
     let mut summary_lines: Vec<String> = Vec::new();
-    let mut pending_calls: Vec<(String, String)> = Vec::new(); // (tool_name, args_summary)
+    let mut pending_calls: Vec<(Uuid, String, String)> = Vec::new(); // (event id, tool_name, args_summary)
 
-    for (event_type, payload) in events {
+    for (event_id, event_type, payload) in events {
         match event_type.as_str() {
             "ToolCalled" => {
                 let name = payload
@@ -639,7 +643,7 @@ fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
                             .map(|a| a.to_string())
                             .unwrap_or_default()
                     });
-                pending_calls.push((name, truncate_for_note(&args_str)));
+                pending_calls.push((*event_id, name, truncate_for_note(&args_str)));
             }
             "ToolResult" => {
                 let result_text = payload
@@ -648,7 +652,16 @@ fn build_side_effect_summary(events: &[(String, serde_json::Value)]) -> String {
                     .unwrap_or("(no result)")
                     .to_string();
                 let result_summary = truncate_for_note(&result_text);
-                if let Some((name, args)) = pending_calls.pop() {
+                // A parallel run answers in completion order, so a result
+                // names its call. A legacy row pairs with the newest call.
+                let answered = match crate::core::store::tool_called_event_id_of(payload) {
+                    Some(call_id) => pending_calls
+                        .iter()
+                        .position(|(id, _, _)| *id == call_id)
+                        .map(|i| pending_calls.remove(i)),
+                    None => pending_calls.pop(),
+                };
+                if let Some((_, name, args)) = answered {
                     summary_lines.push(format!("- {}({}) → {}", name, args, result_summary));
                     if summary_lines.len() >= MAX_BULLET_ENTRIES {
                         summary_lines.push(format!(
@@ -746,10 +759,12 @@ mod tests {
     fn summary_pairs_tool_call_with_result() {
         let events = vec![
             (
+                Uuid::nil(),
                 "ToolCalled".to_string(),
                 json!({"name": "send_notification", "description": "Notify: Ping"}),
             ),
             (
+                Uuid::nil(),
                 "ToolResult".to_string(),
                 json!({"name": "send_notification", "result": "ok"}),
             ),
@@ -762,10 +777,47 @@ mod tests {
         );
     }
 
+    /// A parallel run answers in completion order. Pairing each result with
+    /// the newest pending call would put the wrong call beside it.
+    #[test]
+    fn summary_pairs_results_by_call_id_in_any_order() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let call = |id, path: &str| {
+            (
+                id,
+                "ToolCalled".to_string(),
+                json!({"name": "read_file", "description": format!("Read {path}")}),
+            )
+        };
+        let result = |id: Uuid, text: &str| {
+            (
+                Uuid::new_v4(),
+                "ToolResult".to_string(),
+                json!({"name": "read_file", "result": text, "tool_called_event_id": id}),
+            )
+        };
+        let events = vec![
+            call(a, "a.txt"),
+            call(b, "b.txt"),
+            call(c, "c.txt"),
+            result(a, "contents of a"),
+            result(c, "contents of c"),
+            result(b, "contents of b"),
+        ];
+        let s = build_side_effect_summary(&events);
+        for name in ["a", "b", "c"] {
+            let line = format!("- read_file(Read {name}.txt) → contents of {name}");
+            assert!(s.contains(&line), "missing {line:?} in {s}");
+        }
+    }
+
     #[test]
     fn summary_handles_zero_pairs() {
-        let events: Vec<(String, serde_json::Value)> =
-            vec![("Thinking".to_string(), json!({"text": "musing"}))];
+        let events: Vec<BetweenEvent> = vec![(
+            Uuid::nil(),
+            "Thinking".to_string(),
+            json!({"text": "musing"}),
+        )];
         let s = build_side_effect_summary(&events);
         assert_eq!(s, "No actions completed before the abort.");
     }
@@ -773,12 +825,18 @@ mod tests {
     #[test]
     fn summary_skips_thinking() {
         let events = vec![
-            ("Thinking".to_string(), json!({"text": "thinking..."})),
             (
+                Uuid::nil(),
+                "Thinking".to_string(),
+                json!({"text": "thinking..."}),
+            ),
+            (
+                Uuid::nil(),
                 "ToolCalled".to_string(),
                 json!({"name": "read_file", "description": "Read foo.txt"}),
             ),
             (
+                Uuid::nil(),
                 "ToolResult".to_string(),
                 json!({"name": "read_file", "result": "contents"}),
             ),
@@ -797,10 +855,12 @@ mod tests {
         let big = "x".repeat(500);
         let events = vec![
             (
+                Uuid::nil(),
                 "ToolCalled".to_string(),
                 json!({"name": "run_bash", "args": {"command": big.clone()}}),
             ),
             (
+                Uuid::nil(),
                 "ToolResult".to_string(),
                 json!({"name": "run_bash", "result": big}),
             ),
@@ -824,10 +884,12 @@ mod tests {
         let mut events = Vec::new();
         for i in 0..(MAX_BULLET_ENTRIES + 5) {
             events.push((
+                Uuid::nil(),
                 "ToolCalled".to_string(),
                 json!({"name": "tool", "description": format!("call {}", i)}),
             ));
             events.push((
+                Uuid::nil(),
                 "ToolResult".to_string(),
                 json!({"name": "tool", "result": format!("ok {}", i)}),
             ));
@@ -887,6 +949,7 @@ mod tests {
         }
         fn message(text: &str) -> ThreadEvent {
             ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: text.to_string(),
                 user_image_hashes: vec![],

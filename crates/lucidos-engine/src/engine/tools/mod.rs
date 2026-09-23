@@ -31,6 +31,29 @@ mod web;
 
 pub(crate) use capabilities::TurnCapabilities;
 
+/// The name `execute_tool` dispatches a call on.
+///
+/// Phase 5 grouped manifest tools delegate to their flat-alias handlers:
+/// `action` resolves to the legacy flat tool name, validated against the
+/// capability parity manifest. Only these seven names resolve. A flat alias
+/// runs as itself whatever `action` it carries, and domains with bespoke
+/// handling (notifications, preferences, triggers) keep their own arms.
+pub(crate) fn dispatch_name<'a>(
+    name: &'a str,
+    args: &serde_json::Value,
+) -> Result<&'a str, String> {
+    match name {
+        tn::MCP
+        | tn::PLUGINS
+        | tn::EVENTS
+        | tn::CHANGES
+        | tn::THREADS
+        | tn::THREAD_QUEUE
+        | tn::MEMORY => grouped::grouped_legacy_name(name, args),
+        other => Ok(other),
+    }
+}
+
 use super::LucidosEngine;
 use crate::api::thread_reach::ThreadReachVerb;
 use crate::engine::thread_lifecycle::ThreadStatus;
@@ -184,22 +207,7 @@ impl LucidosEngine {
         cancel_token: &tokio_util::sync::CancellationToken,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        // Phase 5 grouped manifest tools delegate to their flat-alias handlers:
-        // resolve `action` to the legacy flat tool name (validated against the
-        // capability parity manifest) and fall through to that name's arm below.
-        // The flat arms stay wired as back-compat aliases for cached prompts /
-        // in-flight threads. Domains with bespoke handling (notifications /
-        // preferences / triggers / trigger_groups) keep their own arms below.
-        let name: &str = match name {
-            tn::MCP
-            | tn::PLUGINS
-            | tn::EVENTS
-            | tn::CHANGES
-            | tn::THREADS
-            | tn::THREAD_QUEUE
-            | tn::MEMORY => grouped::grouped_legacy_name(name, args)?,
-            other => other,
-        };
+        let name = dispatch_name(name, args)?;
         match name {
             tn::READ_FILE
             | tn::WRITE_FILE
@@ -1275,8 +1283,8 @@ pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRe
         // tool. The test beside this asserts the bare absence, rather than
         // trusting the model to read the "not".
         R::ThreadParked => {
-            "Error: the thread that proposed this change is parked, on a question, an event wait \
-             or a sub-thread. It wakes on the delivery and may commit again, so Apply is \
+            "Error: the thread that proposed this change is parked, on a question or an event \
+             wait. It wakes on the answer or the delivery and may commit again, so Apply is \
              withheld. Waiting for it will not help either: a standing apply drops at once on a \
              parked thread. Tell the user, who can answer it or stop the wait, and then apply."
                 .to_string()

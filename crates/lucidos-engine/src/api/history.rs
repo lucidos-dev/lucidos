@@ -211,7 +211,21 @@ fn lagged_event_json(count: u64) -> String {
     .to_string()
 }
 
-pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// The status an engine reports while it is `shutting_down` or not.
+///
+/// An engine in teardown still answers for up to its whole drain window. A 2xx
+/// then would let a gateway adopt it and route a page to it seconds before it
+/// exits. `probe_health` in the gateway needs a 2xx to adopt.
+fn health_status(shutting_down: bool) -> (StatusCode, &'static str) {
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+    } else {
+        (StatusCode::OK, "ok")
+    }
+}
+
+pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (code, status) = health_status(state.engine.is_shutting_down());
     let workspace_name = state
         .workspace_path
         .file_name()
@@ -222,13 +236,13 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
     // changes are picked up without an engine restart.
     let latest_engine_version = read_engine_version();
     let latest_tauri_app_version = read_app_version();
-    Json(serde_json::json!({
+    let body = Json(serde_json::json!({
         // Deliberately still "ok" (and a 200) when `database_reachable` is false:
         // this half is about the engine PROCESS, which is answering. Failing the
         // endpoint would recruit the gateway's respawn machinery against a
         // condition respawning cannot fix, and ADR 0014 forbids culling an alive
         // engine. See `engine::db_health` and ADR 0037.
-        "status": "ok",
+        "status": status,
         "workspace": workspace_name,
         "workspace_path": state.workspace_path.to_string_lossy(),
         "started_at": state.started_at.to_rfc3339(),
@@ -258,7 +272,8 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
         // "don't filter" (mock / no routing); an array enumerates live backends.
         // Reflects a runtime credential swap (read from the live provider).
         "configured_providers": state.engine.configured_providers(),
-    }))
+    }));
+    (code, body)
 }
 
 /// True in a packaged desktop build, detected by the ABSENCE of a Lucidos source
@@ -1059,6 +1074,16 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A draining engine must not read as healthy, or a gateway adopts it.
+    #[test]
+    fn an_engine_in_teardown_reports_unavailable() {
+        assert_eq!(
+            health_status(true),
+            (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+        );
+        assert_eq!(health_status(false), (StatusCode::OK, "ok"));
+    }
 
     /// The emit surface reads both facts off the token, and neither off a
     /// header a caller could set (ADR 0137, ADR 0138).

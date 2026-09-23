@@ -414,6 +414,7 @@ export async function sendMessage(
     // `ccModel: null` = the explicit "default" pick (omit cc_model).
     modelOverride?: string;
     reasoningEffortOverride?: string;
+    providerOverride?: string;
     ccModelOverride?: CodingAgentModelValue | null;
     ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
   },
@@ -562,6 +563,10 @@ export async function sendMessage(
     // omit so the backend reuses the thread's last effort (?? account default).
     const effort = options?.reasoningEffortOverride ?? getThreadModelOverride(threadId).reasoningEffort;
     if (effort) body.reasoning_effort = effort;
+    // Same rule for the backend: only an explicit pick is sent, so the thread's
+    // memory and then the model's own default decide otherwise.
+    const provider = options?.providerOverride ?? getThreadModelOverride(threadId).provider;
+    if (provider) body.provider = provider;
   }
 
   // CC ignores url_context; only send for non-CC threads. Content extraction is

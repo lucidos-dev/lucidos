@@ -594,16 +594,7 @@ impl LucidosEngine {
             (None, None)
         };
         let cc_model = cc_model.or(prev_model).or(event_model);
-        let cc_reasoning_effort = cc_reasoning_effort
-            .or(prev_effort)
-            .or(event_effort)
-            .or_else(|| {
-                // The Claude Code settings files are a CC-only fallback: their
-                // effort vocabulary must not leak into other backends.
-                (coding_agent == CodingAgent::ClaudeCode)
-                    .then(crate::runtime::claude_code::read_cc_default_effort)
-                    .flatten()
-            });
+        let pinned_effort = cc_reasoning_effort.or(prev_effort).or(event_effort);
 
         // The startup semaphore limits concurrent process initializations. Hold
         // the permit until Init, when the process is up and mostly idle.
@@ -626,15 +617,8 @@ impl LucidosEngine {
         // User-managed env vars injected into the coding-agent subprocess
         // alongside the CRED_*/OAUTH_* the script path already gets. Applied
         // first in `apply_lucidos_env`, so engine-owned vars still win.
-        let user_env_vars = crate::core::EnvironmentVariableStore::env_pairs(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                log!(
-                    "[AgentSession] Failed to load user environment variables for spawn: {}",
-                    e
-                );
-                Vec::new()
-            });
+        let user_env_vars =
+            crate::core::EnvironmentVariableStore::spawn_pairs(&self.pool, "AgentSession").await;
         // Resolve the CLAUDE_CONFIG_DIR (provider/account) this session runs under.
         // A CC session's transcript lives at
         // `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the thread is PINNED
@@ -654,19 +638,31 @@ impl LucidosEngine {
         let effective_config_dir = inject_config_dir.clone().or_else(|| {
             // Match CC's precedence for a fresh session, so the recorded dir
             // never diverges from where CC writes the transcript. The
-            // user-managed env var wins, then the engine's own inherited process
-            // env, then CC's default.
+            // user-managed env var wins, then what CC inherits from the
+            // engine's own env, then CC's default.
             user_env_vars
                 .iter()
                 .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
                 .map(|(_, v)| v.clone())
-                .or_else(|| {
-                    std::env::var("CLAUDE_CONFIG_DIR")
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                })
+                .or_else(|| crate::core::inherited_env_var("CLAUDE_CONFIG_DIR"))
                 .or_else(default_claude_config_dir)
         });
+        // CC's defaults, resolved as the spawned CC will resolve them. The
+        // settings files are a CC-only fallback: their effort vocabulary must
+        // not leak into other backends.
+        let cc_defaults = (coding_agent == CodingAgent::ClaudeCode).then(|| {
+            crate::runtime::claude_code::CcSettingsScope {
+                env: &user_env_vars,
+                inherited: crate::core::inherited_env_var,
+                config_dir: effective_config_dir.as_deref().map(std::path::Path::new),
+                project_dir: &cwd,
+            }
+        });
+        let cc_reasoning_effort =
+            pinned_effort.or_else(|| cc_defaults.as_ref().and_then(|s| s.default_effort()));
+        // Only a hint for the Init handler: CC names the model it chose at
+        // Init, but strips a `[1m]` suffix the user's own setting carries.
+        let cc_default_model = cc_defaults.as_ref().and_then(|s| s.default_model());
         // User-configured agent binary path. Resolved here, where the spawn
         // orchestration has the pool, and validated inside the runtime's spawn.
         // An unresolvable path fails loud and names the setting, rather than
@@ -1327,7 +1323,7 @@ impl LucidosEngine {
                                         // the [1m] suffix survives. CC strips it,
                                         // and `context_window_for` keys on it.
                                         let norm = crate::runtime::claude_code::reconcile_cc_model(
-                                            cc_model.as_deref(),
+                                            cc_model.as_deref().or(cc_default_model.as_deref()),
                                             m,
                                         );
                                         s.current_model = Some(norm.clone());
@@ -1614,7 +1610,7 @@ impl LucidosEngine {
                                 coding_agent,
                                 &snapshot_model,
                             )
-                            .unwrap_or_else(|| self.context_window_for(&snapshot_model));
+                            .unwrap_or_else(|| self.context_window_for(&snapshot_model, None));
                             // Anthropic reports `input_tokens` as the
                             // uncached portion only. `ApiUsage.input_tokens`
                             // stores the TOTAL prompt size, the same

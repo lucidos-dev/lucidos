@@ -3,7 +3,8 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
 use crate::triggers::{
-    normalize_route_setting, validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
+    normalize_route_setting, resolve_trigger_provider_update, validate_trigger_provider,
+    validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
 };
 // Lets the never-fires diagnosis and the AND-footgun check read a parsed
 // schedule's day-of-month / month / day-of-week ordinal sets, instead of
@@ -253,6 +254,15 @@ impl LucidosEngine {
                     Ok(None) => {}
                     Err(e) => return Ok(format!("Error: {}", e)),
                 }
+                match validate_trigger_provider(
+                    &self.model_registry,
+                    args.get("model").and_then(|v| v.as_str()),
+                    args.get("provider").and_then(|v| v.as_str()),
+                ) {
+                    Ok(Some(provider)) => event_payload["provider"] = serde_json::json!(provider),
+                    Ok(None) => {}
+                    Err(e) => return Ok(format!("Error: {}", e)),
+                }
 
                 self.trigger_registry_writer()
                     .write_created_minting_slug(&trigger_id_str, event_payload, name, None)
@@ -440,6 +450,17 @@ impl LucidosEngine {
                         },
                         None => None,
                     };
+                // Cleared as well when the model moves without it: a pin
+                // belongs to its model.
+                let new_provider: Option<Option<String>> = match resolve_trigger_provider_update(
+                    &self.model_registry,
+                    &existing,
+                    new_model.as_ref().map(Option::as_deref),
+                    args.get("provider").map(|v| v.as_str()),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return Ok(format!("Error: {}", e)),
+                };
 
                 if new_name.is_none()
                     && new_run.is_none()
@@ -451,6 +472,7 @@ impl LucidosEngine {
                     && new_group_id.is_none()
                     && new_model.is_none()
                     && new_reasoning_effort.is_none()
+                    && new_provider.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -503,6 +525,10 @@ impl LucidosEngine {
                 if let Some(ref effort) = new_reasoning_effort {
                     update_payload["reasoning_effort"] = serde_json::json!(effort);
                     updated_fields.push("reasoning_effort");
+                }
+                if let Some(ref provider) = new_provider {
+                    update_payload["provider"] = serde_json::json!(provider);
+                    updated_fields.push("provider");
                 }
 
                 // Ensure trigger still has at least one firing mechanism

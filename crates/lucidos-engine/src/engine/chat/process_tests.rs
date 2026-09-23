@@ -116,8 +116,7 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
         &TriggerInvocation::Schedule,
         "Run the check.",
         false,
-        None,
-        None,
+        &sel(None, None, None),
     );
     assert_eq!(meta.channel, Some(EventChannel::Trigger));
     let ThreadEvent::TriggerStarted {
@@ -156,12 +155,12 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
         &TriggerInvocation::Schedule,
         "Summarize today.",
         false,
-        Some("gemini-3.5-flash"),
-        Some("low"),
+        &sel(Some("gemini-3.5-flash"), Some("low"), Some("anthropic")),
     );
     let ThreadEvent::TriggerStarted {
         model,
         reasoning_effort,
+        provider,
         ..
     } = event
     else {
@@ -169,6 +168,26 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     };
     assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
     assert_eq!(reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(
+        provider.as_deref(),
+        Some("anthropic"),
+        "a trigger's pinned backend is recorded too, so a human follow-up on \
+         the thread stays on the backend the fire ran on"
+    );
+}
+
+/// The override triple a caller passes `resolve_route_overrides`, spelled
+/// positionally so the cases read as (model, effort, provider).
+fn sel(
+    model: Option<&str>,
+    effort: Option<&str>,
+    provider: Option<&str>,
+) -> crate::core::ResolvedModelSelection {
+    crate::core::ResolvedModelSelection {
+        model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+        provider: provider.map(str::to_string),
+    }
 }
 
 /// The deadline these tests run against. The real ones come from
@@ -1362,10 +1381,7 @@ fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::Mo
     let mut map = HashMap::new();
     map.insert(
         id.to_string(),
-        crate::llm::model_registry::ModelRouting {
-            provider,
-            context_window: None,
-        },
+        crate::llm::model_registry::ModelRouting::single(provider, id),
     );
     Arc::new(RwLock::new(map))
 }
@@ -1384,19 +1400,19 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry(),
+        |_| true,
         Some(true),
         None,
         None,
-        Some("claude-opus-4-8[1m]"),
-        None,
+        sel(Some("claude-opus-4-8[1m]"), None, None),
     )
     .await;
 
-    assert_eq!(model, None);
-    assert_eq!(effort, None);
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort, None);
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1408,19 +1424,19 @@ async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry(),
+        |_| true,
         Some(true),
         None,
         None,
-        None,
-        Some("xhigh"),
+        sel(None, Some("xhigh"), None),
     )
     .await;
 
-    assert_eq!(model, None);
-    assert_eq!(effort.as_deref(), Some("xhigh"));
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1435,11 +1451,19 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
         .await
         .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, &registry(), None, None, None, None, None).await;
+    let resolved = resolve_route_overrides(
+        &pool,
+        &registry(),
+        |_| true,
+        None,
+        None,
+        None,
+        sel(None, None, None),
+    )
+    .await;
 
-    assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
-    assert_eq!(effort.as_deref(), Some("high"));
+    assert_eq!(resolved.model.as_deref(), Some("claude-opus-4-8[1m]"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1469,11 +1493,19 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
     .await
     .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, &registry(), None, Some(tid), None, None, None).await;
+    let resolved = resolve_route_overrides(
+        &pool,
+        &registry(),
+        |_| true,
+        None,
+        Some(tid),
+        None,
+        sel(None, None, None),
+    )
+    .await;
 
-    assert_eq!(model.as_deref(), Some("thread-model"));
-    assert_eq!(effort.as_deref(), Some("low"));
+    assert_eq!(resolved.model.as_deref(), Some("thread-model"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1509,11 +1541,19 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     .await
     .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, &registry(), None, Some(tid), None, None, None).await;
+    let resolved = resolve_route_overrides(
+        &pool,
+        &registry(),
+        |_| true,
+        None,
+        Some(tid),
+        None,
+        sel(None, None, None),
+    )
+    .await;
 
-    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
-    assert_eq!(effort.as_deref(), Some("low"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1532,19 +1572,19 @@ async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry(),
+        |_| true,
         None,
         None,
         None,
-        Some("gemini-3.5-flash"),
-        Some("low"),
+        sel(Some("gemini-3.5-flash"), Some("low"), None),
     )
     .await;
 
-    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
-    assert_eq!(effort.as_deref(), Some("low"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1558,38 +1598,46 @@ async fn trigger_route_resolves_model_and_effort_independently() {
     // An adaptive Claude account model, so every tier is available and the
     // clamp is a no-op: this test is about the two fields resolving
     // independently, not about clamping (covered separately below).
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-5@default")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-5")
         .await
         .unwrap();
     crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry(),
+        |_| true,
         None,
         None,
         None,
-        Some("gemini-3.5-flash"),
-        None,
+        sel(Some("gemini-3.5-flash"), None, None),
     )
     .await;
-    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
     assert_eq!(
-        effort.as_deref(),
+        resolved.reasoning_effort.as_deref(),
         Some("high"),
         "account effort still applies"
     );
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, &registry(), None, None, None, None, Some("max")).await;
+    let resolved = resolve_route_overrides(
+        &pool,
+        &registry(),
+        |_| true,
+        None,
+        None,
+        None,
+        sel(None, Some("max"), None),
+    )
+    .await;
     assert_eq!(
-        model.as_deref(),
-        Some("claude-opus-5@default"),
+        resolved.model.as_deref(),
+        Some("claude-opus-5"),
         "account model still applies"
     );
-    assert_eq!(effort.as_deref(), Some("max"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1612,20 +1660,20 @@ async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
         .unwrap();
     let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry,
+        |_| true,
         None,
         None,
         None,
-        Some("muse-glimmer:30b-mlx"),
-        None,
+        sel(Some("muse-glimmer:30b-mlx"), None, None),
     )
     .await;
 
-    assert_eq!(model.as_deref(), Some("muse-glimmer:30b-mlx"));
+    assert_eq!(resolved.model.as_deref(), Some("muse-glimmer:30b-mlx"));
     assert_eq!(
-        effort.as_deref(),
+        resolved.reasoning_effort.as_deref(),
         Some("high"),
         "a local model cannot run xhigh, so the turn must not record that it did"
     );
@@ -1642,19 +1690,19 @@ async fn a_coding_agent_effort_is_not_clamped_against_the_chat_registry() {
     let (pool, db_name) = setup_test_db().await;
     let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
 
-    let (model, effort) = resolve_route_overrides(
+    let resolved = resolve_route_overrides(
         &pool,
         &registry,
+        |_| true,
         Some(true),
         None,
         None,
-        None,
-        Some("xhigh"),
+        sel(None, Some("xhigh"), None),
     )
     .await;
 
-    assert_eq!(model, None);
-    assert_eq!(effort.as_deref(), Some("xhigh"));
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1765,4 +1813,39 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
         permission_supersede < question_supersede,
         "the question supersede belongs in the coding-agent-only block, beside the permission one"
     );
+}
+
+/// A provider the model has no route on is not stamped. The router would treat
+/// it as stale and fall through, so stamping it would record a backend the turn
+/// never reached. A provider the model does have passes through.
+#[tokio::test]
+async fn a_provider_the_model_cannot_use_is_not_stamped() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = registry_with("m", crate::llm::ProviderKind::Vertex);
+
+    let off_route = resolve_route_overrides(
+        &pool,
+        &registry,
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("m"), Some("high"), Some("anthropic")),
+    )
+    .await;
+    assert_eq!(off_route.provider, None);
+
+    let on_route = resolve_route_overrides(
+        &pool,
+        &registry,
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("m"), Some("high"), Some("vertex")),
+    )
+    .await;
+    assert_eq!(on_route.provider.as_deref(), Some("vertex"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }

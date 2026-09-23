@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, SystemEvent};
-use crate::engine::git_ops::git_cmd;
+use crate::engine::git_ops::{consume_harden_marker, consume_plan_marker, git_cmd};
 use crate::engine::thread_events::{
     EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
@@ -82,8 +82,8 @@ async fn changes_updated_payload(
     }
     // The gate the UI disables Apply on, and the one the bulk paths filter by.
     // A frame without it re-offers Apply on a thread that is still working.
-    if let Err(e) = crate::core::changes::enrich_thread_unsettled(pool, &mut pending).await {
-        log!("[Changes] enrich pending thread_unsettled: {}", e);
+    if let Err(e) = crate::core::changes::enrich_pending_state(pool, &mut pending).await {
+        log!("[Changes] enrich pending state: {}", e);
     }
     Some(SystemEvent::ChangesUpdated {
         total_pending: pending.len(),
@@ -270,9 +270,37 @@ impl LucidosEngine {
             change_id,
         ));
         if accepted {
+            self.clear_gate_markers_of_applied_change(change_id).await;
             self.post_apply_dev_refresh(thread_id, requires_restart, client_update)
                 .await;
         }
+    }
+
+    /// Clear the harden and plan markers of the branch a change landed from.
+    /// The next round of work on that branch must then plan and harden again.
+    ///
+    /// Here because every merge path emits `ChangeApplied` once, and the
+    /// branch outlives the apply: a thread keeps working on it, and a stale
+    /// harden marker still counts as hardened (ADR 0249). Gated on the
+    /// accepted emit, so a suppressed duplicate cannot wipe a marker recorded
+    /// for newer work. Every merge path applies a change it read or proposed,
+    /// so a row exists. One whose proposal never persisted names no branch.
+    async fn clear_gate_markers_of_applied_change(&self, change_id: Uuid) {
+        let change = match self.changes().get_by_id(change_id).await {
+            Ok(Some(change)) => change,
+            Ok(None) => return,
+            Err(e) => {
+                log!(
+                    "[Changes] marker clear for applied change {} skipped: {}",
+                    change_id,
+                    e
+                );
+                return;
+            }
+        };
+        let repo_root = std::path::Path::new(&change.repo_root);
+        consume_harden_marker(self.pool(), repo_root, &change.branch_name).await;
+        consume_plan_marker(self.pool(), repo_root, &change.branch_name).await;
     }
 
     /// Advance what dev serves after a change LANDED on main — the single
@@ -475,6 +503,9 @@ impl LucidosEngine {
                 "[Changes] MergeConflictDetected",
             )
             .await;
+        // The event opens the pairing that `resolving_conflict` reads, so the
+        // panel repaints the row as an apply in flight.
+        self.broadcast_changes_updated().await;
     }
 
     /// Emit `MergeConflictDetected` AND build the merge prompt to send to CC.

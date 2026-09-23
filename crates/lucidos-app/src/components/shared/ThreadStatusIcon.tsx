@@ -16,14 +16,16 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
  *  one dot rather than splitting into two, since the distinction between them
  *  is detail the waiting indicator carries.
  *
- *  Both outrank `changes`, and the Apply gate agrees with the dot: a parked
- *  thread wakes and may commit again, so `availableThreadActions` withholds
- *  Apply and Discard on the same two facts. `is_blocking`,
- *  `is_attention_needing` and `displaySection` still never see them, so a
- *  parked thread stays archivable when it has no change to resolve (ADR 0049).
- *  `VisualStatus` is the right home for the fact precisely because it is
- *  already a derived axis: `changes` and `question` are not `ThreadStatus`
- *  values either. */
+ *  The two causes rank differently against `changes`, because the Apply gate
+ *  treats them differently. A live event wait outranks it: the thread wakes on
+ *  its own branch, so `availableThreadActions` withholds Apply and Discard. A
+ *  running sub-thread ranks below it: the child writes its own worktree, so a
+ *  parent with a proposed change reads "Changes to review" and offers Apply
+ *  (ADR 0249). `is_blocking`, `is_attention_needing` and `displaySection` never
+ *  see either, so a parked thread stays archivable when it has no change to
+ *  resolve (ADR 0049). `VisualStatus` is the right home for the fact because
+ *  it is already a derived axis: `changes` and `question` are not
+ *  `ThreadStatus` values either. */
 export function resolveVisualStatus(
   status: ThreadStatus,
   hasActiveChildren: boolean,
@@ -44,11 +46,12 @@ export function resolveVisualStatus(
   // an interrupted thread with a change came back reading Running. See
   // `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
   if (status === 'paused') return 'paused';
-  // `waiting` outranks `changes`: the thread is not finished, so its change is
-  // not final and cannot be resolved yet. Reading it as "Changes to review"
-  // invited an Apply that would merge a branch still being worked on.
-  if (hasActiveChildren || hasLiveEventWaits) return 'waiting';
+  // A live event wait outranks `changes`: the thread is not finished, so its
+  // change is not final and cannot be resolved yet. Reading it as "Changes to
+  // review" invited an Apply that would merge a branch still being worked on.
+  if (hasLiveEventWaits) return 'waiting';
   if (codingAgentProposed) return 'changes';
+  if (hasActiveChildren) return 'waiting';
   return 'idle';
 }
 
@@ -76,8 +79,9 @@ const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   // One description for both causes, because one dot covers both (see
   // `resolveVisualStatus`). Naming only children would be a lie on a thread
   // that is watching for an event, and the per-wait detail is one tap away in
-  // the waiting indicator.
-  { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to. Any proposed change waits with it.' },
+  // the waiting indicator. A thread with a change and only children reads
+  // `changes` instead, so this dot never sits on an applicable change.
+  { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to. While it waits on an event, any proposed change waits with it.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
   { status: 'paused', label: 'Paused', desc: 'Your switch to a new version interrupted this turn. It resumes on its own, so there is nothing to do.' },

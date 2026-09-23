@@ -29,6 +29,7 @@ async fn seed_thread(bus: &EventBus, parent: Option<uuid::Uuid>) -> (Uuid, Uuid)
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: format!("please remember {BODY_MARKER}"),
                 user_image_hashes: vec![],
@@ -450,6 +451,7 @@ async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "work".into(),
             user_image_hashes: vec![],

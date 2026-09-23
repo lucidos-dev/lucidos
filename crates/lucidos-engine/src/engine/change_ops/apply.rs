@@ -820,7 +820,6 @@ impl LucidosEngine {
                                 &post_sha,
                                 &session.worktree_path,
                                 &repo_root,
-                                &change.branch_name,
                                 actor.clone(),
                             )
                             .await;

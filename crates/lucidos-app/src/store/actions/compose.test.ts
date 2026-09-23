@@ -27,7 +27,7 @@ import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, 
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
-import { patchComposeSelection, getComposeSelectionOverride, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { patchComposeSelection, getComposeSelectionOverride, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -2193,5 +2193,57 @@ describe('a compose write states the mode only when it changes', () => {
     // that is its business rather than this rule's.
     expect(composeModes()).not.toEqual([]);
     expect(composeModes().every((m) => m === 'claude_code')).toBe(true);
+  });
+});
+
+/** A draft's backend pick binds to the thread its send spawns, and only that
+ *  thread. The model's row remembers the pick too, but that is the picker's
+ *  write, not the draft's: a draft that picked nothing sends nothing. */
+describe('a compose backend pick is per-draft', () => {
+  let chatBodies: Array<{ provider?: string; model?: string }>;
+
+  beforeEach(() => {
+    chatBodies = [];
+    globalThis.fetch = vi.fn((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (typeof url === 'string' && url.endsWith('/chat/stream') && method === 'POST') {
+        chatBodies.push(JSON.parse(init!.body as string));
+        return Promise.resolve(new Response(JSON.stringify({ event_id: 'evt' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    }) as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  function composingChat(id: string, text: string): ThreadState {
+    return makeThread({ id, state: 'composing', channel: 'chat', composeText: text, composeMode: 'lucidos' });
+  }
+
+  it("sends this draft's backend, and never another draft's", async () => {
+    threadMap.value = new Map<string, ThreadState>()
+      .set('d-A', composingChat('d-A', 'first'))
+      .set('d-B', composingChat('d-B', 'second'));
+    patchComposeSelection('d-A', { model: 'claude-opus-5-5', provider: 'anthropic' });
+
+    expect(resolveProvider('d-B')).toBeNull();
+
+    await sendCompose('d-A', { useCodingAgent: false });
+    await sendCompose('d-B', { useCodingAgent: false });
+
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[0]).toMatchObject({ model: 'claude-opus-5-5', provider: 'anthropic' });
+    expect(chatBodies[1].provider).toBeUndefined();
   });
 });

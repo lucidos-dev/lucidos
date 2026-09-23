@@ -701,6 +701,31 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   arm is exercised on real data by the test suite, which points the shipped list
   at a stand-in mirror and asserts it is refused.
 
+### Recorded release-tag bases for v0.39.2 and v0.39.3
+
+- **Added:** 2026-09-23
+- **Lives in:** `RELEASE_TAG_CUT_OVERRIDES` in `scripts/lib/release_main_sync.sh`
+  (in `RELEASE_TREE_EXCLUDE_PATHS`, so it never reaches the mirror). Read by
+  `release_prev_release_base`, which Phase A and `--prep-preflight` share.
+- **Impermanent because:** Both tags predate ADR 0250. Main moved before
+  Phase B, so the bump was cherry-picked onto the moved main and the tag landed
+  on that cherry-pick. Each tag's commit therefore covers work its release never
+  shipped. The list records the commit each release was cut from, so the next
+  release counts from there. It repairs two existing tags. Since ADR 0250 a
+  moved main is merged, so no new entry should ever be needed.
+- **Removal / resolution condition:** Drop the array, and the lookup in
+  `release_prev_release_base`, once the newest local `v*` tag is newer than
+  v0.39.3. Base selection only ever reads the newest tag, so neither entry can
+  be read again. Verify with
+  `git tag --list 'v*' --sort=-v:refname | head -1`. Keep
+  `release_commits_since_release` itself: it is where every consumer counts new
+  work.
+- **Status:** `active`
+- **Not a softening of any check.** Every run re-verifies each entry: a full
+  sha, and a strict ancestor of its tag's commit. A stale entry fails the
+  release or the preflight by name. `release_main_sync_test.sh` verifies the
+  shipped entries against the real local tags.
+
 ### One-time mirror history rebuild script
 
 - **Added:** 2026-08-03 (re-armed and wired to a gate 2026-08-04)
@@ -1978,6 +2003,40 @@ condition; fix the condition rather than acting on it.
   suppression branch + the `LeakedAsText` re-ask cause.
 - **Status:** active
 - **Investigation:** `model-tool-call-as-text`
+
+### A question card with no answer before it
+
+- **Added:** 2026-09-23, widened the same day to coding agents. Plan:
+  `docs/plans/2026-09-23-a-card-never-replaces-the-answer.md`.
+- **Lives in:** `crates/lucidos-engine/src/engine/question_card_gate.rs`
+  (rule, query, refusal text, tests in the sibling `_tests.rs`). The chat
+  loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
+  `POST /api/v1/internal/ask-user-question`, which returns `refusal`. The CLI
+  hook turns that into a denied tool call (`ask_user_question_hook.rs`), and
+  the Codex MCP tool into an error result (`mcp_permission_server.rs`).
+- **Impermanent because (tolerates):** an agent raises a question card with
+  no prose, so the user gets a menu instead of an answer. Two shapes were
+  observed:
+  - **Chat, after tool work.** Asked what the next patch would contain, the
+    agent ran `git log`, then asked "How do you want to continue?". The answer
+    lived only in option text.
+  - **Claude Code, after a typed reply.** The user typed a question into a
+    plan card and got "With that answered: approve the plan?", with no answer
+    and no tool call in between.
+
+  `ASK_USER_QUESTION_RULE` already said "answer first", so guidance alone
+  failed. The gate refuses such a card once per user input.
+- **Removal / resolution condition:** in a per-workspace audit, count question
+  cards raised after a typed reply or after tool work since the last input.
+  That is the denominator. Count refusals among them: tool-result rows
+  (`ToolResult` or `CodingAgentToolResult`) containing "Question card not
+  shown.". When no routed model draws a refusal, drop the module, its two call
+  sites and the `refusal` field.
+- **Superseded:** `SilentWork`, the first chat-only version, lived in
+  `agentic_loop/helpers.rs` for one day. Its refusals are failed `ToolResult`
+  rows starting "Not shown to the user", so an audit covering that window
+  counts those too.
+- **Status:** active
 
 ### HTML entities in tool-argument text (`Machine &amp; Tooling Health`)
 

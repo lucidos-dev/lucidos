@@ -14,7 +14,7 @@ import {
   applyFollowSeed,
   type FollowResumeFrom,
 } from '../components/chat/scrollState';
-import { ANCHOR_ATTR, anchorTargetTop, readScrollAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorTargetTop, anchorTurnIsClamped, readScrollAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
 import { watchUserAction } from '../utils/userAction';
 
@@ -206,12 +206,6 @@ const RESTORE_DEADLINE_MS = 3000;
  *  A ceiling all the same, so a container that grows forever cannot hold the
  *  observers and suppress every save for the life of the thread. */
 const ANCHOR_RESTORE_CEILING_MS = 20_000;
-/** How far past the container's maximum a RESOLVED anchor may sit and still
- *  land. One pixel is rounding, not a transcript too short. `relTop` and both
- *  heights are whole numbers read off a fractional layout, so a bottom-parked
- *  reader can measure just past the reported edge. More than that is content
- *  below the anchor still rendering, which the wait is for. */
-const ANCHOR_ROUNDING_SLACK_PX = 1;
 /** Grace on top of `EVENT_RESOLVE_DEADLINE_MS` before a stood-down open decides
  *  the deep-link is dead and positions the thread itself. Covers a release
  *  landing a beat after its own deadline. Short enough that a dead link is not
@@ -490,20 +484,25 @@ export function attachScrollMemory(
    *  where this content cannot reach. Clamping it invents a position: the live
    *  edge, which nothing may scroll to on its own (ADR 0064).
    *
-   *  A RESOLVED anchor is the opposite case, and `final` is where it lands. The
-   *  turn was found and measured, and it is taller than the part scrolled past,
-   *  so the nearest reachable offset still shows it. Refusing gives the top of
-   *  the window, which is further from the reader's turn than the clamp is. See
-   *  ADR 0152 (docs/adr/). */
-  const offsetFor = (record: SavedScroll, final = false): number | null => {
-    const top = record.kind === 'anchor' ? anchorTargetTop(el, record)
+   *  A RESOLVED anchor is the opposite case, and lands at once. The turn was
+   *  found and measured, so the nearest reachable offset still shows it.
+   *
+   *  Waiting cannot bring it closer. The window renders from its edge to the
+   *  newest turn, so everything below a rendered turn is already drawn. A
+   *  shortfall means that content got shorter since the save. See ADR 0152
+   *  (docs/adr/).
+   *
+   *  A turn drawn with its head CLAMPED is not resolved yet. Its rows are still
+   *  arriving, and landing on it would settle the restore and stop the walk. */
+  const offsetFor = (record: SavedScroll): number | null => {
+    const top = record.kind === 'anchor'
+      ? (anchorTurnIsClamped(el, record) ? null : anchorTargetTop(el, record))
       : record.kind === 'offset' ? record.top
       : null;
     if (top === null) return null;
     if (isFullyRestorable(top, el.scrollHeight, el.clientHeight)) return top;
     if (record.kind !== 'anchor') return null;
-    const max = Math.max(0, el.scrollHeight - el.clientHeight);
-    return final || top - max <= ANCHOR_ROUNDING_SLACK_PX ? max : null;
+    return Math.max(0, el.scrollHeight - el.clientHeight);
   };
 
   /** Put the reader where the record's PLACE says, whatever request rides
@@ -530,12 +529,11 @@ export function attachScrollMemory(
     tryRestore();
   };
 
-  /** `final` says the restore window has closed, so a resolved anchor takes the
-   *  nearest reachable offset rather than nothing, and no further round is
+  /** `final` says the restore window has closed, so no further round is
    *  armed. */
   const tryRestore = (final = false) => {
     if (!restoring || saved === null || saved.kind === 'live-edge') return;
-    const top = offsetFor(saved, final);
+    const top = offsetFor(saved);
     if (top === null) {
       if (!final) keepWaitingForAnchor();
       return;
@@ -711,10 +709,8 @@ export function attachScrollMemory(
         // The arm's save is debounced by `SAVE_DEBOUNCE_MS`, and this timer is
         // `EVENT_RESOLVE_DEADLINE_MS` plus its slack. The first is two orders of
         // magnitude shorter, so the arm is committed by the time this reads.
-        // `final`, because the rescue writes once and stops: there is no later
-        // round in which a resolved anchor could become exactly reachable.
         const recorded = readSaved();
-        const rescueTop = recorded === null ? null : offsetFor(recorded, true);
+        const rescueTop = recorded === null ? null : offsetFor(recorded);
         if (recorded?.kind === 'live-edge') {
           resumeFollowingBottom(el);
         } else if (rescueTop !== null) {

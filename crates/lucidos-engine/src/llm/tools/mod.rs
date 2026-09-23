@@ -39,7 +39,7 @@
 //! `env_vars` (list/set/delete; `set_environment_variable` is the back-compat
 //! alias to `set`), `threads` (list/count; the run_thread / run_coding_agent /
 //! follow_up_child_thread family stays standalone),
-//! `manage_models` (list/add/enable/disable/remove; the `models` domain),
+//! `manage_models` (list/add/enable/disable/update/remove; the `models` domain),
 //! `manage_repositories` (add/list/remove; the `repositories` domain). Their
 //! retired flat tool names (`read_notifications`, `create_trigger`,
 //! `setup_mcp_server`, `install_plugin`, `emit_event`, `list_changes`,

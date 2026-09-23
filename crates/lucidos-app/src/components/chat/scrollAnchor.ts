@@ -28,6 +28,11 @@
  *  below then changes with nothing else moving. */
 export const ANCHOR_ATTR = 'data-event-id';
 
+/** Marks a turn the render window draws with its leading rows clamped off.
+ *  Its top edge is real, but the content under it is short until the window
+ *  walks the rest in. `ChatExchange` stamps it. */
+export const HEAD_CLAMPED_ATTR = 'data-head-clamped';
+
 /** A reading position expressed against a turn.
  *
  *  `relTop` is that turn's top, measured from the container's top. It is at or
@@ -125,10 +130,21 @@ function namedAt(kids: HTMLCollection, i: number, relTop: number | null): Scroll
  *  taken. Clamped at zero on the way out, which is where a positive `relTop`
  *  taken over the first turn lands. */
 export function anchorTargetTop(el: HTMLElement, anchor: ScrollAnchor): number | null {
-  if (typeof el.querySelector !== 'function' || typeof el.getBoundingClientRect !== 'function') return null;
-  const target = el.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(anchor.eventId)}"]`);
+  if (typeof el.getBoundingClientRect !== 'function') return null;
+  const target = anchorTurn(el, anchor);
   if (!target || typeof target.getBoundingClientRect !== 'function') return null;
   const rect = target.getBoundingClientRect();
   if (rect.height <= 0) return null;
   return Math.max(0, Math.round(el.scrollTop + (rect.top - el.getBoundingClientRect().top) - anchor.relTop));
+}
+
+/** Is the turn `anchor` names drawn with its head clamped off? False for a
+ *  turn that is whole, and for one that is not rendered at all. */
+export function anchorTurnIsClamped(el: HTMLElement, anchor: ScrollAnchor): boolean {
+  return anchorTurn(el, anchor)?.hasAttribute?.(HEAD_CLAMPED_ATTR) === true;
+}
+
+function anchorTurn(el: HTMLElement, anchor: ScrollAnchor): HTMLElement | null {
+  if (typeof el.querySelector !== 'function') return null;
+  return el.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(anchor.eventId)}"]`);
 }

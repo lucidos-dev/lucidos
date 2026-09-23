@@ -170,6 +170,8 @@ pub(super) struct CodexConfig {
     pub(super) sandbox_writable_roots: Vec<PathBuf>,
     /// Pre-built env (Lucidos contract) applied to every spawned child.
     pub(super) env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Vars the contract removes from every child, so it cannot inherit them.
+    pub(super) env_removed: Vec<std::ffi::OsString>,
 }
 
 /// Resolve the `codex` executable: the user-configured override (already
@@ -241,14 +243,18 @@ impl AgentRuntime for CodexRuntime {
             sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
 
         // Bake the Lucidos env contract once; each per-turn child re-applies it.
-        let env = {
+        let (env, env_removed) = {
             let mut probe = tokio::process::Command::new("true");
             apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
-            probe
-                .as_std()
-                .get_envs()
-                .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
-                .collect()
+            let mut env = Vec::new();
+            let mut env_removed = Vec::new();
+            for (k, v) in probe.as_std().get_envs() {
+                match v {
+                    Some(v) => env.push((k.to_owned(), v.to_owned())),
+                    None => env_removed.push(k.to_owned()),
+                }
+            }
+            (env, env_removed)
         };
 
         // A user-configured `codex` path must point at a real executable —
@@ -270,6 +276,7 @@ impl AgentRuntime for CodexRuntime {
             reasoning_effort: args.reasoning_effort.map(str::to_string),
             sandbox_writable_roots,
             env,
+            env_removed,
         };
 
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -534,6 +541,9 @@ fn build_codex_turn_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for k in &config.env_removed {
+        cmd.env_remove(k);
+    }
     for (k, v) in &config.env {
         cmd.env(k, v);
     }

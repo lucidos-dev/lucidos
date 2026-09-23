@@ -110,7 +110,7 @@ describe('reasoning pickers go through the model-to-tiers module', () => {
     // The hook offers neither, and the two scans above stop a surface deriving
     // them. So the pair cannot be split back into two controls.
     const hook = readFileSync(resolve(SRC, 'hooks/useModelSelection.ts'), 'utf8');
-    expect(hook).toMatch(/\bpick: \(encoded: string\)/);
+    expect(hook).toMatch(/\bpick: \(encoded: string, provider\?: string\)/);
     expect(hook).not.toMatch(/\bpickEffort\b|\bpickModel\b|\beffortOptions\b|\bmodelOptions\b/);
   });
 

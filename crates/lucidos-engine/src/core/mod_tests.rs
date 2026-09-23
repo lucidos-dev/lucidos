@@ -984,8 +984,8 @@ fn both_tool_call_emit_sites_redact_before_describing() {
             "describe_cc_tool(&name, &input)",
         ),
         (
-            "agentic_loop/run.rs",
-            include_str!("../engine/agentic_loop/run.rs"),
+            "agentic_loop/helpers.rs (emit_tool_called)",
+            include_str!("../engine/agentic_loop/helpers.rs"),
             "redact_postgres_secrets_in_json(&mut redacted_args)",
             "describe_tool(&tool_call.name, &redacted_args)",
         ),

@@ -18,25 +18,69 @@ pub const SOURCE_BUILTIN: &str = "builtin";
 /// `source = 'user'` rows are added in Settings: fully editable and deletable.
 pub const SOURCE_USER: &str = "user";
 
+/// One way a model can be served: a backend, the id to send it, and that
+/// backend's context window.
+///
+/// A row carries an ordered list of these, which is what lets one model row be
+/// served by whichever provider the workspace has credentials for. Before it,
+/// `provider` named THE backend and the same model on two backends needed two
+/// rows, so it appeared in the picker twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    /// Backend that serves the model on this route:
+    /// "vertex" | "anthropic" | "openai" | "openrouter" | "xai" |
+    /// "opencode-free" | "local".
+    pub provider: String,
+    /// The id sent on the wire. `None` means the row's own id, which is the
+    /// common case: a first-party Claude id is byte-identical on Vertex and on
+    /// the direct Anthropic API. OpenRouter is the case that needs one, since
+    /// it prefixes (`anthropic/claude-opus-5-5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// This backend's context window in tokens. `None` = not declared, so
+    /// `llm::model_registry::context_window_from_prefix` reads THIS route's
+    /// wire id. That is what makes an OpenRouter route carrying no `[1m]` land
+    /// on 200k without declaring anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
+}
+
+impl Route {
+    /// A route on `provider` sending the row's own id, with no declared window.
+    pub fn bare(provider: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            id: None,
+            context_window: None,
+        }
+    }
+
+    /// The id this route puts on the wire: its own if it declares one, else the
+    /// row's. Every id-shape rule reads THIS, never the row id, or a route with
+    /// a different spelling would be judged by a string it never sends.
+    pub fn wire_id<'a>(&'a self, row_id: &'a str) -> &'a str {
+        self.id.as_deref().unwrap_or(row_id)
+    }
+}
+
 /// A chat model in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
-    /// Value sent in the API request (e.g. "claude-fable-5",
-    /// "claude-opus-4-8@default[1m]"). Primary key.
+    /// Identity and primary key (e.g. "claude-fable-5", "claude-opus-5[1m]").
+    /// The default wire id too, which a [`Route`] may override.
     pub id: String,
     pub label: String,
-    /// Backend that serves the model:
-    /// "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "local".
-    pub provider: String,
+    /// Backends that can serve this model, in priority order. Never empty, and
+    /// never naming one provider twice (enforced by `model_routes_valid`).
+    pub routes: Vec<Route>,
+    /// The provider last picked for this model, or `None` for never picked.
+    /// Honoured when its route is configured, and refused rather than
+    /// substituted when it is not.
+    pub preferred_provider: Option<String>,
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
     pub source: String,
     pub enabled: bool,
-    /// Declared context window in tokens. `None` = not declared, so
-    /// `llm::model_registry::context_window_from_prefix` decides from the id shape.
-    /// Only worth setting for ids the prefix map gets wrong — every OpenRouter /
-    /// xAI / Gemini / local model, which otherwise takes the 200k fallback.
-    pub context_window: Option<i32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -44,34 +88,90 @@ impl Model {
     pub fn is_builtin(&self) -> bool {
         self.source == SOURCE_BUILTIN
     }
+
+    /// The row's first route's provider, which is what serves the model when
+    /// nothing has been picked. Named on the `Model{Created,Updated}` events so
+    /// the audit timeline still says which backend a model landed on.
+    pub fn primary_provider(&self) -> &str {
+        self.routes.first().map_or("", |r| r.provider.as_str())
+    }
 }
 
-/// Raw DB row: (id, label, provider, sort_order, source, enabled,
-/// context_window, created_at).
+/// The editable shape of a model row, shared by the create and update paths.
+///
+/// `enabled` is deliberately absent: create always lands enabled, and update
+/// takes it as its own argument. A field nobody reads on one of the two paths
+/// is a state that looks settable and is not.
+#[derive(Debug, Clone)]
+pub struct ModelFields {
+    pub label: String,
+    pub routes: Vec<Route>,
+    pub preferred_provider: Option<String>,
+    pub sort_order: i32,
+}
+
+/// Check a route list against the rules the DB CHECK also enforces, and say
+/// what is wrong in a sentence rather than a constraint-violation string.
+///
+/// An empty list makes the model unreachable with nothing saying so. A
+/// provider named twice makes "the first configured route" ambiguous. A blank
+/// id or a non-positive window would send nothing or budget nothing. Provider
+/// names parse strictly, through the one list `ProviderKind` holds.
+pub fn validate_routes(routes: &[Route]) -> Result<(), String> {
+    if routes.is_empty() {
+        return Err("A model needs at least one route".to_string());
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(routes.len());
+    for route in routes {
+        let p = route.provider.as_str();
+        if crate::llm::ProviderKind::from_name(p).is_none() {
+            return Err(crate::llm::model_registry::unknown_provider_message(p));
+        }
+        if seen.contains(&p) {
+            return Err(format!("Provider '{p}' appears twice in routes"));
+        }
+        if route.id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+            return Err(format!(
+                "The '{p}' route's id is blank (omit it to send the model's own id)"
+            ));
+        }
+        if route.context_window.is_some_and(|w| w <= 0) {
+            return Err(format!(
+                "The '{p}' route's context_window must be a positive number of tokens \
+                 (omit it to infer from the id)"
+            ));
+        }
+        seen.push(p);
+    }
+    Ok(())
+}
+
+/// Raw DB row: (id, label, routes, preferred_provider, sort_order, source,
+/// enabled, created_at).
 type ModelRow = (
     String,
     String,
-    String,
+    sqlx::types::Json<Vec<Route>>,
+    Option<String>,
     i32,
     String,
     bool,
-    Option<i32>,
     chrono::DateTime<chrono::Utc>,
 );
 
 const SELECT_COLS: &str =
-    "id, label, provider, sort_order, source, enabled, context_window, created_at";
+    "id, label, routes, preferred_provider, sort_order, source, enabled, created_at";
 
 fn row_to_model(row: ModelRow) -> Model {
-    let (id, label, provider, sort_order, source, enabled, context_window, created_at) = row;
+    let (id, label, routes, preferred_provider, sort_order, source, enabled, created_at) = row;
     Model {
         id,
         label,
-        provider,
+        routes: routes.0,
+        preferred_provider,
         sort_order,
         source,
         enabled,
-        context_window,
         created_at,
     }
 }
@@ -117,50 +217,45 @@ impl ModelStore {
     async fn insert_row(
         pool: &PgPool,
         id: &str,
-        label: &str,
-        provider: &str,
-        sort_order: i32,
-        context_window: Option<i32>,
+        fields: &ModelFields,
     ) -> Result<Model, sqlx::Error> {
         let row: ModelRow = sqlx::query_as(&format!(
-            "INSERT INTO models (id, label, provider, sort_order, source, enabled, context_window) \
-             VALUES ($1, $2, $3, $4, '{SOURCE_USER}', TRUE, $5) \
+            "INSERT INTO models \
+               (id, label, routes, preferred_provider, sort_order, source, enabled) \
+             VALUES ($1, $2, $3, $4, $5, '{SOURCE_USER}', TRUE) \
              RETURNING {SELECT_COLS}"
         ))
         .bind(id)
-        .bind(label)
-        .bind(provider)
-        .bind(sort_order)
-        .bind(context_window)
+        .bind(&fields.label)
+        .bind(sqlx::types::Json(&fields.routes))
+        .bind(&fields.preferred_provider)
+        .bind(fields.sort_order)
         .fetch_one(pool)
         .await?;
         Ok(row_to_model(row))
     }
 
     /// Update the editable fields of a user model (never `source` or `id`).
-    /// `context_window` is written as given — `None` clears the declaration and
-    /// hands the model back to the prefix-map fallback, so the caller must
-    /// resolve "field absent from the request" to the existing value before
-    /// calling. Returns whether a row existed.
+    /// Every field is written as given, so the caller must resolve "absent from
+    /// the request" to the existing value first. A `None` `preferred_provider`
+    /// clears the pick and hands the model back to its first configured route.
+    /// Returns whether a row existed.
     async fn update_row(
         pool: &PgPool,
         id: &str,
-        label: &str,
-        provider: &str,
-        sort_order: i32,
+        fields: &ModelFields,
         enabled: bool,
-        context_window: Option<i32>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE models SET label = $2, provider = $3, sort_order = $4, enabled = $5, \
-             context_window = $6, updated_at = NOW() WHERE id = $1",
+            "UPDATE models SET label = $2, routes = $3, preferred_provider = $4, \
+             sort_order = $5, enabled = $6, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
-        .bind(label)
-        .bind(provider)
-        .bind(sort_order)
+        .bind(&fields.label)
+        .bind(sqlx::types::Json(&fields.routes))
+        .bind(&fields.preferred_provider)
+        .bind(fields.sort_order)
         .bind(enabled)
-        .bind(context_window)
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -204,24 +299,20 @@ impl ModelStore {
     /// Errors (unique violation) if `id` already exists; the caller maps that to
     /// a 4xx so the user can pick another id. Nothing is announced on that
     /// error, because nothing was written.
-    #[allow(clippy::too_many_arguments)] // one arg per model column, plus the bus and actor
     pub async fn create(
         pool: &PgPool,
         event_bus: &EventBus,
         id: &str,
-        label: &str,
-        provider: &str,
-        sort_order: i32,
-        context_window: Option<i32>,
+        fields: &ModelFields,
         actor: Option<MessageOrigin>,
     ) -> Result<Model, sqlx::Error> {
-        let model = Self::insert_row(pool, id, label, provider, sort_order, context_window).await?;
+        let model = Self::insert_row(pool, id, fields).await?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::ModelCreated {
                     id: model.id.clone(),
                     label: model.label.clone(),
-                    provider: model.provider.clone(),
+                    provider: model.primary_provider().to_string(),
                     actor,
                 }),
                 "[Models] ModelCreated",
@@ -232,28 +323,15 @@ impl ModelStore {
 
     /// Edit a user model and announce it. Announces only when a row existed, so
     /// an edit aimed at a missing id stays silent.
-    #[allow(clippy::too_many_arguments)] // one arg per editable column, plus the bus and actor
     pub async fn update(
         pool: &PgPool,
         event_bus: &EventBus,
         id: &str,
-        label: &str,
-        provider: &str,
-        sort_order: i32,
+        fields: &ModelFields,
         enabled: bool,
-        context_window: Option<i32>,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
-        let updated = Self::update_row(
-            pool,
-            id,
-            label,
-            provider,
-            sort_order,
-            enabled,
-            context_window,
-        )
-        .await?;
+        let updated = Self::update_row(pool, id, fields, enabled).await?;
         if updated {
             Self::announce_update(event_bus, id, actor).await;
         }
@@ -326,6 +404,40 @@ mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
+    /// Whether `provider` can serve this model.
+    fn routes_to(m: &Model, provider: &str) -> bool {
+        m.routes.iter().any(|r| r.provider == provider)
+    }
+
+    /// The window declared on this model's `provider` route, or `None` for an
+    /// undeclared one or no such route.
+    fn window_on(m: &Model, provider: &str) -> Option<i32> {
+        m.routes
+            .iter()
+            .find(|r| r.provider == provider)
+            .and_then(|r| r.context_window)
+    }
+
+    /// The window declared on the row's FIRST route, which is where the
+    /// migration put the retired `context_window` column.
+    fn declared_window(m: &Model) -> Option<i32> {
+        m.routes.first().and_then(|r| r.context_window)
+    }
+
+    /// A single-route field set, which is what nearly every caller builds.
+    fn fields(label: &str, provider: &str, sort_order: i32, window: Option<i32>) -> ModelFields {
+        ModelFields {
+            label: label.to_string(),
+            routes: vec![Route {
+                provider: provider.to_string(),
+                id: None,
+                context_window: window,
+            }],
+            preferred_provider: None,
+            sort_order,
+        }
+    }
+
     #[tokio::test]
     async fn migration_seeds_builtins_including_fable_5() {
         let (pool, db_name) = setup_test_db().await;
@@ -333,12 +445,12 @@ mod tests {
         assert!(
             models
                 .iter()
-                .any(|m| m.id == "claude-fable-5" && m.provider == "anthropic" && m.is_builtin()),
+                .any(|m| m.id == "claude-fable-5" && routes_to(m, "anthropic") && m.is_builtin()),
             "Fable 5 builtin must be seeded on the anthropic provider"
         );
         assert!(
             models.iter().any(|m| m.id == "claude-fable-5-1"
-                && m.provider == "anthropic"
+                && routes_to(m, "anthropic")
                 && m.is_builtin()
                 && m.enabled),
             "Fable 5.1 builtin must be seeded on the anthropic provider, enabled"
@@ -346,26 +458,26 @@ mod tests {
         assert!(
             models
                 .iter()
-                .any(|m| m.id == "claude-opus-4-8@default" && m.provider == "vertex"),
+                .any(|m| m.id == "claude-opus-4-8" && routes_to(m, "vertex")),
             "existing Vertex builtins must be seeded"
         );
         assert!(
             models.iter().any(|m| m.id == "claude-opus-5-5"
-                && m.provider == "vertex"
+                && routes_to(m, "vertex")
                 && m.is_builtin()
                 && m.enabled),
             "Opus 5.5 builtin must be seeded on the vertex provider, enabled"
         );
         assert!(
-            models.iter().any(|m| m.id == "claude-opus-5@default"
-                && m.provider == "vertex"
+            models.iter().any(|m| m.id == "claude-opus-5"
+                && routes_to(m, "vertex")
                 && m.is_builtin()
                 && m.enabled),
             "Opus 5 builtin must be seeded on the vertex provider, enabled"
         );
         assert!(
             models.iter().any(|m| m.id == "claude-sonnet-5"
-                && m.provider == "vertex"
+                && routes_to(m, "vertex")
                 && m.is_builtin()
                 && m.enabled),
             "Sonnet 5 builtin must be seeded on the vertex provider, enabled"
@@ -391,17 +503,14 @@ mod tests {
             .iter()
             .position(|m| m.id == "claude-opus-5-5")
             .unwrap();
-        let opus5 = models
-            .iter()
-            .position(|m| m.id == "claude-opus-5@default")
-            .unwrap();
+        let opus5 = models.iter().position(|m| m.id == "claude-opus-5").unwrap();
         let sonnet5 = models
             .iter()
             .position(|m| m.id == "claude-sonnet-5")
             .unwrap();
         let opus = models
             .iter()
-            .position(|m| m.id == "claude-opus-4-8@default")
+            .position(|m| m.id == "claude-opus-4-8")
             .unwrap();
         assert!(
             fable51 < fable
@@ -422,7 +531,7 @@ mod tests {
             .await
             .unwrap()
             .expect("GLM 5.2 builtin must be seeded");
-        assert_eq!(m.provider, "openrouter");
+        assert!(routes_to(&m, "openrouter"));
         assert_eq!(m.label, "GLM 5.2");
         assert!(m.is_builtin(), "GLM 5.2 must be a builtin (disable-only)");
         assert!(m.enabled, "GLM 5.2 builtin is enabled by default");
@@ -451,11 +560,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must be seeded"));
-            assert_eq!(m.provider, "xai", "{id}");
+            assert!(routes_to(&m, "xai"), "{id}");
             assert_eq!(m.label, label, "{id}");
             assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
             assert_eq!(m.enabled, enabled, "{id}");
-            assert_eq!(m.context_window, Some(window), "{id}");
+            assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
         // The OpenRouter route for Grok is a different id on a different
@@ -502,11 +611,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must be seeded"));
-            assert_eq!(m.provider, "opencode-free", "{id}");
+            assert!(routes_to(&m, "opencode-free"), "{id}");
             assert_eq!(m.label, label, "{id}");
             assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
             assert!(m.enabled, "{id} is enabled by default");
-            assert_eq!(m.context_window, Some(window), "{id}");
+            assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
         // The relay serves big-pickle only to the OpenCode CLI's own
@@ -532,8 +641,8 @@ mod tests {
     async fn migration_switches_off_the_prior_generation_of_every_family() {
         let (pool, db_name) = setup_test_db().await;
         for id in [
-            "claude-opus-4-8@default",
-            "claude-opus-4-8@default[1m]",
+            "claude-opus-4-8",
+            "claude-opus-4-8[1m]",
             "claude-opus-4-7",
             "claude-opus-4-7[1m]",
             "claude-sonnet-4-6",
@@ -559,7 +668,7 @@ mod tests {
             "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5-5",
-            "claude-opus-5@default",
+            "claude-opus-5",
             "claude-sonnet-5",
             "gpt-6-astra",
             "gpt-5.6-sol",
@@ -590,10 +699,7 @@ mod tests {
             &pool,
             &bus,
             "my-model",
-            "My Model",
-            "anthropic",
-            99,
-            None,
+            &fields("My Model", "anthropic", 99, None),
             None,
         )
         .await
@@ -603,13 +709,18 @@ mod tests {
         assert!(!created.is_builtin());
 
         assert!(ModelStore::update(
-            &pool, &bus, "my-model", "Renamed", "vertex", 5, false, None, None
+            &pool,
+            &bus,
+            "my-model",
+            &fields("Renamed", "vertex", 5, None),
+            false,
+            None
         )
         .await
         .unwrap());
         let fetched = ModelStore::get(&pool, "my-model").await.unwrap().unwrap();
         assert_eq!(fetched.label, "Renamed");
-        assert_eq!(fetched.provider, "vertex");
+        assert!(routes_to(&fetched, "vertex"));
         assert!(!fetched.enabled);
         // source is immutable through update
         assert_eq!(fetched.source, SOURCE_USER);
@@ -639,14 +750,21 @@ mod tests {
                 .unwrap()
         }
 
-        ModelStore::create(&pool, &bus, "m", "M", "anthropic", 10, None, None)
+        ModelStore::create(&pool, &bus, "m", &fields("M", "anthropic", 10, None), None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "ModelCreated").await, 1);
 
-        ModelStore::update(&pool, &bus, "m", "M2", "anthropic", 10, true, None, None)
-            .await
-            .unwrap();
+        ModelStore::update(
+            &pool,
+            &bus,
+            "m",
+            &fields("M2", "anthropic", 10, None),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(emitted(&pool, "ModelUpdated").await, 1);
 
         ModelStore::set_enabled(&pool, &bus, "m", false, None)
@@ -707,84 +825,71 @@ mod tests {
             &pool,
             &bus,
             "ctx-model",
-            "Ctx",
-            "openrouter",
-            99,
-            None,
+            &fields("Ctx", "openrouter", 99, None),
             None,
         )
         .await
         .unwrap();
-        assert_eq!(created.context_window, None);
+        assert_eq!(declared_window(&created), None);
 
         // Declared on create.
         let declared = ModelStore::create(
             &pool,
             &bus,
             "moonshotai/kimi-k3",
-            "Kimi K3",
-            "openrouter",
-            100,
-            Some(1_048_576),
+            &fields("Kimi K3", "openrouter", 100, Some(1_048_576)),
             None,
         )
         .await
         .unwrap();
-        assert_eq!(declared.context_window, Some(1_048_576));
+        assert_eq!(declared_window(&declared), Some(1_048_576));
         // …and survives a re-read, not just the RETURNING row.
         let reread = ModelStore::get(&pool, "moonshotai/kimi-k3")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reread.context_window, Some(1_048_576));
+        assert_eq!(declared_window(&reread), Some(1_048_576));
 
         // Update sets it.
         assert!(ModelStore::update(
             &pool,
             &bus,
             "ctx-model",
-            "Ctx",
-            "openrouter",
-            99,
+            &fields("Ctx", "openrouter", 99, Some(262_144)),
             true,
-            Some(262_144),
             None
         )
         .await
         .unwrap());
         let fetched = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
-        assert_eq!(fetched.context_window, Some(262_144));
+        assert_eq!(declared_window(&fetched), Some(262_144));
 
         // …and `None` clears it back to the fallback.
         assert!(ModelStore::update(
             &pool,
             &bus,
             "ctx-model",
-            "Ctx",
-            "openrouter",
-            99,
+            &fields("Ctx", "openrouter", 99, None),
             true,
-            None,
             None
         )
         .await
         .unwrap());
         let cleared = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
-        assert_eq!(cleared.context_window, None);
+        assert_eq!(declared_window(&cleared), None);
 
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
-    /// Builtins declare the window of the request Lucidos actually makes — which
+    /// Builtins declare the window of the request Lucidos actually makes, which
     /// is not always the model's theoretical maximum.
     ///
-    /// The distinction is load-bearing for Claude. Current Claude models
-    /// advertise 1M, but Lucidos only requests 1M mode for its own `[1m]` id
-    /// suffix (`parse_context_suffix` → `is_1m` → the `context-1m-2025-08-07`
-    /// beta in `build_claude_request`). A bare id sends no such beta, so its
-    /// real budget is the 200k the prefix map already infers — declaring 1M
-    /// there would let the packer build a prompt the API rejects.
+    /// The distinction is load-bearing for Claude. Lucidos requests 1M mode for
+    /// its own `[1m]` id suffix (the 1M-context beta in `build_claude_request`).
+    /// A bare id sends no beta, so most bare rows run at the 200k the prefix
+    /// map infers. The exception is a family whose DEFAULT window is 1M (Opus
+    /// 5, Opus 5.5, Fable 5.x): its bare request is 1M too.
     #[tokio::test]
     async fn migration_declares_context_window_on_verified_builtins() {
         let (pool, db_name) = setup_test_db().await;
@@ -799,12 +904,18 @@ mod tests {
             ("claude-fable-5-1[1m]", 1_000_000),
             ("claude-fable-5[1m]", 1_000_000),
             ("claude-opus-5-5[1m]", 1_000_000),
-            ("claude-opus-5@default[1m]", 1_000_000),
-            ("claude-opus-4-8@default[1m]", 1_000_000),
+            ("claude-opus-5[1m]", 1_000_000),
+            ("claude-opus-4-8[1m]", 1_000_000),
             ("claude-opus-4-7[1m]", 1_000_000),
             ("claude-opus-4-6[1m]", 1_000_000),
             ("claude-sonnet-5[1m]", 1_000_000),
             ("claude-sonnet-4-6[1m]", 1_000_000),
+            // Bare rows of the families whose default window is 1M: no beta
+            // needed, so the bare request is 1M as well.
+            ("claude-fable-5-1", 1_000_000),
+            ("claude-fable-5", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-opus-5", 1_000_000),
             // OpenAI — no context opt-in either; the 400k guess understates these.
             ("gpt-5.5-pro", 1_050_000),
             ("gpt-5.5", 1_050_000),
@@ -817,29 +928,26 @@ mod tests {
         for (id, window) in expected {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert_eq!(
-                m.context_window,
+                declared_window(&m),
                 Some(*window),
                 "{id} must declare its real {window}-token window"
             );
         }
 
-        // Bare Claude ids stay undeclared so they keep tracking the prefix map's
-        // 200k — which is correct, because the request carries no 1M beta.
-        // Declaring 1M here is the dangerous direction: the packer would exceed
-        // the API mode the request actually selected.
+        // Every other bare Claude id stays undeclared, tracking the prefix
+        // map's 200k: the request carries no 1M beta and 1M is not their
+        // default. Declaring 1M here is the dangerous direction, because the
+        // packer would exceed the API mode the request actually selected.
         for id in [
-            "claude-fable-5-1",
-            "claude-fable-5",
-            "claude-opus-5-5",
-            "claude-opus-5@default",
-            "claude-opus-4-8@default",
+            "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
         ] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert_eq!(
-                m.context_window, None,
+                declared_window(&m),
+                None,
                 "{id} sends no 1M beta — it must stay on the prefix map's 200k"
             );
         }
@@ -855,7 +963,8 @@ mod tests {
         ] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert_eq!(
-                m.context_window, None,
+                declared_window(&m),
+                None,
                 "{id} has no verified window — it must fall back to the prefix map"
             );
         }
@@ -864,74 +973,88 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The GPT-6 Astra seed, run verbatim from the migration file.
-    ///
-    /// A workspace could already hold this id as a hand-added `user` row, so
-    /// the seed is `ON CONFLICT DO UPDATE` rather than the usual DO NOTHING.
-    /// DO NOTHING would leave that row deletable and on whatever identity it
-    /// was typed with, outside every disable-only builtin protection.
-    ///
-    /// `include_str!` rather than a copy of the statement: a test asserting a
-    /// promotion the shipped migration no longer performs proves nothing.
+    /// The 1M-default window migration, re-run verbatim from its file. It
+    /// declares the window on every route sending the row's own id to Vertex or
+    /// Anthropic. It leaves a route with its own id, a window the user set, and
+    /// a user-created row sharing a builtin id.
     #[tokio::test]
-    async fn the_astra_seed_promotes_a_user_row_without_switching_it_on() {
-        const SEED: &str =
-            include_str!("../../migrations/20260905112728_seed_gpt_6_astra_openai_model.sql");
+    async fn the_1m_default_window_migration_declares_routes_and_leaves_user_choices() {
+        const MIGRATION: &str = include_str!(
+            "../../migrations/20260923075003_declare_1m_window_on_1m_default_claude_rows.sql"
+        );
         let (pool, db_name) = setup_test_db().await;
 
-        /// Put the row back in the shape a hand-added `manage_models` row has.
-        async fn as_hand_added_user_row(pool: &PgPool, enabled: bool) {
-            sqlx::query(
-                "UPDATE models SET source = 'user', label = 'astra', \
-                 provider = 'openrouter', sort_order = 99, context_window = NULL, \
-                 enabled = $1 WHERE id = 'gpt-6-astra'",
-            )
-            .bind(enabled)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
+        // The chain already ran this migration, so put each row back to a shape
+        // it has to act on (or refuse to).
+        sqlx::raw_sql(
+            r#"UPDATE models SET routes = '[{"provider": "vertex"}, {"provider": "anthropic"},
+                   {"provider": "openrouter", "id": "anthropic/claude-opus-5"}]'
+                 WHERE id = 'claude-opus-5';
+               UPDATE models SET routes = '[{"provider": "anthropic", "context_window": 300000}]'
+                 WHERE id = 'claude-fable-5-1';
+               UPDATE models SET routes = '[{"provider": "vertex"}]', source = 'user'
+                 WHERE id = 'claude-opus-5-5';"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
 
-        // An enabled user row is promoted, identity and all.
-        as_hand_added_user_row(&pool, true).await;
-        sqlx::query(SEED).execute(&pool).await.unwrap();
+        let routes = |id: &'static str| {
+            let pool = pool.clone();
+            async move { ModelStore::get(&pool, id).await.unwrap().unwrap().routes }
+        };
+        let windows: Vec<Option<i32>> = routes("claude-opus-5")
+            .await
+            .iter()
+            .map(|r| r.context_window)
+            .collect();
+        assert_eq!(windows, vec![Some(1_000_000), Some(1_000_000), None]);
+        assert_eq!(
+            routes("claude-fable-5-1").await[0].context_window,
+            Some(300_000)
+        );
+        assert_eq!(routes("claude-opus-5-5").await[0].context_window, None);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The GPT-6 Astra seed, as the migration chain leaves it.
+    ///
+    /// It used to run that migration's SQL verbatim through `include_str!`, to
+    /// pin its `ON CONFLICT DO UPDATE`. A workspace could already hold the id as
+    /// a hand-added `user` row. DO NOTHING would have left that row deletable,
+    /// outside every disable-only builtin protection.
+    ///
+    /// **That re-run is gone, because the statement can no longer execute.** It
+    /// writes `provider` and `context_window`, which the routes migration drops
+    /// AFTER it. Nothing can reach that SQL again on any workspace, so a test
+    /// re-running it would assert an unreachable path.
+    ///
+    /// What is still worth pinning is the FOLD. Astra's seed is a later
+    /// generation than the original registry, so its row proves a late
+    /// `provider` plus `context_window` landed correctly on one route.
+    #[tokio::test]
+    async fn the_astra_seed_survives_the_fold_into_routes() {
+        let (pool, db_name) = setup_test_db().await;
         let m = ModelStore::get(&pool, "gpt-6-astra")
             .await
             .unwrap()
             .expect("the seed must leave a row");
-        assert!(m.is_builtin(), "a user row must be promoted to builtin");
+        assert!(m.is_builtin(), "the promotion to builtin must survive");
         assert_eq!(m.label, "GPT-6 Astra");
-        assert_eq!(m.provider, "openai");
         assert_eq!(m.sort_order, 36);
-        assert_eq!(m.context_window, Some(1_050_000));
         assert!(m.enabled);
-
-        // A row the user switched off is promoted too, and STAYS off. Whether a
-        // model is offered is their decision, not the migration's.
-        as_hand_added_user_row(&pool, false).await;
-        sqlx::query(SEED).execute(&pool).await.unwrap();
-        let m = ModelStore::get(&pool, "gpt-6-astra")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(m.is_builtin(), "a disabled user row is still promoted");
-        assert_eq!(m.provider, "openai");
-        assert!(!m.enabled, "the promotion must not switch the row back on");
-
-        // With no row at all the seed inserts one, enabled by the column default.
-        sqlx::query("DELETE FROM models WHERE id = 'gpt-6-astra'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(SEED).execute(&pool).await.unwrap();
-        let m = ModelStore::get(&pool, "gpt-6-astra")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(m.is_builtin());
-        assert!(m.enabled, "a fresh insert lands enabled");
-        assert_eq!(m.context_window, Some(1_050_000));
-
+        assert_eq!(
+            m.routes,
+            vec![Route {
+                provider: "openai".to_string(),
+                id: None,
+                context_window: Some(1_050_000),
+            }],
+            "the retired columns must fold into exactly one route"
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -967,14 +1090,346 @@ mod tests {
             &pool,
             &bus,
             "claude-fable-5",
-            "Dupe",
-            "anthropic",
-            1,
-            None,
+            &fields("Dupe", "anthropic", 1, None),
             None,
         )
         .await;
         assert!(result.is_err(), "duplicate id must error");
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The whole point of the change: the current-generation Claude rows are
+    /// reachable from a workspace holding only an Anthropic key.
+    ///
+    /// Vertex stays FIRST, so a workspace already on Vertex keeps its backend.
+    /// Both routes leave the id to default, because a first-party Claude id is
+    /// byte-identical on the two backends.
+    #[tokio::test]
+    async fn the_current_claude_generation_routes_to_vertex_and_anthropic() {
+        let (pool, db_name) = setup_test_db().await;
+        for id in [
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-sonnet-5",
+            "claude-sonnet-5[1m]",
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must be seeded"));
+            assert_eq!(
+                m.routes
+                    .iter()
+                    .map(|r| r.provider.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["vertex", "anthropic"],
+                "{id} must reach both backends, Vertex first"
+            );
+            assert!(
+                m.routes.iter().all(|r| r.id.is_none()),
+                "{id} is spelled the same on both backends"
+            );
+            assert_eq!(
+                m.preferred_provider, None,
+                "{id} must ship unpicked, so the first configured route serves"
+            );
+            // The Anthropic route declares no window on a `[1m]` row or on
+            // Sonnet 5: the id-shape guess reads that route's own id, which
+            // carries `[1m]` where the row does. The bare Opus 5 and 5.5 rows
+            // run 1M by default, so 20260923075003 declares it on both routes.
+            let expected = match id {
+                "claude-opus-5-5" | "claude-opus-5" => Some(1_000_000),
+                _ => None,
+            };
+            assert_eq!(window_on(&m, "anthropic"), expected, "{id}");
+        }
+
+        // Fable is not published on Vertex, so its rows keep one route.
+        for id in ["claude-fable-5-1", "claude-fable-5"] {
+            let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                m.routes
+                    .iter()
+                    .map(|r| r.provider.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["anthropic"],
+                "{id} is Anthropic-only"
+            );
+        }
+
+        // The retired rows are an explicit non-goal: their direct-API ids were
+        // never probed, and seeding one unverified trades a clean "not
+        // configured" refusal for a vendor 404.
+        for id in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6"] {
+            let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
+            assert!(
+                !routes_to(&m, "anthropic"),
+                "{id} is retired and must keep its single Vertex route"
+            );
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A row cannot be stored with no route, nor with one provider twice. The
+    /// first makes the model unreachable with nothing saying so; the second
+    /// makes "the first configured route" ambiguous.
+    #[tokio::test]
+    async fn the_route_list_cannot_be_empty_or_name_a_provider_twice() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        let empty = ModelFields {
+            label: "Empty".to_string(),
+            routes: Vec::new(),
+            preferred_provider: None,
+            sort_order: 1,
+        };
+        assert!(
+            ModelStore::create(&pool, &bus, "no-routes", &empty, None)
+                .await
+                .is_err(),
+            "the CHECK must refuse an empty route list"
+        );
+
+        let doubled = ModelFields {
+            routes: vec![Route::bare("anthropic"), Route::bare("anthropic")],
+            ..empty.clone()
+        };
+        assert!(
+            ModelStore::create(&pool, &bus, "doubled", &doubled, None)
+                .await
+                .is_err(),
+            "the CHECK must refuse a duplicated provider"
+        );
+
+        // And the same judgment at the API boundary, which is what turns those
+        // into a sentence rather than a constraint-violation string.
+        let refused = |routes: &[Route], says: &str| {
+            let err = validate_routes(routes).expect_err("refused");
+            assert!(err.contains(says), "{err}");
+        };
+        refused(&[], "at least one route");
+        refused(&doubled.routes, "appears twice");
+        refused(&[Route::bare("nope")], "Unknown provider 'nope'");
+        assert_eq!(validate_routes(&[Route::bare("anthropic")]), Ok(()));
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The `@default` re-spell reaches every store that reads a model id back
+    /// as a live setting, and moves nothing when its rename was skipped.
+    ///
+    /// The migration already ran on this database, so the test seeds legacy
+    /// spellings and runs the same file again. It is written to be re-runnable.
+    #[tokio::test]
+    async fn the_respell_leaves_no_saved_model_reference_orphaned() {
+        const RESPELL: &str =
+            include_str!("../../migrations/20260922222019_respell_default_alias_model_ids.sql");
+        let (pool, db_name) = setup_test_db().await;
+        let thread = uuid::Uuid::new_v4();
+        let seed = [
+            // Opus 4.8 renames cleanly. Opus 5 collides with the bare row the
+            // first run produced, so its references must stay where they are.
+            "DELETE FROM models WHERE id = 'claude-opus-4-8'".to_string(),
+            "INSERT INTO models (id, label, routes, sort_order, source, enabled) VALUES \
+             ('claude-opus-4-8@default', 'Opus 4.8', '[{\"provider\": \"vertex\"}]', 1, \
+              'builtin', false), \
+             ('claude-opus-5@default', 'Opus 5 (legacy)', '[{\"provider\": \"vertex\"}]', 1, \
+              'user', true)"
+                .to_string(),
+            "DELETE FROM preferences WHERE key IN ('chat_model', 'model_memory', 'model_title')"
+                .to_string(),
+            "INSERT INTO preferences (key, value) VALUES \
+             ('chat_model', 'claude-opus-4-8@default'), \
+             ('model_memory', 'claude-opus-4-8@default'), \
+             ('model_title', 'claude-opus-5@default')"
+                .to_string(),
+            format!(
+                "INSERT INTO thread_summaries (thread_id, compose_selection) VALUES \
+                 ('{thread}', '{{\"model\": \"claude-opus-4-8@default\"}}')"
+            ),
+            format!(
+                "INSERT INTO thread_queue (id, kind, summary, request) VALUES \
+                 ('{thread}', 'cron', 's', \
+                  '{{\"type\": \"cron\", \"model\": \"claude-opus-4-8@default\"}}')"
+            ),
+            format!(
+                "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload) VALUES \
+                 (gen_random_uuid(), 'thread', '{thread}', 'MessageReceived', \
+                  '{{\"text\": \"hi\", \"model\": \"claude-opus-4-8@default\"}}'), \
+                 (gen_random_uuid(), 'trigger', 't1', 'TriggerCreated', \
+                  '{{\"id\": \"t1\", \"model\": \"claude-opus-4-8@default\"}}')"
+            ),
+        ];
+        for statement in seed {
+            sqlx::query(&statement)
+                .execute(&pool)
+                .await
+                .expect(&statement);
+        }
+
+        sqlx::raw_sql(RESPELL)
+            .execute(&pool)
+            .await
+            .expect("the re-spell re-runs");
+
+        let text = |sql: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(&sql)
+                    .fetch_one(&pool)
+                    .await
+                    .expect(&sql)
+            }
+        };
+        assert!(ModelStore::get(&pool, "claude-opus-4-8")
+            .await
+            .unwrap()
+            .is_some());
+        for key in ["chat_model", "model_memory"] {
+            assert_eq!(
+                text(format!("SELECT value FROM preferences WHERE key = '{key}'")).await,
+                "claude-opus-4-8"
+            );
+        }
+        assert_eq!(
+            text(format!(
+                "SELECT compose_selection->>'model' FROM thread_summaries \
+                 WHERE thread_id = '{thread}'"
+            ))
+            .await,
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            text(format!(
+                "SELECT request->>'model' FROM thread_queue WHERE id = '{thread}'"
+            ))
+            .await,
+            "claude-opus-4-8"
+        );
+        for event in ["MessageReceived", "TriggerCreated"] {
+            assert_eq!(
+                text(format!(
+                    "SELECT payload->>'model' FROM events WHERE event_type = '{event}' \
+                     AND payload->>'model' LIKE 'claude-opus-4-8%'"
+                ))
+                .await,
+                "claude-opus-4-8"
+            );
+        }
+
+        // The collision: the legacy row stays, and so does what names it. It
+        // keeps its Vertex-only route too, since the direct API rejects its id.
+        let legacy = ModelStore::get(&pool, "claude-opus-5@default")
+            .await
+            .unwrap()
+            .expect("the legacy row stays");
+        assert_eq!(legacy.routes, vec![Route::bare("vertex")]);
+        assert_eq!(
+            text("SELECT value FROM preferences WHERE key = 'model_title'".to_string()).await,
+            "claude-opus-5@default"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// One route the engine cannot decode fails the WHOLE registry read, so the
+    /// CHECK refuses every malformed shape a hand edit could write. A string
+    /// window must be refused too, rather than raise inside the cast.
+    #[tokio::test]
+    async fn a_malformed_route_cannot_reach_the_table() {
+        let (pool, db_name) = setup_test_db().await;
+        for bad in [
+            r#"[{"provider": "vertex", "id": 5}]"#,
+            r#"[{"provider": "vertex", "id": "  "}]"#,
+            r#"[{"provider": "vertex", "context_window": "big"}]"#,
+            r#"[{"provider": "vertex", "context_window": 0}]"#,
+            r#"[{"provider": "vertex", "context_window": 1.5}]"#,
+            r#"[{"provider": "vertex", "context_window": 1048576.0}]"#,
+            r#"[{"provider": "vertex", "context_window": 99999999999}]"#,
+            r#"[{"id": "no-provider"}]"#,
+            r#"["vertex"]"#,
+        ] {
+            let inserted = sqlx::query(
+                "INSERT INTO models (id, label, routes, sort_order, source, enabled) \
+                 VALUES ('hand-edited', 'Hand edited', $1::jsonb, 1, 'user', true)",
+            )
+            .bind(bad)
+            .execute(&pool)
+            .await;
+            assert!(inserted.is_err(), "the CHECK must refuse {bad}");
+        }
+        sqlx::query(
+            "INSERT INTO models (id, label, routes, sort_order, source, enabled) \
+             VALUES ('hand-edited', 'Hand edited', \
+                     '[{\"provider\": \"vertex\", \"id\": \"x\", \"context_window\": 1000, \
+                       \"extra\": null}]'::jsonb, 1, 'user', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("a well-formed route is stored");
+        assert!(
+            ModelStore::list(&pool).await.is_ok(),
+            "the registry still reads"
+        );
+
+        let blank_id = Route {
+            id: Some(" ".to_string()),
+            ..Route::bare("vertex")
+        };
+        assert!(validate_routes(&[blank_id])
+            .unwrap_err()
+            .contains("id is blank"));
+        let no_window = Route {
+            context_window: Some(0),
+            ..Route::bare("vertex")
+        };
+        assert!(validate_routes(&[no_window])
+            .unwrap_err()
+            .contains("positive number"));
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The picker's write path. `preferred_provider` round-trips on a BUILTIN,
+    /// which is the case that matters: refusing it there would pin every seeded
+    /// model to whichever backend the migration listed first.
+    #[tokio::test]
+    async fn a_builtin_remembers_its_preferred_provider() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let existing = ModelStore::get(&pool, "claude-opus-5-5")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.preferred_provider, None);
+
+        let picked = ModelFields {
+            label: existing.label.clone(),
+            routes: existing.routes.clone(),
+            preferred_provider: Some("anthropic".to_string()),
+            sort_order: existing.sort_order,
+        };
+        assert!(
+            ModelStore::update(&pool, &bus, &existing.id, &picked, true, None)
+                .await
+                .unwrap()
+        );
+        let after = ModelStore::get(&pool, "claude-opus-5-5")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.preferred_provider.as_deref(), Some("anthropic"));
+        assert!(after.is_builtin(), "the pick must not change source");
+        assert_eq!(after.label, existing.label);
+
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

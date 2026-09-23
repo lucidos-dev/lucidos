@@ -29,15 +29,8 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub const JUDGE_PROVIDER_VAR: &str = "LUCIDOS_EVAL_JUDGE_PROVIDER";
 
 /// Every provider the judge can be pinned to, in the engine's own vocabulary.
-const PROVIDER_KINDS: [ProviderKind; 7] = [
-    ProviderKind::Vertex,
-    ProviderKind::Anthropic,
-    ProviderKind::OpenAi,
-    ProviderKind::OpenRouter,
-    ProviderKind::XAi,
-    ProviderKind::OpenCodeFree,
-    ProviderKind::Local,
-];
+/// The engine's own list, so a backend it gains is pinnable here at once.
+const PROVIDER_KINDS: [ProviderKind; 7] = ProviderKind::ALL;
 
 /// The region the engine defaults to when nothing names one.
 const DEFAULT_VERTEX_REGION: &str = "europe-west1";
@@ -329,13 +322,7 @@ fn route_to(registry: &ModelRegistry, model: &str, provider: ProviderKind) -> Fa
     registry
         .write()
         .map_err(|_| "the judge's model registry lock is poisoned")?
-        .insert(
-            model.to_string(),
-            ModelRouting {
-                provider,
-                context_window: None,
-            },
-        );
+        .insert(model.to_string(), ModelRouting::single(provider, model));
     Ok(())
 }
 
@@ -469,8 +456,7 @@ pub async fn judge_call(judge: &Judge<'_>, rubric: &str, subject: &str) -> Falli
         .chat(
             vec![message],
             Vec::new(),
-            Some(&judge.config.model),
-            None,
+            lucidos_engine::llm::ModelSelection::model(&judge.config.model),
             None,
             None,
         )

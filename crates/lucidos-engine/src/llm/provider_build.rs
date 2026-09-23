@@ -475,21 +475,25 @@ const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-5.5";
 
 /// A model id valid for `provider`, for the one-shot search call.
 ///
-/// Prefers the configured chat model — it is known to work for this user and
-/// keeps search on the tier they picked — **but only when that model actually
-/// routes to `provider`**. The entire point of the chain is that search can run
+/// Prefers the configured chat model, which is known to work for this user and
+/// keeps search on the tier they picked. **But only when that model has a route
+/// to `provider`.** The entire point of the chain is that search can run
 /// on a provider the user is *not* chatting with, and in that case the chat
 /// model id is meaningless to the search provider: handing OpenRouter's
 /// `z-ai/glm-5.2` to Anthropic's Messages API is a hard rejection, which would
 /// make the advertised fallback fail every time it was actually needed.
 ///
+/// It asks whether a route EXISTS, rather than which one would serve. A Claude
+/// model listing Vertex first still has an Anthropic route, and that route's
+/// own id is what Anthropic's search backend should be sent.
+///
 /// The reused chat model has its `[1m]` suffix stripped. That suffix is a
 /// Lucidos convention selecting the 1M-context beta, not part of any real model
 /// id: the chat path strips it in `build_claude_request` and sends the beta as a
-/// header instead. The one-shot search call has no such opt-in, so leaving the
+/// header instead. The one-shot search call has no such opt-in. Leaving the
 /// suffix on sends `claude-fable-5[1m]` (a seeded, direct-Anthropic builtin)
 /// verbatim to `/v1/messages`, which rejects it and drops the backend out of the
-/// chain. Routing is resolved on the FULL id, because that is how the registry
+/// chain. The route is resolved on the FULL id, because that is how the registry
 /// rows are keyed.
 fn search_model_for(
     registry: &crate::llm::model_registry::ModelRegistry,
@@ -497,12 +501,11 @@ fn search_model_for(
     chat_model: &str,
     fallback: &str,
 ) -> String {
-    if crate::llm::model_registry::provider_kind_for(registry, chat_model) == provider {
-        crate::llm::anthropic_wire::parse_context_suffix(chat_model)
+    match crate::llm::model_registry::route_on(registry, chat_model, provider) {
+        Some(route) => crate::llm::anthropic_wire::parse_context_suffix(&route.wire_id)
             .0
-            .to_string()
-    } else {
-        fallback.to_string()
+            .to_string(),
+        None => fallback.to_string(),
     }
 }
 

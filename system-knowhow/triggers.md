@@ -448,8 +448,8 @@ chat model and `reasoning_effort` to pin its thinking budget
 account default. The two are independent: pinning the model leaves the effort on
 the account setting, and the reverse.
 
-Script triggers have no model. They run no LLM, so both fields are ignored there
-and the form hides them.
+Script triggers have no model. They run no LLM, so these fields and `provider`
+below are ignored there, and the form hides them.
 
 | User phrasing | What to set |
 |---|---|
@@ -470,6 +470,27 @@ to see the real ids.
 The model and effort a run actually used are recorded on its `TriggerStarted`
 event, so the trigger's thread shows what it ran on and a follow-up there
 continues on the same model rather than snapping to the account default.
+
+### Which backend serves the model: `provider`
+
+A model can have more than one route, one per backend that serves it. With no
+`provider`, the run follows the model's own *preferred provider*, then its first
+configured route. Set `provider` only when the user asks for a specific backend
+("run this one on the direct Anthropic API").
+
+Unlike the model id, a `provider` pin **is checked when you save**:
+
+- it must be a provider name (`manage_models(action='list')` shows each model's
+  routes);
+- it needs a `model` pin, since it says which backend serves that model;
+- it must be one of that model's routes.
+
+Null clears the pin. Changing the trigger's `model` without restating
+`provider` clears it too, because a pin belongs to the model it was picked for.
+
+A pin to a backend with no credential **refuses the fire** rather than running
+it on another backend. A trigger fires unattended, so a silent move to another
+vendor is a change nobody would notice.
 
 ### Notification routing (`app_id`, `tap`, `event_id`)
 
@@ -762,8 +783,9 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 **The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
 **derived read-model** of the trigger's definition, mirroring the durable subset
 of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`, `app_id`,
-`go_to_review`, `group_id`, `side_effect_grant`, `model`, `reasoning_effort`).
-A trigger on the account chat defaults omits the last two. The engine maintains it from
+`go_to_review`, `group_id`, `side_effect_grant`, `model`, `reasoning_effort`,
+`provider`). A trigger on the account chat defaults omits the last three.
+The engine maintains it from
 the trigger events — written on create/update, removed on delete, fully rebuilt
 from events on boot (ADR 0019). Runtime/identity fields (`id`, `last_run`,
 `last_run_status`, `paused`) are deliberately omitted. It is **not

@@ -543,6 +543,7 @@ async fn lookup_question_channel_returns_chat_for_chat_emitter() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "ask me about colors".into(),
             user_image_hashes: vec![],
@@ -1092,6 +1093,7 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "ask me something".into(),
             user_image_hashes: vec![],

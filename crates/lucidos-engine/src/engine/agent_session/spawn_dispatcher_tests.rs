@@ -30,6 +30,7 @@ fn chat_meta() -> EventMeta {
 
 fn user_message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.into(),
         user_image_hashes: vec![],

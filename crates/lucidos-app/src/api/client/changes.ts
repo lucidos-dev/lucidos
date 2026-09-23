@@ -26,16 +26,22 @@ export interface Change {
    * `WaitingBanner` reads this to confirm before Apply so the user knows
    * they're about to land partial changes from a failed run. */
   incomplete: boolean;
-  /** True when the originating thread is mid-turn (the coding agent is Running
-   * or WaitingForUserAnswer). Applying then races the session's next proposal,
-   * so the changes view disables Apply and drops it from Apply All. Defaults to
-   * false (absent on non-pending changes and older payloads). */
+  /** True when the originating thread has not finished with this change: it is
+   * mid-turn (Running or WaitingForUserAnswer) or holds a live event wait.
+   * Applying then races the session's next proposal, so the changes view draws
+   * no Apply and Apply All drops it. A thread waiting only on its sub-threads is
+   * NOT unsettled (ADR 0249). Defaults to false (absent on non-pending changes
+   * and older payloads). */
   thread_unsettled?: boolean;
   /** True when the originating thread is still WORKING, the half of
    *  `thread_unsettled` a *standing apply* can act on. A thread parked on a
-   *  question, an event wait or a sub-thread is unsettled too, and arming one
-   *  drops the moment it is pressed. Defaults to false. */
+   *  question or an event wait is unsettled too, and arming one drops the
+   *  moment it is pressed. Defaults to false. */
   thread_working?: boolean;
+  /** True while an apply of this change is resolving merge conflicts. The
+   *  thread works only to finish that apply, and its completion lands the
+   *  change, so no standing apply is offered. Defaults to false. */
+  resolving_conflict?: boolean;
 }
 
 /** One thread's contribution to the current restart-required toast: derived
@@ -289,8 +295,9 @@ export interface EngineVersionStatus {
    *  `build_state: 'failed'`. The toast renders this INSTEAD of pointing at the
    *  engine log, which is unreachable on the phone the toast is often read on.
    *
-   *  Absent on a failure means the output could not be read back. The toast
-   *  then reports an unknown cause, rather than dressing one up. */
+   *  The engine always sends it with a failure. An older engine may not, and
+   *  the toast then says the cause was not reported, rather than dressing one
+   *  up. */
   build_failure?: BuildFailure;
   /** Dev only: the checkout-shared engine-build lock is currently held — a
    *  background rebuild of the shared binary is in flight (a co-located peer

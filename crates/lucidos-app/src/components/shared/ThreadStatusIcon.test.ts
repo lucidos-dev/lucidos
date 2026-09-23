@@ -20,8 +20,8 @@ describe('statusTooltip', () => {
     expect(title).toBe('Waiting');
     expect(text).toMatch(/child thread/);
     expect(text).toMatch(/subscribed/);
-    // The dot now outranks `changes`, so a parked thread with a real change
-    // wears it. The copy has to account for the change it is covering.
+    // An event wait outranks `changes`, so a parked thread with a real change
+    // wears this dot. The copy has to account for the change it is covering.
     expect(text).toMatch(/proposed change/);
   });
 
@@ -92,7 +92,7 @@ describe('live event waits', () => {
   // A parked thread's change is not final: it wakes on its delivery and may
   // commit again on the same branch. Reading it as "Changes to review" invited
   // an Apply that merges a live branch. The gate in `availableThreadActions`
-  // now withholds the button on these same two facts.
+  // withholds the button on the same fact.
   it('outranks a proposed change', () => {
     expect(resolveVisualStatus('idle', false, true, true)).toBe('waiting');
   });
@@ -103,12 +103,30 @@ describe('live event waits', () => {
   });
 
   // Every combination of the two waiting causes against a proposed change,
-  // pinned so the precedence cannot be flipped back by accident.
-  it('resolves the four cause combinations', () => {
-    expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
-    expect(resolveVisualStatus('idle', false, true, false)).toBe('changes');
-    expect(resolveVisualStatus('idle', true, true, false)).toBe('waiting');
-    expect(resolveVisualStatus('idle', true, true, true)).toBe('waiting');
+  // pinned so the precedence cannot be flipped back by accident. The two
+  // causes differ against `changes` because the Apply gate differs: a running
+  // child does not withhold its parent's Apply (ADR 0249).
+  it('resolves every cause combination the way the Apply gate does', () => {
+    // [children, proposed, waits] → dot
+    const cases: [boolean, boolean, boolean, VisualStatus][] = [
+      [false, false, false, 'idle'],
+      [false, true, false, 'changes'],
+      [true, false, false, 'waiting'],
+      [true, true, false, 'changes'],
+      [false, false, true, 'waiting'],
+      [false, true, true, 'waiting'],
+      [true, false, true, 'waiting'],
+      [true, true, true, 'waiting'],
+    ];
+    for (const [children, proposed, waits, dot] of cases) {
+      expect(resolveVisualStatus('idle', children, proposed, waits), `children=${children} proposed=${proposed} waits=${waits}`).toBe(dot);
+    }
+  });
+
+  // A delegating parent: idle apart from a running child, with a change of its
+  // own. The dot must offer what the panel offers, which is Apply.
+  it('paints changes, not waiting, on a parent with a change and a running child', () => {
+    expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
   });
 
   // The verdict statuses stay ahead of both: they describe what happened to the

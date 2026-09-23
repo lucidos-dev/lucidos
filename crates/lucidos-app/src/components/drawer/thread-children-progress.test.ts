@@ -231,10 +231,10 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting', true, false, false)).toBe('waiting');
   });
 
-  // Waiting outranks changes: a running child wakes this thread through the
-  // fan-in, so its change is not final and Apply is withheld to match.
-  it('waiting + active children + codingAgentProposed → waiting (not done yet)', () => {
-    expect(resolveVisualStatus('waiting', true, true, false)).toBe('waiting');
+  // Changes outrank active children: the child writes its own worktree, so
+  // the parent's change is whole and Apply is offered to match (ADR 0249).
+  it('waiting + active children + codingAgentProposed → changes (resolvable)', () => {
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
 
   it('failed → failed (red triangle)', () => {
@@ -253,8 +253,8 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting_for_user_answer', true, false, false)).toBe('question');
   });
 
-  it('idle + active children + codingAgentProposed → waiting (not done yet)', () => {
-    expect(resolveVisualStatus('idle', true, true, false)).toBe('waiting');
+  it('idle + active children + codingAgentProposed → changes (resolvable)', () => {
+    expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
   });
 });
 
@@ -302,10 +302,10 @@ describe('thread title status icon', () => {
     expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
-  // With a child still running the title pulses instead: the change is real,
-  // but it cannot be resolved until the thread stops being woken.
-  it('children outrank changes, so the thread title pulses', () => {
-    expect(resolveVisualStatus('waiting', true, true, false)).toBe('waiting');
+  // A running child does not pulse over it: the parent's change is whole and
+  // Apply is offered, so the title reads changes (ADR 0249).
+  it('changes outrank children, so the thread title stays static', () => {
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
 
   it('pulsing waiting dot only when own state has nothing else to show', () => {

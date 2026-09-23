@@ -36,10 +36,11 @@ pub struct Change {
     /// 76b4ee76):
     ///
     /// - **mid-turn**, `Running` or `WaitingForUserAnswer`;
-    /// - **parked**, holding a live event wait or an active sub-thread. It wakes
-    ///   on the delivery and commits on to the same branch (ADR 0106).
+    /// - **parked**, holding a live event wait. It wakes on the delivery and
+    ///   commits on to the same branch (ADR 0106). An active sub-thread does
+    ///   not count: the child writes its own worktree (ADR 0249).
     ///
-    /// NOT a DB column: populated by `enrich_thread_unsettled` at serialize time
+    /// NOT a DB column: populated by `enrich_pending_state` at serialize time
     /// (defaults to `false` for direct DB loads). The frontend disables Apply for
     /// these and the bulk paths filter them out; the per-change Apply endpoint
     /// already 409s via `guard_change_action`.
@@ -50,16 +51,30 @@ pub struct Change {
     /// apply* has a settle to wait for.
     ///
     /// The half of `thread_unsettled` that can be acted on. A thread parked on
-    /// a question, an event wait or a sub-thread is unsettled too, and arming
-    /// it drops on the first look (`engine::standing_apply`). The panel needs
+    /// a question or an event wait is unsettled too, and arming it drops on
+    /// the first look (`engine::standing_apply`). The panel needs
     /// the two apart, or it offers a control that ends the moment it is
     /// pressed.
     ///
-    /// NOT a DB column: populated by `enrich_thread_unsettled` at serialize
+    /// NOT a DB column: populated by `enrich_pending_state` at serialize
     /// time, and `false` for a direct DB load.
     #[sqlx(default)]
     #[serde(default)]
     pub thread_working: bool,
+    /// `true` while an apply of this change is resolving merge conflicts: its
+    /// conflict pairing is open (`ChangesProjection::conflict_pairing_open`)
+    /// and its thread has not finished.
+    ///
+    /// The thread works only to finish this apply, and the resolver's
+    /// completion lands the change. So the panel shows the apply in flight and
+    /// never offers a standing apply for it. A pairing a crash left open on a
+    /// finished thread does not count: that row must keep its Discard.
+    ///
+    /// NOT a DB column: populated by `enrich_pending_state` at serialize
+    /// time, and `false` for a direct DB load.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub resolving_conflict: bool,
 }
 
 /// One thread's contribution to the current restart-required toast: the
@@ -93,21 +108,22 @@ pub async fn enrich_thread_titles(
 /// be withheld (mirrors the `live` clause in `available_thread_actions`).
 const LIVE_THREAD_STATUSES: [&str; 2] = ["running", "waiting_for_user_answer"];
 
-/// The parked half of the same question, mirroring `will_resume` in
-/// `available_thread_actions`: a thread watching an event, or waiting on a
-/// sub-thread, is `idle` but will wake and may commit again (ADR 0106).
-const PARKED_THREAD_SQL: &str = "live_event_wait_count > 0 OR active_children_count > 0";
+/// The parked half of the same question, mirroring `has_live_event_waits` in
+/// `available_thread_actions`: a thread watching an event is `idle` but will
+/// wake and may commit again (ADR 0106). A running sub-thread does not park
+/// its parent's change (ADR 0249), so `active_children_count` is not read.
+const PARKED_THREAD_SQL: &str = "live_event_wait_count > 0";
 
 /// Of the given thread ids, return the subset that has not finished with its
-/// change: mid-turn, or parked on an event wait or a sub-thread. One batch
-/// query. The bulk paths filter their batch with this, so they never resolve a
-/// change whose session is still going. That is the gate the per-change
-/// endpoint enforces via `guard_change_action`.
+/// change: mid-turn, or parked on an event wait. One batch query. The bulk
+/// paths filter their batch with this, so they never resolve a change whose
+/// session is still going. That is the gate the per-change endpoint enforces
+/// via `guard_change_action`.
 ///
-/// This is the SQL mirror of `available_thread_actions`'s `live || will_resume`,
-/// and the two must agree. This one drives the bulk paths and the
-/// `thread_unsettled` flag the UI disables its buttons on. That one drives the
-/// per-thread actions and the per-change guard.
+/// This is the SQL mirror of `available_thread_actions`'s
+/// `live || has_live_event_waits`, and the two must agree. This one drives the
+/// bulk paths and the `thread_unsettled` flag the UI disables its buttons on.
+/// That one drives the per-thread actions and the per-change guard.
 pub async fn unsettled_thread_ids(
     pool: &PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
@@ -169,33 +185,42 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Set `thread_unsettled` and `thread_working` on each pending Change by
-/// batch-loading thread state. Applied changes are left alone (their thread
-/// state no longer gates Apply). Two batch queries, no N+1: the serialize-time
+/// Set `thread_unsettled`, `thread_working` and `resolving_conflict` on each
+/// pending Change. Applied changes are left alone (their thread state no
+/// longer gates Apply). Three batch queries, no N+1: the serialize-time
 /// companion to `enrich_thread_titles`.
 ///
-/// Both queries always run, because `working` is NOT a subset of `unsettled`.
+/// Every query always runs, because `working` is NOT a subset of `unsettled`.
 /// A `paused` coding-agent thread is working, and its status is outside
 /// `LIVE_THREAD_STATUSES`. Skipping the second query on an empty `unsettled`
 /// hid the standing-apply control whenever no other change in the batch had a
 /// live thread.
-pub async fn enrich_thread_unsettled(
+pub async fn enrich_pending_state(
     pool: &PgPool,
     changes: &mut [Change],
 ) -> Result<(), sqlx::Error> {
-    let pending_ids = || {
+    let pending = || {
         changes
             .iter()
             .filter(|c| c.status == "pending")
-            .filter_map(|c| c.thread_id)
+            .filter_map(|c| c.thread_id.map(|tid| (tid, c.id)))
     };
-    let unsettled = unsettled_thread_ids(pool, pending_ids()).await?;
-    let working = crate::engine::standing_apply::working_thread_ids(pool, pending_ids()).await?;
+    let thread_ids = || pending().map(|(tid, _)| tid);
+    let unsettled = unsettled_thread_ids(pool, thread_ids()).await?;
+    let working = crate::engine::standing_apply::working_thread_ids(pool, thread_ids()).await?;
+    let resolving = crate::core::changes_projection::resolving_conflict_change_ids(
+        pool,
+        &pending().collect::<Vec<_>>(),
+    )
+    .await?;
     for change in changes.iter_mut() {
         if let Some(tid) = change.thread_id {
             let pending = change.status == "pending";
             change.thread_unsettled = pending && unsettled.contains(&tid);
             change.thread_working = pending && working.contains(&tid);
+            change.resolving_conflict = pending
+                && (change.thread_unsettled || change.thread_working)
+                && resolving.contains(&change.id);
         }
     }
     Ok(())
@@ -292,6 +317,7 @@ mod tests {
             incomplete: false,
             thread_unsettled: false,
             thread_working: false,
+            resolving_conflict: false,
         }
     }
 
@@ -307,12 +333,12 @@ mod tests {
         .expect("insert thread_summary with status");
     }
 
-    /// `enrich_thread_unsettled` flags a pending change whose thread is mid-turn
+    /// `enrich_pending_state` flags a pending change whose thread is mid-turn
     /// (`running` / `waiting_for_user_answer`), leaves idle-thread changes
     /// false, and never flags an already-applied change (its thread state no
     /// longer gates Apply).
     #[tokio::test]
-    async fn enrich_thread_unsettled_flags_only_live_pending() {
+    async fn enrich_pending_state_flags_only_live_pending() {
         let (pool, db) = setup_test_db().await;
 
         let running = Uuid::new_v4();
@@ -336,7 +362,7 @@ mod tests {
             },
         ];
 
-        enrich_thread_unsettled(&pool, &mut changes)
+        enrich_pending_state(&pool, &mut changes)
             .await
             .expect("enrich");
 
@@ -356,10 +382,11 @@ mod tests {
     }
 
     /// A parked thread is `idle`. The status list alone would let its change
-    /// through Apply All, and leave the button live in the Changes view. Both
-    /// waiting causes count, matching `available_thread_actions` (ADR 0106).
+    /// through Apply All, and leave the button live in the Changes view. A live
+    /// event wait counts (ADR 0106). An active sub-thread does not (ADR 0249),
+    /// matching `available_thread_actions`.
     #[tokio::test]
-    async fn a_parked_thread_is_unsettled_even_though_its_status_is_idle() {
+    async fn only_a_live_event_wait_parks_an_idle_threads_change() {
         let (pool, db) = setup_test_db().await;
 
         let watching = Uuid::new_v4();
@@ -384,7 +411,7 @@ mod tests {
             make_change(Some(with_child)),
             make_change(Some(settled)),
         ];
-        enrich_thread_unsettled(&pool, &mut changes)
+        enrich_pending_state(&pool, &mut changes)
             .await
             .expect("enrich");
 
@@ -392,19 +419,22 @@ mod tests {
             changes[0].thread_unsettled,
             "a live event wait blocks apply"
         );
-        assert!(changes[1].thread_unsettled, "an active child blocks apply");
+        assert!(
+            !changes[1].thread_unsettled,
+            "an active child alone does not block apply"
+        );
         assert!(
             !changes[2].thread_unsettled,
             "a settled idle thread still allows apply"
         );
 
-        // The bulk paths read the same predicate, so Apply All drops the two
-        // parked ones and keeps the settled one.
+        // The bulk paths read the same predicate, so Apply All drops the
+        // watching one and keeps the delegating parent and the settled one.
         let kept = drop_unsettled_thread_changes(&pool, changes)
             .await
             .expect("filter");
-        assert_eq!(kept.len(), 1, "only the settled thread's change survives");
-        assert_eq!(kept[0].thread_id, Some(settled));
+        let kept_threads: Vec<_> = kept.iter().map(|c| c.thread_id).collect();
+        assert_eq!(kept_threads, vec![Some(with_child), Some(settled)]);
 
         teardown_test_db(&db).await;
     }
@@ -426,7 +456,7 @@ mod tests {
             .expect("mark it a coding-agent thread");
 
         let mut changes = vec![make_change(Some(paused))];
-        enrich_thread_unsettled(&pool, &mut changes)
+        enrich_pending_state(&pool, &mut changes)
             .await
             .expect("enrich");
 

@@ -1,5 +1,16 @@
 import { API, json } from './_core';
-import type { ApiResult, ModelsListResponse, ResponseStylesListResponse } from '../types';
+import type {
+  ApiResult, ModelsListResponse, ResponseStylesListResponse,
+} from '../types';
+
+/** A route as the write surface takes it. `id` absent means the row's own id,
+ *  which is the common case: a first-party Claude id is byte-identical on
+ *  Vertex and on the direct Anthropic API. */
+export interface RouteInput {
+  provider: string;
+  id?: string;
+  context_window?: number;
+}
 
 // --- Model registry (Settings → Models) ---
 
@@ -17,12 +28,16 @@ export function listResponseStyles(): Promise<ResponseStylesListResponse> {
   return json(`${API}/response-styles`);
 }
 
+/** `provider` plus `context_window` is the single-route shorthand, and what
+ *  the Add Model form sends. Pass `routes` instead for a model reachable more
+ *  than one way. */
 export function createModel(body: {
   id: string;
   label: string;
-  provider: string;
+  provider?: string;
   sort_order?: number;
   context_window?: number;
+  routes?: RouteInput[];
 }): Promise<ApiResult> {
   return json(`${API}/models`, {
     method: 'POST',
@@ -35,12 +50,16 @@ export function updateModel(
   id: string,
   // `context_window: null` CLEARS the declared window (back to inferring from
   // the model id); omitting the key leaves the stored value alone.
+  // `preferred_provider: null` CLEARS the pick, back to the first configured
+  // route; omitting the key leaves the stored one alone.
   body: {
     label?: string;
     provider?: string;
     sort_order?: number;
     enabled?: boolean;
     context_window?: number | null;
+    routes?: RouteInput[];
+    preferred_provider?: string | null;
   }
 ): Promise<ApiResult> {
   return json(`${API}/models?id=${encodeURIComponent(id)}`, {

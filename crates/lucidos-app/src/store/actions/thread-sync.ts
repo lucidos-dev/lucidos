@@ -1419,10 +1419,10 @@ const FILE_TOOL_TARGET_ARG: Record<string, string> = {
  *  only for `artifacts/` writes (`engine/tools/files.rs`). So this is how an
  *  open `knowhow/` or `apps/` preview learns that its own file changed.
  *
- *  One slot per thread, because chat tools run one at a time inside the
- *  agentic loop. Every `ToolResult` clears the slot, so a path recorded for
- *  one call can never be attributed to a later one. A turn interrupted between
- *  the call and its result leaves one short string behind. */
+ *  One slot per thread, because a write never joins a parallel run: file
+ *  writes still run one at a time. Every `ToolResult` clears the slot, so a
+ *  path recorded for one call can never be attributed to a later one. A turn
+ *  interrupted between the call and its result leaves one short string behind. */
 const pendingFileToolWrite = new Map<string, { eventId?: string; path: string }>();
 
 /** Take the thread's pending write and invalidate the preview for it.

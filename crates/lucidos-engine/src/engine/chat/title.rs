@@ -351,10 +351,9 @@ async fn title_attempts(
             .chat(
                 messages,
                 vec![],
-                None,
+                crate::llm::ModelSelection::default().with_effort(reasoning_effort),
                 Some(TITLE_SYSTEM_PROMPT),
                 None,
-                reasoning_effort,
             )
             .await?;
         if let Some(capture) = capture {

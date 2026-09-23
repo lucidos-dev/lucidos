@@ -202,8 +202,8 @@ describe('header cost figures', () => {
   });
 
   it('states a 1M window as 1M, matching the marker the id carries', () => {
-    const summary = mcpHeaderSummary(totals({ tokens: 0 }), 1_000_000, 'claude-opus-5@default[1m]');
-    expect(summary.share).toBe("0% of claude-opus-5@default[1m]'s 1M context window");
+    const summary = mcpHeaderSummary(totals({ tokens: 0 }), 1_000_000, 'claude-opus-5[1m]');
+    expect(summary.share).toBe("0% of claude-opus-5[1m]'s 1M context window");
   });
 
   it('omits the share when the engine reports no window', () => {

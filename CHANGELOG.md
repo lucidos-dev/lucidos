@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.39.4 — 2026-09-23
+
+### Changed
+
+- Choose which backend a model runs on. When a model has two configured providers, the model picker adds a provider step. The pick applies to the thread and is remembered for next time.
+- Edit a model's routes in Settings > Models: the backends in the order Lucidos tries them, and which one is remembered. Built-in models take route edits too.
+- A trigger can pin a provider along with its model, from the API, the CLI, `trigger.toml` and the Lucidos Agent.
+- The model picker names the backend each model runs on, even when there is only one.
+- A model shows in the picker when any of its providers is configured.
+- The Lucidos Agent runs independent reads (files, searches, event queries) at the same time, up to four at once. Each step reports live as it starts and ends.
+- A running sub-thread no longer holds back its parent's Apply.
+- A pending change says when its apply is resolving merge conflicts.
+
+### Fixed
+
+- Opus 5, Opus 5.5, Fable 5 and Fable 5.1 use their full 1M context window.
+- Opus 5.5 and Fable show their progress notes between tool calls, on the direct API and on Vertex.
+- Reasoning effort "none" works on every Claude model.
+- Web search no longer fails on models that think by default.
+- A reply the model refuses partway through shows as a failed turn.
+- `http_request` never sends a POST twice when the server may have acted on it.
+- A question card never replaces the agent's answer, in chat, Claude Code or Codex. The agent reports what it found first.
+- Coding agents no longer tell you where to apply a change.
+- A coding agent uses the model and reasoning level defaults set for each spawn.
+- A deleted workspace environment variable stops reaching new coding agents, scripts and commands at once.
+- After an update, the desktop app waits for the old engines to exit, so the new window loads the new version.
+- The macOS window buttons stay in place when a window changes its title.
+- A thread reopens at your reading position without a late jump, including on the iOS home-screen app.
+- A failed engine rebuild in Settings says how it stopped.
+- Every apply clears the change's plan and harden markers.
+- A merge conflict left open on a finished thread keeps its Discard button.
+- Apply as it settles is not offered for a change already resolving its merge conflicts.
 ## v0.39.3 — 2026-09-23
 
 ### Fixed

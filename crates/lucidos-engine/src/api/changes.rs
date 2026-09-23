@@ -101,7 +101,7 @@ pub(super) async fn list_changes(
     // Flag pending changes whose thread has not settled, mid-turn or parked, so
     // the UI disables Apply and the bulk paths drop them. Same gate the
     // per-change endpoint enforces server-side via guard_change_action.
-    crate::core::changes::enrich_thread_unsettled(pool, &mut pending)
+    crate::core::changes::enrich_pending_state(pool, &mut pending)
         .await
         .map_err(ApiError::db)?;
 
@@ -187,8 +187,8 @@ pub(crate) enum ChangeActionRefusal {
     /// The thread is still *working*: running or paused. It will settle, and a
     /// *standing apply* is what waits for that.
     ThreadWorking,
-    /// The thread is *parked*: on a question, an event wait, or a sub-thread.
-    /// It wakes on the delivery and may commit again, so the change is not
+    /// The thread is *parked*: on a question or an event wait. It wakes on the
+    /// answer or the delivery and may commit again, so the change is not
     /// final. A standing apply cannot wait this out.
     ThreadParked,
     /// The selector withholds the action for a reason no wait resolves.
@@ -899,12 +899,12 @@ mod tests {
 
         let (pool, db_name) = setup_test_db().await;
 
-        // Mid-turn, parked on an event wait, parked on a sub-thread, and
-        // parked on a question. All four wake and may commit again.
+        // Mid-turn, parked on an event wait (with and without a child), and
+        // parked on a question. All of them wake and may commit again.
         for (status, waits, children, expected) in [
             ("running", 0, 0, ChangeActionRefusal::ThreadWorking),
             ("idle", 1, 0, ChangeActionRefusal::ThreadParked),
-            ("idle", 0, 1, ChangeActionRefusal::ThreadParked),
+            ("idle", 1, 1, ChangeActionRefusal::ThreadParked),
             (
                 "waiting_for_user_answer",
                 0,
@@ -938,27 +938,22 @@ mod tests {
             standing_verdict, ArmedChange, SettleFacts, StandingVerdict,
         };
 
-        let facts = |status: &str, waits: bool, children: bool| SettleFacts {
+        let facts = |status: &str, waits: bool| SettleFacts {
             status: status.to_string(),
             live_event_waits: waits,
-            active_children: children,
             has_diff: true,
             armed_change: ArmedChange::Ready(Uuid::new_v4()),
         };
         let waits_it_out = |f: SettleFacts| matches!(standing_verdict(&f), StandingVerdict::Wait);
         // The state behind ThreadWorking. The arm keeps its place.
         assert!(
-            waits_it_out(facts("running", false, false)),
+            waits_it_out(facts("running", false)),
             "a running thread is what a standing apply waits through",
         );
-        // The three behind ThreadParked. Each ends the arm on its first look.
-        for (status, waits, children) in [
-            ("idle", true, false),
-            ("idle", false, true),
-            ("waiting_for_user_answer", false, false),
-        ] {
+        // The two behind ThreadParked. Each ends the arm on its first look.
+        for (status, waits) in [("idle", true), ("waiting_for_user_answer", false)] {
             assert!(
-                !waits_it_out(facts(status, waits, children)),
+                !waits_it_out(facts(status, waits)),
                 "a parked thread ({status}) drops the arm, so it must not read as working",
             );
         }
@@ -966,23 +961,32 @@ mod tests {
 
     /// The control: a settled coding-agent thread with a real diff applies.
     /// Without this, a gate that refused everything would look correct.
+    ///
+    /// A delegating parent, idle apart from a running child, is settled too.
+    /// The child writes its own worktree (ADR 0249), so Apply and Discard both
+    /// pass the per-change gate.
     #[tokio::test]
-    async fn a_settled_thread_is_not_refused() {
+    async fn a_settled_thread_is_not_refused_even_with_a_running_child() {
         use crate::engine::thread_lifecycle::Action;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
-        let thread_id = Uuid::new_v4();
-        let change_id = Uuid::new_v4();
-        seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
-        seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+        for children in [0, 1] {
+            let thread_id = Uuid::new_v4();
+            let change_id = Uuid::new_v4();
+            seed_cc_thread(&pool, thread_id, "idle", 0, children).await;
+            seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
 
-        assert_eq!(
-            change_action_refusal(&pool, change_id, Action::Apply)
-                .await
-                .expect("ask the gate"),
-            None,
-        );
+            for action in [Action::Apply, Action::Discard] {
+                assert_eq!(
+                    change_action_refusal(&pool, change_id, action)
+                        .await
+                        .expect("ask the gate"),
+                    None,
+                    "children={children} {action:?} must pass the gate",
+                );
+            }
+        }
         teardown_test_db(&db_name).await;
     }
 

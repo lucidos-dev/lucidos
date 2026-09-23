@@ -1,15 +1,18 @@
 import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { chatModels, showToast } from '../../store/store';
-import { resolveModel, resolveReasoningEffort } from '../../store/composeSelections';
+import {
+  resolveModel, resolveProvider, resolveReasoningEffort,
+} from '../../store/composeSelections';
 import {
   resolveActiveThreadModel,
+  resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
   patchThreadModelOverride,
 } from '../../store/threadModelSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
 import {
-  loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
+  loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY, rememberProvider,
 } from '../../store/actions/models';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { pairLabelOf } from '../../store/modelSelection';
@@ -66,17 +69,28 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   const effortValue = perDraft
     ? resolveReasoningEffort(threadId)
     : resolveActiveThreadReasoningEffort(threadId);
+  // A draft's pick belongs to the draft's model. A thread remembers one per
+  // model, which the engine applies when the thread switches to it.
+  const providerFor = (model: string) => (perDraft
+    ? (model === modelValue ? resolveProvider(threadId) : null)
+    : resolveActiveThreadProvider(threadId, model));
 
-  /** Where a pick lands. Never the account preference: that is a Settings
-   *  default, and writing it here would leak the pick to every other draft and
-   *  thread. */
+  /** Where a pick lands. The model and effort never reach the account
+   *  preference: that is a Settings default, and writing it here would leak
+   *  the pick to every other draft and thread.
+   *
+   *  The backend binds here too, and is ALSO remembered on the model's row,
+   *  since the last provider picked for a model is remembered per model. */
   function applyPick(patch: ModelSelectionPatch) {
     const write = {
-      ...(patch.model !== undefined ? { model: patch.model } : {}),
+      model: patch.model,
       ...(patch.reasoningEffort != null ? { reasoningEffort: patch.reasoningEffort } : {}),
+      // `undefined` clears a pick the new model cannot use.
+      provider: patch.provider ?? undefined,
     };
     if (perDraft) updateComposeSelection(threadId ?? null, write);
     else if (threadId) patchThreadModelOverride(threadId, write);
+    if (patch.provider) void rememberProvider(patch.model, patch.provider);
   }
 
   const selection = useModelSelection({
@@ -84,12 +98,13 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
     vocabulary: LUCIDOS_TIER_VOCABULARY,
     model: modelValue,
     effort: effortValue,
+    providerFor,
     onChange: applyPick,
   });
 
-  function pick(encoded: string) {
-    selection.pick(encoded);
-    showToast(`Model: ${pairLabelOf(selection.rows, encoded)}`, 'success');
+  function pick(encoded: string, provider?: string) {
+    selection.pick(encoded, provider);
+    showToast(`Model: ${pairLabelOf(selection.rows, encoded, provider)}`, 'success');
     close();
   }
 

@@ -462,6 +462,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens,
                     context_messages,
                     trimmed,
+                    tool_called_event_id: None,
                 });
             }
             // "MemorySearched" is the legacy DB string; the variant was renamed
@@ -508,6 +509,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens: None,
                     context_messages: None,
                     trimmed: None,
+                    tool_called_event_id: None,
                 });
             }
             "ToolCalled" => {
@@ -563,6 +565,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     context_tokens: None,
                     context_messages: None,
                     trimmed: None,
+                    tool_called_event_id: Some(event.id.to_string()),
                 });
             }
             "ToolResult" => {
@@ -572,8 +575,20 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true); // missing field = legacy or pre-Phase-0; bias to success
 
-                if let Some(last_step) = pending_steps.last_mut() {
-                    last_step.success = success;
+                // A result names its call, since a parallel run answers in
+                // completion order. A legacy row falls to the newest step.
+                let call_id =
+                    super::tool_called_event_id_of(&event.payload).map(|id| id.to_string());
+                let answers = |step_call: &Option<String>| match &call_id {
+                    Some(id) => step_call.as_deref() == Some(id.as_str()),
+                    None => true,
+                };
+                if let Some(step) = pending_steps
+                    .iter_mut()
+                    .rev()
+                    .find(|step| answers(&step.tool_called_event_id))
+                {
+                    step.success = success;
                 }
 
                 // Track screenshots for image embedding
@@ -591,16 +606,17 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                 let detail =
                     super::super::super::describe_tool_result(tool_name, result_text, success);
 
-                // Update the last step event with success and detail
                 if let Some(ResponseEvent::Step {
                     success: ref mut s,
                     detail: ref mut d,
                     ..
-                }) = pending_events
-                    .iter_mut()
-                    .rev()
-                    .find(|e| matches!(e, ResponseEvent::Step { .. }))
-                {
+                }) = pending_events.iter_mut().rev().find(|e| match e {
+                    ResponseEvent::Step {
+                        tool_called_event_id,
+                        ..
+                    } => answers(tool_called_event_id),
+                    _ => false,
+                }) {
                     *s = success;
                     *d = detail;
                 }

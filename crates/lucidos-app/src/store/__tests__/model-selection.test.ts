@@ -121,7 +121,7 @@ describe('lucidosTiers', () => {
 
   it('falls back to the id-shape heuristic before the registry loads', () => {
     expect(lucidosTiers('gpt-5.4')).not.toContain('max');
-    expect(lucidosTiers('claude-opus-5@default')).toContain('xhigh');
+    expect(lucidosTiers('claude-opus-5')).toContain('xhigh');
   });
 });
 
@@ -159,6 +159,7 @@ describe('modelRows', () => {
     );
     expect(rows).toEqual([{
       value: 'imagen-4', label: 'Imagen 4', description: undefined, tiers: [],
+      provider: null, providerLabel: null, providers: [],
     }]);
   });
 
@@ -272,7 +273,7 @@ describe('useModelSelection', () => {
   it('reports both halves in one patch, so nothing can be half-applied', () => {
     const { selection, patches } = selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-5.6-sol', 'max');
     selection.pick('gpt-5.5|xhigh');
-    expect(patches).toEqual([{ model: 'gpt-5.5', reasoningEffort: 'xhigh' }]);
+    expect(patches).toEqual([{ model: 'gpt-5.5', reasoningEffort: 'xhigh', provider: null }]);
   });
 
   it('reports a tierless model with no effort at all', () => {
@@ -282,7 +283,7 @@ describe('useModelSelection', () => {
     ];
     const { selection, patches } = selectionFor(imageModels, LUCIDOS, 'imagen-4', null);
     selection.pick('gpt-image-2|');
-    expect(patches).toEqual([{ model: 'gpt-image-2', reasoningEffort: null }]);
+    expect(patches).toEqual([{ model: 'gpt-image-2', reasoningEffort: null, provider: null }]);
   });
 
   it('renders one row and no tiers when the model has none', () => {
@@ -306,5 +307,82 @@ describe('useModelSelection', () => {
   it('labels an unlisted model by its id rather than blank', () => {
     const { selection } = selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-9', null);
     expect(selection.label).toBe('gpt-9');
+  });
+});
+
+/** A Claude row as the Lucidos Agent's adapter serves it: two backends. The
+ *  OpenRouter one stops at `high`, since that server has no `xhigh`. */
+function dualRouted(configured: Record<string, boolean>, defaultProvider: string): ModelChoice {
+  return {
+    value: 'claude-opus-5-5',
+    label: 'Opus 5.5',
+    reasoningEfforts: ['low', 'high', 'xhigh'],
+    providers: [
+      { value: 'vertex', label: 'Vertex', configured: configured.vertex, reasoningEfforts: ['low', 'high', 'xhigh'] },
+      { value: 'openrouter', label: 'OpenRouter', configured: configured.openrouter, reasoningEfforts: ['low', 'high'] },
+    ],
+    defaultProvider,
+  };
+}
+
+describe('the provider step', () => {
+  it('appears only when there is a real choice of backend', () => {
+    const one = modelRows([dualRouted({ vertex: true, openrouter: false }, 'vertex')], LUCIDOS);
+    expect(one[0].providers).toEqual([]);
+    const two = modelRows([dualRouted({ vertex: true, openrouter: true }, 'vertex')], LUCIDOS);
+    expect(two[0].providers.map((p) => p.value)).toEqual(['vertex', 'openrouter']);
+  });
+
+  it('appears when the backend in force is parked, so a refusal stays fixable', () => {
+    const rows = modelRows([dualRouted({ vertex: false, openrouter: true }, 'vertex')], LUCIDOS);
+    expect(rows[0].provider).toBe('vertex');
+    expect(rows[0].providers.find((p) => p.value === 'vertex')?.configured).toBe(false);
+  });
+
+  it("draws the tiers of the backend in force, not the model's", () => {
+    const model = dualRouted({ vertex: true, openrouter: true }, 'vertex');
+    const onPick = modelRows([model], LUCIDOS, () => 'openrouter');
+    expect(onPick[0].provider).toBe('openrouter');
+    expect(onPick[0].tiers.map((t) => t.value)).toEqual(['low', 'high']);
+  });
+
+  it("ignores a pick for a backend the model does not have", () => {
+    const model = dualRouted({ vertex: true, openrouter: true }, 'vertex');
+    const rows = modelRows([model], LUCIDOS, () => 'xai');
+    expect(rows[0].provider).toBe('vertex');
+  });
+
+  it('names the backend in the selection label and reports it on a pick', () => {
+    const model = dualRouted({ vertex: true, openrouter: true }, 'vertex');
+    const patches: ModelSelectionPatch[] = [];
+    const selection = useModelSelection({
+      models: [model], vocabulary: LUCIDOS, model: model.value, effort: 'xhigh',
+      providerFor: () => 'openrouter', onChange: (p) => patches.push(p),
+    });
+    // The effort in force snaps onto what OpenRouter accepts.
+    expect(selection.effort).toBe('high');
+    expect(selection.label).toBe('Opus 5.5 · High · OpenRouter');
+    selection.pick('claude-opus-5-5|low', 'vertex');
+    expect(patches).toEqual([{ model: 'claude-opus-5-5', reasoningEffort: 'low', provider: 'vertex' }]);
+    expect(pairLabelOf(selection.rows, 'claude-opus-5-5|low', 'vertex')).toBe('Opus 5.5 · Low · Vertex');
+  });
+
+  it('names the backend even when there is no choice to make', () => {
+    const model = dualRouted({ vertex: true, openrouter: false }, 'vertex');
+    const selection = useModelSelection({
+      models: [model], vocabulary: LUCIDOS, model: model.value, effort: 'high',
+      onChange: () => {},
+    });
+    expect(selection.rows[0].providers).toEqual([]);
+    expect(selection.label).toBe('Opus 5.5 · High · Vertex');
+    // Every row's muted note names where a pick of it would go, beside any
+    // description the model already carries.
+    expect(selection.rows[0].description).toBe('Vertex');
+    const described = modelRows([{ ...model, description: 'Fast' }], LUCIDOS);
+    expect(described[0].description).toBe('Fast · Vertex');
+  });
+
+  it('names no backend on a surface that has none', () => {
+    expect(formatPair('Opus 5.5', 'High', null)).toBe('Opus 5.5 · High');
   });
 });

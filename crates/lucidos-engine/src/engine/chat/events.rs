@@ -47,6 +47,7 @@ pub(crate) fn make_message_received(
     mode: ActorMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    provider: Option<&str>,
     explicit_origin: Option<MessageOrigin>,
     voice_session_id: Option<Uuid>,
 ) -> crate::engine::thread_events::ThreadEvent {
@@ -70,6 +71,7 @@ pub(crate) fn make_message_received(
         mode,
         model,
         reasoning_effort,
+        provider,
         origin,
         voice_session_id,
     )
@@ -91,6 +93,7 @@ pub(super) fn make_message_received_with_origin(
     mode: ActorMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    provider: Option<&str>,
     origin: Option<MessageOrigin>,
     // Set only by the voice path. Every other caller types.
     voice_session_id: Option<Uuid>,
@@ -109,6 +112,7 @@ pub(super) fn make_message_received_with_origin(
         mode,
         model: model.map(|s| s.to_string()),
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
+        provider: provider.map(|s| s.to_string()),
         origin,
         voice_session_id,
     })
@@ -220,6 +224,7 @@ impl crate::engine::LucidosEngine {
         device_id: Option<&str>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        provider: Option<&str>,
         event_id: Option<&str>,
         origin: Option<MessageOrigin>,
         // The *voice session* this message was spoken on. `None` is typed.
@@ -243,15 +248,22 @@ impl crate::engine::LucidosEngine {
         // Stamp the same resolved model / effort the turn would have stamped,
         // so per-thread model memory reads back an unchanged value. The turn
         // re-resolves with this event excluded, landing on the same answer.
-        let (model, reasoning_effort) =
-            crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
-                self.pool(),
-                Some(thread_id),
-                None,
-                model.map(str::to_string),
-                reasoning_effort.map(str::to_string),
-            )
-            .await;
+        let resolved = crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
+            self.pool(),
+            Some(thread_id),
+            None,
+            crate::core::ResolvedModelSelection {
+                model: model.map(str::to_string),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                provider: provider.map(str::to_string),
+            },
+        )
+        .await;
+        let crate::core::ResolvedModelSelection {
+            model,
+            reasoning_effort,
+            provider,
+        } = resolved;
         let device_name = match device_id {
             Some(did) => crate::core::DeviceStore::tooltip_info(self.pool(), did).await,
             None => None,
@@ -275,6 +287,7 @@ impl crate::engine::LucidosEngine {
                     mode,
                     model.as_deref(),
                     reasoning_effort.as_deref(),
+                    provider.as_deref(),
                     origin,
                     voice_session_id,
                 ),
@@ -345,7 +358,13 @@ pub(super) async fn describe_images(
     }];
 
     let response = provider
-        .chat(messages, vec![], None, None, None, reasoning_effort)
+        .chat(
+            messages,
+            vec![],
+            crate::llm::ModelSelection::default().with_effort(reasoning_effort),
+            None,
+            None,
+        )
         .await?;
     if let Some(capture) = capture {
         capture
@@ -443,6 +462,7 @@ mod origin_invariants {
             ActorMode::Human,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -464,6 +484,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Agent,
+            None,
             None,
             None,
             Some(origin),
@@ -490,6 +511,7 @@ mod origin_invariants {
             ActorMode::Human,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -513,6 +535,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Agent,
+            None,
             None,
             None,
             Some(origin),
@@ -543,6 +566,7 @@ mod origin_invariants {
             ActorMode::Engine,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -566,6 +590,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Human,
+            None,
             None,
             None,
             Some(origin),
@@ -594,6 +619,7 @@ mod origin_invariants {
             ActorMode::Human,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -618,6 +644,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Agent,
+            None,
             None,
             None,
             Some(origin),
@@ -649,6 +676,7 @@ mod origin_invariants {
             ActorMode::Agent,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -673,6 +701,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Human,
+            None,
             None,
             None,
             Some(origin),
@@ -700,6 +729,7 @@ mod origin_invariants {
             ActorMode::Engine,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -720,6 +750,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Human,
+            None,
             None,
             None,
             Some(origin),
@@ -747,6 +778,7 @@ mod origin_invariants {
             Some(parent_id),
             spawn_id,
             ActorMode::Agent,
+            None,
             None,
             None,
             None,
@@ -799,6 +831,7 @@ mod origin_invariants {
             ActorMode::Agent,
             None,
             None,
+            None,
             Some(origin),
             None,
         );
@@ -820,6 +853,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
         );
         assert!(res.is_ok());
         let res2 = make_message_received_with_origin(
@@ -831,6 +865,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Agent,
+            None,
             None,
             None,
             None,
@@ -859,6 +894,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             Some(session_id),
         );
         let typed = make_message_received(
@@ -870,6 +906,7 @@ mod origin_invariants {
             None,
             None,
             ActorMode::Human,
+            None,
             None,
             None,
             None,

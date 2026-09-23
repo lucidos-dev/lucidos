@@ -55,7 +55,6 @@ pub(crate) struct SettleFacts {
     /// `thread_summaries.status`.
     pub status: String,
     pub live_event_waits: bool,
-    pub active_children: bool,
     /// `thread_summaries.coding_agent_has_diff`: the branch holds commits the
     /// projection has seen. A settled thread with a diff and no pending change
     /// is one whose `ChangeProposed` is still on its way.
@@ -77,7 +76,6 @@ pub(crate) enum StandingVerdict {
 /// such a thread never settles by itself, so the arm ends here.
 pub(crate) const PARKED_ON_QUESTION: &str = "The thread parked on a question.";
 pub(crate) const PARKED_ON_EVENT_WAIT: &str = "The thread parked on an event wait.";
-pub(crate) const PARKED_ON_SUB_THREAD: &str = "The thread is waiting for a sub-thread.";
 pub(crate) const TURN_FAILED: &str = "The turn failed.";
 pub(crate) const NOTHING_PROPOSED: &str = "The thread settled without proposing a change.";
 pub(crate) const CHANGE_RESOLVED: &str = "The change was already applied or discarded.";
@@ -156,9 +154,9 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
         "paused" => StandingVerdict::Wait,
         "waiting_for_user_answer" => StandingVerdict::Drop(PARKED_ON_QUESTION),
         "failed" => StandingVerdict::Drop(TURN_FAILED),
-        // At rest. Parked counts as ended, per the doc above.
+        // At rest. Parked counts as ended, per the doc above. A running
+        // sub-thread is not parked: the parent's change is whole (ADR 0249).
         _ if facts.live_event_waits => StandingVerdict::Drop(PARKED_ON_EVENT_WAIT),
-        _ if facts.active_children => StandingVerdict::Drop(PARKED_ON_SUB_THREAD),
         _ => match facts.armed_change {
             ArmedChange::Ready(change_id) => StandingVerdict::Fire(change_id),
             // The proposal follows the idle, so a diff on the branch means it
@@ -339,14 +337,14 @@ async fn take_arm_generation(
 /// unknown must not end an instruction the owner set, so the arm keeps its
 /// place and the next event retries.
 async fn read_settle_facts(pool: &sqlx::PgPool, arm: &StandingApply) -> FactsProbe {
-    let probe: Result<Option<(String, i32, i32, bool)>, sqlx::Error> = sqlx::query_as(
-        "SELECT status, live_event_wait_count, active_children_count, coding_agent_has_diff \
+    let probe: Result<Option<(String, i32, bool)>, sqlx::Error> = sqlx::query_as(
+        "SELECT status, live_event_wait_count, coding_agent_has_diff \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(arm.thread_id)
     .fetch_optional(pool)
     .await;
-    let (status, live_waits, active_children, has_diff) = match probe {
+    let (status, live_waits, has_diff) = match probe {
         Ok(Some(row)) => row,
         Ok(None) => return FactsProbe::ThreadGone,
         Err(e) => {
@@ -364,7 +362,6 @@ async fn read_settle_facts(pool: &sqlx::PgPool, arm: &StandingApply) -> FactsPro
     FactsProbe::Ready(SettleFacts {
         status,
         live_event_waits: live_waits > 0,
-        active_children: active_children > 0,
         has_diff,
         armed_change,
     })
@@ -1055,6 +1052,35 @@ mod db_tests {
         teardown_test_db(&db).await;
     }
 
+    /// **A delegating parent settles.** Idle apart from its running children,
+    /// its change is whole, so the arm fires rather than dropping (ADR 0249).
+    /// Read through the real row, so a probe that still read
+    /// `active_children_count` would fail here.
+    #[tokio::test]
+    async fn a_parent_waiting_only_on_sub_threads_fires_its_arm() {
+        let (pool, db) = setup_test_db().await;
+        let parent = Uuid::new_v4();
+        let change = Uuid::new_v4();
+        seed_thread(&pool, parent, "running").await;
+        seed_change(&pool, change, parent, "pending").await;
+        let arm = arm_for(parent, Some(change));
+        insert_arm(&pool, &arm).await.expect("insert arm");
+
+        sqlx::query(
+            "UPDATE thread_summaries SET status = 'idle', active_children_count = 2 \
+             WHERE thread_id = $1",
+        )
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("settle with running children");
+        let FactsProbe::Ready(facts) = read_settle_facts(&pool, &arm).await else {
+            panic!("facts must read back");
+        };
+        assert_eq!(standing_verdict(&facts), StandingVerdict::Fire(change));
+        teardown_test_db(&db).await;
+    }
+
     /// A row survives a restart, and taking it is one-shot.
     #[tokio::test]
     async fn an_arm_is_stored_once_and_taken_once() {
@@ -1406,7 +1432,6 @@ mod tests {
         SettleFacts {
             status: status.to_string(),
             live_event_waits: false,
-            active_children: false,
             has_diff: false,
             armed_change,
         }
@@ -1456,13 +1481,6 @@ mod tests {
         assert_eq!(
             standing_verdict(&waiting),
             StandingVerdict::Drop(PARKED_ON_EVENT_WAIT)
-        );
-
-        let mut child = facts("idle", ArmedChange::Ready(id));
-        child.active_children = true;
-        assert_eq!(
-            standing_verdict(&child),
-            StandingVerdict::Drop(PARKED_ON_SUB_THREAD)
         );
     }
 

@@ -15,7 +15,8 @@ import { psql } from './db-helpers';
  *  inside the loaded pages is restored exactly. A turn BEHIND them is not
  *  chased: the thread opens at the top of the newest page and fetches nothing
  *  (ADR 0234). One test each, and the second is the guard against the chase
- *  being added later.
+ *  being added later. A third covers a turn the thread SHRANK under since the
+ *  save, which lands on the nearest reachable offset at once.
  *
  *  The assertion is the reader's own question: which turn is at the top of the
  *  transcript. Not `scrollTop`, which is exactly the number that stopped
@@ -127,9 +128,17 @@ async function openThread(page: Page, threadId: string, reading?: string): Promi
  *  reader's own question rather than trusting the code under test.
  *
  *  Deliberately NOT `scrollTop`, which is the number that stops meaning the
- *  same thing between the two opens. */
+ *  same thing between the two opens.
+ *
+ *  Read in a frame with no WebKit repaint nudge (`utils/webkitRepaint.ts`). A
+ *  nudge moves the content a pixel and translates the container back over it,
+ *  so the reader sees nothing move. An offset measured from the container's
+ *  box in that frame is a pixel off all the same. */
 async function restingOn(page: Page): Promise<{ id: string | null; relTop: number }> {
-  return page.locator('.thread-content').first().evaluate((el) => {
+  return page.locator('.thread-content').first().evaluate(async (el) => {
+    for (let frame = 0; frame < 60 && el.style.transform.includes('translateZ'); frame++) {
+      await new Promise(requestAnimationFrame);
+    }
     const top = el.getBoundingClientRect().top;
     const turns = Array.from(el.querySelectorAll<HTMLElement>('.chat-exchange'));
     let earliest: { id: string | null; relTop: number } | null = null;
@@ -371,5 +380,52 @@ test.describe('Where a thread reopens', () => {
     const recorded = await page.evaluate(
       (key) => localStorage.getItem(key), scrollKey(threadId));
     expect(recorded, 'giving up must not destroy the reading position').toBe(behindThePage);
+  });
+
+  /** A position the thread SHRANK under lands at once, then holds still.
+   *
+   *  The reader parked at the bottom, and the content below their turn has got
+   *  shorter since: a Thinking row folded, or the keyboard was open. The exact
+   *  offset is out of reach, and no wait can bring it back. So the reader lands
+   *  on the nearest reachable offset at once, and nothing moves them after. */
+  test('a position the thread shrank under lands at once and holds still', async ({ page }) => {
+    const { threadId, messageIds } = seedStepHeavyThread();
+    seededThreads.push(threadId);
+
+    // The newest turn, measured when far more content sat below its top.
+    await openThread(page, threadId, `anchor:-4000:${messageIds[TURNS - 1]}`);
+    const transcript = page.locator('.thread-content').first();
+    await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
+
+    // Well inside `RESTORE_DEADLINE_MS` (3s), so only an immediate landing passes.
+    await page.waitForTimeout(500);
+    const landed = await transcript.evaluate(el => ({
+      top: el.scrollTop,
+      max: el.scrollHeight - el.clientHeight,
+    }));
+    expect(landed.max, 'the transcript must scroll, or landing proves nothing').toBeGreaterThan(10);
+    expect(landed.top, 'the open must land on the reachable end at once')
+      .toBeGreaterThanOrEqual(landed.max - 1);
+    // The named turn is on screen. Not the turn at the top line: this one is
+    // shorter than the pane, so the turn above it reaches the line.
+    const onScreen = await transcript.evaluate((el, id) => {
+      const turn = el.querySelector(`[data-event-id="${id}"]`)!.getBoundingClientRect();
+      const view = el.getBoundingClientRect();
+      return turn.top < view.bottom && turn.bottom > view.top;
+    }, messageIds[TURNS - 1]);
+    expect(onScreen, 'the turn the reader parked on must be on screen').toBe(true);
+
+    // Past every restore deadline, the reader has not moved a pixel.
+    const drift = await transcript.evaluate(async (el) => {
+      const start = el.scrollTop;
+      let worst = 0;
+      const until = performance.now() + 4_000;
+      while (performance.now() < until) {
+        await new Promise(requestAnimationFrame);
+        worst = Math.max(worst, Math.abs(el.scrollTop - start));
+      }
+      return worst;
+    });
+    expect(drift, 'nothing may move the transcript after it opens').toBeLessThanOrEqual(1);
   });
 });

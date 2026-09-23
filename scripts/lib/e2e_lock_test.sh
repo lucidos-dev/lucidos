@@ -169,6 +169,7 @@ reset_emit_sandbox() {
     rm -f "$EMIT_LOCK" "$E2E_WORKSPACE/.lucidos/engine.pid"
     E2E_LOCK_OWNED=""
     SYNTHETIC_PS=""
+    SYNTHETIC_ENV=""
     : > "$CAPTURE"
 }
 
@@ -213,6 +214,23 @@ EOF
     return 0
 }
 
+# ── neutralize the real environment read ────────────────────────────────
+# The `browser` kind asks for a pid's environment through proc_env.sh, whose
+# own suite tests the real reader. SYNTHETIC_ENV holds "PID NAME=VALUE ..."
+# rows. Fails CLOSED like the seams above: an unlisted pid has no environment.
+SYNTHETIC_ENV=""
+proc_env_has_entry() {
+    local want="$1" pair="$2" pid envs
+    while read -r pid envs; do
+        [ "$pid" = "$want" ] || continue
+        case " $envs " in *" $pair "*) return 0 ;; esac
+        return 1
+    done <<EOF
+$SYNTHETIC_ENV
+EOF
+    return 1
+}
+
 PASS=0
 FAIL=0
 
@@ -237,6 +255,7 @@ reset_lock_dir() {
     E2E_LOCK_OWNED=""
     rm -f "$E2E_WORKSPACE/.lucidos/engine.pid"
     SYNTHETIC_PS=""
+    SYNTHETIC_ENV=""
 }
 
 # Spawn a real sleeper and publish its PID in SLEEPER_PID. Must run in the main
@@ -354,19 +373,22 @@ release_e2e_lock
 # ── 4. Stale lock + orphan present → reaped, THEN reclaimed ───────────────
 # The crux of the 2026-06-21 fix: a dead-PID lock with a live orphan must NOT be
 # blindly reclaimed. A REAL sleeper plays the orphaned Playwright browser (fed
-# through the ps seam with an ms-playwright path). The default reaper SIGKILLs it;
-# the liveness-aware ps feed then drops it, so the lock is reclaimed.
+# through the ps seam with an ms-playwright path, and carrying the dead run's
+# marker). The default reaper SIGKILLs it; the liveness-aware ps feed then drops
+# it, so the lock is reclaimed.
 echo "Test 4: stale lock with a live orphan is swept then reclaimed"
 reset_lock_dir
 spawn_sleeper
 orphan=$SLEEPER_PID
 SYNTHETIC_PS="$orphan /Users/x/Library/Caches/ms-playwright/webkit-2287/WebContent.app/Contents/MacOS/WebContent"
+SYNTHETIC_ENV="$orphan PATH=/usr/bin LUCIDOS_E2E_RUN_ID=dead-run"
 cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
 PID=999999
 THREAD_ID=ghost
 WORKTREE=/tmp/ghost
 STARTED=2020-01-01T00:00:00Z
 SCRIPT=e2e-browser
+RUN_ID=dead-run
 EOF
 acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-4.out 2>&1
 rc4=$?
@@ -396,12 +418,14 @@ reset_lock_dir
 spawn_sleeper
 orphan=$SLEEPER_PID
 SYNTHETIC_PS="$orphan /Users/x/Library/Caches/ms-playwright/webkit-2287/WebContent.app/Contents/MacOS/WebContent"
+SYNTHETIC_ENV="$orphan PATH=/usr/bin LUCIDOS_E2E_RUN_ID=dead-run"
 cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
 PID=999999
 THREAD_ID=ghost
 WORKTREE=/tmp/ghost
 STARTED=2020-01-01T00:00:00Z
 SCRIPT=e2e-browser
+RUN_ID=dead-run
 EOF
 # Simulate "couldn't kill it": stub the reaper to a no-op, saving the real one so
 # later tests still have it (bash can't restore a shadowed function via unset).
@@ -450,10 +474,13 @@ spawn_sleeper; cc=$SLEEPER_PID       # a Claude Code session that only MENTIONS 
 # so a full-command-line match here kills the session that runs the suite.
 SYNTHETIC_PS="$wk /Users/x/Library/Caches/ms-playwright/webkit-2287/WebContent.app/Contents/MacOS/WebContent
 $sf /Applications/Safari.app/Contents/MacOS/Safari
-$cc /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: the leak lives under ms-playwright/webkit-2287/ and ms-playwright/chromium-1187/"
+$cc /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: the leak lives under ms-playwright/webkit-2287/ and ms-playwright/chromium-1187/ LUCIDOS_E2E_RUN_ID=scan-run"
+SYNTHETIC_ENV="$wk PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run
+$sf PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run
+$cc PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run"
 echo "$eng" > "$E2E_WORKSPACE/.lucidos/engine.pid"
-scan_out="$(_e2e_list_orphans)"
-SYNTHETIC_PS=""
+scan_out="$(_e2e_list_orphans scan-run)"
+SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 if printf '%s\n' "$scan_out" | grep -qx "browser $wk"; then
     pass "Playwright WebKit child detected as a browser orphan"
 else
@@ -620,6 +647,108 @@ fi
 echo "Test 6f: an empty process feed finds nothing to sweep"
 SYNTHETIC_PS=""; SYNTHETIC_CWD=""
 assert_eq "" "$(_e2e_list_orphans)" "empty feed yields no orphans"
+
+# ── 6g. A foreign Playwright browser survives reclaim AND teardown ───────
+# Every Playwright on the host shares the browsers cache, so a cache argv[0]
+# says only "some Playwright launched this". A reclaim matched on it alone
+# SIGKILLed a Python driver's chrome-headless-shell and other sessions' Chrome
+# for Testing (ADR 0251). Only the run's own marker makes an orphan.
+# The Chrome for Testing argv[0] holds spaces, so it still passes the cache gate.
+echo "Test 6g: a foreign Playwright browser survives the reclaim and the teardown sweep"
+reset_lock_dir
+spawn_sleeper; own=$SLEEPER_PID          # WebKit helper the dead run launched
+spawn_sleeper; venv=$SLEEPER_PID         # a Python driver's headless shell
+spawn_sleeper; other=$SLEEPER_PID        # a browser another run launched
+foreign_ps="$venv /Users/x/Library/Caches/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-mac-arm64/chrome-headless-shell --headless
+$other /Users/x/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+foreign_env="$venv PATH=/usr/bin VIRTUAL_ENV=/Users/x/venv
+$other PATH=/usr/bin LUCIDOS_E2E_RUN_ID=someone-elses-run"
+SYNTHETIC_PS="$own /Users/x/Library/Caches/ms-playwright/webkit-2359/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent
+$foreign_ps"
+SYNTHETIC_ENV="$own PATH=/usr/bin LUCIDOS_E2E_RUN_ID=dead-run
+$foreign_env"
+cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
+PID=999999
+THREAD_ID=ghost
+WORKTREE=/tmp/ghost
+STARTED=2020-01-01T00:00:00Z
+SCRIPT=e2e-browser
+RUN_ID=dead-run
+EOF
+acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-6g-reclaim.out 2>&1
+assert_eq "0" "$?" "reclaim succeeds with foreign browsers alive (no refusal loop)"
+wait_until_dead "$own"
+if orphan_alive "$own"; then
+    fail "the dead run's own browser survived the reclaim (pid $own)"
+else
+    pass "the dead run's own browser was reaped"
+fi
+for pid in "$venv" "$other"; do
+    if orphan_alive "$pid"; then
+        pass "foreign browser pid $pid survived the reclaim"
+    else
+        fail "reclaim SIGKILLed foreign browser pid $pid"
+    fi
+    if grep -q "browser $pid" "$OUT_DIR"/test-6g-reclaim.out; then
+        fail "reclaim listed foreign browser pid $pid as an orphan"
+    fi
+done
+# The teardown half, under the id this acquire just exported, which is what
+# `sweep_e2e_orphans` reads in a real run.
+spawn_sleeper; own2=$SLEEPER_PID
+SYNTHETIC_PS="$own2 /Users/x/Library/Caches/ms-playwright/webkit-2359/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU
+$foreign_ps"
+SYNTHETIC_ENV="$own2 PATH=/usr/bin LUCIDOS_E2E_RUN_ID=${LUCIDOS_E2E_RUN_ID:-}
+$foreign_env"
+sweep_e2e_orphans 2> "$OUT_DIR"/test-6g-teardown.err
+wait_until_dead "$own2"
+if orphan_alive "$own2"; then
+    fail "teardown left this run's own browser alive (pid $own2)"
+else
+    pass "teardown reaped this run's own browser"
+fi
+for pid in "$venv" "$other"; do
+    if orphan_alive "$pid"; then
+        pass "foreign browser pid $pid survived the teardown sweep"
+    else
+        fail "teardown SIGKILLed foreign browser pid $pid"
+    fi
+done
+SYNTHETIC_PS=""; SYNTHETIC_ENV=""
+release_e2e_lock
+kill -KILL "$venv" "$other" 2>/dev/null; wait 2>/dev/null
+
+# ── 6h. No run id means no browser orphans ───────────────────────────────
+# A lock file written before RUN_ID existed has none. Guessing would put every
+# Playwright browser on the host back in scope, so the answer is "none".
+echo "Test 6h: an empty run id finds no browser orphans"
+spawn_sleeper; marked=$SLEEPER_PID
+SYNTHETIC_PS="$marked /Users/x/Library/Caches/ms-playwright/webkit-2359/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"
+SYNTHETIC_ENV="$marked PATH=/usr/bin LUCIDOS_E2E_RUN_ID="
+assert_eq "" "$(_e2e_list_orphans "")" "no run id yields no browser orphan"
+SYNTHETIC_PS=""; SYNTHETIC_ENV=""
+kill -KILL "$marked" 2>/dev/null; wait 2>/dev/null
+
+# ── 6j. Acquire mints, records and exports one run id ────────────────────
+# Every process the run starts must inherit the marker. The WebKit helpers are
+# launchd children that only see `__XPC_`-prefixed variables, so both names are
+# exported. A fresh id per hold keeps one run's sweep off the next run's browsers.
+echo "Test 6j: acquire records the run id in the lock file and exports both names"
+reset_lock_dir
+acquire_e2e_lock e2e-browser >/dev/null 2>&1
+first_id="${LUCIDOS_E2E_RUN_ID:-}"
+if [ -n "$first_id" ]; then pass "acquire set LUCIDOS_E2E_RUN_ID"; else fail "acquire set no run id"; fi
+assert_eq "$first_id" "$(sed -n 's/^RUN_ID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "the lock file records the same run id"
+assert_eq "$first_id" "$(bash -c 'printf %s "${LUCIDOS_E2E_RUN_ID:-}"')" "LUCIDOS_E2E_RUN_ID is exported to children"
+assert_eq "$first_id" "$(bash -c 'printf %s "${__XPC_LUCIDOS_E2E_RUN_ID:-}"')" "__XPC_LUCIDOS_E2E_RUN_ID is exported to children"
+release_e2e_lock
+acquire_e2e_lock e2e-browser >/dev/null 2>&1
+if [ "${LUCIDOS_E2E_RUN_ID:-}" != "$first_id" ]; then
+    pass "a second hold gets a fresh run id"
+else
+    fail "two holds shared run id $first_id"
+fi
+release_e2e_lock
 
 # ── 7. Release only removes a lock we own ────────────────────────────────
 echo "Test 7: release does not remove another owner's lock"
@@ -1112,8 +1241,13 @@ for bad in "" "not-a-number" "99999999999999999999999" "-5"; do
         pass "held_secs is silent for STARTED_EPOCH='$bad'"
     fi
 done
+# 42 or 43: this line and the function each read the clock, and a second
+# boundary can fall between the two reads.
 out="$(_e2e_lock_held_secs "$(( $(date +%s) - 42 ))")"
-assert_eq "42" "$out" "held_secs still measures a well-formed epoch"
+case "$out" in
+    42|43) pass "held_secs still measures a well-formed epoch ($out)" ;;
+    *) fail "held_secs mismeasured a well-formed epoch (expected 42 or 43, got '$out')" ;;
+esac
 
 echo ""
 echo "Test 21: a failed lock-file read does not abort the EXIT trap under \`set -e\`"

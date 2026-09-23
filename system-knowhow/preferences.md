@@ -27,7 +27,7 @@ The other Settings stores have their own tools — don't try to reach them throu
 | Want to change… | Use |
 |---|---|
 | A preference below | `set_preference` |
-| Which models appear in the picker, or a model's context window | `manage_models` |
+| Which models appear in the picker, or a model's routes, preferred provider or context window | `manage_models` |
 | An API key / secret | `request_credential` (never put secrets in a preference) |
 | A non-secret env var | `env_vars` (`action: set`) |
 | A registered repo | `manage_repositories` |
@@ -90,7 +90,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 |---|---|---|---|---|
 | `language` | global | text | (detected from conversation) | Language for responses + session summaries (e.g. "English", "Norwegian"). A *voice session* speaks it. On a Realtime talker it also pins the transcriber to the matching ISO-639-1 code; a Live one has no such setting (ADR 0198). |
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
-| `chat_model` | global | a model id from the registry | `claude-opus-5@default` | Default chat model for NEW threads (a running thread reuses its own last-used model — see "How a write propagates"). Use `manage_models(action='list')` to see options. |
+| `chat_model` | global | a model id from the registry | `claude-opus-5` | Default chat model for NEW threads (a running thread reuses its own last-used model, see "How a write propagates"). Use `manage_models(action='list')` to see options. |
 | `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads (a running thread reuses its own last-used effort; clamped per model). |
 | `response_style` | global | the id of a style in the library | `standard` | How much comes back in a chat or trigger answer. `standard` adds nothing, so answers are as they always were. Shipped beside it: `concise` and `minimal`. Both are editable, and the user may add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids that exist here. An id nothing defines falls back to `standard`. |
 | `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" below. |

@@ -51,6 +51,9 @@ export interface Trigger {
    *  `none|low|medium|high|xhigh|max`. Omitted when the trigger uses the
    *  account default. */
   reasoning_effort?: string;
+  /** The backend the pinned model runs on. Omitted when the model's own
+   *  preferred provider decides. */
+  provider?: string;
 }
 
 export interface CreateTrigger {
@@ -71,6 +74,11 @@ export interface CreateTrigger {
   /** Thinking budget for this trigger's intent fires. Omit / null = the account
    *  default. Must be one of `none|low|medium|high|xhigh|max`. */
   reasoning_effort?: string | null;
+  /** The backend for the pinned model, when it has more than one. Needs a
+   *  `model` pin and must name one of that model's providers. Omit / null = the
+   *  model's own preferred provider. A pin to an unconfigured backend refuses
+   *  the fire. */
+  provider?: string | null;
 }
 
 export interface UpdateTrigger {
@@ -93,6 +101,9 @@ export interface UpdateTrigger {
   /** Pin the trigger's thinking budget (`none|low|medium|high|xhigh|max`) or
    *  clear it back to the account default (null). Absent leaves it unchanged. */
   reasoning_effort?: string | null;
+  /** Pin the backend for the pinned model (string), clear it (null), or leave
+   *  it unchanged (absent). Changing the model drops a pin it cannot use. */
+  provider?: string | null;
 }
 
 export interface ApiResult {

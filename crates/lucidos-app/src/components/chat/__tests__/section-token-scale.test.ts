@@ -19,7 +19,7 @@ function section(name: string, chars: number, role: ContextSection['role'] = 'us
 function capture(over: Partial<ContextCapture> = {}): ContextCapture {
   return {
     producer: 'main_llm',
-    model: 'claude-opus-5@default[1m]',
+    model: 'claude-opus-5[1m]',
     context_window: 1_000_000,
     sections: [
       section('System Instructions', 147_800, 'system'),

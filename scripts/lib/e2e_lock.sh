@@ -14,6 +14,7 @@
 #   STARTED=<ISO 8601 UTC>
 #   STARTED_EPOCH=<the same instant in epoch seconds>
 #   SCRIPT=<entry-point name>
+#   RUN_ID=<this hold's e2e run marker; see _e2e_export_run_id>
 #
 # STARTED_EPOCH is redundant with STARTED and exists so held_secs is portable
 # arithmetic: parsing the ISO form back needs `date -j -f` on BSD and `date -d`
@@ -61,7 +62,10 @@
 # pinned in critical memory pressure for 4+ hours.
 #
 # THREE KINDS of orphan, because a run leaks three kinds of process:
-#   browser: Playwright's browser children, matched by the browsers-cache path.
+#   browser: Playwright's browser children. The browsers-cache path narrows the
+#            candidates, and THIS RUN's marker in the process environment
+#            decides. Every Playwright on the host shares the cache, so the
+#            path alone SIGKILLed other tools' browsers (ADR 0251).
 #   engine:  the e2e-test workspace's own engine, keyed on its pidfile.
 #   agent:   the CODING-AGENT subprocesses the suite's own tests spawn (Claude
 #            Code / Codex, and the `lucidos mcp-permission-server` each one
@@ -96,6 +100,7 @@ _E2E_LK_WORKTREE=""
 _E2E_LK_STARTED=""
 _E2E_LK_STARTED_EPOCH=""
 _E2E_LK_SCRIPT=""
+_E2E_LK_RUN_ID=""
 
 # PID of the announcement `acquire_e2e_lock` backgrounded, so the release can
 # order itself after it. See `_e2e_await_acquire_announcement`.
@@ -104,6 +109,10 @@ E2E_LOCK_ANNOUNCE_PID=""
 # Directory this lib lives in (scripts/lib), used to point operators at stop.sh
 # in the refusal message. Resolved at source time; safe under `set -u`.
 _E2E_LOCK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+# For `proc_env_has_entry`, which decides the `browser` kind.
+# shellcheck source=proc_env.sh
+source "$_E2E_LOCK_LIB_DIR/proc_env.sh"
 
 # Resolve the lock file path. $E2E_LOCK_DIR_OVERRIDE is for tests; otherwise
 # falls back to ~/workspaces/e2e-test/.lucidos/.
@@ -129,12 +138,10 @@ _e2e_orphan_ps() {
     ps -Aww -o pid=,command= 2>/dev/null
 }
 
-# Executable-path substrings that mark a process as a Playwright browser child.
-# Matching by the browsers-cache path (NOT a bare "WebContent") is what keeps us
-# off the user's own Safari/Chrome and unrelated WebKit consumers: the same
-# discriminator webkit_reaper.sh uses, broadened from webkit to every browser
-# engine because a dead run can orphan any of them. Honors
-# PLAYWRIGHT_BROWSERS_PATH like the reaper.
+# Executable-path substrings that mark a process as SOME Playwright browser.
+# They keep us off the user's own Safari/Chrome and unrelated WebKit consumers,
+# and honor PLAYWRIGHT_BROWSERS_PATH like webkit_reaper.sh. They NARROW only:
+# every Playwright on the host shares this cache, so the run marker decides.
 #
 # Tested against argv[0] ONLY, never the whole command line. See _e2e_list_orphans.
 _e2e_orphan_browser_tokens() {
@@ -179,6 +186,26 @@ _e2e_proc_cwd() {
     lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
 }
 
+# ── the e2e run marker ──────────────────────────────────────────────────
+# One random id per hold, written to the lock file and exported, so every
+# process the run starts carries it: the engine, the Playwright runner, and
+# each browser. It is how the sweep and webkit_reaper.sh tell this run's
+# browsers from everyone else's. They read it with `proc_env_has_entry`.
+#
+# The `__XPC_` twin is load-bearing on macOS. WebKit's Networking, GPU and
+# WebContent helpers are XPC services, launchd children from birth, and launchd
+# passes them only `__XPC_`-prefixed variables, with the prefix stripped. So the
+# twin arrives in them as the plain name. See ADR 0251 for the probe.
+_e2e_new_run_id() {
+    local rnd
+    rnd="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    printf '%s-%s-%s' "$(date +%s)" "$$" "${rnd:-$RANDOM$RANDOM}"
+}
+
+_e2e_export_run_id() {
+    export LUCIDOS_E2E_RUN_ID="$1" __XPC_LUCIDOS_E2E_RUN_ID="$1"
+}
+
 # The e2e workspace dir with symlinks resolved, so a prefix test can match the
 # real paths `lsof` reports. Falls back to the unresolved form if it is gone.
 _e2e_resolved_workspace_dir() {
@@ -221,13 +248,16 @@ _e2e_is_ancestor_of_self() {
     return 1
 }
 
-# Emit "KIND PID" for every LIVE orphan of a prior e2e run. KIND ∈ browser|engine|agent.
-# Browser children are matched by the cache-path substring; the engine is keyed on
-# the e2e-test workspace's OWN engine.pid (so we never touch another workspace's
-# engine). PID≤1 and our own shell are always skipped. Test seam: overridden by
-# the test to inject fakes.
+# Emit "KIND PID" for every LIVE orphan of the e2e run whose marker is $1.
+# KIND ∈ browser|engine|agent. A browser must carry that run's marker in its
+# environment, so an empty $1 finds no browser at all (a lock file from before
+# RUN_ID existed). The engine is keyed on the e2e-test workspace's OWN
+# engine.pid (so we never touch another workspace's engine). PID≤1 and our own
+# shell are always skipped.
 _e2e_list_orphans() {
-    local self=$$
+    local run_id="${1:-}" self=$$
+    local marker=""
+    [ -z "$run_id" ] || marker="LUCIDOS_E2E_RUN_ID=$run_id"
     local tokens
     tokens="$(_e2e_orphan_browser_tokens)"
     local pid command tok
@@ -271,14 +301,22 @@ EOF
         # RSS, and since it runs the browser WITHOUT exec it simply exits once we
         # kill its child. Widening to argv[1] would put every `bash -c` whose
         # argument mentions these paths back in scope.
+        local cached=""
         while IFS= read -r tok; do
             [ -z "$tok" ] && continue
             case "${command%% *}" in
-                *"$tok"*) echo "browser $pid"; break ;;
+                *"$tok"*) cached=1; break ;;
             esac
         done <<EOF
 $tokens
 EOF
+        [ -n "$cached" ] || continue
+        # The cache path says only "some Playwright launched this". The marker
+        # in the environment is what says THIS run did. See `proc_env_has_entry`.
+        if [ -z "$marker" ] || ! proc_env_has_entry "$pid" "$marker"; then
+            continue
+        fi
+        echo "browser $pid"
     done
 
     # Coding-agent subprocesses the suite's own tests spawned. Two-stage on
@@ -387,9 +425,12 @@ _e2e_reap_orphans() {
 #
 # Never fails the caller and never blocks it for long: teardown must not turn a
 # green run red, and an orphan that survives is still caught by the reclaim path.
+#
+# Only THIS run's browsers: the marker is the one `acquire_e2e_lock` exported
+# into this shell. A browser any other tool launched is not ours to kill.
 sweep_e2e_orphans() {
     local orphans
-    orphans="$(_e2e_list_orphans 2>/dev/null)" || return 0
+    orphans="$(_e2e_list_orphans "${LUCIDOS_E2E_RUN_ID:-}" 2>/dev/null)" || return 0
     [ -n "$orphans" ] || return 0
     echo "[e2e-lock] teardown: sweeping processes this run left behind:" >&2
     printf '%s\n' "$orphans" | sed 's/^/[e2e-lock]   orphan: /' >&2
@@ -421,6 +462,7 @@ _e2e_read_lock_file() {
     _E2E_LK_STARTED=""
     _E2E_LK_STARTED_EPOCH=""
     _E2E_LK_SCRIPT=""
+    _E2E_LK_RUN_ID=""
     [ -f "$file" ] || return 1
     while IFS='=' read -r key val || [ -n "$key" ]; do
         case "$key" in
@@ -430,14 +472,16 @@ _e2e_read_lock_file() {
             STARTED)       _E2E_LK_STARTED="$val" ;;
             STARTED_EPOCH) _E2E_LK_STARTED_EPOCH="$val" ;;
             SCRIPT)        _E2E_LK_SCRIPT="$val" ;;
+            RUN_ID)        _E2E_LK_RUN_ID="$val" ;;
         esac
     done < "$file"
     return 0
 }
 
 # Atomic create-or-fail using noclobber. Returns 0 on success, non-zero if file exists.
+# RUN_ID goes before SCRIPT so SCRIPT stays last (see the reader above).
 _e2e_lock_write() {
-    local lock_file="$1" script_name="$2"
+    local lock_file="$1" script_name="$2" run_id="$3"
     local thread_id="${LUCIDOS_THREAD_ID:-unknown}"
     local started started_epoch
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -448,6 +492,7 @@ THREAD_ID=$thread_id
 WORKTREE=$PWD
 STARTED=$started
 STARTED_EPOCH=$started_epoch
+RUN_ID=$run_id
 SCRIPT=$script_name
 EOF
     ) 2>/dev/null
@@ -790,8 +835,14 @@ acquire_e2e_lock() {
     # its EXIT trap emits an hour later, is addressed from here.
     _e2e_capture_emit_env
 
-    if _e2e_lock_write "$lock_file" "$script_name"; then
+    # Exported only once the lock file names it, and before anything the run
+    # starts, so every browser this hold launches is findable by its sweep.
+    local run_id
+    run_id="$(_e2e_new_run_id)"
+
+    if _e2e_lock_write "$lock_file" "$script_name" "$run_id"; then
         E2E_LOCK_OWNED="$lock_file"
+        _e2e_export_run_id "$run_id"
         # Backgrounded: the lock is now HELD and the caller has not armed its
         # teardown yet. See the section header above. The pid is kept so the
         # release can order itself after this, rather than racing it.
@@ -821,13 +872,14 @@ acquire_e2e_lock() {
     local existing_pid="$_E2E_LK_PID" existing_thread="$_E2E_LK_THREAD"
     local existing_wt="$_E2E_LK_WORKTREE" existing_started="$_E2E_LK_STARTED"
     local existing_started_epoch="$_E2E_LK_STARTED_EPOCH"
-    local existing_script="$_E2E_LK_SCRIPT"
+    local existing_script="$_E2E_LK_SCRIPT" existing_run_id="$_E2E_LK_RUN_ID"
 
     # Stale (dead PID) — but a dead run can leave ORPHANED e2e processes alive.
     # Sweep them before reclaiming; refuse if the sweep can't clear them. (State 4.)
+    # Browsers are the DEAD run's only, by the marker its lock file recorded.
     if [ -n "$existing_pid" ] && ! kill -0 "$existing_pid" 2>/dev/null; then
         local orphans
-        orphans="$(_e2e_list_orphans)"
+        orphans="$(_e2e_list_orphans "$existing_run_id")"
         if [ -n "$orphans" ]; then
             echo "[e2e-lock] stale lock (owner PID $existing_pid is dead) but the prior" >&2
             echo "[e2e-lock] run left orphaned e2e processes still alive — sweeping before" >&2
@@ -843,7 +895,7 @@ EOF
             case "$timeout_s" in ''|*[!0-9]*) timeout_s=15 ;; esac
             local deadline=$(( $(date +%s) + timeout_s ))
             while [ "$(date +%s)" -lt "$deadline" ]; do
-                orphans="$(_e2e_list_orphans)"
+                orphans="$(_e2e_list_orphans "$existing_run_id")"
                 [ -z "$orphans" ] && break
                 sleep 0.5
             done
@@ -870,8 +922,9 @@ EOF
             echo "[e2e-lock] orphans reaped — reclaiming the stale lock" >&2
         fi
         rm -f "$lock_file"
-        if _e2e_lock_write "$lock_file" "$script_name"; then
+        if _e2e_lock_write "$lock_file" "$script_name" "$run_id"; then
             E2E_LOCK_OWNED="$lock_file"
+            _e2e_export_run_id "$run_id"
             # The dead owner's hold is over, and a waiter blocked on that hold
             # is blocked on exactly this. Announced AFTER the new lock file is
             # written, so a waiter that wakes and retries reads the true state

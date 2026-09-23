@@ -100,6 +100,13 @@ describe('changeRowActions: never a disabled change action', () => {
     expect(changeRowActions(parked, false)).toEqual([]);
   });
 
+  // The thread is working only to finish an apply that hit a conflict, and the
+  // resolver lands the change itself. That apply is already in flight.
+  it('offers nothing on a change whose apply is resolving merge conflicts', () => {
+    const resolving = makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true });
+    expect(changeRowActions(resolving, false)).toEqual([]);
+  });
+
   it('drops Apply for an emptied change and keeps Discard, which resolves it', () => {
     const actions = changeRowActions(makeChange({ file_count: 0 }), false);
     expect(actions.map((a) => a.kind)).toEqual(['discard']);

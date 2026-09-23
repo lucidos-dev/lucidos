@@ -69,6 +69,64 @@ async fn get_pending_by_branch_returns_only_pending() {
     teardown_test_db(&db).await;
 }
 
+/// The case ADR 0106 feared, at the projection. A parent's change is applied,
+/// then the parent commits again on the same branch. `emit_change_proposed`
+/// asks `get_pending_by_branch` for an id to reuse; after the apply that
+/// answers `None`, so the next proposal is a NEW row. The applied row keeps
+/// its status and commits, and the one-pending-per-branch index does not
+/// trip on it (ADR 0249).
+#[tokio::test]
+async fn a_proposal_after_an_apply_on_the_same_branch_is_a_new_change() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let parent = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    start_cc_thread(&bus, parent).await;
+    let proj = ChangesProjection::new(pool.clone());
+
+    emit(
+        &bus,
+        parent,
+        aggregate_proposed(first, "thread-parent", "/repo"),
+    )
+    .await;
+    emit(
+        &bus,
+        parent,
+        applied_event(first, &["feat: first round"], false),
+    )
+    .await;
+
+    assert!(
+        proj.get_pending_by_branch("thread-parent")
+            .await
+            .unwrap()
+            .is_none(),
+        "the proposal path must find no pending change to fold into"
+    );
+
+    let second = Uuid::new_v4();
+    emit(
+        &bus,
+        parent,
+        aggregate_proposed(second, "thread-parent", "/repo"),
+    )
+    .await;
+
+    let pending = proj.pending_for_thread(parent).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, second, "the new round is its own change");
+
+    let applied = proj.get_by_id(first).await.unwrap().expect("applied row");
+    assert_eq!(
+        applied.status, "applied",
+        "the applied change stays applied"
+    );
+    assert_eq!(applied.commits, vec!["feat: first round".to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
 #[tokio::test]
 async fn has_pending_for_branch_reflects_pending_state() {
     let (pool, db) = setup_test_db().await;
@@ -570,6 +628,95 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
     assert!(
         !proj.conflict_pairing_open(thread, change).await.unwrap(),
         "an applied change's pairing reads closed"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The Changes panel reads `resolving_conflict` off the served frame. So a
+/// reload still shows a conflict-resolving apply as in flight, with no
+/// standing apply offered. It takes an open pairing on a thread that has not
+/// finished: a pairing a crash stranded on a settled thread keeps its Discard.
+#[tokio::test]
+async fn enrich_marks_only_changes_whose_conflict_pairing_is_open() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let proj = ChangesProjection::new(pool.clone());
+
+    let conflict = |change: Uuid| ThreadEvent::MergeConflictDetected {
+        change_id: change.to_string(),
+        files: vec!["a.rs".to_string()],
+        origin: None,
+    };
+    let [resolving, untouched, cleared, stranded] =
+        [(); 4].map(|_| (Uuid::new_v4(), Uuid::new_v4()));
+    for (i, (thread, change)) in [resolving, untouched, cleared, stranded]
+        .into_iter()
+        .enumerate()
+    {
+        start_cc_thread(&bus, thread).await;
+        emit(
+            &bus,
+            thread,
+            aggregate_proposed(change, &format!("b{i}"), "/r"),
+        )
+        .await;
+    }
+    for (thread, status) in [
+        (resolving.0, "running"),
+        (untouched.0, "running"),
+        (cleared.0, "running"),
+        (stranded.0, "idle"),
+    ] {
+        sqlx::query("UPDATE thread_summaries SET status = $2 WHERE thread_id = $1")
+            .bind(thread)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    emit(&bus, resolving.0, conflict(resolving.1)).await;
+    emit(&bus, stranded.0, conflict(stranded.1)).await;
+    emit(&bus, cleared.0, conflict(cleared.1)).await;
+    emit(
+        &bus,
+        cleared.0,
+        ThreadEvent::MergeResolutionCleared {
+            change_id: cleared.1.to_string(),
+        },
+    )
+    .await;
+
+    let mut pending = proj.list_pending().await.unwrap();
+    crate::core::changes::enrich_pending_state(&pool, &mut pending)
+        .await
+        .unwrap();
+    for (thread, change) in [resolving, untouched, cleared] {
+        let row = pending
+            .iter()
+            .find(|c| c.id == change)
+            .expect("pending row");
+        assert_eq!(
+            row.resolving_conflict,
+            proj.conflict_pairing_open(thread, change).await.unwrap(),
+            "the served flag and the merge guard read one definition"
+        );
+    }
+    let flagged: Vec<Uuid> = pending
+        .iter()
+        .filter(|c| c.resolving_conflict)
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(
+        flagged,
+        vec![resolving.1],
+        "only the open pairing on an unfinished thread is flagged"
+    );
+    assert!(
+        proj.conflict_pairing_open(stranded.0, stranded.1)
+            .await
+            .unwrap(),
+        "the stranded pairing is still open, so only the thread's state clears the flag"
     );
 
     teardown_test_db(&db).await;

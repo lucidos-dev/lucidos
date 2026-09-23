@@ -144,7 +144,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: super::preferences::DEFAULT_CHAT_MODEL,
-        description: "Default chat model id for NEW Lucidos Agent threads. A thread that's already running reuses its own last-used model, so changing this does NOT switch the current/running thread on its next turn (use the thread's in-thread picker for that). Must be an enabled model id from the registry — call get_preferences or manage_models(action='list') to see the options (e.g. 'claude-opus-5@default', 'claude-fable-5').",
+        description: "Default chat model id for NEW Lucidos Agent threads. A thread that's already running reuses its own last-used model, so changing this does NOT switch the current/running thread on its next turn (use the thread's in-thread picker for that). Must be an enabled model id from the registry: call get_preferences or manage_models(action='list') to see the options (e.g. 'claude-opus-5', 'claude-fable-5').",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {

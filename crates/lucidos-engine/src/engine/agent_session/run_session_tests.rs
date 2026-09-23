@@ -82,6 +82,7 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     };
 
     let message_received = |text: &str| ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.into(),
         user_image_hashes: vec![],
@@ -224,6 +225,7 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     };
 
     let message_received = |text: &str| ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: text.into(),
         user_image_hashes: vec![],

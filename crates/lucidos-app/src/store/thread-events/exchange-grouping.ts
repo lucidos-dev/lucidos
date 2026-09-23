@@ -1676,7 +1676,8 @@ function chatTurnOwner(state: GroupFoldState, previousCurrent: Exchange | null):
  *  Codex, so `toolCallOwners` finds the exchange across any boundary between
  *  them. A chat `ToolCalled` has no such id, so the chat lanes take the last
  *  call step of the turn the request interrupted (`chatTurnOwner`). That is
- *  exact because the chat agentic loop is sequential: one call at a time. */
+ *  exact because a gated call never joins a parallel run, so it is always the
+ *  one call in flight when its request arrives (ADR 0246). */
 function gatedCallOf(
   state: GroupFoldState,
   event: StoredEvent,

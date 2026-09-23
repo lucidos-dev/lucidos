@@ -7,7 +7,9 @@
 //! the [`crate::llm::model_registry`] maps to `ProviderKind::Anthropic`.
 
 use crate::core::AuthType;
-use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::provider::{
+    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -146,11 +148,15 @@ impl LlmProvider for AnthropicProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model_override: Option<&str>,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let ModelSelection {
+            model: model_override,
+            reasoning_effort,
+            ..
+        } = selection;
         let model = model_override.unwrap_or(&self.model);
         self.chat_anthropic(
             messages,

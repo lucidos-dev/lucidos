@@ -148,6 +148,14 @@ pub struct TriggerConfig {
     /// [`Self::model`], so a trigger may pin one and leave the other on the
     /// account default. Intent-only, like `model`.
     pub reasoning_effort: Option<String>,
+    /// The backend this trigger's model runs on, when the model has more than
+    /// one route. `None` (the default) lets the model's own *preferred
+    /// provider* decide, then its first configured route.
+    ///
+    /// A pin naming an unconfigured backend REFUSES the fire, rather than
+    /// running it somewhere else: a trigger fires unattended, so a silent move
+    /// to another vendor is one nobody would notice. Intent-only, like `model`.
+    pub provider: Option<String>,
 }
 
 /// True if `effort` is a reasoning tier a trigger may pin. Shares the closed set
@@ -157,6 +165,12 @@ pub struct TriggerConfig {
 /// when a model's supported tiers change under it.
 pub fn is_valid_reasoning_effort(effort: &str) -> bool {
     crate::core::preference_catalog::REASONING_EFFORTS.contains(&effort)
+}
+
+/// True if `provider` names a backend. The API refuses anything else, so this
+/// only drops a hand-edited value, which must not become a Vertex pin.
+pub fn is_valid_provider(provider: &str) -> bool {
+    crate::llm::ProviderKind::from_name(provider).is_some()
 }
 
 /// Normalize a submitted or stored model / reasoning effort pin: trim, and
@@ -190,6 +204,63 @@ pub fn validate_trigger_reasoning_effort(raw: Option<&str>) -> Result<Option<Str
             effort
         )),
         normalized => Ok(normalized),
+    }
+}
+
+/// Validate a submitted provider pin against the model it would run on.
+///
+/// Blank or absent reads as no pin. A pin must name a backend, needs a model
+/// pin beside it, and must name one of that model's routes. Shared by the HTTP
+/// handlers and the triggers LLM tool, so the two cannot disagree.
+pub fn validate_trigger_provider(
+    registry: &crate::llm::ModelRegistry,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(provider) = normalize_route_setting(provider) else {
+        return Ok(None);
+    };
+    let Some(kind) = crate::llm::ProviderKind::from_name(&provider) else {
+        return Err(crate::llm::model_registry::unknown_provider_message(
+            &provider,
+        ));
+    };
+    let Some(model) = normalize_route_setting(model) else {
+        return Err(format!(
+            "A provider pin needs a model pin: '{provider}' says which backend serves \
+             the trigger's model, so set model too"
+        ));
+    };
+    match crate::llm::model_registry::route_on(registry, &model, kind) {
+        Some(_) => Ok(Some(provider)),
+        None => Err(format!(
+            "Model '{model}' has no route on provider '{provider}'. Pin one of the \
+             model's own providers, or leave provider unset"
+        )),
+    }
+}
+
+/// The provider pin an update leaves a trigger with.
+///
+/// `None` leaves the pin untouched. `Some(None)` clears it, and `Some(Some(p))`
+/// sets it. `new_model` and `new_provider` carry the update's triple state.
+///
+/// A pin belongs to its model. An update that changes the model, clearing
+/// included, drops the old pin unless it names a provider itself.
+pub fn resolve_trigger_provider_update(
+    registry: &crate::llm::ModelRegistry,
+    existing: &TriggerConfig,
+    new_model: Option<Option<&str>>,
+    new_provider: Option<Option<&str>>,
+) -> Result<Option<Option<String>>, String> {
+    let model = match new_model {
+        Some(m) => normalize_route_setting(m),
+        None => existing.model.clone(),
+    };
+    match new_provider {
+        Some(p) => validate_trigger_provider(registry, model.as_deref(), p).map(Some),
+        None if existing.provider.is_some() && model != existing.model => Ok(Some(None)),
+        None => Ok(None),
     }
 }
 
@@ -405,6 +476,7 @@ impl TriggerConfig {
         let model = read_trimmed_string(payload, "model");
         let reasoning_effort = read_trimmed_string(payload, "reasoning_effort")
             .filter(|e| is_valid_reasoning_effort(e));
+        let provider = read_trimmed_string(payload, "provider").filter(|p| is_valid_provider(p));
 
         Ok(TriggerConfig {
             id,
@@ -424,6 +496,7 @@ impl TriggerConfig {
             plugin_id,
             model,
             reasoning_effort,
+            provider,
         })
     }
 
@@ -626,6 +699,14 @@ impl TriggerConfig {
                 self.model = None;
             } else if v.is_string() {
                 self.model = read_trimmed_string(payload, "model");
+            }
+        }
+        if let Some(v) = payload.get("provider") {
+            if v.is_null() {
+                self.provider = None;
+            } else if v.is_string() {
+                self.provider =
+                    read_trimmed_string(payload, "provider").filter(|p| is_valid_provider(p));
             }
         }
         if let Some(v) = payload.get("reasoning_effort") {

@@ -65,6 +65,7 @@ impl LucidosEngine {
                         None,
                         None,
                         reasoning_effort.as_deref(),
+                        None, // provider_override
                         None,
                         None,
                         None,

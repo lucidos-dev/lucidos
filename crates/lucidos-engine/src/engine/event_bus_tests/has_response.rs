@@ -11,6 +11,7 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
@@ -93,6 +94,7 @@ async fn response_canceled_sets_has_response_true() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
@@ -165,6 +167,7 @@ async fn trigger_completed_sets_has_response_true() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("job-tracker".into()),
             prompt: Some("Check jobs".into()),

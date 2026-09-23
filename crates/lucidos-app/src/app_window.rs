@@ -328,9 +328,12 @@ pub(crate) fn toggle_window_maximize(window: tauri::Window) -> Result<(), String
 /// The title is invisible in the window itself, since `titleBarStyle: "Overlay"`
 /// plus `hiddenTitle` leaves that band to the webview. Where it does show is the
 /// Window menu, Mission Control and the window switcher.
+///
+/// Never `window.set_title` directly: on macOS a new title reverts the traffic
+/// lights, and [`traffic_lights::retitle`] is what puts them back.
 #[tauri::command]
 pub(crate) fn set_window_title(window: tauri::Window, title: String) -> Result<(), String> {
-    window.set_title(&title).map_err(|e| format!("{e}"))
+    traffic_lights::retitle(&window, title)
 }
 
 /// Open an additional top-level app window (File → New Window / Cmd+N) on the

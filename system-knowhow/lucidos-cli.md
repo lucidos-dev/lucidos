@@ -762,7 +762,7 @@ its current value, allowed values, default, and scope; `set` changes one.
 ```bash
 $ lucidos preferences get
 $ lucidos preferences set --key timezone --value Europe/Oslo
-$ lucidos preferences set --key chat_model --value claude-opus-4-8@default
+$ lucidos preferences set --key chat_model --value claude-opus-5
 ```
 
 `get` accepts `--device-id <id>` (read device-scoped overrides; omit for the
@@ -793,7 +793,15 @@ $ lucidos triggers delete --id <uuid>
 $ lucidos triggers run --id <uuid>
 # Pin an intent trigger to its own model and thinking budget
 $ lucidos triggers update --id <uuid> --model gemini-3.5-flash --reasoning-effort low
+# Pin which backend serves a model that has more than one route
+$ lucidos triggers update --id <uuid> --model claude-opus-5 --provider anthropic
 ```
+
+`--provider` needs a model pin, from the same request or already on the
+trigger, and must name one of that model's routes. Anything else is refused at
+save time. A later `--model` change clears the pin unless the same request sets
+`--provider` again. At fire time, a pin to a backend with no credential refuses
+the fire rather than running it elsewhere.
 
 `--cron-expressions` entries are validated on `create` and `update`. Within one
 expression the fields are ANDed and across the array they are ORed, so
@@ -806,7 +814,7 @@ preview back rather than assuming the schedule means what you intended;
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
 `--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`,
-`--model`, `--reasoning-effort`;
+`--model`, `--reasoning-effort`, `--provider`;
 `update`/`delete`/`run` take `--id <uuid>`. The chat agent's in-process
 equivalent is the grouped `triggers` tool (`action: create | list | update |
 delete | pause | resume | run`). Pause/resume are tool-only there; the CLI
@@ -925,7 +933,7 @@ At parity, the chat agent has the grouped `env_vars` LLM tool (`list` / `set` /
 `delete`) — the retired `set_environment_variable` name still works as a
 back-compat alias for `set`.
 
-### `lucidos models list | add --id <id> --provider <p> [--label L] [--sort-order N] [--context-window N] | update --id <id> [...] | delete --id <id>`
+### `lucidos models list | add --id <id> (--provider <p> | --routes <JSON>) [--label L] [--sort-order N] [--context-window N] | update --id <id> [...] | delete --id <id>`
 
 Manage the chat-model registry (Settings → Models) — the models in the Lucidos
 Agent's picker.
@@ -937,10 +945,27 @@ $ lucidos models add --id z-ai/glm-5.2 --provider openrouter --label "GLM 5.2" \
 $ lucidos models update --id z-ai/glm-5.2 --context-window 1048576
 $ lucidos models update --id z-ai/glm-5.2 --enabled false   # disable
 $ lucidos models delete --id z-ai/glm-5.2                   # user models only
+# One model, two backends: Vertex first, then OpenRouter under its own id
+$ lucidos models update --id claude-opus-5-5 \
+    --routes '[{"provider":"vertex"},{"provider":"openrouter","id":"anthropic/claude-opus-5-5","context_window":200000}]'
+# Which backend to use when more than one route is configured
+$ lucidos models update --id claude-opus-5-5 --preferred-provider openrouter
 ```
 
-`provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `xai`,
+A provider is one of `vertex`, `anthropic`, `openai`, `openrouter`, `xai`,
 `opencode-free`, `local`.
+
+**A model has an ordered list of routes, one per backend that serves it.**
+Each route names a `provider`, an optional wire `id` (default: the model id),
+and an optional `context_window`. `--routes` takes the whole list as JSON, in
+priority order, and replaces the stored one. A list must not be empty and must
+not name a provider twice. `--provider` and `--context-window` are the
+single-route shorthand: on `add` they build the one route, and on `update` they
+edit the first route.
+
+`--preferred-provider` must name one of the model's routes. It is the same
+setting the picker writes when you choose a provider. A `--routes` edit that
+drops the preferred provider's route clears the preference with it.
 
 **`--context-window` is worth setting on every model you add.** It's the model's
 context window in tokens, and it sizes the engine's context budget. Omit it and
@@ -953,8 +978,10 @@ could hold.
 Set it to the window your model actually serves for the request being made, not
 its headline maximum. Every guess errs low on purpose: under-declaring only trims
 early, whereas over-declaring makes the engine pack a prompt the provider then
-rejects. (This is why bare `claude-*` ids sit at 200k rather than the 1M those
-models advertise — Lucidos requests 1M mode only for the `[1m]` variants.)
+rejects. (This is why most bare `claude-*` ids sit at 200k rather than the 1M
+those models advertise: Lucidos requests 1M mode only for the `[1m]` variants.
+Opus 5, Opus 5.5 and Fable 5.x are the exception. 1M is their default window, so
+their bare builtin rows declare it on each Vertex and Anthropic route.)
 
 `list` shows each model's window, or `inferred from id` when it has none.
 Builtins ship with theirs already declared. Builtins accept a window correction
@@ -962,9 +989,10 @@ too — the vendor can raise a model's window, and a seeded value can be wrong.
 (Clearing one back to inferred is API-only — send `"context_window": null` to
 `PUT /api/v1/models`; there's no CLI flag for it.)
 
-Builtin models can be disabled (`update --enabled false`) and can have their
-context window corrected, but they can't be renamed, re-providered, or deleted —
-their identity is engine-owned. To
+Builtin models can be disabled (`update --enabled false`), and they accept
+route edits (`--routes`, `--provider`, `--context-window`) and a
+`--preferred-provider`. Which backends serve a model is a fact that changes.
+They can't be renamed, re-sorted or deleted: their identity is engine-owned. To
 change the **default** chat model for new threads, set the `chat_model`
 preference instead (a thread that's already running reuses its own last-used
 model — see `preferences.md`). Mirrors the chat agent's `manage_models` tool.

@@ -156,6 +156,9 @@ export interface Step {
    *  ambiguous for parallel calls like two `Read SKILL.md`. Absent for
    *  engine tools and legacy DB rows. */
   tool_use_id?: string;
+  /** The chat `ToolCalled` event this step renders. Its `ToolResult` names
+   *  the same id, which is how a parallel run's results find their rows. */
+  call_event_id?: string;
   /** Legacy fields — kept for old DB rows. New emissions carry these
    *  on `contextCapture.usage`. */
   context_tokens?: number;
@@ -498,6 +501,8 @@ export interface TriggerInfo {
   /** Thinking budget for this trigger's intent fires. Absent = the account
    *  default, same as `model`. */
   reasoning_effort?: string;
+  /** The backend the pinned model runs on. Absent = the model's own default. */
+  provider?: string;
 }
 
 /** A user-visible folder that organizes triggers in the panel. Pure label —

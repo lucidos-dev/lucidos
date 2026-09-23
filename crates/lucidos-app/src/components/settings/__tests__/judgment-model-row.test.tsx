@@ -159,7 +159,7 @@ describe('JudgmentModelRow', () => {
     expect(saveModelSelection).toHaveBeenCalledWith(
       'model_command_judge',
       'reasoning_command_judge',
-      { model: 'claude-haiku-4-5', reasoningEffort: 'low' },
+      { model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null },
     );
   });
 
@@ -174,7 +174,7 @@ describe('JudgmentModelRow', () => {
     expect(saveModelSelection).toHaveBeenCalledWith(
       'model_command_judge',
       'reasoning_command_judge',
-      { model: 'gemini-3.5-flash', reasoningEffort: null },
+      { model: 'gemini-3.5-flash', reasoningEffort: null, provider: null },
     );
   });
 

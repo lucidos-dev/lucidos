@@ -461,15 +461,17 @@ describe('the build-failed toast says what broke, and what to do', () => {
     expect(failedToast()?.message).toContain('something deterministic. Ask a coding agent');
   });
 
-  it('keeps Retry when the cause could not be read at all', async () => {
-    // An unreadable failure is UNKNOWN, never "proved repeatable". Retiring the
+  it('keeps Retry when the cause was not reported at all', async () => {
+    // An unreported failure is UNKNOWN, never "proved repeatable". Retiring the
     // button here would strand a build that the next attempt would have passed.
     mockStatus.mockResolvedValue(failedWith(undefined));
     await checkEngineVersion();
     const toast = failedToast();
     expect(toast?.type).toBe('error');
     expect(toast?.action?.label).toBe('Retry build');
-    expect(toast?.message).toContain('could not read the build output');
+    expect(toast?.message).toContain('the engine did not report why');
+    // The old wording claimed the output was unreadable, which was false.
+    expect(toast?.message).not.toContain('could not read');
   });
 
   it('an old engine that cannot describe its failure still gets a usable toast', async () => {

@@ -45,6 +45,10 @@ pub enum ResponseEvent {
         context_messages: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         trimmed: Option<bool>,
+        /// The `ToolCalled` this step renders, the key its `ToolResult`
+        /// resolves by. Mirrors [`Step::tool_called_event_id`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_called_event_id: Option<String>,
     },
     #[serde(rename = "section_break")]
     SectionBreak { channel: String },

@@ -13,22 +13,24 @@ import {
 
 /** The one place a *model selection* is resolved for a picker.
  *
- *  A model selection is one thing, so picking it is ONE act, reached in two
- *  steps: a model, then one of its tiers. Only the second step reports, and it
- *  reports both halves. The hook writes no store. A compose surface hands it a
- *  per-draft writer and Settings hands it a preference writer, and neither
- *  leaks into the other.
+ *  A model selection is one thing, so picking it is ONE act, reached in steps:
+ *  a model, one of its tiers, then one of its backends when there is a real
+ *  choice. Only the last step reports, and it reports every part. The hook
+ *  writes no store. A compose surface hands it a per-draft writer and Settings
+ *  a preference writer, and neither leaks into the other.
  *
  *  `ModelSelectionPicker` is the one component that renders this. Every
  *  surface mounts it: both prompt-bar control menus, the Settings field and the
  *  trigger form. */
 
-/** What a pick reports back. Both halves always, because the pair is picked
- *  whole. `reasoningEffort: null` means the model has no tiers and the stored
- *  effort no longer applies. */
+/** What a pick reports back. Every part always, because the selection is
+ *  picked whole. `reasoningEffort: null` means the model has no tiers and the
+ *  stored effort no longer applies. `provider: null` means the model offered no
+ *  choice of backend, so a stored pick no longer applies either. */
 export interface ModelSelectionPatch {
   model: string;
   reasoningEffort: string | null;
+  provider: string | null;
 }
 
 export interface ModelSelectionInput {
@@ -39,6 +41,9 @@ export interface ModelSelectionInput {
   /** The currently selected pair. */
   model: string | null;
   effort: string | null;
+  /** The backend this surface picked for a model, or `null` for the model's
+   *  own default. Ignored where the models carry no providers. */
+  providerFor?: (model: string) => string | null;
   onChange: (patch: ModelSelectionPatch) => void;
 }
 
@@ -53,32 +58,44 @@ export interface ModelSelection {
   /** The effort actually in force: the stored one when the model offers it,
    *  else the clamp. `null` when the model has no tiers. */
   effort: string | null;
-  /** Take one encoded pair. Reports both halves, so nothing can be
-   *  half-applied. */
-  pick: (encoded: string) => void;
+  /** The backend in force for `model`, or `null` when it has no routes here. */
+  provider: string | null;
+  /** Take one encoded pair, and the backend when the provider step chose one.
+   *  Reports every part, so nothing can be half-applied. */
+  pick: (encoded: string, provider?: string) => void;
 }
 
 export function useModelSelection(input: ModelSelectionInput): ModelSelection {
   const { models, vocabulary, model, effort, onChange } = input;
+  const rows = modelRows(models, vocabulary, input.providerFor);
+  const current = rows.find((r) => r.value === model);
 
-  const offered = tierOptions(tiersOf(models, model), vocabulary);
+  // The tiers of the backend in force, since efforts differ per backend. A
+  // model with no row offers nothing we can vouch for.
+  const offered = current?.tiers ?? tierOptions(tiersOf(models, model), vocabulary);
   // The STORED pair can still be stale: the model may have been changed
   // elsewhere, or its tier set narrowed under it. A pick cannot leave one
   // behind any more, but a preference written before this could.
   const resolvedEffort = clampToOffered(effort, offered);
 
   return {
-    rows: modelRows(models, vocabulary),
+    rows,
     value: encodePair(model ?? '', resolvedEffort),
     label: formatPair(
-      models.find((m) => m.value === model)?.label ?? model ?? '',
+      current?.label ?? model ?? '',
       offered.find((t) => t.value === resolvedEffort)?.label ?? resolvedEffort,
+      current?.providerLabel,
     ),
     model,
     effort: resolvedEffort,
-    pick: (encoded: string) => {
+    provider: current?.provider ?? null,
+    pick: (encoded: string, provider?: string) => {
       const picked = decodePair(encoded);
-      onChange({ model: picked.model, reasoningEffort: picked.effort });
+      onChange({
+        model: picked.model,
+        reasoningEffort: picked.effort,
+        provider: provider ?? null,
+      });
     },
   };
 }

@@ -1005,6 +1005,52 @@ fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
     );
 }
 
+/// Guard that every merge path clears the applied branch's harden and plan
+/// markers, from one place.
+///
+/// The branch outlives the apply, and a stale harden marker still counts as
+/// hardened. Without the clear, the thread's NEXT change rides the old plan
+/// approval and `/harden` run (ADR 0249). Gated on the accepted emit, so a
+/// suppressed duplicate cannot wipe a marker recorded for newer work. The live
+/// half is the API e2e test
+/// `a_parents_commits_after_an_apply_come_back_as_a_new_change`.
+#[test]
+fn every_apply_clears_the_branch_gate_markers_from_the_shared_emit() {
+    let emitters = include_str!("../change_ops_emitters.rs");
+    let emit_pos = emitters
+        .find("ThreadEvent::ChangeApplied {")
+        .expect("emit_change_applied must emit ChangeApplied");
+    let tail = &emitters[emit_pos..];
+    let accepted_pos = tail
+        .find("if accepted {")
+        .expect("the marker clear must be gated on the emit being accepted");
+    let clear_pos = tail
+        .find("clear_gate_markers_of_applied_change(change_id)")
+        .expect("emit_change_applied must clear the applied branch's markers");
+    assert!(
+        accepted_pos < clear_pos,
+        "the `accepted` gate must wrap the clear"
+    );
+    for fn_name in ["consume_harden_marker(", "consume_plan_marker("] {
+        assert!(tail.contains(fn_name), "the clear must call {fn_name}");
+    }
+    for (label, src) in [
+        (
+            "change_ops/apply.rs",
+            include_str!("../change_ops/apply.rs"),
+        ),
+        (
+            "agent_session/apply_now.rs",
+            include_str!("../agent_session/apply_now.rs"),
+        ),
+    ] {
+        assert!(
+            !src.contains("consume_plan_marker("),
+            "{label} must not clear the plan marker itself: emit_change_applied owns it"
+        );
+    }
+}
+
 /// Guard that `discard_change` feeds the Apply-All driver a terminal signal.
 ///
 /// When the sibling reconcile (or a concurrent user discard) drops a change that

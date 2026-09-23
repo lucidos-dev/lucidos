@@ -26,7 +26,7 @@ vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => 
 let userScrolling = false;
 vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
 
-import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR } from './webkitRepaint';
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR, repaintNudgeShift, settledScrollTop } from './webkitRepaint';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
   it('starts with an immediate (0ms) attempt', () => {
@@ -824,6 +824,51 @@ describe('isRepaintNudging', () => {
     flushFrame();
     flushFrame();
     expect(nudgedSince(t0)).toBe(false);
+  });
+});
+
+describe('settledScrollTop', () => {
+  // A capture taken inside the nudged frame and applied in a later one keeps
+  // the nudge's pixel for good: the restore yields to the write built from it.
+
+  it('reads through the nudge while it is in its nudged frame', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    expect(settledScrollTop(el)).toBe(500); // scheduled, nothing written yet
+
+    flushFrame(); // frame 1: the -1px nudge
+    expect(el.scrollTop).toBe(499);
+    expect(repaintNudgeShift(el)).toBe(-1);
+    expect(settledScrollTop(el)).toBe(500);
+
+    flushFrame(); // frame 2: the restore
+    expect(repaintNudgeShift(el)).toBe(0);
+    expect(settledScrollTop(el)).toBe(500);
+  });
+
+  it('reads through the +1px nudge at the very top too', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.scrollTop).toBe(1);
+    expect(settledScrollTop(el)).toBe(0);
+  });
+
+  it('believes another writer that moved the container mid-nudge', () => {
+    // A restore or a correction landing inside the nudged frame is where the
+    // reader IS now. The nudge yields to it, so nothing is discounted.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    el.scrollTop = 1337;
+    expect(settledScrollTop(el)).toBe(1337);
+    flushFrame(); // the restore yields
+    expect(el.scrollTop).toBe(1337);
+  });
+
+  it('is the plain scrollTop for an element nobody is nudging', () => {
+    const el = fakeEl('', { scrollTop: 420, scrollHeight: 2000, clientHeight: 800 });
+    expect(settledScrollTop(el)).toBe(420);
   });
 });
 

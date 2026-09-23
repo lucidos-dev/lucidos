@@ -2,6 +2,12 @@
 
 **Status:** Accepted (2026-07-30)
 
+**Amended by:** [0250: A moved main merges the release
+commit](0250-a-moved-main-merges-the-release-commit.md). Read "cherry-pick the
+single release commit" below as "merge the release commit". The local and
+`origin` tag now name the release commit itself. The merge puts it in main's
+history, so the tag no longer covers work the release never shipped.
+
 **Amended by:** [0039: The public mirror's `main` is a linear release
 history](0039-the-public-mirror-is-a-linear-release-history.md). Read "the
 orphan" throughout this ADR as "the **published release commit**": since

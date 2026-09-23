@@ -53,7 +53,13 @@ pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
     }];
 
     match provider
-        .chat(messages, vec![], None, None, None, None)
+        .chat(
+            messages,
+            vec![],
+            crate::llm::ModelSelection::default(),
+            None,
+            None,
+        )
         .await
     {
         Ok(response) => {

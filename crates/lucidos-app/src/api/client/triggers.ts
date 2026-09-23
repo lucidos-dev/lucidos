@@ -29,6 +29,8 @@ export function createTrigger(body: {
   model?: string;
   /** Thinking budget for this trigger's intent fires. Omit for the account default. */
   reasoning_effort?: string;
+  /** Backend for the pinned model. Needs a model pin. Omit for the model's own default. */
+  provider?: string;
 }): Promise<ApiResult> {
   return lucidos.triggers.create(body) as Promise<ApiResult>;
 }
@@ -54,6 +56,9 @@ export function updateTrigger(
     /** Pin the intent's thinking budget or clear it back to the account default
      *  (null). Absent leaves it unchanged. */
     reasoning_effort?: string | null;
+    /** Pin the backend for the pinned model, or clear it back to the model's
+     *  own default (null). Absent leaves it unchanged. */
+    provider?: string | null;
   }
 ): Promise<ApiResult> {
   return lucidos.triggers.update(id, body) as Promise<ApiResult>;

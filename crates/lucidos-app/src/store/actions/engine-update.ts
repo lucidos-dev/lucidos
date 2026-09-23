@@ -215,8 +215,8 @@ let acknowledgedBuildFailure: string | null = null;
  *    `wedged` treatment above, applied to a failing build rather than a
  *    fruitless successful one, down to the `dismissable: false` + explicit OK.
  *
- *  An ABSENT failure is not a third shape. The engine could not read its own
- *  build output, so the cause is unknown and Retry stays. That is the same
+ *  An ABSENT failure is not a third shape. Only an older engine omits it, so
+ *  the cause is unknown and Retry stays. That is the same
  *  fallible-but-worth-trying position as an ordinary error. */
 function renderBuildFailedToast(failure: EngineVersionStatus['build_failure']): void {
   // A compiler error line does not end in a full stop, so it would run
@@ -225,7 +225,7 @@ function renderBuildFailedToast(failure: EngineVersionStatus['build_failure']): 
   // "Ask a coding agent" is the honest instruction on a phone: the workspace
   // can fix its own build, and it is the only remedy that does not require
   // being sat at the checkout.
-  const cause = sentence(failure?.summary ?? 'the engine could not read the build output');
+  const cause = sentence(failure?.summary ?? 'the engine did not report why');
   if (failure?.repeatable) {
     if (acknowledgedBuildFailure === cause) return;
     const fix = failure.remedy

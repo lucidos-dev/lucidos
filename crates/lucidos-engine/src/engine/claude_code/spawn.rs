@@ -354,11 +354,14 @@ impl LucidosEngine {
                     None,
                     None,
                     None,
-                    // `reasoning_effort` — the caller's pin, or None to inherit
+                    // `reasoning_effort`: the caller's pin, or None to inherit
                     // the backend default. `resolve_route_overrides` passes a
                     // coding-agent effort straight through: the tier belongs to
                     // CC / Codex, not to the chat registry.
                     reasoning_effort.as_deref(),
+                    // `provider_override`: always None. A coding-agent thread
+                    // runs on its own backend, not on a chat-registry route.
+                    None,
                     images_owned.as_deref(),
                     device_id_owned.as_deref(),
                     Some(true),
@@ -374,8 +377,8 @@ impl LucidosEngine {
                     // backend's picker at the tool boundary. It reaches
                     // `run_direct_agent`'s explicit-param slot, which wins over
                     // the session and thread-event fallbacks, so a spawn runs on
-                    // the model the caller named rather than on the durable
-                    // default in `cc-settings.json`.
+                    // the model the caller named rather than on CC's own
+                    // default.
                     model.as_deref(),
                     Some(coding_agent),
                     None, // pre_emitted_origin — router emits MR itself

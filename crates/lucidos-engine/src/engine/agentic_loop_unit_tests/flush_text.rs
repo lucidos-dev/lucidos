@@ -84,6 +84,7 @@ mod reply_text_tests {
             cache_creation_tokens: None,
             cache_read_tokens: None,
             thinking_chars: None,
+            thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: model_only.map(str::to_string),
         }

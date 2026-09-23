@@ -3,9 +3,9 @@ use crate::engine::change_ops::{
 };
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
-    branch_changed_files, catchup_and_ff_to_main, commits_in_range, consume_harden_marker,
-    consume_plan_marker, default_local_branch, describe_branch_changes, files_have_client_update,
-    files_require_restart, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
+    branch_changed_files, catchup_and_ff_to_main, commits_in_range, default_local_branch,
+    describe_branch_changes, files_have_client_update, files_require_restart, git_cmd, git_ran_ok,
+    has_branch_commits, push_main_in_background,
 };
 use crate::engine::thread_events::{EventChannel, MessageOrigin};
 use crate::engine::{AgentUserInput, LucidosEngine};
@@ -560,14 +560,10 @@ impl LucidosEngine {
                         None,
                     )
                     .await;
-                    // The branch is reset for reuse below, so mirror
-                    // `apply_now_success`: clear the harden + plan markers (the
-                    // next round of work on this branch must re-trigger both
-                    // gates) and make sure the already-merged main reaches the
-                    // remote (the abandoned apply that merged it may never have
-                    // pushed).
-                    consume_harden_marker(&self.pool, repo_root, branch_name).await;
-                    consume_plan_marker(&self.pool, repo_root, branch_name).await;
+                    // The branch is reset for reuse below. `emit_change_applied`
+                    // cleared the applied change's branch markers. Make sure the
+                    // already-merged main reaches the remote: the abandoned
+                    // apply that merged it may never have pushed.
                     self.reset_worktree_and_idle(thread_id, worktree_path).await;
                     push_main_in_background(repo_root);
                     self.broadcast_changes_updated().await;
@@ -700,7 +696,6 @@ impl LucidosEngine {
                     &post_sha,
                     worktree_path,
                     repo_root,
-                    branch_name,
                     actor.clone(),
                 )
                 .await;
@@ -997,7 +992,6 @@ impl LucidosEngine {
                             &post_sha,
                             &worktree_path,
                             &repo_root,
-                            &branch_name,
                             actor,
                         )
                         .await;
@@ -1030,7 +1024,6 @@ impl LucidosEngine {
         post_sha: &str,
         worktree_path: &Path,
         repo_root: &Path,
-        branch_name: &str,
         actor: Option<MessageOrigin>,
     ) -> Vec<String> {
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
@@ -1119,12 +1112,8 @@ impl LucidosEngine {
             }
         }
 
-        consume_harden_marker(&self.pool, repo_root, branch_name).await;
-        // The worktree/branch is reset for reuse below — clear the Planned
-        // marker too so the next round of work on this branch re-triggers the
-        // plan gate (a new planning decision for new work), mirroring the
-        // harden-marker reset.
-        consume_plan_marker(&self.pool, repo_root, branch_name).await;
+        // The branch is reset for reuse below. `emit_change_applied` cleared
+        // the applied change's branch markers, so new work re-triggers both.
         self.reset_worktree_and_idle(thread_id, worktree_path).await;
         push_main_in_background(repo_root);
         self.broadcast_changes_updated().await;

@@ -70,6 +70,8 @@ export type ChangeRowAction =
  *  - Thread unsettled but PARKED: nothing. A standing apply would drop the
  *    moment it was pressed, so offering one is the same broken control in a
  *    new coat. The row's details line says the thread has not finished.
+ *  - Apply resolving merge conflicts: nothing. That apply is already in
+ *    flight, and the row wears its "Applying..." face.
  *  - Nothing left in the change: Discard alone. That IS how an emptied change
  *    is resolved, and Apply is removed rather than faded.
  *  - Otherwise: Discard and Apply, both live.
@@ -78,7 +80,7 @@ export type ChangeRowAction =
  *  expressions in the markup. */
 export function changeRowActions(change: Change, armed: boolean): ChangeRowAction[] {
   if (change.thread_unsettled) {
-    if (!change.thread_working) return [];
+    if (!change.thread_working || change.resolving_conflict) return [];
     return [
       {
         kind: 'standing',
@@ -138,7 +140,9 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
               {/* No action can resolve an unsettled change, so the reason is
                   read here rather than from a tooltip on a control that is
                   not drawn. */}
-              {change.thread_unsettled && ' · The thread has not finished'}
+              {change.resolving_conflict
+                ? ' · Resolving merge conflicts'
+                : change.thread_unsettled && ' · The thread has not finished'}
             </>
           )}
         </SkText>
@@ -399,7 +403,10 @@ export function ChangesView() {
             <>
               {bulkRow}
           {pending.map(change => {
-            const busy = busyIds.value.has(change.id) || busyChangeIds.value.has(change.id);
+            const busy =
+              busyIds.value.has(change.id) ||
+              busyChangeIds.value.has(change.id) ||
+              !!change.resolving_conflict;
             // A change whose thread is mid-turn can't be applied or discarded:
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action). What the

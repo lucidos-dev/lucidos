@@ -12,6 +12,32 @@ use std::time::Duration;
 /// loop multiplies this against `MAX_RETRIES` for the upper bound.
 const HTTP_TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// What one `http_request` attempt came back with, as far as retrying goes.
+#[derive(Clone, Copy, Debug)]
+enum AttemptOutcome {
+    Status(u16),
+    /// The request errored before a response arrived. `never_connected` means
+    /// it never left this machine, so the server cannot have acted on it.
+    SendFailed {
+        never_connected: bool,
+    },
+}
+
+/// Whether `method` may be sent again after `outcome`.
+///
+/// A retry is a second copy of the request. After a 5xx or a request that
+/// went quiet, the server may already have acted on the first copy. So only
+/// an idempotent method (RFC 9110) may repeat then. A 401 or 429 means the
+/// server refused the request before acting on it, so any method may retry.
+fn retry_allowed(method: &str, outcome: AttemptOutcome) -> bool {
+    let idempotent = matches!(method, "GET" | "PUT" | "DELETE");
+    match outcome {
+        AttemptOutcome::Status(401 | 429) => true,
+        AttemptOutcome::Status(status) => status >= 500 && idempotent,
+        AttemptOutcome::SendFailed { never_connected } => idempotent || never_connected,
+    }
+}
+
 /// Build the reqwest client used by `execute_http_tool`. Extracted so the
 /// timeout is set in one place and tests can verify the timeout fires against
 /// a hung server without depending on the full tool surface.
@@ -200,8 +226,10 @@ impl LucidosEngine {
         let mut status: u16 = 0;
         let mut body_bytes = Bytes::new();
         let mut request_error: Option<String> = None;
+        let mut attempts_made = 0;
 
         for attempt in 0..=MAX_RETRIES {
+            attempts_made = attempt + 1;
             let request_builder = match method {
                 "GET" => client.get(url),
                 "POST" => client.post(url),
@@ -253,8 +281,7 @@ impl LucidosEngine {
                     };
                     request_error = None;
 
-                    // Retry on transient errors: 401, 429, 5xx
-                    let retryable = status == 401 || status == 429 || status >= 500;
+                    let retryable = retry_allowed(method, AttemptOutcome::Status(status));
                     if retryable && attempt < MAX_RETRIES {
                         // On 401 with OAuth provider, force-refresh the token before retrying
                         if status == 401 {
@@ -294,7 +321,10 @@ impl LucidosEngine {
                 }
                 Err(e) => {
                     request_error = Some(format!("{}", e));
-                    if attempt < MAX_RETRIES {
+                    let outcome = AttemptOutcome::SendFailed {
+                        never_connected: e.is_connect(),
+                    };
+                    if attempt < MAX_RETRIES && retry_allowed(method, outcome) {
                         let delay = 1u64 << attempt;
                         log!(@http_request, "Request failed for {} — retrying in {}s (attempt {}/{}): {}",
                             url, delay, attempt + 1, MAX_RETRIES, e);
@@ -306,11 +336,10 @@ impl LucidosEngine {
             }
         }
 
-        // Connection error after all retries
         if let Some(err) = request_error {
             return Ok(format!(
-                "Error: Request failed after {} retries: {}",
-                MAX_RETRIES, err
+                "Error: Request failed after {} attempt(s): {}",
+                attempts_made, err
             ));
         }
 
@@ -445,6 +474,68 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A POST re-sent after the server may have acted on it can send an email,
+    /// place an order or charge a card twice. Only a request the server never
+    /// saw, or refused outright, may go again.
+    #[test]
+    fn a_post_is_never_resent_after_the_server_may_have_acted_on_it() {
+        for outcome in [
+            AttemptOutcome::Status(500),
+            AttemptOutcome::Status(502),
+            AttemptOutcome::Status(503),
+            AttemptOutcome::SendFailed {
+                never_connected: false,
+            },
+        ] {
+            assert!(!retry_allowed("POST", outcome), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_post_the_server_refused_or_never_saw_may_retry() {
+        for outcome in [
+            AttemptOutcome::Status(401),
+            AttemptOutcome::Status(429),
+            AttemptOutcome::SendFailed {
+                never_connected: true,
+            },
+        ] {
+            assert!(retry_allowed("POST", outcome), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn idempotent_methods_keep_every_retry() {
+        for method in ["GET", "PUT", "DELETE"] {
+            for outcome in [
+                AttemptOutcome::Status(401),
+                AttemptOutcome::Status(429),
+                AttemptOutcome::Status(500),
+                AttemptOutcome::Status(503),
+                AttemptOutcome::SendFailed {
+                    never_connected: false,
+                },
+                AttemptOutcome::SendFailed {
+                    never_connected: true,
+                },
+            ] {
+                assert!(retry_allowed(method, outcome), "{method} {outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_final_answer_is_never_retried() {
+        for method in ["GET", "POST"] {
+            for status in [200, 201, 204, 302, 400, 403, 404, 422] {
+                assert!(
+                    !retry_allowed(method, AttemptOutcome::Status(status)),
+                    "{method} {status}"
+                );
+            }
+        }
+    }
 
     /// Regression guard for `harden-engine-tools-http-no-timeout`. Before the
     /// fix, `execute_http_tool` built its reqwest client with

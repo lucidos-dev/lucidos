@@ -164,6 +164,7 @@ async fn user_status(queue: &ThreadQueue, thread_id: Uuid) -> Option<&'static st
 
 fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
     crate::triggers::TriggerConfig {
+        provider: None,
         id: id.to_string(),
         name: format!("Trigger {id}"),
         slug: id.to_string(),
@@ -294,6 +295,7 @@ async fn materialize_trigger_thread(bus: &EventBus, thread_id: Uuid, trigger_id:
     bus.emit(BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::TriggerStarted {
+            provider: None,
             trigger_id: trigger_id.to_string(),
             trigger_name: Some(format!("Trigger {trigger_id}")),
             prompt: Some("run it".to_string()),
@@ -1543,6 +1545,7 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "hello".into(),
             user_image_hashes: vec![],
@@ -1861,6 +1864,7 @@ async fn reconcile_ignores_background_thread() {
         .emit(BusEvent::Thread {
             thread_id: tid,
             event: crate::engine::thread_events::ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: "spawned".into(),
                 user_image_hashes: vec![],
@@ -1959,6 +1963,7 @@ fn affects_user_running_selects_status_transitions() {
     // Gate-covered starts: the gate owns the add, so reconcile must NOT fire on
     // these (a reconcile add would race the gate's unconditional add).
     assert!(!affects_user_running(&ThreadEvent::MessageReceived {
+        provider: None,
         voice_session_id: None,
         text: "hi".into(),
         user_image_hashes: vec![],

@@ -16,6 +16,7 @@ use std::time::Duration;
 use super::{format_search_result, WebSearchProvider, SEARCH_SYSTEM_PROMPT};
 use crate::llm::anthropic::chat::{auth_header, ANTHROPIC_VERSION};
 use crate::llm::anthropic::{AnthropicAuth, ANTHROPIC_OAUTH_BETA};
+use crate::llm::anthropic_wire::{thinking_mode, ThinkingMode};
 use crate::llm::ANTHROPIC_API_BASE_URL;
 
 /// Output ceiling for the summary Claude writes over the search results. Small
@@ -23,6 +24,11 @@ use crate::llm::ANTHROPIC_API_BASE_URL;
 /// picks, so reusing the user's own Anthropic chat model (see
 /// `provider_build::search_model_for`) can't turn one search into a large bill.
 const MAX_TOKENS: u32 = 2048;
+
+/// The ceiling for a model that thinks unless told otherwise. Thinking counts
+/// toward `max_tokens`, so 2048 could run out before the summary began. Such a
+/// request also sends effort `low`, which keeps the thinking itself small.
+const THINKING_MAX_TOKENS: u32 = 8192;
 
 /// Whole-request timeout. A grounded search that hasn't answered by now is not
 /// going to; failing lets the chain try the next backend.
@@ -71,9 +77,13 @@ fn search_tool_type_for(model: &str) -> &'static str {
 /// Build the `/v1/messages` body. Pure, so the shape is unit-testable without
 /// a network call.
 fn build_request(model: &str, query: &str) -> serde_json::Value {
-    serde_json::json!({
+    let thinks_by_default = matches!(
+        thinking_mode(model),
+        Some(ThinkingMode::OnByDefault | ThinkingMode::AlwaysOn)
+    );
+    let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": if thinks_by_default { THINKING_MAX_TOKENS } else { MAX_TOKENS },
         "system": SEARCH_SYSTEM_PROMPT,
         "messages": [{ "role": "user", "content": query }],
         "tools": [{
@@ -81,7 +91,11 @@ fn build_request(model: &str, query: &str) -> serde_json::Value {
             "name": "web_search",
             "max_uses": MAX_SEARCHES,
         }],
-    })
+    });
+    if thinks_by_default {
+        body["output_config"] = serde_json::json!({ "effort": "low" });
+    }
+    body
 }
 
 /// Flatten the response into the same shape every other backend returns: answer
@@ -145,11 +159,9 @@ fn parse_response(
         && answer.trim().is_empty()
         && sources.is_empty()
     {
-        return Err(format!(
-            "Anthropic search response hit the {MAX_TOKENS}-token output cap before returning \
-             any result"
-        )
-        .into());
+        return Err(
+            "Anthropic search response hit its output cap before returning any result".into(),
+        );
     }
 
     // A genuinely empty result renders as the "no results" line and stays `Ok`,
@@ -300,7 +312,32 @@ mod tests {
         assert_eq!(req["model"], "claude-opus-5");
         assert_eq!(req["messages"][0]["content"], "rust release date");
         assert_eq!(req["tools"][0]["name"], "web_search");
-        assert_eq!(req["max_tokens"], MAX_TOKENS);
+    }
+
+    /// A model that thinks unless told otherwise spends part of `max_tokens`
+    /// on thinking, so 2048 could end the search with no summary at all.
+    #[test]
+    fn a_model_that_thinks_by_default_searches_at_low_effort_with_room() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5",
+        ] {
+            let req = build_request(model, "q");
+            assert_eq!(req["max_tokens"], THINKING_MAX_TOKENS, "{model}");
+            assert_eq!(req["output_config"]["effort"], "low", "{model}");
+            assert!(req.get("thinking").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn every_other_model_keeps_the_small_search_request() {
+        for model in ["claude-haiku-4-5", "claude-opus-4-8", "claude-sonnet-4-6"] {
+            let req = build_request(model, "q");
+            assert_eq!(req["max_tokens"], MAX_TOKENS, "{model}");
+            assert!(req.get("output_config").is_none(), "{model}");
+        }
     }
 
     #[test]

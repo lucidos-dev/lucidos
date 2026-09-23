@@ -76,6 +76,7 @@ async fn spawn_idle_parent(bus: &EventBus) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do something".into(),
             user_image_hashes: vec![],
@@ -170,6 +171,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "child task".into(),
             user_image_hashes: vec![],
@@ -251,6 +253,7 @@ async fn spawn_cc_child(
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
@@ -337,6 +340,7 @@ async fn spawn_idle_chat_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid) -
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "delegated task".into(),
             user_image_hashes: vec![],
@@ -792,6 +796,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
@@ -913,6 +918,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
     bus.emit(BusEvent::Thread {
         thread_id: fresh_child,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fresh cc child".into(),
             user_image_hashes: vec![],

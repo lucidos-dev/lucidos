@@ -1368,3 +1368,128 @@ fn validate_trigger_reasoning_effort_rejects_an_unknown_tier() {
         "error lists the accepted tiers: {err}"
     );
 }
+
+// --- Per-trigger provider pin -----------------------------------------------
+
+/// A registry holding one model served by `vertex` then `anthropic`.
+fn two_route_registry() -> crate::llm::ModelRegistry {
+    use crate::llm::model_registry::{ModelRouting, RouteEntry};
+    use crate::llm::ProviderKind;
+    let registry = crate::llm::model_registry::empty();
+    registry.write().unwrap().insert(
+        "claude-opus-5".to_string(),
+        ModelRouting {
+            routes: vec![
+                RouteEntry::new(ProviderKind::Vertex, "claude-opus-5"),
+                RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5"),
+            ],
+            preferred: None,
+        },
+    );
+    registry
+}
+
+#[test]
+fn validate_trigger_provider_accepts_a_route_of_the_model() {
+    let registry = two_route_registry();
+    assert_eq!(
+        validate_trigger_provider(&registry, Some("claude-opus-5"), Some(" anthropic ")),
+        Ok(Some("anthropic".to_string()))
+    );
+}
+
+#[test]
+fn validate_trigger_provider_reads_blank_as_no_pin() {
+    let registry = two_route_registry();
+    assert_eq!(validate_trigger_provider(&registry, None, None), Ok(None));
+    assert_eq!(
+        validate_trigger_provider(&registry, None, Some("  ")),
+        Ok(None)
+    );
+}
+
+/// A typo must be refused, never stored and never read as Vertex.
+#[test]
+fn validate_trigger_provider_refuses_an_unknown_provider() {
+    let registry = two_route_registry();
+    let err =
+        validate_trigger_provider(&registry, Some("claude-opus-5"), Some("antropic")).unwrap_err();
+    assert!(err.contains("Unknown provider 'antropic'"), "{err}");
+}
+
+/// A provider says which backend serves the model, so it means nothing alone.
+#[test]
+fn validate_trigger_provider_refuses_a_pin_without_a_model() {
+    let registry = two_route_registry();
+    let err = validate_trigger_provider(&registry, None, Some("anthropic")).unwrap_err();
+    assert!(err.contains("needs a model pin"), "{err}");
+}
+
+#[test]
+fn validate_trigger_provider_refuses_a_provider_the_model_has_no_route_on() {
+    let registry = two_route_registry();
+    let err = validate_trigger_provider(&registry, Some("claude-opus-5"), Some("openrouter"))
+        .unwrap_err();
+    assert!(err.contains("'claude-opus-5'"), "names the model: {err}");
+    assert!(err.contains("'openrouter'"), "names the provider: {err}");
+}
+
+fn pinned_trigger() -> TriggerConfig {
+    created_with(json!({ "model": "claude-opus-5", "provider": "anthropic" }))
+}
+
+#[test]
+fn provider_update_leaves_the_pin_alone_when_neither_field_moves() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, None),
+        Ok(None)
+    );
+    // Re-sending the same model is not a model change.
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(Some("claude-opus-5")), None),
+        Ok(None)
+    );
+}
+
+#[test]
+fn provider_update_null_clears_the_pin() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, Some(None)),
+        Ok(Some(None))
+    );
+}
+
+/// Clearing the model drops the provider with it, since a pin belongs to its
+/// model.
+#[test]
+fn provider_update_clearing_the_model_clears_the_pin() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(None), None),
+        Ok(Some(None))
+    );
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(Some("gpt-5.5")), None),
+        Ok(Some(None))
+    );
+}
+
+/// A provider-only update validates against the model the trigger already has.
+#[test]
+fn provider_update_validates_against_the_existing_model() {
+    let registry = two_route_registry();
+    let existing = created_with(json!({ "model": "claude-opus-5" }));
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, Some(Some("vertex"))),
+        Ok(Some(Some("vertex".to_string())))
+    );
+    let unpinned = created_with(json!({}));
+    let err = resolve_trigger_provider_update(&registry, &unpinned, None, Some(Some("vertex")))
+        .unwrap_err();
+    assert!(err.contains("needs a model pin"), "{err}");
+}

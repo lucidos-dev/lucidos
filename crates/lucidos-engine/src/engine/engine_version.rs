@@ -70,9 +70,9 @@ pub enum BuildState {
     ///
     /// Carries WHY, for the same reason `Building` carries its instant. The
     /// toast has to tell the user something they can act on. "Failed, but
-    /// nobody knows why" is not worth being able to represent. `None` only
-    /// when the build's own output could not be read back.
-    Failed { reason: Option<BuildFailure> },
+    /// nobody knows why" is not representable: a failure no recognizer names
+    /// still reports its exit status and last output line.
+    Failed { reason: BuildFailure },
 }
 
 /// Why a background build failed, reduced to what a toast can carry.
@@ -100,6 +100,18 @@ pub struct BuildFailure {
     pub repeatable: bool,
 }
 
+impl BuildFailure {
+    /// A failure with a summary and nothing else: no remedy to suggest, and
+    /// never proved repeatable, so Retry stays offered.
+    pub(crate) fn plain(summary: String) -> Self {
+        BuildFailure {
+            summary,
+            remedy: None,
+            repeatable: false,
+        }
+    }
+}
+
 /// Longest summary a toast should carry. Past this the line stops being
 /// readable on a phone, which is the device this whole shape exists for.
 const BUILD_FAILURE_SUMMARY_CAP: usize = 200;
@@ -118,9 +130,9 @@ const BUILD_FAILURE_SUMMARY_CAP: usize = 200;
 /// error line, then the wrapper script's own `ERROR:` for a build that died
 /// before cargo ran. See [`script_error`] for why the last one exists.
 ///
-/// `None` when the output carries no error at all. One of the three prints for
-/// any real failure, so nothing found means the output was never captured. The
-/// caller must then say the cause is unknown rather than invent one.
+/// `None` when the output carries no error line at all. This function never
+/// invents a cause; the caller reports what it saw instead, through
+/// [`unrecognized_build_failure`].
 pub fn classify_build_failure(
     output: &str,
     previous_summary: Option<&str>,
@@ -139,14 +151,11 @@ pub fn classify_build_failure(
         .map(str::trim)
         .filter(|l| !l.is_empty());
 
-    let summary = panic_message
-        .or(error_line)
-        .or_else(|| script_error(output))?;
-    let summary = summary
-        .get(..summary.floor_char_boundary(BUILD_FAILURE_SUMMARY_CAP))
-        .unwrap_or(summary)
-        .trim_end()
-        .to_string();
+    let summary = cap_summary(
+        panic_message
+            .or(error_line)
+            .or_else(|| script_error(output))?,
+    );
 
     // BOTH halves are required, and each answers a way the other is wrong.
     //
@@ -167,14 +176,37 @@ pub fn classify_build_failure(
     })
 }
 
+/// The failure no recognizer names, described by what the engine saw: the exit
+/// status, and the last line the build printed.
+///
+/// This is what keeps a silent failure honest. A build can die before it
+/// prints anything, and the toast then said the output could not be read. The
+/// output had been read; there was none. Pure, so both shapes are testable.
+fn unrecognized_build_failure(exit: &str, last_line: Option<&str>) -> BuildFailure {
+    let summary = match last_line {
+        Some(line) => format!("the build stopped ({exit}) after printing \"{line}\""),
+        None => format!("the build stopped ({exit}) without printing anything"),
+    };
+    BuildFailure::plain(cap_summary(&summary))
+}
+
+/// Trim a summary to [`BUILD_FAILURE_SUMMARY_CAP`] without splitting a
+/// character.
+fn cap_summary(summary: &str) -> String {
+    summary
+        .get(..summary.floor_char_boundary(BUILD_FAILURE_SUMMARY_CAP))
+        .unwrap_or(summary)
+        .trim_end()
+        .to_string()
+}
+
 /// The wrapper script's own refusal, for a build that died before cargo ran.
 ///
 /// `web-dev.sh --engine-build` is a shell script and can fail on its own terms.
 /// A missing tool, a Docker daemon that is down, a preflight that refuses. Each
 /// prints `ERROR:` at line start, the convention every `scripts/lib/*.sh` uses,
-/// and none is a cargo diagnostic. The two recognizers above therefore found
-/// nothing, and the toast said "the engine could not read the build output".
-/// That message is false: the output was captured and named its cause.
+/// and none is a cargo diagnostic. The two recognizers above therefore find
+/// nothing, while the script's own line names the cause.
 ///
 /// RANKED LAST, after the panic and the cargo error, and that ordering is the
 /// point. A compile failure is the more specific cause whenever both appear.
@@ -234,10 +266,10 @@ impl BuildState {
         }
     }
 
-    /// Why this build failed, when it did and the output could be read.
+    /// Why this build failed, or `None` when it is not a failed build.
     pub fn failure(&self) -> Option<&BuildFailure> {
         match self {
-            BuildState::Failed { reason } => reason.as_ref(),
+            BuildState::Failed { reason } => Some(reason),
             _ => None,
         }
     }
@@ -264,9 +296,9 @@ impl BuildState {
         BuildState::Ready { built_head }
     }
 
-    /// A failed build carrying why, when the output could be read. The one
-    /// constructor for `Failed`, matching its two siblings above.
-    pub fn failed_with(reason: Option<BuildFailure>) -> Self {
+    /// A failed build carrying why. The one constructor for `Failed`, matching
+    /// its two siblings above.
+    pub fn failed_with(reason: BuildFailure) -> Self {
         BuildState::Failed { reason }
     }
 }
@@ -505,8 +537,7 @@ pub struct VersionStatus {
     /// Why the last build failed, absent unless `build_state` is `failed`.
     ///
     /// The toast renders this INSTEAD of pointing at the engine log, which a
-    /// phone cannot open. Absent on a failure means the build's output could
-    /// not be read, and the toast says the cause is unknown.
+    /// phone cannot open. Always present on a failure from this engine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_failure: Option<BuildFailure>,
     /// How long THIS engine's own background rebuild has been running, in ms,
@@ -1161,7 +1192,8 @@ impl LucidosEngine {
             // its locals, the lock guard among them, are dropped. Bounded
             // without a timeout because every await in that task is cancel-safe
             // and already unblocked at cancellation: the SSE emit, the lock
-            // wait's sleep, and `Child::wait`.
+            // wait's sleep, `Child::wait`, the output pipe's reads, and the
+            // drain timeout.
             if let Some(old) = superseded {
                 let _ = old.await;
             }
@@ -1224,9 +1256,8 @@ impl LucidosEngine {
 /// surface the "build failed" toast.
 enum EngineBuildOutcome {
     Succeeded,
-    /// Carries why, so the toast can say it. `None` only when the build's own
-    /// output could not be read back.
-    Failed(Option<BuildFailure>),
+    /// Carries why, so the toast can say it.
+    Failed(BuildFailure),
     SkippedLocked,
 }
 
@@ -1655,7 +1686,7 @@ async fn current_head_sha() -> Option<String> {
 }
 
 /// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
-/// appending output to the workspace engine log. The build runs in its own
+/// copying its output into the workspace engine log. The build runs in its own
 /// process group so a coalescing abort kills `cargo` too, not just the script
 /// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for
 /// the whole build, and returns `SkippedLocked` when a peer already holds it.
@@ -1686,110 +1717,197 @@ async fn run_engine_build(
         Ok(s) => s,
         Err(e) => {
             crate::log!("[Rebuild] cannot locate web-dev.sh: {e}");
-            return EngineBuildOutcome::Failed(Some(BuildFailure {
-                summary: format!("cannot locate web-dev.sh: {e}"),
-                remedy: None,
-                repeatable: false,
-            }));
+            return EngineBuildOutcome::Failed(BuildFailure::plain(format!(
+                "cannot locate web-dev.sh: {e}"
+            )));
         }
     };
     let ws = workspace.to_string_lossy().to_string();
-    let log_path = workspace.join(".lucidos/engine.log");
-    // Where THIS build's output will start. The build appends to the shared
-    // engine log. Without the mark, a failure would read back every earlier
-    // build's errors too and report the oldest one.
-    //
-    // `None` is UNKNOWN, never 0. Defaulting an unreadable length to the start
-    // of the file would report some long-dead build's error as this one's.
-    let log_start = std::fs::metadata(&log_path).map(|m| m.len()).ok();
     let mut cmd = tokio::process::Command::new(&script);
     cmd.args(["-w", &ws, "--engine-build"]).kill_on_drop(true);
     // Own process group, so a coalescing abort can reach the `cargo` grandchild
     // and not just this script. See `BuildProcessGroupGuard`.
     crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
-    if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        match f.try_clone() {
-            Ok(f2) => {
-                cmd.stdout(f).stderr(f2);
-            }
-            Err(_) => {
-                cmd.stdout(f);
-            }
-        }
-    }
-    // `spawn` + `wait` rather than `status`, so the pid is in hand for the
-    // group-kill guard before the wait can be cancelled.
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            crate::log!("[Rebuild] failed to spawn engine build: {e}");
-            return EngineBuildOutcome::Failed(Some(BuildFailure {
-                summary: format!("could not start the build: {e}"),
-                remedy: None,
-                repeatable: false,
-            }));
-        }
-    };
-    let mut group_guard = BuildProcessGroupGuard(child.id());
-    let status = child.wait().await;
-    // Reaped: the pid may now be recycled, so the group must not be signalled.
-    group_guard.disarm();
-    match status {
-        Ok(status) if status.success() => EngineBuildOutcome::Succeeded,
-        Ok(status) => {
+    let log_path = workspace.join(".lucidos/engine.log");
+    match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE).await {
+        Ok((status, _)) if status.success() => EngineBuildOutcome::Succeeded,
+        Ok((status, output)) => {
             crate::log!("[Rebuild] engine build exited {status}");
-            let output = build_output_since(&log_path, log_start);
-            let reason = classify_build_failure(&output, previous_failure);
-            if let Some(r) = &reason {
-                crate::log!("[Rebuild] cause: {}", r.summary);
-            }
+            let reason = classify_build_failure(&output.head_text(), previous_failure)
+                .unwrap_or_else(|| {
+                    unrecognized_build_failure(&status.to_string(), output.last_line().as_deref())
+                });
+            crate::log!("[Rebuild] cause: {}", reason.summary);
             EngineBuildOutcome::Failed(reason)
         }
         Err(e) => {
-            crate::log!("[Rebuild] engine build could not be waited on: {e}");
-            EngineBuildOutcome::Failed(Some(BuildFailure {
-                summary: format!("the build could not be waited on: {e}"),
-                remedy: None,
-                repeatable: false,
-            }))
+            crate::log!("[Rebuild] {e}");
+            EngineBuildOutcome::Failed(BuildFailure::plain(e))
         }
     }
 }
 
-/// Longest slice of a failed build's output to read back. Cargo stops at the
-/// error, so it sits near the start of what this build appended. The cap
-/// therefore costs nothing and bounds a pathological log.
-const BUILD_OUTPUT_READ_CAP: u64 = 512 * 1024;
+/// How long to wait for a build's output to end after the build exits. A
+/// process the build left running can hold the pipe open indefinitely, so the
+/// build's result does not wait on end-of-file.
+const BUILD_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// What the build appended to the engine log, from `start` to the cap.
+/// Run `cmd` with stdout and stderr on ONE pipe that this function drains. It
+/// copies every chunk into `log_path` and keeps the text for
+/// [`classify_build_failure`].
 ///
-/// Empty when the log cannot be read, and when `start` is `None`. An absent
-/// mark means there is no way to tell this build's output from an older one's.
-/// `classify_build_failure` then finds no error line and reports the cause as
-/// unknown, which is the honest answer rather than a stale one.
-fn build_output_since(log_path: &std::path::Path, start: Option<u64>) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut buf = String::new();
-    let Some(start) = start else { return buf };
-    if let Ok(mut f) = std::fs::File::open(log_path) {
-        if f.seek(SeekFrom::Start(start)).is_ok() {
-            // Lossy, deliberately. A partial UTF-8 sequence can land at the
-            // cap, and a decode error must not cost us the error line before
-            // it.
-            let mut bytes = Vec::new();
-            if f.take(BUILD_OUTPUT_READ_CAP)
-                .read_to_end(&mut bytes)
-                .is_ok()
-            {
-                buf = String::from_utf8_lossy(&bytes).into_owned();
+/// A pipe rather than the log file itself, because the file failed for real.
+/// Handed the log as its stdout, the build exited 1 in under a second and wrote
+/// zero bytes: its first `echo` failed under `set -e`, and so did the error
+/// message. The pipe stays writable while this function reads it. So a log that
+/// cannot be written costs the copy, never the build, and says so with its
+/// real error.
+///
+/// One pipe for both streams keeps them in the order they were printed.
+async fn run_capturing_output(
+    mut cmd: tokio::process::Command,
+    log_path: &std::path::Path,
+    drain_grace: Duration,
+) -> Result<(std::process::ExitStatus, BuildOutput), String> {
+    use tokio::io::AsyncReadExt;
+    let capture_failed = |e: std::io::Error| format!("could not capture the build output: {e}");
+    let (sender, mut receiver) = tokio::net::unix::pipe::pipe().map_err(capture_failed)?;
+    let stdout = sender.into_blocking_fd().map_err(capture_failed)?;
+    let stderr = stdout.try_clone().map_err(capture_failed)?;
+    cmd.stdout(stdout).stderr(stderr);
+    // `spawn` + `wait` rather than `status`, so the pid is in hand for the
+    // group-kill guard before the wait can be cancelled.
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start the build: {e}"))?;
+    // Our copies of the write end must go, or end-of-file never arrives.
+    drop(cmd);
+    let mut group_guard = BuildProcessGroupGuard(child.id());
+    let mut output = BuildOutput::new(log_path);
+    let mut buf = vec![0u8; 8192];
+    let mut open = true;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            read = receiver.read(&mut buf), if open => match read {
+                Ok(0) => open = false,
+                Err(e) => {
+                    crate::log!("[Rebuild] stopped reading the build output: {e}");
+                    open = false;
+                }
+                Ok(n) => output.push(&buf[..n]),
+            },
+        }
+    };
+    // Reaped: the pid may now be recycled, so the group must not be signalled.
+    group_guard.disarm();
+    let status = status.map_err(|e| format!("the build could not be waited on: {e}"))?;
+    if open {
+        let drained = tokio::time::timeout(drain_grace, async {
+            while let Ok(n @ 1..) = receiver.read(&mut buf).await {
+                output.push(&buf[..n]);
             }
+        })
+        .await;
+        if drained.is_err() {
+            crate::log!(
+                "[Rebuild] a process the build started still holds its output open; \
+                 its output keeps going to the log in the background"
+            );
+            // Keep the read end alive. Closing it would turn that process's
+            // next write into a SIGPIPE, which the log file never did.
+            let mut log = output.log.take();
+            tokio::spawn(async move {
+                use std::io::Write;
+                let mut buf = vec![0u8; 8192];
+                while let Ok(n @ 1..) = receiver.read(&mut buf).await {
+                    if let Some(Err(e)) = log.as_mut().map(|f| f.write_all(&buf[..n])) {
+                        crate::log!("[Rebuild] stopped copying late build output: {e}");
+                        log = None;
+                    }
+                }
+            });
         }
     }
-    buf
+    Ok((status, output))
+}
+
+/// How much of a build's output to keep for [`classify_build_failure`]. Cargo
+/// stops at the error, so it sits near the start. The cap therefore costs
+/// nothing and bounds a pathological build.
+const BUILD_OUTPUT_HEAD_CAP: usize = 512 * 1024;
+
+/// How much of the END of a build's output to keep, for the last line an
+/// unrecognized failure reports.
+const BUILD_OUTPUT_TAIL_CAP: usize = 4 * 1024;
+
+/// What a build printed, as it arrives: the head the classifier reads, a short
+/// tail for the last line, and the copy into the engine log.
+struct BuildOutput {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    log: Option<std::fs::File>,
+    log_path: std::path::PathBuf,
+}
+
+impl BuildOutput {
+    /// Opens `log_path` for appending. A log that cannot be opened is logged
+    /// and skipped: the copy is a convenience, the build is not.
+    fn new(log_path: &std::path::Path) -> Self {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .inspect_err(|e| {
+                crate::log!(
+                    "[Rebuild] cannot open {} to copy the build output: {e}",
+                    log_path.display()
+                );
+            })
+            .ok();
+        BuildOutput {
+            head: Vec::new(),
+            tail: Vec::new(),
+            log,
+            log_path: log_path.to_path_buf(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        use std::io::Write;
+        if let Some(log) = &mut self.log {
+            if let Err(e) = log.write_all(chunk) {
+                crate::log!(
+                    "[Rebuild] stopped copying the build output to {}: {e}",
+                    self.log_path.display()
+                );
+                self.log = None;
+            }
+        }
+        let room = BUILD_OUTPUT_HEAD_CAP.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > 2 * BUILD_OUTPUT_TAIL_CAP {
+            self.tail.drain(..self.tail.len() - BUILD_OUTPUT_TAIL_CAP);
+        }
+    }
+
+    /// The kept head as text. Lossy, deliberately: a partial UTF-8 sequence
+    /// can land at the cap, and a decode error must not cost the error line
+    /// before it.
+    fn head_text(&self) -> String {
+        String::from_utf8_lossy(&self.head).into_owned()
+    }
+
+    /// The last non-blank line the build printed, or `None` when it printed
+    /// nothing but whitespace.
+    fn last_line(&self) -> Option<String> {
+        String::from_utf8_lossy(&self.tail)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .map(str::to_string)
+    }
 }
 
 #[cfg(test)]
@@ -1798,9 +1916,11 @@ mod tests {
         acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
         disk_upgrade_verdict, engine_build_lock_path, lock_held_at, open_teardown,
-        parse_pending_commits, rebuild_is_wedged, self_heal_is_wedged, stash_first_restart_actor,
-        try_lock_file, wants_pending_commits, BuildProcessGroupGuard, BuildState, CommitGroupKind,
-        BUILD_FAILURE_SUMMARY_CAP, COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
+        parse_pending_commits, rebuild_is_wedged, run_capturing_output, self_heal_is_wedged,
+        stash_first_restart_actor, try_lock_file, unrecognized_build_failure,
+        wants_pending_commits, BuildFailure, BuildOutput, BuildProcessGroupGuard, BuildState,
+        CommitGroupKind, BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
+        COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
     };
     use crate::engine::thread_events::MessageOrigin;
     use std::time::Duration;
@@ -1896,10 +2016,9 @@ Caused by:
     }
 
     #[test]
-    fn output_that_could_not_be_read_reports_no_cause_at_all() {
-        // The safety direction. Empty output means the log could not be read,
-        // NOT that the build failed for a knowable reason. Inventing one here
-        // is how a toast starts lying.
+    fn output_with_no_error_line_is_not_given_a_cause() {
+        // The classifier never invents a cause. The caller describes what it
+        // saw instead, through `unrecognized_build_failure`.
         assert!(classify_build_failure("", None).is_none());
         assert!(classify_build_failure("   Compiling lucidos-engine v0.1.0\n", None).is_none());
     }
@@ -2020,16 +2139,142 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     }
 
     #[test]
+    fn a_silent_failure_says_it_printed_nothing() {
+        // The incident: exit 1 in under a second, zero bytes. The output WAS
+        // read; there was none. Saying it could not be read was the lie.
+        let f = unrecognized_build_failure("exit status: 1", None);
+        assert_eq!(
+            f.summary,
+            "the build stopped (exit status: 1) without printing anything"
+        );
+        assert_eq!(f.remedy, None);
+        assert!(!f.repeatable, "an unknown cause never retires Retry");
+    }
+
+    #[test]
+    fn an_unrecognized_failure_quotes_its_last_line() {
+        let f = unrecognized_build_failure("signal: 9 (SIGKILL)", Some("Building engine..."));
+        assert_eq!(
+            f.summary,
+            "the build stopped (signal: 9 (SIGKILL)) after printing \"Building engine...\""
+        );
+        let long = "\u{e9}".repeat(400);
+        let f = unrecognized_build_failure("exit status: 1", Some(&long));
+        assert!(f.summary.len() <= BUILD_FAILURE_SUMMARY_CAP);
+    }
+
+    #[test]
     fn the_failure_rides_in_the_variant_and_only_the_failed_variant_has_one() {
         // Same argument as `Building` carrying its instant: "failed, but nobody
         // knows why" should not be reachable through the state.
-        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None);
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
         let state = BuildState::failed_with(f);
         assert_eq!(state.as_wire(), "failed");
         assert!(state.failure().is_some());
         assert!(BuildState::Idle.failure().is_none());
         assert!(BuildState::ready_from(None).failure().is_none());
         assert!(BuildState::building_now().failure().is_none());
+    }
+
+    // ── Capturing the build's output ─────────────────────────────────────────
+
+    fn shell(script: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-build-output-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn both_streams_are_captured_in_order_and_copied_to_the_log() {
+        let dir = scratch_dir("order");
+        let log = dir.join("engine.log");
+        let (status, output) = run_capturing_output(
+            shell("echo first; echo second >&2; echo third; exit 3"),
+            &log,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the build must run");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(output.head_text(), "first\nsecond\nthird\n");
+        assert_eq!(output.last_line().as_deref(), Some("third"));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "first\nsecond\nthird\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_log_that_cannot_be_written_never_fails_the_build() {
+        // The incident class. Handed the log as its stdout, the build died on
+        // its first `echo` and said nothing. Through the pipe it cannot.
+        let dir = scratch_dir("unwritable");
+        let log = dir.join("engine.log");
+        std::fs::write(&log, "").unwrap();
+        let mut perms = std::fs::metadata(&log).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+        std::fs::set_permissions(&log, perms).unwrap();
+        let (status, output) = run_capturing_output(
+            shell("set -e; echo Building engine...; echo done"),
+            &log,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the build must run");
+        assert!(status.success(), "{status}");
+        assert_eq!(output.last_line().as_deref(), Some("done"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_process_left_holding_the_pipe_does_not_hang_the_build() {
+        // A daemon the build started inherits the write end, so end-of-file
+        // may never come. The grace bounds the wait.
+        let dir = scratch_dir("lingering");
+        let started = std::time::Instant::now();
+        let (status, output) = run_capturing_output(
+            shell("sleep 5 & echo done"),
+            &dir.join("engine.log"),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("the build must run");
+        assert!(status.success());
+        assert_eq!(output.last_line().as_deref(), Some("done"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "waited {:?} for a pipe a daemon held open",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_output_keeps_a_bounded_head_and_tail() {
+        let dir = scratch_dir("caps");
+        let mut output = BuildOutput::new(&dir.join("engine.log"));
+        output.push(b"error: the first line wins\n");
+        let filler = vec![b'x'; 1024];
+        for _ in 0..(BUILD_OUTPUT_HEAD_CAP / filler.len() + 8) {
+            output.push(&filler);
+        }
+        output.push(b"\nthe last line\n");
+        assert_eq!(output.head.len(), BUILD_OUTPUT_HEAD_CAP);
+        assert!(output.head_text().starts_with("error: the first line wins"));
+        assert!(output.tail.len() <= 2 * BUILD_OUTPUT_TAIL_CAP);
+        assert_eq!(output.last_line().as_deref(), Some("the last line"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── The restart-actor stash ──────────────────────────────────────────────
@@ -2452,7 +2697,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         // A compile error is retryable, not wedged.
         assert!(!self_heal_is_wedged(
             1,
-            &BuildState::failed_with(None),
+            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
             Some("head1")
         ));
         // Idle: no build outcome to judge (the caller already excluded Building).
@@ -2487,7 +2732,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         // Only a COMPLETED build is evidence.
         assert!(!rebuild_is_wedged(&BuildState::Idle, Some("head1")));
         assert!(!rebuild_is_wedged(
-            &BuildState::failed_with(None),
+            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
             Some("head1")
         ));
         assert!(!rebuild_is_wedged(
@@ -2757,7 +3002,11 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert!(BuildState::building_now().elapsed().is_some());
         assert!(BuildState::Idle.elapsed().is_none());
         assert!(BuildState::ready_from(None).elapsed().is_none());
-        assert!(BuildState::failed_with(None).elapsed().is_none());
+        assert!(
+            BuildState::failed_with(BuildFailure::plain("error: boom".into()))
+                .elapsed()
+                .is_none()
+        );
         assert_eq!(BuildState::building_now().as_wire(), "building");
         // The HEAD a build was started from is bookkeeping for the wedge
         // verdict, not a new wire state: `ready` stays `ready` either way.

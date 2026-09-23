@@ -181,6 +181,20 @@ describe('the Changes panel row', () => {
     expect(host.textContent).toContain('The thread has not finished');
   });
 
+  // The served flag alone carries it, so a reload shows the apply in flight
+  // with the live `MergeConflictDetected` bookkeeping empty.
+  it('shows an apply resolving merge conflicts as in flight, with no standing apply', () => {
+    changes.value = {
+      status: 'loaded',
+      data: [makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true })],
+    };
+    render(<ChangesView />, host);
+    expect(actionLabels()).not.toContain('Apply as it settles');
+    expect(actionLabels()).toContain('Applying...');
+    expect(host.textContent).toContain('Resolving merge conflicts');
+    expect(host.textContent).not.toContain('The thread has not finished');
+  });
+
   it('draws no disabled Apply for a change with nothing left in it', () => {
     changes.value = {
       status: 'loaded',
@@ -273,6 +287,14 @@ describe("the thread's own prompt row", () => {
   it('carries a tooltip, which a disabled button would make unreachable', () => {
     render(getStandingApplyControl(), host);
     expect(promptRowControl().getAttribute('data-tooltip')).toBeTruthy();
+  });
+
+  it('offers nothing while the thread resolves an apply that hit merge conflicts', () => {
+    changes.value = {
+      status: 'loaded',
+      data: [makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true })],
+    };
+    expect(getStandingApplyControl()).toBeNull();
   });
 
   it('offers nothing once the thread has settled, where Apply itself takes over', () => {

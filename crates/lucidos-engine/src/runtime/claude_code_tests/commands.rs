@@ -210,12 +210,145 @@ fn control_request_deserializes_all_variants() {
     }
 }
 
+fn write_settings(dir: &Path, body: serde_json::Value) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("settings.json"), body.to_string()).unwrap();
+}
+
+fn effort_env(value: &str) -> Vec<(String, String)> {
+    vec![("CLAUDE_CODE_EFFORT_LEVEL".to_string(), value.to_string())]
+}
+
+/// Regression: the label read a value cached at engine startup, so it kept
+/// saying `xhigh` after the workspace var changed to `high`.
 #[test]
-fn read_cc_default_effort_reads_settings() {
-    let result = read_cc_default_effort();
-    if let Some(ref v) = result {
-        assert!(is_valid_effort(v), "Unexpected effort level: {}", v);
+fn default_effort_follows_a_changed_workspace_env_var() {
+    let project = tempfile::TempDir::new().unwrap();
+    let resolve = |env: &[(String, String)]| {
+        CcSettingsScope {
+            env,
+            inherited: |_| None,
+            config_dir: None,
+            project_dir: project.path(),
+        }
+        .default_effort()
+    };
+    assert_eq!(resolve(&effort_env("xhigh")).as_deref(), Some("xhigh"));
+    assert_eq!(resolve(&effort_env("high")).as_deref(), Some("high"));
+}
+
+/// The user settings live under the session's `CLAUDE_CONFIG_DIR`, not `$HOME`,
+/// and the project settings under its worktree, not the engine's cwd.
+#[test]
+fn default_effort_reads_the_sessions_own_settings_files() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    write_settings(config.path(), serde_json::json!({ "effortLevel": "low" }));
+    let scope = CcSettingsScope {
+        env: &[],
+        inherited: |_| None,
+        config_dir: Some(config.path()),
+        project_dir: project.path(),
+    };
+    assert_eq!(scope.default_effort().as_deref(), Some("low"));
+
+    write_settings(
+        &project.path().join(".claude"),
+        serde_json::json!({ "effortLevel": "medium" }),
+    );
+    assert_eq!(
+        scope.default_effort().as_deref(),
+        Some("medium"),
+        "project settings outrank the user's"
+    );
+    assert_eq!(
+        CcSettingsScope {
+            env: &effort_env("max"),
+            ..scope
+        }
+        .default_effort()
+        .as_deref(),
+        Some("max"),
+        "the env var outranks every settings file"
+    );
+}
+
+/// A level from the engine's own launch env reaches CC, so the label reads it
+/// too. A workspace var still outranks it, as it does in the spawned env.
+#[test]
+fn default_effort_reads_what_cc_inherits_below_the_workspace_var() {
+    let project = tempfile::TempDir::new().unwrap();
+    let mut scope = CcSettingsScope {
+        env: &[],
+        inherited: |name| (name == "CLAUDE_CODE_EFFORT_LEVEL").then(|| "low".to_string()),
+        config_dir: None,
+        project_dir: project.path(),
+    };
+    assert_eq!(scope.default_effort().as_deref(), Some("low"));
+    let env = effort_env("high");
+    scope.env = &env;
+    assert_eq!(scope.default_effort().as_deref(), Some("high"));
+}
+
+#[test]
+fn default_effort_skips_an_unknown_level() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    write_settings(config.path(), serde_json::json!({ "effortLevel": "high" }));
+    let scope = CcSettingsScope {
+        env: &effort_env("turbo"),
+        inherited: |_| None,
+        config_dir: Some(config.path()),
+        project_dir: project.path(),
+    };
+    assert_eq!(scope.default_effort().as_deref(), Some("high"));
+}
+
+#[test]
+fn default_model_prefers_anthropic_model_over_the_user_settings() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    write_settings(
+        config.path(),
+        serde_json::json!({ "model": "claude-opus-5-5[1m]" }),
+    );
+    let mut scope = CcSettingsScope {
+        env: &[],
+        inherited: |_| None,
+        config_dir: Some(config.path()),
+        project_dir: project.path(),
+    };
+    assert_eq!(
+        scope.default_model().as_deref(),
+        Some("claude-opus-5-5[1m]")
+    );
+
+    let env = vec![("ANTHROPIC_MODEL".to_string(), "claude-sonnet-5".to_string())];
+    scope.env = &env;
+    assert_eq!(scope.default_model().as_deref(), Some("claude-sonnet-5"));
+}
+
+/// With no pin, the Init handler reconciles CC's echo against the user's own
+/// default, so a `[1m]` they configured survives into the label.
+#[test]
+fn an_unpinned_session_keeps_the_1m_suffix_of_the_users_default() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    write_settings(
+        config.path(),
+        serde_json::json!({ "model": "claude-opus-5-5[1m]" }),
+    );
+    let default_model = CcSettingsScope {
+        env: &[],
+        inherited: |_| None,
+        config_dir: Some(config.path()),
+        project_dir: project.path(),
     }
+    .default_model();
+    assert_eq!(
+        reconcile_cc_model(default_model.as_deref(), "claude-opus-5-5"),
+        "claude-opus-5-5[1m]"
+    );
 }
 
 #[test]

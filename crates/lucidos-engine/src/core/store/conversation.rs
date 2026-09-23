@@ -116,8 +116,14 @@ impl EventStore {
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(true);
 
-                    if let Some(last_step) = current_steps.last_mut() {
-                        last_step.success = success;
+                    // A legacy row carries no call id, and falls to the newest step.
+                    let call_id =
+                        super::tool_called_event_id_of(&event.payload).map(|id| id.to_string());
+                    if let Some(step) = current_steps.iter_mut().rev().find(|step| match &call_id {
+                        Some(id) => step.tool_called_event_id.as_deref() == Some(id.as_str()),
+                        None => true,
+                    }) {
+                        step.success = success;
                     }
 
                     let tool_name = event

@@ -99,6 +99,202 @@ where
     }
 }
 
+/// Tools that may run at the same time as their neighbours in one batch.
+///
+/// Every entry is a pure read. None has a command guard lane, none routes
+/// through `handle_special_tool`, none emits a thread event while it runs, and
+/// none writes. Adding a tool here means checking all four (ADR 0246).
+pub(crate) const PARALLEL_SAFE_TOOLS: &[&str] = &[
+    tn::READ_FILE,
+    tn::LIST_FILES,
+    tn::GLOB_FILES,
+    tn::GREP_FILES,
+    tn::WEB_SEARCH,
+    tn::FETCH_NEWS,
+    tn::QUERY_EVENTS,
+    tn::COUNT_EVENTS,
+    tn::LIST_EVENT_TYPES,
+];
+
+/// The most calls of one parallel run in flight at once. It bounds the
+/// pressure a batch of web searches puts on the search provider.
+pub(crate) const MAX_PARALLEL_TOOL_CALLS: usize = 4;
+
+/// Whether this call may run beside its neighbours. It judges the name
+/// `execute_tool` will dispatch on, so a grouped tool counts only when its
+/// `action` resolves to an allowlisted flat name.
+pub(crate) fn is_parallel_safe(name: &str, args: &serde_json::Value) -> bool {
+    super::super::tools::dispatch_name(name, args)
+        .is_ok_and(|dispatched| PARALLEL_SAFE_TOOLS.contains(&dispatched))
+}
+
+/// The exclusive end of the parallel run that starts at `start`: the block of
+/// consecutive parallel-safe calls. A run never crosses another call, so a
+/// read that follows a write in the same batch still sees the write.
+pub(crate) fn parallel_run_end(calls: &[crate::llm::provider::ToolCall], start: usize) -> usize {
+    start
+        + calls[start..]
+            .iter()
+            .take_while(|call| is_parallel_safe(&call.name, &call.arguments))
+            .count()
+}
+
+/// Run futures `MAX_PARALLEL_TOOL_CALLS` at a time and return their outputs in
+/// input order. Each one's own side effects land when it finishes.
+///
+/// Unordered underneath on purpose. An ordered buffer holds a finished call's
+/// slot until every earlier call is done. One slow call would then delay the
+/// start of every call queued behind it.
+pub(crate) async fn run_concurrently<F: std::future::Future>(calls: Vec<F>) -> Vec<F::Output> {
+    use futures::StreamExt;
+    let mut finished: Vec<(usize, F::Output)> = futures::stream::iter(
+        calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| async move { (index, call.await) }),
+    )
+    .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+    .collect()
+    .await;
+    finished.sort_by_key(|(index, _)| *index);
+    finished.into_iter().map(|(_, output)| output).collect()
+}
+
+/// What one call of a parallel run leaves for the loop's bookkeeping. Its
+/// `ToolCalled` and `ToolResult` were emitted when it started and finished.
+pub(super) struct ParallelRead {
+    pub(super) tool_called_event_id: Option<Uuid>,
+    /// The raw outcome text, as the ordinary path's `result`.
+    pub(super) result: String,
+    /// What the model sees, as the ordinary path's `split.llm_text`.
+    pub(super) llm_text: String,
+    pub(super) is_error: bool,
+}
+
+impl LucidosEngine {
+    /// Persist and broadcast `ToolCalled` for one call, and log it as step
+    /// `step` of `max`. Returns the event id, which pairs the result and
+    /// becomes a spawned thread's `spawning_event_id`.
+    pub(super) async fn emit_tool_called(
+        &self,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        tool_call: &crate::llm::provider::ToolCall,
+        step: usize,
+        max: usize,
+    ) -> Option<Uuid> {
+        // Mask any postgres password the LLM hardcoded into a command BEFORE
+        // it reaches the log, the description or the args. The description
+        // renders in the steps UI just like the args, so both come from the
+        // redacted copy; see `core::redact_postgres_secrets_in_json`.
+        let mut redacted_args = tool_call.arguments.clone();
+        crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
+        let description = self.describe_tool(&tool_call.name, &redacted_args);
+        log!("[AgentLoop] Step {}/{}: {}", step, max, description);
+        self.event_bus
+            .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ToolCalled {
+                    name: tool_call.name.clone(),
+                    description,
+                    args: redacted_args,
+                },
+                meta: meta.clone(),
+            })
+            .await
+    }
+
+    /// Persist and broadcast one call's `ToolResult`, taking the split's images.
+    ///
+    /// It always stamps the originating `ToolCalled`'s id. A parallel run
+    /// answers in completion order, so every reader pairs a result by that id.
+    /// The frontend also routes the result to its exchange through it
+    /// (`chatToolCallOwners`).
+    pub(super) async fn emit_tool_result(
+        &self,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        name: &str,
+        split: &mut ToolResultSplit,
+        success: bool,
+        tool_called_event_id: Option<Uuid>,
+    ) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                        name: name.to_string(),
+                        result: crate::core::sanitize_for_jsonb(split.event_text()),
+                        images: std::mem::take(&mut split.images),
+                        success,
+                        tool_called_event_id,
+                    },
+                    meta: meta.clone(),
+                },
+                "[AgenticLoop] ToolResult",
+            )
+            .await;
+    }
+
+    /// Run a block of parallel-safe calls at once, each reporting as it goes.
+    ///
+    /// Every call emits `ToolCalled` when it starts and `ToolResult` the moment
+    /// it finishes, so each step row shows what really happened (ADR 0246).
+    /// The cancel race wraps only the work, never the emits: a dropped future
+    /// must not leave a call without its result. Outputs come back in call
+    /// order, which is the order the model receives them in.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_parallel_reads(
+        &self,
+        calls: &[crate::llm::provider::ToolCall],
+        first_step: usize,
+        max_steps: usize,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        extraction_ctx: &str,
+        request_id: Uuid,
+        device_id: Option<&str>,
+        cancel_token: &CancellationToken,
+    ) -> Vec<ParallelRead> {
+        let reads = calls.iter().enumerate().map(|(offset, call)| async move {
+            let tool_called_event_id = self
+                .emit_tool_called(thread_id, meta, call, first_step + offset, max_steps)
+                .await;
+            let work = self.execute_tool(
+                &call.name,
+                &call.arguments,
+                extraction_ctx,
+                request_id,
+                device_id,
+                cancel_token,
+                thread_id,
+            );
+            let (result, is_error) = match run_tool_with_cancel(work, cancel_token).await {
+                Ok(text) => (text, false),
+                Err(text) => (text, true),
+            };
+            let mut split = split_tool_result(&result);
+            self.emit_tool_result(
+                thread_id,
+                meta,
+                &call.name,
+                &mut split,
+                !is_error,
+                tool_called_event_id,
+            )
+            .await;
+            ParallelRead {
+                tool_called_event_id,
+                result,
+                llm_text: split.llm_text,
+                is_error,
+            }
+        });
+        run_concurrently(reads.collect()).await
+    }
+}
+
 /// Race a **read-only** future against the per-thread cancel token, yielding
 /// `None` when the token wins. The turn's setup phase (history load, query
 /// classification, memory retrieval, system-prompt and context assembly) uses
@@ -501,6 +697,20 @@ pub(crate) fn normalize_finish_reason(stop_reason: &str) -> FinishClass {
     }
 }
 
+/// Why a final turn that DID produce text must still end as a failure, or
+/// `None` when its text is a finished answer.
+///
+/// A safety classifier can stop a response partway. The text before the cut
+/// has already streamed and stays on screen. It is not an answer, though, so
+/// the turn fails with this message rather than completing as if it were whole.
+pub(crate) fn declined_partway_error(stop_reason: Option<&str>) -> Option<&'static str> {
+    (stop_reason.map(normalize_finish_reason) == Some(FinishClass::Blocked)).then_some(
+        "The model stopped partway: the provider's safety classifier withheld the rest of the \
+         response. The text above is incomplete. Rephrase the request or start a new thread; \
+         retrying the same prompt will be refused again.",
+    )
+}
+
 /// Verdict for a completion that returned no text and no tool calls.
 pub(crate) struct EmptyCompletionClass {
     /// `true` → emit `ResponseFailed` (genuine failure: truncation, safety
@@ -521,12 +731,12 @@ pub(crate) struct EmptyCompletionClass {
 ///
 /// - **Truncated / Blocked** (normalized finish reason): content was lost or
 ///   withheld → error.
-/// - **Dropped output** — `output_tokens > 16` with `thinking_chars == 0`, or
-///   `unknown_sse_dropped > 0`: the provider billed real output but nothing
-///   reached the engine (a known block carried an unrecognised shape, or an
-///   unknown SSE block slipped past the parser). Anthropic-only signal —
-///   Gemini / OpenAI hardcode these to `None`/`0`, so it never fires there →
-///   error.
+/// - **Dropped output**: `output_tokens > 16` while the model did not think
+///   (`model_thought` false), or `unknown_sse_dropped > 0`. The provider billed
+///   real output but nothing reached the engine: a known block carried an
+///   unrecognised shape, or an unknown SSE block slipped past the parser.
+///   `model_thought` must count thinking BLOCKS, not only thinking text:
+///   Claude returns empty thinking text unless asked to show it. → error.
 /// - **Unknown** finish reason with nothing salvageable (`null`,
 ///   `stop_sequence`, a future reason): fail-safe → error.
 /// - **Clean** stop with nothing dropped: the model ended its turn and chose to
@@ -538,7 +748,7 @@ pub(crate) struct EmptyCompletionClass {
 pub(crate) fn classify_empty_completion(
     stop_reason: &str,
     output_tokens: u32,
-    thinking_chars: usize,
+    model_thought: bool,
     unknown_sse_dropped: u32,
 ) -> EmptyCompletionClass {
     let error = |hint: &'static str| EmptyCompletionClass {
@@ -562,7 +772,7 @@ pub(crate) fn classify_empty_completion(
     // SSE block was dropped (`unknown_sse_dropped`, incremented in
     // `vertex::process_sse_data`). Surfacing this prevents the misleading
     // "model decided no action was needed" that masked real Vertex SSE drift.
-    if output_tokens > 16 && thinking_chars == 0 {
+    if output_tokens > 16 && !model_thought {
         if unknown_sse_dropped > 0 {
             return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
         }
@@ -577,7 +787,7 @@ pub(crate) fn classify_empty_completion(
         return error("");
     }
     // Clean stop, nothing dropped: intentional silence. Not an error.
-    let hint = if thinking_chars > 0 {
+    let hint = if model_thought {
         " — model thought but produced no text or tool call"
     } else {
         " — model ended its turn without producing text"
@@ -1305,6 +1515,13 @@ fn asked_in_prose(inputs: QuestionReaskInputs) -> bool {
         && inputs.reask_forced == 0
         && inputs.prose_nudges_forced < MAX_PROSE_QUESTION_NUDGE
 }
+
+/// What follows every successful tool round. The user sees only the agent's
+/// text and cards, so this must never suggest they read the results.
+pub(crate) const TOOL_RESULTS_INSTRUCTION: &str = "Results above. The user never sees tool \
+     results, only what you write, so what they need from these must reach them in your words \
+     before you ask them anything or finish. Do not repeat what you already told them. Proceed \
+     to your next action or final answer.";
 
 /// How many times one turn may be sent back for leaving work open with nothing
 /// to re-open the thread. One, and the bound matters more here than for the

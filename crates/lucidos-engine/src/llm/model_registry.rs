@@ -38,20 +38,38 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    /// Parse a `models.provider` column value. Unknown strings fall back to
-    /// Vertex — the historical default for every non-`gpt-` model — so a row
-    /// written by a newer engine with an unrecognized provider still routes
-    /// somewhere sane rather than erroring.
+    /// Every backend, in the order `/health` reports them. One list, so a new
+    /// variant cannot reach the router while missing from what `/health` says
+    /// is configured, which is what the picker filters against.
+    pub const ALL: [Self; 7] = [
+        Self::Vertex,
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::OpenRouter,
+        Self::XAi,
+        Self::OpenCodeFree,
+        Self::Local,
+    ];
+
+    /// Parse a provider name strictly: `None` for anything that is not one.
+    ///
+    /// Every CHOICE goes through this, never [`Self::parse`]: a request, a
+    /// trigger pin, a remembered pick. A typo there must not become a Vertex
+    /// pin, since a choice is honoured or refused, never substituted.
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == s)
+    }
+
+    /// Every backend's name, comma separated, for an error that lists them.
+    pub fn names() -> String {
+        Self::ALL.map(|kind| kind.as_str()).join(", ")
+    }
+
+    /// Parse a stored route's provider. An unknown string falls back to Vertex,
+    /// the historical default for every non-`gpt-` model. So a row a newer
+    /// engine wrote still routes somewhere rather than erroring.
     pub fn parse(s: &str) -> Self {
-        match s {
-            "anthropic" => Self::Anthropic,
-            "openai" => Self::OpenAi,
-            "openrouter" => Self::OpenRouter,
-            "xai" => Self::XAi,
-            "opencode-free" => Self::OpenCodeFree,
-            "local" => Self::Local,
-            _ => Self::Vertex,
-        }
+        Self::from_name(s).unwrap_or(Self::Vertex)
     }
 
     /// The `models.provider` column string — inverse of [`Self::parse`]. Used to
@@ -70,14 +88,54 @@ impl ProviderKind {
     }
 }
 
-/// What the registry knows about one model id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelRouting {
+/// One way a model can be served, as the registry holds it: a backend, the id
+/// that goes on the wire, and that backend's window.
+///
+/// The wire id is already resolved against the row id, so nothing downstream
+/// has to remember the defaulting rule. Every id-shape rule reads this id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteEntry {
     pub provider: ProviderKind,
-    /// Context window in tokens as declared on the `models` row. `None` = not
+    pub wire_id: String,
+    /// Context window in tokens as declared on this route. `None` = not
     /// declared, so [`context_window_for`] falls back to the id-shape guess in
-    /// `engine::context::context_window_from_prefix`.
+    /// [`context_window_from_prefix`], read from [`Self::wire_id`].
     pub context_window: Option<usize>,
+}
+
+impl RouteEntry {
+    /// A route on `provider` sending `wire_id`, declaring no window.
+    pub fn new(provider: ProviderKind, wire_id: impl Into<String>) -> Self {
+        Self {
+            provider,
+            wire_id: wire_id.into(),
+            context_window: None,
+        }
+    }
+}
+
+/// What the registry knows about one model id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRouting {
+    /// Backends that can serve this model, in priority order. Never empty for a
+    /// row that came from the table.
+    pub routes: Vec<RouteEntry>,
+    /// The provider last picked for this model, or `None` for never picked.
+    pub preferred: Option<ProviderKind>,
+}
+
+impl ModelRouting {
+    /// A single-route model, the shape most rows have.
+    pub fn single(provider: ProviderKind, wire_id: impl Into<String>) -> Self {
+        Self {
+            routes: vec![RouteEntry::new(provider, wire_id)],
+            preferred: None,
+        }
+    }
+
+    fn route_on(&self, provider: ProviderKind) -> Option<&RouteEntry> {
+        self.routes.iter().find(|r| r.provider == provider)
+    }
 }
 
 /// Shared, hot-swappable model routing map. Cloned into `RoutingProvider` and
@@ -101,10 +159,10 @@ pub fn empty() -> ModelRegistry {
 /// - `[1m]` → 1M is correct: the suffix is Lucidos's own marker for "request 1M
 ///   mode", and `build_claude_request` attaches the `context-1m-2025-08-07` beta
 ///   for exactly those ids.
-/// - `claude-` → 200k is **also correct**, and deliberately so. A bare id sends
-///   no 1M beta, so 200k is the window of the request the engine actually makes
-///   — not a stale guess about the model's maximum. Declaring 1M on a bare row
-///   would let the context packer exceed the API mode the request selected.
+/// - `claude-` → 200k is correct for most bare ids. A bare id sends no 1M
+///   beta, so 200k is the window of the request the engine actually makes. The
+///   exception is a family whose DEFAULT window is 1M (Opus 5, Opus 5.5, Fable
+///   5.x): their bare builtin rows declare 1M, so they never reach this guess.
 /// - `gpt-` major 5 or newer → 400k **understates** GPT-5.5, GPT-5.6 and GPT-6
 ///   Astra, which are all 1,050,000. The OpenAI path has no context opt-in, so
 ///   the full window applies to every request, and those rows declare it.
@@ -171,13 +229,20 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
         Ok(models) => models
             .into_iter()
             .map(|m| {
-                (
-                    m.id,
-                    ModelRouting {
-                        provider: ProviderKind::parse(&m.provider),
-                        context_window: declared_window(m.context_window),
-                    },
-                )
+                let routes = m
+                    .routes
+                    .iter()
+                    .map(|r| RouteEntry {
+                        provider: ProviderKind::parse(&r.provider),
+                        wire_id: r.wire_id(&m.id).to_string(),
+                        context_window: declared_window(r.context_window),
+                    })
+                    .collect();
+                let preferred = m
+                    .preferred_provider
+                    .as_deref()
+                    .and_then(ProviderKind::from_name);
+                (m.id, ModelRouting { routes, preferred })
             })
             .collect(),
         Err(e) => {
@@ -192,29 +257,135 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
 
 /// Look up a model id in the registry, if the lock is readable.
 fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
-    registry.read().ok().and_then(|map| map.get(model).copied())
+    registry.read().ok().and_then(|map| map.get(model).cloned())
 }
 
-/// Resolve the provider for a model id. Exact registry hit first; on a miss
-/// (unknown id, a legacy saved preference no longer in the table, or a poisoned
-/// lock) fall back to the prefix heuristic so routing never dead-ends.
-pub fn provider_kind_for(registry: &ModelRegistry, model: &str) -> ProviderKind {
-    routing_for(registry, model)
-        .map(|r| r.provider)
-        .unwrap_or_else(|| prefix_heuristic(model))
+/// The refusal for a provider name that names no backend.
+pub fn unknown_provider_message(name: &str) -> String {
+    format!(
+        "Unknown provider '{name}'. Use one of: {}",
+        ProviderKind::names()
+    )
 }
 
-/// Resolve the context window for a model id: the declared window if the row
-/// has one, else the id-shape guess.
+/// Which backend an unconfigured choice named, so the caller can say what to
+/// set up. Returned instead of a route, never in place of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unconfigured(pub ProviderKind);
+
+/// Resolve which backend serves `model`, and what id to send it.
 ///
-/// This is the fix for the trim budget being computed from a hardcoded prefix
-/// map that had no rule for OpenRouter / xAI / Gemini / local ids and handed all of
-/// them 200k — kimi-k3 (1,048,576 real) was trimmed as if it held 200k, so the
-/// agentic loop evicted context at roughly 8% of the true window.
-pub fn context_window_for(registry: &ModelRegistry, model: &str) -> usize {
-    routing_for(registry, model)
-        .and_then(|r| r.context_window)
-        .unwrap_or_else(|| context_window_from_prefix(model))
+/// **An explicit choice is honoured or refused, never substituted.** `chosen`
+/// is the caller's own pick and outranks the row's stored one. If the picked
+/// backend is not configured, this returns [`Unconfigured`]. The caller then
+/// says how to set it up, rather than sending the turn to another vendor at
+/// another price under other terms.
+///
+/// With no choice on either side, the first configured route wins.
+///
+/// With no configured route at all, the error names the row's FIRST route. That
+/// keeps the message pointing at the backend the model actually wants.
+///
+/// With no row at all the prefix heuristic answers, as it always has. That
+/// covers an unknown id, a saved preference for a deleted model, and a poisoned
+/// lock.
+pub fn resolve_route(
+    registry: &ModelRegistry,
+    model: &str,
+    chosen: Option<ProviderKind>,
+    is_configured: impl Fn(ProviderKind) -> bool,
+) -> Result<RouteEntry, Unconfigured> {
+    let Some(routing) = routing_for(registry, model) else {
+        let guess = prefix_heuristic(model);
+        return match is_configured(guess) {
+            true => Ok(RouteEntry::new(guess, model)),
+            false => Err(Unconfigured(guess)),
+        };
+    };
+    // A pick the row cannot serve is STALE, not a refusal: the model moved off
+    // that backend. It yields to the row's own preference, rather than skipping
+    // it and reporting a provider this model never had.
+    let pick = chosen
+        .and_then(|p| routing.route_on(p))
+        .or_else(|| routing.preferred.and_then(|p| routing.route_on(p)));
+    if let Some(route) = pick {
+        return match is_configured(route.provider) {
+            true => Ok(route.clone()),
+            false => Err(Unconfigured(route.provider)),
+        };
+    }
+    match routing.routes.iter().find(|r| is_configured(r.provider)) {
+        Some(route) => Ok(route.clone()),
+        None => Err(Unconfigured(
+            routing
+                .routes
+                .first()
+                .map_or_else(|| prefix_heuristic(model), |r| r.provider),
+        )),
+    }
+}
+
+/// The route serving `model` on `provider`, if this model has one at all.
+///
+/// Answers "can this backend serve this model", which is a different question
+/// from [`resolve_route`]'s "which backend will". The web-search chain asks it:
+/// it may run on a provider the user is not chatting with, and handing that
+/// provider the chat model's id would be a hard rejection.
+///
+/// A model with no row falls back to the prefix heuristic. So an id the table
+/// has never seen answers exactly as it did before routes existed.
+pub fn route_on(
+    registry: &ModelRegistry,
+    model: &str,
+    provider: ProviderKind,
+) -> Option<RouteEntry> {
+    match routing_for(registry, model) {
+        Some(routing) => routing.route_on(provider).cloned(),
+        None => (prefix_heuristic(model) == provider).then(|| RouteEntry::new(provider, model)),
+    }
+}
+
+/// The provider that would serve `model`, ignoring what is configured: the
+/// row's preferred route if it names one, else its first, else the prefix
+/// heuristic.
+///
+/// For "which backend will this turn actually reach", call [`resolve_route`]
+/// with the router's configured set. This answers the weaker question, for
+/// callers that hold no such set. Deriving a model's reasoning tiers for the
+/// registry listing is one, and the eval harness naming a run's provider is
+/// the other.
+pub fn provider_kind_for(registry: &ModelRegistry, model: &str) -> ProviderKind {
+    resolve_route(registry, model, None, |_| true)
+        .map_or_else(|_| prefix_heuristic(model), |r| r.provider)
+}
+
+/// Resolve the context window for a model id.
+///
+/// The resolved route's declared window wins. Undeclared falls back to the
+/// id-shape guess, read from that route's WIRE id.
+///
+/// Reading the route's id keeps the budget honest across backends. A `[1m]` row
+/// reached through a route whose id carries no suffix sent no 1M beta. So it
+/// must be budgeted at 200k, however the row itself is spelled.
+///
+/// A declared window is also the kimi-k3 fix. The prefix map has no rule for an
+/// OpenRouter, xAI, Gemini or local id and hands them all 200k. That evicted a
+/// 1,048,576-token model's context at roughly 8% of its real window.
+///
+/// `is_configured` decides which route answers. A caller with no view of the
+/// configured set passes `|_| true`, which reads the row's own first choice.
+pub fn context_window_for(
+    registry: &ModelRegistry,
+    model: &str,
+    chosen: Option<ProviderKind>,
+    is_configured: impl Fn(ProviderKind) -> bool,
+) -> usize {
+    match resolve_route(registry, model, chosen, is_configured) {
+        Ok(route) => route
+            .context_window
+            .unwrap_or_else(|| context_window_from_prefix(&route.wire_id)),
+        Err(_) => context_window_from_prefix(model),
+    }
 }
 
 /// Last-resort provider guess from the model-string shape. Mirrors the
@@ -234,19 +405,22 @@ fn prefix_heuristic(model: &str) -> ProviderKind {
 mod tests {
     use super::*;
 
+    /// Single-route rows, the shape most of the registry has.
     fn registry(pairs: &[(&str, ProviderKind)]) -> ModelRegistry {
         Arc::new(RwLock::new(
             pairs
                 .iter()
-                .map(|(k, v)| {
-                    (
-                        k.to_string(),
-                        ModelRouting {
-                            provider: *v,
-                            context_window: None,
-                        },
-                    )
-                })
+                .map(|(id, provider)| (id.to_string(), ModelRouting::single(*provider, *id)))
+                .collect(),
+        ))
+    }
+
+    /// Rows whose routes are spelled out, for the multi-route cases.
+    fn registry_of(pairs: &[(&str, ModelRouting)]) -> ModelRegistry {
+        Arc::new(RwLock::new(
+            pairs
+                .iter()
+                .map(|(id, routing)| (id.to_string(), routing.clone()))
                 .collect(),
         ))
     }
@@ -255,17 +429,24 @@ mod tests {
         Arc::new(RwLock::new(
             pairs
                 .iter()
-                .map(|(k, w)| {
-                    (
-                        k.to_string(),
-                        ModelRouting {
-                            provider: ProviderKind::OpenRouter,
-                            context_window: *w,
-                        },
-                    )
+                .map(|(id, window)| {
+                    let mut routing = ModelRouting::single(ProviderKind::OpenRouter, *id);
+                    routing.routes[0].context_window = *window;
+                    (id.to_string(), routing)
                 })
                 .collect(),
         ))
+    }
+
+    /// Every provider is configured, which is what the no-configured-set
+    /// callers (`provider_kind_for`, the reasoning-effort derivation) assume.
+    fn all() -> impl Fn(ProviderKind) -> bool {
+        |_| true
+    }
+
+    /// Only these providers are configured.
+    fn only(kinds: &[ProviderKind]) -> impl Fn(ProviderKind) -> bool + '_ {
+        move |kind| kinds.contains(&kind)
     }
 
     #[test]
@@ -383,7 +564,7 @@ mod tests {
         let reg = registry(&[
             ("claude-fable-5", ProviderKind::Anthropic),
             ("claude-fable-5-1", ProviderKind::Anthropic),
-            ("claude-opus-4-8@default", ProviderKind::Vertex),
+            ("claude-opus-4-8", ProviderKind::Vertex),
             ("claude-sonnet-5", ProviderKind::Vertex),
             ("gpt-5.5", ProviderKind::OpenAi),
         ]);
@@ -400,7 +581,7 @@ mod tests {
             ProviderKind::Vertex
         );
         assert_eq!(
-            provider_kind_for(&reg, "claude-opus-4-8@default"),
+            provider_kind_for(&reg, "claude-opus-4-8"),
             ProviderKind::Vertex
         );
         assert_eq!(provider_kind_for(&reg, "gpt-5.5"), ProviderKind::OpenAi);
@@ -444,7 +625,7 @@ mod tests {
         // heuristic routes any non-fable `claude-*` to Vertex, matching the
         // seeded provider.
         assert_eq!(
-            provider_kind_for(&reg, "claude-opus-5@default"),
+            provider_kind_for(&reg, "claude-opus-5"),
             ProviderKind::Vertex
         );
         assert_eq!(
@@ -549,24 +730,24 @@ mod tests {
     #[test]
     fn astras_declared_window_beats_the_widened_prefix_guess() {
         let reg = registry_with_windows(&[("gpt-6-astra", Some(1_050_000))]);
-        assert_eq!(context_window_for(&reg, "gpt-6-astra"), 1_050_000);
-        assert_eq!(context_window_for(&empty(), "gpt-6-astra"), 400_000);
+        assert_eq!(
+            context_window_for(&reg, "gpt-6-astra", None, all()),
+            1_050_000
+        );
+        assert_eq!(
+            context_window_for(&empty(), "gpt-6-astra", None, all()),
+            400_000
+        );
     }
 
-    /// The `[1m]`-vs-bare split is NOT an oversight — it mirrors what the engine
-    /// actually requests. `build_claude_request` attaches the
-    /// `context-1m-2025-08-07` beta only when `parse_context_suffix` reports
-    /// `is_1m`, so a bare id genuinely runs at 200k however large the model is.
-    /// Pinned so nobody "corrects" the bare rows to 1M and starts building
-    /// prompts the API rejects.
+    /// The `[1m]`-vs-bare split mirrors what the engine actually requests.
+    /// `build_claude_request` attaches the 1M beta only for a `[1m]` id. So a
+    /// bare id of a family whose default window is 200k genuinely runs at 200k.
+    /// Pinned so nobody "corrects" those to 1M and starts building prompts the
+    /// API rejects. The 1M-default families declare their window on their rows.
     #[test]
     fn bare_claude_ids_are_correctly_200k_because_they_send_no_1m_beta() {
-        for base in [
-            "claude-fable-5",
-            "claude-opus-5@default",
-            "claude-opus-4-8@default",
-            "claude-sonnet-4-6",
-        ] {
+        for base in ["claude-opus-4-8", "claude-sonnet-4-6"] {
             assert_eq!(
                 context_window_from_prefix(base),
                 200_000,
@@ -580,12 +761,203 @@ mod tests {
         }
     }
 
+    /// A Claude row served by both Vertex and the direct Anthropic API, which
+    /// is what the seed ships.
+    fn dual_routed(id: &str) -> ModelRouting {
+        ModelRouting {
+            routes: vec![
+                RouteEntry::new(ProviderKind::Vertex, id),
+                RouteEntry::new(ProviderKind::Anthropic, id),
+            ],
+            preferred: None,
+        }
+    }
+
+    /// The reported bug, at the layer that fixes it. A workspace holding only
+    /// an Anthropic key reaches Opus, instead of having it silently hidden.
+    ///
+    /// Vertex is listed first, so a workspace holding both keeps Vertex.
+    #[test]
+    fn a_dual_routed_model_resolves_to_whichever_backend_is_configured() {
+        let reg = registry_of(&[("claude-opus-5-5", dual_routed("claude-opus-5-5"))]);
+        for (configured, expected) in [
+            (vec![ProviderKind::Anthropic], ProviderKind::Anthropic),
+            (vec![ProviderKind::Vertex], ProviderKind::Vertex),
+            (
+                vec![ProviderKind::Vertex, ProviderKind::Anthropic],
+                ProviderKind::Vertex,
+            ),
+        ] {
+            let route = resolve_route(&reg, "claude-opus-5-5", None, only(&configured))
+                .expect("a configured route serves it");
+            assert_eq!(route.provider, expected, "{configured:?}");
+            assert_eq!(route.wire_id, "claude-opus-5-5");
+        }
+    }
+
+    /// Honoured or refused, never substituted.
+    ///
+    /// The refusal names the PICKED backend, not the one that happens to be
+    /// configured, so the message says what to set up. Silently falling through
+    /// would move a turn to another vendor at another price under other terms.
+    #[test]
+    fn a_pick_is_honoured_or_refused_and_never_swapped() {
+        let mut routing = dual_routed("claude-opus-5");
+        routing.preferred = Some(ProviderKind::Anthropic);
+        let reg = registry_of(&[("claude-opus-5", routing)]);
+
+        // Configured: honoured, even though Vertex is listed first.
+        let route = resolve_route(
+            &reg,
+            "claude-opus-5",
+            None,
+            only(&[ProviderKind::Anthropic]),
+        )
+        .expect("the picked backend serves it");
+        assert_eq!(route.provider, ProviderKind::Anthropic);
+
+        // Parked: refused, naming Anthropic rather than running on Vertex.
+        assert_eq!(
+            resolve_route(&reg, "claude-opus-5", None, only(&[ProviderKind::Vertex])),
+            Err(Unconfigured(ProviderKind::Anthropic))
+        );
+
+        // The turn's own pick outranks the row's stored one, and is refused the
+        // same way.
+        assert_eq!(
+            resolve_route(
+                &reg,
+                "claude-opus-5",
+                Some(ProviderKind::Vertex),
+                only(&[ProviderKind::Anthropic])
+            ),
+            Err(Unconfigured(ProviderKind::Vertex))
+        );
+    }
+
+    /// A pick the row cannot serve is STALE, not a refusal: the model moved off
+    /// that backend. Reporting a provider this model never had would send the
+    /// user to configure something that still would not serve it.
+    #[test]
+    fn a_pick_the_row_cannot_serve_falls_through_rather_than_refusing() {
+        let mut routing = ModelRouting::single(ProviderKind::Vertex, "gemini-3.5-flash");
+        routing.preferred = Some(ProviderKind::Anthropic);
+        let reg = registry_of(&[("gemini-3.5-flash", routing)]);
+        let route = resolve_route(
+            &reg,
+            "gemini-3.5-flash",
+            None,
+            only(&[ProviderKind::Vertex]),
+        )
+        .expect("the row's own route serves it");
+        assert_eq!(route.provider, ProviderKind::Vertex);
+    }
+
+    /// A stale turn pick yields to the row's own preference, rather than
+    /// skipping it for the first configured route.
+    #[test]
+    fn a_stale_turn_pick_yields_to_the_rows_preference() {
+        let mut routing = dual_routed("claude-sonnet-5");
+        routing.preferred = Some(ProviderKind::Anthropic);
+        let reg = registry_of(&[("claude-sonnet-5", routing)]);
+        let route = resolve_route(
+            &reg,
+            "claude-sonnet-5",
+            Some(ProviderKind::XAi),
+            only(&[ProviderKind::Vertex, ProviderKind::Anthropic]),
+        )
+        .expect("the preferred route serves it");
+        assert_eq!(route.provider, ProviderKind::Anthropic);
+    }
+
+    /// A choice is parsed strictly, so a typo is no choice at all rather than
+    /// a Vertex pin. A stored route still falls back, so it keeps routing.
+    #[test]
+    fn a_choice_parses_strictly_and_a_stored_route_leniently() {
+        assert_eq!(
+            ProviderKind::from_name("anthropic"),
+            Some(ProviderKind::Anthropic)
+        );
+        assert_eq!(ProviderKind::from_name("Anthropic"), None);
+        assert_eq!(ProviderKind::from_name(""), None);
+        assert_eq!(ProviderKind::parse("Anthropic"), ProviderKind::Vertex);
+    }
+
+    /// With nothing configured the error names the row's FIRST route, which is
+    /// the backend the model actually wants.
+    #[test]
+    fn no_configured_route_names_the_rows_own_first_choice() {
+        let reg = registry_of(&[("claude-opus-5-5", dual_routed("claude-opus-5-5"))]);
+        assert_eq!(
+            resolve_route(&reg, "claude-opus-5-5", None, only(&[])),
+            Err(Unconfigured(ProviderKind::Vertex))
+        );
+    }
+
+    /// The budget reads the ROUTE's wire id, not the row's.
+    ///
+    /// An OpenRouter route on a `[1m]` row sends an id carrying no suffix, so
+    /// it requested no 1M beta and must be budgeted at 200k. Budgeting the row
+    /// would have the packer build a prompt that backend rejects.
+    #[test]
+    fn the_window_follows_the_route_not_the_row() {
+        let reg = registry_of(&[(
+            "claude-opus-5-5[1m]",
+            ModelRouting {
+                routes: vec![
+                    RouteEntry {
+                        provider: ProviderKind::Vertex,
+                        wire_id: "claude-opus-5-5[1m]".to_string(),
+                        context_window: Some(1_000_000),
+                    },
+                    RouteEntry::new(ProviderKind::OpenRouter, "anthropic/claude-opus-5-5"),
+                ],
+                preferred: None,
+            },
+        )]);
+        let id = "claude-opus-5-5[1m]";
+        assert_eq!(
+            context_window_for(&reg, id, None, only(&[ProviderKind::Vertex])),
+            1_000_000
+        );
+        assert_eq!(
+            context_window_for(&reg, id, None, only(&[ProviderKind::OpenRouter])),
+            200_000,
+            "the undeclared route falls back on its OWN id, which has no [1m]"
+        );
+    }
+
+    /// `route_on` asks whether a backend CAN serve a model, which is the
+    /// web-search chain's question. A row with no route there answers `None`,
+    /// and a row with no entry at all falls back to the prefix heuristic.
+    #[test]
+    fn route_on_answers_whether_a_backend_can_serve_the_model() {
+        let reg = registry_of(&[("claude-opus-5-5", dual_routed("claude-opus-5-5"))]);
+        assert_eq!(
+            route_on(&reg, "claude-opus-5-5", ProviderKind::Anthropic).map(|r| r.wire_id),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            route_on(&reg, "claude-opus-5-5", ProviderKind::OpenAi),
+            None
+        );
+        // No row: the heuristic answers, exactly as it did before routes.
+        assert_eq!(
+            route_on(&empty(), "gpt-5.5", ProviderKind::OpenAi).map(|r| r.wire_id),
+            Some("gpt-5.5".to_string())
+        );
+        assert_eq!(route_on(&empty(), "gpt-5.5", ProviderKind::Vertex), None);
+    }
+
     /// The whole point of the `context_window` column: a declared window wins,
     /// so kimi-k3 stops being budgeted as a 200k model.
     #[test]
     fn declared_context_window_wins_over_the_prefix_fallback() {
         let reg = registry_with_windows(&[("moonshotai/kimi-k3", Some(1_048_576))]);
-        assert_eq!(context_window_for(&reg, "moonshotai/kimi-k3"), 1_048_576);
+        assert_eq!(
+            context_window_for(&reg, "moonshotai/kimi-k3", None, all()),
+            1_048_576
+        );
     }
 
     /// An undeclared window, an unknown id, and an empty registry all fall
@@ -595,15 +967,30 @@ mod tests {
     fn undeclared_window_falls_back_to_the_prefix_map() {
         let reg = registry_with_windows(&[("moonshotai/kimi-k3", None)]);
         // Declared-as-None is the same as absent.
-        assert_eq!(context_window_for(&reg, "moonshotai/kimi-k3"), 200_000);
+        assert_eq!(
+            context_window_for(&reg, "moonshotai/kimi-k3", None, all()),
+            200_000
+        );
         // Not in the table at all.
-        assert_eq!(context_window_for(&reg, "claude-opus-4-7[1m]"), 1_000_000);
-        assert_eq!(context_window_for(&reg, "gpt-5.5"), 400_000);
+        assert_eq!(
+            context_window_for(&reg, "claude-opus-4-7[1m]", None, all()),
+            1_000_000
+        );
+        assert_eq!(context_window_for(&reg, "gpt-5.5", None, all()), 400_000);
         // Empty registry — every id takes the prefix map.
         let none = empty();
-        assert_eq!(context_window_for(&none, "claude-opus-4-7"), 200_000);
-        assert_eq!(context_window_for(&none, "claude-opus-4-7[1m]"), 1_000_000);
-        assert_eq!(context_window_for(&none, "unknown-model"), 200_000);
+        assert_eq!(
+            context_window_for(&none, "claude-opus-4-7", None, all()),
+            200_000
+        );
+        assert_eq!(
+            context_window_for(&none, "claude-opus-4-7[1m]", None, all()),
+            1_000_000
+        );
+        assert_eq!(
+            context_window_for(&none, "unknown-model", None, all()),
+            200_000
+        );
     }
 
     /// A declared window can also be SMALLER than the id-shape guess — a
@@ -612,7 +999,10 @@ mod tests {
     #[test]
     fn declared_window_can_shrink_as_well_as_grow() {
         let reg = registry_with_windows(&[("claude-opus-4-7", Some(32_000))]);
-        assert_eq!(context_window_for(&reg, "claude-opus-4-7"), 32_000);
+        assert_eq!(
+            context_window_for(&reg, "claude-opus-4-7", None, all()),
+            32_000
+        );
     }
 
     /// A hand-edited zero / negative row must not reach the map — otherwise it

@@ -80,7 +80,22 @@ This also **replaced** `purge_orphan_migrations`, which dropped the public schem
 ### Single-writer lock on the e2e workspace
 Every e2e entry point (`e2e.sh`, `e2e-browser.sh`, `e2e-api.sh`) acquires `~/workspaces/e2e-test/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace or any browser. A second invocation while the lock is held (owner PID alive) exits 1 with a message naming the holder. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac.
 
-**Reclaiming a stale lock is orphan-safe, not blind.** A "stale" lock is one whose owner PID is dead — but an *interrupted* run (killed before its EXIT trap could tear down) leaves orphaned e2e processes alive: Playwright/WebKit browser children and the e2e-test workspace engine, still holding RSS. The old reclaim treated "owner dead" as "safe to start fresh", so on 2026-06-21 the nightly orchestrator re-spawned the full suite three times and each re-spawn reclaimed the free stale lock and stacked a fresh set of browsers on top of the orphans → 23.5 GB compressed + 14 GB swap, machine pinned in critical memory pressure for 4+ hours. `acquire_e2e_lock` now scans for those orphans before reclaiming (browser children matched by the `ms-playwright/*` cache path — same discriminator the webkit reaper uses; the engine via its own `engine.pid`), runs a **deliberate, logged sweep** (SIGKILL the browsers, SIGUSR1 the engine so its supervisor stops cleanly), re-scans, and reclaims only once they are gone. If the sweep can't clear them it **refuses** with an actionable error rather than stack. The four states: no lock → acquire; live-PID lock → hard-fail; stale + no orphans → reclaim; stale + orphans → sweep then reclaim, else refuse. (Deliberately *not* swept: any `vite`/web-dev server — under ADR 0014 e2e runs a one-shot `vite build`, no long-lived server, and a name-based match would risk SIGKILLing the checkout-level shared build-watch that serves other workspaces.) Lock logic in `scripts/lib/e2e_lock.sh`; covered by `scripts/lib/e2e_lock_test.sh` (run directly, no harness — hermetic, fakes orphans with sleepers, never spawns a browser).
+**Reclaiming a stale lock is orphan-safe, not blind.** A "stale" lock is one whose owner PID is dead. But an *interrupted* run, killed before its EXIT trap could tear down, leaves orphaned e2e processes alive. They are Playwright/WebKit browser children and the e2e-test workspace engine, still holding RSS.
+
+The old reclaim treated "owner dead" as "safe to start fresh". On 2026-06-21 the nightly orchestrator re-spawned the full suite three times. Each re-spawn reclaimed the free stale lock and stacked a fresh set of browsers on top of the orphans. The host reached 23.5 GB compressed + 14 GB swap, pinned in critical memory pressure for 4+ hours.
+
+`acquire_e2e_lock` now handles those orphans in four steps:
+
+1. Scan for them before reclaiming. The engine is found by its own `engine.pid`. A browser is found by the dead run's *e2e run marker* in its environment. The `ms-playwright/*` cache path only narrows the candidates, because alone it also matched other tools' browsers (ADR 0251).
+2. Run a **deliberate, logged sweep**: SIGKILL the browsers, SIGUSR1 the engine so its supervisor stops cleanly.
+3. Re-scan, and reclaim only once they are gone.
+4. If the sweep can't clear them, **refuse** with an actionable error rather than stack.
+
+The four states: no lock → acquire; live-PID lock → hard-fail; stale + no orphans → reclaim; stale + orphans → sweep then reclaim, else refuse.
+
+Deliberately *not* swept: any `vite`/web-dev server. Under ADR 0014 e2e runs a one-shot `vite build` with no long-lived server. A name-based match would risk SIGKILLing the checkout-level shared build-watch that serves other workspaces.
+
+Lock logic lives in `scripts/lib/e2e_lock.sh`. `scripts/lib/e2e_lock_test.sh` covers it: run it directly, with no harness. It is hermetic, fakes orphans with sleepers, and never spawns a browser.
 
 ### A run that LOST the lock subscribes; it does not poll
 The lock's refusal is correct, and how a loser *waits* was not. On 2026-08-09 three coding-agent threads raced for it at once: one held it mid mobile-webkit run, and both losers hand-rolled a busy-wait. One wrote `/tmp/run-e2e-retry-<pid>.sh` with `for i in $(seq 1 120)` around `./scripts/e2e-browser.sh` and `sleep 20; continue` on refusal, a 40 minute foreground tool call that re-executed the entry script's build checks on every attempt; the other parked on a bare `sleep 20`. Both burned a Claude Code turn and held engine capacity to learn something the engine could have told them.
@@ -387,15 +402,19 @@ the whole machine down with it. If the reaper fires often in the nightly output,
 that is the signal that the underlying wedge is getting worse — worth surfacing in
 the Concerns rollup.
 
-- **What it matches.** Only processes whose full `ps … command=` path contains the
-  Playwright WebKit browsers-cache token (default `ms-playwright/webkit`, or
-  `$PLAYWRIGHT_BROWSERS_PATH/webkit` when that env is set). On macOS the
-  WebContent/GPU/Networking XPC services all live under
-  `…/ms-playwright/webkit-NNNN/`, so this catches the whole WebKit process tree.
-  It deliberately does **not** match by a bare `WebContent` substring, so it never
-  touches the user's own Safari/Chrome, the `lucidos-engine`, `node`/`vite`,
-  Playwright's **chromium** (`ms-playwright/chromium-NNNN/`), or unrelated WebKit
-  consumers. PID ≤ 1, the script's own PID, and the reaper's own loop are skipped.
+- **What it matches.** Two facts, both required:
+  - argv[0] contains the Playwright WebKit browsers-cache token (default
+    `ms-playwright/webkit`, or `$PLAYWRIGHT_BROWSERS_PATH/webkit`). On macOS the
+    WebContent/GPU/Networking XPC services all live under
+    `…/ms-playwright/webkit-NNNN/`, so this reaches the whole WebKit tree. It
+    never matches a bare `WebContent`, so Safari, Chrome, `lucidos-engine`,
+    `node`, Playwright's chromium and unrelated WebKit consumers are out.
+  - The process environment holds this run's *e2e run marker*. Every
+    Playwright on the host shares the cache, so without it the reaper also
+    killed other tools' WebKit processes (ADR 0251). With no marker set it
+    kills nothing and warns at start.
+
+  PID ≤ 1, the script's own PID, and the reaper's own loop are skipped.
 - **Knobs.** `E2E_WEBKIT_RSS_CAP_MB` (default `6144` — well above a healthy
   WebContent, well below the level that exhausts a 48 GB host),
   `E2E_WEBKIT_REAP_INTERVAL_S` (default `5`), `E2E_WEBKIT_REAP_MATCH` (override the

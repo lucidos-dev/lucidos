@@ -464,6 +464,8 @@ impl GatewayService {
     /// NOT. It leaves the cluster running for the re-exec'd image to re-adopt,
     /// and stopping Postgres here would break that.
     fn shutdown(&mut self, resources: &Path, app_data: &Path) {
+        #[cfg(unix)]
+        let started = Instant::now();
         // SIGUSR1 is the gateway's graceful-stop signal, since it ignores
         // SIGTERM. It exits but deliberately LEAVES its engines running for
         // re-adoption, so we stop those explicitly below.
@@ -478,18 +480,21 @@ impl GatewayService {
             unsafe {
                 libc::kill(self.gateway.id() as libc::pid_t, libc::SIGUSR1);
             }
-            for _ in 0..30 {
-                match self.gateway.try_wait() {
-                    Ok(Some(_)) => break,
-                    _ => std::thread::sleep(Duration::from_millis(100)),
-                }
-            }
+            let gateway = &mut self.gateway;
+            wait_until_gone(GATEWAY_STOP_TIMEOUT, || {
+                matches!(gateway.try_wait(), Ok(Some(_)))
+            });
         }
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
         // A restart and a crash respawn run this same teardown, so record what
         // is being stopped for the next boot. See `record_workspaces_to_restore`.
         let stopped = stop_workspace_engines(app_data);
+        // The next service start must find these engines gone. One still
+        // draining answers health, and the new gateway would route the window
+        // to it seconds before it exits.
+        #[cfg(unix)]
+        finish_stopping_engines(&stopped, engine_exit_wait(started.elapsed()));
         let ids: Vec<String> = stopped.into_iter().map(|e| e.id).collect();
         record_workspaces_to_restore(app_data, &ids);
         // Last, after the engines that connect to it. A permanent shutdown must
@@ -497,6 +502,95 @@ impl GatewayService {
         // postmaster.pid for the next app version to trip over.
         stop_embedded_postgres(resources, app_data);
     }
+}
+
+/// How long the service teardown waits for the gateway to exit on SIGUSR1.
+#[cfg(unix)]
+const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long launchd lets the service run after SIGTERM before it SIGKILLs it.
+/// The service plist sets no `ExitTimeOut`, so this is launchd's default.
+#[cfg(unix)]
+const LAUNCHD_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The part of [`LAUNCHD_EXIT_TIMEOUT`] the engine wait leaves for the rest:
+/// the supervise loop noticing SIGTERM, [`ENGINE_KILL_GRACE`], and `pg_ctl`.
+#[cfg(unix)]
+const SERVICE_TEARDOWN_ALLOWANCE: Duration = Duration::from_secs(3);
+
+/// How long a force-killed engine gets to leave the process table. SIGKILL
+/// only queues the kill, and the next service start must not find it bound.
+#[cfg(unix)]
+const ENGINE_KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// How long the engine wait may take, given the time the teardown has spent.
+/// Everything launchd has left, minus [`SERVICE_TEARDOWN_ALLOWANCE`].
+#[cfg(unix)]
+fn engine_exit_wait(spent: Duration) -> Duration {
+    (LAUNCHD_EXIT_TIMEOUT - SERVICE_TEARDOWN_ALLOWANCE).saturating_sub(spent)
+}
+
+/// Wait out the engines [`stop_workspace_engines`] signalled for up to
+/// `timeout`, then SIGKILL any still running.
+///
+/// Must run before `stop_embedded_postgres`, since a draining engine still
+/// writes its teardown events. A pid reaches the kill only if it was signalled,
+/// is still alive at the deadline, and still runs the engine binary. The last
+/// check matters because the kernel may reuse a pid during the wait.
+#[cfg(unix)]
+fn finish_stopping_engines(engines: &[SignalledEngine], timeout: Duration) {
+    let mut killed = Vec::new();
+    for engine in wait_for_engines_to_exit(engines, timeout) {
+        if !pid_runs_engine(engine.pid) {
+            eprintln!(
+                "[service] pid {} for '{}' no longer runs the engine; not killing it",
+                engine.pid, engine.id
+            );
+            continue;
+        }
+        eprintln!(
+            "[service] engine for '{}' (pid {}) did not exit within {}s; force-killing it",
+            engine.id,
+            engine.pid,
+            timeout.as_secs()
+        );
+        // SAFETY: a positive pid we signalled, that is alive and runs the engine.
+        unsafe {
+            libc::kill(engine.pid, libc::SIGKILL);
+        }
+        killed.push(engine);
+    }
+    for engine in wait_for_engines_to_exit(&killed, ENGINE_KILL_GRACE) {
+        eprintln!(
+            "[service] engine for '{}' (pid {}) is still running after SIGKILL",
+            engine.id, engine.pid
+        );
+    }
+}
+
+/// Does `pid` run the bundled engine binary? `false` whenever that cannot be
+/// read, so an unknown process is never killed as an engine.
+#[cfg(target_os = "macos")]
+fn pid_runs_engine(pid: i32) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable and its length is passed alongside it.
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    len > 0 && executable_is_engine(Path::new(std::ffi::OsStr::from_bytes(&buf[..len as usize])))
+}
+
+/// Linux twin of the macOS probe, through `/proc`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pid_runs_engine(pid: i32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|exe| executable_is_engine(&exe))
+        .unwrap_or(false)
+}
+
+/// Is `exe` an engine binary, judged by its file name?
+#[cfg(unix)]
+fn executable_is_engine(exe: &Path) -> bool {
+    exe.file_name() == Some(std::ffi::OsStr::new(ENGINE_RESOURCE_NAME))
 }
 
 /// Stop the embedded Postgres cluster cleanly on a permanent service shutdown.
@@ -2577,12 +2671,12 @@ const LAUNCHD_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const ENGINE_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How often either teardown wait re-probes, matching the shell twin's cadence.
-#[cfg(target_os = "macos")]
+/// How often a teardown wait re-probes, matching the shell twin's cadence.
+#[cfg(unix)]
 const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How a bounded wait for something to go away ended.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TeardownWait {
     /// A probe saw it leave.
@@ -2599,7 +2693,7 @@ enum TeardownWait {
 /// refuses to delete rather than deleting under a live writer.
 ///
 /// Pure, so the posture is pinned by a test rather than by reading the loop.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn teardown_poll(gone: bool, out_of_time: bool) -> Option<TeardownWait> {
     if gone {
         return Some(TeardownWait::Gone);
@@ -2611,7 +2705,7 @@ fn teardown_poll(gone: bool, out_of_time: bool) -> Option<TeardownWait> {
 }
 
 /// Poll `gone` until it answers true, or until `timeout` has passed.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wait_until_gone(timeout: Duration, mut gone: impl FnMut() -> bool) -> TeardownWait {
     let deadline = Instant::now() + timeout;
     loop {
@@ -2669,13 +2763,16 @@ fn process_is_gone(pid: i32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Wait for every signalled engine to exit, and name the workspaces whose
-/// engine did not. An empty result means every one of them is gone.
+/// Wait for every signalled engine to exit, and return the ones that did not.
+/// An empty result means every one of them is gone.
 ///
 /// All the pids are probed on each pass, so one slow engine cannot spend the
 /// whole deadline before the next is looked at.
-#[cfg(target_os = "macos")]
-fn wait_for_engines_to_exit(engines: &[SignalledEngine], timeout: Duration) -> Vec<String> {
+#[cfg(unix)]
+fn wait_for_engines_to_exit(
+    engines: &[SignalledEngine],
+    timeout: Duration,
+) -> Vec<SignalledEngine> {
     let mut alive = engines.to_vec();
     let verdict = wait_until_gone(timeout, || {
         alive.retain(|e| !process_is_gone(e.pid));
@@ -2683,7 +2780,7 @@ fn wait_for_engines_to_exit(engines: &[SignalledEngine], timeout: Duration) -> V
     });
     match verdict {
         TeardownWait::Gone => Vec::new(),
-        TeardownWait::StillThere => alive.into_iter().map(|e| e.id).collect(),
+        TeardownWait::StillThere => alive,
     }
 }
 
@@ -2793,8 +2890,11 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
     //      The engines are waited out only once the service is gone. A live
     //      service respawns them, so their liveness decides nothing while it is
     //      up, and the refusal below already names it.
-    let live_engines = match service {
-        TeardownWait::Gone => wait_for_engines_to_exit(&signalled, ENGINE_EXIT_TIMEOUT),
+    let live_engines: Vec<String> = match service {
+        TeardownWait::Gone => wait_for_engines_to_exit(&signalled, ENGINE_EXIT_TIMEOUT)
+            .into_iter()
+            .map(|e| e.id)
+            .collect(),
         TeardownWait::StillThere => Vec::new(),
     };
     //      A refusal ends the uninstall HERE, before the first deletion. That
@@ -5310,7 +5410,56 @@ mod tests {
             },
         ];
         let still_alive = wait_for_engines_to_exit(&engines, Duration::ZERO);
-        assert_eq!(still_alive, vec!["live-ws".to_string()]);
+        assert_eq!(still_alive, vec![engines[1].clone()]);
+    }
+
+    // launchd SIGKILLs the service at its exit timeout, and a killed teardown
+    // leaves the engines it was waiting on running into the next start.
+    #[cfg(unix)]
+    #[test]
+    fn the_service_teardown_fits_inside_launchds_exit_timeout() {
+        // A slow gateway stop still leaves the engines their drain window: an
+        // engine gives a coding-agent session up to 10 s before force-stopping.
+        assert!(engine_exit_wait(GATEWAY_STOP_TIMEOUT) >= Duration::from_secs(10));
+        // However much time was spent, the wait ends with the allowance left.
+        for spent in [0, 3, 17].map(Duration::from_secs) {
+            assert_eq!(
+                spent + engine_exit_wait(spent) + SERVICE_TEARDOWN_ALLOWANCE,
+                LAUNCHD_EXIT_TIMEOUT
+            );
+        }
+        assert_eq!(engine_exit_wait(LAUNCHD_EXIT_TIMEOUT), Duration::ZERO);
+        // The force-kill grace comes out of the allowance, with room for pg_ctl.
+        assert!(ENGINE_KILL_GRACE < SERVICE_TEARDOWN_ALLOWANCE);
+    }
+
+    // The SIGKILL goes only to a pid that still runs the engine binary, so a
+    // pid the kernel reused during the wait is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_engine_binary_counts_as_an_engine() {
+        assert!(executable_is_engine(Path::new(
+            "/Applications/Lucidos.app/Contents/Resources/lucidos-engine"
+        )));
+        assert!(!executable_is_engine(Path::new(
+            "/Applications/Lucidos.app/Contents/Resources/lucidos-gateway"
+        )));
+        assert!(!executable_is_engine(Path::new(
+            "/usr/bin/lucidos-engine-helper"
+        )));
+        // This test binary is alive and is not an engine; a missing pid is unknown.
+        assert!(!pid_runs_engine(std::process::id() as i32));
+        assert!(!pid_runs_engine(999_999));
+    }
+
+    // The plist must not grow an `ExitTimeOut` the budget above does not know.
+    #[test]
+    fn the_service_plist_leaves_launchds_exit_timeout_at_its_default() {
+        let plist = desired_service_plist(
+            Path::new("/Applications/Lucidos.app/Contents/MacOS/Lucidos"),
+            Path::new("/Users/me/Library/Application Support/com.lucidos.app"),
+        );
+        assert!(!plist.contains("ExitTimeOut"));
     }
 
     #[cfg(target_os = "macos")]

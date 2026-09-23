@@ -20,7 +20,8 @@
 //!
 //! The `screens` mode walks the window through every move the client makes to
 //! one, and found that none of them reverts the placement. See
-//! [`walk_screens`], whose control step proves the walk can see a revert.
+//! [`walk_screens`], whose control step proves the walk can see a revert. It
+//! ends on [`judge_the_retitle`], because a new title does revert it.
 
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 
-use crate::traffic_lights::{inset_lights, measure_cluster, LIGHTS_X_PX};
+use crate::traffic_lights::{inset_lights, measure_cluster, retitle_and_place, LIGHTS_X_PX};
 
 /// The page. It ticks once a second and publishes the count and WebKit's own
 /// visibility verdict through the title. A suspended WebContent cannot keep that
@@ -739,6 +740,37 @@ fn walk_screens(
         });
     }
     faults.extend(judge_the_re_apply(app, window, options));
+    faults.extend(judge_the_retitle(app, window, options));
+    faults
+}
+
+/// Whether a retitle still reverts the placement, and whether the client's
+/// retitle puts it back. The client retitles a window each time its page
+/// reports a workspace name.
+///
+/// The bare `setTitle:` is a control, like the resize one: if it stops
+/// reverting, [`crate::traffic_lights::retitle`] is guarding nothing.
+fn judge_the_retitle(app: &NSApplication, window: &NSWindow, options: &Options) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    inset_lights(window, LIGHTS_X_PX, options.bar_px);
+
+    window.setTitle(&NSString::from_str("probe: bare retitle"));
+    pump(app, Instant::now() + STOP_SETTLE);
+    let bare = read_stop(window);
+    let mut control = Vec::new();
+    judge_stop("retitle-bare", bare, bare, options, &mut control);
+    if control.is_empty() {
+        faults.push(Fault {
+            step: "retitle-bare",
+            what: "a new title left the placement alone, so the client's retitle re-place is dead"
+                .to_string(),
+        });
+    }
+
+    retitle_and_place(window, "probe: client retitle", options.bar_px);
+    pump(app, Instant::now() + STOP_SETTLE);
+    let client = read_stop(window);
+    judge_stop("retitle", client, client, options, &mut faults);
     faults
 }
 

@@ -359,6 +359,7 @@ async fn a_turn_starts(bus: &EventBus, thread_id: uuid::Uuid) {
         bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "what have I got running".to_string(),
             user_image_hashes: vec![],

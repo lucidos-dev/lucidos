@@ -124,6 +124,8 @@ export function mockTranscript(opts: {
   // change cannot move one onto a different turn.
   const heights = new Map<string, number>();
   const heightOf = (eventId: string) => heights.get(eventId) ?? turnHeight;
+  // Turns drawn with their leading rows clamped off by the render window.
+  const clamped = new Set<string>();
 
   const rendered = () => opts.ids.slice(renderFrom);
   const scrollHeight = () => rendered().reduce((sum, id) => sum + heightOf(id), 0);
@@ -133,6 +135,7 @@ export function mockTranscript(opts: {
 
   const turn = (eventId: string, indexInWindow: number) => ({
     getAttribute: (name: string) => (name === 'data-event-id' ? eventId : null),
+    hasAttribute: (name: string) => name === 'data-head-clamped' && clamped.has(eventId),
     getBoundingClientRect: () => {
       const height = heightOf(eventId);
       const rectTop = CONTAINER_VIEWPORT_TOP + offsetOf(indexInWindow) - top;
@@ -176,6 +179,9 @@ export function mockTranscript(opts: {
      *  anchor between two opens. The live Thinking row is derived, so the last
      *  turn loses it the moment that turn finishes (ADR 0066). */
     setTurnHeightOf: (eventId: string, px: number) => { heights.set(eventId, px); },
+    /** ONE turn drawn with its head clamped off, or whole again. The window
+     *  edge sits mid-turn while the walk is still drawing that turn. */
+    setHeadClamped: (eventId: string, on: boolean) => { if (on) clamped.add(eventId); else clamped.delete(eventId); },
     /** The browser re-clamping `scrollTop` after the content shrank under a
      *  reader parked near the bottom. A real container does it itself, where
      *  this mock holds its offset until something writes one. */

@@ -400,16 +400,36 @@ impl LucidosEngine {
             .clone()
     }
 
-    /// Context window (tokens) for `model`: the window declared on its `models`
-    /// registry row, else the id-shape guess in
+    /// The hot-swapped model routing map, for a boundary that validates a
+    /// provider pin against a model's routes.
+    pub(crate) fn model_registry(&self) -> &crate::llm::ModelRegistry {
+        &self.model_registry
+    }
+
+    /// Context window (tokens) for `model`: the window declared on the *route*
+    /// that will serve it, else the id-shape guess in
     /// [`crate::llm::model_registry::context_window_from_prefix`].
     ///
     /// Every context-budget and `ContextCaptured` site goes through here rather
     /// than calling the prefix map directly — the prefix map has no rule for
     /// OpenRouter / xAI / Gemini / local ids and silently hands them 200k, which is
     /// what made the trim loop evict context at ~8% of kimi-k3's real 1M window.
-    pub(crate) fn context_window_for(&self, model: &str) -> usize {
-        crate::llm::model_registry::context_window_for(&self.model_registry, model)
+    ///
+    /// It resolves the route exactly as the router will: the turn's `chosen`
+    /// provider, then the row's preference, then the first configured route.
+    /// So a model served by two backends is budgeted for the one that answers.
+    pub(crate) fn context_window_for(
+        &self,
+        model: &str,
+        chosen: Option<crate::llm::ProviderKind>,
+    ) -> usize {
+        let configured = self.current_provider().configured_providers();
+        crate::llm::model_registry::context_window_for(
+            &self.model_registry,
+            model,
+            chosen,
+            |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
+        )
     }
 
     /// Whether the installed LLM provider can actually serve calls. `false` only

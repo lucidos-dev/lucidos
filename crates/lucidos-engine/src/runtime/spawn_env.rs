@@ -47,9 +47,7 @@ pub(super) fn apply_lucidos_env(
     // User-managed env vars FIRST so every engine-owned var below overrides on
     // collision (e.g. a user `LUCIDOS_REPO` is replaced by the spawn's repo
     // context). The pairs are already reserved-name-filtered by `env_pairs`.
-    for (key, value) in args.user_env_vars {
-        cmd.env(key, value);
-    }
+    crate::core::apply_to_subprocess_env(cmd, args.user_env_vars);
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
     for (key, value) in crate::api::actor::host_protection_env_vars(args.workspace_path) {
         cmd.env(key, value);

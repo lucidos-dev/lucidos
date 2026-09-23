@@ -14,7 +14,7 @@ import fixture from './cross-validation-fixture.json';
 
 interface AvailableThreadActionsCase {
   fn: 'availableThreadActions';
-  args: [string, string, string, boolean, boolean, boolean, boolean, boolean, boolean];
+  args: [string, string, string, boolean, boolean, boolean, boolean, boolean];
   expected: string[];
 }
 
@@ -45,16 +45,16 @@ describe('Cross-validation: generated TS matches Rust', () => {
 
     it(`has exhaustive coverage (${availableThreadActionsCases.length} cases)`, () => {
       // 2 threadTypes × N statuses × 2 sections × 2 pending ×
-      // 2 descendantsBlockArchive × 2 hasLiveEventWaits × 2 hasActiveChildren ×
-      // 2 hasUnsentDraft × 2 isSaved.
+      // 2 descendantsBlockArchive × 2 hasLiveEventWaits × 2 hasUnsentDraft ×
+      // 2 isSaved.
       // Derived from THREAD_STATUSES rather than hardcoded, because the literal
       // product went stale on every new ThreadStatus variant.
-      expect(availableThreadActionsCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 7);
+      expect(availableThreadActionsCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 6);
     });
 
     for (const tc of availableThreadActionsCases) {
-      const [threadType, status, section, pending, descendantsBlockArchive, waits, children, hasUnsentDraft, isSaved] = tc.args;
-      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, dba=${descendantsBlockArchive}, waits=${waits}, children=${children}, draft=${hasUnsentDraft}, saved=${isSaved})`;
+      const [threadType, status, section, pending, descendantsBlockArchive, waits, hasUnsentDraft, isSaved] = tc.args;
+      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, dba=${descendantsBlockArchive}, waits=${waits}, draft=${hasUnsentDraft}, saved=${isSaved})`;
 
       it(`${label} → [${tc.expected.join(', ')}]`, () => {
         const result = availableThreadActions(
@@ -64,7 +64,6 @@ describe('Cross-validation: generated TS matches Rust', () => {
           pending,
           descendantsBlockArchive,
           waits,
-          children,
           hasUnsentDraft,
           isSaved,
         );

@@ -161,6 +161,7 @@ fn coding_agent_prompt_sent_origin_defaults_to_none_when_missing() {
 fn trigger_started_can_carry_scheduler_origin() {
     let id = uuid::Uuid::new_v4().to_string();
     let event = ThreadEvent::TriggerStarted {
+        provider: None,
         trigger_id: id.clone(),
         trigger_name: Some("nightly".into()),
         prompt: Some("run".into()),

@@ -104,6 +104,7 @@ describe('submitTrigger scroll reset', () => {
       sideEffectGrant: [],
       model: null,
       reasoningEffort: null,
+      provider: null,
     });
 
     expect(ok).toBe(true);
@@ -122,6 +123,7 @@ describe('submitTrigger scroll reset', () => {
       sideEffectGrant: [],
       model: null,
       reasoningEffort: null,
+      provider: null,
     });
 
     expect(ok).toBe(true);
@@ -141,6 +143,7 @@ describe('submitTrigger scroll reset', () => {
       sideEffectGrant: [],
       model: null,
       reasoningEffort: null,
+      provider: null,
     });
 
     expect(ok).toBe(false);
@@ -167,6 +170,7 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     cronExpressions: ['0 0 8 * * *'],
     goToReview: false,
     sideEffectGrant: [],
+    provider: null,
   };
 
   it('sends the pinned pair on create and omits it when Default', async () => {
@@ -198,6 +202,22 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     expect(body.reasoning_effort).toBeNull();
   });
 
+  it('sends the backend pin only beside a model pin', async () => {
+    await submitTrigger({
+      ...base, run: intentRun, triggerId: 't1',
+      model: 'claude-opus-5-5', reasoningEffort: 'high', provider: 'anthropic',
+    });
+    expect(mockUpdateTrigger.mock.calls[0][1].provider).toBe('anthropic');
+
+    // Default model: a backend has nothing to pin, and the engine refuses one.
+    mockUpdateTrigger.mockClear();
+    await submitTrigger({
+      ...base, run: intentRun, triggerId: 't1',
+      model: null, reasoningEffort: null, provider: 'anthropic',
+    });
+    expect(mockUpdateTrigger.mock.calls[0][1].provider).toBeNull();
+  });
+
   it('forces both to null for a script trigger, which runs no LLM', async () => {
     // Guards the intent → script switch: the form still holds the model the
     // user picked while it was an intent trigger, and none of it applies now.
@@ -209,10 +229,12 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
       sideEffectGrant: ['email'],
       model: 'gemini-3.5-flash',
       reasoningEffort: 'low',
+      provider: 'vertex',
     });
     const body = mockUpdateTrigger.mock.calls[0][1];
     expect(body.model).toBeNull();
     expect(body.reasoning_effort).toBeNull();
+    expect(body.provider).toBeNull();
     expect(body.go_to_review).toBe(false);
     expect(body.side_effect_grant).toEqual([]);
   });
@@ -238,6 +260,7 @@ describe('submitTrigger surfaces the engine warnings', () => {
     sideEffectGrant: [],
     model: null,
     reasoningEffort: null,
+    provider: null,
   };
 
   it('toasts an event-type warning on create, so a typo is caught at save time', async () => {

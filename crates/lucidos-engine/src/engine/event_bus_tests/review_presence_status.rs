@@ -111,6 +111,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "dispatch work".into(),
             user_image_hashes: vec![],
@@ -138,6 +139,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: format!("child task {}", i),
                 user_image_hashes: vec![],
@@ -336,6 +338,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
@@ -452,6 +455,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do work".into(),
             user_image_hashes: vec![],
@@ -535,6 +539,7 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "first".into(),
             user_image_hashes: vec![],

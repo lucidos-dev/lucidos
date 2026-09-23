@@ -15,6 +15,7 @@ async fn first_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "one prompt-wording change in the engine".into(),
             user_image_hashes: vec![],

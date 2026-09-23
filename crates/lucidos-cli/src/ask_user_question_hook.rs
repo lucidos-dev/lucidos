@@ -49,6 +49,9 @@ struct AskUserQuestionRequestBody<'a> {
 struct AskUserQuestionResponseBody {
     questions: serde_json::Value,
     answers: serde_json::Value,
+    /// Set when the engine refused the card, which the user never saw.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 pub(crate) fn run() -> Result<(), BoxError> {
@@ -79,9 +82,25 @@ pub(crate) fn run() -> Result<(), BoxError> {
         .json()
         .map_err(|e| format!("hook response parse: {}", e))?;
 
-    let output = build_hook_output(&resp.questions, &resp.answers);
+    let output = match &resp.refusal {
+        Some(reason) => build_refusal_output(reason),
+        None => build_hook_output(&resp.questions, &resp.answers),
+    };
     println!("{output}");
     Ok(())
+}
+
+/// Deny the tool call: Claude Code hands the reason to the model as the tool
+/// result, and no card was shown.
+fn build_refusal_output(reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
 }
 
 /// Build the JSON Claude Code expects on a PreToolUse hook's stdout when the
@@ -155,5 +174,18 @@ mod tests {
             parsed["hookSpecificOutput"]["updatedInput"]["answers"],
             answers
         );
+    }
+
+    #[test]
+    fn a_refusal_denies_the_call_with_the_reason() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&build_refusal_output("Question card not shown.")).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"],
+            "Question card not shown."
+        );
+        assert!(parsed["hookSpecificOutput"].get("updatedInput").is_none());
     }
 }

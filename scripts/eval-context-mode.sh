@@ -122,7 +122,7 @@ cd "$PROJECT_DIR"
 # picker lists them without a nested root nobody else uses.
 export LUCIDOS_EVAL_ROOT="${LUCIDOS_EVAL_ROOT:-$HOME/workspaces}"
 export LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://lucidos:lucidos@localhost:5435}"
-export LUCIDOS_EVAL_MODEL="${LUCIDOS_EVAL_MODEL:-claude-opus-5@default}"
+export LUCIDOS_EVAL_MODEL="${LUCIDOS_EVAL_MODEL:-claude-opus-5}"
 export LUCIDOS_EVAL_MODEL_LABEL="${LUCIDOS_EVAL_MODEL_LABEL:-Model under test}"
 export LUCIDOS_EVAL_MODEL_PROVIDER="${LUCIDOS_EVAL_MODEL_PROVIDER:-vertex}"
 export LUCIDOS_EVAL_REASONING_EFFORT="${LUCIDOS_EVAL_REASONING_EFFORT:-default}"

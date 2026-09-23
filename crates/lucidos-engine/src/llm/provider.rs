@@ -128,6 +128,11 @@ pub struct LlmResponse {
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_chars: Option<usize>,
+    /// Count of thinking blocks the model produced. Proof it thought even when
+    /// `thinking_chars` is 0: Claude returns empty thinking text unless asked
+    /// to show it. `None` for providers that don't report blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_blocks: Option<usize>,
     /// Count of SSE shapes the provider parser saw but couldn't classify
     /// (unknown `content_block` types or unknown delta types, excluding
     /// known-quiet metadata). Non-zero with empty content + empty
@@ -164,16 +169,55 @@ impl LlmResponse {
     }
 }
 
+/// The *model selection* for one turn: which model, on which backend, thinking
+/// how hard.
+///
+/// Every field is optional, and absent means "resolve it". `RoutingProvider` is
+/// the only implementor that reads more than `model`: the leaf providers each
+/// serve one backend, so `provider` is already settled by the time a turn
+/// reaches them.
+///
+/// The three travel together because they are resolved together. Carrying them
+/// as three arguments put the provider six parameters deep on a trait whose
+/// leaves all ignore it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelSelection<'a> {
+    /// The model to run, or `None` for the provider's own default.
+    pub model: Option<&'a str>,
+    /// The backend to serve it. Honoured or refused, never substituted, so a
+    /// pick naming an unconfigured backend errors rather than moving the turn
+    /// to a different vendor. `None` takes the row's own preference, then its
+    /// first configured route.
+    pub provider: Option<crate::llm::model_registry::ProviderKind>,
+    /// One of `llm::reasoning::EFFORT_LADDER`, snapped onto what the resolved
+    /// backend supports. `None` leaves the provider's own default.
+    pub reasoning_effort: Option<&'a str>,
+}
+
+impl<'a> ModelSelection<'a> {
+    /// A selection naming only the model, which is what most callers have.
+    pub fn model(model: &'a str) -> Self {
+        Self {
+            model: Some(model),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_effort(mut self, effort: Option<&'a str>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn chat(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model_override: Option<&str>,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Returns the default model name for this provider.

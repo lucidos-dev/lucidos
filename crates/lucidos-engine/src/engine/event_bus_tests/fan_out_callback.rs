@@ -14,6 +14,7 @@ async fn test_fan_out_parent_callback() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do three things".into(),
             user_image_hashes: vec![],
@@ -40,6 +41,7 @@ async fn test_fan_out_parent_callback() {
         bus.emit(BusEvent::Thread {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: format!("task {}", i + 1),
                 user_image_hashes: vec![],
@@ -282,6 +284,7 @@ async fn test_fan_out_chat_children_all_report_back() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "research crypto sectors".into(),
             user_image_hashes: vec![],
@@ -308,6 +311,7 @@ async fn test_fan_out_chat_children_all_report_back() {
         bus.emit(BusEvent::Thread {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
+                provider: None,
                 voice_session_id: None,
                 text: format!("research sector {}", i + 1),
                 user_image_hashes: vec![],
@@ -406,6 +410,7 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
     bus.emit(BusEvent::Thread {
         thread_id: spawning_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "kick off some research".into(),
             user_image_hashes: vec![],
@@ -431,6 +436,7 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
     bus.emit(BusEvent::Thread {
         thread_id: top_thread_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do the research independently".into(),
             user_image_hashes: vec![],
@@ -513,6 +519,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "research something".into(),
             user_image_hashes: vec![],
@@ -538,6 +545,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
@@ -639,6 +647,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "research something".into(),
             user_image_hashes: vec![],
@@ -664,6 +673,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
@@ -799,6 +809,7 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
     bus1.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
@@ -905,6 +916,7 @@ async fn refire_skips_parent_that_already_resumed() {
     bus1.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            provider: None,
             voice_session_id: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],

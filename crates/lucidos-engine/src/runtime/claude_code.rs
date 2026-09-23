@@ -204,60 +204,81 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
     .expect("ControlRequest serialization cannot fail")
 }
 
-/// Cached default reasoning effort from CC settings. Read once per process.
-static CC_DEFAULT_EFFORT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
 fn is_valid_effort(value: &str) -> bool {
     cc_reasoning_effort_options()
         .iter()
         .any(|m| m.value == value)
 }
 
-fn effort_from_json(path: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let v = parsed.get("effortLevel")?.as_str()?.to_lowercase();
-    if is_valid_effort(&v) {
-        Some(v)
-    } else {
-        None
-    }
+/// Where one Claude Code session finds its defaults, read fresh per spawn.
+///
+/// It sees exactly the env the spawned CC sees. The engine's raw process env
+/// would not do: it holds the workspace env vars as of engine startup, so a
+/// value read there goes stale the moment a variable changes.
+pub struct CcSettingsScope<'a> {
+    /// The workspace env vars the spawn injects (`SpawnArgs::user_env_vars`).
+    pub env: &'a [(String, String)],
+    /// What CC inherits for a name `env` does not set. Production passes
+    /// `core::inherited_env_var`, and tests pass a stub.
+    pub inherited: fn(&str) -> Option<String>,
+    /// The `CLAUDE_CONFIG_DIR` the session runs under, holding the user settings.
+    pub config_dir: Option<&'a Path>,
+    /// The session's cwd, whose `.claude/` holds the project settings.
+    pub project_dir: &'a Path,
 }
 
-/// Read the effective reasoning effort from Claude Code's configuration.
-/// Precedence (highest first): env var > local project > project > user local > user global.
-/// Cached after first call.
-pub fn read_cc_default_effort() -> Option<String> {
-    CC_DEFAULT_EFFORT
-        .get_or_init(|| {
-            if let Ok(val) = std::env::var("CLAUDE_CODE_EFFORT_LEVEL") {
-                let v = val.to_lowercase();
-                if is_valid_effort(&v) {
-                    return Some(v);
-                }
-            }
-            // CC settings precedence: local project > project > user local > user global
-            let project_files = [".claude/settings.local.json", ".claude/settings.json"];
-            for f in &project_files {
-                if let Some(v) = effort_from_json(std::path::Path::new(f)) {
-                    return Some(v);
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                let home = std::path::Path::new(&home);
-                let user_files = [
-                    home.join(".claude/settings.local.json"),
-                    home.join(".claude/settings.json"),
-                ];
-                for f in &user_files {
-                    if let Some(v) = effort_from_json(f) {
-                        return Some(v);
-                    }
-                }
-            }
-            None
+impl CcSettingsScope<'_> {
+    /// The effort CC runs at when no caller pinned one.
+    pub fn default_effort(&self) -> Option<String> {
+        self.resolve("CLAUDE_CODE_EFFORT_LEVEL", "effortLevel", |v| {
+            let v = v.to_lowercase();
+            is_valid_effort(&v).then_some(v)
         })
-        .clone()
+    }
+
+    /// The model CC picks when no `--model` is passed. `None` means CC's
+    /// built-in default, which only its Init event names.
+    pub fn default_model(&self) -> Option<String> {
+        self.resolve("ANTHROPIC_MODEL", "model", |v| {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        })
+    }
+
+    /// CC's own order, highest first: the env var, then the local project,
+    /// project and user settings files. The source order is CC's
+    /// `userSettings < projectSettings < localSettings < flagSettings`. The
+    /// engine's `--settings` file (flagSettings) sets neither key, so it is
+    /// skipped here.
+    fn resolve(
+        &self,
+        env_var: &str,
+        settings_key: &str,
+        accept: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        let env_value = self
+            .env
+            .iter()
+            .find(|(k, _)| k == env_var)
+            .map(|(_, v)| v.clone())
+            .or_else(|| (self.inherited)(env_var));
+        if let Some(v) = env_value.as_deref().and_then(&accept) {
+            return Some(v);
+        }
+        let claude_dir = self.project_dir.join(".claude");
+        [
+            Some(claude_dir.join("settings.local.json")),
+            Some(claude_dir.join("settings.json")),
+            self.config_dir.map(|d| d.join("settings.json")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+            accept(parsed.get(settings_key)?.as_str()?)
+        })
+    }
 }
 
 /// `AgentRuntime` implementation backed by the `claude` CLI.
@@ -504,29 +525,28 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if let Some(m) = args.model {
         cmd.arg("--model").arg(m);
     }
-    if let Some(effort) = args.reasoning_effort {
-        cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
-    }
     if let Some(prompt) = args.system_prompt {
         cmd.arg("--append-system-prompt").arg(prompt);
     }
-    // Push CC's own byte-idle streaming deadline out past the engine's
-    // inactivity watchdog, so a provider stall auto-resumes instead of killing
-    // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
-    //
-    // Set BEFORE `apply_lucidos_env`, which is load-bearing: that helper applies
-    // the user's workspace env vars FIRST and lets engine-owned vars win a
-    // collision, so anything written after it is unoverridable. This one is a
-    // tunable default, not a contract, so it goes before and a workspace env var
-    // of the same name still wins.
-    cmd.env(
-        "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS",
-        CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string(),
-    );
     // Agent-independent Lucidos env contract (workspace, host protection,
     // PG*, subprocess origin, spawn metadata, RUSTC_WRAPPER, PATH) — shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
     apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    // Push CC's own byte-idle streaming deadline out past the engine's
+    // inactivity watchdog, so a provider stall auto-resumes instead of killing
+    // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
+    //
+    // A tunable default, not a contract, so a workspace env var of the same name
+    // wins. Set AFTER `apply_lucidos_env`, which strips a deleted workspace var
+    // and would take this default with it if it were written first.
+    const IDLE_TIMEOUT_ENV: &str = "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS";
+    if !args
+        .user_env_vars
+        .iter()
+        .any(|(k, _)| k == IDLE_TIMEOUT_ENV)
+    {
+        cmd.env(IDLE_TIMEOUT_ENV, CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string());
+    }
     // Pin the session's CLAUDE_CONFIG_DIR on a RESUME. CC stores each session's
     // transcript at `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/<sid>.jsonl`, so
     // a `--resume <sid>` MUST run under the config dir the session was created
@@ -537,6 +557,12 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // session leaves the user's value or CC's default in place.
     if let Some(dir) = args.claude_config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    // The effort the thread records is the effort CC runs at. So it goes AFTER
+    // `apply_lucidos_env`, where a workspace `CLAUDE_CODE_EFFORT_LEVEL` cannot
+    // overwrite a pin.
+    if let Some(effort) = args.reasoning_effort {
+        cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
     }
     // Auto mode's opt-in, for the same reason and by the same rule as the pin
     // above: engine-owned, so it goes AFTER `apply_lucidos_env` and a stale

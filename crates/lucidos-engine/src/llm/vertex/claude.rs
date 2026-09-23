@@ -26,7 +26,7 @@ impl VertexProvider {
         let (base_model, _) = parse_context_suffix(model);
         let url = self.endpoint_for_model(base_model);
 
-        let (request, _is_1m) = build_claude_request(
+        let (request, header_betas) = build_claude_request(
             messages,
             tools,
             model,
@@ -35,6 +35,8 @@ impl VertexProvider {
             WireTarget::Vertex { url: &url },
             "Vertex",
         );
+        let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
+        let display = request.thinking_display();
 
         let mut access_token = self.get_access_token().await?;
 
@@ -46,12 +48,15 @@ impl VertexProvider {
         loop {
             attempt += 1;
 
-            let builder = self
+            let mut builder = self
                 .streaming_client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", access_token))
-                .header("Content-Type", "application/json")
-                .json(&request);
+                .header("Content-Type", "application/json");
+            if let Some(beta) = &beta_header {
+                builder = builder.header("anthropic-beta", beta);
+            }
+            let builder = builder.json(&request);
             let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
                 crate::llm::StreamSend::Got(r) => r,
                 crate::llm::StreamSend::Retry => continue,
@@ -96,7 +101,7 @@ impl VertexProvider {
             }
 
             // Parse SSE stream — retry on overload errors
-            match parse_claude_stream(resp, &on_token, "Vertex").await {
+            match parse_claude_stream(resp, &on_token, display, "Vertex").await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();

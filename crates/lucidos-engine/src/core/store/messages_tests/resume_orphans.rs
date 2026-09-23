@@ -669,3 +669,105 @@ fn resume_blocks_orphan_load_knowhow_emits_orphan_stub_even_when_id_in_loaded_se
         panic!("expected Blocks content");
     }
 }
+
+fn parallel_row(id: Uuid, event_type: &str, payload: serde_json::Value, seq: i64) -> EventRow {
+    EventRow {
+        id,
+        event_type: event_type.to_string(),
+        payload,
+        created: Utc.timestamp_opt(1700000000 + seq, 0).unwrap(),
+        thread_id: None,
+        sequence: Some(seq),
+    }
+}
+
+/// A parallel run answers in completion order. Pairing with the newest pending
+/// call of the same name would give the model one file's contents under
+/// another file's call (ADR 0246).
+#[test]
+fn a_parallel_run_pairs_each_result_with_its_own_call() {
+    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let call = |id, path: &str, seq| {
+        parallel_row(
+            id,
+            "ToolCalled",
+            json!({"name": "read_file", "args": {"path": path}}),
+            seq,
+        )
+    };
+    let result = |id: Uuid, text: &str, seq| {
+        parallel_row(
+            Uuid::new_v4(),
+            "ToolResult",
+            json!({"name": "read_file", "result": text, "tool_called_event_id": id}),
+            seq,
+        )
+    };
+    let events = vec![
+        call(a, "a", 1),
+        call(b, "b", 2),
+        call(c, "c", 3),
+        result(a, "A", 4),
+        result(c, "C", 5),
+        result(b, "B", 6),
+    ];
+    let pairs = crate::core::store::collect_tool_pairs_chronological(&events);
+    let got: Vec<(Uuid, Option<&str>)> = pairs
+        .iter()
+        .map(|p| (p.tool_called_event_id, p.result.as_deref()))
+        .collect();
+    assert_eq!(got, vec![(a, Some("A")), (b, Some("B")), (c, Some("C"))]);
+}
+
+/// A crash mid-run leaves the slow call unanswered. The orphan is the call
+/// with no result, not whichever came last.
+#[test]
+fn the_orphan_of_a_parallel_run_is_the_call_with_no_result() {
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let events = vec![
+        parallel_row(
+            a,
+            "ToolCalled",
+            json!({"name": "read_file", "args": {"path": "a"}}),
+            1,
+        ),
+        parallel_row(
+            b,
+            "ToolCalled",
+            json!({"name": "read_file", "args": {"path": "b"}}),
+            2,
+        ),
+        parallel_row(
+            Uuid::new_v4(),
+            "ToolResult",
+            json!({"name": "read_file", "result": "A", "tool_called_event_id": a}),
+            3,
+        ),
+    ];
+    let orphans = crate::core::store::find_orphan_tool_called_ids(&events);
+    assert_eq!(orphans, vec![(b, "read_file".to_string())]);
+}
+
+/// A result naming a call outside the window pairs nothing. Guessing by name
+/// would give it to a pending call it does not answer.
+#[test]
+fn a_result_naming_an_absent_call_pairs_nothing() {
+    let a = Uuid::new_v4();
+    let events = vec![
+        parallel_row(
+            a,
+            "ToolCalled",
+            json!({"name": "read_file", "args": {"path": "a"}}),
+            1,
+        ),
+        parallel_row(
+            Uuid::new_v4(),
+            "ToolResult",
+            json!({"name": "read_file", "result": "X", "tool_called_event_id": Uuid::new_v4()}),
+            2,
+        ),
+    ];
+    let pairs = crate::core::store::collect_tool_pairs_chronological(&events);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].result, None);
+}

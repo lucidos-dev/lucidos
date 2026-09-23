@@ -74,7 +74,7 @@ const NO_MEMORY_FILES_RULE: &str = "NEVER WRITE A CODING-AGENT MEMORY FILE: Do n
 /// test `lucidos_prompts_carry_full_apply_restart_rule` documents the
 /// failure mode that motivated the hard ban.
 const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your commits sit \
-    as a pending change in the UI. The user explicitly clicks Apply to merge your branch into \
+    as a pending change on this thread. The user explicitly clicks Apply to merge your branch into \
     main — nothing happens automatically. The button label is \"Apply\" (no restart needed) or \
     \"Apply & Restart\" (restart needed); the engine derives this from the touched files. ANY \
     of these triggers restart: a non-test `.rs` file, `Cargo.toml`, `Cargo.lock`, a `.sql` \
@@ -453,12 +453,12 @@ const ASK_USER_QUESTION_RULE: &str =
 /// mislead them into stopping without pushing. Reaches both backends: it is a
 /// separate placeholder in the builders, so `append_backend_rules`' Codex swap
 /// of `ASK_USER_QUESTION_RULE` leaves it intact.
-const APPLY_CONFIRMATION_NOTE: &str = "APPLYING YOUR WORK: Concretely, a question you leave open \
-     parks this thread in the waiting-for-answer state, which BLOCKS the Apply button — the user \
-     cannot Apply your change while a question is open, and for a visual change they can't judge \
-     it until they Apply. So when your change is ready, finish the turn and let the change be \
-     proposed, so the user can review the Diff, click Apply, and see it live — never gate a \
-     finished change behind a \"does this look good?\" question.";
+const APPLY_CONFIRMATION_NOTE: &str = "APPLYING YOUR WORK: A question you leave open parks this \
+     thread in the waiting-for-answer state. That BLOCKS the Apply button, and the user can't \
+     judge a visual change until they Apply. So when your change is ready, finish the turn and \
+     the engine proposes it. Its Apply button sits in this thread. Never tell the user where to \
+     apply it (no \"from the Changes panel\"). Never gate a finished change behind a \"does this \
+     look good?\" question.";
 
 /// A session may not settle a question about the shipped product's security,
 /// data exposure, or user-visible correctness on its own. When it finds
@@ -1050,7 +1050,7 @@ pub(super) fn app_worktree_system_prompt(
          `run_bash` — that writes to live workspace data on `main`, not into your worktree.\n\n\
          You don't have `cargo`, `npx tsc`, `scripts/web-dev.sh`, or any Lucidos-source \
          build tooling here. Run the app's own test/lint commands if it ships any.\n\n\
-         APPLY: When you finish, the user sees a pending *change* in the Apply panel. \
+         APPLY: When you finish, your commits become a pending *change* on this thread. \
          Apply ff-merges your branch into the workspace git's `main`. **No engine \
          restart** ever happens (data-tree changes don't restart the engine). **No \
          `/harden`** runs (apps own their hardening; if this app ships its own \
@@ -1110,7 +1110,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          3. If the work looks complete, clean up and finish\n\
          4. If incomplete, continue where you left off\n\n\
          {restart_not_rejection}\n\n\
-         When you finish, the user sees a pending *change* in the Apply panel. Apply \
+         When you finish, your commits become a pending *change* on this thread. Apply \
          ff-merges your branch into the workspace git's `main`. No engine restart; no \
          `/harden` (apps own their hardening). Apply emits `AppUiRefreshRequested` if any \
          iframe-bundled file changed.\n\n\
@@ -2298,6 +2298,16 @@ mod tests {
                     full.contains("BLOCKS the Apply button"),
                     "{label} ({agent:?}) must carry the Apply-specific confirmation note \
                      — the Codex ask-rule swap must not strip the separate note",
+                );
+                // The change is appliable from the thread the user reads the
+                // report in. An agent told nothing guesses a panel and names it.
+                assert!(
+                    full.contains("Never tell the user where to apply it"),
+                    "{label} ({agent:?}) must forbid naming where to apply the change",
+                );
+                assert!(
+                    !full.contains("Apply panel"),
+                    "{label} ({agent:?}) must not name a panel the user applies from",
                 );
             }
         }

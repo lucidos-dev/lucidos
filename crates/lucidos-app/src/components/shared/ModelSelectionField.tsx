@@ -9,12 +9,12 @@ import type { ModelChoice, TierChoice } from '../../store/modelSelection';
 import { focusIfNeeded } from '../../utils/dom';
 
 /** A form field over a *model selection*: a dropdown-shaped trigger reading the
- *  whole pair, opening the same two-step picker the prompt bar mounts.
+ *  whole selection, opening the same stepped picker the prompt bar mounts.
  *
  *  It wears `.dropdown-trigger` and opens a `.dropdown-menu` panel, so it sits
  *  in a Settings row or a `.form-group` like any other control. What it is NOT
  *  is a `Dropdown`: that one is a flat list of values, and a model selection is
- *  reached in two steps.
+ *  reached in steps.
  *
  *  Bare on purpose, so a caller can put it in whatever field its surface uses:
  *  a Settings row, or the trigger form's `.form-group`. */
@@ -24,6 +24,7 @@ export function ModelSelectionField({
   vocabulary,
   model,
   effort,
+  provider,
   disabled,
   onChange,
 }: {
@@ -33,6 +34,8 @@ export function ModelSelectionField({
   vocabulary: readonly TierChoice[];
   model: string;
   effort: string | null;
+  /** The backend picked for `model`, or `null` for the model's own default. */
+  provider?: string | null;
   disabled?: boolean;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {
@@ -46,7 +49,10 @@ export function ModelSelectionField({
   const pos = useAnchoredPosition(anchor, menuRef);
   useHidePanelWebviewWhile(open);
 
-  const selection = useModelSelection({ models, vocabulary, model, effort, onChange });
+  const selection = useModelSelection({
+    models, vocabulary, model, effort, onChange,
+    providerFor: (m) => (m === model ? provider ?? null : null),
+  });
 
   function close() {
     setAnchor(null);
@@ -95,8 +101,8 @@ export function ModelSelectionField({
         <ModelSelectionPicker
           label={label}
           selection={selection}
-          onPick={(encoded) => {
-            selection.pick(encoded);
+          onPick={(encoded, pickedProvider) => {
+            selection.pick(encoded, pickedProvider);
             closeAfterPick();
           }}
         />

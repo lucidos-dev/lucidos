@@ -33,8 +33,8 @@ Two rules.
 
 **Each adaptive-thinking model carries its own published `max_tokens` ceiling**,
 paired with the model fragment in one `ADAPTIVE_THINKING_MODELS` table.
-`requires_adaptive_thinking` derives from that table, so the ceiling and the
-adaptive gate cannot drift.
+`thinking_mode` derives from that table, so the ceiling and the adaptive gate
+cannot drift.
 
 **A tool-argument parse failure is classified by `stop_reason`**, not by whether
 a block was produced:
