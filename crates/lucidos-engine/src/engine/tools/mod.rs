@@ -521,6 +521,15 @@ impl LucidosEngine {
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
         let n = parse_send_notification_args(args, thread_id)?;
+        crate::scheduler::notifications::verify_event_anchors(
+            &self.pool,
+            Some(n.link_thread),
+            n.link_event,
+            &n.tap,
+        )
+        .await
+        .map_err(|e| format!("Error: could not check event_id: {e}"))?
+        .map_err(|e| format!("Error: {e}"))?;
         match self
             .create_notification(
                 &n.title,

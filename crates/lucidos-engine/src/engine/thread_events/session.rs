@@ -99,9 +99,10 @@ pub enum ChildCompletionStatus {
     /// `Success` so the parent can branch on "did the child actually produce
     /// reviewable work?" without re-querying the changes table.
     NoChanges,
-    /// Child was canceled by the user (`ResponseCanceled`). The summary is
-    /// the partial response text (or empty); the parent can decide whether to
-    /// retry, prompt again, or give up. `ResponseAborted` (system-driven, e.g.
+    /// The child is not continuing. The user archived, deleted or discarded
+    /// it, or an agent canceled its own child. A person's Stop is never this:
+    /// it sends `ChildThreadStopped` (ADR 0252). The summary says what ended
+    /// it; the parent can decide whether to retry, prompt again, or give up. `ResponseAborted` (system-driven, e.g.
     /// engine restart) deliberately does NOT surface here — that case is
     /// transient and the engine resumes the child on next visit.
     Canceled,

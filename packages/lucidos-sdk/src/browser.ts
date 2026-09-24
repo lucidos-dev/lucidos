@@ -3,7 +3,8 @@ import { lucidos } from './index';
 import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
 import { installTooltips } from './tooltip';
-import { primeExternalLinkTarget } from './ui';
+import { primeDevicePreferences } from './ui';
+import { installAutocorrectStamp } from './autocorrectStamp';
 import { isBridged } from './_bridge';
 import { primeBridgedStorage } from './_storage';
 import { installHostOps } from './hostOps';
@@ -12,6 +13,10 @@ import { installCapabilityRenewal } from './frameCapability';
 export * from './index';
 
 if (typeof document !== 'undefined') {
+  // The device's Autocorrect switch, on this frame's own text fields. It starts
+  // from the first-paint seed or the default of on, and the prime below
+  // corrects it to the device's stored value.
+  installAutocorrectStamp();
   // Answer the host's own requests: capture, app switch, fragment delivery. It
   // reached through `contentWindow` for all three until an opaque origin closed
   // that. Installed unconditionally, so the host can ask the same way whichever
@@ -42,14 +47,13 @@ if (typeof document !== 'undefined') {
   // never wires a touch affordance by hand: any data-tooltip answers a long
   // press, and the tooltip clears itself shortly after the finger lifts.
   installTooltips({ longPressNeedsOptIn: false, hideAfterLongPressMs: 2000 });
-  // Warm the external-link target so the click handler below can read it
-  // synchronously (the "Ask" mode's share sheet needs the click's user
-  // activation intact). Done here rather than leaning on applyPreferences,
-  // which an app shipping its own visual identity never calls. Self-limits to
-  // an installed iOS PWA, the only client where the value is read. Best-effort:
-  // on failure links take the host path, exactly as they did before.
-  primeExternalLinkTarget().catch((err) => {
-    console.warn('[lucidos-sdk] could not read the external-link preference:', err);
+  // Read this device's preferences once, for the two things every app frame
+  // follows whether or not it themes itself: the external-link target (the
+  // click handler below reads it synchronously, so the "Ask" share sheet keeps
+  // the click's user activation) and the Autocorrect switch. Best-effort: on
+  // failure links take the host path and the stamp keeps its load-time value.
+  primeDevicePreferences().catch((err) => {
+    console.warn('[lucidos-sdk] could not read this device\'s preferences:', err);
   });
   // Forward host keyboard shortcuts (pane focus/hide, narrow/widen, Escape, …)
   // up to the parent — iframe keydowns never reach the host document otherwise,

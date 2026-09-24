@@ -159,9 +159,12 @@ describe('ThreadView reaches for the whole history through the hold', () => {
   it('settles the chevron read too, so a hold taken for it is consumed', () => {
     // The press is not the only way into a hold on that read: a reader
     // returning mid-fetch takes one for whatever is running.
-    const from = SOURCE.indexOf('void ensureWholeThreadLoaded(threadId).then(');
+    const from = SOURCE.indexOf('void ensureWholeThreadLoaded(threadId, ');
     expect(from, 'the chevron reaches for the whole history').toBeGreaterThan(-1);
-    expect(SOURCE.slice(from, from + 400)).toContain('settleHistoryRead(threadId, added, onHistoryRead)');
+    const call = SOURCE.slice(from, from + 400);
+    expect(call).toContain('settleHistoryRead(threadId, added, onHistoryRead)');
+    // And it lands only once the reader lets go of the scrollbar (ADR 0258).
+    expect(call).toContain('scrollbarReleased(el)');
   });
 
   it('bounds that retry at one ask per visit, and clears it on the way out', () => {

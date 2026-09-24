@@ -123,7 +123,11 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         crate::core::store::fetch_thread_aggregate(pool, thread_uuid),
     );
 
-    let (mut events, has_more, max_sequence) = events_res.map_err(|e| {
+    let EventsRead {
+        mut events,
+        has_more,
+        max_sequence,
+    } = events_res.map_err(|e| {
         log!("[API] Failed to get thread events: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -170,6 +174,14 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     }))
 }
 
+/// What `read_events` returns. On an unpaged read, whose rows are the whole
+/// history, `has_more` is false and `max_sequence` is `None`.
+struct EventsRead {
+    events: Vec<ThreadEventRow>,
+    has_more: bool,
+    max_sequence: Option<i64>,
+}
+
 /// The events half of the snapshot, paged or whole.
 ///
 /// Split out so the unpaged path keeps calling the query it always called. A
@@ -180,21 +192,29 @@ async fn read_events(
     thread_uuid: Uuid,
     query: &ThreadEventsQuery,
     before: Option<(chrono::DateTime<chrono::Utc>, i64)>,
-) -> Result<(Vec<ThreadEventRow>, bool, Option<i64>), sqlx::Error> {
+) -> Result<EventsRead, sqlx::Error> {
     let Some(limit) = query.limit else {
         let events = state
             .event_store
             .get_thread_events_by_seq(thread_uuid, query.after)
             .await?;
         // An unpaged read carries every row, so its own rows ARE the watermark.
-        return Ok((events, false, None));
+        return Ok(EventsRead {
+            events,
+            has_more: false,
+            max_sequence: None,
+        });
     };
     let limit = limit.clamp(1, MAX_EVENTS_PAGE);
     let page = state
         .event_store
         .get_thread_events_page(thread_uuid, before, limit)
         .await?;
-    Ok((page.events, page.has_more, page.max_sequence))
+    Ok(EventsRead {
+        events: page.events,
+        has_more: page.has_more,
+        max_sequence: page.max_sequence,
+    })
 }
 
 /// The two event types carrying a tool's OUTPUT, one per channel. Every read

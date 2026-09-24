@@ -8,6 +8,7 @@ import { createFailureCounter } from '../../utils/failureCounter';
 import { REASONING_LEVELS, DEFAULT_CHAT_MODEL } from '../models';
 import { clampEffortFor } from './models';
 import { isIOSPwa, isTauri } from '../../utils/platform';
+import { setProseAutocorrect } from '../../utils/noAutofill';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
 import {
@@ -22,6 +23,7 @@ import {
   UI_SCALE_DEFAULT, clampUiScale, fontFeaturesFor, parseUiScale, resolveTheme,
   type FontFamily, type ThemePref,
 } from '@lucidos/appearance';
+import { AUTOCORRECT_STORAGE_KEY, defaultAutocorrect } from '@lucidos/text-entry';
 
 /** Re-exported so the components that already import these from the store keep
  *  one import site. The definitions live in the appearance contract, which is
@@ -71,6 +73,19 @@ function currentPreference<T extends string>(
     if (cached && (validValues as readonly string[]).includes(cached)) return cached as T;
   }
   return defaultValue;
+}
+
+/** Take a switch's device-local mirror from what the engine just served. An
+ *  absent key CLEARS it rather than leaving it: unset means the default, and a
+ *  cache kept there would outlive a reset and keep answering for a preference
+ *  nobody holds. */
+function cacheServedSwitch(key: string, storageKey: string): void {
+  const served = preferences.value.status === 'loaded' ? preferences.value.data[key] : undefined;
+  if (served === 'true' || served === 'false') {
+    localStorage.setItem(storageKey, served);
+  } else {
+    localStorage.removeItem(storageKey);
+  }
 }
 
 // --- Preference writes: apply locally, deliver durably ---
@@ -694,25 +709,33 @@ export function currentNotificationToasts(): boolean {
   ) === 'true';
 }
 
-/** Take the mirror from what the engine just served. An absent key CLEARS it
- *  rather than leaving it: unset means the default, and a cache kept there
- *  would outlive a reset and keep answering for a preference nobody holds. */
-function cacheNotificationToasts(): void {
-  const served = preferences.value.status === 'loaded'
-    ? preferences.value.data['notification_toasts']
-    : undefined;
-  if (served === 'true' || served === 'false') {
-    localStorage.setItem(NOTIFICATION_TOASTS_KEY, served);
-  } else {
-    localStorage.removeItem(NOTIFICATION_TOASTS_KEY);
-  }
-}
-
 export function setNotificationToasts(enabled: boolean): Promise<void> {
   const value = enabled ? 'true' : 'false';
   return savePreference('notification_toasts', value, () => {
     localStorage.setItem(NOTIFICATION_TOASTS_KEY, value);
   });
+}
+
+// --- Autocorrect ---
+
+/** Whether this device's prose fields autocorrect. A stored value wins on any
+ *  client; unset falls to the mirror, then to `defaultAutocorrect`, which is
+ *  on. The mirror exists for the same reason the toasts switch keeps one: the
+ *  composer can take focus before preferences load, and iOS reads the
+ *  attribute at focus. */
+export function currentAutocorrect(): boolean {
+  const fallback = defaultAutocorrect() ? 'true' : 'false';
+  return currentPreference(
+    'autocorrect', ['true', 'false'], fallback, AUTOCORRECT_STORAGE_KEY,
+  ) === 'true';
+}
+
+export function setAutocorrect(enabled: boolean): Promise<void> {
+  const value = enabled ? 'true' : 'false';
+  return savePreference('autocorrect', value, () => {
+    localStorage.setItem(AUTOCORRECT_STORAGE_KEY, value);
+    setProseAutocorrect(enabled);
+  }, true);
 }
 
 // --- Chat model & reasoning effort ---
@@ -905,7 +928,10 @@ export async function loadPreferences(): Promise<void> {
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
-    cacheNotificationToasts();
+    cacheServedSwitch('notification_toasts', NOTIFICATION_TOASTS_KEY);
+    // The cache first: a stale mirror would otherwise answer for an unset key.
+    cacheServedSwitch('autocorrect', AUTOCORRECT_STORAGE_KEY);
+    setProseAutocorrect(currentAutocorrect());
     selectedCodingAgent.value = currentCodingAgentDefault();
     // LAST, deliberately: the three applies above write properties the remote
     // is allowed to override, so the overrides go on top of them.

@@ -120,7 +120,10 @@ pub(crate) async fn undrained_user_messages(
 /// follow-up is the case that decides it: the text alone says nothing. A hash
 /// whose blob is gone is skipped, since a missing attachment must not cost the
 /// whole message.
-fn images_for_row(workspace: &Path, payload: &serde_json::Value) -> Option<Vec<ChatImage>> {
+pub(super) fn images_for_row(
+    workspace: &Path,
+    payload: &serde_json::Value,
+) -> Option<Vec<ChatImage>> {
     let images: Vec<ChatImage> = payload
         .get("user_image_hashes")
         .and_then(|v| v.as_array())

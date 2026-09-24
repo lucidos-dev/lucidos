@@ -105,15 +105,15 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   real value, and the rest of the label parses as attribute NAMES. Verified to
   produce a live `onmouseover` handler on the `<td>` from plain markdown.
 
-  `linkifyPaths` has the same hole for any attribute an author writes with a
-  raw `>` in it. That one predates this and is filed separately. Stripping the
-  two characters closes only the route `data-label` opened.
-- **Removal / resolution condition:** `linkifyPaths` stops recognising tags by
-  regex, so a `<` or `>` inside an attribute value cannot end a tag early.
-  Converting it to a pass over a parsed document is the shape `renderMarkdown`
-  already uses (`inDom`). Verify by searching `linkifyPaths.ts` for `<[^>]`
-  and finding nothing. Then delete `stackLabelText`'s `replace` and confirm
-  the pinning test above still passes with a header carrying `>`.
+  `linkifyPaths` had the same hole for any attribute with a raw `>` in it.
+  Its `splitTags` now closes that hole for every attribute, `data-label`
+  included. Before the split, it spots a tag cut inside a value and writes
+  each bracket in a value as an entity. So this strip is now a second layer.
+- **Removal / resolution condition:** a `<` or `>` inside an attribute value
+  cannot end a tag early in `linkifyPaths`. `splitTags` meets this, pinned by
+  `linkifyPaths.attributes.test.ts`. Delete `stackLabelText`'s `replace` in
+  its own change, and confirm both that test and the pinning test above pass
+  with a header carrying `>`.
 - **Status:** `active`
 
 ### Focused-field reveal probe
@@ -139,6 +139,24 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** `ios-keyboard-reveal-placement`
 
+### Toast press probe
+
+- **Added:** 2026-09-23
+- **Lives in:** `crates/lucidos-app/src/components/shared/toastPressProbe.ts`
+  (one `postClientLog('toast-press', …)` per press on a toast control),
+  installed from `main.tsx`.
+- **Impermanent because:** pure telemetry chasing a bug. On the iOS PWA a
+  toast's Open sometimes does nothing on the first tap and works on the second.
+  The failed tap left no trace in the log. Nothing could say whether iOS
+  delivered the touch, whether a click followed, or what cancelled it. The line
+  carries the verdict, whether an overlay was open, and how many page mutations
+  landed while the finger was down.
+- **Removal / resolution condition:** a reported episode produces a
+  `[Client/toast-press]` line that names the cause, and that cause is fixed. Or
+  two months pass with no episode reported. Verify by confirming no open work
+  reads the line, then delete the module, its test and the install call.
+- **Status:** active
+
 ### Dead-press probe on the composer's action row
 
 - **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28; 2026-08-29.
@@ -149,10 +167,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
   served press from a swallowed one, so each consumer says which it was.
 
-  The *close path* in `src/components/layout/keyboardCloseRelayout.ts` is part
-  of it too, on the same grounds: `ClosePath`, the `closePath` variable, and
-  `KeyboardCloseState.path`. The recovery reads none of them. Their one reader
-  is this probe's `silent-since-keyboard` line.
+  All of `src/components/layout/keyboardCloseRelayout.ts` is part of it since
+  ADR 0262, with `src/components/layout/__tests__/keyboard-close-relayout.test.ts`.
+  So are its callers in `MobileSwipeContainer.tsx` and the viewport poll gated
+  there on **Perf instrumentation**. The relayout answered a stale-layout theory
+  that ADR retired.
 - **Impermanent because:** It chases one bug and produces no feature. On an iOS
   PWA the composer's buttons go dead now and then, wherever the finger presses,
   until the keyboard is dismissed. Six reports so far, each able to say only
@@ -291,17 +310,18 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   is the running maximum while the press was armed, and the second is what was
   still down at the lift. Anything but one and zero is a gesture WebKit owes no
   click to, and it writes `multi-touch` rather than `dead`.
-- **Removal / resolution condition:** An episode arrives carrying a verdict, and
-  the fix that verdict points at ships, OR two months pass with no report. The
-  eighth episode reopened this: the cause is NOT named, and the probe's job is
-  evidence again rather than confirmation. Then delete the module, its install
-  call, its two tests, the `PressOutcome` pair and its two callers, and the
-  *close path* named under **Lives in**. Dropping the close path means
-  `ClosePath`, the `closePath` variable, `KeyboardCloseState.path` and the
-  argument `recordClose` takes. The three close paths themselves are the
-  RECOVERY and stay: only the record of which one fired goes. Flip this row to
-  `removed`. Verify with a tree-wide search for `deadPressProbe`,
-  `notePressOutcome` and `ClosePath`, which must return nothing.
+- **Removal / resolution condition:** Three weeks of normal phone use since
+  ADR 0262 named the cause, with no dead-Send report that autocorrect cannot
+  explain. With the Autocorrect switch off, every dead Send is such a report.
+  With it on, a report counts when autocorrect had not just changed a word
+  above Send.
+  A report like that reopens the diagnosis instead. Then delete everything
+  under **Lives in**: the module, its install
+  call, its two tests, and the `PressOutcome` pair with its two callers.
+  `keyboardCloseRelayout.ts` goes too, with its test, its callers and the poll.
+  Flip this row to `removed`. Verify with a tree-wide search for
+  `deadPressProbe`, `notePressOutcome`, `keyboardCloseState` and
+  `relayoutShell`, which must return nothing.
 - **Investigation:** none. It is narrow enough to stand alone. The three plans
   behind it are
   [`docs/plans/2026-08-27-the-composer-row-reports-which-face-died.md`](plans/2026-08-27-the-composer-row-reports-which-face-died.md),
@@ -585,19 +605,26 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   a displacement can show, and it carried the point without the distance. The
   plan is
   [`docs/plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md`](plans/2026-09-22-the-touch-pipeline-is-the-one-that-dies.md).
-- **Status:** `active`, and now carrying one recovery as well as evidence. The
-  cause is still NOT named. So the removal condition needs a quiet period with
-  the transition relayout running, or an episode that names the mechanism.
-- **It is not quite behaviour-free, and the removal condition says what that
-  costs.** The transition relayout is outside the module, so deleting the probe
-  cannot delete the fix. What remains inside is the typing-driven relayout,
-  which covers a wedge with no keyboard close in front of it. Removal therefore
-  means moving `liveCommitFace`, `commitFace`, `shouldNudgeUntouched`,
-  `runUntouchedNudge` and, since round 20, `armKeystrokeNudge` with
-  `nudgeIsTooSoon` and `lastNudgeAt`, to a permanent home first. Only the
-  reporting around them is dropped. The keystroke stamp goes with them, and so
-  does the `input` listener that arms the timer: `runUntouchedNudge` and
-  `armKeystrokeNudge` are its only readers.
+- **What the twenty-first report found: the cause is iOS autocorrect.** No
+  touch reached the page while Send was dead, yet a tap near the top of the
+  screen did. Four relayouts changed nothing. Three of four report screenshots
+  show the autocorrect underline on the last word, right above the dead button.
+  Apple tracks the bug as FB13418977. The fix and the full reading are in
+  [ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md).
+
+  **Three earlier readings were wrong, and every round above inherits them.**
+  The long silences were mostly typing time. The keyboard close was the
+  reporter's recovery, not the trigger. The one relayout "success" landed in the
+  same second as a keyboard close.
+- **Status:** `active` for the quiet period the removal condition names, now
+  that the cause is known.
+- **Neither relayout survives the removal.** They answered a stale-layout theory
+  ADR 0262 retires, so the typing-driven relayout is deleted rather than moved.
+  That is `liveCommitFace`, `commitFace`, `shouldNudgeUntouched`,
+  `runUntouchedNudge`, `armKeystrokeNudge`, `nudgeIsTooSoon`, `lastNudgeAt`, the
+  keystroke stamp and the `input` listener that arms the timer. The transition
+  relayout in `components/layout/keyboardCloseRelayout.ts` goes too, with its
+  call sites and the gated viewport poll.
 - **Still consumes no gesture, and presses nothing.** Every listener stays
   passive, and none calls `preventDefault` or `stopPropagation`. No path
   dispatches a click, a tap, a pointer event or a submit.
@@ -635,7 +662,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `resolveEmptyDraftSync` STAYS: it is a behaviour fix, not a diagnostic.
 - **Investigation:** none, same as the press probe. The plan behind it is
   [`docs/plans/2026-08-29-the-composer-never-erases-what-you-typed.md`](plans/2026-08-29-the-composer-never-erases-what-you-typed.md).
-- **Status:** `active`
+- **Status:** `active`. The press probe's cause, iOS autocorrect
+  ([ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md)), does not explain
+  this half. Characters that never appeared are a different symptom, so its own
+  removal condition stands.
 - **Not a workaround.** Every listener is passive and consumes nothing. The
   behaviour fix ships beside it, in `resolveEmptyDraftSync`.
 
@@ -668,7 +698,45 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Investigation:** none, same as the two probes above. It goes with the
   press probe if that is removed first, since it depends on that module's
   scheduled check.
-- **Status:** `active`
+- **Status:** `removed` 2026-09-20, in commit f84e592ba, because it answered
+  healthy through every episode it was built for. This row stayed `active` by
+  mistake until 2026-09-23. [ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md)
+  names the cause, which no relayout could reach.
+
+### Autocorrect starts off on iPhone and iPad
+
+- **Added:** 2026-09-23
+- **Lives in:** `defaultAutocorrect` in
+  `packages/lucidos-sdk/src/textEntry.ts` and its cases in
+  `textEntry.test.ts`. The host store and the SDK's app-frame stamp both read
+  it. Also the `default` of the
+  `autocorrect` entry in `crates/lucidos-engine/src/core/preference_catalog.rs`,
+  with its row in `system-knowhow/preferences.md`.
+- **Scope note:** the switch itself is **permanent** and is NOT part of this
+  measure: the `autocorrect` preference, its Debugging row, and the stamp's
+  handling of it. This row covers only the iOS default.
+- **Impermanent because:** It works around a UIKit bug, FB13418977. While
+  autocorrect holds a pending or fresh correction, iOS takes a tap near the
+  text and never delivers it to the page. The composer's Send and Submit sit
+  under the last typed word, so they went dead until the keyboard closed.
+  Apple's developer support found no workaround. ADR 0262 has the evidence.
+- **Removal / resolution condition:** An iOS release fixes FB13418977. Verify
+  on an iPhone with Predictive Text off and autocorrect switched on: type a
+  message whose last word autocorrect changes, then tap Send at once. Repeat
+  ten times, and every tap must send. Then delete `defaultAutocorrect` so an
+  unset switch means on everywhere, and set the catalog default to `true`.
+  Update the Debugging explainer and ADR 0262 to match. Update the knowhow too:
+  `system-knowhow/preferences.md`, and in `system-knowhow/js-sdk.md` § Text
+  fields and autocorrect and the `autocorrect` key row.
+- **Status:** `removed` 2026-09-23, the day it landed, by a product call rather
+  than the upstream fix. A heavy iPhone user never hit the bug, and no other
+  user reported it. Typing without autocorrect cost every iPhone user their
+  corrections. `defaultAutocorrect` now returns `true` on every client, and the
+  catalog default is `true`. The switch stays, for a device that hits the bug.
+  The amendment to
+  [ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md) records why.
+- **Investigation:** n/a (the cause is upstream in UIKit's keyboard, and
+  nothing is being chased here)
 
 ### Recorded mirror-history exceptions
 
@@ -1542,6 +1610,62 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a. An upstream version constraint, not an open question.
 
+### Text before a tool call arrives as hidden reasoning
+
+- **Added:** 2026-09-23. Plan for the real fix:
+  `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
+- **Lives in:** three sites.
+  - The closing sentence of `REASONING_NOT_VISIBLE_RULE` in
+    `crates/lucidos-engine/src/engine/agent_session/prompts.rs`, pinned by
+    `coding_agent_prompts_tell_agent_its_reasoning_is_not_visible`.
+  - `CODING_AGENT_CARD_REFUSAL` in
+    `crates/lucidos-engine/src/engine/question_card_gate.rs`, used by
+    `api/internal.rs`. Pinned by
+    `the_coding_agent_refusal_explains_hidden_text_and_names_the_card_question`.
+  - The "hidden reasoning" clause of "When the user asks back" in
+    `.claude/skills/grill/SKILL.md`.
+- **Impermanent because (works around):** Opus 5.5 and Fable 5.x return their
+  notes between tool calls as thinking blocks. The blocks are empty unless the
+  request sets `thinking.display: "updates"`. Claude Code 2.1.280 sets it only
+  on the first-party API, never on Vertex. So a coding agent's prose before a
+  tool call reaches nobody, and most often right before a question card (34 of
+  56 messages).
+
+  The agent then believes it answered, the question card gate refuses, and the
+  agent re-sends. The Lucidos Agent requests `updates` and is not affected.
+- **Removal / resolution condition:** the repro in the plan prints a `text`
+  block on the current Claude Code, with Opus 5.5 on Vertex. Or the engine relay
+  the plan proposes ships. Then drop the prompt sentence and its test needles,
+  point `api/internal.rs` back at `CARD_REFUSAL` and delete the coding-agent
+  refusal, and drop the grill clause's reason.
+- **Status:** removed 2026-09-23. The Vertex relay below shipped, so the notes
+  arrive as the agent's messages. All three sites were removed in that change.
+- **Investigation:** `cc-reasoning-dormant`. Same upstream path: headless
+  Claude Code returns thinking blocks empty.
+
+### Claude Code's Vertex calls go through the Vertex relay
+
+- **Added:** 2026-09-23. Plan:
+  `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
+- **Lives in:** three sites.
+  - `crates/lucidos-engine/src/runtime/vertex_relay.rs`, the relay itself,
+    started in `main.rs`.
+  - The `ANTHROPIC_VERTEX_BASE_URL` stamp in `build_command`,
+    `runtime/claude_code.rs`.
+  - The `notes_relayed` flag on `CcStreamState` in
+    `runtime/claude_code_parse.rs`, which renders a note as a message.
+- **Impermanent because (works around):** Claude Code 2.1.280 sets
+  `thinking.display: "updates"` only when its provider is `firstParty`. On
+  Vertex, Opus 5.5 and Fable 5.x then return every note before a tool call as
+  an empty `thinking` block. The relay sets the display and the beta, so the
+  notes come back as text.
+- **Removal / resolution condition:** run the repro in the plan WITHOUT the
+  relay, on the current Claude Code with Opus 5.5 on Vertex. When the note
+  block before the `Bash` call carries text, delete the relay, its spawn stamp,
+  its start in `main.rs` and the parser flag.
+- **Status:** active
+- **Investigation:** n/a. An upstream gap with a checkable repro.
+
 ---
 
 ## 2. Model-tolerance measures
@@ -2026,6 +2150,10 @@ condition; fix the condition rather than acting on it.
 
   `ASK_USER_QUESTION_RULE` already said "answer first", so guidance alone
   failed. The gate refuses such a card once per user input.
+
+  Before 2026-09-23 a refusal could also mean the agent did answer, invisibly.
+  See § "Text before a tool call arrives as hidden reasoning", now removed.
+  Refusals from Claude Code sessions before that date overstate model mistakes.
 - **Removal / resolution condition:** in a per-workspace audit, count question
   cards raised after a typed reply or after tool work since the last input.
   That is the denominator. Count refusals among them: tool-result rows
@@ -2697,6 +2825,10 @@ measure now eligible for removal** — search this file for the id to find them 
   stays regardless. The deferred alternative — an engine-driven elapsed
   "Thinking… (Ns)" indicator that needs no reasoning text — remains the fallback if
   CC never surfaces it.
+- **Progress notes are a separate channel.** Under the Vertex relay (§ 1), an
+  always-thinking model's notes arrive as `thinking` text. They render as the
+  agent's messages, not as `CodingAgentThoughtStreamed`. The relay asks for
+  notes, never reasoning, so this investigation stays open.
 - **Status:** open
 - **Measures referencing this investigation:** none (both the parser field-name
   correction and the `REASONING_NOT_VISIBLE_RULE` companion are permanent fixes,

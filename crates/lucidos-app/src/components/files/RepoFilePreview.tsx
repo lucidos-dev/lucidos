@@ -17,6 +17,7 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 import { ChangesFileList } from './RepoFilesView';
+import { RepoPreviewSplit } from './RepoPreviewSplit';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
@@ -74,10 +75,10 @@ export function sidebarStateFromDiff(diff: Loadable<RepoDiff>): SidebarState {
   return { kind: 'files', files: diff.data.files };
 }
 
-/** Renders RepoFilePreview with a sidebar listing the changed files in the
- *  current diff. The sidebar is hidden via container query when the content
- *  pane is too narrow (see `.repo-preview-split-sidebar` in panels.css), so
- *  mobile and a heavily-collapsed content pane fall back to today's behavior. */
+/** Renders RepoFilePreview with a resizable sidebar listing the changed files in
+ *  the current diff. A container query hides the sidebar on a narrow content
+ *  pane (see `.repo-preview-split-sidebar` in panels/content.css). Mobile and a
+ *  heavily-collapsed content pane then show the preview alone. */
 export function RepoFilePreviewWithSidebar(props: Props) {
   const isActiveLayout = props.layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   // Delay the sidebar skeleton (300ms) so a fast diff load never flashes it.
@@ -91,8 +92,8 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   }
 
   return (
-    <div class="repo-preview-split">
-      <aside class="repo-preview-split-sidebar">
+    <RepoPreviewSplit
+      sidebar={<>
         {sidebar.kind === 'loading' && showSidebarLoading && (
           <div class="repo-preview-sidebar-state loading-skeleton" data-state="loading">
             Loading changed files…
@@ -106,11 +107,9 @@ export function RepoFilePreviewWithSidebar(props: Props) {
         {sidebar.kind === 'files' && (
           <ChangesFileList files={sidebar.files} activePath={props.locator.path} />
         )}
-      </aside>
-      <div class="repo-preview-split-main">
-        <RepoFilePreview {...props} />
-      </div>
-    </div>
+      </>}
+      main={<RepoFilePreview {...props} />}
+    />
   );
 }
 

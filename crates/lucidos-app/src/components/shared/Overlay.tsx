@@ -175,7 +175,11 @@ export function Overlay({
   // `topPanelOverlay`, never the raw stack top: an Escape-only registrant draws
   // nothing, so a pointer cannot be meant for it, and one sits ABOVE its own
   // host panel by design (`ModelSelectionPicker`'s step).
-  useDismissOnOutside(open, panelRef, anchor, onClose, () => topPanelOverlay()?.id === idRef.current);
+  //
+  // A toast tap light-dismisses a backdrop-less popover and never a modal.
+  useDismissOnOutside(
+    open, panelRef, anchor, onClose, () => topPanelOverlay()?.id === idRef.current, !backdrop,
+  );
 
   // Escape via the central overlay stack (not a per-instance keydown listener —
   // those raced each other and the global dispatcher). Keep the latest onClose

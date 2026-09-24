@@ -40,6 +40,10 @@ export type ThreadAggregate = {
    *  bubble the parent to REVIEW even when sibling descendants are still
    *  running. */
   attentionDescendantCount: number;
+  /** Whether this thread is a *stopped child*: a user Stop ended its turn and
+   *  its parent is still owed a result (ADR 0252). The backend always sends
+   *  it; optional only so test fixtures needn't set it. */
+  isStoppedChild?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
    *  for why the count is carried separately from `meta.liveEventWaits`. */
@@ -122,6 +126,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
+  if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
   if (meta.codingAgentHasDiff !== agg.codingAgentHasDiff) { meta.codingAgentHasDiff = agg.codingAgentHasDiff; changed = true; }
@@ -209,6 +214,12 @@ export type ThreadMeta = {
    *  pending changes). Strict subset of `blockingDescendantCount` — drops the
    *  Running case. Consumed by `getThreadDisplaySection` via `count > 0`. */
   attentionDescendantCount: number;
+  /** Whether this thread is a *stopped child*: a user Stop ended its turn and
+   *  its parent is still owed a result (ADR 0252). It counts toward the
+   *  attention badge and draws the notice that ends the transcript. Absent
+   *  reads as false, which is what a meta built before the field existed
+   *  means. */
+  isStoppedChild?: boolean;
   /** How many *event waits* this thread holds unresolved, from the backend
    *  projection (`thread_summaries.live_event_wait_count`). Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the same Waiting dot

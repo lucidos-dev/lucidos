@@ -332,6 +332,67 @@ fn cc_threads_go_to_inbox_even_when_unattended() {
     }
 }
 
+// 14e. an_event_that_waits_on_the_user_never_archives
+#[test]
+fn an_event_that_waits_on_the_user_never_archives() {
+    // The unattended guard used to archive a trigger run the moment it asked
+    // the user something, so the question never reached them (ADR 0259).
+    for &event_type in WAITING_FOR_USER_ANSWER_EVENTS {
+        let mut legal_somewhere = false;
+        for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+            for section in [ArchiveState::Archived, ArchiveState::Inbox] {
+                for is_unattended in [true, false] {
+                    let Ok(result) =
+                        resolve_transition(event_type, thread_type, section, is_unattended)
+                    else {
+                        continue;
+                    };
+                    legal_somewhere = true;
+                    assert_eq!(
+                        result.new_section,
+                        Some(ArchiveState::Inbox),
+                        "'{event_type}' on {thread_type:?} from {section:?} \
+                         (unattended={is_unattended}) must land in the inbox",
+                    );
+                }
+            }
+        }
+        assert!(legal_somewhere, "'{event_type}' is legal on no thread type");
+    }
+}
+
+// 14f. waiting_for_user_answer_events_match_the_status_table
+#[test]
+fn waiting_for_user_answer_events_match_the_status_table() {
+    use std::collections::BTreeSet;
+    let from_table: BTreeSet<&str> = status_transitions()
+        .into_iter()
+        .filter(|(_, t)| t.status == StatusRule::Set(ThreadStatus::WaitingForUserAnswer))
+        .map(|(event_type, _)| event_type)
+        .collect();
+    let listed: BTreeSet<&str> = WAITING_FOR_USER_ANSWER_EVENTS.iter().copied().collect();
+    assert_eq!(
+        listed, from_table,
+        "every event that parks a thread on the user must be in \
+         WAITING_FOR_USER_ANSWER_EVENTS, or the unattended guard archives it",
+    );
+}
+
+// 14g. only_a_thread_waiting_on_the_user_refuses_archive
+#[test]
+fn only_a_thread_waiting_on_the_user_refuses_archive() {
+    for status in ThreadStatus::ALL {
+        for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+            let refused = check_archive_allowed(thread_type, ArchiveState::Inbox, status).is_err();
+            assert_eq!(
+                refused,
+                status == ThreadStatus::WaitingForUserAnswer,
+                "archive of a {status:?} {thread_type:?} thread",
+            );
+        }
+    }
+}
+
 // 15. no_transition_produces_illegal_section
 #[test]
 fn no_transition_produces_illegal_section() {

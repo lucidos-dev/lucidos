@@ -185,6 +185,33 @@ fn origin_mac(prefix: &str) -> Option<hmac::Hmac<sha2::Sha256>> {
     Some(mac)
 }
 
+/// The MAC input for `payload` signed in `domain`, a credential other than the
+/// origin token. An origin-token prefix never holds a newline, so no domain's
+/// MAC can ever verify as an origin token, or the reverse.
+fn domain_prefix(domain: &str, payload: &str) -> String {
+    format!("{domain}\n{payload}")
+}
+
+/// Sign `payload` under the per-startup secret, in its own `domain`. Returns
+/// the MAC as hex, or `None` before the secret is installed.
+pub(crate) fn sign_in_domain(domain: &str, payload: &str) -> Option<String> {
+    use hmac::Mac;
+    let mac = origin_mac(&domain_prefix(domain, payload))?;
+    Some(hex::hex_lower(&mac.finalize().into_bytes()))
+}
+
+/// Whether `mac_hex` is [`sign_in_domain`]'s MAC for `payload` in `domain`.
+/// Constant-time, for the same reason as [`subprocess_origin`].
+pub(crate) fn verify_in_domain(domain: &str, payload: &str, mac_hex: &str) -> bool {
+    let (Some(mac), Some(presented)) = (
+        origin_mac(&domain_prefix(domain, payload)),
+        hex::hex_decode(mac_hex),
+    ) else {
+        return false;
+    };
+    hmac::Mac::verify_slice(mac, &presented).is_ok()
+}
+
 /// Mint a thread-bound origin token for a subprocess spawned on behalf of
 /// `thread_id` (or with no thread context), carrying `emitting_trigger_id` when
 /// the spawn IS a trigger's fire. `None` before the secret is installed.

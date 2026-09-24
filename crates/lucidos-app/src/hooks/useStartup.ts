@@ -267,15 +267,12 @@ export function useStartup(): void {
       if (copyBtn) {
         e.preventDefault();
         e.stopPropagation();
-        // Resolve text: copyable-block uses data attribute, code-block uses textContent
-        let text: string | null = null;
-        const copyableBlock = copyBtn.closest('.copyable-block') as HTMLElement | null;
-        if (copyableBlock) {
-          text = copyableBlock.getAttribute('data-copy-text');
-        } else {
-          const wrapper = copyBtn.closest('.code-block-wrapper') as HTMLElement | null;
-          text = wrapper?.querySelector('pre code')?.textContent ?? null;
-        }
+        // Only the renderer writes `data-copy-text` and `data-copy-code`, and
+        // content cannot, so a lookalike block copies nothing
+        // (utils/renderMarkdown.ts).
+        const text = copyBtn.closest('[data-copy-text]')?.getAttribute('data-copy-text')
+          ?? copyBtn.closest('[data-copy-code]')?.querySelector('pre code')?.textContent
+          ?? null;
         if (text == null) return;
         // Guarded rather than called bare: a non-secure origin exposes no
         // `navigator.clipboard`, so the unguarded call threw before a promise

@@ -140,7 +140,22 @@ collapse a coding-agent child's terminal storm (`CodingAgentIdled`, then
 possibly `SessionEnded` / `ResponseFailed` / `ResponseCanceled`) into exactly
 one completion card, which is why every read of it is `is_coding_agent`-gated. A
 row with `parent_thread_id IS NULL` is always FALSE: a top-level thread owes no
-parent a card. See ADR 0011.
+parent a card. See ADR 0011. Two terminals leave it TRUE on purpose, because the
+card is still owed: a user Stop (the child becomes a stopped child, ADR 0252)
+and a turn that ends holding a live event wait (ADR 0254). `settle_child` reads
+"TRUE on a row not in flight" as owed, when the user archives or discards.
+
+**`thread_summaries.is_stopped_child`** (BOOLEAN NOT NULL DEFAULT FALSE,
+`20260923114811_add_is_stopped_child.sql`) is TRUE while a user Stop has ended
+a child's turn and nothing has settled it. The `ResponseCanceled { user_stop }`
+arm sets it, only on a row with a parent and a pending marker.
+`mark_parent_callback_pending` clears it on the next start event. The settling
+`ChildThreadCompleted` arm clears it too, on the child's row. That write sits
+outside the parent event's own attention sample, so the arm reconciles the
+child's ancestors itself.
+
+It feeds `is_attention_needing` and its two SQL mirrors, and never
+`is_blocking`. See ADR 0252.
 
 **`thread_summaries.live_event_waits`** and **`live_event_wait_count`** are the
 *event waits* the thread itself holds unresolved: which ones, and how many. The

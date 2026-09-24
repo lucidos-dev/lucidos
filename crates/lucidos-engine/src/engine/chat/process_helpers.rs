@@ -611,6 +611,35 @@ pub(super) fn arm_followup_redirect(
     Some(s.idle_notify.clone())
 }
 
+/// Whether a coding-agent follow-up that could not answer the open question
+/// leaves it open, instead of superseding it.
+///
+/// Only an engine re-entry (a child's completion, an event-wait delivery) on a
+/// question the user can still answer. It reaches the agent without a
+/// `CodingAgentPromptSent`, so the card stays live, and the parked agent reads
+/// it after the answer. Everything else still supersedes, per ADR 0082: a
+/// message's own prompt overtakes the card, and an overtaken question or a
+/// dead session leaves nothing an answer could release. See ADR 0255.
+pub(super) async fn follow_up_keeps_open_question(
+    pool: &sqlx::PgPool,
+    agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
+    thread_id: Uuid,
+    pre_emitted_origin: Option<super::PreEmittedOrigin>,
+) -> bool {
+    if !pre_emitted_origin.is_some_and(|o| o.is_engine_reentry()) {
+        return false;
+    }
+    let session_is_live = agent_sessions
+        .lock()
+        .await
+        .get(&thread_id)
+        .is_some_and(|s| s.is_live());
+    session_is_live
+        && crate::engine::agent_question::lookup_active_question_tool_use_id(pool, thread_id)
+            .await
+            .is_some()
+}
+
 #[cfg(test)]
 #[path = "process_helpers_tests.rs"]
 mod process_helpers_tests;

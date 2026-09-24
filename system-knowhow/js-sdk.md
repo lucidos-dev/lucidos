@@ -41,10 +41,10 @@ What each piece does — include only what you need:
 | Tag | Provides | Skip if |
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
-| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); and the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
 
@@ -124,6 +124,34 @@ which download from any frame.
 That interception works behind a gateway too. It asks for
 `/<slug>/app/<id>/<file>?download=1`, which is one of your own files, so the
 pass above reaches it.
+
+### Text fields and autocorrect
+
+**`sdk.js` turns autocorrect off on your text fields while the device's
+Autocorrect switch is off.** Every text `<input>` and every `<textarea>` gets
+`autocorrect="off"`, including fields you add later. The stamp lands as each
+field mounts, before its first focus, which is when iOS reads it. You write
+nothing.
+
+The reason is an iOS bug. While autocorrect holds a correction, iOS can keep a
+tap on a button below the text for itself. A Save under a notes field then does
+nothing until the keyboard closes, and nothing tells the user why. See
+[ADR 0262](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0262-ios-autocorrect-eats-the-send-tap.md).
+
+The switch is the `autocorrect` preference, per device (§ lucidos.preferences).
+Unset, it is on, on every device. A user who keeps hitting the dead tap turns
+it off under **Settings → System → Debugging**, on iPhone and iPad only.
+
+Three rules hold:
+
+- **Only `autocorrect` changes.** `autocapitalize` and `spellcheck` stay yours.
+- **Your own attribute wins.** A field that declares `autocorrect` keeps it, in
+  either direction. Turning the switch back on removes only the SDK's stamps.
+- **A change reaches a running app through `watchPreferences()`.** Without it,
+  the app keeps the value it read at load until it reloads.
+
+`sdk.js` reads the switch from `sdk-prefs.js` when you include it, otherwise
+it starts on. One preference read at load then corrects it.
 
 ### Theme variables
 
@@ -801,6 +829,7 @@ Denied, and each for a reason worth knowing:
 | answering a question, every consent route, the `/internal/` tree | an app never answers as the user |
 | applying a change, restarting, rebuilding, installing a plugin | an app does not change the platform under the user |
 | writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
+| writing a preference the Lucidos Agent may not write (other keys are open) | a security setting such as the command guard stays the user's, changed in Settings |
 | message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
 
@@ -1088,6 +1117,10 @@ is in, and the host substitutes the id. A standalone app tab reads the id
 itself, from the workspace-scoped `ws:<slug>:lucidos-device-id`. Pass `null` to
 fetch only globally-scoped preferences.
 
+`set()` refuses a key the Lucidos Agent may not write either, such as
+`command_guard`, `max_tool_calls` or `network_bind`. Those are security
+settings, and the user changes them in Settings.
+
 ### Types
 
 ```ts
@@ -1101,6 +1134,7 @@ type Preferences = Record<string, string>;
 | `theme` | `dark`, `light`, `system` | UI theme |
 | `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures, on code and `pre` blocks only, via `--font-features-text` / `--font-features-code`) |
 | `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
+| `autocorrect` | `true`, `false` | Whether text fields autocorrect on this device. Unset, on everywhere. `sdk.js` applies it to your fields (§ Text fields and autocorrect, under Setup) |
 
 ## lucidos.notifications — Notification Center
 
@@ -1235,7 +1269,9 @@ await lucidos.request('/notifications', {
 // the page cannot resolve is a dead deep link the reader meets as
 // `Thread "<id>" no longer exists`. The agent-only `current` alias means "the
 // thread I am working in", which an app does not have, so it is refused here
-// too. Take the ids from whatever you are notifying about.
+// too. Take the ids from whatever you are notifying about. The event must live
+// in that thread: a domain event, or one from another thread, is refused with a
+// 400, because no transcript could show it.
 const threadId = '4f1c2e8a-9d3b-4c17-8a55-0b6e2f7d1c93';
 const eventId = 'b7e04a12-5f6c-4d29-9e31-8c2a6d4b70f5';
 await lucidos.request('/notifications', {
@@ -1429,7 +1465,7 @@ comment opener is dropped, because the map is writable by any app and must not
 be able to inject a declaration or fetch from another origin. Nothing is
 required of an app beyond calling `applyPreferences()`.
 
-`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts without a reload: when the user toggles light/dark, when the OS appearance changes under a `system` preference, or when a value is retuned from the Style Remote.
+`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts without a reload. That covers a light/dark toggle, an OS appearance change under a `system` preference, and a value retuned from the Style Remote. It also covers a flip of the device's Autocorrect switch (§ Text fields and autocorrect, under Setup).
 
 Under a `system` preference the OS appearance is watched two ways, because neither alone is enough on every client. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not. That is the normal case in an installed iOS PWA, which is resumed rather than reloaded. Both are sampled a moment after the event and only re-apply when the resolved theme actually moved, so a wake that changed nothing costs nothing. Your app needs to do none of this: it is inside `watchPreferences()`.
 

@@ -663,6 +663,70 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
     );
 }
 
+/// ADR 0252: a user Stop reaches a chat parent as a `[CHILD THREAD STOPPED]`
+/// block. Its words are the fix, so pin them: the child is alive, what comes
+/// next, and what not to do. The incident's parent rolled back live work.
+#[test]
+fn build_session_messages_projects_child_thread_stopped_as_alive() {
+    use chrono::Utc;
+    let child_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+    let events = vec![EventRow {
+        id: event_id,
+        event_type: "ChildThreadStopped".into(),
+        payload: json!({
+            "child_thread_id": child_id.to_string(),
+            "child_thread_title": "Fix the ticket",
+        }),
+        created: Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    }];
+    let msgs = build_session_messages(&events);
+    let note = msgs
+        .iter()
+        .find(|m| m.content.contains("[CHILD THREAD STOPPED]"))
+        .expect("child thread stopped message");
+    assert_eq!(note.role, "user");
+    for needle in [
+        child_id.to_string(),
+        format!("event_id: {event_id}"),
+        "Fix the ticket".to_string(),
+        "NOT finished".to_string(),
+        "[CHILD THREAD COMPLETED]".to_string(),
+        "do not roll back".to_string(),
+    ] {
+        assert!(
+            note.content.contains(&needle),
+            "missing {needle:?} in:\n{}",
+            note.content
+        );
+    }
+}
+
+/// A canceled card now comes only from Archive or Discard, so it reads as
+/// final and no longer says "user stop".
+#[test]
+fn a_canceled_card_reads_as_the_users_final_word() {
+    use chrono::Utc;
+    let events = vec![EventRow {
+        id: Uuid::new_v4(),
+        event_type: "ChildThreadCompleted".into(),
+        payload: json!({
+            "child_thread_id": Uuid::new_v4().to_string(),
+            "status": "canceled",
+            "summary": "The user archived this child thread.",
+        }),
+        created: Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    }];
+    let msgs = build_session_messages(&events);
+    let card = &msgs[0].content;
+    assert!(card.contains(" canceled\n"), "got:\n{card}");
+    assert!(!card.contains("user stop"), "got:\n{card}");
+}
+
 /// Engine-core audit finding 3: a rebuilt result reaches the model with the
 /// same `[evt-<hex>]` trailer the live turn appends. Without it the context
 /// panel cannot address a resumed result. From the second round on, the model

@@ -488,6 +488,16 @@ pub const CATALOG: &[PrefSpec] = &[
         description: "UI scale percent for THIS device (75–200, snapped to 12.5 steps; 100 = default). Device-scoped.",
         side_effect: PrefSideEffect::None,
     },
+    // ---- Typing (device-scoped) ----
+    PrefSpec {
+        key: "autocorrect",
+        label: "Autocorrect",
+        scope: PrefScope::Device,
+        value: PrefValue::Bool,
+        default: "true",
+        description: "Whether text fields autocorrect as the user types on THIS device. Device-scoped. On an iPhone or iPad, iOS autocorrect can swallow the tap on Send or Submit while it holds a correction. The button then does nothing until the keyboard closes. Closing the keyboard and tapping again gets through; offer 'false' if it keeps happening. Spell-check underlines and sentence capitals stay either way.",
+        side_effect: PrefSideEffect::None,
+    },
     // ---- Push (device-scoped, side-effecting) ----
     PrefSpec {
         key: "push_notifications",
@@ -1040,6 +1050,18 @@ mod tests {
     fn theme_is_device_scoped_and_language_is_global() {
         assert_eq!(lookup("theme").unwrap().scope, PrefScope::Device);
         assert_eq!(lookup("language").unwrap().scope, PrefScope::Global);
+    }
+
+    /// The dead-Send bug belongs to one keyboard, so turning autocorrect off on
+    /// the phone must not reach another device. Unset means on, on every client.
+    #[test]
+    fn autocorrect_is_a_device_scoped_switch() {
+        let spec = lookup("autocorrect").expect("the agent can flip autocorrect");
+        assert_eq!(spec.scope, PrefScope::Device);
+        assert!(validate(spec, "true").is_ok());
+        assert!(validate(spec, "false").is_ok());
+        assert!(validate(spec, "off").is_err());
+        assert_eq!(spec.default, "true", "unset means on, on every client");
     }
 
     /// Drift guard (`.claude/rules/system-knowhow.md`): every catalog key and

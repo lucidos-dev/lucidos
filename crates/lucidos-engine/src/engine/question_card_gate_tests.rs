@@ -97,11 +97,19 @@ fn a_typed_answer_carries_text() {
 }
 
 #[test]
-fn the_refusal_starts_with_its_marker_and_offers_the_escape() {
+fn the_refusal_starts_with_the_marker_and_offers_the_escape() {
     assert!(CARD_REFUSAL.starts_with(REFUSAL_MARKER));
     assert!(CARD_REFUSAL.contains("never your tool results"));
     assert!(CARD_REFUSAL.contains("unchanged"));
     assert!(!CARD_REFUSAL.contains('\u{2014}'));
+}
+
+/// Every agent's notes arrive as text, the coding agents' through the Vertex
+/// relay. So the refusal asks for prose and never blames hidden reasoning.
+#[test]
+fn the_refusal_asks_for_prose() {
+    assert!(CARD_REFUSAL.contains("plain prose"));
+    assert!(!CARD_REFUSAL.contains("hidden reasoning"));
 }
 
 // ---------------------------------------------------------------------------

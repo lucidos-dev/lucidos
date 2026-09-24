@@ -946,6 +946,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The slot boots empty and the model is installed live once it lands, so
     // boot never waits on a multi-hundred-MB download.
     shared_engine.spawn_embedder_load();
+    // Before recovery below, which can resume a Claude Code session. A failed
+    // bind only costs those sessions their progress notes, so boot goes on.
+    // A temporary measure: `docs/temporary-measures.md` § "Claude Code's
+    // Vertex calls go through the Vertex relay".
+    if let Err(e) = lucidos_engine::runtime::vertex_relay::start().await {
+        log!("[Startup] WARNING: the Vertex relay did not start ({e}); Claude Code sessions on Vertex will show no progress notes");
+    }
 
     // The recovery sweeps below run before the HTTP server binds, so narrate
     // them on the boot splash.
@@ -1183,6 +1190,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //    reason stated at its own call site below.
     shared_engine.start_wait_reentry_consumer();
     shared_engine.start_event_wait_dispatcher();
+    shared_engine.start_background_task_reaper();
     // Before either: close any `await_event` call the legacy attached-wait
     // shape left unpaired, or the thread 400s on its next turn. Ordered first,
     // so a wait that is ALSO re-armed below re-enters a thread whose message

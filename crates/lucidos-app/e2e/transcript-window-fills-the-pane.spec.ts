@@ -177,6 +177,58 @@ function seedFragmentUnderOneShortTurn(): string {
   return threadId;
 }
 
+/** The opening message of the silent turn, pages behind the newest event. */
+const SILENT_TURN_TEXT = 'the silent turn began here';
+
+/** Prose chunks early in the silent turn, and the calls after each. */
+const PROSE_CHUNKS = 30;
+const CALLS_PER_CHUNK = 2;
+
+/** Calls in the silent tail. Each is three events (blank text, call, result),
+ *  so 700 calls is 2,100 events, none of it drawn once steps are hidden. That
+ *  is past the four pages (`MAX_FILL_BACKFILLS`) a fill that charged silent
+ *  pages could reach, which is what stranded the reader. */
+const SILENT_CALLS = 700;
+
+/** The text of every prose chunk, so a test can find one on screen. */
+const PROSE_MARK = 'Prose chunk';
+
+/** The reported shape: one coding-agent turn that talks early and then runs a
+ *  long stretch of tool calls with no prose, still in flight. Every call is
+ *  preceded by the blank text block the agent writes, as in the real thread. */
+function seedSilentTurn(): string {
+  const threadId = randomUUID();
+  const messageId = randomUUID();
+  const base = Date.now();
+  let n = 0;
+  const at = () => new Date(base + n++ * 1000).toISOString();
+  const rows: string[] = [];
+  const row: RowWriter = (type, payload) =>
+    `('${randomUUID()}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
+  const text = (md: string) => row('CodingAgentTextStreamed',
+    `{"text":"${md}","channel":"claude_code","coding_agent":"claude-code","request_event_id":"${messageId}"}`);
+  let call = 0;
+  const silentCall = () => {
+    rows.push(text('\\n\\n'), ...callPair(row, messageId, `silent-${call}`, call));
+    call++;
+  };
+
+  rows.push(`('${messageId}', 'MessageReceived', '{"text":"${SILENT_TURN_TEXT}","mode":"human","channel":"claude_code"}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`);
+  for (let c = 0; c < PROSE_CHUNKS; c++) {
+    rows.push(text(`\\n\\n${PROSE_MARK} ${c}. The agent explains what it will change next, ` +
+      'over enough words to wrap onto a second line on a phone.'));
+    for (let i = 0; i < CALLS_PER_CHUNK; i++) silentCall();
+  }
+  for (let i = 0; i < SILENT_CALLS; i++) silentCall();
+
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E silent turn', 'claude_code', '${new Date(base).toISOString()}', 1, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
+  ].join(';\n'));
+  return threadId;
+}
+
 async function openThread(page: Page, threadId: string): Promise<void> {
   await page.addInitScript((tid: string) => {
     localStorage.setItem('lucidos-focused-thread', tid);
@@ -354,5 +406,30 @@ test.describe('Windowed transcript', () => {
     const wheelless = browserName === 'webkit' && isMobile;
     const reached = await walkUpUntilHeld(page, FIRST_TURN_TEXT, wheelless);
     expect(reached, 'the wheel alone must reach the thread\'s first message').toBe(true);
+  });
+
+  /** Steps hidden, and the newest pages of a huge turn hold nothing but tool
+   *  calls. Those rows draw nothing, so the window must cross them to reach
+   *  prose. Stopping inside them leaves the turn's header over an empty body,
+   *  with nothing to scroll. */
+  test('scrolls a silent turn with steps hidden', async ({ page, browserName, isMobile }) => {
+    test.setTimeout(180_000);
+    const threadId = seedSilentTurn();
+    seededThreads.push(threadId);
+    await page.addInitScript(() => localStorage.setItem('lucidos-steps-expanded-v2', 'false'));
+    await openThread(page, threadId);
+
+    const transcript = page.locator('.thread-content').first();
+    await expect(transcript.locator('.chat-exchange').first()).toBeVisible({ timeout: 60_000 });
+
+    await expect.poll(
+      () => transcript.evaluate(el => el.scrollHeight - el.clientHeight),
+      { message: 'a silent turn must still leave the reader something to scroll', timeout: 60_000 },
+    ).toBeGreaterThan(10);
+    await expect(transcript.getByText(PROSE_MARK).first()).toBeVisible();
+
+    const wheelless = browserName === 'webkit' && isMobile;
+    const reached = await walkUpUntilHeld(page, SILENT_TURN_TEXT, wheelless);
+    expect(reached, 'the wheel alone must reach the turn\'s opening message').toBe(true);
   });
 });

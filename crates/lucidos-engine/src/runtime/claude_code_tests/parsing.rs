@@ -729,6 +729,96 @@ fn parse_stream_event_empty_thinking_delta_is_liveness_only() {
     );
 }
 
+// ── Relayed progress notes (plan invariant 8) ───────────────────────────────
+// `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
+
+fn assistant_thinking(model: &str, thinking: &str) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "id": "msg_1",
+            "model": model,
+            "content": [{"type": "thinking", "thinking": thinking, "signature": "sig"}],
+        },
+    })
+    .to_string()
+}
+
+fn messages(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Message { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_relayed_note_from_an_always_thinking_model_is_a_message() {
+    for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+        let mut state = CcStreamState::with_notes_relayed(true);
+        let events = parse_line(&mut state, &assistant_thinking(model, "  Found it.  "));
+        assert_eq!(messages(&events), ["Found it.\n\n"], "{model}");
+    }
+}
+
+/// Without the relay, or on a model whose thinking is not a note, the text is
+/// reasoning and must never reach the transcript.
+#[test]
+fn thinking_text_stays_hidden_unless_the_relay_asked_for_notes() {
+    let mut unrelayed = CcStreamState::default();
+    let events = parse_line(&mut unrelayed, &assistant_thinking("claude-opus-5-5", "x"));
+    assert!(messages(&events).is_empty());
+
+    let mut relayed = CcStreamState::with_notes_relayed(true);
+    for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"] {
+        let events = parse_line(&mut relayed, &assistant_thinking(model, "reasoning"));
+        assert!(messages(&events).is_empty(), "{model}");
+    }
+}
+
+#[test]
+fn an_empty_note_and_the_interrupted_sentinel_render_nothing() {
+    let mut state = CcStreamState::with_notes_relayed(true);
+    for text in [
+        "",
+        "   ",
+        "This part of the response was interrupted before it finished.",
+    ] {
+        let events = parse_line(&mut state, &assistant_thinking("claude-opus-5-5", text));
+        assert!(messages(&events).is_empty(), "{text:?}");
+    }
+}
+
+/// The complete frame carries the whole note, so its streamed delta must not
+/// also become a Thought, or the note shows twice.
+#[test]
+fn a_relayed_notes_delta_yields_no_thought_but_keeps_liveness() {
+    let start = |model: &str| {
+        serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"model": model}},
+        })
+        .to_string()
+    };
+    let delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Found it."}}}"#;
+
+    let mut relayed = CcStreamState::with_notes_relayed(true);
+    parse_line(&mut relayed, &start("claude-opus-5-5"));
+    assert!(matches!(
+        &parse_line(&mut relayed, delta)[..],
+        [AgentEvent::StreamActivity]
+    ));
+
+    // A model whose thinking is reasoning keeps its Thought, relay or not.
+    parse_line(&mut relayed, &start("claude-opus-5"));
+    assert!(matches!(
+        &parse_line(&mut relayed, delta)[..],
+        [AgentEvent::Thought { .. }, AgentEvent::StreamActivity]
+    ));
+}
+
 #[test]
 fn parse_result() {
     let line = r#"{"type":"result","result":"Done.","duration_ms":1234}"#;

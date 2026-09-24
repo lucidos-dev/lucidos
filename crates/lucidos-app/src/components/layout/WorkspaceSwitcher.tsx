@@ -32,8 +32,8 @@
  *   `vnodeToText` with no DOM. Same split as `networkAccessBody`.
  * - `WorkspacesMenuRow` is the hook-bearing wrapper: the expanded flag, the
  *   fetch, the skeleton gate. It is rendered INSIDE the menu's `<Overlay>`, so
- *   closing the menu unmounts it and the next open starts collapsed, with no
- *   stale list to correct. Same trick `WorkspaceRestartRow` uses for its confirm.
+ *   closing the menu unmounts it and the next open refetches, with no stale
+ *   list to correct. Only the expanded flag outlives it, remembered per device.
  * - `WorkspaceSwitcherSkeleton` mirrors the real row's markup inside a
  *   `SkeletonProvider` (the sanctioned shape for a surface that cannot use
  *   `ListSkeletonOf`'s wrapper, see `.claude/rules/frontend.md`).
@@ -62,7 +62,12 @@ import { workspaceActionRow } from './WorkspaceActionRow';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import { errorDetail } from '../../utils/errorDetail';
 import { replaceOnPlainClick } from '../../utils/documentNavigation';
-import { rememberLastWorkspaceCount, recallLastWorkspaceCount } from '../../utils/lastWorkspace';
+import {
+  rememberLastWorkspaceCount,
+  recallLastWorkspaceCount,
+  rememberWorkspaceSwitcherExpanded,
+  recallWorkspaceSwitcherExpanded,
+} from '../../utils/lastWorkspace';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
 
 /** Skeleton rows when this device has never recorded a workspace count. Two,
@@ -90,6 +95,13 @@ export function skeletonShape(
   manageHref: string | null,
 ): { rows: number; manage: boolean } {
   return { rows: remembered ?? DEFAULT_SKELETON_ROWS, manage: manageHref !== null };
+}
+
+/** Whether the list opens unfolded: the device's last choice, but only where
+ *  the list can be fetched. Expanding is what fires the listing, so carrying an
+ *  unfolded state into a page without the control plane would request a 404. */
+export function initiallyExpanded(canList: boolean, remembered: boolean): boolean {
+  return canList && remembered;
 }
 
 /** Stacked plates: several of the same thing, one of them on top. Deliberately
@@ -468,9 +480,10 @@ function WorkspaceSwitcherSkeleton({ rows, manage }: { rows: number; manage: boo
  *
  * The fetch hangs off the EXPAND, never off the menu opening: Refresh and
  * Restart have nothing to do with workspaces, and a control-plane request on
- * every menu open would put gateway traffic behind both of them. Every expand
- * refetches, for the reason the picker's popover documents: what is shown must
- * be what the gateway says now, not what it said the last time it was asked.
+ * every menu open would put gateway traffic behind both of them. A device that
+ * left the list unfolded opens the menu expanded, so it pays that request by
+ * its own choice. Every expand refetches, for the reason the picker's popover
+ * documents: what is shown must be what the gateway says now.
  *
  * `onClose` shuts the menu on a switch. The navigation is a full document load,
  * so the current page stays on screen until the next one paints; leaving the
@@ -482,7 +495,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   // control client's absolute `/~/…` path reaches it. See `workspacesMenuRow`
   // for why this is not the same question as "is there a picker to link to".
   const canList = WORKSPACE_ID !== null;
-  const expanded = useSignal(false);
+  const expanded = useSignal(initiallyExpanded(canList, recallWorkspaceSwitcherExpanded()));
   const list = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   // Sized to the count the last successful listing saw, on this device, so the
   // skeleton does not bounce into the list. Captured once per mount so it holds
@@ -526,6 +539,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
 
   const loading = list.value.status === 'not-loaded' || list.value.status === 'loading';
   const showSkeleton = useDelayedFlag(expanded.value && loading);
+  const placeholder = <WorkspaceSwitcherSkeleton rows={skeleton.rows} manage={skeleton.manage} />;
 
   // Every way out of this list, in either mode. The menu always shuts. An
   // in-place switch replaces the document, and a menu left over the loading
@@ -550,15 +564,21 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
         manageHref,
         workspaceName: visibleWorkspaceName.value,
         expanded: expanded.value,
-        onToggle: () => { expanded.value = !expanded.value; },
+        onToggle: () => {
+          expanded.value = !expanded.value;
+          rememberWorkspaceSwitcherExpanded(expanded.value);
+        },
         onNavigate: onClose,
       })}
       {expanded.value && (
         <LoadingFade
           showSkeleton={showSkeleton}
-          skeleton={<WorkspaceSwitcherSkeleton rows={skeleton.rows} manage={skeleton.manage} />}
+          skeleton={placeholder}
         >
-          {workspaceSwitcherList({
+          {/* Before the gate opens, an invisible placeholder holds the list's
+              height, so a menu that opens unfolded does not grow when the
+              listing lands. The shimmer copy stacks over it once the gate opens. */}
+          {loading ? <div class="brand-menu-ws-reserve" aria-hidden="true">{placeholder}</div> : workspaceSwitcherList({
             state: list.value,
             currentId: WORKSPACE_ID,
             manageHref,

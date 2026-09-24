@@ -113,6 +113,9 @@ export function mockTranscript(opts: {
   turnHeight?: number;
   clientHeight?: number;
   scrollTop?: number;
+  /** Step rows per turn, each `turnHeight / rowsPerTurn` tall and stamped
+   *  `<turnId>-r<k>` (`ROW_ATTR`). None by default. */
+  rowsPerTurn?: number;
 }) {
   let clientHeight = opts.clientHeight ?? 800;
   const listeners: Array<() => void> = [];
@@ -123,9 +126,14 @@ export function mockTranscript(opts: {
   // Per-turn overrides on top of the shared default, keyed by id so a window
   // change cannot move one onto a different turn.
   const heights = new Map<string, number>();
-  const heightOf = (eventId: string) => heights.get(eventId) ?? turnHeight;
+  const heightOf = (eventId: string) =>
+    heights.get(eventId) ?? turnHeight - (rowsHidden.get(eventId) ?? 0) * rowHeight();
   // Turns drawn with their leading rows clamped off by the render window.
   const clamped = new Set<string>();
+  // How many leading ROWS a clamped turn leaves out, for a turn that has rows.
+  const rowsHidden = new Map<string, number>();
+  const rowsPerTurn = opts.rowsPerTurn ?? 0;
+  const rowHeight = () => (rowsPerTurn > 0 ? turnHeight / rowsPerTurn : 0);
 
   const rendered = () => opts.ids.slice(renderFrom);
   const scrollHeight = () => rendered().reduce((sum, id) => sum + heightOf(id), 0);
@@ -133,14 +141,29 @@ export function mockTranscript(opts: {
     rendered().slice(0, indexInWindow).reduce((sum, id) => sum + heightOf(id), 0);
   const maxTop = () => Math.max(0, scrollHeight() - clientHeight);
 
+  const turnTop = (indexInWindow: number) => CONTAINER_VIEWPORT_TOP + offsetOf(indexInWindow) - top;
+  const row = (eventId: string, indexInWindow: number, k: number) => ({
+    getAttribute: (name: string) => (name === 'data-row-event' ? `${eventId}-r${k}` : null),
+    getBoundingClientRect: () => {
+      const height = rowHeight();
+      const rectTop = turnTop(indexInWindow) + (k - (rowsHidden.get(eventId) ?? 0)) * height;
+      return { top: rectTop, bottom: rectTop + height, height, left: 0, right: 400, width: 400 };
+    },
+  });
+  const drawnRows = (eventId: string, indexInWindow: number) => {
+    const out = [];
+    for (let k = rowsHidden.get(eventId) ?? 0; k < rowsPerTurn; k++) out.push(row(eventId, indexInWindow, k));
+    return out;
+  };
   const turn = (eventId: string, indexInWindow: number) => ({
     getAttribute: (name: string) => (name === 'data-event-id' ? eventId : null),
     hasAttribute: (name: string) => name === 'data-head-clamped' && clamped.has(eventId),
     getBoundingClientRect: () => {
       const height = heightOf(eventId);
-      const rectTop = CONTAINER_VIEWPORT_TOP + offsetOf(indexInWindow) - top;
+      const rectTop = turnTop(indexInWindow);
       return { top: rectTop, bottom: rectTop + height, height, left: 0, right: 400, width: 400 };
     },
+    querySelectorAll: (selector: string) => (selector === '[data-row-event]' ? drawnRows(eventId, indexInWindow) : []),
   });
 
   const el = {
@@ -157,6 +180,13 @@ export function mockTranscript(opts: {
     }),
     get children() { return rendered().map(turn); },
     querySelector(selector: string) {
+      const rowMatch = /^\[data-row-event="(.*)-r(\d+)"\]$/.exec(selector);
+      if (rowMatch) {
+        const index = rendered().indexOf(rowMatch[1]);
+        const k = Number(rowMatch[2]);
+        if (index < 0 || k < (rowsHidden.get(rowMatch[1]) ?? 0) || k >= rowsPerTurn) return null;
+        return row(rowMatch[1], index, k);
+      }
       const match = /^\[data-event-id="(.*)"\]$/.exec(selector);
       if (!match) return null;
       const index = rendered().indexOf(match[1]);
@@ -182,6 +212,13 @@ export function mockTranscript(opts: {
     /** ONE turn drawn with its head clamped off, or whole again. The window
      *  edge sits mid-turn while the walk is still drawing that turn. */
     setHeadClamped: (eventId: string, on: boolean) => { if (on) clamped.add(eventId); else clamped.delete(eventId); },
+    /** ONE turn drawn without its first `k` rows, as the render window's
+     *  `rowsHidden` does: the rows leave the DOM and the turn is that much
+     *  shorter. Leaves `scrollTop` alone, as the DOM change alone does. */
+    setRowsHidden: (eventId: string, k: number) => {
+      if (k > 0) { rowsHidden.set(eventId, k); clamped.add(eventId); }
+      else { rowsHidden.delete(eventId); clamped.delete(eventId); }
+    },
     /** The browser re-clamping `scrollTop` after the content shrank under a
      *  reader parked near the bottom. A real container does it itself, where
      *  this mock holds its offset until something writes one. */

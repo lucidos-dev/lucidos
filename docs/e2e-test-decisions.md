@@ -100,7 +100,9 @@ Lock logic lives in `scripts/lib/e2e_lock.sh`. `scripts/lib/e2e_lock_test.sh` co
 ### A run that LOST the lock subscribes; it does not poll
 The lock's refusal is correct, and how a loser *waits* was not. On 2026-08-09 three coding-agent threads raced for it at once: one held it mid mobile-webkit run, and both losers hand-rolled a busy-wait. One wrote `/tmp/run-e2e-retry-<pid>.sh` with `for i in $(seq 1 120)` around `./scripts/e2e-browser.sh` and `sleep 20; continue` on refusal, a 40 minute foreground tool call that re-executed the entry script's build checks on every attempt; the other parked on a bare `sleep 20`. Both burned a Claude Code turn and held engine capacity to learn something the engine could have told them.
 
-So **the lock announces itself**. Every hold emits `E2ELockAcquired` when it starts and `E2ELockReleased` when it ends, as domain events through `lucidos events emit`, and a refused run subscribes with `lucidos await-event --on E2ELockReleased` and **ends its turn**. The engine re-opens the thread when the event lands. `.claude/skills/e2e-lock-wait/SKILL.md` carries the agent-facing rules (one-shot subscription, forward-only watch, the cap of 10 consecutive subscriptions, the attempt cap, timeout handling); the refusal message teaches the same path in four lines so an agent that never loaded the skill still does the right thing.
+So **the lock announces itself**. Every hold emits `E2ELockAcquired` when it starts and `E2ELockReleased` when it ends, as domain events through `lucidos events emit`. A refused run subscribes with `lucidos await-event --on E2ELockReleased` and **ends its turn**. The engine re-opens the thread when the event lands.
+
+`.claude/skills/e2e-lock-wait/SKILL.md` carries the agent-facing rules: one-shot subscription, forward-only watch, the cap of 10 subscriptions an hour, the attempt cap, and timeout handling. The refusal message teaches the same path in four lines, so an agent that never loaded the skill still does the right thing.
 
 | Event | When | Payload |
 |---|---|---|
@@ -540,6 +542,29 @@ previous boundary over its own reading. A boundary sample alone bounds the
 reading at the boundary and never the chunk, whose observed compressor deltas
 reach 1.16 GB.
 
+**The sampler also stops a chunk that never reaches its boundary.** A hung
+mobile-webkit chunk once held the host at 0.3 GB available, at critical
+pressure, for 45 minutes, and the Mac had to be restarted. No boundary came, so
+the guard never ran. The sampler now watches for the freeze signature on its own
+ticks: critical pressure with available memory at or under the collapse level
+(2.40 GB here).
+
+- **It needs several samples in a row**, `LUCIDOS_E2E_COLLAPSE_TICKS` (3). It
+  counts samples rather than seconds, because a starving host slows the sampler
+  down. That night it wrote 95 samples an hour instead of 720.
+- **Nothing else stops a chunk.** Critical alone, the floor, warn and the
+  backstop keep their boundary-only rules.
+- **It interrupts only this run's Playwright invocation.** `run_playwright`
+  records the runner's pid. The sampler sends SIGINT to that pid and its
+  descendants by parent pid, then SIGKILL to what is left after
+  `LUCIDOS_E2E_TRIP_GRACE_SECS` (15).
+- **The run then reads as a memory stop**: exit 71, and no later chunk, phase
+  or project starts. A trip that lands between invocations stops the next
+  boundary, and no new invocation starts after it. The interrupted invocation
+  never prints its summary, so the project's tally is excused from adding up.
+- **A run torn down on a signal interrupts its own runner too**, using the pid
+  it holds in memory, never one a stale file names. Plan: `docs/plans/2026-09-24-host-memory-watch-and-in-chunk-stop.md`.
+
 **No caller may export a ceiling, and that lesson outlived the cap.**
 `e2e-browser.sh` sets none and the umbrella sets none, so an unset run gets the
 checked-in default. Exporting one is how a run comes to stop at a number nobody
@@ -571,6 +596,10 @@ stop stays, because it is correct wherever swap exists.
     instantaneous reading there is healthy.
   - A window dimension no sample could read never erases the direct reading.
   - The sampler is reaped, and it signals no pid it did not spawn.
+  - Three collapse samples in a row trip the chunk once. Critical with
+    headroom, warn, and a deep dip without critical never trip it.
+  - The trip signals only the recorded runner's tree, and nothing when no safe
+    runner is recorded.
 
 **The compressor drains, but only when the host asks for the pages back.** This
 page used to say it does not drain, on one observation of 0.55 GB at teardown

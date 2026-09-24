@@ -13,6 +13,7 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - spawn a new *thread* with `lucidos spawn-thread`: a chat thread, or a *coding-agent thread* on a repo or an app folder. `--coding-agent claude-code|codex` picks the backend, `--folder data/apps/<id>` targets an app worktree
 - subscribe the calling thread to an event instead of polling for it, and finish, letting the engine re-open the thread when the event lands: `lucidos await-event`
 - read what this thread is currently subscribed to, and stop watching: `lucidos event-waits list` / `lucidos event-waits cancel`
+- run work that has to outlive a coding agent's turn, and be re-opened when it finishes: `lucidos background-task run -- <command>`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
@@ -435,7 +436,7 @@ poll for those.
 engine emits `ChildThreadCompleted` here and re-opens this thread with the
 child's status, summary and `pending_change_ids`, which is everything a
 subscription would have handed you. So a wait on it buys nothing, and it costs
-two things: one of the consecutive subscriptions the loop cap below allows, and
+two things: one of the subscriptions the loop cap below allows, and
 a second clock, since
 a child that outlives `--timeout-secs` re-opens this thread with a pointless expiry
 and then re-opens it again when it actually finishes. Await a `ChildThreadCompleted`
@@ -446,7 +447,9 @@ session another thread spawned is a first-class thing to watch, and the wait
 fires when its completion lands on that thread. A session **nobody** spawned
 (the user started it themselves) has no `ChildThreadCompleted` at all, since
 only the parent/child fan-in emits one. Watch its turn boundary instead:
-`--on CodingAgentIdled --condition '{"thread_id": "<uuid>"}'`.
+`--on CodingAgentIdled --condition '{"thread_id": "<uuid>"}'`. That fires on
+every idle, including the one a user Stop causes, so it means "the agent went
+idle", not "the work is done".
 
 A **rendezvous, not a stream**. The first match resolves the subscription and
 consumes it. "Continue when the next X happens" is this; "react to every X,
@@ -491,8 +494,8 @@ Refusals arrive as a `400` carrying the reason, and are worth reading rather
 than retrying: a per-token streaming event (`TextStreamed` and friends) or an
 `EventWait*` type is refused outright, a thread may hold at most 25 live
 subscriptions, the same `--on` list twice on one thread is refused (it would
-deliver one event to you twice), and 10 subscriptions in a row with no message
-from the user is the loop cap.
+deliver one event to you twice), and 10 subscriptions within an hour with no
+message from the user is the loop cap.
 
 ```bash
 # Wait for a domain event the workspace's own scripts emit, then stop. The
@@ -503,6 +506,58 @@ $ lucidos await-event --on E2ETestsPassed --timeout-secs 3600 \
 # Narrow it: only a change that actually touched files.
 $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}}' \
     --timeout-secs 1800 --reason "the refactor to propose its change"
+```
+
+### `lucidos background-task run [--timeout-secs <N>] -- <command>` / `output <task_id>` / `stop <task_id>`
+
+Run work that has to outlive your turn, then **end your turn**. The engine runs
+the command as a *background task* in this thread's worktree. It arms an event
+wait on the task's `BackgroundBashCompleted` before `run` returns. When the task
+finishes, the engine re-opens this thread with the exit status and the tail of
+its output. Nothing waits in the meantime, so no turn re-reads its context.
+
+Use it for anything that may take longer than a foreground call can hold: a
+full test suite, an e2e run, a release build. A command you background yourself
+(the Bash tool's `run_in_background`, `&`, `nohup`) is killed when your turn
+ends, because the engine stops your whole process group. Anything that surely
+fits in 10 minutes is simpler as one foreground call with its timeout set to
+the maximum.
+
+- **One argument after `--` runs as written**, so quote a pipeline or a
+  redirect as a single string. Several arguments run as exactly those words.
+- `--timeout-secs` kills a task still running after that long. Default and
+  maximum: 3600.
+- `run` prints a `status`. `watched` means end your turn now. `unwatched` means
+  the thread hit a subscription limit and nothing will wake it: stop the task
+  and run the command in the foreground. `finished` means it was quick, and the
+  output is already in the response.
+- The re-open message carries each output stream's last 4000 bytes. `output
+  <task_id>` prints more: what arrived since your last read while the task
+  runs, and its final record once it has finished.
+- Only this thread's own agent can start, read or stop its tasks. The engine
+  refuses a command on the catastrophic deny-list.
+- The task gets the same environment as your own shell, so no `CRED_*` or
+  `OAUTH_*` secrets. Reach an external API through `lucidos proxy`.
+- Discarding or archiving the thread kills its running tasks. Stopping a task
+  records its completion as killed, and that still re-opens the thread.
+- **The exit status is the command's own.** Do not end a command with
+  `; echo $? > file`: the `echo` succeeds, so the task reports exit 0 even when
+  the work failed. To keep a copy in a file as well, pass the status on:
+  `…; rc=$?; echo $rc > .lucidos/run.exit; exit $rc`.
+
+**A stop, a timeout or a Discard ends the task's whole process group.** The
+engine sends SIGTERM, waits 3 s so a trap can clean up, then sends SIGKILL. A
+process that detached into its own session is out of reach. A task that exits
+on its own signals nothing, so a `nohup … &` it started keeps running. The chat
+agent's `run_bash_background` behaves the same way.
+
+```bash
+# The normal shape: start the suite, then end your turn.
+$ lucidos background-task run -- 'lucidos build-slot -- cargo test > .lucidos/test.log 2>&1'
+
+# Look in on it, or give up on it.
+$ lucidos background-task output 5f0c2e1a-…
+$ lucidos background-task stop 5f0c2e1a-…
 ```
 
 ### `lucidos build-slot [--label <T>] [--max-wait <SECS>] -- <command>` / `--status` / `--set-capacity <N>`
@@ -679,7 +734,7 @@ For event-driven triggers ("coding agent is asking", "credential needed", …) t
 
 - **`--tap <modal|navigate>`** — which kind of tap. `modal` (default) opens the inbox detail; use it for purely informational pushes too ("Backup complete", "Sync finished") — every notification is openable, there is no passive kind. `navigate` deep-links to the target inferred from the other flags: `--thread-id` → navigate to that thread (scrolling and pulsing `--event-id` when set); `--app-id` → navigate to that app. When both `--thread-id` and `--app-id` are present, thread wins (the more common CTA shape — "answer this question"). (The passive `none` kind was retired — `docs/plans/2026-07-02-remove-notification-tap-none.md`.)
 - **`--thread-id <UUID>`** — the originating thread. With `--tap navigate`, the tap deep-links straight to this thread instead of the inbox modal. Even without `--tap`, this stamps the notification so the modal's "Open thread" button resolves.
-- **`--event-id <UUID>`** — a specific event id inside `--thread-id` to scroll to and briefly pulse when the tap lands. Ignored when `--thread-id` is absent.
+- **`--event-id <UUID>`**: a specific event id inside `--thread-id` to scroll to and briefly pulse when the tap lands. Ignored when `--thread-id` is absent. An event that is not in that thread fails the command with a 400, and so does a domain event, which lives in no thread.
 - **`--fragment <string>`**: the place INSIDE the app the tap lands on. It arrives as the app's `location.hash`, so an app that routes on the hash opens on that item. Only read on the `--app-id` branch, since a thread deep-link names no app. An app that ignores the hash still opens.
 
 ```bash
@@ -1208,11 +1263,11 @@ lucidos planned state
 
 `mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple` / `--security-fix`.
 
-**`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool**, never in prose. That is `AskUserQuestion` on Claude Code and `ask_user_question` on Codex, with options `Approve` / `Request changes`. Approval is a DECISION question the agent is blocked on. Asked in prose, it leaves the thread idle until the user types "approve" by hand.
+**`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must summarize the plan in its message and ask for approval **with its question tool**, never in prose. That is `AskUserQuestion` on Claude Code and `ask_user_question` on Codex, with options `Approve` / `Request changes`. Approval is a DECISION question the agent is blocked on. Asked in prose, it leaves the thread idle until the user types "approve" by hand.
 
 That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot. `Request changes` is then dropped rather than carried as a third option, where it would mean only "I will type what I want changed".
 
-Only after the user approves does the agent run `lucidos planned approve` to flip `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
+Only after the user approves does the agent run `lucidos planned approve` to flip `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again (the marker stays `proposed`). The message carries the plan summary, or on a re-ask only what changed. The card asks one short question and never repeats the message. `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
 
 `mark --security-fix` is the **bounded security-fix lane**, and it exists for one case: a run nobody can be asked. An UNATTENDED session may commit a security fix with no prior plan decision. The fix must be confined to the files `--files` names, and must ship a regression test. It records `bounded_security_fix`, which satisfies the gate at once.
 

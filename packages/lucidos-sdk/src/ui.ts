@@ -9,6 +9,8 @@ import {
   type FontFamily, type ThemePref,
 } from './appearance';
 import { preferences as prefsModule } from './preferences';
+import { isIOSAgent } from './platform';
+import { applyAutocorrectPreference } from './autocorrectStamp';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
 import { disableTooltips } from './tooltip';
@@ -59,20 +61,6 @@ function currentThemePreference(): ThemePref {
     wsLocalGet('lucidos-theme'),
     () => document.documentElement.getAttribute('data-theme'),
   );
-}
-
-/**
- * iOS / iPadOS detection, mirroring `crates/lucidos-app/src/utils/platform.ts`.
- * Exported for tests; `nav` defaults to the global navigator. Used to spot an
- * installed iOS PWA, whose external links need the host's hand-off.
- */
-export function isIOSAgent(
-  nav: { userAgent: string; platform?: string; maxTouchPoints?: number } | undefined =
-    typeof navigator !== 'undefined' ? navigator : undefined,
-): boolean {
-  if (!nav) return false;
-  return /iPad|iPhone|iPod/.test(nav.userAgent) ||
-    (nav.platform === 'MacIntel' && (nav.maxTouchPoints ?? 0) > 1);
 }
 
 /** Only the window this frame posted to may answer it.
@@ -254,33 +242,61 @@ function cacheExternalLinkTarget(raw: string | undefined): void {
     : 'safari';
 }
 
-/** In-flight prime, so a themed app calling `applyPreferences` and the
- *  load-time prime below don't each fetch. */
-let primingExternalLinkTarget: Promise<void> | null = null;
+/** Whether a device-preference read has landed here, from the load-time prime
+ *  or from `applyPreferences`. */
+let devicePreferencesLoaded = false;
+/** The prime's own read, so repeated prime calls share one fetch. */
+let primingDevicePreferences: Promise<void> | null = null;
+/** Every device-preference read takes the next attempt number when issued. */
+let devicePreferencesIssued = 0;
+/** The newest attempt applied so far. */
+let devicePreferencesApplied = 0;
 
-/** Warm {@link externalLinkTargetCache} without going through
- *  `applyPreferences`.
+/**
+ * Apply the device preferences every app frame follows, themed or not.
+ *
+ * The prime and `applyPreferences` each fetch, and never share one promise.
+ * WebKit can leave a fetch hanging across an iOS suspension. A shared read
+ * would then hold every later re-apply behind it, which the host's
+ * `loadPreferences` guard also rules out. So a response older than one already
+ * applied is dropped.
+ */
+function applyDevicePreferences(prefs: Record<string, string>, attempt: number): void {
+  if (attempt < devicePreferencesApplied) return;
+  devicePreferencesApplied = attempt;
+  devicePreferencesLoaded = true;
+  cacheExternalLinkTarget(prefs['external_link_target']);
+  applyAutocorrectPreference(prefs);
+}
+
+/** Read this device's preferences once at load, without `applyPreferences`.
  *
  *  Needed because `applyPreferences` is OPTIONAL. An app shipping its own
- *  complete visual identity never calls it, yet still gets the SDK's delegated
- *  link handler. Left to theming alone, such an app holds a `null` cache
- *  forever and takes the host path on every link. It then ignores the user's
- *  "Ask" choice, since by then the activation `navigator.share` needs is gone.
+ *  complete visual identity never calls it, yet two SDK behaviors still read
+ *  the device's preferences:
  *
- *  Called at load from `browser.ts`, and only inside an installed iOS PWA, the
- *  one place the cache is ever read. A failure leaves the cache null, which
- *  falls back to the host path.
+ *  - The delegated link handler reads {@link externalLinkTargetCache}. With a
+ *    null cache every link takes the host path, which ignores "Ask": the
+ *    activation `navigator.share` needs is gone by then.
+ *  - The autocorrect stamp (`autocorrectStamp.ts`) starts from the seed or the
+ *    default of on, and this read corrects it to the device's stored switch.
  *
- *  Not live: an app that never calls `watchPreferences` keeps the mode it saw at
+ *  Called at load from `browser.ts`, on every client, since the switch is read
+ *  everywhere. A failure keeps what the SDK had: a null link cache, which takes
+ *  the host path, and the stamp's load-time value.
+ *
+ *  Not live: an app that never calls `watchPreferences` keeps what it saw at
  *  load until the next reload. Subscribing SSE from every app iframe to catch a
  *  rare mid-session change is not worth the connection. */
-export function primeExternalLinkTarget(): Promise<void> {
-  if (externalLinkTargetCache !== null) return Promise.resolve();
-  if (!inIOSStandalone()) return Promise.resolve();
-  primingExternalLinkTarget ??= prefsModule.get()
-    .then((prefs) => { cacheExternalLinkTarget(prefs['external_link_target']); })
-    .finally(() => { primingExternalLinkTarget = null; });
-  return primingExternalLinkTarget;
+export function primeDevicePreferences(): Promise<void> {
+  if (devicePreferencesLoaded) return Promise.resolve();
+  if (!primingDevicePreferences) {
+    const attempt = ++devicePreferencesIssued;
+    primingDevicePreferences = prefsModule.get()
+      .then((prefs) => applyDevicePreferences(prefs, attempt))
+      .finally(() => { primingDevicePreferences = null; });
+  }
+  return primingDevicePreferences;
 }
 
 /** Whether this frame is inside an installed iOS PWA. The app iframe inherits
@@ -324,6 +340,7 @@ function applyStyleOverrides(raw: string | null | undefined): void {
 export const ui = {
   /** Fetch user preferences and apply theme, font, scale as CSS variables. */
   async applyPreferences(): Promise<void> {
+    const attempt = ++devicePreferencesIssued;
     const prefs = await prefsModule.get();
 
     // Theme: prefer the value the synchronous sdk-prefs.js resolver already
@@ -381,9 +398,10 @@ export const ui = {
     // every open app iframe only on its next reload.
     applyStyleOverrides(prefs['style_overrides'] || wsLocalGet('lucidos-style-overrides'));
 
-    // Cache the external-link target for openExternal, which must resolve it
-    // WITHOUT awaiting (see EXTERNAL_LINK_TARGET_CACHE).
-    cacheExternalLinkTarget(prefs['external_link_target']);
+    // The external-link target, which openExternal reads WITHOUT awaiting, and
+    // the Autocorrect switch. A live re-apply is what lets a watching app follow
+    // a flip of either.
+    applyDevicePreferences(prefs, attempt);
   },
 
   watchPreferences(): void {

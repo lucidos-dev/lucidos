@@ -263,6 +263,15 @@ export type ResponseEvent =
     }
   | { type: 'section_break'; channel: string }
   | {
+      /** An agent-sent message a coding agent holds until a human replies
+       *  (ADR 0256). `released` flips once its `HeldMessageReleased` lands. */
+      type: 'held_message';
+      held_id: string;
+      text: string;
+      sender: string;
+      released: boolean;
+    }
+  | {
       type: 'image';
       base64: string;
       mime_type: string;

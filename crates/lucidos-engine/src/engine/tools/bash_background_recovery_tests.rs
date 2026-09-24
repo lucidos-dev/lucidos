@@ -446,18 +446,18 @@ fn an_abandoned_completion_claims_no_exit_status() {
 
 /// **Neither note promises the work stopped**, and that restraint is the
 /// point. After a crash no destructor ran at all. After a teardown the kill
-/// reached the `bash -c` wrapper, but a pipeline or a list leaves its real work
-/// reparented to init. Telling an agent "nothing is running, re-run it" in
-/// either case starts a second release beside the first.
+/// reached the task's process group, but not a process that detached into its
+/// own session. Telling an agent "nothing is running, re-run it" in either
+/// case starts a second release beside the first.
 #[test]
 fn neither_note_promises_the_work_stopped() {
     // Neither promises the work stopped, and for different reasons. The crash
-    // path ran no destructor at all; the teardown's SIGKILL reaches the `bash
-    // -c` wrapper but not the pipeline behind it.
+    // path ran no destructor at all; the teardown's SIGKILL reaches the task's
+    // process group but not a process that detached into its own session.
     assert!(ENGINE_STOPPED_NOTE.contains("it killed this task"));
     assert!(
         ENGINE_STOPPED_NOTE.contains("may still be running"),
-        "a single-pid kill cannot promise the pipeline stopped: {ENGINE_STOPPED_NOTE}"
+        "a group kill cannot reach a detached session: {ENGINE_STOPPED_NOTE}"
     );
     assert!(
         !ENGINE_CRASHED_NOTE.contains("killed"),

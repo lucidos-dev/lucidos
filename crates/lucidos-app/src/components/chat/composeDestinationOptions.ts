@@ -55,16 +55,16 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
       description: "The Lucidos platform's own code",
     });
   }
-  for (const a of apps) {
-    options.push({
-      value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'app', appId: a.id } }),
-      label: `${a.name} · app`,
-    });
-  }
   for (const r of externalRepos) {
     options.push({
       value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'external', repoId: r.id } }),
       label: `${r.name} · repository`,
+    });
+  }
+  for (const a of apps) {
+    options.push({
+      value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'app', appId: a.id } }),
+      label: `${a.name} · app`,
     });
   }
   // Loading must not look like "no apps / no repos".

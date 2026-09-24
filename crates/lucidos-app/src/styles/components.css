@@ -1223,6 +1223,14 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     overflow-wrap: anywhere;
 }
 
+/* A wrapped path makes the row tall, so its icon, diffstat and badge hold the
+   top rather than floating to the middle. The line height equals the icon's box
+   (`.file-icon`), so each of them shares a line with the path's first line. */
+.file-item.repo-changed-file {
+    align-items: flex-start;
+    line-height: 1.25rem;
+}
+
 /* Image thumbnails - clickable to show full size */
 .image-thumbnail {
     max-width: 18.75rem;

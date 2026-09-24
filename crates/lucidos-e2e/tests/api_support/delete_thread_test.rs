@@ -245,9 +245,8 @@ async fn delete_refuses_a_running_descendant() {
     pool.close().await;
 }
 
-/// The parked parent, which is the one state archive and delete answer
-/// differently. Archive admits it and cancel-stamps the card; delete refuses,
-/// because there is nothing to stamp when the card is about to go.
+/// A parent parked on a question needs the user, so delete and archive both
+/// refuse it (ADR 0259).
 #[tokio::test]
 async fn delete_refuses_a_parent_waiting_on_an_answer() {
     let client = user_client().await;
@@ -275,18 +274,18 @@ async fn delete_refuses_a_parent_waiting_on_an_answer() {
         "a refused delete must leave the thread alone"
     );
 
-    // Archive admits the same thread, which is what makes the divergence real
-    // rather than a coincidence of fixtures.
     let archived = client
         .post(format!("{}/api/v1/threads/archive", base_url()))
         .json(&json!({ "thread_id": thread_id.to_string() }))
         .send()
         .await
         .expect("archive request failed");
+    let archive_status = archived.status().as_u16();
+    let archive_body: serde_json::Value = archived.json().await.expect("Invalid JSON");
+    assert_eq!(archive_status, 409, "a parked parent blocks archive too");
     assert_eq!(
-        archived.status().as_u16(),
-        200,
-        "archive must still admit a parent parked on a question"
+        archive_body["reason"], "parent_not_archivable",
+        "{archive_body:?}"
     );
 
     cleanup(&pool, &[thread_id]).await;

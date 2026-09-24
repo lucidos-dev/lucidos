@@ -361,6 +361,11 @@ export default defineConfig({
       // barrel, for the same reason as the three above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/event-stream': resolve(__dirname, '../../packages/lucidos-sdk/src/eventStream.ts'),
+      // The text-entry contract, shared so the host's field stamp and an app
+      // frame's resolve the Autocorrect switch by one rule. Reached WITHOUT the
+      // barrel, for the same reason as the four above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/text-entry': resolve(__dirname, '../../packages/lucidos-sdk/src/textEntry.ts'),
     },
   },
   server: {

@@ -481,15 +481,13 @@ impl PythonRuntime {
             // it: SIGKILL reaches the INTERPRETER, not a process tree the
             // script started itself. A script that shells out via
             // `subprocess.Popen` leaves those grandchildren running, because
-            // they are not in a group we signal. That is the uniform contract
-            // of every exec path here (`run_bash`, `run_bash_background`, the
-            // scheduled `.sh` branch and this one all rely on kill_on_drop
-            // alone), so fixing it belongs in all four at once, on
-            // `spawn_env::{isolate_in_process_group, kill_child_process_group_now}`,
-            // the facility the coding-agent spawns already use. Fixing it here
-            // alone would also only cover the timeout: `kill_on_drop` still
-            // signals the leader on the cancel and shutdown paths, so a
-            // group-aware teardown needs a Drop guard, not a call on one arm.
+            // they are not in a group we signal. The foreground exec paths
+            // (`run_bash`, the scheduled `.sh` branch and this one) share that
+            // contract. The background registry signals its task's group:
+            // a stop there is a decision to end the work (ADR 0263). ADR 0100
+            // records why `run_bash` does not. A group kill here would also
+            // need a Drop guard, not a call on one arm: `kill_on_drop` still
+            // signals only the leader on cancel and shutdown.
             .kill_on_drop(true);
         crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
         let output = match tokio::time::timeout(self.execution_timeout, cmd.output()).await {

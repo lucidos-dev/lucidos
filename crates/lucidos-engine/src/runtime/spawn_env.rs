@@ -102,11 +102,10 @@ pub(super) fn apply_lucidos_env(
     // `build.rustc-wrapper = "sccache"`, which cargo falls back to when
     // RUSTC_WRAPPER is unset — only an explicit empty value overrides it to
     // a plain (uncached) build. See `sccache_on_path`.
-    if sccache_on_path(std::env::var_os("PATH").as_deref()) {
-        cmd.env("RUSTC_WRAPPER", "sccache");
-    } else {
-        cmd.env("RUSTC_WRAPPER", "");
-    }
+    cmd.env(
+        "RUSTC_WRAPPER",
+        rustc_wrapper_for_path(std::env::var_os("PATH").as_deref()),
+    );
     let prefixes = agent_path_prefixes(
         cli_dir,
         std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from),
@@ -285,13 +284,37 @@ pub(super) fn signal_child_process_group(_pid: u32, _signal: i32) {}
 /// recycled group would hit unrelated processes (see `signal_child_process_group`).
 #[cfg(unix)]
 pub(super) async fn graceful_kill_child_process_group(pid: u32, grace: std::time::Duration) {
-    signal_child_process_group(pid, libc::SIGTERM);
-    tokio::time::sleep(grace).await;
-    signal_child_process_group(pid, libc::SIGKILL);
+    graceful_kill_child_process_group_or_sooner(pid, grace, std::future::pending()).await;
 }
 
 #[cfg(not(unix))]
 pub(super) async fn graceful_kill_child_process_group(_pid: u32, _grace: std::time::Duration) {}
+
+/// [`graceful_kill_child_process_group`], with a grace that `sooner` can cut
+/// short. The background-task registry needs it: an engine teardown arriving
+/// mid-grace has only `REAP_WAIT` to reap, so it cannot sit out the grace.
+/// Same reaping caveat: only while the child is unreaped.
+#[cfg(unix)]
+pub(crate) async fn graceful_kill_child_process_group_or_sooner(
+    pid: u32,
+    grace: std::time::Duration,
+    sooner: impl std::future::Future<Output = ()>,
+) {
+    signal_child_process_group(pid, libc::SIGTERM);
+    tokio::select! {
+        _ = tokio::time::sleep(grace) => {}
+        _ = sooner => {}
+    }
+    signal_child_process_group(pid, libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn graceful_kill_child_process_group_or_sooner(
+    _pid: u32,
+    _grace: std::time::Duration,
+    _sooner: impl std::future::Future<Output = ()>,
+) {
+}
 
 /// SIGKILL a child's whole process group, synchronously.
 ///
@@ -375,6 +398,18 @@ pub(crate) fn find_on_path(
 pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
     let exe = format!("sccache{}", std::env::consts::EXE_SUFFIX);
     find_on_path(std::ffi::OsStr::new(&exe), path_var).is_some()
+}
+
+/// The `RUSTC_WRAPPER` a Lucidos-spawned build gets: `sccache` when it is on
+/// PATH, else empty. Empty, never unset: see the note in `apply_lucidos_env`.
+/// Shared by the agent spawn and a coding agent's background task, so a build
+/// behaves the same in both.
+pub(crate) fn rustc_wrapper_for_path(path_var: Option<&std::ffi::OsStr>) -> &'static str {
+    if sccache_on_path(path_var) {
+        "sccache"
+    } else {
+        ""
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +546,23 @@ mod tests {
         assert!(
             !sccache_on_path(Some(path_var.as_os_str())),
             "missing sccache must not be reported as present"
+        );
+    }
+
+    #[test]
+    fn rustc_wrapper_is_empty_rather_than_unset_without_sccache() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
+        assert_eq!(rustc_wrapper_for_path(Some(path_var.as_os_str())), "");
+        std::fs::write(
+            tmp.path()
+                .join(format!("sccache{}", std::env::consts::EXE_SUFFIX)),
+            b"#!/bin/sh\nexit 0\n",
+        )
+        .expect("write fake sccache");
+        assert_eq!(
+            rustc_wrapper_for_path(Some(path_var.as_os_str())),
+            "sccache"
         );
     }
 

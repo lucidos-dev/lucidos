@@ -11,6 +11,8 @@
 //! The script sets `data-theme`, `--bg-primary`, `--font-ui` (and
 //! `--user-ui-scale` when set) on `<html>` synchronously, so first paint
 //! matches the user's preferences before any subsequent stylesheet evaluates.
+//! The seed it carries also holds the device's `autocorrect` switch, which the
+//! SDK's field stamp reads before its own preference read returns.
 //!
 //! **Where the values come from.** A same-origin iframe inherits the parent's
 //! localStorage, so the shell's mirror writes are visible to it. An ISOLATED
@@ -52,19 +54,24 @@ use crate::core::PreferenceStore;
 const SDK_PREFS_JS: &str =
     include_str!("../../../../packages/lucidos-sdk/src/generated/appearance-boot.iframe.js");
 
-/// The preference keys first paint needs, in the order the SDK resolves them.
+/// The preference keys an app frame needs before anything async can answer, in
+/// the order the SDK resolves them. The appearance keys paint the first frame.
 /// `text-size` and `font-size` are the pre-grid aliases for `ui-scale`, carried
 /// so this script and the live `ui.applyPreferences` pick the same scale.
-const SEED_KEYS: [&str; 6] = [
+/// `autocorrect` is read by the SDK's field stamp, which must answer before a
+/// field's first focus (ADR 0262).
+const SEED_KEYS: [&str; 7] = [
     "theme",
     "font-family",
     "ui-scale",
     "text-size",
     "font-size",
     "style_overrides",
+    "autocorrect",
 ];
 
-/// The global the seed lands on, read by `boot/appearanceBoot.ts`.
+/// The global the seed lands on, read by `boot/appearanceBoot.ts` and the SDK's
+/// `autocorrectStamp.ts`.
 const SEED_GLOBAL: &str = "__lucidosPrefs";
 
 /// Query for the prefs script: which device is asking.
@@ -314,6 +321,16 @@ mod tests {
         assert_eq!(
             seed_line(&prefs(&[("theme", "dark"), ("ui-scale", "150")])),
             "window.__lucidosPrefs={\"theme\":\"dark\",\"ui-scale\":\"150\"};\n"
+        );
+    }
+
+    #[test]
+    fn the_seed_line_carries_the_autocorrect_switch() {
+        // An isolated frame reads none of the shell's storage, so the seed is
+        // its only synchronous source for the stamp's first value.
+        assert_eq!(
+            seed_line(&prefs(&[("autocorrect", "true")])),
+            "window.__lucidosPrefs={\"autocorrect\":\"true\"};\n"
         );
     }
 

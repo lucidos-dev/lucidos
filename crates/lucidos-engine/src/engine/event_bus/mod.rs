@@ -215,6 +215,7 @@ mod auto_resume_hold;
 pub(crate) use auto_resume_hold::AutoResumeHolds;
 
 mod parent_callback;
+pub(crate) use parent_callback::ChildSettle;
 
 impl EmittedEvent {
     /// Convert to SSE-compatible JSON string.
@@ -795,6 +796,12 @@ impl EventBus {
                         }
                     }
 
+                    // A thread waiting on the user is never archived, whoever
+                    // emits the archive (ADR 0259).
+                    if matches!(te, ThreadEvent::ThreadArchived) {
+                        Self::check_archive_allowed(&mut tx, thread_id).await?;
+                    }
+
                     // === Phase: Persist ===
                     // INSERT into the events table. Assigns the bigserial sequence
                     // that drives ordering for every downstream consumer (SSE
@@ -1062,6 +1069,33 @@ impl EventBus {
         section
             .map(|s| ArchiveState::parse(&s))
             .unwrap_or(ArchiveState::Archived)
+    }
+
+    /// Refuse a `ThreadArchived` on a thread waiting on the user.
+    ///
+    /// `FOR UPDATE` is load-bearing. A concurrent `UserQuestionAsked` holds the
+    /// row until it commits, so this read waits and sees the parked status. A
+    /// plain read would see the older snapshot and archive over the question.
+    async fn check_archive_allowed(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        thread_id: &Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT source, archive_state, status FROM thread_summaries \
+             WHERE thread_id = $1 FOR UPDATE",
+        )
+        .bind(thread_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((source, section, status)) = row else {
+            return Ok(());
+        };
+        thread_lifecycle::check_archive_allowed(
+            ThreadType::from_source(&source),
+            ArchiveState::parse(&section),
+            thread_lifecycle::ThreadStatus::parse(&status),
+        )?;
+        Ok(())
     }
 
     /// Apply a contract transition result to the database. Only effect is the

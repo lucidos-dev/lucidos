@@ -16,7 +16,7 @@ use super::*;
 const SMTP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(80);
 
 /// Hard wall-clock bound for one complete IMAP operation (session setup +
-/// select + search/fetch + logout). `IMAP_CONNECT_TIMEOUT` (email.rs) bounds
+/// examine + search/fetch + logout). `IMAP_CONNECT_TIMEOUT` (email.rs) bounds
 /// only session setup with a sharper error; async-imap's post-auth command
 /// phase is equally unbounded, so a server that stalls AFTER login would
 /// otherwise hang the calling chat turn indefinitely. Deliberately generous:
@@ -37,6 +37,45 @@ fn imap_op_timed_out(account: &EmailAccount, op: &str) -> BoxError {
         IMAP_OP_TIMEOUT.as_secs()
     )
     .into()
+}
+
+/// The full-message fetch. It MUST stay a `BODY.PEEK[]` fetch: per RFC 3501
+/// §6.4.5, a plain `RFC822` or `BODY[]` fetch sets `\Seen` on the user's real
+/// mailbox, so reading a message would mark it read.
+const FULL_MESSAGE_FETCH: &str = "(UID BODY.PEEK[])";
+
+/// Download one complete message, without changing its flags.
+///
+/// Two guards keep a read from marking mail read. `EXAMINE` opens the folder
+/// read-only, and the fetch itself peeks. No caller changes flags or moves
+/// mail on this session, so the read-only open costs nothing.
+async fn fetch_raw_message(
+    account: &EmailAccount,
+    uid: u32,
+    folder: Option<&str>,
+    oauth_access_token: Option<&str>,
+) -> Result<Vec<u8>, BoxError> {
+    let folder = folder.unwrap_or("INBOX");
+
+    let mut session = imap_connect(account, oauth_access_token).await?;
+    session.examine(folder).await?;
+
+    let fetches: Vec<_> = session
+        .uid_fetch(uid.to_string(), FULL_MESSAGE_FETCH)
+        .await?
+        .try_collect()
+        .await?;
+
+    // Best-effort teardown: a `?` would discard the successful read above
+    // when the server drops the connection instead of replying to LOGOUT
+    // (rust.md cleanup).
+    let _ = session.logout().await;
+
+    // The server answers `BODY.PEEK[]` as `BODY[]`, which `body()` returns.
+    let fetch = fetches
+        .first()
+        .ok_or_else(|| format!("No message found with UID {}", uid))?;
+    Ok(fetch.body().unwrap_or_default().to_vec())
 }
 
 impl EmailClient {
@@ -72,7 +111,7 @@ impl EmailClient {
         // Both raw IMAP fragments reach `uid_search` verbatim, which does not
         // validate them. Refuse a line break BEFORE connecting so an injected
         // second command can never reach the mailbox. See
-        // `reject_imap_line_break`. (`folder` needs no check: `select` runs
+        // `reject_imap_line_break`. (`folder` needs no check: `examine` runs
         // async-imap's own `validate_str`.)
         if let Some(search) = search {
             reject_imap_line_break("search", search)?;
@@ -81,8 +120,10 @@ impl EmailClient {
             reject_imap_line_break("since", since)?;
         }
 
+        // `EXAMINE`, not `SELECT`: a listing never changes flags, so open the
+        // folder read-only. See `fetch_raw_message`.
         let mut session = imap_connect(account, oauth_access_token).await?;
-        session.select(folder).await?;
+        session.examine(folder).await?;
 
         // Detect non-ASCII in search query (Exchange Online only supports US-ASCII IMAP SEARCH)
         let has_non_ascii = search.is_some_and(|s| !s.is_ascii());
@@ -132,6 +173,7 @@ impl EmailClient {
             .collect::<Vec<_>>()
             .join(",");
 
+        // PEEK is mandatory here too: a plain `BODY[...]` sets `\Seen` (RFC 3501).
         let fetch_stream = session
             .uid_fetch(&uid_set, "(UID BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.500>)")
             .await?;
@@ -248,24 +290,9 @@ impl EmailClient {
         folder: Option<&str>,
         oauth_access_token: Option<&str>,
     ) -> Result<EmailMessage, BoxError> {
-        let folder = folder.unwrap_or("INBOX");
-
-        let mut session = imap_connect(account, oauth_access_token).await?;
-        session.select(folder).await?;
-
-        let uid_str = uid.to_string();
-        let fetch_stream = session.uid_fetch(&uid_str, "(UID RFC822)").await?;
-        let fetches: Vec<_> = fetch_stream.try_collect().await?;
-
-        let fetch = fetches
-            .first()
-            .ok_or_else(|| format!("No message found with UID {}", uid))?;
-
-        let body_bytes = fetch.body().unwrap_or_default();
+        let raw = fetch_raw_message(account, uid, folder, oauth_access_token).await?;
         let parser = mail_parser::MessageParser::default();
-        let parsed = parser
-            .parse(body_bytes)
-            .ok_or("Failed to parse email message")?;
+        let parsed = parser.parse(&raw).ok_or("Failed to parse email message")?;
 
         let message_id = parsed.message_id().unwrap_or("").to_string();
         let from = format_address(parsed.from());
@@ -283,11 +310,6 @@ impl EmailClient {
 
         // Extract attachment metadata
         let attachments = extract_attachment_info(&parsed);
-
-        // Best-effort teardown: a `?` would discard the successful read above
-        // when the server drops the connection instead of replying to LOGOUT
-        // (rust.md cleanup).
-        let _ = session.logout().await;
 
         Ok(EmailMessage {
             uid,
@@ -334,24 +356,9 @@ impl EmailClient {
     ) -> Result<(String, String, Vec<u8>), BoxError> {
         use mail_parser::MimeHeaders;
 
-        let folder = folder.unwrap_or("INBOX");
-
-        let mut session = imap_connect(account, oauth_access_token).await?;
-        session.select(folder).await?;
-
-        let uid_str = uid.to_string();
-        let fetch_stream = session.uid_fetch(&uid_str, "(UID RFC822)").await?;
-        let fetches: Vec<_> = fetch_stream.try_collect().await?;
-
-        let fetch = fetches
-            .first()
-            .ok_or_else(|| format!("No message found with UID {}", uid))?;
-
-        let body_bytes = fetch.body().unwrap_or_default();
+        let raw = fetch_raw_message(account, uid, folder, oauth_access_token).await?;
         let parser = mail_parser::MessageParser::default();
-        let parsed = parser
-            .parse(body_bytes)
-            .ok_or("Failed to parse email message")?;
+        let parsed = parser.parse(&raw).ok_or("Failed to parse email message")?;
 
         let part = parsed
             .attachment(attachment_index)
@@ -366,11 +373,6 @@ impl EmailClient {
         let mime_type = mime_type_from_content_type(ct);
 
         let data = part.contents().to_vec();
-
-        // Best-effort teardown: a `?` would discard the successful read above
-        // when the server drops the connection instead of replying to LOGOUT
-        // (rust.md cleanup).
-        let _ = session.logout().await;
 
         Ok((filename, mime_type, data))
     }

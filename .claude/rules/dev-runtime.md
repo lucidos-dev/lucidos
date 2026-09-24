@@ -52,6 +52,8 @@ paths:
   - "scripts/lib/sleep.sh"
   - "scripts/lib/host_load_guard*.sh"
   - "scripts/lib/host_memory_guard*.sh"
+  - "scripts/memory-watch*.sh"
+  - "scripts/lib/memory_watch*.sh"
   - "scripts/preflight-reclaim-engines.sh"
   - "scripts/lib/preflight_reclaim*.sh"
   - "scripts/lib/webkit_reaper*.sh"
@@ -106,6 +108,8 @@ opt-in itself, and never starts a gateway.
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
 ./scripts/test-scripts.sh                 # Run every scripts/lib/*_test.sh (= make test-scripts): per-suite pass/fail + a total, exits non-zero if any suite fails. Needs no Postgres; separate from `make lint` and the engine suite. See below
 ./scripts/preflight-reclaim-engines.sh    # Pre-flight: stop every engine that should not be running, and prove what it freed. Exits non-zero if one survived. See below
+./scripts/memory-watch.sh --once          # Host memory watch, one tick: record any process over a share of RAM, kill one past physical RAM. See below
+./scripts/memory-watch-install.sh install|uninstall|status  # Load the watch as a launchd agent for THIS checkout (refused from a worktree)
 ./scripts/e2e-packaged.sh [--rebuild]     # macOS-only: boot the packaged .app (service + embedded PG) and smoke-test the chain (heavy: builds the .app)
 ./scripts/with-build-slot.sh [--label "<t>"] -- <cmd>  # Run a heavy build under a build slot (ADR 0070). Resolves the `lucidos` broker, or runs the command unrestricted when there is none. A granted slot also nices the build and sets its `CARGO_BUILD_JOBS` share (ADR 0210). Already wired into `make lint-rust`, `test-engine.sh` and `run_engine_cargo_build`; reach for it directly only for a NEW heavy build command
 ./scripts/lint-shell.sh                   # ShellCheck over every tracked *.sh (= make lint-shell; part of make lint / make check)
@@ -220,6 +224,35 @@ engine whose workspace id cannot be read is left alone and never counted as a
 survivor: killing what you cannot name is how a reclaim takes out the wrong
 engine. The available reading is `host_memory_guard.sh`'s, so there is no
 second formula.
+
+### Host memory watch (`memory-watch.sh`, ADR 0264)
+
+A launchd agent that runs `memory-watch.sh --once` every 30 seconds, with or
+without Lucidos running. The logic is `scripts/lib/memory_watch.sh`, tested by
+`scripts/lib/memory_watch_test.sh`. The log is
+`~/.lucidos/memory-watch/memory-watch.log`.
+
+- **It measures footprint, never RSS.** One `top -l 1 -o mem` sample per tick.
+  A compressed page leaves RSS but still costs the host, and the runaway it was
+  built for was almost all compressed. `ps` and `lsof` run only for a process
+  already over the log threshold.
+- **It records, then kills.** A process over `MEMORY_WATCH_LOG_PCT` (20) of RAM
+  gets a full record: start time, command line, cwd, parent chain. One past
+  `MEMORY_WATCH_KILL_PCT` (100) gets SIGTERM, then SIGKILL, after the record is
+  on disk. `0` turns killing off. The kill first re-checks the pid's start time
+  and footprint, so a reused pid is never hit.
+- **Knobs are fixed at install.** launchd passes the agent nothing, so the
+  installer writes the knobs in force into the plist. Re-run `install` with a
+  new value to change one.
+- **It never kills** pid 0 or 1, a pid `is_protected_host_pid` protects, or
+  another user's process. `kernel_task` reads tens of GB in `top` as kernel
+  accounting, which is why pids 0 and 1 are skipped outright.
+- **Install it from your own checkout.** The plist names the checkout's own
+  script, so `memory-watch-install.sh` refuses a coding-agent worktree, the
+  same trap as ADR 0021.
+- **The suite is hermetic by construction.** The real `top`, `ps`, `lsof`,
+  `launchctl` and `kill` are shadowed, and a stray call fails it. Same posture
+  as `webkit_reaper_test.sh`.
 
 ### One Docker-daemon probe, shared by preflight and provisioning
 

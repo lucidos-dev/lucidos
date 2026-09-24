@@ -18,6 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
 mod await_event;
+mod background_task;
 mod build_slot;
 mod cc_bash_guard;
 mod cc_plan_gate;
@@ -106,6 +107,21 @@ enum Command {
     /// rule that fires every time, create a trigger instead.
     #[command(name = "await-event")]
     AwaitEvent(AwaitEventArgs),
+    /// Run work that has to outlive your turn: a long build, a test suite, an
+    /// e2e run. The engine runs it in this thread's worktree and re-opens the
+    /// thread when it finishes, so you END YOUR TURN instead of waiting.
+    ///
+    /// A command you start yourself in the background dies when your turn
+    /// ends, because the engine stops your whole process group. Anything that
+    /// surely fits in 10 minutes is simpler as a foreground call.
+    ///
+    /// All three verbs act on `$LUCIDOS_THREAD_ID`, so none can reach another
+    /// thread's tasks.
+    #[command(name = "background-task")]
+    BackgroundTask {
+        #[command(subcommand)]
+        action: BackgroundTaskCmd,
+    },
     /// Mint a one-time code that pairs a device with this machine's gateway.
     ///
     /// The gateway authenticates every network caller, and a browser cannot
@@ -559,6 +575,43 @@ enum ThreadsCmd {
         /// reads you only when that call returns.
         #[arg(long)]
         urgent: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackgroundTaskCmd {
+    /// Start a background task, then end your turn. The thread re-opens when
+    /// it finishes, with its exit status and the tail of its output.
+    ///
+    /// One argument after `--` runs as written, so quote a pipeline or a
+    /// redirect as one string. Several arguments run as exactly those words.
+    ///
+    /// The exit status is the command's own. Do not end it with
+    /// `; echo $? > file`, which always exits 0; end with `exit $rc` instead.
+    Run {
+        /// Kill the task if it is still running after this many seconds
+        /// (default and maximum 3600).
+        #[arg(long = "timeout-secs")]
+        timeout_secs: Option<u64>,
+        /// The command to run, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND",
+            required = true
+        )]
+        command: Vec<String>,
+    },
+    /// Print a task's output: what arrived since your last read while it
+    /// runs, and its final record once it has finished.
+    Output {
+        /// The id `run` printed.
+        task_id: String,
+    },
+    /// Stop a running task. Its completion is still recorded, as killed.
+    Stop {
+        /// The id `run` printed.
+        task_id: String,
     },
 }
 
@@ -1320,6 +1373,20 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             label: args.label,
             command: args.command,
         }),
+        Command::BackgroundTask { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                BackgroundTaskCmd::Run {
+                    timeout_secs,
+                    command,
+                } => background_task::cmd_run(&ws, &command, timeout_secs)?,
+                BackgroundTaskCmd::Output { task_id } => {
+                    background_task::cmd_output(&ws, &task_id)?
+                }
+                BackgroundTaskCmd::Stop { task_id } => background_task::cmd_stop(&ws, &task_id)?,
+            }
+            Ok(0)
+        }
         Command::EventWaits { action } => {
             let ws = resolve_from_env()?;
             match action {

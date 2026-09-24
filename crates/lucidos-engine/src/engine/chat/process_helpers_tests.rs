@@ -517,3 +517,129 @@ fn arm_redirect_none_when_no_session() {
     let mut sessions = HashMap::new();
     assert!(arm_followup_redirect(&mut sessions, Uuid::new_v4(), true, false, &None).is_none());
 }
+
+// --- follow_up_keeps_open_question ----------------------------------------
+
+use super::follow_up_keeps_open_question;
+use crate::engine::agent_question::aq_test_helpers::{cc_meta, emit_user_question, seed_cc_thread};
+use crate::engine::chat::PreEmittedOrigin;
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::ThreadEvent;
+use crate::test_support::{setup_test_db, teardown_test_db};
+
+/// The shape each case below starts from: a coding-agent thread parked on a
+/// question nothing has overtaken yet.
+async fn seed_parked_question(bus: &EventBus) -> Uuid {
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(bus, thread_id).await;
+    emit_user_question(bus, thread_id, "toolu-parked#q0").await;
+    thread_id
+}
+
+fn live_sessions(thread_id: Uuid) -> (TokioSessions, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (session, msg_rx) = make_test_session(false);
+    let sessions = tokio::sync::Mutex::new(HashMap::from([(thread_id, session)]));
+    (sessions, msg_rx)
+}
+
+type TokioSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
+
+/// The reported incident. A child finished while its parent's agent was parked
+/// on a question. The completion wake superseded the question, so the user
+/// never got to answer it. A child report is delivered without a
+/// `CodingAgentPromptSent`, so it cannot kill the card, and the agent reads it
+/// after the answer. The question must stay open. An event-wait delivery is the
+/// same kind of re-entry and gets the same rule.
+#[tokio::test]
+async fn an_engine_reentry_keeps_a_live_question_open() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    for origin in [
+        PreEmittedOrigin::EngineReentry(Uuid::new_v4()),
+        PreEmittedOrigin::WaitReentry(Uuid::new_v4()),
+    ] {
+        assert!(
+            follow_up_keeps_open_question(&pool, &sessions, thread_id, Some(origin)).await,
+            "{origin:?} must not supersede a question the user can still answer"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A real message reaching this point could not answer the question and was not
+/// held: an agent message already on the wire. Its `CodingAgentPromptSent`
+/// overtakes the card, so keeping the question brings back the ADR 0082 deadlock.
+#[tokio::test]
+async fn a_message_still_supersedes_the_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    for origin in [None, Some(PreEmittedOrigin::Message(Uuid::new_v4()))] {
+        assert!(
+            !follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await,
+            "{origin:?} must supersede, or its prompt kills the card and deadlocks the agent"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An overtaken question has dead buttons already. Nobody can answer it, so the
+/// re-entry must close it rather than leave the agent parked behind it.
+#[tokio::test]
+async fn an_engine_reentry_supersedes_an_overtaken_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            description: String::new(),
+            coding_agent: CodingAgent::ClaudeCode,
+            tool_use_id: "toolu-sibling".into(),
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .expect("CodingAgentToolCalled emit")
+    .expect("CodingAgentToolCalled persisted");
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    let origin = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+    assert!(!follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// With no live session nothing is parked on the question. The re-entry spawns
+/// a fresh session, and its first step would overtake the card anyway. So the
+/// question is closed now rather than left to die unanswered.
+#[tokio::test]
+async fn an_engine_reentry_supersedes_when_no_session_is_live() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (exited, _msg_rx) = make_test_session(true);
+
+    for sessions in [
+        TokioSessions::default(),
+        tokio::sync::Mutex::new(HashMap::from([(thread_id, exited)])),
+    ] {
+        let origin = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+        assert!(!follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

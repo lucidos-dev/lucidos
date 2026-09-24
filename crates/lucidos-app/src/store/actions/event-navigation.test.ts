@@ -34,6 +34,7 @@ const {
   _resetEventTargetCacheForTesting,
   ensureEventTargetResolved,
   eventHasTarget,
+  jumpableEventId,
   resolveEventTarget,
   showEventWhereItLives,
 } = await import('./event-navigation');
@@ -521,5 +522,21 @@ describe('eventHasTarget', () => {
     await settle();
     expect(eventHasTarget('flaky-1')).toBe(true);
     expect(fetchEventLocation).toHaveBeenCalledTimes(2);
+  });
+});
+
+/** Some event types can never be a jump target, whatever thread holds them. */
+describe('jumpableEventId', () => {
+  /** **The reported bug.** A `BackgroundBashCompleted` in a long, paged thread
+   *  resolved as `unloaded`, so the wake card drew a link. The tap then loaded
+   *  the whole thread only to toast "not drawn anywhere". The type alone
+   *  settles that answer, so the row must not ask at all. */
+  it('rules out an event type that never anchors', () => {
+    expect(jumpableEventId('bash-1', 'BackgroundBashCompleted')).toBeUndefined();
+  });
+
+  it('passes through any other event id', () => {
+    expect(jumpableEventId('idle-1', 'CodingAgentIdled')).toBe('idle-1');
+    expect(jumpableEventId(undefined, 'CodingAgentIdled')).toBeUndefined();
   });
 });

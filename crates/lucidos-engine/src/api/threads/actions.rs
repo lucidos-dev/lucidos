@@ -405,6 +405,9 @@ pub(in crate::api) async fn continue_thread(
                     format!("Failed to emit ContinuationRequested: {}", e),
                 )
             })?;
+        // Continue is the user's reply too, so held agent messages follow it
+        // into the resumed session (ADR 0256).
+        state.engine.spawn_held_message_release(thread_uuid);
         return Ok(StatusCode::OK);
     }
 

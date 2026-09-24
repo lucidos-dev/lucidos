@@ -184,6 +184,10 @@ pub struct ThreadSummary {
     /// Consumed by `display_section` via `count > 0` to bubble Current to the
     /// ancestor chain even when sibling descendants are still running.
     pub attention_descendant_count: i64,
+    /// Whether this thread is a *stopped child*: a user Stop ended its turn,
+    /// and its parent is still owed the card that settles it (ADR 0252).
+    /// Counts toward attention and never toward blocking.
+    pub is_stopped_child: bool,
     /// Thread status, computed by the backend. One of the six
     /// [`ThreadStatus`] values as written by `as_str`: `idle`, `running`,
     /// `waiting`, `waiting_for_user_answer`, `paused`, `failed`. Nothing
@@ -371,6 +375,7 @@ struct ThreadRow {
     total_children_count: i64,
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
+    is_stopped_child: bool,
     live_event_wait_count: i64,
     /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
     /// decodes a JSONB column into a typed value.
@@ -446,6 +451,10 @@ pub struct ThreadAggregate {
     /// per-event SSE aggregate alongside `blocking_descendant_count` so the
     /// frontend can recompute section without a refetch.
     pub attention_descendant_count: i64,
+    /// See `ThreadSummary::is_stopped_child`. Carried on the per-event SSE
+    /// aggregate so the stopped-child notice and the attention badge appear
+    /// and clear live.
+    pub is_stopped_child: bool,
     /// Count of *event waits* this thread holds unresolved. See
     /// `ThreadSummary::live_event_wait_count`. Carried on the per-event SSE
     /// aggregate so the Waiting dot lights the moment a wait is registered or
@@ -536,6 +545,7 @@ fn row_to_thread_aggregate(
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
+        is_stopped_child: r.is_stopped_child,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
         coding_agent_has_diff: r.coding_agent_has_diff,
@@ -580,7 +590,7 @@ fn thread_cols(alias: &str) -> String {
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.total_children_count::bigint, \
-        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, \
+        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.coding_agent_applying, {a}.last_revived_at, \
@@ -662,6 +672,7 @@ impl EventStore {
                     total_children_count: r.total_children_count,
                     blocking_descendant_count: r.blocking_descendant_count,
                     attention_descendant_count: r.attention_descendant_count,
+                    is_stopped_child: r.is_stopped_child,
                     live_event_wait_count: r.live_event_wait_count,
                     live_event_waits: r.live_event_waits.0,
                     status: r.status,

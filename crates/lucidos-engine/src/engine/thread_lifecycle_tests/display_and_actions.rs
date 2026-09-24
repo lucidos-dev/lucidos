@@ -305,6 +305,7 @@ fn is_attention_needing_wfua_is_attention_regardless_of_archive() {
                     archive,
                     false,
                     false,
+                    false,
                 ),
                 "WFUA must be attention-needing (type={:?}, archive={:?})",
                 ttype,
@@ -328,6 +329,7 @@ fn is_attention_needing_archived_short_circuits_pending_changes() {
             ArchiveState::Archived,
             true,  // has_pending_changes
             false, // is_external_repo
+            false, // is_stopped_child
         ),
         "Archived + pending_changes must return false — matches is_blocking"
     );
@@ -342,6 +344,7 @@ fn is_attention_needing_in_workspace_cc_pending_changes_is_attention() {
         ThreadStatus::Idle,
         ArchiveState::Inbox,
         true,
+        false,
         false,
     ));
 }
@@ -358,6 +361,7 @@ fn is_attention_needing_external_repo_carve_out() {
         ArchiveState::Inbox,
         true, // has_pending_changes
         true, // is_external_repo
+        false,
     ));
 }
 
@@ -372,6 +376,7 @@ fn is_attention_needing_chat_pending_changes_does_not_apply() {
         ArchiveState::Inbox,
         true,
         false,
+        false,
     ));
 }
 
@@ -385,13 +390,15 @@ fn is_attention_needing_running_is_not_attention() {
         ArchiveState::Inbox,
         false,
         false,
+        false,
     ));
 }
 
 #[test]
 fn is_attention_needing_subset_of_is_blocking() {
-    // Invariant: `is_attention_needing` is a STRICT SUBSET of `is_blocking`.
-    // For every combination of inputs: attention => blocking. Pinning this
+    // Invariant: `is_attention_needing` is a STRICT SUBSET of `is_blocking`,
+    // except for the stopped-child clause, which the next test pins apart.
+    // For every other combination: attention => blocking. Pinning this
     // prevents drift across the two predicates as either evolves.
     for status in [
         ThreadStatus::Idle,
@@ -403,7 +410,7 @@ fn is_attention_needing_subset_of_is_blocking() {
                 for pending in [false, true] {
                     for external in [false, true] {
                         let attention =
-                            is_attention_needing(ttype, status, archive, pending, external);
+                            is_attention_needing(ttype, status, archive, pending, external, false);
                         let blocking = is_blocking(ttype, status, archive, pending, external);
                         if attention {
                             assert!(
@@ -417,6 +424,39 @@ fn is_attention_needing_subset_of_is_blocking() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn a_stopped_child_needs_attention_and_never_blocks() {
+    // ADR 0252: the user must continue, archive or discard a stopped child,
+    // but archiving its parent must stay possible. So the clause lives in
+    // `is_attention_needing` only, and an archived row drops it like the
+    // pending-change clause does.
+    for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
+        assert!(is_attention_needing(
+            ttype,
+            ThreadStatus::Idle,
+            ArchiveState::Inbox,
+            false,
+            false,
+            true,
+        ));
+        assert!(!is_attention_needing(
+            ttype,
+            ThreadStatus::Idle,
+            ArchiveState::Archived,
+            false,
+            false,
+            true,
+        ));
+        assert!(!is_blocking(
+            ttype,
+            ThreadStatus::Idle,
+            ArchiveState::Inbox,
+            false,
+            false,
+        ));
     }
 }
 
@@ -721,7 +761,9 @@ fn saved_cc_pending_shows_unsave() {
 // (`event_bus_projection_propagation.rs`), so pin the relation here.
 
 /// The documented relation in `is_attention_needing`'s doc comment, asserted
-/// across every status rather than trusted as prose.
+/// across every status rather than trusted as prose. The stopped-child clause
+/// is the documented exception, pinned by
+/// `a_stopped_child_needs_attention_and_never_blocks`.
 #[test]
 fn blocking_equals_attention_or_running() {
     for status in [
@@ -738,7 +780,7 @@ fn blocking_equals_attention_or_running() {
                     for external in [false, true] {
                         let blocking = is_blocking(ttype, status, archive, pending, external);
                         let attention =
-                            is_attention_needing(ttype, status, archive, pending, external);
+                            is_attention_needing(ttype, status, archive, pending, external, false);
                         let expected = attention || status == ThreadStatus::Running;
                         assert_eq!(
                             blocking, expected,

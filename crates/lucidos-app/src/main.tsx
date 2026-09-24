@@ -10,7 +10,9 @@ import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installDeadPressProbe } from './components/chat/deadPressProbe';
 import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
+import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installNoAutofill } from './utils/noAutofill';
+import { currentAutocorrect } from './store/actions/preferences';
 import { installNoDrag } from './utils/noDrag';
 import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
@@ -73,11 +75,13 @@ if (isIOSPwa()) {
 }
 
 installActionBtnBlurListener();
-// Two diagnostics, not features: the composer's buttons and its textarea. See
-// their headers and docs/temporary-measures.md.
+// Three diagnostics, not features: the composer's buttons, its textarea and the
+// toasts' buttons. See their headers and docs/temporary-measures.md.
 installDeadPressProbe();
 installDeadKeystrokeProbe();
-installNoAutofill();
+installToastPressProbe();
+// Preferences have not loaded yet, so this is the mirror, or on when it is empty.
+installNoAutofill(currentAutocorrect());
 installNoDrag();
 installNoFunctionKeyText();
 // Both render roots, so a near-miss drop cannot navigate the picker document

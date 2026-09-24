@@ -11,7 +11,7 @@ import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../com
 import { setComposeSelectionFromServer } from '../composeSelections';
 import { fetchThreads, fetchThreadById, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow, ThreadEventsSnapshot } from '../../api/threads';
-import { isTransientFetchError } from '../../api/client';
+import { isTransientFetchError, retryTransientRead } from '../../api/client';
 import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
@@ -58,6 +58,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       totalChildrenCount: info.total_children_count || 0,
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
+      isStoppedChild: info.is_stopped_child === true,
       liveEventWaitCount: info.live_event_wait_count || 0,
       codingAgentHasDiff: info.coding_agent_has_diff || false,
       codingAgentProposed: info.coding_agent_proposed || false,
@@ -208,6 +209,7 @@ export function upsertThread(
     existing.meta.totalChildrenCount = info.total_children_count || 0;
     existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
     existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
+    existing.meta.isStoppedChild = info.is_stopped_child === true;
     existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
     // The *event wait* list, under the SAME staleness guard as status, and for
     // the same reason: both directions lose real state. A GET fired before a
@@ -1603,32 +1605,44 @@ async function afterHistoryRead(threadId: string, read: () => Promise<void>): Pr
   }
 }
 
+/** Resolves when the transcript can take history landing above the reader.
+ *  A read holds its fetched events until then and stays in flight, so no
+ *  second read starts behind it. */
+export type HistoryLandingGate = () => Promise<void>;
+
 /** Fetch the page of history behind what this thread holds.
  *
  *  Driven by the reader reaching the top of the loaded window, so it is user
- *  intent and a failure is toasted rather than swallowed. `hasOlderEvents`
- *  survives a failure, so the next scroll tries again.
+ *  intent and a failure is toasted rather than swallowed. A transient one is
+ *  retried first, since the first request after an iOS resume often dies on a
+ *  stale connection. `hasOlderEvents` survives a failure, so the next scroll
+ *  tries again.
  *
  *  Reports whether anything was added, which is what lets the caller stop. */
-export async function loadOlderThreadEvents(threadId: string): Promise<boolean> {
+export async function loadOlderThreadEvents(
+  threadId: string,
+  pageSize: number = THREAD_EVENTS_PAGE_SIZE,
+  landWhen?: HistoryLandingGate,
+): Promise<boolean> {
   if (historyReadInFlight.has(threadId)) return false;
   let added = false;
-  await afterHistoryRead(threadId, () => backfillOnePage(threadId).then(r => { added = r; }));
+  await afterHistoryRead(threadId, () => backfillOnePage(threadId, pageSize, landWhen).then(r => { added = r; }));
   return added;
 }
 
-async function backfillOnePage(threadId: string): Promise<boolean> {
+async function backfillOnePage(threadId: string, pageSize: number, landWhen?: HistoryLandingGate): Promise<boolean> {
   const thread = threadMap.value.get(threadId);
   if (!thread || !thread.hasOlderEvents) return false;
   const floor = thread.historyFloor;
   if (!floor) return false;
   try {
     const fetchStart = performance.now();
-    const snapshot = await fetchThreadEvents(threadId, {
-      limit: THREAD_EVENTS_PAGE_SIZE,
+    const snapshot = await retryTransientRead(() => fetchThreadEvents(threadId, {
+      limit: pageSize,
       before: floor,
-    });
+    }));
     const fetchMs = performance.now() - fetchStart;
+    await landWhen?.();
     // Re-read: the map reference can change while the fetch is in flight.
     const current = threadMap.value.get(threadId);
     if (!current) return false;
@@ -1666,25 +1680,27 @@ async function backfillOnePage(threadId: string): Promise<boolean> {
  *
  *  It merges rather than replacing outright, so an event that arrived over SSE
  *  while the request was in flight is not dropped. A no-op once the thread is
- *  loaded to its start, which is every short thread.
+ *  loaded to its start, which is every short thread. A transient failure is
+ *  retried once, like the backfill's.
  *
  *  Reports whether history actually folded in, like `loadOlderThreadEvents`.
  *  The transcript grows at the FRONT when it does, so the caller holding the
  *  reader's place must know whether it grew. */
-export async function ensureWholeThreadLoaded(threadId: string): Promise<boolean> {
+export async function ensureWholeThreadLoaded(threadId: string, landWhen?: HistoryLandingGate): Promise<boolean> {
   // WAITS for a backfill rather than skipping past one. A deep link that
   // arrived mid-scroll would otherwise find nobody fetching the history it
   // needs, and land on a transcript without its target.
   let added = false;
-  await afterHistoryRead(threadId, () => loadWholeThread(threadId).then(r => { added = r; }));
+  await afterHistoryRead(threadId, () => loadWholeThread(threadId, landWhen).then(r => { added = r; }));
   return added;
 }
 
-async function loadWholeThread(threadId: string): Promise<boolean> {
+async function loadWholeThread(threadId: string, landWhen?: HistoryLandingGate): Promise<boolean> {
   const thread = threadMap.value.get(threadId);
   if (!thread || !thread.hasOlderEvents) return false;
   try {
-    const snapshot = await fetchThreadEvents(threadId);
+    const snapshot = await retryTransientRead(() => fetchThreadEvents(threadId));
+    await landWhen?.();
     const current = threadMap.value.get(threadId);
     if (!current) return false;
     const grew = prependEventRows(current, snapshot.events);

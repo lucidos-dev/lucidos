@@ -45,9 +45,13 @@ This step is **advisory**: its findings feed the same validate→fix pipeline as
 - **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
 - **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
 
-Resolve the companion script (installed with the `codex` plugin, do not hardcode a path) and launch the review in **one** Bash call, so the resolved path and the launch share a shell (variables do not persist across Bash tool calls). Run that Bash call with the tool's own `run_in_background: true` and join it in Phase 3 with `TaskOutput`. The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored (only `task` honours it), so the flag is deliberately absent below and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base main` matches `/harden`'s diff base of `main...HEAD`:
+Resolve the companion script (installed with the `codex` plugin; do not hardcode a path). Launch the review in **one** Bash call, so the resolved path and the launch share a shell: variables do not persist across Bash tool calls. Run that call with the tool's own `run_in_background: true`. It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool.
+
+The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored, since only `task` honours it. So the flag is deliberately absent below, and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base main` matches `/harden`'s diff base of `main...HEAD`:
 
 ```bash
+mkdir -p .lucidos && rm -f .lucidos/codex-review.done
+{
 CODEX_COMPANION=$(find "$HOME/.claude/plugins" -name codex-companion.mjs -path '*codex*' 2>/dev/null | sort | tail -1)
 if [ -z "$CODEX_COMPANION" ]; then
   echo "Codex review: unavailable (plugin not installed), proceeding"
@@ -67,6 +71,8 @@ else
     echo "Codex review: unavailable (CLI not answering after 3 probes), proceeding"
   fi
 fi
+} > .lucidos/codex-review.out 2>&1
+touch .lucidos/codex-review.done
 ```
 
 **The probe loop is not defensive padding.** The companion runs exactly those two
@@ -79,7 +85,7 @@ failure on this repo is that one error, each returning in under a quarter of a
 second, against 25 reviews that completed. Retrying rides the window out instead,
 and costs nothing on the normal path because the whole call is backgrounded.
 
-**Record the Bash task id: that is the handle for the Phase 3 join.** There is no companion job id to capture, because the review runs in the foreground of that backgrounded shell and prints its findings only when it finishes. If the plugin was unavailable, or all three probes failed, there is nothing to join. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
+**The `.done` marker is the handle for the Phase 3 join.** There is no companion job id to capture. The review runs in the foreground of that backgrounded shell, and prints its findings only when it finishes. If the plugin was unavailable, or all three probes failed, there is nothing to join. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
 
 ### Phase 1 review
 
@@ -187,10 +193,10 @@ If the diff edits the resource set or a staging/service/spawn-env path, run `./s
 
 ### Join the Codex review (if launched in Phase 1)
 
-If you launched a background Codex review in Phase 1, join it now with `TaskOutput` on the Bash task id you recorded there. Its stdout is the review itself, not a status line, so there is nothing further to poll.
+If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended, and `.lucidos/codex-review.out` is the review itself, not a status line.
 
 - **Completed:** fold Codex's findings into the validation set below. Treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs": record that outcome and move on.
-- **Still running:** give it a bounded wait with `TaskOutput` `block: true`, until it completes or until ~5 minutes have elapsed *since it was launched in Phase 1* (usually it is already done, since Phases 1 to 2 ran in parallel with it). Remember the probe loop can hold the task for up to a minute before the review even starts.
+- **Still running:** give it one bounded foreground wait on the marker: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts.
 - **Ran but returned nothing:** the JSON carries `"status": 1` and `"stdout": "Reviewer failed to output a response."` That is the reviewer starting, and its model call failing. Report it as a failure with that reason, never as "unavailable". It is still advisory, so proceed.
 - **Failed / unavailable / plugin not installed:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
@@ -545,22 +551,27 @@ see the `Makefile`) strictly supersedes `cargo check`: same compile, plus the
 lint set, plus every tracked `*.sh`, plus a rustfmt-clean tree. It is the single
 canonical invocation; never restate its flags here.
 
-When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. (Codex / any agent without a background-Bash + `TaskOutput` tool: run the two suites **sequentially** instead — `cargo …` then `npm …`. Parallelism is only a wall-clock optimization; sequential gives identical correctness.) Pattern:
+When the diff is mixed, kick the Rust and TS suites off concurrently: they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. (Codex, or any agent without a background Bash: run the two suites **sequentially** instead, `cargo …` then `npm …`. Parallelism is only a wall-clock optimization.)
+
+**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool, so each suite writes an exit file when it ends, and a foreground wait joins on those files:
 
 ```
 # Logs go in the worktree's own .lucidos/ (gitignored, and per-worktree, so a
 # concurrent /harden in another session cannot truncate this run's log).
-Bash(cmd="mkdir -p .lucidos && (make lint && make test) > .lucidos/harden-rust.log 2>&1", run_in_background=true)  → task_id A
-Bash(cmd="mkdir -p .lucidos && (cd crates/lucidos-app && npx tsc --noEmit && npm test) > .lucidos/harden-ts.log 2>&1", run_in_background=true)  → task_id B
-# Then TaskOutput (block: true) on A and B until both finish, and read the
-# detail out of the logs: tail -40 on each, grep -nE "^error|test result:"
+# Launch, with the Bash tool's run_in_background: true:
+mkdir -p .lucidos && rm -f .lucidos/harden-rust.exit .lucidos/harden-ts.exit
+( (make lint && make test) > .lucidos/harden-rust.log 2>&1; echo $? > .lucidos/harden-rust.exit ) &
+( (cd crates/lucidos-app && npx tsc --noEmit && npm test) > .lucidos/harden-ts.log 2>&1; echo $? > .lucidos/harden-ts.exit ) &
+wait
+
+# Join, in the foreground with timeout: 600000. Re-issue it until both exist:
+for i in $(seq 1 590); do
+  [ -f .lucidos/harden-rust.exit ] && [ -f .lucidos/harden-ts.exit ] && break; sleep 1
+done; cat .lucidos/harden-rust.exit .lucidos/harden-ts.exit
+# Then read the detail out of the logs: tail -40 on each, grep -nE "^error|test result:"
 ```
 
-Redirecting is not piping, so each task still reports cargo's / npm's real exit
-code, and it is what keeps the join cheap: every `TaskOutput` call replays the
-task's ENTIRE accumulated output rather than only what is new, so joining an
-un-redirected `make test` pours the whole engine suite into context again on
-every wait.
+Each exit file holds cargo's or npm's real exit code: redirecting is not piping. The join reads a few bytes per call, so the suites' logs never flood your context.
 
 **A jsdom test that times out at exactly the vitest default is contention, not
 a finding.** The engine suite saturates every core for minutes, and a Vitest
@@ -570,7 +581,9 @@ exactly as the Codex note above says for `runtime::codex::driver_tests`. Two
 settings and trigger cases failed that way on 2026-09-15 and passed instantly
 on their own.
 
-**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `make test > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
+**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's. So `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run. This has shipped a failing nightly.
+
+Run each suite un-piped: the exit-file pattern above already preserves the real exit. If you must trim, redirect to a log and capture `$?` first (`make test > /tmp/t.log 2>&1; echo "EXIT: $?"`), then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line. See `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 
 If everything passes, proceed to Phase 5.
 

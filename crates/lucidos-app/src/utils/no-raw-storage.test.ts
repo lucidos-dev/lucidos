@@ -17,8 +17,8 @@
  *      storage call there must be `wsKey(...)`-wrapped or use a global picker
  *      key (`GLOBAL_KEYS`).
  *
- * (The allowlist itself — exactly the two cross-workspace picker keys — is
- * locked by `workspaceStorage.test.ts`.)
+ * (The allowlist itself, exactly the cross-workspace keys, is locked by
+ * `workspaceStorage.test.ts`.)
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
@@ -114,7 +114,7 @@ describe('no raw browser storage outside the sanctioned wrappers', () => {
       const arg = after.replace(/^\s*\(\s*/, '');
       if (arg.startsWith('wsKey(')) continue; // namespaced by hand — OK
       const lit = arg.match(/^['"]([^'"]+)['"]/);
-      if (lit && GLOBAL_KEYS.has(lit[1])) continue; // cross-workspace picker key — OK raw
+      if (lit && GLOBAL_KEYS.has(lit[1])) continue; // cross-workspace key: OK raw
       if (lit && BOOT_TAB_KEYS.has(lit[1])) continue; // per-TAB state, OK raw
       bad.push(lit ? lit[1] : m[0]);
     }

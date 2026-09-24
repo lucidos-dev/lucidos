@@ -81,8 +81,46 @@ impl LucidosEngine {
         thread_id: Option<Uuid>,
         emitting_trigger_id: Option<&str>,
     ) -> Vec<(String, String)> {
-        use crate::core::oauth;
-        use crate::core::{CredentialStore, EnvironmentVariableStore, OAuthStore};
+        let mut env_vars = self
+            .build_env_without_secrets(
+                thread_id,
+                crate::scheduler::user_tasks::current_event_trigger_depth(),
+                emitting_trigger_id,
+            )
+            .await;
+        env_vars.extend(self.secret_env_vars().await);
+        env_vars
+    }
+
+    /// Env for a coding agent's *background task*: what the agent's own shell
+    /// gets (`runtime::spawn_env::apply_lucidos_env`), and no more.
+    ///
+    /// **No `CRED_*` or `OAUTH_*`.** A coding agent's shell never holds the
+    /// workspace's secrets. A task it starts through the engine must not
+    /// either, or the route would hand them over. `RUSTC_WRAPPER` follows the
+    /// agent's rule, so a build that works in its shell works here too.
+    pub(crate) async fn build_agent_task_env_vars(&self, thread_id: Uuid) -> Vec<(String, String)> {
+        let depth =
+            crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
+        let mut env_vars = self
+            .build_env_without_secrets(Some(thread_id), depth, None)
+            .await;
+        env_vars.push((
+            "RUSTC_WRAPPER".to_string(),
+            crate::runtime::spawn_env::rustc_wrapper_for_path(std::env::var_os("PATH").as_deref())
+                .to_string(),
+        ));
+        env_vars
+    }
+
+    /// Everything a Lucidos-spawned subprocess gets except the secrets.
+    async fn build_env_without_secrets(
+        &self,
+        thread_id: Option<Uuid>,
+        chain_depth: u32,
+        emitting_trigger_id: Option<&str>,
+    ) -> Vec<(String, String)> {
+        use crate::core::EnvironmentVariableStore;
         use crate::runtime::lucidos_cli::{lucidos_cli_dir, workspace_script_env_vars};
 
         // User-managed environment variables FIRST. Everything engine-owned
@@ -120,7 +158,7 @@ impl LucidosEngine {
         env_vars.extend(
             crate::api::actor::subprocess_origin_env_vars(
                 thread_id,
-                crate::scheduler::user_tasks::current_event_trigger_depth(),
+                chain_depth,
                 emitting_trigger_id,
             )
             .into_iter()
@@ -137,6 +175,14 @@ impl LucidosEngine {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v)),
         );
+        env_vars
+    }
+
+    /// `CRED_*` and `OAUTH_*` vars, the OAuth tokens refreshed first.
+    async fn secret_env_vars(&self) -> Vec<(String, String)> {
+        use crate::core::oauth;
+        use crate::core::{CredentialStore, OAuthStore};
+        let mut env_vars = Vec::new();
 
         // Credentials → CRED_* vars
         match CredentialStore::list_all_with_secrets(&self.pool).await {

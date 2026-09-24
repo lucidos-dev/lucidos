@@ -172,7 +172,10 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
         Ok(ChildCompletionStatus::Success) => "completed (success)",
         Ok(ChildCompletionStatus::Failure) => "completed (failure)",
         Ok(ChildCompletionStatus::NoChanges) => "completed (no changes)",
-        Ok(ChildCompletionStatus::Canceled) => "canceled (user stop)",
+        // The child is not continuing: the user ended it, or an agent canceled
+        // its own child. The summary says which. A person's Stop never lands
+        // here: it sends `ChildThreadStopped` (ADR 0252).
+        Ok(ChildCompletionStatus::Canceled) => "canceled",
         Err(_) => "completed",
     };
     let summary = event
@@ -217,6 +220,36 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
          a multi-step procedure, continue with the next step. Otherwise use \
          run_thread to refine.",
         child_thread_id, status, event.id, title_line, pending_section, summary_section
+    )
+}
+
+/// Format a persisted `ChildThreadStopped` event row as the `[CHILD THREAD
+/// STOPPED]` user-channel block the parent LLM sees in its history.
+///
+/// It says in plain words that the child is alive, what arrives next, and what
+/// not to do meanwhile (ADR 0252). A parent must not read a Stop as the end.
+pub fn format_child_thread_stopped_block(event: &EventRow) -> String {
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title_line = match event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+    {
+        Some(title) if !title.is_empty() => format!("\nTitle: {title}"),
+        _ => String::new(),
+    };
+    format!(
+        "[CHILD THREAD STOPPED] {child_thread_id}\nevent_id: {}{title_line}\n\
+         The user stopped this child's turn. The child is NOT finished and NOT \
+         dead: it is waiting for the user, who may send it a new message. You \
+         will get a [CHILD THREAD COMPLETED] block when it next finishes, or one \
+         with status canceled if the user archives or discards it. Until then, \
+         do not roll back its work, respawn it, or send it a follow-up.",
+        event.id
     )
 }
 
@@ -929,6 +962,29 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                 messages.push(SessionMessage {
                     role: "user".to_string(),
                     content,
+                    created_at: event.created,
+                    channel: None,
+                    steps: vec![],
+                    images: vec![],
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
+                });
+            }
+            "ChildThreadStopped" => {
+                // Same user-channel shape as the completion block above, so
+                // the parent's next turn knows the child is alive.
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content: format_child_thread_stopped_block(event),
                     created_at: event.created,
                     channel: None,
                     steps: vec![],

@@ -13,9 +13,32 @@ pub struct CcStreamState {
     /// the turn now in flight. See the dedup comment in the `"assistant"` arm
     /// of [`parse_line`], and [`CcStreamState::end_turn`] for the lifetime.
     usage_reported_message_ids: HashSet<String>,
+    /// The session's Vertex calls go through the relay, which asks an
+    /// always-thinking model for its notes. Only then is `thinking` text a
+    /// note for the user; anywhere else it is reasoning. A temporary measure:
+    /// `docs/temporary-measures.md` § "Claude Code's Vertex calls go through
+    /// the Vertex relay".
+    notes_relayed: bool,
+    /// The model of the message now streaming, from its `message_start`. Its
+    /// deltas carry no model of their own.
+    streaming_model: Option<String>,
 }
 
 impl CcStreamState {
+    pub fn with_notes_relayed(notes_relayed: bool) -> Self {
+        Self {
+            notes_relayed,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `model`'s `thinking` text is a progress note for the user.
+    fn thinking_is_a_note(&self, model: Option<&str>) -> bool {
+        self.notes_relayed
+            && model.and_then(crate::llm::anthropic_wire::thinking_mode)
+                == Some(crate::llm::anthropic_wire::ThinkingMode::AlwaysOn)
+    }
+
     /// Claim the one `Usage` event this assistant message is entitled to.
     /// `true` means the caller may emit: nothing has reported this id yet, and
     /// the claim is now recorded so the message's remaining frames get `false`.
@@ -194,6 +217,10 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 .get("is_api_error_message")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let model = message
+                .and_then(|m| m.get("model"))
+                .and_then(|v| v.as_str());
+            let notes_are_text = state.thinking_is_a_note(model);
             if let Some(content) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_array())
@@ -206,6 +233,20 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 events.push(AgentEvent::Message {
                                     role: "assistant".to_string(),
                                     text: text.to_string(),
+                                });
+                            }
+                        }
+                        // The engine joins consecutive messages with no
+                        // separator, so a note ends its own paragraph.
+                        "thinking" if notes_are_text && !is_api_error_banner => {
+                            if let Some(note) = block
+                                .get("thinking")
+                                .and_then(|v| v.as_str())
+                                .and_then(crate::llm::anthropic_wire::progress_note)
+                            {
+                                events.push(AgentEvent::Message {
+                                    role: "assistant".to_string(),
+                                    text: format!("{note}\n\n"),
                                 });
                             }
                         }
@@ -249,10 +290,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // call. Only the `Usage` event is suppressed. The frame's own
             // content block is a distinct text / tool_use and still emits above.
             if let Some(usage) = message.and_then(|m| m.get("usage")) {
-                let model = message
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                let model = model.map(String::from);
                 let input_tokens = crate::llm::clamp_provider_token_count(
                     usage
                         .get("input_tokens")
@@ -469,8 +507,20 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
         // See the `cc-reasoning-dormant` investigation in docs/temporary-measures.md.
         "stream_event" => {
             let mut events = Vec::new();
-            if let Some(text) = val
-                .get("event")
+            let event = val.get("event");
+            if event.and_then(|e| e.get("type")).and_then(|v| v.as_str()) == Some("message_start") {
+                state.streaming_model = event
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.get("model"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+            // A relayed note arrives whole as a message, from the complete
+            // assistant frame. Streaming it as a Thought too would show it twice.
+            let note_arrives_as_message =
+                state.thinking_is_a_note(state.streaming_model.as_deref());
+            if let Some(text) = event
+                .filter(|_| !note_arrives_as_message)
                 .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("content_block_delta"))
                 .and_then(|e| e.get("delta"))
                 .filter(|d| d.get("type").and_then(|v| v.as_str()) == Some("thinking_delta"))

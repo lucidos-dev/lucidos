@@ -114,10 +114,10 @@ confirmation. Read it. If the lock was released while you were composing the
 call, the subscription will never fire for it: go retry the script now instead of
 waiting.
 
-### There is a cap of 10 consecutive subscriptions
+### There is a cap of 10 subscriptions an hour
 
-Ten registrations with no message from the user, and the eleventh is refused
-outright. So do not spend the budget on short waits and do not treat
+Ten registrations inside one hour with no message from the user, and the next
+is refused outright. So do not spend the budget on short waits and do not treat
 re-subscription as free:
 
 - **Pick the timeout from the run you are waiting on, generously.** A full

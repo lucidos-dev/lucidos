@@ -12,14 +12,17 @@ import {
     STEP_BUDGET,
     WINDOW_STEP,
     ROW_BUDGET,
+    ROW_CEILING,
     WHOLE_THREAD,
     canSeedRenderWindow,
     computeRenderFromIndex,
     countWithinBudget,
     deepLinkMustPersist,
     edgeHasMoreAbove,
-    edgeMustReachIndex,
-    edgeReachesIndex,
+    edgeMustReachRow,
+    MAX_READING_CHASES,
+    readingChaseAction,
+    edgeReachesRow,
     exchangeRenderCost,
     expandWindowEdge,
     expandRenderCount,
@@ -32,6 +35,12 @@ import {
     fillAction,
     transcriptScrolls,
     MAX_FILL_BACKFILLS,
+    EMPTY_FILL_LEDGER,
+    chargeFillRound,
+    drawnRowsInWindow,
+    fillRoundAllowed,
+    settleFillLedger,
+    type FillLedger,
     type WindowEdge,
 } from './threadWindow';
 
@@ -60,9 +69,13 @@ const view = (scrollHeight: number, clientHeight = 800) => ({ scrollHeight, clie
 const edgeOf = (total: number, renderCount: number): WindowEdge =>
     ({ exchange: computeRenderFromIndex(total, renderCount), rowsHidden: 0 });
 
-/** A `rowCountAt` over a fixed list, so a case can say how big each turn draws
- *  without folding anything. Turns not listed draw nothing. */
-const rowsFrom = (rows: readonly number[]) => (index: number) => rows[index] ?? 0;
+/** `n` rows, every one drawn: the default view, steps and details on. */
+const allDrawn = (n: number): boolean[] => Array.from({ length: n }, () => true);
+
+/** A `rowsAt` over a fixed list of row counts, every row drawn, so a case can
+ *  say how big each turn is without folding anything. Turns not listed have no
+ *  rows. */
+const rowsFrom = (rows: readonly number[]) => (index: number) => allDrawn(rows[index] ?? 0);
 
 describe('thread render windowing', () => {
     describe('computeRenderFromIndex', () => {
@@ -243,18 +256,25 @@ describe('thread render windowing', () => {
             }
         });
 
-        it('stops at the cap when nothing the window adds ever draws', () => {
-            // Degenerate: every turn blows the budget alone and draws no
-            // height. The loop has to stop rather than render the thread out.
+        it('charges no round that drew nothing, so the loop ends at the top', () => {
+            // Every turn blows the budget alone and draws no row. Charging those
+            // rounds stopped the loop at the cap with the pane still empty. Each
+            // one moved the edge up, so the thread's own top ends the loop.
             const costs = flat(200, STEP_BUDGET * 2);
-            let count = seedRenderCount(costs);
+            const silent = () => [false, false];
+            let edge = seedWindowEdge(costs, silent);
+            let ledger: FillLedger = EMPTY_FILL_LEDGER;
             let rounds = 0;
-            while (whole(view(0), edgeOf(costs.length, count)) === 'grow' && rounds < MAX_FILL_EXPANSIONS) {
-                count = expandRenderCount(costs, count);
+            while (whole(view(0), edge) === 'grow') {
+                const now = { drawn: drawnRowsInWindow(edge, costs.length, silent), floor: Infinity };
+                ledger = settleFillLedger(ledger, now);
+                if (!fillRoundAllowed(ledger, 'grow')) break;
+                edge = expandWindowEdge(edge, costs, silent);
+                ledger = chargeFillRound(ledger, 'grow', now);
                 rounds++;
+                expect(rounds).toBeLessThanOrEqual(costs.length);
             }
-            expect(rounds).toBe(MAX_FILL_EXPANSIONS);
-            expect(count).toBe(1 + MAX_FILL_EXPANSIONS);
+            expect(edge).toEqual(WHOLE_THREAD);
         });
 
         /** The page arm answers from the SERVER's watermark, so it keeps saying
@@ -267,11 +287,14 @@ describe('thread render windowing', () => {
             expect(MAX_FILL_BACKFILLS).toBeGreaterThan(0);
             const threadView = readFileSync(
                 resolve(dirname(fileURLToPath(import.meta.url)), 'ThreadView.tsx'), 'utf-8');
-            // BOTH halves. A guard over a counter nothing increments reads
-            // `0 >= 4` for ever, and every suite stays green while the fill
-            // pages without bound.
-            expect(threadView).toContain('if (pages >= MAX_FILL_BACKFILLS) return;');
-            expect(threadView).toContain('fillBackfillsByThread.set(threadId, pages + 1);');
+            // BOTH halves, for both kinds. A guard over a ledger nothing charges
+            // allows every round for ever, and every suite stays green while
+            // the fill pages without bound.
+            for (const kind of ['page', 'grow']) {
+                expect(threadView).toContain(`if (!fillRoundAllowed(ledger, '${kind}')) return;`);
+                expect(threadView).toContain(`chargeFillRound(ledger, '${kind}', reading)`);
+            }
+            expect(threadView).toContain('settleFillLedger(stored, reading)');
         });
 
         it('ends the moment the server says nothing is older', () => {
@@ -284,18 +307,22 @@ describe('thread render windowing', () => {
      *  afterwards, against the 37 its window would have drawn. */
     describe('reseedOnReopen', () => {
         it('drops a render-all the last visit left behind', () => {
-            expect(reseedOnReopen(WHOLE_THREAD, false)).toBe(true);
+            expect(reseedOnReopen('render-all', false)).toBe(true);
         });
 
         it('keeps the one THIS visit is asking for', () => {
-            expect(reseedOnReopen(WHOLE_THREAD, true)).toBe(false);
+            expect(reseedOnReopen('render-all', true)).toBe(false);
         });
 
-        /** The reader grew this one by scrolling. It describes where they are,
-         *  and re-seeding would make them walk back up on every return. */
-        it('keeps a partial edge, whichever dimension is partial', () => {
-            expect(reseedOnReopen({ exchange: 4, rowsHidden: 0 }, false)).toBe(false);
-            expect(reseedOnReopen({ exchange: 0, rowsHidden: 40 }, false)).toBe(false);
+        /** The reader grew this one by scrolling, so it describes where they
+         *  are. Re-seeding would make them walk back up on every return.
+         *
+         *  That holds for a window grown all the way to the first turn. Its
+         *  edge equals `WHOLE_THREAD` by value. Read as a claim, the thread
+         *  would open on the newest turns and jump when the walk arrives. */
+        it('keeps a window the reader grew, even one reaching the first turn', () => {
+            expect(reseedOnReopen('grown', false)).toBe(false);
+            expect(reseedOnReopen('grown', true)).toBe(false);
         });
 
         it('leaves a thread with no stored edge to the ordinary seed', () => {
@@ -411,33 +438,33 @@ describe('thread render windowing', () => {
 // windowing exists to prevent (ADR 0081).
 // ---------------------------------------------------------------------------
 describe('reaching the anchored turn', () => {
-    describe('edgeReachesIndex over an exchange-only edge', () => {
+    describe('edgeReachesRow over an exchange-only edge', () => {
         it('is true for a turn inside the window, false for one above it', () => {
             // 100 turns, the newest 20 rendered: the window starts at index 80.
-            expect(edgeReachesIndex(edgeOf(100, 20), 80)).toBe(true);
-            expect(edgeReachesIndex(edgeOf(100, 20), 99)).toBe(true);
-            expect(edgeReachesIndex(edgeOf(100, 20), 79)).toBe(false);
-            expect(edgeReachesIndex(edgeOf(100, 20), 0)).toBe(false);
+            expect(edgeReachesRow(edgeOf(100, 20), 80, 0)).toBe(true);
+            expect(edgeReachesRow(edgeOf(100, 20), 99, 0)).toBe(true);
+            expect(edgeReachesRow(edgeOf(100, 20), 79, 0)).toBe(false);
+            expect(edgeReachesRow(edgeOf(100, 20), 0, 0)).toBe(false);
         });
     });
 
-    describe('edgeMustReachIndex over an exchange-only edge', () => {
+    describe('edgeMustReachRow over an exchange-only edge', () => {
         it('says no when the turn is already rendered', () => {
-            expect(edgeMustReachIndex(edgeOf(100, 20), 85)).toBe(false);
+            expect(edgeMustReachRow(edgeOf(100, 20), 85, 0)).toBe(false);
         });
 
         it('says no for a record naming a turn this thread has not got', () => {
             // `findIndex` answers -1. Acting on it would walk the window to the
             // very top of a thread the reader never asked to see.
-            expect(edgeMustReachIndex(edgeOf(100, 20), -1)).toBe(false);
+            expect(edgeMustReachRow(edgeOf(100, 20), -1, 0)).toBe(false);
         });
 
         it('says no when the thread is rendered whole', () => {
-            expect(edgeMustReachIndex(edgeOf(20, 20), 0)).toBe(false);
+            expect(edgeMustReachRow(edgeOf(20, 20), 0, 0)).toBe(false);
         });
 
         it('says yes for a turn above the window, with more above to take', () => {
-            expect(edgeMustReachIndex(edgeOf(100, 20), 40)).toBe(true);
+            expect(edgeMustReachRow(edgeOf(100, 20), 40, 0)).toBe(true);
         });
     });
 
@@ -449,7 +476,7 @@ describe('reaching the anchored turn', () => {
         const target = 20;
         let count = seedRenderCount(costs);
         const rounds: number[] = [];
-        while (edgeMustReachIndex(edgeOf(costs.length, count), target)) {
+        while (edgeMustReachRow(edgeOf(costs.length, count), target, 0)) {
             const next = expandRenderCount(costs, count);
             expect(next).toBeGreaterThan(count); // every round takes something
             expect(next - count).toBeLessThanOrEqual(WINDOW_STEP); // and never a jump
@@ -457,7 +484,7 @@ describe('reaching the anchored turn', () => {
             count = next;
         }
         expect(rounds.length).toBeGreaterThan(1); // a real walk, not one hop
-        expect(edgeReachesIndex(edgeOf(costs.length, count), target)).toBe(true);
+        expect(edgeReachesRow(edgeOf(costs.length, count), target, 0)).toBe(true);
         // Stopped AT the turn rather than continuing to the top of the thread.
         expect(computeRenderFromIndex(costs.length, count)).toBeGreaterThan(0);
     });
@@ -466,7 +493,7 @@ describe('reaching the anchored turn', () => {
         const costs = flat(60, 9);
         let count = seedRenderCount(costs);
         let rounds = 0;
-        while (edgeMustReachIndex(edgeOf(costs.length, count), 0)) {
+        while (edgeMustReachRow(edgeOf(costs.length, count), 0, 0)) {
             count = expandRenderCount(costs, count);
             rounds++;
             expect(rounds).toBeLessThan(costs.length + 1); // no unbounded walk
@@ -490,19 +517,20 @@ describe('clamping the floor turn', () => {
 
     describe('seedRowsHidden', () => {
         it('hides nothing in a turn that fits', () => {
-            expect(seedRowsHidden(10)).toBe(0);
-            expect(seedRowsHidden(ROW_BUDGET)).toBe(0);
+            expect(seedRowsHidden(allDrawn(10))).toBe(0);
+            expect(seedRowsHidden(allDrawn(ROW_BUDGET))).toBe(0);
         });
 
         it('hides everything past the budget', () => {
-            expect(seedRowsHidden(ROW_BUDGET + 40)).toBe(40);
+            expect(seedRowsHidden(allDrawn(ROW_BUDGET + 40))).toBe(40);
         });
 
         it('always leaves a row, whatever the budget says', () => {
             // The floor `countWithinBudget` keeps one level up: a turn admitted
             // to the window draws something, or the transcript reads as empty.
-            expect(seedRowsHidden(500, 0)).toBe(499);
-            expect(seedRowsHidden(1, 0)).toBe(0);
+            expect(seedRowsHidden(allDrawn(500), 0)).toBe(499);
+            expect(seedRowsHidden(allDrawn(1), 0)).toBe(0);
+            expect(seedRowsHidden([])).toBe(0);
         });
     });
 
@@ -528,9 +556,9 @@ describe('clamping the floor turn', () => {
 
     describe('expandWindowEdge', () => {
         it('uncovers the floor turn before reaching past it', () => {
-            const edge = { exchange: 1, rowsHidden: 200 };
+            const edge = { exchange: 2, rowsHidden: 200 };
             const next = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
-            expect(next.exchange).toBe(1);
+            expect(next.exchange).toBe(2);
             expect(next.rowsHidden).toBe(200 - ROW_BUDGET);
         });
 
@@ -558,7 +586,7 @@ describe('clamping the floor turn', () => {
                 // No round may hand the reader an unbounded turn.
                 const uncovered = before.exchange === edge.exchange
                     ? before.rowsHidden - edge.rowsHidden
-                    : voiceRows(edge.exchange) - edge.rowsHidden;
+                    : voiceRows(edge.exchange).length - edge.rowsHidden;
                 drawn.push(uncovered);
                 expect(uncovered).toBeLessThanOrEqual(ROW_BUDGET);
                 rounds++;
@@ -574,15 +602,15 @@ describe('clamping the floor turn', () => {
         it('does not call a half-drawn turn reached', () => {
             // ADR 0152 restores by the turn's own top edge, so a clamped head
             // means the restore has nothing to measure from.
-            expect(edgeReachesIndex({ exchange: 2, rowsHidden: 40 }, 2)).toBe(false);
-            expect(edgeReachesIndex({ exchange: 2, rowsHidden: 0 }, 2)).toBe(true);
-            expect(edgeReachesIndex({ exchange: 2, rowsHidden: 40 }, 3)).toBe(true);
+            expect(edgeReachesRow({ exchange: 2, rowsHidden: 40 }, 2, 0)).toBe(false);
+            expect(edgeReachesRow({ exchange: 2, rowsHidden: 0 }, 2, 0)).toBe(true);
+            expect(edgeReachesRow({ exchange: 2, rowsHidden: 40 }, 3, 0)).toBe(true);
         });
 
         it('keeps walking until the anchored turn is whole', () => {
             let edge = seedWindowEdge(VOICE_LOOP, voiceRows);
             let rounds = 0;
-            while (edgeMustReachIndex(edge, 2)) {
+            while (edgeMustReachRow(edge, 2, 0)) {
                 edge = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
                 rounds++;
                 expect(rounds).toBeLessThan(200);
@@ -593,14 +621,14 @@ describe('clamping the floor turn', () => {
 
         it('stops at the anchored turn rather than the top of the thread', () => {
             let edge = seedWindowEdge(VOICE_LOOP, voiceRows);
-            while (edgeMustReachIndex(edge, 2)) edge = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
+            while (edgeMustReachRow(edge, 2, 0)) edge = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
             expect(edgeHasMoreAbove(edge)).toBe(true);
         });
 
         it('is already done for a turn below the floor, and for no turn at all', () => {
-            expect(edgeMustReachIndex({ exchange: 2, rowsHidden: 40 }, 3)).toBe(false);
-            expect(edgeMustReachIndex({ exchange: 2, rowsHidden: 40 }, -1)).toBe(false);
-            expect(edgeMustReachIndex(WHOLE_THREAD, 0)).toBe(false);
+            expect(edgeMustReachRow({ exchange: 2, rowsHidden: 40 }, 3, 0)).toBe(false);
+            expect(edgeMustReachRow({ exchange: 2, rowsHidden: 40 }, -1, 0)).toBe(false);
+            expect(edgeMustReachRow(WHOLE_THREAD, 0, 0)).toBe(false);
         });
     });
 
@@ -635,5 +663,217 @@ describe('clamping the floor turn', () => {
         it('leaves an edge that already renders the whole thread alone', () => {
             expect(deepLinkMustPersist(WHOLE_THREAD)).toBe(false);
         });
+    });
+});
+
+describe('edgeMustReachRow: a reading position that names a row', () => {
+    const edge = { exchange: 5, rowsHidden: 300 };
+
+    it('walks while the named row is still clamped off the floor turn', () => {
+        expect(edgeMustReachRow(edge, 5, 120)).toBe(true);
+    });
+
+    it('stops as soon as the row is drawn, with the turn head still clamped', () => {
+        expect(edgeMustReachRow(edge, 5, 300)).toBe(false);
+        expect(edgeMustReachRow(edge, 5, 450)).toBe(false);
+    });
+
+    it('walks into an older turn, and stops for any row of a turn already drawn', () => {
+        expect(edgeMustReachRow(edge, 3, 999)).toBe(true);
+        expect(edgeMustReachRow(edge, 6, 0)).toBe(false);
+    });
+
+    it('gives up on a row the loaded turns do not hold', () => {
+        expect(edgeMustReachRow(edge, -1, 0)).toBe(false);
+    });
+});
+
+describe('readingChaseAction: a reading position the loaded pages do not hold', () => {
+    const state = { readInFlight: false, paneMeasurable: true, hasOlderEvents: true, chasesSpent: 0 };
+
+    it('chases while older history remains and the bound is not spent', () => {
+        expect(readingChaseAction(state)).toBe('chase');
+        expect(readingChaseAction({ ...state, chasesSpent: MAX_READING_CHASES - 1 })).toBe('chase');
+    });
+
+    it('gives up once the bound is spent, or nothing older remains', () => {
+        expect(readingChaseAction({ ...state, chasesSpent: MAX_READING_CHASES })).toBe('give-up');
+        expect(readingChaseAction({ ...state, hasOlderEvents: false })).toBe('give-up');
+    });
+
+    it('waits for a read already running, whose fold re-runs the walk', () => {
+        expect(readingChaseAction({ ...state, readInFlight: true })).toBe('wait');
+        expect(readingChaseAction({ ...state, readInFlight: true, chasesSpent: MAX_READING_CHASES })).toBe('wait');
+    });
+
+    it('waits, rather than giving up, while the pane has no box', () => {
+        expect(readingChaseAction({ ...state, paneMeasurable: false })).toBe('wait');
+    });
+});
+
+/** The row budget counts rows the reader's view DRAWS.
+ *
+ *  The reported turn: 748 text events, 45 with prose, and runs of 352 and 206
+ *  tool calls between two lines of prose. With steps hidden, each call and the
+ *  blank text before it draw nothing. Counted as rows, they filled the seed and
+ *  every fill round, and the reader got a header over an empty body. */
+describe('budgeting by the rows the view draws', () => {
+    /** A coding-agent turn as its rows: each run is one prose chunk, then that
+     *  many tool calls, each preceded by the blank text the agent writes. */
+    const turn = (runs: readonly number[], showSteps: boolean): boolean[] => runs.flatMap(calls => [
+        true,
+        ...Array.from({ length: calls }, () => [false, showSteps]).flat(),
+    ]);
+    const REPORTED_RUNS = [12, 17, 206, 16, 352];
+    const hiddenSteps = turn(REPORTED_RUNS, false);
+    const onlyTurn = () => hiddenSteps;
+
+    it('reaches a steps-hidden turn\'s prose in bounded rounds', () => {
+        // The seed stops at the ceiling, deep inside the 352-call run. Each
+        // round the fill takes after it is uncharged, since it draws nothing.
+        let edge = seedWindowEdge([hiddenSteps.length], onlyTurn);
+        let rounds = 0;
+        while (drawnRowsInWindow(edge, 1, onlyTurn) === 0) {
+            const next = expandWindowEdge(edge, [hiddenSteps.length], onlyTurn);
+            expect(edge.rowsHidden - next.rowsHidden).toBeLessThanOrEqual(ROW_CEILING);
+            edge = next;
+            expect(++rounds).toBeLessThan(10);
+        }
+        expect(rounds).toBeGreaterThan(0);
+    });
+
+    it('used to open on nothing, which is the report', () => {
+        // The old unit: the last ROW_BUDGET rows, all inside the 352-call run.
+        const oldHidden = hiddenSteps.length - ROW_BUDGET;
+        expect(drawnRowsInWindow({ exchange: 0, rowsHidden: oldHidden }, 1, onlyTurn)).toBe(0);
+    });
+
+    it('uncovers ROW_BUDGET drawn rows a round, and at least one row', () => {
+        const rows = turn(Array.from({ length: 300 }, () => 1), false);
+        const at = () => rows;
+        let edge = seedWindowEdge([rows.length], at);
+        expect(drawnRowsInWindow(edge, 1, at)).toBe(ROW_BUDGET);
+        let rounds = 0;
+        while (edgeHasMoreAbove(edge)) {
+            const before = drawnRowsInWindow(edge, 1, at);
+            const next = expandWindowEdge(edge, [rows.length], at);
+            expect(next.rowsHidden).toBeLessThan(edge.rowsHidden);
+            expect(drawnRowsInWindow(next, 1, at) - before).toBeLessThanOrEqual(ROW_BUDGET);
+            edge = next;
+            expect(++rounds).toBeLessThan(10);
+        }
+        expect(drawnRowsInWindow(edge, 1, at)).toBe(300);
+    });
+
+    it('crosses a silent head in rounds of at most ROW_CEILING rows', () => {
+        const rows = [true, ...Array.from({ length: 704 }, () => false), true];
+        let edge: WindowEdge = { exchange: 0, rowsHidden: 705 };
+        let rounds = 0;
+        while (edgeHasMoreAbove(edge)) {
+            const next = expandWindowEdge(edge, [rows.length], () => rows);
+            expect(edge.rowsHidden - next.rowsHidden).toBeLessThanOrEqual(ROW_CEILING);
+            edge = next;
+            rounds++;
+        }
+        expect(rounds).toBe(Math.ceil(705 / ROW_CEILING));
+    });
+
+    it('bounds what showing steps can make draw at once', () => {
+        // The edge is not re-seeded on the toggle, so the rows it uncovered
+        // while steps were hidden all draw the moment they are shown.
+        const edge = seedWindowEdge([hiddenSteps.length], onlyTurn);
+        const shown = () => hiddenSteps.map(() => true);
+        expect(drawnRowsInWindow(edge, 1, shown)).toBeLessThanOrEqual(ROW_CEILING);
+    });
+
+    it('passes over the blank text between calls when steps are shown', () => {
+        const withSteps = turn(REPORTED_RUNS, true);
+        const hidden = seedRowsHidden(withSteps);
+        expect(withSteps.slice(hidden).filter(Boolean)).toHaveLength(ROW_BUDGET);
+        expect(withSteps.length - hidden).toBeGreaterThan(ROW_BUDGET);
+    });
+
+    it('counts the floor turn from its edge and every later turn whole', () => {
+        const rows = [[true, true], [true, false, true], [false, true]];
+        expect(drawnRowsInWindow({ exchange: 1, rowsHidden: 1 }, 3, i => rows[i])).toBe(2);
+        expect(drawnRowsInWindow(WHOLE_THREAD, 3, i => rows[i])).toBe(5);
+    });
+});
+
+/** A fill round that drew nothing is not charged. The caps bound rounds that
+ *  DREW, and a refund always follows progress, so the loop still ends. */
+describe('the fill ledger', () => {
+    const at = (drawn: number, floor = Infinity) => ({ drawn, floor });
+
+    it('charges a round that drew something', () => {
+        let ledger = chargeFillRound(EMPTY_FILL_LEDGER, 'grow', at(0));
+        ledger = settleFillLedger(ledger, at(12));
+        expect(ledger.grow).toBe(1);
+        expect(ledger.last).toBeNull();
+    });
+
+    it('stops after MAX_FILL_EXPANSIONS grows that each drew something', () => {
+        let ledger: FillLedger = EMPTY_FILL_LEDGER;
+        let drawn = 0;
+        let rounds = 0;
+        while (fillRoundAllowed(ledger, 'grow')) {
+            ledger = chargeFillRound(ledger, 'grow', at(drawn));
+            drawn += ROW_BUDGET;
+            ledger = settleFillLedger(ledger, at(drawn));
+            rounds++;
+        }
+        expect(rounds).toBe(MAX_FILL_EXPANSIONS);
+    });
+
+    it('refunds a grow that drew nothing', () => {
+        let ledger = chargeFillRound(EMPTY_FILL_LEDGER, 'grow', at(3));
+        ledger = settleFillLedger(ledger, at(3));
+        expect(ledger.grow).toBe(0);
+    });
+
+    it('refunds a page that folded history in yet drew nothing', () => {
+        let ledger = chargeFillRound(EMPTY_FILL_LEDGER, 'page', at(0, 5_000));
+        ledger = settleFillLedger(ledger, at(0, 4_600));
+        expect(ledger.page).toBe(0);
+    });
+
+    it('keeps a page charged when only the live turn grew', () => {
+        // The live turn streams in at the NEWEST end. The floor holds still,
+        // so a failed page on a live thread is not mistaken for progress.
+        let ledger = chargeFillRound(EMPTY_FILL_LEDGER, 'page', at(0, 5_000));
+        ledger = settleFillLedger(ledger, at(0, 5_000));
+        expect(ledger.page).toBe(1);
+    });
+
+    it('keeps a failed page charged, so a failing endpoint is asked a bounded number of times', () => {
+        let ledger: FillLedger = EMPTY_FILL_LEDGER;
+        let asks = 0;
+        while (fillRoundAllowed(ledger, 'page')) {
+            ledger = chargeFillRound(ledger, 'page', at(0, 5_000));
+            asks++;
+            // A failed read folds nothing in: no progress, no refund.
+            ledger = settleFillLedger(ledger, at(0, 5_000));
+            expect(asks).toBeLessThanOrEqual(MAX_FILL_BACKFILLS);
+        }
+        expect(asks).toBe(MAX_FILL_BACKFILLS);
+    });
+
+    it('pages through silent history to the first page that draws, past the cap', () => {
+        // Ten silent pages, then one with prose: the shape of a long run of
+        // tool calls a reader with steps hidden opens in the middle of.
+        let ledger: FillLedger = EMPTY_FILL_LEDGER;
+        let floor = 10_000;
+        let drawn = 0;
+        let pages = 0;
+        while (drawn === 0) {
+            ledger = settleFillLedger(ledger, at(drawn, floor));
+            expect(fillRoundAllowed(ledger, 'page')).toBe(true);
+            ledger = chargeFillRound(ledger, 'page', at(drawn, floor));
+            floor -= 400;
+            pages++;
+            if (pages === 11) drawn = 5;
+        }
+        expect(pages).toBeGreaterThan(MAX_FILL_BACKFILLS);
+        expect(settleFillLedger(ledger, at(drawn, floor)).page).toBe(1);
     });
 });

@@ -1,6 +1,7 @@
 use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
+use crate::engine::agent_session::text_buffer::CodingAgentTextBuffer;
 use crate::engine::agentic_loop::should_flush;
 use crate::engine::change_ops::now_epoch_millis;
 use crate::engine::claude_code::STALE_RESUME_ERROR;
@@ -1060,8 +1061,7 @@ impl LucidosEngine {
         // outright. Without it, a healthy resume that says nothing is
         // indistinguishable from a dead one.
         let mut init_session_id: Option<String> = None;
-        let mut claude_text_buf = String::new();
-        let mut last_text_persisted_len: usize = 0;
+        let mut claude_text_buf = CodingAgentTextBuffer::default();
         // Reasoning stream buffer, coalesced like the text buffer above. Deltas
         // arrive per-token, so flush on a paragraph boundary or once
         // `THOUGHT_FLUSH_THRESHOLD` chars accumulate. The threshold bounds
@@ -1169,17 +1169,7 @@ impl LucidosEngine {
                             &meta,
                         )
                         .await;
-                        // Final flush of any pending text
-                        if !claude_text_buf.is_empty() {
-                            let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-                            if !delta.is_empty() {
-                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
-                                    meta: meta.clone(),
-                                }, "[AgentSession] CodingAgentTextStreamed (final flush on exit)").await;
-                            }
-                        }
+                        claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (final flush on exit)").await;
                         if is_waiting {
                             // The process exited after producing a Result, so the
                             // session is idle. Do not hold the ThreadGuard for
@@ -1259,7 +1249,7 @@ impl LucidosEngine {
                         log!(
                             "[AgentSession] CC exited without Result event for thread {} (buffered_text_len={})",
                             thread_id,
-                            claude_text_buf.len()
+                            claude_text_buf.as_str().len()
                         );
                         break;
                     }
@@ -1415,18 +1405,10 @@ impl LucidosEngine {
                                 &meta,
                             )
                             .await;
-                            claude_text_buf.push_str(&text);
+                            claude_text_buf.push(&text);
                             // Persist + broadcast at natural boundaries
-                            if should_flush(&claude_text_buf) {
-                                let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-                                if !delta.is_empty() {
-                                    self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
-                                        thread_id,
-                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
-                                        meta: meta.clone(),
-                                    }, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
-                                    last_text_persisted_len = claude_text_buf.len();
-                                }
+                            if should_flush(claude_text_buf.as_str()) {
+                                claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
                             }
                         }
                         // Reasoning stream, with the same straggler guard as
@@ -1485,20 +1467,8 @@ impl LucidosEngine {
                                 &meta,
                             )
                             .await;
-                            {
-                                let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-                                if !delta.is_empty() {
-                                    self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
-                                        thread_id,
-                                        event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
-                                        meta: meta.clone(),
-                                    }, "[AgentSession] CodingAgentTextStreamed (pre-ToolUse flush)").await;
-                                    last_text_persisted_len = claude_text_buf.len();
-                                }
-                            }
-                            if !claude_text_buf.is_empty() {
-                                claude_text_buf.push_str("\n\n");
-                            }
+                            claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (pre-ToolUse flush)").await;
+                            claude_text_buf.break_paragraph();
                             // Disarm the watchdog while ANY tool runs, including
                             // AskUserQuestion: the user may take ten minutes to
                             // answer, and the session must survive that. The
@@ -1688,26 +1658,16 @@ impl LucidosEngine {
                                             // sees the complete text before the
                                             // session goes to waiting. Mirrors
                                             // `build_session_messages`.
-                                            let buf_trimmed = claude_text_buf.trim();
                                             let result_trimmed = text.trim();
-                                            if !result_trimmed.is_empty()
-                                                && result_trimmed.len() > buf_trimmed.len()
-                                                && result_trimmed.starts_with(buf_trimmed)
-                                            {
-                                                let extra = result_trimmed[buf_trimmed.len()..].trim();
-                                                if !extra.is_empty() {
-                                                    claude_text_buf.push_str("\n\n");
-                                                    claude_text_buf.push_str(extra);
-                                                }
+                                            let extra = result_trimmed
+                                                .strip_prefix(claude_text_buf.as_str().trim())
+                                                .map(str::trim)
+                                                .filter(|extra| !extra.is_empty());
+                                            if let Some(extra) = extra {
+                                                claude_text_buf.break_paragraph();
+                                                claude_text_buf.push(extra);
                                             }
-                                            let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-                                            if !delta.is_empty() {
-                                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
-                                                    thread_id,
-                                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
-                                                    meta: meta.clone(),
-                                                }, "[AgentSession] CodingAgentTextStreamed (Result flush)").await;
-                                            }
+                                            claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Result flush)").await;
                                         } else if result_text_is_own_prose(&text, cc_error.as_deref()) {
                                             // A slash command produces a Result
                                             // with no preceding Message events,
@@ -1722,7 +1682,7 @@ impl LucidosEngine {
                                         // Result.text without buffering it, so `claude_text_buf` alone
                                         // would mis-flag /model output as empty.
                                         let result_text_empty = text.trim().is_empty();
-                                        let buffered_text_empty = claude_text_buf.trim().is_empty();
+                                        let buffered_text_empty = claude_text_buf.as_str().trim().is_empty();
                                         // Detect a stale resume: the backend
                                         // returned an empty Result right after
                                         // resuming an expired session. Abort with
@@ -1945,7 +1905,6 @@ impl LucidosEngine {
                                         // fallback before it escalates.
                                         interrupt_escalate_at = None;
                                         claude_text_buf.clear();
-                                        last_text_persisted_len = 0;
                                         claude_thought_buf.clear();
                                         last_thought_persisted_len = 0;
                                         // Auto-commit dirty files before checking
@@ -2008,14 +1967,10 @@ impl LucidosEngine {
                                                 s.idle_notify.notify_waiters();
                                             }
                                         }
-                                        // `bg_bash_running` reflects the chat-agent's
-                                        // `run_bash_background` tool. It does not gate
-                                        // the propose decision. It only keeps the
-                                        // subprocess alive at idle, so
-                                        // `spawn_bash_completion_watcher` can push a
-                                        // resume prompt when the bash finishes. It is
-                                        // also recorded on the `CodingAgentIdled` payload
-                                        // for the event history.
+                                        // Recorded on the `CodingAgentIdled` payload for
+                                        // the event history. It gates nothing: a running
+                                        // background task re-opens the thread through its
+                                        // event wait.
                                         let bg_bash_running = self
                                             .bash_background
                                             .has_running_for_thread(thread_id)
@@ -2200,7 +2155,6 @@ impl LucidosEngine {
                                                     msg_rx.len(),
                                                     awaiting_result,
                                                     redirect_pending,
-                                                    bg_bash_running,
                                                 ) {
                                                     TerminateDecision::KeepAliveForFollowup {
                                                         queued,
@@ -2208,9 +2162,6 @@ impl LucidosEngine {
                                                         redirect_pending,
                                                     } => {
                                                         log!("[AgentSession] Skipping subprocess termination for thread {}: a follow-up is still on its way ({} queued, {} awaiting a Result, redirect pending: {})", thread_id, queued, awaiting_result, redirect_pending);
-                                                    }
-                                                    TerminateDecision::KeepAliveForBgBash => {
-                                                        log!("[AgentSession] Skipping subprocess termination for thread {} — background bash still running (auto-wake will resume CC on completion)", thread_id);
                                                     }
                                                     TerminateDecision::Terminate => {
                                                         // Mark the session exited BEFORE
@@ -2366,18 +2317,8 @@ impl LucidosEngine {
                     .await;
                     claude_thought_buf.clear();
                     last_thought_persisted_len = 0;
-                    if !claude_text_buf.is_empty() {
-                        let delta = &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-                        if !delta.is_empty() {
-                            self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: delta.to_string(), coding_agent },
-                                meta: meta.clone(),
-                            }, "[AgentSession] CodingAgentTextStreamed (flush before user_input)").await;
-                        }
-                        claude_text_buf.clear();
-                        last_text_persisted_len = 0;
-                    }
+                    claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (flush before user_input)").await;
+                    claude_text_buf.clear();
 
                     let images = user_input.images.clone().unwrap_or_default();
                     let input_kind = user_input.kind;
@@ -2466,8 +2407,7 @@ impl LucidosEngine {
                         suppress_user_terminal,
                         false, // the stop channel is never a redirect (redirects use `interrupt`)
                         &agent_cancel,
-                        &claude_text_buf,
-                        last_text_persisted_len,
+                        &mut claude_text_buf,
                         &meta,
                         &external_terminal_emitted,
                         &normalized_model,
@@ -2517,8 +2457,7 @@ impl LucidosEngine {
                         false, // suppress: a real Cancel — not Apply/Discard/Archive
                         interrupt_is_redirect, // redirect → SupersededByFollowup cause
                         &agent_cancel,
-                        &claude_text_buf,
-                        last_text_persisted_len,
+                        &mut claude_text_buf,
                         &meta,
                         &external_terminal_emitted,
                         &normalized_model,
@@ -2542,8 +2481,7 @@ impl LucidosEngine {
                         false,
                         false, // chat_cancel is engine shutdown / request abort, not a redirect
                         &agent_cancel,
-                        &claude_text_buf,
-                        last_text_persisted_len,
+                        &mut claude_text_buf,
                         &meta,
                         &external_terminal_emitted,
                         &normalized_model,
@@ -2659,7 +2597,7 @@ impl LucidosEngine {
             worktree_path,
             images,
             msg_rx,
-            claude_text_buf,
+            claude_text_buf.into_text(),
             normalized_model,
             cc_reasoning_effort,
             last_terminal_kind,

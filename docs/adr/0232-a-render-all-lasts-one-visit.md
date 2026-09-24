@@ -62,6 +62,12 @@ every return, which is what module-scoping it prevented in the first place.
   margin was under one screen and is not at 1600px.
 - A reader who deep-links to an old turn, leaves, and returns pays the anchor
   walk to reach it again. Chunked per frame, so the pane stays responsive.
+- **The claim is told apart by who stored it, never by its value.** A reader
+  who scrolls up to the first turn grows the edge to `WHOLE_THREAD` too. The
+  first cut compared values, so that reader was re-seeded on every open. The
+  thread opened on the newest turns and jumped once the walk arrived, a second
+  later on a phone. The stored window now records its kind
+  (`StoredWindowKind`), and only `render-all` is dropped.
 - **A gesture is the reader by definition, so no navigation guard applies to
   it.** The scroll handler needs one, because our own writes fire scroll
   events. Nothing in the app dispatches a wheel.

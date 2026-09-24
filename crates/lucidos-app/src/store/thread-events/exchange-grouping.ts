@@ -3,7 +3,7 @@ import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { isUserStoppedWait } from './thread-event-types';
+import { isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -448,6 +448,9 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'CredentialRequested',
   'McpConsentRequested',
   'ChildThreadCompleted',
+  // A user Stop paused a child (ADR 0252). A note that holds no turn: see
+  // `isTurnlessBoundary`.
+  'ChildThreadStopped',
   // A caller's utterance the talker answered alone. A reader sorts a
   // transcript by who is talking. Which turn was running underneath comes
   // second, so the caller opens a boundary either way.
@@ -526,9 +529,10 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['ChangeDiscarded', 'leaves'],
   ['ChangeReverted', 'leaves'],
   ['ChangeApplyFailed', 'leaves'],
-  // Both are settled before the decision below is read.
+  // All three are settled before the decision below is read.
   ['SpokenMessageReceived', 'own-arm'],
   ['EventWaitCanceled', 'own-arm'],
+  ['ChildThreadStopped', 'own-arm'],
 ]);
 
 /** Does this boundary take the running turn? `previous` held it.
@@ -1341,7 +1345,7 @@ function liveReplyTargetIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const exchange = exchanges[i];
     if (isWaitingTypedMessage(exchange)) continue;
-    if (isUserStoppedWait(exchange.userEvent)) continue;
+    if (isTurnlessBoundary(exchange.userEvent)) continue;
     return i;
   }
   return -1;
@@ -1752,6 +1756,18 @@ function foldEvent(
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
 
+    // A release marks its held row delivered, so it joins the exchange that
+    // holds the row, wherever the transcript has moved on to since.
+    if (event.type === 'HeldMessageReleased') {
+      const holder = exchanges.find(ex => ex.steps.some(s =>
+        s.event.type === 'MessageHeld' && s.event._eventId === event.held_message_id));
+      if (holder) {
+        holder.steps.push({ seq, event });
+        touched?.add(holder);
+        return;
+      }
+    }
+
     // Walked once, and only for a row a call leaves behind. Every other event
     // short-circuits on the set membership and pays nothing.
     const callTarget = CALL_ROW_TYPES.has(event.type) ? callRowTarget(exchanges) : null;
@@ -1995,7 +2011,10 @@ function foldEvent(
       // Restoring `current` is the whole handling it needs, and is why it is
       // `own-arm` in `BOUNDARY_CONTINUATION_HANDOFF`. It continues nothing, so
       // there is no continuation to redirect and no handoff to record.
-      if (isUserStoppedWait(event)) {
+      //
+      // A `ChildThreadStopped` is handled the same way: it wakes nothing, so a
+      // turn the parent is running keeps writing where it was.
+      if (isTurnlessBoundary(event)) {
         current = previousCurrent;
         return;
       }

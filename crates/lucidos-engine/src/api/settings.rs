@@ -1004,8 +1004,8 @@ pub(super) async fn set_preference(
     // language/timezone refresh the engine's in-memory locale + emit
     // LanguageSet/TimezoneSet, push syncs devices.push_enabled, everything else
     // emits PreferencesChanged. The HTTP path is intentionally permissive about
-    // the key (the human edits internal keys here) — the catalog gate lives in
-    // the tool handler only.
+    // the key, because the human edits internal keys here. The agent's gate is
+    // in the tool handler, and an app's is `app_reach::enforce_app_reach`.
     let actor =
         super::actor::user_actor_resolved(&headers, &state.pool, request.device_id.as_deref())
             .await;

@@ -710,17 +710,10 @@
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     line-height: 1.5;
-}
-
-/* Fixed prose with one short inline link — wrap only at spaces so "MIT" never
-   splits mid-word. The shared .markdown-content rules set word-break: break-all
-   on links (and break-word on the container) to break long URLs/tokens in agent
-   responses; neither applies to this known-short license copy, where break-all
-   would split the "MIT license" link as "MI" / "T". The `a` override is the
-   load-bearing one — break-all sits directly on the anchor, so a value on the
-   parent <p> alone can't reach it. */
-.welcome-message .disclaimer,
-.welcome-message .disclaimer a {
+    /* Fixed prose with one short inline link: wrap only at spaces so "MIT"
+       never splits mid-word. The .markdown-content container sets break-word
+       for long tokens in agent responses, and this copy has none. The link
+       inherits the value. */
     word-break: normal;
 }
 
@@ -1425,6 +1418,16 @@
 
 .permission-actions-secondary {
     margin-top: -0.375rem;
+}
+
+/* Why the engine resolved a card nobody clicked. Muted, because the struck
+   buttons above already carry the outcome; this only says who decided. */
+.permission-resolution-note {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    text-align: right;
+    word-break: break-word;
 }
 
 .permission-actions-secondary code {

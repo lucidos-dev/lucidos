@@ -1,4 +1,5 @@
 use super::lifecycle::{stop_terminal_kind, TerminalKind};
+use super::text_buffer::CodingAgentTextBuffer;
 use crate::engine::thread_events::{EventChannel, MessageOrigin, SessionEndReason};
 use crate::engine::LucidosEngine;
 use uuid::Uuid;
@@ -40,34 +41,22 @@ impl LucidosEngine {
     /// child; we don't own the process here.
     pub(crate) async fn kill_cc_and_flush(
         cancel: &tokio_util::sync::CancellationToken,
-        claude_text_buf: &str,
-        last_text_persisted_len: usize,
+        claude_text_buf: &mut CodingAgentTextBuffer,
         event_bus: &crate::engine::event_bus::EventBus,
         thread_id: Uuid,
         meta: &crate::engine::thread_events::EventMeta,
         coding_agent: crate::runtime::CodingAgent,
     ) {
         cancel.cancel();
-        if !claude_text_buf.is_empty() {
-            let delta =
-                &claude_text_buf[claude_text_buf.floor_char_boundary(last_text_persisted_len)..];
-            if !delta.is_empty() {
-                event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event:
-                                crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
-                                    text: delta.to_string(),
-                                    coding_agent,
-                                },
-                            meta: meta.clone(),
-                        },
-                        "[AgentSession] CodingAgentTextStreamed flush on cancel",
-                    )
-                    .await;
-            }
-        }
+        claude_text_buf
+            .flush(
+                event_bus,
+                thread_id,
+                coding_agent,
+                meta,
+                "[AgentSession] CodingAgentTextStreamed flush on cancel",
+            )
+            .await;
     }
 
     /// Is this session shutting down? **The only definition**, for every reader
@@ -228,8 +217,7 @@ impl LucidosEngine {
         suppress_user_terminal: bool,
         interrupt_is_redirect: bool,
         agent_cancel: &tokio_util::sync::CancellationToken,
-        claude_text_buf: &str,
-        last_text_persisted_len: usize,
+        claude_text_buf: &mut CodingAgentTextBuffer,
         meta: &crate::engine::thread_events::EventMeta,
         external_terminal_emitted: &std::sync::atomic::AtomicBool,
         normalized_model: &Option<String>,
@@ -259,7 +247,6 @@ impl LucidosEngine {
         Self::kill_cc_and_flush(
             agent_cancel,
             claude_text_buf,
-            last_text_persisted_len,
             &self.event_bus,
             thread_id,
             meta,
@@ -302,7 +289,7 @@ impl LucidosEngine {
         }
         let terminal_event = Self::make_terminal_event(
             kind,
-            claude_text_buf.to_string(),
+            claude_text_buf.as_str().to_string(),
             normalized_model.clone(),
             cc_reasoning_effort.clone(),
         );

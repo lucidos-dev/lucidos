@@ -560,6 +560,15 @@ pub enum StopReason {
     Archive,
 }
 
+impl StopReason {
+    /// Whether the thread's work is being thrown away, so its running
+    /// background tasks go too. An Apply keeps the work, and a Cancel keeps the
+    /// session, so a task either of them started runs on.
+    pub fn abandons_background_tasks(self) -> bool {
+        matches!(self, StopReason::Discard | StopReason::Archive)
+    }
+}
+
 /// State for a single active coding-agent session.
 ///
 /// **Single agent per thread — deliberate.** The owning HashMap is keyed by
@@ -735,8 +744,8 @@ pub struct AgentSession {
     /// `msg_rx` is covered by `msg_rx.is_empty()`, this counter starts where that
     /// stops, and no message is in both. It also means every sender is counted by
     /// construction, including the three that never touched the old send-site
-    /// counter (`apply_now`'s hardening prompt, the `run_bash_background`
-    /// auto-wake, `change_ops::propose`).
+    /// counter (`apply_now`'s hardening prompt, `change_ops::propose`, and a
+    /// background-task wake since removed).
     ///
     /// **Settled per backend at each `Result`**, by
     /// `lifecycle::settle_inputs_awaiting_result`, because the backends make

@@ -917,9 +917,8 @@
 /* The transcript's own scroll indicator is MOBILE ONLY (styles/mobile.css gives
    it its geometry and turns it on). On desktop `.thread-content-wrap` sits below
    the header in normal flow, so the native scrollbar is already aligned with the
-   content and there is nothing to replace. Hidden by default rather than
-   conditionally rendered, matching `.mobile-swipe-wrapper`, so the mobile rules
-   are the only place the element's layout is described. */
+   content. Hidden by default rather than conditionally rendered, so the mobile
+   rules are the only place the element's layout is described. */
 .thread-scroll-indicator {
     display: none;
 }
@@ -1400,6 +1399,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 .thread-feed > .chat-exchange:last-child > .initiator-panel:last-child:not(.nav-focus-stuck),
 .thread-feed > .chat-exchange:last-child > .response-panel:last-child:not(.nav-focus-stuck) {
     padding-bottom: 0;
+}
+
+/* A stopped child's notice (ADR 0252) closes the feed. It sits on the turns'
+   content edge, with no bottom half for the same reason the last turn drops
+   its own: the transcript's bottom padding follows. */
+.stopped-child-notice {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
 /* `flex-start` plus a row unit on every field, exactly as `.response-header`

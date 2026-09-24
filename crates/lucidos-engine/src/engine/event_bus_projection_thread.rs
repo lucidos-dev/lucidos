@@ -14,13 +14,14 @@ use super::super::{
     preserving_verdict, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
 };
 use super::propagation::{
-    load_blocking_sample, mark_parent_callback_pending, propagate_blocking_change,
+    load_blocking_sample, mark_parent_callback_pending, mark_stopped_child,
+    propagate_blocking_change, reconcile_blocking_descendant_count_for_ancestors,
     reconcile_parent_active_children_count, reconcile_proposal_lifecycle_end,
-    reincrement_parent_active_count_if_revived,
+    reincrement_parent_active_count_if_revived, settle_parent_callback,
 };
 use crate::core::store::{EventWaitSummary, LegacyInitiator};
 use crate::engine::thread_events::{
-    ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    ActorMode, AnswerKind, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
 use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState};
 
@@ -790,9 +791,12 @@ impl EventBus {
                 // is still active; zeroing them would hide the disclosure
                 // chevron (gated on `totalChildrenCount > 0`) and leave the
                 // user unable to collapse the lifted family.
+                // `is_stopped_child` clears too. A cascade from the parent
+                // archives the parent as well, so the child owes it nothing. A
+                // direct archive settles through the marker, which stays.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET status = 'idle', \
-                     is_saved = FALSE, \
+                     is_saved = FALSE, is_stopped_child = FALSE, \
                      {CLEAR_CODING_AGENT_FLAGS} \
                      WHERE thread_id = $1",
                 ))
@@ -848,7 +852,7 @@ impl EventBus {
             }
 
             // Events that update status but no other metadata.
-            ThreadEvent::ResponseCanceled { .. } => {
+            ThreadEvent::ResponseCanceled { cause, .. } => {
                 // User canceled — go idle. Set has_response so the thread
                 // appears in archive (a canceled response is still a response —
                 // the user should see the thread).
@@ -878,6 +882,17 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
+                // A person's Stop pauses a child rather than finishing it
+                // (ADR 0252). The fan-in reads this flag in PostCommit. An
+                // agent cancelling its own child records the same cause, and
+                // is told apart by its actor: it expects the canceled card.
+                let by_agent = meta
+                    .actor
+                    .as_ref()
+                    .is_some_and(|actor| actor.mode() != ActorMode::Human);
+                if matches!(cause, CancelCause::UserStop) && !by_agent {
+                    mark_stopped_child(tx, thread_id).await?;
+                }
                 // See ResponseGenerated for the IN-TX broadcast rationale.
                 if let Some(pid) =
                     reconcile_parent_active_children_count(tx, thread_id).await?
@@ -1479,18 +1494,25 @@ impl EventBus {
             // completion card. The parent's wake-up + agentic-loop replay
             // handle the actual side effect — no other projection state
             // changes for the parent row itself.
+            //
+            // The same write settles a stopped child. It lands on the child's
+            // row, outside this event's own attention sample. So the child's
+            // ancestors are reconciled here, and its aggregate is rebroadcast.
             ThreadEvent::ChildThreadCompleted {
                 child_thread_id, ..
             } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET parent_callback_pending = FALSE \
-                     WHERE thread_id = $1",
-                )
-                .bind(child_thread_id)
-                .execute(&mut **tx)
-                .await?;
+                if settle_parent_callback(tx, *child_thread_id).await? {
+                    extra_ancestors.push(*child_thread_id);
+                    extra_ancestors.extend(
+                        reconcile_blocking_descendant_count_for_ancestors(tx, *child_thread_id)
+                            .await?,
+                    );
+                }
                 Vec::new()
             }
+            // A note, never a write: the stopped child's own row already
+            // carries the state, and the parent does not wake (ADR 0252).
+            ThreadEvent::ChildThreadStopped { .. } => Vec::new(),
             // Recency, and nothing else. Placing a call is a user action on
             // whatever thread it was placed from, so the drawer's sort keys
             // move. Status does not: the doer's turn owns it (ADR 0149), and a
@@ -1586,6 +1608,10 @@ impl EventBus {
             // renderer/agentic loop consult this row without changing the
             // thread summary projection.
             | ThreadEvent::QueuedMessageRemoved { .. }
+            // Markers over a held message. The release's own
+            // `MessageReceived` is what moves the projection.
+            | ThreadEvent::MessageHeld { .. }
+            | ThreadEvent::HeldMessageReleased { .. }
             // Agent-driven curation of a prior tool result / child completion
             // in future resume context: the retired dismissal, and the record
             // of a keep. Pure bookkeeping; no projection state change.

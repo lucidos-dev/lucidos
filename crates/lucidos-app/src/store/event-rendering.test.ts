@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { drawsResponseRow, liveStepIndex, rendersLiveStep } from './event-rendering';
+import { drawsResponseRow, headClampApplies, liveStepIndex, rendersLiveStep, rowsDrawnByClamp } from './event-rendering';
 import type { ResponseEvent, StepOutcome } from './types';
 
 const step = (outcome: StepOutcome): ResponseEvent => ({
@@ -139,5 +139,48 @@ describe('drawsResponseRow', () => {
       expect(drawsResponseRow(e, true), e.type).toBe(false);
       expect(drawsResponseRow(e, false), e.type).toBe(false);
     }
+  });
+});
+
+/** What the render window budgets by. A row the clamped slice renders as
+ *  `null` costs nothing and fills no height, so the window must not count it.
+ *  One reported turn held 748 text events and 45 with prose. With steps hidden,
+ *  a run of 352 tool calls drew nothing at all. */
+describe('rowsDrawnByClamp', () => {
+  const view = { showSteps: true, showDetails: true, folded: false };
+  const silentRun = [text('\n\n'), step('success'), text('\n\n'), step('success')];
+
+  it('marks each row the slice would draw, row for row', () => {
+    const events = [text('the plan'), ...silentRun, text('done')];
+    expect(rowsDrawnByClamp(events, view)).toEqual([true, false, true, false, true, true]);
+  });
+
+  it('marks a silent run as drawing nothing once steps are hidden', () => {
+    const events = [text('the plan'), ...silentRun];
+    expect(rowsDrawnByClamp(events, { ...view, showSteps: false }))
+      .toEqual([true, false, false, false, false]);
+  });
+
+  it('marks nothing drawn in a folded turn, whose body is not mounted', () => {
+    const events = [text('the plan'), ...silentRun, text('done')];
+    expect(rowsDrawnByClamp(events, { ...view, folded: true }).some(Boolean)).toBe(false);
+  });
+
+  it('marks nothing drawn on the collapsed-prose path, which ignores the clamp', () => {
+    // Two prose chunks and a step: turning details off draws only what follows
+    // the last prose, whatever `rowsHidden` says.
+    const events = [text('first'), step('success'), text('last')];
+    expect(headClampApplies(events, false)).toBe(false);
+    expect(rowsDrawnByClamp(events, { ...view, showDetails: false }).some(Boolean)).toBe(false);
+  });
+
+  it('keeps the clamp where details off drops no prose', () => {
+    const events = [step('success'), text('only answer')];
+    expect(headClampApplies(events, false)).toBe(true);
+    expect(rowsDrawnByClamp(events, { ...view, showDetails: false })).toEqual([true, true]);
+  });
+
+  it('keeps the clamp whenever details are on', () => {
+    expect(headClampApplies([text('first'), step('success'), text('last')], true)).toBe(true);
   });
 });

@@ -510,6 +510,36 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** An agent-sent message held back from a coding agent, because the thread
+   *  waits on a human: an open question, or older held messages. It stays
+   *  held until a human replies, and is released as an ordinary
+   *  `MessageReceived`. Unlike that event, it moves no status, so the
+   *  question stays answerable. See ADR 0256. */
+  | {
+      type: 'MessageHeld';
+      text: string;
+      user_image_hashes?: string[];
+      mode?: ActorMode;
+      origin?: MessageOrigin;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A `MessageHeld` was handed to the agent. Emitted just before its
+   *  `MessageReceived`, so a message is released at most once. */
+  | {
+      type: 'HeldMessageReleased';
+      held_message_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'TextStreamed';
       text: string;
@@ -1613,6 +1643,22 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** A user Stop ended a child thread's turn, and the child is now a
+   *  *stopped child*. Emitted on the **parent** by the same fan-in as
+   *  `ChildThreadCompleted`, in its place. It wakes nothing: the child is
+   *  alive, and the parent is still owed the `ChildThreadCompleted` that
+   *  settles it (ADR 0252). */
+  | {
+      type: 'ChildThreadStopped';
+      child_thread_id: string;
+      child_thread_title?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** The agent (LLM) asked to drop a prior `ToolCalled` (and its matching
    *  `ToolResult`) or `ChildThreadCompleted` from future resume context.
    *  Full reasoning is on the Rust variant. */
@@ -2060,6 +2106,8 @@ export type TransientEvent =
 const THREAD_EVENT_TYPE_FLAGS = {
   MessageReceived: true,
   QueuedMessageRemoved: true,
+  MessageHeld: true,
+  HeldMessageReleased: true,
   TextStreamed: true,
   ThoughtStreamed: true,
   ContextCaptured: true,
@@ -2120,6 +2168,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CommandCheckpointReverted: true,
   WorktreeCleaned: true,
   ChildThreadCompleted: true,
+  ChildThreadStopped: true,
   ContextDismissed: true,
   ContextKeptOpen: true,
   WorkingUnderstandingWritten: true,

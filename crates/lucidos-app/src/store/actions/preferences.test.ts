@@ -1,15 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
 
-const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false }));
+const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false, isIOS: false }));
 vi.mock('../../utils/platform', () => ({
   isTauri: () => platformMocks.isTauri,
   isIOSPwa: () => platformMocks.isIOSPwa,
+  isIOS: () => platformMocks.isIOS,
 }));
+
+// The test environment has no DOM to stamp, so the Autocorrect switch is read
+// off the call it makes. `noAutofill.test.ts` covers what the stamp does.
+const setProseAutocorrectMock = vi.hoisted(() => vi.fn());
+vi.mock('../../utils/noAutofill', () => ({ setProseAutocorrect: setProseAutocorrectMock }));
 
 // applyTheme tints the native title bar via this when isTauri(); mock it so the
 // web-path tests don't need a Tauri IPC bridge and the Tauri-path test can
@@ -1581,6 +1587,93 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
     void setNotificationToasts(false);
     expect(localStorage.getItem(KEY)).toBe('false');
+  });
+});
+
+/**
+ * The device's Autocorrect switch. iOS autocorrect can keep the tap on Send for
+ * itself, so a device that hits it can turn autocorrect off. Unset means on, on
+ * every client. The mirror answers before preferences load, because the
+ * composer can take focus first and iOS reads the attribute at focus.
+ */
+describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
+  const KEY = 'lucidos-autocorrect';
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+    platformMocks.isIOS = false;
+    setProseAutocorrectMock.mockClear();
+    _resetPendingPreferenceWritesForTesting();
+  });
+
+  afterEach(() => {
+    platformMocks.isIOS = false;
+    vi.restoreAllMocks();
+  });
+
+  // The iPhone case is the one that matters: the platform must not pick the
+  // default, or the switch goes back to hiding autocorrect from iOS users.
+  it('is on when nothing is stored, on an iPhone and on a desktop alike', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    platformMocks.isIOS = true;
+    expect(currentAutocorrect()).toBe(true);
+    platformMocks.isIOS = false;
+    expect(currentAutocorrect()).toBe(true);
+  });
+
+  it('lets a stored off win on any client', () => {
+    preferences.value = { status: 'loaded', data: { autocorrect: 'false' } };
+    platformMocks.isIOS = true;
+    expect(currentAutocorrect()).toBe(false);
+    platformMocks.isIOS = false;
+    expect(currentAutocorrect()).toBe(false);
+  });
+
+  it('answers from the mirror while preferences are still loading', () => {
+    platformMocks.isIOS = true;
+    localStorage.setItem(KEY, 'false');
+    preferences.value = { status: 'loading' };
+    expect(currentAutocorrect()).toBe(false);
+  });
+
+  // Driven through `loadPreferences`, because a switch nothing applies is how
+  // this fix would go quietly dead.
+  it('applies the served value to the stamp and to the mirror', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
+      preferences: { autocorrect: 'false' },
+    });
+    await loadPreferences();
+    expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(false);
+    expect(localStorage.getItem(KEY)).toBe('false');
+  });
+
+  it('keeps autocorrect on for a fresh iPhone that stores nothing', async () => {
+    platformMocks.isIOS = true;
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(true);
+  });
+
+  it('clears the mirror when the engine serves no value', async () => {
+    // Unset means on, and a mirror left behind would keep answering for a
+    // preference nobody holds any more.
+    localStorage.setItem(KEY, 'false');
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it('writes this device only, and re-stamps before the round trip', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    const saved = setAutocorrect(false);
+    // Applied locally before the network, so the next focus already has it.
+    expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(false);
+    expect(localStorage.getItem(KEY)).toBe('false');
+    await saved;
+    expect(spy).toHaveBeenCalledWith('autocorrect', 'false', expect.any(String));
+    await setAutocorrect(true);
+    expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(true);
   });
 });
 describe('the resident-block sections a call opens with', () => {

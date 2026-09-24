@@ -89,10 +89,17 @@ export function computeAnchorPosition(
   return { top, left, placement, maxWidth };
 }
 
+const TOAST_LAYER_SELECTOR = '.toast-container';
+
 /** Decide whether a pointerdown should dismiss the popover. Clicks on the panel
  *  itself or on the anchor element are kept inside — the anchor is excluded so
  *  re-clicking it can toggle the popover via the caller's click handler instead
- *  of being eaten by this dismiss handler firing first. */
+ *  of being eaten by this dismiss handler firing first.
+ *
+ *  A toast is excluded too. It is its own layer, rendered outside `.app-shell`
+ *  so it stays live while an overlay is open. A tap on a toast button must
+ *  reach that button, so it is never swallowed. Whether it still closes the
+ *  overlay is `dismissOnToastTap` in `makeDismissHandlers`. */
 export function isOutsidePointerTarget(
   target: Node,
   panel: HTMLElement | null,
@@ -100,7 +107,13 @@ export function isOutsidePointerTarget(
 ): boolean {
   if (panel?.contains(target)) return false;
   if (anchor?.contains(target)) return false;
+  if (isInToastLayer(target)) return false;
   return true;
+}
+
+function isInToastLayer(target: Node): boolean {
+  const el = target.nodeType === 1 ? (target as Element) : target.parentElement;
+  return !!el?.closest?.(TOAST_LAYER_SELECTOR);
 }
 
 /** Track an anchored popover's position and keep it pinned to the anchor as the
@@ -339,6 +352,11 @@ export function installPairedSwallow(arming?: Event): void {
  *  dismiss nothing. `primaryPointerIsDown` answers it, and counts only TRUSTED
  *  presses, since only those get a click from the browser.
  *
+ *  **`dismissOnToastTap` is light dismiss, as `popover="auto"` does it.** A
+ *  toast tap closes a backdrop-less popover, and the same tap still presses
+ *  the toast button. A backdrop modal passes false and stays open, so the X on
+ *  an error toast never throws a half-filled form away.
+ *
  *  Exported as a pure factory so `.test.ts` can drive the handlers without
  *  jsdom — `useDismissOnOutside` is the hook that wires these to `document`
  *  (and passes `installPairedSwallow` as `onArm`).
@@ -350,6 +368,7 @@ export function makeDismissHandlers(
   onArm?: (arming: Event) => void,
   isTop: () => boolean = () => true,
   openedUnderPress = false,
+  dismissOnToastTap = false,
 ): {
   onPointerDown(e: PointerEvent): void;
   onTouchEnd(e: TouchEvent): void;
@@ -396,6 +415,11 @@ export function makeDismissHandlers(
       // A new press ends the opening gesture, whichever side of the panel it
       // lands on. Ahead of the inside/outside test for that reason.
       if (e.isPrimary !== false) owedToOpeningPress = false;
+      if (dismissOnToastTap && isInToastLayer(e.target as Node)) {
+        // Nothing is armed, so the toast's own touchend and click go through.
+        if (isTop()) onDismiss();
+        return;
+      }
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
       if (e.button === 0) awaitingPairedClick = true;
       if (!isTop()) return;
@@ -545,6 +569,7 @@ export function useDismissOnOutside(
   anchor: HTMLElement | null,
   onDismiss: () => void | boolean,
   isTop?: () => boolean,
+  dismissOnToastTap = false,
 ): void {
   // Stash onDismiss in a ref so an inline arrow callback at the call site
   // doesn't churn the effect deps below: the listeners install once per
@@ -586,6 +611,7 @@ export function useDismissOnOutside(
       // answer means anything: a press still down now is the one that opened
       // this overlay. See `makeDismissHandlers` on `openedUnderPress`.
       primaryPointerIsDown(),
+      dismissOnToastTap,
     );
     document.addEventListener('pointerdown', handlers.onPointerDown, true);
     // Capture phase so this precedes the target button's own bubble-phase
@@ -612,5 +638,5 @@ export function useDismissOnOutside(
       document.removeEventListener('pointercancel', handlers.onCancel, true);
       document.removeEventListener('touchcancel', handlers.onCancel, true);
     };
-  }, [isOpen, panelRef, anchor]);
+  }, [isOpen, panelRef, anchor, dismissOnToastTap]);
 }

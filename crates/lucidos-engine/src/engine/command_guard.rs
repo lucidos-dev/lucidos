@@ -1441,6 +1441,15 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
     catastrophic_reason_at(command, 0)
 }
 
+/// [`catastrophic_reason`] for a whole shell command line, a wrapper included.
+///
+/// The one guard lane a coding agent's background task takes. The agent's own
+/// permission check already saw the full command line, so the ask and judge
+/// lanes would ask twice. The hard-block is the floor no grant can lift.
+pub(crate) fn catastrophic_reason_for_command(command: &str) -> Option<&'static str> {
+    catastrophic_reason(&unwrap_shell_command(command))
+}
+
 /// [`catastrophic_reason`], carrying the substitution-recursion depth.
 fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
     if is_fork_bomb(command) {
@@ -2556,6 +2565,23 @@ mod tests {
             "/bin/zsh -lc 'rm -rf ~' zsh",
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// A coding agent's background task reaches the guard as a bare command
+    /// line, behind `lucidos background-task run --`, where the agent's own
+    /// Bash guard read head `lucidos`. The route's floor must still refuse a
+    /// wrapped payload, and must let an ordinary build through.
+    #[test]
+    fn catastrophic_reason_for_command_reads_through_a_wrapper_and_passes_a_build() {
+        for cmd in ["rm -rf ~", "bash -c 'rm -rf /'", "/bin/zsh -lc 'rm -rf ~'"] {
+            assert!(catastrophic_reason_for_command(cmd).is_some(), "{cmd}");
+        }
+        for cmd in [
+            "cargo test -p lucidos-engine --lib",
+            "./scripts/e2e.sh > .lucidos/e2e.log 2>&1",
+        ] {
+            assert_eq!(catastrophic_reason_for_command(cmd), None, "{cmd}");
         }
     }
 

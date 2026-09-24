@@ -19,7 +19,18 @@ use crate::support::{
 use uuid::Uuid;
 
 async fn insert_user_question_asked(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str) {
-    seed_cc_thread_summary(pool, thread_id, "waiting_for_user_answer").await;
+    insert_user_question_asked_on(pool, thread_id, tool_use_id, "waiting_for_user_answer").await;
+}
+
+/// The question event on a coding-agent row at `status`. `idle` models an
+/// orphaned card: the turn ended without an answer.
+async fn insert_user_question_asked_on(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    status: &str,
+) {
+    seed_cc_thread_summary(pool, thread_id, status).await;
 
     // Insert the question event directly. We bypass the bus to keep the test
     // hermetic — the API handler reads back from events, so this is sufficient.
@@ -240,13 +251,65 @@ async fn answer_question_chat_channel_skips_cc_resume_marker() {
     );
 }
 
+async fn post_archive(thread_id: Uuid) -> reqwest::Response {
+    user_client()
+        .await
+        .post(format!("{}/api/v1/threads/archive", base_url()))
+        .json(&serde_json::json!({ "thread_id": thread_id.to_string() }))
+        .send()
+        .await
+        .expect("request failed")
+}
+
+/// A thread waiting on the user needs attention, so Archive refuses it and
+/// writes nothing (ADR 0259). The exit is to answer the question, or Stop.
 #[tokio::test]
-async fn archive_with_pending_question_emits_canceled_answer() {
-    // Bug: a CC thread sitting in WaitingForUserAnswer had no Archive button
-    // and archiving didn't resolve the question card. Dismiss must auto-cancel
-    // any pending question so the card resolves cleanly to "Canceled" and the
-    // thread can leave REVIEW.
-    let client = user_client().await;
+async fn archive_refuses_a_thread_waiting_on_a_question() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("tu-parked-{}", &Uuid::new_v4().as_simple().to_string()[..8]);
+    insert_user_question_asked(&pool, thread_id, &tool_use_id).await;
+
+    let resp = post_archive(thread_id).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "archive must refuse a parked thread"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["reason"], "parent_not_archivable");
+    assert_eq!(body["parent_status"], "waiting_for_user_answer");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        count_answered(&pool, thread_id, &tool_use_id).await,
+        0,
+        "a refused archive must leave the question open"
+    );
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "ThreadArchived").await,
+        0
+    );
+    let (status, section): (String, String) =
+        sqlx::query_as("SELECT status, archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!(
+        (status.as_str(), section.as_str()),
+        ("waiting_for_user_answer", "inbox")
+    );
+}
+
+#[tokio::test]
+async fn archive_cancels_an_orphaned_question_card() {
+    // A turn that ended without an answer leaves the thread idle with the
+    // question card still clickable. Archive admits that thread and resolves
+    // the card to "Canceled", so no dead buttons linger in the archive.
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -256,16 +319,9 @@ async fn archive_with_pending_question_emits_canceled_answer() {
         "tu-archive-{}",
         &Uuid::new_v4().as_simple().to_string()[..8]
     );
-    insert_user_question_asked(&pool, thread_id, &tool_use_id).await;
+    insert_user_question_asked_on(&pool, thread_id, &tool_use_id, "idle").await;
 
-    let url = format!("{}/api/v1/threads/archive", base_url());
-    let body = serde_json::json!({ "thread_id": thread_id.to_string() });
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .expect("request failed");
+    let resp = post_archive(thread_id).await;
     assert_eq!(resp.status().as_u16(), 200, "archive should succeed");
 
     // Wait for both UserQuestionAnswered (Canceled) and ThreadArchived to land.

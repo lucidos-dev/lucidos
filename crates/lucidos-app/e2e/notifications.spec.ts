@@ -31,6 +31,19 @@ async function postNotification(
   expect(res.ok(), `POST /api/v1/notifications -> ${res.status()}`).toBeTruthy();
 }
 
+/** Seed one event row inside a fresh thread id, for a notification to point
+ *  at. The engine refuses an `event_id` its thread does not hold, so even a
+ *  test that never follows the jump needs a real row. No thread summary is
+ *  written: the thread itself need not exist for these tests. */
+function seedThreadEvent(): { threadId: string; eventId: string } {
+  const threadId = randomUUID();
+  const eventId = randomUUID();
+  psql(
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${eventId}', 'UserQuestionAsked', '{}'::jsonb, NOW(), 'thread', '${threadId}', '${threadId}')`,
+  );
+  return { threadId, eventId };
+}
+
 /** Seed a chat thread with `exchanges` message/response pairs. The USER
  *  messages carry the height: a seeded chat response body does not render,
  *  since response text comes from streamed events rather than a bare
@@ -141,12 +154,13 @@ test.describe('Notification row: jump, or read the card', () => {
     await navigateToApp(page);
 
     // A source event makes this a jumping row, which is the only kind that has
-    // a chevron. The thread need not exist: nothing here follows the jump.
+    // a chevron. Nothing here follows the jump.
+    const source = seedThreadEvent();
     await postNotification(page, {
       title: 'Chevron reaches the card',
       message: 'the row body jumps to the thread instead',
-      thread_id: randomUUID(),
-      event_id: randomUUID(),
+      thread_id: source.threadId,
+      event_id: source.eventId,
     });
 
     await ensureMobileView(page, 'content');
@@ -510,12 +524,11 @@ test.describe('Declarative Web Push payload', () => {
     });
     expect(subRes.ok(), `POST /api/v1/push/subscribe -> ${subRes.status()}`).toBeTruthy();
 
-    // A UUID-formatted but synthetic thread/event id. focusThreadOrBootstrap
+    // A seeded event in a thread with no summary row. focusThreadOrBootstrap
     // surfaces a "Thread not found" toast, which is fine: the engine-side
     // payload shape and the page-side mark-read dispatch both fire whether or
     // not the target resolves to a thread row.
-    const fakeThreadId = '00000000-0000-4000-8000-000000000001';
-    const fakeEventId = '00000000-0000-4000-8000-000000000002';
+    const { threadId: fakeThreadId, eventId: fakeEventId } = seedThreadEvent();
 
     const res = await apiRequest(page).post('/api/v1/notifications', {
       headers: { 'content-type': 'application/json' },

@@ -985,7 +985,7 @@ EOF
 #
 # The E2ELockReleased emit comes AFTER the file is gone. A waiter woken by it
 # retries at once, so waking one to find the lock still held would spend one of
-# its ten consecutive subscriptions on nothing.
+# its ten subscriptions an hour on nothing.
 release_e2e_lock() {
     local owned="${E2E_LOCK_OWNED:-}"
     # Cleared up front: this shell is done with the lock either way, and the
@@ -1017,7 +1017,7 @@ release_e2e_lock() {
     # is silent about a missing file but NOT about a permission or filesystem
     # error, and announcing through one would wake every waiter onto a lock that
     # is still held: they retry, are refused, and each spends one of its ten
-    # consecutive subscriptions on a release that never happened. Tested in a
+    # subscriptions an hour on a release that never happened. Tested in a
     # condition rather than run bare for the reason the read above is: this is an
     # EXIT trap under `set -e`.
     #

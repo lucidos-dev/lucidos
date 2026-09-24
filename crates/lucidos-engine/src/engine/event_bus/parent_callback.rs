@@ -9,24 +9,113 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
-use crate::engine::thread_events::{CancelCause, ChildCompletionStatus, EventMeta, ThreadEvent};
+use crate::engine::thread_events::{
+    CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent,
+};
 use crate::engine::thread_lifecycle::ArchiveState;
 
-/// DB row from thread_summaries for child-to-parent fan-out:
-/// `(parent_thread_id, is_coding_agent, title, first_message,
-/// parent_callback_pending, parent_is_coding_agent)`. The last column is
-/// `Option<bool>` because it comes from a `LEFT JOIN` against the parent's
-/// own `thread_summaries` row — `None` either when the child has no parent
-/// (immediately filtered out below) or when that parent row is missing
-/// (corruption, no safe default).
-type ChildSummaryRow = (
-    Option<Uuid>,
-    bool,
-    Option<String>,
-    Option<String>,
-    bool,
-    Option<bool>,
-);
+/// What the fan-in reads about a child, in one self-joined query.
+///
+/// `parent_is_coding_agent` comes from a `LEFT JOIN` on the parent's own row.
+/// It is `None` when the child has no parent, or when that parent row is
+/// missing (corruption, no safe default).
+#[derive(sqlx::FromRow)]
+struct ChildRow {
+    parent_thread_id: Option<Uuid>,
+    is_coding_agent: bool,
+    title: Option<String>,
+    first_message: Option<String>,
+    parent_callback_pending: bool,
+    is_stopped_child: bool,
+    holds_live_wait: bool,
+    status: String,
+    coding_agent_proposed: bool,
+    parent_is_coding_agent: Option<bool>,
+}
+
+const CHILD_ROW_SQL: &str = "SELECT c.parent_thread_id, c.is_coding_agent, c.title, \
+            c.first_message, c.parent_callback_pending, c.is_stopped_child, \
+            c.live_event_wait_count > 0 AS holds_live_wait, c.status, \
+            c.coding_agent_proposed, p.is_coding_agent AS parent_is_coding_agent \
+     FROM thread_summaries c \
+     LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
+     WHERE c.thread_id = $1";
+
+/// Per-status summary caps. Success, no-changes and canceled summaries come
+/// from a real response the orchestrator may want most of. A failure summary
+/// is often a panic or a stack trace and must never dominate the parent's
+/// context.
+const SUCCESS_SUMMARY_CAP: usize = 2000;
+const FAILURE_SUMMARY_CAP: usize = 200;
+
+/// Cut `summary` to `cap` bytes on a char boundary, marking the cut.
+fn cap_summary(summary: String, cap: usize) -> String {
+    if summary.len() <= cap {
+        return summary;
+    }
+    let cut = summary.floor_char_boundary(cap);
+    format!("{}… (truncated)", &summary[..cut])
+}
+
+/// Whether a child is mid-turn, by the one in-flight definition the counters
+/// use. A child mid-turn is not owed a settle: its own terminal will report.
+fn in_flight(status: &str) -> bool {
+    crate::core::store::active_thread_statuses().contains(&status)
+}
+
+/// The name a completion card gives the child: its title, else the start of
+/// its first message.
+fn child_label(title: Option<String>, first_message: Option<String>) -> String {
+    title
+        .or_else(|| first_message.map(|m| m.chars().take(80).collect()))
+        .unwrap_or_else(|| "unknown task".into())
+}
+
+/// Which user act ended a child that still owed its parent a card: a
+/// *stopped child* (ADR 0252) or one that ended a turn holding an event wait
+/// (ADR 0254). Each becomes the summary of the canceled card, so the parent
+/// reads what the user actually did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildSettle {
+    Archived,
+    Discarded,
+    Deleted,
+}
+
+impl ChildSettle {
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Archived => "The user archived this child thread. Its work is not continuing.",
+            Self::Discarded => {
+                "The user discarded this child thread's change. Its work is not continuing."
+            }
+            Self::Deleted => "The user deleted this child thread. Its work is not continuing.",
+        }
+    }
+
+    /// Whether this act ends the child's event waits. Archive and delete do.
+    /// A discard does not, so a waiting child wakes again and its turn reports.
+    fn ends_waits(self) -> bool {
+        !matches!(self, Self::Discarded)
+    }
+}
+
+/// A canceled card a settle decided is owed, read while the child's row still
+/// exists. Delivered separately, because a delete must read before it deletes
+/// and deliver after it commits.
+pub(crate) struct OwedChildCard(ChildCompletion);
+
+/// One `ChildThreadCompleted` owed to a parent, ready to deliver. The terminal
+/// fan-in, a settle, and the end of a child's last event wait each build one.
+struct ChildCompletion {
+    child_thread_id: Uuid,
+    parent_id: Uuid,
+    parent_is_coding_agent: Option<bool>,
+    label: String,
+    status: ChildCompletionStatus,
+    summary: String,
+    terminal_event_id: Option<Uuid>,
+}
 
 /// What a wake changed on the parent's row, so a caller that then fails to
 /// drive a turn can put it back exactly.
@@ -113,6 +202,14 @@ impl EventBus {
         terminal_event_id: Option<Uuid>,
         event: &ThreadEvent,
     ) {
+        // Not a terminal, and still sometimes the moment a card falls due:
+        // see `announce_when_last_wait_ends`.
+        if let ThreadEvent::EventWaitCanceled { cause, .. } = event {
+            self.announce_when_last_wait_ends(child_thread_id, *cause)
+                .await;
+            return;
+        }
+
         // Cancel = user-driven, terminal. Abort splits on `AbortCause::is_transient`:
         // EngineShutdown / RecoveryAfterRestart are mid-retry (no decrement, no
         // callback — the resumed child's eventual idle would be orphaned);
@@ -172,45 +269,80 @@ impl EventBus {
             return;
         }
 
-        // Look up parent, child info, CC status, and whether the parent
-        // callback for this run is still pending. Self-join to pick up the parent's
-        // own `is_coding_agent` in the same roundtrip — the FanOut consumer
-        // needs it to pick the CC vs chat routing fork, and skipping the
-        // join would force a second query per child completion.
-        let row: Option<ChildSummaryRow> = match sqlx::query_as::<_, ChildSummaryRow>(
-            "SELECT c.parent_thread_id, c.is_coding_agent, c.title, c.first_message, \
-                    c.parent_callback_pending, p.is_coding_agent \
-             FROM thread_summaries c \
-             LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
-             WHERE c.thread_id = $1",
-        )
-        .bind(child_thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(Some(row)) => Some(row),
-            Ok(None) => return,
-            Err(e) => {
-                crate::log!(
-                    "[FanOut] Failed to look up parent for child {}: {}",
-                    child_thread_id,
-                    e
-                );
-                return;
-            }
-        };
-
-        let Some((
-            Some(parent_id),
+        let Some(ChildRow {
+            parent_thread_id: Some(parent_id),
             is_coding_agent,
             title,
-            first_msg,
+            first_message: first_msg,
             parent_callback_pending,
+            is_stopped_child,
+            holds_live_wait,
             parent_is_coding_agent,
-        )) = row
+            ..
+        }) = self.load_child_row(child_thread_id).await
         else {
             return;
         };
+
+        // **A user Stop pauses a child; it does not finish it** (ADR 0252).
+        // The child is alive and one message continues it, so the parent gets
+        // a note and no turn. A woken parent acts, and here it would act on
+        // work that is still running.
+        //
+        // `is_stopped_child` was set in-tx by the cancel's own projection arm,
+        // only when this turn was still owed a card and a person pressed Stop.
+        // A Stop the parent is owed nothing for returns in silence. A cancel an
+        // agent issued is not a Stop of the user's: it falls through and
+        // reports a canceled card, as it always did.
+        //
+        // While the child stays stopped, no terminal speaks for it. The idle
+        // that follows the Stop is the one that matters: the marker is still
+        // set, so without this it would reach the parent as a "completed"
+        // card. What settles a stopped child is a start event, which clears
+        // the flag and lets its turn report, or `settle_child`.
+        if let ThreadEvent::ResponseCanceled {
+            cause: CancelCause::UserStop,
+            ..
+        } = event
+        {
+            if is_stopped_child {
+                self.announce_stopped_child(
+                    parent_id,
+                    child_thread_id,
+                    child_label(title, first_msg),
+                )
+                .await;
+                return;
+            }
+            if !parent_callback_pending {
+                return;
+            }
+        } else if is_stopped_child {
+            return;
+        }
+
+        // **A child holding a live event wait has not finished** (ADR 0254).
+        // Arming a wait and ending the turn is the event-wait contract, and
+        // the wait wakes the child for another turn. So a turn that ends
+        // holding one reports nothing, and the marker stays set for the turn
+        // the wait wakes. A failed turn still reports: that is loud and worth
+        // knowing whatever comes next. A cancel that ended the child reports
+        // too.
+        if holds_live_wait
+            && matches!(
+                event,
+                ThreadEvent::CodingAgentIdled { .. }
+                    | ThreadEvent::ResponseGenerated { .. }
+                    | ThreadEvent::SessionEnded { .. }
+            )
+        {
+            crate::log!(
+                "[FanOut] Child {} ended a turn holding an event wait: no card until the \
+                 turn the wait wakes ends",
+                child_thread_id
+            );
+            return;
+        }
 
         // CC threads can emit CodingAgentIdled multiple times (initial work,
         // auto-harden, background agents). Only process the first one —
@@ -262,10 +394,9 @@ impl EventBus {
         };
         // Completion events trigger a callback to the parent (typed
         // ChildThreadCompleted on the parent thread) and surface the parent
-        // to inbox. ResponseCanceled is included so the parent sees a
-        // "Canceled" card and the LLM learns the child was stopped, except for
-        // a `SupersededByFollowup` redirect, which never reaches here (the
-        // `is_terminal` split above already returned).
+        // to inbox. ResponseCanceled is included for a cancel that is not a
+        // person's Stop: an agent cancelling its own child, or a `UserAction`.
+        // A person's Stop and a `SupersededByFollowup` redirect returned above.
         // ResponseAborted is NOT — the user already sees the child's error
         // state (SafetyNet/ProcessKilled), and engine-shutdown aborts are
         // transient (and were filtered out above). For coding-agent children,
@@ -303,15 +434,6 @@ impl EventBus {
         // `should_decrement && !should_callback` paths (CC terminal abort,
         // non-CC ResponseAborted/SessionEnded) used to land here only for
         // the decrement; the in-tx reconcile + in-tx broadcast now cover it.
-        // Held for the rest of the function: every path below that gives up on
-        // driving a turn hands it to `undo_parent_wake`, so the parent is not
-        // left reading "Requesting" against nothing.
-        let wake = if should_callback {
-            self.update_parent_after_child_terminal(parent_id).await
-        } else {
-            None
-        };
-
         if clear_callback_for_terminal_abort {
             self.clear_pending_parent_callback(child_thread_id).await;
         }
@@ -320,40 +442,12 @@ impl EventBus {
             return;
         }
 
-        let label = title
-            .or_else(|| first_msg.map(|m| m.chars().take(80).collect()))
-            .unwrap_or_else(|| "unknown task".into());
+        let label = child_label(title, first_msg);
 
-        // Fetch the child thread's last response text — becomes the
-        // `summary` field on the typed event (and the failure-error path
-        // overrides it below). 2000-char cap mirrors the previous prose
-        // path's truncation.
-        let last_response: Option<String> = sqlx::query_scalar(
-            "SELECT payload->>'text' FROM events \
-             WHERE aggregate_id = $1 AND event_type = 'ResponseGenerated' \
-             AND payload->>'text' IS NOT NULL AND payload->>'text' != '' \
-             ORDER BY created DESC LIMIT 1",
-        )
-        .bind(child_thread_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!(
-                "[FanOut] Failed to fetch child response for {}: {}",
-                child_thread_id,
-                e
-            );
-            None
-        });
+        // The child's last response text becomes the `summary` field on the
+        // typed event. The failure path overrides it with the error.
+        let last_response = self.last_response_text(child_thread_id).await;
 
-        // Per-status caps differ deliberately: success / no-changes / canceled
-        // summaries come from a real ResponseGenerated.text (or partial text)
-        // the orchestrator may want most of (2000 chars). Failure summaries
-        // come from ResponseFailed.error which is often a panic / stack trace
-        // and should never dominate the parent's context — re-cap to 200 chars
-        // (matching the pre-Phase-4 prose path) before truncation.
-        const SUCCESS_SUMMARY_CAP: usize = 2000;
-        const FAILURE_SUMMARY_CAP: usize = 200;
         let (status, summary, cap) = match event {
             ThreadEvent::CodingAgentIdled {
                 has_changes: true, ..
@@ -379,8 +473,7 @@ impl EventBus {
                 error.clone(),
                 FAILURE_SUMMARY_CAP,
             ),
-            // User-driven cancel — surface to parent so the LLM learns the
-            // child was stopped (and the UI shows a Canceled card). Pull the
+            // A cancel that ended the child. Pull the
             // partial-stream text from ResponseCanceled itself; falling back
             // to last_response would surface a *prior* turn's text and read
             // as if the canceled turn had completed.
@@ -398,16 +491,218 @@ impl EventBus {
             ),
         };
 
-        let summary = {
-            if summary.len() > cap {
-                let cut = summary.floor_char_boundary(cap);
-                let mut s = summary[..cut].to_string();
-                s.push_str("… (truncated)");
-                s
-            } else {
-                summary
-            }
+        self.deliver_child_completion(ChildCompletion {
+            child_thread_id,
+            parent_id,
+            parent_is_coding_agent,
+            label,
+            status,
+            summary: cap_summary(summary, cap),
+            terminal_event_id,
+        })
+        .await;
+    }
+
+    /// Read [`ChildRow`] for `child_thread_id`. `None` when the row is gone, or
+    /// when the read failed, which is logged.
+    async fn load_child_row(&self, child_thread_id: Uuid) -> Option<ChildRow> {
+        sqlx::query_as::<_, ChildRow>(CHILD_ROW_SQL)
+            .bind(child_thread_id)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                crate::log!(
+                    "[FanOut] Failed to look up child {}: {}",
+                    child_thread_id,
+                    e
+                );
+                None
+            })
+    }
+
+    /// The text of `child_thread_id`'s newest `ResponseGenerated`, if any.
+    async fn last_response_text(&self, child_thread_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'text' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseGenerated' \
+             AND payload->>'text' IS NOT NULL AND payload->>'text' != '' \
+             ORDER BY created DESC LIMIT 1",
+        )
+        .bind(child_thread_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!(
+                "[FanOut] Failed to fetch child response for {}: {}",
+                child_thread_id,
+                e
+            );
+            None
+        })
+    }
+
+    /// Deliver the card a waiting child held back, once its last event wait
+    /// ends without waking it (ADR 0254).
+    ///
+    /// A delivery or an expiry wakes the child, and that turn reports. Stop
+    /// waiting and an agent standing a wait down wake nothing, so without this
+    /// the parent would never hear. An archive or a discard of the thread is
+    /// the settle's business: see `settle_child`.
+    ///
+    /// Only an idle child still owed a card qualifies. A running child's own
+    /// terminal reports, and a stopped child waits for the user.
+    async fn announce_when_last_wait_ends(
+        &self,
+        child_thread_id: Uuid,
+        cause: EventWaitCancelCause,
+    ) {
+        if !matches!(
+            cause,
+            EventWaitCancelCause::UserStop | EventWaitCancelCause::AgentStandDown
+        ) {
+            return;
+        }
+        // Idle only. A failed or paused child still owes its parent a card,
+        // and the next resume or the settle carries it with the real status.
+        let Some(ChildRow {
+            parent_thread_id: Some(parent_id),
+            is_coding_agent,
+            title,
+            first_message: first_msg,
+            parent_callback_pending: true,
+            is_stopped_child: false,
+            holds_live_wait: false,
+            status,
+            coding_agent_proposed: proposed,
+            parent_is_coding_agent,
+        }) = self.load_child_row(child_thread_id).await
+        else {
+            return;
         };
+        if status != "idle" {
+            return;
+        }
+        crate::log!(
+            "[FanOut] Child {}'s last event wait ended without waking it: sending its \
+             parent {} the card it held back",
+            child_thread_id,
+            parent_id
+        );
+        let summary = self
+            .last_response_text(child_thread_id)
+            .await
+            .unwrap_or_default();
+        self.deliver_child_completion(ChildCompletion {
+            child_thread_id,
+            parent_id,
+            parent_is_coding_agent,
+            label: child_label(title, first_msg),
+            status: if is_coding_agent && !proposed {
+                ChildCompletionStatus::NoChanges
+            } else {
+                ChildCompletionStatus::Success
+            },
+            summary: cap_summary(summary, SUCCESS_SUMMARY_CAP),
+            terminal_event_id: None,
+        })
+        .await;
+    }
+
+    /// Record on the parent that a user Stop paused one of its children
+    /// (ADR 0252). No wake, no status write and no callback: the parent stays
+    /// exactly as it was, and reads the note on its next turn.
+    async fn announce_stopped_child(&self, parent_id: Uuid, child_thread_id: Uuid, label: String) {
+        // Box::pin for the same recursion `deliver_child_completion` breaks.
+        Box::pin(self.emit_or_log(
+            BusEvent::Thread {
+                thread_id: parent_id,
+                event: ThreadEvent::ChildThreadStopped {
+                    child_thread_id,
+                    child_thread_title: Some(label),
+                },
+                meta: EventMeta::NONE,
+            },
+            "[FanOut] ChildThreadStopped",
+        ))
+        .await;
+    }
+
+    /// Send the canceled card a child still owed its parent, because the user
+    /// archived, discarded or deleted it (ADR 0252, ADR 0254). A no-op for any other thread, so a caller need not check first.
+    ///
+    /// The caller decides WHICH thread the user acted on. A cascading archive
+    /// must pass only its root: a grandchild archived along with its parent
+    /// owes that parent nothing, and a card would un-archive it.
+    pub(crate) async fn settle_child(&self, child_thread_id: Uuid, settled_by: ChildSettle) {
+        if let Some(card) = self.owed_child_card(child_thread_id, settled_by).await {
+            self.deliver_owed_child_card(card).await;
+        }
+    }
+
+    /// The canceled card `child_thread_id` owes its parent if the user ends it
+    /// by `settled_by`, or `None` when it owes nothing.
+    ///
+    /// Owed means the marker is still set on a child not in flight: a stopped
+    /// child, one that ended a turn holding an event wait, or one a crash left
+    /// owed. A child still holding a wait owes nothing to an act that leaves
+    /// its waits alone, because it wakes again and its turn reports.
+    pub(crate) async fn owed_child_card(
+        &self,
+        child_thread_id: Uuid,
+        settled_by: ChildSettle,
+    ) -> Option<OwedChildCard> {
+        let ChildRow {
+            parent_thread_id: Some(parent_id),
+            title,
+            first_message,
+            parent_callback_pending: true,
+            holds_live_wait,
+            status,
+            parent_is_coding_agent,
+            ..
+        } = self.load_child_row(child_thread_id).await?
+        else {
+            return None;
+        };
+        if in_flight(&status) || (holds_live_wait && !settled_by.ends_waits()) {
+            return None;
+        }
+        Some(OwedChildCard(ChildCompletion {
+            child_thread_id,
+            parent_id,
+            parent_is_coding_agent,
+            label: child_label(title, first_message),
+            status: ChildCompletionStatus::Canceled,
+            summary: settled_by.summary().to_string(),
+            terminal_event_id: None,
+        }))
+    }
+
+    /// Deliver a card [`Self::owed_child_card`] decided is owed.
+    pub(crate) async fn deliver_owed_child_card(&self, card: OwedChildCard) {
+        crate::log!(
+            "[FanOut] Child {} settled by the user: sending its parent {} the canceled card",
+            card.0.child_thread_id,
+            card.0.parent_id
+        );
+        self.deliver_child_completion(card.0).await;
+    }
+
+    /// Wake the parent and deliver one `ChildThreadCompleted` to it.
+    async fn deliver_child_completion(&self, card: ChildCompletion) {
+        let ChildCompletion {
+            child_thread_id,
+            parent_id,
+            parent_is_coding_agent,
+            label,
+            status,
+            summary,
+            terminal_event_id,
+        } = card;
+        // Held for the rest of the function: every path below that gives up on
+        // driving a turn hands it to `undo_parent_wake`, so the parent is not
+        // left reading "Requesting" against nothing.
+        let wake = self.update_parent_after_child_terminal(parent_id).await;
 
         // Look up which proposed changes the child left in `pending` state.
         // CC chats that ended with `has_changes: true` typically have one;
@@ -446,7 +741,7 @@ impl EventBus {
         // fan-in is engine orchestration, not user/agent actor.
         let typed_event = ThreadEvent::ChildThreadCompleted {
             child_thread_id,
-            child_thread_title: Some(label.clone()),
+            child_thread_title: Some(label),
             status,
             summary,
             pending_change_ids,
@@ -776,7 +1071,9 @@ impl EventBus {
         // selecting legacy NULL-state rows. The NOT EXISTS makes the card the
         // thread's last word — scoped to `aggregate = 'thread'` to match
         // `lookup_last_activity` and never let a same-id non-thread event suppress
-        // a real fan-in. See the selection rationale above.
+        // a real fan-in. See the selection rationale above. A later
+        // `ChildThreadStopped` is not a reaction: it wakes nothing, so a card it
+        // follows is still unprocessed (ADR 0252).
         //
         // The OUTER `e.aggregate = 'thread'` is load-bearing for a second reason.
         // On a DOMAIN event `aggregate_id` holds the event TYPE NAME, not a uuid,
@@ -799,6 +1096,7 @@ impl EventBus {
                  WHERE later.aggregate = 'thread' \
                    AND later.aggregate_id = e.aggregate_id \
                    AND later.sequence > e.sequence \
+                   AND later.event_type <> 'ChildThreadStopped' \
                )",
         )
         .fetch_all(&self.pool)

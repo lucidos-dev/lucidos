@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { readScrollAnchor, anchorTargetTop, anchorTurnIsClamped, HEAD_CLAMPED_ATTR } from '../scrollAnchor';
+import { readScrollAnchor, readRowAnchor, rowTargetTop, anchorTargetTop, anchorTurnIsClamped, HEAD_CLAMPED_ATTR } from '../scrollAnchor';
 import { mockTranscript } from './scroll-test-helpers';
 
 // WHERE THE READER IS, said as content. The pair has to be exact and it has to
@@ -125,5 +125,76 @@ describe('anchorTurnIsClamped', () => {
     const here: string = dirname(fileURLToPath(import.meta.url));
     const source: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf8');
     expect(source).toContain(`${HEAD_CLAMPED_ATTR}={rowsHidden > 0 ? '' : undefined}`);
+  });
+});
+
+describe('readRowAnchor: a reading position that names a step row', () => {
+  // Three turns of 40 rows, 25px each, so a turn is 1000px tall.
+  const turns = ['t0', 't1', 't2'];
+  const make = (scrollTop: number) =>
+    mockTranscript({ ids: turns, turnHeight: 1000, rowsPerTurn: 40, scrollTop });
+
+  it('names the row at or above the line, inside the turn at the line', () => {
+    // 1310px down: turn t1 starts at 1000, so row 12 starts at 1300.
+    expect(readRowAnchor(make(1310))).toEqual({ rowEventId: 't1-r12', relTop: -10 });
+  });
+
+  it('answers the row exactly on the line with a relTop of zero', () => {
+    expect(readRowAnchor(make(1300))).toEqual({ rowEventId: 't1-r12', relTop: 0 });
+  });
+
+  it('answers null for a turn with no rows, which keeps the turn anchor', () => {
+    expect(readRowAnchor(mockTranscript({ ids: turns, turnHeight: 1000, scrollTop: 1310 }))).toBeNull();
+  });
+
+  it('names the first drawn row for a reader exactly on the first drawn turn', () => {
+    const el = mockTranscript({ ids: turns, renderFrom: 1, turnHeight: 1000, rowsPerTurn: 40, scrollTop: 0 });
+    // The reader sits exactly on t1's first row, which IS at the line.
+    expect(readRowAnchor(el)).toEqual({ rowEventId: 't1-r0', relTop: 0 });
+  });
+});
+
+describe('a position saved on a turn drawn with its head clamped', () => {
+  // THE REPORT: "its not remembering the position correctly". The window draws
+  // the floor turn's tail. A turn anchor taken there measures from the CLAMPED
+  // top. The next open draws the turn whole, and lands the reader above their
+  // place by the height of the rows that had been left out.
+  const turns = ['t0', 't1'];
+
+  function parkedInClampedTurn() {
+    const el = mockTranscript({ ids: turns, turnHeight: 1000, rowsPerTurn: 40, scrollTop: 300 });
+    el.setRowsHidden('t0', 20); // t0 shows rows 20..39 only, 500px
+    el.scrollTop = 300; // row 32 at the line: 12 rows into what is drawn
+    return el;
+  }
+
+  /** The next open: the same turn drawn whole, and the reader's row where it
+   *  really is, 20 rows further down the content. */
+  function reopenedWhole(el: ReturnType<typeof parkedInClampedTurn>) {
+    el.setRowsHidden('t0', 0);
+    el.scrollTop = 0;
+  }
+
+  it('the turn anchor lands above the reader', () => {
+    const el = parkedInClampedTurn();
+    const turnAnchor = readScrollAnchor(el)!;
+    reopenedWhole(el);
+    // Row 32 starts 800px into the whole turn; the turn anchor says 300.
+    expect(anchorTargetTop(el, turnAnchor)).toBe(300);
+    expect(anchorTargetTop(el, turnAnchor)).not.toBe(800);
+  });
+
+  it('the row anchor lands the reader on their row', () => {
+    const el = parkedInClampedTurn();
+    const rowAnchor = readRowAnchor(el)!;
+    expect(rowAnchor.rowEventId).toBe('t0-r32');
+    reopenedWhole(el);
+    expect(rowTargetTop(el, rowAnchor)).toBe(800);
+  });
+
+  it('the row anchor waits while its row is still clamped off', () => {
+    const el = parkedInClampedTurn();
+    el.setRowsHidden('t0', 35);
+    expect(rowTargetTop(el, { rowEventId: 't0-r32', relTop: 0 })).toBeNull();
   });
 });

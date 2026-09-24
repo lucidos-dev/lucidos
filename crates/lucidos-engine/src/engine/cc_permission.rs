@@ -507,7 +507,9 @@ async fn fetch_thread_origin_and_linkage(
 /// what side-effect grant an unattended one inherits. Walks the spawn tree from
 /// `thread_id` up to its root through the persisted `MessageOrigin` chain:
 ///
-///   * a `Device`, or a human-mode `Api` or `Workspace`, gives `Interactive`.
+///   * a `Device`, a human-mode `Api`, or any `Workspace` gives `Interactive`.
+///     A `Workspace` origin is a top spawn through `caller_*`: the CLI's, or
+///     one engine calling another. It lends nothing.
 ///   * a scheduler origin gives `Unattended` with that trigger's
 ///     `side_effect_grant`, read from the in-memory registry that boot rebuilds
 ///     from events.
@@ -552,12 +554,10 @@ pub async fn resolve_attend_mode(
                 }
                 (_, None) => return AttendMode::Unattended { grant: Vec::new() },
             },
-            MessageOrigin::Workspace { mode, .. } => {
-                return match mode {
-                    ActorMode::Human => AttendMode::Interactive,
-                    _ => AttendMode::Unattended { grant: Vec::new() },
-                };
-            }
+            // A top spawn from the CLI or another engine. Like a
+            // `ThreadLink` without linkage it is independent of its caller, so
+            // the walk stops and a human answers, whoever the caller was.
+            MessageOrigin::Workspace { .. } => return AttendMode::Interactive,
             MessageOrigin::ThreadLink { direction, .. } => {
                 // Only a Parent link means "the linked thread spawned me". A
                 // Child callback should never be a thread's originating origin,
@@ -1619,6 +1619,11 @@ pub async fn resolve_coding_agent_permission(
         log_context,
     )
     .await;
+    // A human answered the card, so agent messages held behind it go now
+    // (ADR 0256).
+    if let Some(engine) = engine.try_clone_arc() {
+        engine.spawn_held_message_release(entry.thread_id);
+    }
     true
 }
 
@@ -1671,6 +1676,30 @@ pub async fn resolve_pending_permissions_as_session_ended(
     .await;
 }
 
+/// The request ids of every permission card on thread `$1` nobody resolved.
+const UNRESOLVED_PERMISSION_REQUESTS_SQL: &str = "SELECT e.payload->>'request_id' \
+     FROM events e \
+     WHERE e.event_type = 'CodingAgentPermissionRequest' \
+       AND e.thread_id = $1 \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM events r \
+         WHERE r.event_type = 'CodingAgentPermissionResolved' \
+           AND r.payload->>'request_id' = e.payload->>'request_id' \
+       )";
+
+/// Whether `thread_id` has a permission card waiting on a human.
+pub(crate) async fn has_pending_permission_card(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS ({UNRESOLVED_PERMISSION_REQUESTS_SQL})"
+    ))
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Shared core of the two sweeps that clear every unresolved
 /// `CodingAgentPermissionRequest` on this thread as denied: the superseded path
 /// and the session-ended path. Mirrors `recover_orphan_cc_permission_requests`
@@ -1696,20 +1725,10 @@ async fn resolve_pending_permissions_with_reason(
     reason: &str,
     log_label: &str,
 ) {
-    let rows: Vec<(Option<String>,)> = match sqlx::query_as(
-        "SELECT e.payload->>'request_id' \
-         FROM events e \
-         WHERE e.event_type = 'CodingAgentPermissionRequest' \
-           AND e.thread_id = $1 \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM events r \
-             WHERE r.event_type = 'CodingAgentPermissionResolved' \
-               AND r.payload->>'request_id' = e.payload->>'request_id' \
-           )",
-    )
-    .bind(thread_id)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<(Option<String>,)> = match sqlx::query_as(UNRESOLVED_PERMISSION_REQUESTS_SQL)
+        .bind(thread_id)
+        .fetch_all(pool)
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -3239,6 +3258,51 @@ mod tests {
             AttendMode::Interactive,
             "a top spawn names its spawning thread for display, but is not in its privilege tree"
         );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `lucidos spawn-thread --relation top` stamps a `Workspace` origin with
+    /// `mode: agent`, even for a target in the caller's own workspace. It is a
+    /// top spawn like the tool's, so it asks a human and inherits no grant.
+    #[tokio::test]
+    async fn resolve_attend_mode_cli_top_spawn_asks_a_human() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-cli-top";
+        let root = Uuid::new_v4();
+        let spawned = Uuid::new_v4();
+        let from_elsewhere = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        let workspace_origin = |thread_id, mode| MessageOrigin::Workspace {
+            workspace: "myws".into(),
+            thread_id,
+            event_id: None,
+            user_agent: None,
+            mode,
+        };
+        insert_origin_event(
+            &pool,
+            spawned,
+            "MessageReceived",
+            &workspace_origin(Some(root), ActorMode::Agent),
+        )
+        .await;
+        insert_origin_event(
+            &pool,
+            from_elsewhere,
+            "MessageReceived",
+            &workspace_origin(None, ActorMode::Engine),
+        )
+        .await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        for thread_id in [spawned, from_elsewhere] {
+            assert_eq!(
+                resolve_attend_mode(&pool, &cfgs, thread_id).await,
+                AttendMode::Interactive,
+                "a top spawn from the CLI waits for a human, like the tool's"
+            );
+        }
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

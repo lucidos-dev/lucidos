@@ -192,6 +192,33 @@ export function keyboardBandPx(args: {
   return Math.max(0, innerHeight - vvHeight);
 }
 
+/** Pure decision: the padding a scroller must keep when the band drops, in px,
+ *  and 0 when the band alone is enough. This is the *band hold*.
+ *
+ *  A reader scrolled into the band would otherwise lose the padding under
+ *  them. The browser clamps their scrollTop and the content jumps, so a press
+ *  on a button lands its release on whatever moved there. The hold is the
+ *  least padding that keeps scrollTop valid, and it never grows back, so it
+ *  drains as the reader scrolls toward the content. It lets go at once when
+ *  the content it anchored shrinks, since that content is no longer there.
+ *  See `docs/plans/2026-09-24-the-keyboard-band-holds-the-scroll-anchor.md`. */
+export function heldBandPx(args: {
+  paddingPx: number;
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  bandPx: number;
+  heldPx?: number;
+  anchorContentPx?: number;
+}): number {
+  const { paddingPx, scrollTop, scrollHeight, clientHeight, bandPx, heldPx = Infinity, anchorContentPx = 0 } = args;
+  // A pixel of slack, since scrollHeight is whole and the padding need not be.
+  if (scrollTop <= 0 || scrollHeight - paddingPx < anchorContentPx - 1) return 0;
+  const room = scrollHeight - clientHeight - scrollTop;
+  const needed = Math.min(heldPx, Math.round(paddingPx - room));
+  return needed > bandPx ? needed : 0;
+}
+
 /** The band to assume on a focus before any keyboard has been measured.
  *  An iPhone's portrait keyboard is a little under half the screen, and
  *  over-reserving costs only scrollable slack nobody scrolls into. */
@@ -546,8 +573,58 @@ export function MobileSwipeContainer() {
     // the first resize arrives too late to change that decision.
     let seenBand = 0;
     let lastSetBand = -1;
+    // Each scroller's band hold (`heldBandPx`): the content height it anchors,
+    // and the scroll listener and mutation observer that re-measure it.
+    interface Hold { px: number; anchorContentPx: number; recheck: () => void; observer: MutationObserver }
+    const holds = new Map<HTMLElement, Hold>();
+    const releaseHold = (el: HTMLElement) => {
+      const hold = holds.get(el);
+      if (!hold) return;
+      el.removeEventListener('scroll', hold.recheck);
+      hold.observer.disconnect();
+      el.style.removeProperty('--keyboard-band-hold');
+      holds.delete(el);
+    };
+    const updateHold = (el: HTMLElement, bandPx: number) => {
+      const paddingPx = parseFloat(getComputedStyle(el).paddingBottom) || 0;
+      const hold = holds.get(el);
+      const px = heldBandPx({
+        paddingPx,
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+        bandPx,
+        heldPx: hold?.px,
+        anchorContentPx: hold?.anchorContentPx,
+      });
+      if (px === 0 || !el.isConnected) { releaseHold(el); return; }
+      if (hold?.px === px) return;
+      if (hold) hold.px = px;
+      else {
+        const recheck = () => updateHold(el, lastSetBand);
+        // Content that shrinks under the hold may move no scrollTop, so no
+        // scroll event says so. A mutation is the other way it shows up.
+        const observer = new MutationObserver(recheck);
+        observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true });
+        holds.set(el, { px, anchorContentPx: el.scrollHeight - paddingPx, recheck, observer });
+        el.addEventListener('scroll', recheck, { passive: true });
+      }
+      el.style.setProperty('--keyboard-band-hold', `${px}px`);
+    };
+    // A lower band checks every padded scroller; a higher one only needs to
+    // retire the holds it now covers. Both re-check the held ones, which is
+    // what retires a hold whose scroller has left the page.
+    const holdScrollAnchors = (px: number) => {
+      const scrollers = new Set(holds.keys());
+      if (px < lastSetBand) {
+        document.querySelectorAll<HTMLElement>('.mobile-swipe-pane .content-pane-body')
+          .forEach((el) => scrollers.add(el));
+      }
+      for (const el of scrollers) updateHold(el, px);
+    };
     const setBand = (px: number) => {
       if (px === lastSetBand) return;
+      holdScrollAnchors(px);
       lastSetBand = px;
       document.documentElement.style.setProperty('--keyboard-band', `${px}px`);
     };
@@ -668,7 +745,9 @@ export function MobileSwipeContainer() {
     // documents above. This effect is mobile-only, so no desktop pays for it.
     //
     // Behind the perf gate (utils/perfQueue.ts), which owns every timer a
-    // diagnostic costs. Read live, so the toggle needs no reload.
+    // diagnostic costs. Read live, so the toggle needs no reload. It goes with
+    // the dead-press probe (docs/temporary-measures.md), since ADR 0262 found
+    // the close it watches for was never the cause.
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     const stopPoll = () => {
       if (pollTimer === null) return;
@@ -712,6 +791,7 @@ export function MobileSwipeContainer() {
       window.removeEventListener('pageshow', onWake);
       document.removeEventListener('focusin', armBand);
       document.removeEventListener('focusout', onFocusOut);
+      for (const el of Array.from(holds.keys())) releaseHold(el);
       document.documentElement.style.removeProperty('--app-height');
       document.documentElement.style.removeProperty('--keyboard-band');
     };

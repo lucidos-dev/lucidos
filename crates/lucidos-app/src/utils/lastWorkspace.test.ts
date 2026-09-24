@@ -7,7 +7,33 @@ import {
   forgetLastWorkspace,
   rememberLastWorkspaceCount,
   recallLastWorkspaceCount,
+  WORKSPACE_SWITCHER_EXPANDED_KEY,
+  rememberWorkspaceSwitcherExpanded,
+  recallWorkspaceSwitcherExpanded,
 } from './lastWorkspace';
+
+describe('workspace switcher expand memory', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('starts folded when nothing is recorded', () => {
+    expect(recallWorkspaceSwitcherExpanded()).toBe(false);
+  });
+
+  it('round-trips both states at the raw device-global key', () => {
+    rememberWorkspaceSwitcherExpanded(true);
+    expect(recallWorkspaceSwitcherExpanded()).toBe(true);
+    expect(localStorage.getItem(WORKSPACE_SWITCHER_EXPANDED_KEY)).toBe('1');
+    rememberWorkspaceSwitcherExpanded(false);
+    expect(recallWorkspaceSwitcherExpanded()).toBe(false);
+  });
+
+  it('reads a corrupt stored value as folded', () => {
+    localStorage.setItem(WORKSPACE_SWITCHER_EXPANDED_KEY, 'yes please');
+    expect(recallWorkspaceSwitcherExpanded()).toBe(false);
+  });
+});
 
 describe('lastWorkspace memory', () => {
   beforeEach(() => {

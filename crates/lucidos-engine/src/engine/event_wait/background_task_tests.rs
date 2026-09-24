@@ -264,18 +264,18 @@ fn the_live_wait_cap_refuses_and_says_why() {
     }
 }
 
-/// The consecutive cap is what bounds the loop this mechanism could otherwise
-/// create: a turn re-entered by an engine-armed wait spawns another task and ends
-/// again, forever. Counting engine-armed waits stops it at the same ten the
-/// model gets.
+/// The recent-subscription cap is what bounds the loop this mechanism could
+/// otherwise create: a turn re-entered by an engine-armed wait spawns another
+/// task and ends again, forever. Counting engine-armed waits stops it at the
+/// same rate the model gets.
 #[test]
-fn the_consecutive_cap_refuses_at_the_same_limit_the_model_gets() {
+fn the_recent_subscription_cap_refuses_at_the_same_limit_the_model_gets() {
     let running = [task("build")];
     assert!(matches!(
         plan_wait(
             &running,
             &[],
-            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            Some(super::super::MAX_RECENT_SUBSCRIPTIONS),
             owner()
         ),
         ArmingPlan::Refused(_)
@@ -284,7 +284,7 @@ fn the_consecutive_cap_refuses_at_the_same_limit_the_model_gets() {
         plan_wait(
             &running,
             &[],
-            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS - 1),
+            Some(super::super::MAX_RECENT_SUBSCRIPTIONS - 1),
             owner()
         ),
         ArmingPlan::Arm(_)

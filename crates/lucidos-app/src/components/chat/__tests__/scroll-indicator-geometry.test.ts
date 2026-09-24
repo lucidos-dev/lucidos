@@ -3,7 +3,6 @@ import { describe, it, expect } from 'vitest';
 import {
   computeScrollIndicator,
   counterScaledRadiusPx,
-  estimateUnrenderedHeightPx,
   nextIndicatorVisibility,
   MAX_THUMB_FRACTION,
   MIN_THUMB_PX,
@@ -11,14 +10,12 @@ import {
   type ScrollIndicatorInput,
 } from '../scrollIndicator';
 
-/** A whole thread in the DOM (no windowing), 10 screens tall, at the very top. */
+/** A transcript 10 screens tall, at the very top. */
 function base(over: Partial<ScrollIndicatorInput> = {}): ScrollIndicatorInput {
   return {
     scrollTop: 0,
     scrollHeight: 8000,
     clientHeight: 800,
-    renderFromIndex: 0,
-    totalExchanges: 40,
     trackHeightPx: 600,
     ...over,
   };
@@ -54,67 +51,16 @@ describe('computeScrollIndicator: position maps the visible content region', () 
   });
 });
 
-describe('computeScrollIndicator: the un-rendered head of a windowed thread', () => {
-  // The transcript renders a trailing slice only (threadWindow.ts). The scroller
-  // therefore describes the rendered tail, which is what put the native thumb
-  // near the top of its track while the content on screen was deep in the thread.
-  const windowed = base({ renderFromIndex: 180, totalExchanges: 200, scrollTop: 0 });
-
-  it('does not report the top of the thread when only the tail is rendered', () => {
-    const geo = computeScrollIndicator(windowed);
-    expect(geo.thumbOffsetPx).toBeGreaterThan(0);
-    // 20 of 200 exchanges rendered: the viewport is somewhere in the last tenth.
-    expect(geo.thumbOffsetPx).toBeGreaterThan(windowed.trackHeightPx * 0.5);
-  });
-
-  it('reports further down the track than the same scroll position with everything rendered', () => {
-    const whole = computeScrollIndicator(base({ ...windowed, renderFromIndex: 0 }));
-    const partial = computeScrollIndicator(windowed);
-    expect(partial.thumbOffsetPx).toBeGreaterThan(whole.thumbOffsetPx);
-  });
-
-  it('draws a smaller thumb, because the thread is larger than the rendered slice', () => {
-    const whole = computeScrollIndicator(base({ ...windowed, renderFromIndex: 0 }));
-    const partial = computeScrollIndicator(windowed);
-    expect(partial.thumbHeightPx).toBeLessThan(whole.thumbHeightPx);
-  });
-
-  it('settles onto the exact position once the window grows to cover the thread', () => {
-    // Same scroller metrics, window expanded from 20 to all 200: the estimate
-    // collapses to 0 and the mapping becomes the plain one.
-    const expanded = computeScrollIndicator({ ...windowed, renderFromIndex: 0 });
-    expect(expanded.thumbOffsetPx).toBe(0);
-  });
-
-  it('still lands flush with the bottom of the track at the end of a windowed thread', () => {
-    const input = { ...windowed, scrollTop: 7200 };
-    const { thumbHeightPx, thumbOffsetPx } = computeScrollIndicator(input);
-    expect(thumbOffsetPx + thumbHeightPx).toBeCloseTo(input.trackHeightPx, 5);
-  });
-});
-
-describe('estimateUnrenderedHeightPx', () => {
-  it('is zero when the whole thread is rendered', () => {
-    expect(estimateUnrenderedHeightPx(base())).toBe(0);
-  });
-
-  it('scales with how many exchanges are missing', () => {
-    const few = estimateUnrenderedHeightPx(base({ renderFromIndex: 10, totalExchanges: 200 }));
-    const many = estimateUnrenderedHeightPx(base({ renderFromIndex: 100, totalExchanges: 200 }));
-    expect(many).toBeGreaterThan(few);
-  });
-
-  it('uses the rendered slice mean: 20 of 200 rendered over 8000px estimates 72000px above', () => {
-    expect(estimateUnrenderedHeightPx(base({ renderFromIndex: 180, totalExchanges: 200 })))
-      .toBeCloseTo(72000, 5);
-  });
-
-  it('is zero rather than infinite when nothing is rendered to average over', () => {
-    expect(estimateUnrenderedHeightPx(base({ renderFromIndex: 40, totalExchanges: 40 }))).toBe(0);
-  });
-
-  it('ignores a renderFromIndex past the total (a stale window against a shrunken thread)', () => {
-    expect(estimateUnrenderedHeightPx(base({ renderFromIndex: 500, totalExchanges: 40 }))).toBe(0);
+describe('computeScrollIndicator: it measures the drawn slice (ADR 0258)', () => {
+  // The render window draws older turns ABOVE the reader, and the anchor write
+  // moves scrollTop by their height so the content holds still. The thumb then
+  // describes the taller slice: smaller, and further down. That jump is the
+  // infinite-scroll trade ADR 0258 accepts.
+  it('shrinks and moves down when older turns are drawn above the reader', () => {
+    const before = computeScrollIndicator(base({ scrollTop: 400 }));
+    const after = computeScrollIndicator(base({ scrollTop: 400 + 4000, scrollHeight: 8000 + 4000 }));
+    expect(after.thumbHeightPx).toBeLessThan(before.thumbHeightPx);
+    expect(after.thumbOffsetPx).toBeGreaterThan(before.thumbOffsetPx);
   });
 });
 

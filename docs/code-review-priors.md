@@ -657,9 +657,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 - **`BACKGROUND_PROCESS_RULE`'s `/tmp/$(basename "$PWD").log` example is unique
   per session, not a shared path** (2026-08-13, Codex). The rule tells the agent
-  to redirect a long command's output so each blocking `TaskOutput` stays cheap
-  (it replays the task's whole accumulated output on every call), and builds the
-  example path from the worktree's basename. A `/tmp` name reads as
+  to redirect a chatty command's output so a long log never floods its context,
+  and builds the example path from the worktree's basename. A `/tmp` name reads as
   collision-prone across concurrent sessions. It is not: the engine prompt
   reaches only engine-spawned sessions, and every one runs in
   `deterministic_worktree_path`'s `thread-<short_thread_id>` directory, whose
@@ -1167,6 +1166,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A backfill re-point that stores `grown` over a render-all is not a lost
+  claim.** A reviewer sees the re-point effect in `ThreadView.tsx` call
+  `storeEdge`, which always writes `kind: 'grown'`. It then reads every history
+  landing as relabelling a deep link's or the chevron's render-all, so the claim
+  outlives its visit (ADR 0232).
+
+  The navigation reads never reach it. Both hold through `wholeHistoryHold`,
+  whose null keys match nothing in `anchorAfterBackfill`, so the re-point
+  stores nothing. A read that adds nothing drops its hold first
+  (`settleHistoryRead`). What remains is the reader's own scroll folding a page
+  in front of the window, and that window is the reader's to keep.
+
+  Re-flag with a navigation path that stores through `storeEdge`, or a hold
+  that names a turn for a whole-history read.
 
 - **The composer row's 0.750 ink fraction is the GEOMETRIC extent, with the
   stroke excluded.** A reviewer computes a glyph's painted extent by hand, as
@@ -3917,7 +3931,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   It does not, because `installWorkspaceStorage` (`utils/workspaceStorage.ts`)
   overrides `getItem`/`setItem`/`removeItem` on the `localStorage` instance and
   prefixes every key with `ws:<slug>:`. `GLOBAL_KEYS` is the entire exemption
-  list and holds two picker keys. That file says the device id in as many words:
+  list and holds only cross-workspace keys. That file says the device id in as many words:
   each workspace has its own device identity, deliberately. So the read is
   per workspace, and the migration runs once per workspace.
 

@@ -171,7 +171,11 @@ the shared permission chokepoint `engine::cc_permission::prompt_coding_agent_per
    *interactive* (unchanged: emit a card, wait). Trigger/scheduler at the root ⇒
    *unattended*, inheriting that trigger's `side_effect_grant` from the in-memory
    registry (rebuilt from events at boot ⇒ restart-safe). A user-rooted tree
-   stays interactive even when an agent spawned the leaf thread.
+   stays interactive even when an agent spawned the leaf thread. A top spawn,
+   by the `spawn_thread` tool or by `lucidos spawn-thread`, is not in its
+   caller's tree: the walk stops there and a human answers. The CLI route was
+   once read as unattended, which auto-denied cards in user-rooted work; see
+   `docs/plans/2026-09-23-top-spawn-permission-cards-ask-a-human.md`.
 2. **Static classification, no judge.** `classify_coding_agent_request` reuses the
    command guard's `static_classify` / `fallback_classify` (commands) plus a
    workspace-containment check (file writes) — deterministic, so the permission

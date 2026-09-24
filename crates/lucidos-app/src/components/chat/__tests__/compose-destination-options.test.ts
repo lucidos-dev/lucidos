@@ -49,6 +49,17 @@ describe('buildDestinationOptions — Lucidos source packaged gate', () => {
   });
 });
 
+describe('buildDestinationOptions: coding target order', () => {
+  it('lists repositories first, apps second', () => {
+    const opts = buildDestinationOptions(inputs({
+      apps: [{ id: 'habit-tracker', name: 'Habit Tracker' }],
+      externalRepos: [{ id: 'r1', name: 'my-project' }],
+    }));
+    const targets = values(opts).filter(v => /^(code|repo|app):/.test(v));
+    expect(targets).toEqual(['code:lucidos', 'repo:r1', 'app:habit-tracker']);
+  });
+});
+
 describe('buildDestinationOptions — loading / error / unavailable rows', () => {
   it('adds a loading row while lists pend, and no unavailable row yet', () => {
     const opts = buildDestinationOptions(inputs({

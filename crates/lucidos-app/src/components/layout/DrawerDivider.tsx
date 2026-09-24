@@ -1,20 +1,15 @@
-import { useCallback, useRef } from 'preact/hooks';
+import { useCallback } from 'preact/hooks';
 import { threadDrawerWidth, threadDrawerOpen, splitRatio, THREAD_DRAWER_WIDTH_KEY, SPLIT_RATIO_KEY } from '../../store/store';
 import { minDrawerWidth, minThreadPanePx, splitBounds } from '../../store/paneMinimums';
 import { beginPaneResize, endPaneResize, clampToRange, clampSplitRatio } from './splitHelpers';
+import { startDividerDrag } from './dividerDrag';
 
 export function DrawerDivider() {
   const visible = threadDrawerOpen.value && splitRatio.value > 0;
 
-  const dragging = useRef(false);
-
   const onPointerDown = useCallback((e: PointerEvent) => {
     e.preventDefault();
-    dragging.current = true;
-    const target = e.currentTarget as HTMLElement;
-    target.setPointerCapture(e.pointerId);
-
-    const contentRow = target.parentElement;
+    const contentRow = (e.currentTarget as HTMLElement).parentElement;
     if (!contentRow) return;
 
     beginPaneResize();
@@ -42,7 +37,6 @@ export function DrawerDivider() {
     const threadFloor = minThreadPanePx();
     const bounds = splitBounds();
     const onMove = (e: PointerEvent) => {
-      if (!dragging.current || !contentRow) return;
       const rect = contentRow.getBoundingClientRect();
       if (rect.width <= 1) return;
       const newWidth = clampToRange(
@@ -63,23 +57,11 @@ export function DrawerDivider() {
       }
     };
 
-    const cleanup = () => {
-      dragging.current = false;
-      target.removeEventListener('pointermove', onMove);
-      target.removeEventListener('pointerup', cleanup);
-      target.removeEventListener('pointercancel', cleanup);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+    startDividerDrag(e, onMove, () => {
       localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(threadDrawerWidth.value));
       localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatio.value));
       endPaneResize();
-    };
-
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    target.addEventListener('pointermove', onMove);
-    target.addEventListener('pointerup', cleanup);
-    target.addEventListener('pointercancel', cleanup);
+    });
   }, []);
 
   return (

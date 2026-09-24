@@ -3,11 +3,11 @@ import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../ev
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
-import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
+import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
-import type { ActorMode, EventSubscription, EventWaitCancelCause, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
+import type { ActorMode, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
 type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string; call_event_id?: string };
@@ -627,6 +627,19 @@ function failureEchoPredicate(exchange: Exchange): (text: string | undefined) =>
  *  flag to finalize pending steps. A non-last exchange can still be the one
  *  the engine is processing (chat mid-flight injection), so resolution must
  *  not trigger purely on `!isLast`. */
+/** Who sent a held message, as the row names them. A held message is always
+ *  agent-sent, so an origin the engine did not record reads as "an agent". */
+export function heldMessageSender(origin: MessageOrigin | undefined): string {
+  switch (origin?.kind) {
+    case 'thread_link':
+      return origin.title ? `"${origin.title}"` : 'another thread';
+    case 'workspace':
+      return `workspace "${origin.workspace}"`;
+    default:
+      return 'an agent';
+  }
+}
+
 export function exchangeResponseEvents(exchange: Exchange, isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
@@ -934,6 +947,24 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           restores: e.restores ?? 0,
           removes: e.removes ?? 0,
         });
+        break;
+      }
+      case 'MessageHeld': {
+        events.push({
+          type: 'held_message',
+          held_id: event._eventId ?? '',
+          text: event.text,
+          sender: heldMessageSender(event.origin),
+          released: false,
+        });
+        break;
+      }
+      case 'HeldMessageReleased': {
+        for (const row of events) {
+          if (row.type === 'held_message' && row.held_id === event.held_message_id) {
+            row.released = true;
+          }
+        }
         break;
       }
       case 'EventWaitStarted': {
@@ -1459,6 +1490,15 @@ export function isSpeechOnlyTurn(exchange: Exchange): boolean {
   if (exchange.tookTheTurn) return false;
   if (isLiveCallRow(exchange.userEvent)) return true;
   return isCallOnly(exchange);
+}
+
+/** Is this turn's response body folded away, given the reader's folded keys?
+ *
+ *  A speech-only turn draws no header, so it has no `⋯` stub and keeps its
+ *  body whatever the store holds. `ChatExchange` renders by this, and the
+ *  render window budgets by it, so the two cannot disagree. */
+export function turnBodyFolded(folded: ReadonlySet<string>, threadId: string, exchange: Exchange): boolean {
+  return folded.has(`${threadId}:${exchange.userSeq}`) && !isSpeechOnlyTurn(exchange);
 }
 
 /** True when this stretch of a call has been answered, so nothing is pending.
@@ -2109,7 +2149,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // deliberately does not make this boundary `current`
   // (`isExchangeStartEvent`), so it should hold no steps. If a future routing
   // path lands a real terminal in it, that terminal reports itself.
-  if (isUserStoppedWait(exchange.userEvent)) return 'done';
+  if (isTurnlessBoundary(exchange.userEvent)) return 'done';
   // A stretch of a call, holding no turn at all. The stale detector below has
   // nothing to have caught: it reads a transcript with no terminator as a
   // crash, and every finished call rendered "Aborted" until this arm.

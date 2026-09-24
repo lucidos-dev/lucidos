@@ -1056,3 +1056,67 @@ fn a_user_env_var_cannot_strand_a_session_that_asked_for_auto() {
         "the engine-owned opt-in must win over a user env var",
     );
 }
+
+// ── The Vertex relay stamp (plan invariants 3 and 9) ───────────────────────
+
+fn vertex_base_url(cmd: &tokio::process::Command) -> Option<String> {
+    collect_envs(cmd)
+        .get(std::ffi::OsStr::new("ANTHROPIC_VERTEX_BASE_URL"))
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
+#[test]
+fn a_session_with_a_relay_sends_its_vertex_calls_through_it() {
+    crate::api::actor::init_agent_origin_secret("build-command-relay-secret".to_string());
+    let p = std::path::Path::new("/tmp");
+    let args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    let mut cmd = tokio::process::Command::new("true");
+    stamp_vertex_relay(&mut cmd, &args, Some(4321));
+    let url = vertex_base_url(&cmd).expect("the relay URL is stamped");
+    assert!(
+        url.starts_with("http://127.0.0.1:4321/api/v1/vertex-relay/"),
+        "{url}"
+    );
+    assert!(relays_vertex_calls(&cmd));
+}
+
+/// A workspace's own Vertex base URL must not bypass the relay. It rides the
+/// token as the upstream instead.
+#[test]
+fn a_workspace_vertex_url_becomes_the_relays_upstream() {
+    crate::api::actor::init_agent_origin_secret("build-command-relay-secret".to_string());
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "ANTHROPIC_VERTEX_BASE_URL".to_string(),
+        "https://proxy.example/v1".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.user_env_vars = &user_env;
+    let mut with_relay = tokio::process::Command::new("true");
+    with_relay.env("ANTHROPIC_VERTEX_BASE_URL", "https://proxy.example/v1");
+    stamp_vertex_relay(&mut with_relay, &args, Some(4321));
+    let url = vertex_base_url(&with_relay).unwrap();
+    let override_hex = crate::api::hex::hex_lower(b"https://proxy.example/v1");
+    assert!(url.contains(&override_hex), "{url}");
+}
+
+/// No relay running leaves the session exactly as it was, and the parser then
+/// treats `thinking` text as reasoning.
+#[test]
+fn a_session_without_a_relay_keeps_its_own_vertex_url() {
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "ANTHROPIC_VERTEX_BASE_URL".to_string(),
+        "https://proxy.example/v1".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.user_env_vars = &user_env;
+    let mut cmd = tokio::process::Command::new("true");
+    cmd.env("ANTHROPIC_VERTEX_BASE_URL", "https://proxy.example/v1");
+    stamp_vertex_relay(&mut cmd, &args, None);
+    assert_eq!(
+        vertex_base_url(&cmd).as_deref(),
+        Some("https://proxy.example/v1")
+    );
+    assert!(!relays_vertex_calls(&cmd));
+}

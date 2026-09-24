@@ -453,12 +453,52 @@
     min-height: 0;
 }
 
+/* The width is set inline in rem by RepoPreviewSplit, clamped to the container.
+ * No fill of its own: it wears the pane's background, like the changed-files
+ * list does when it stands alone. */
 .repo-preview-split-sidebar {
     display: none;
-    flex: 0 0 16rem;
+    flex: 0 0 auto;
     overflow-y: auto;
-    border-right: 1px solid var(--border-color);
-    background: var(--bg-secondary);
+}
+
+/* Drawn like the pane dividers (.split-divider). The ::before widens the grab
+ * zone into the diff side only, so it never covers the sidebar's scrollbar. */
+.repo-preview-split-divider {
+    display: none;
+    flex: 0 0 var(--divider-width);
+    position: relative;
+    cursor: col-resize;
+    background: var(--border-color);
+    touch-action: none;
+    transition: background-color var(--duration-fast);
+}
+
+.repo-preview-split-divider::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: calc(-1 * var(--space-xs));
+    z-index: 1;
+}
+
+.repo-preview-split-divider[data-dragging] {
+    background: var(--text-muted);
+}
+
+.repo-preview-split-divider:focus-visible {
+    background: var(--text-muted);
+    /* The shared ring; the transparent outline is the forced-colors fallback. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .repo-preview-split-divider:hover {
+        background: var(--text-muted);
+    }
 }
 
 .repo-preview-split-main {
@@ -468,7 +508,8 @@
 }
 
 @container (min-width: 50rem) {
-    .repo-preview-split-sidebar {
+    .repo-preview-split-sidebar,
+    .repo-preview-split-divider {
         display: block;
     }
 }

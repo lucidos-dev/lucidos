@@ -1,13 +1,16 @@
 import { useState } from 'preact/hooks';
-import { currentCaptureContext, setCaptureContext } from '../../store/actions/preferences';
+import { currentAutocorrect, currentCaptureContext, setAutocorrect, setCaptureContext } from '../../store/actions/preferences';
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
-import { animationSpeed, enginePackaged, speedMultiplier } from '../../store/store';
+import { isIOS } from '../../utils/platform';
+import { animationSpeed, enginePackaged, preferences, speedMultiplier } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
+import { LoadableToggle } from '../shared/LoadableToggle';
 
-/** Settings → System → Debugging: developer/diagnostic toggles, off by default.
+/** Settings → System → Debugging: developer/diagnostic toggles, off by default
+ *  except Autocorrect.
  *
  *  - "Capture context per step" is a server preference (`capture_context`),
  *    moved here from the former Models → Debugging group so all diagnostics share
@@ -24,6 +27,10 @@ import { Explainer } from '../shared/Explainer';
  *    It lives here as a diagnostic — slowing animations down makes transition
  *    glitches inspectable; reading `animationSpeed.value` in render subscribes
  *    to the signal so the multiplier label updates live as you drag.
+ *  - "Autocorrect" is the device-scoped `autocorrect` preference, on iOS only.
+ *    It works around a UIKit bug rather than diagnosing one (ADR 0262). It
+ *    starts on, like autocorrect in any other app, and a device that keeps
+ *    hitting the bug turns it off.
  *  - "Communication surfaces" opens the surface gallery, which renders every
  *    toast, banner and dialog against realistic content and performs no
  *    operation. It is its own subview rather than rows here, because it is a
@@ -46,9 +53,9 @@ import { Explainer } from '../shared/Explainer';
  *    that is what the explainer states.
  *
  *  Every row's prose is behind an *explainer* (`components/shared/Explainer.tsx`)
- *  rather than sitting under the row as a `.settings-row-note`: this page is
- *  four toggles and was three quarters grey paragraph. Nothing here is
- *  state-dependent or a next action, so all four moved. */
+ *  rather than sitting under the row as a `.settings-row-note`: this page is a
+ *  handful of switches and was three quarters grey paragraph. Nothing here is
+ *  state-dependent or a next action, so every row's prose moved. */
 export function DebuggingSection() {
   // Lazy initializer: read localStorage once on mount, not on every render. The
   // panel remounts each time it's opened, so this reflects the current flag.
@@ -134,6 +141,32 @@ export function DebuggingSection() {
           <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">{speedMultiplier.value.toFixed(1)}x</span>
         </div>
       </div>
+      {/* iPhone and iPad only: the bug it works around is in iOS's own
+          keyboard, and elsewhere the switch would change nothing visible. */}
+      {isIOS() && (
+        <div class="settings-row" data-search-anchor="debugging:autocorrect">
+          <span class="settings-row-label">
+            Autocorrect
+            <Explainer title="Autocorrect">
+              <p>
+                Whether iOS corrects words as you type in Lucidos and its apps, on this device.
+              </p>
+              <p>
+                When autocorrect has just changed a word, iOS can keep the next
+                tap for itself, so Send or Submit does nothing. Close the
+                keyboard and tap again. If it happens often, turn autocorrect
+                off here.
+              </p>
+              <p>Spell-check underlines and sentence capitals stay either way.</p>
+            </Explainer>
+          </span>
+          <LoadableToggle
+            loaded={preferences.value.status === 'loaded'}
+            checked={currentAutocorrect()}
+            onChange={(c) => void setAutocorrect(c)}
+          />
+        </div>
+      )}
       <div class="settings-row" data-search-anchor="debugging:communication-surfaces">
         <span class="settings-row-label">
           Communication surfaces

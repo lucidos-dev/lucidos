@@ -41,7 +41,7 @@ pub fn get_notification_tool() -> ToolDefinition {
                 },
                 "event_id": {
                     "type": "string",
-                    "description": "Event uuid inside the originating thread. A tap then lands on it and pulses it, so pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
+                    "description": "Event uuid inside the originating thread. A tap then lands on it and pulses it. A trigger's source event id works only if that event is in a thread; a domain event is refused."
                 }
             },
             "required": ["title", "message"]

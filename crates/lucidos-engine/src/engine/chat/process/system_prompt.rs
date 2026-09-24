@@ -1462,7 +1462,7 @@ mod tests {
             "await_event",
             2_845,
             "four tests pin thirteen distinct phrases on it (forward-only plus \
-             the arming race, spent-and-resubscribe, the consecutive cap, the \
+             the arming race, spent-and-resubscribe, the recent-subscription cap, the \
              own-child carve-out), each one a failure that reached a user, and \
              `condition` carries the operator set that makes a filter valid. \
              Raised from 2,550 by ADR 0113: `event_type` now names the three \

@@ -1,4 +1,5 @@
 mod apply_now;
+pub(crate) mod background_task;
 mod cc_spawn_coalesce;
 pub(crate) mod coding_agent_kind;
 mod external_edits;
@@ -14,6 +15,7 @@ mod run_session;
 mod runtime_helpers;
 mod spawn;
 pub(crate) mod spawn_dispatcher;
+mod text_buffer;
 mod turn_gap;
 
 pub(crate) use cc_spawn_coalesce::{

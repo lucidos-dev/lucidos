@@ -1,7 +1,6 @@
 import { test, expect, Page } from './fixtures';
-import { randomUUID } from 'crypto';
 import { navigateToApp, assertHealthy, disarmFollowSeed } from './helpers';
-import { psql } from './db-helpers';
+import { psql, seedStepHeavyThread as seedStepHeavyThreadRows } from './db-helpers';
 
 /** WHERE a thread reopens, over one seeded thread longer than a page.
  *
@@ -11,11 +10,10 @@ import { psql } from './db-helpers';
  *  A *reading position* names a turn instead (`hooks/useScrollMemory.ts`), and
  *  ThreadView walks the window up to it.
  *
- *  The transcript is also PAGED (ADR 0230), and that bounds the promise. A turn
- *  inside the loaded pages is restored exactly. A turn BEHIND them is not
- *  chased: the thread opens at the top of the newest page and fetches nothing
- *  (ADR 0234). One test each, and the second is the guard against the chase
- *  being added later. A third covers a turn the thread SHRANK under since the
+ *  The transcript is also PAGED (ADR 0230). A turn inside the loaded pages is
+ *  restored exactly. A turn BEHIND them is chased, at most two large reads, and
+ *  a turn further back than that opens inside the loaded pages (ADR 0234). A
+ *  test for each, and one more for a turn the thread SHRANK under since the
  *  save, which lands on the nearest reachable offset at once.
  *
  *  The assertion is the reader's own question: which turn is at the top of the
@@ -38,6 +36,12 @@ const EVENTS_PER_TURN = 2 + STEPS_PER_TURN * 2;
  *  against it, so a fixture edit cannot silently make either test vacuous. */
 const PAGE_SIZE = 400;
 
+/** The reading position's chase: `MAX_READING_CHASES` reads of
+ *  `READING_CHASE_PAGE_SIZE` events (`components/chat/threadWindow.ts`).
+ *  Restated for the same reason as `PAGE_SIZE`. */
+const MAX_READING_CHASES = 2;
+const CHASE_PAGE_SIZE = 2000;
+
 /** Oldest turns a cold open does not load, whole or in part. The seed is 432
  *  events against a page of 400, so 32 stay on the server: turn 0 entire, and
  *  all but the tail of turn 1. */
@@ -50,50 +54,15 @@ const TURNS_BEHIND_THE_PAGE =
  *  app still honours. */
 const PARK_ON_TURN = 4;
 
-/** How long to watch before concluding nothing will fetch older history.
+/** How long to watch before concluding the chase is over.
  *
  *  A restore that cannot resolve its turn gives up after `RESTORE_DEADLINE_MS`
- *  (3s in `hooks/useScrollMemory.ts`), re-arming only while the transcript is
- *  still growing under it. A chase would start inside that window. The margin
- *  on top covers a slow cold open. */
-const NO_CHASE_WINDOW_MS = 5_000;
+ *  (3s in `hooks/useScrollMemory.ts`), re-arming while the transcript grows or
+ *  a chase read is in flight. The margin on top covers a slow cold open. */
+const CHASE_WINDOW_MS = 8_000;
 
-function seedStepHeavyThread(): { threadId: string; messageIds: string[] } {
-  const threadId = randomUUID();
-  const now = new Date().toISOString();
-  const messageIds: string[] = [];
-
-  const row = (type: string, payload: string) =>
-    `('${randomUUID()}', '${type}', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`;
-
-  const rows: string[] = [];
-  for (let t = 0; t < TURNS; t++) {
-    const messageId = randomUUID();
-    messageIds.push(messageId);
-    rows.push(`('${messageId}', 'MessageReceived', ` +
-      `'{"text":"turn ${t}","mode":"human","channel":"claude_code"}'::jsonb, ` +
-      `'${now}', 'thread', '${threadId}', '${threadId}')`);
-    for (let s = 0; s < STEPS_PER_TURN; s++) {
-      const useId = `e2e-${t}-${s}`;
-      rows.push(row('CodingAgentToolCalled',
-        `{"name":"Bash","args":{"command":"echo ${t}.${s}"},"description":"Run echo ${t}.${s}",` +
-        `"channel":"claude_code","tool_use_id":"${useId}","coding_agent":"claude-code",` +
-        `"request_event_id":"${messageId}"}`));
-      rows.push(row('CodingAgentToolResult',
-        `{"name":"","result":"${t}.${s} done","channel":"claude_code","tool_use_id":"${useId}",` +
-        `"coding_agent":"claude-code","request_event_id":"${messageId}"}`));
-    }
-    rows.push(row('ResponseGenerated',
-      `{"text":"Finished turn ${t}.","images":[],"request_event_id":"${messageId}"}`));
-  }
-
-  psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E reopen on the same turn', 'claude_code', '${now}', ${TURNS}, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
-    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
-  ].join(';\n'));
-
-  return { threadId, messageIds };
+function seedStepHeavyThread(turns = TURNS): { threadId: string; messageIds: string[] } {
+  return seedStepHeavyThreadRows({ turns, stepsPerTurn: STEPS_PER_TURN, title: 'E2E reopen on the same turn' });
 }
 
 /** The key a thread's *reading position* is recorded under
@@ -307,6 +276,11 @@ test.describe('Where a thread reopens', () => {
       (key) => localStorage.getItem(key), scrollKey(threadId));
     expect(recorded).toBe(`anchor:${parked.relTop}:${parked.id}`);
 
+    // The turn sits inside the page a cold open loads, so nothing is chased.
+    let olderReads = 0;
+    page.on('request', req => {
+      if (isOlderHistoryRead(req.url(), threadId)) olderReads += 1;
+    });
     await page.reload();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
 
@@ -323,18 +297,19 @@ test.describe('Where a thread reopens', () => {
     const restored = await restingOn(page);
     expect(Math.abs(restored.relTop - parked.relTop), 'and at the same offset')
       .toBeLessThanOrEqual(1);
+    expect(olderReads, 'a position inside the loaded page is never chased').toBe(0);
   });
 
-  /** The other side of the promise, and the decision behind it (ADR 0234).
+  /** A position behind the loaded page is CHASED, within a bound (ADR 0234).
    *
    *  A reader who walks far enough back leaves a position naming a turn the
-   *  next open does not load. The app opens at the top of the newest page and
-   *  fetches nothing to chase it. A chase spends exactly what paging bought,
-   *  and this test is what stops one coming back.
+   *  next open does not load. The open reads older history in large pages, at
+   *  most `MAX_READING_CHASES` of them, until that turn is loaded. Then the
+   *  walk lands the reader on it.
    *
    *  The position is seeded rather than walked to. It is the same key and the
    *  same stored form the test above reads back off the app's own write. */
-  test('a position behind the loaded page opens at the top of the newest page', async ({ page }) => {
+  test('a position behind the loaded page is chased and lands on its turn', async ({ page }) => {
     const { threadId, messageIds } = seedStepHeavyThread();
     seededThreads.push(threadId);
 
@@ -351,35 +326,41 @@ test.describe('Where a thread reopens', () => {
     const transcript = page.locator('.thread-content').first();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
 
-    // The count below means "nothing chased" only if nothing else had a reason
-    // to fetch. ADR 0230's escalation asks for a page when the transcript
-    // cannot scroll, so rule that out by measurement rather than by argument.
-    await expect.poll(
-      () => transcript.evaluate(el => el.scrollHeight - el.clientHeight),
-      { message: 'the newest page must fill the pane on its own' },
-    ).toBeGreaterThan(10);
+    await expect.poll(() => restingTurn(page, messageIds), {
+      message: 'the chase must land the reader on the turn they parked on',
+      timeout: 15_000,
+    }).toBe(0);
+    expect(olderReads, 'the chase is bounded').toBeGreaterThanOrEqual(1);
+    expect(olderReads, 'the chase is bounded').toBeLessThanOrEqual(MAX_READING_CHASES);
+  });
 
-    // The restore waits before it gives up, so a chase would start inside that
-    // window. Watch it out before concluding there is none.
-    await page.waitForTimeout(NO_CHASE_WINDOW_MS);
+  /** Past the bound the chase gives up, and the thread opens where a thread
+   *  with no reachable position opens: inside the loaded pages. The record is
+   *  kept, so a client holding the history still lands the reader later. */
+  test('a position beyond the chase opens inside the loaded pages', async ({ page }) => {
+    // Far enough back that two chase reads do not reach turn 0.
+    const turns = Math.ceil((PAGE_SIZE + MAX_READING_CHASES * CHASE_PAGE_SIZE) / EVENTS_PER_TURN) + 20;
+    const { threadId, messageIds } = seedStepHeavyThread(turns);
+    seededThreads.push(threadId);
 
-    expect(olderReads, 'the open must not fetch history to chase the position').toBe(0);
+    let olderReads = 0;
+    page.on('request', req => {
+      if (isOlderHistoryRead(req.url(), threadId)) olderReads += 1;
+    });
+
+    const beyond = `anchor:0:${messageIds[0]}`;
+    await openThread(page, threadId, beyond);
+    const transcript = page.locator('.thread-content').first();
+    await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
+
+    // The restore waits before it gives up. Watch it out first.
+    await page.waitForTimeout(CHASE_WINDOW_MS);
+
+    expect(olderReads, 'the chase stops at its bound').toBeLessThanOrEqual(MAX_READING_CHASES);
     await expect(transcript.locator(`[data-event-id="${messageIds[0]}"]`)).toHaveCount(0);
-
-    // The reader is somewhere inside the newest page, never behind it. WHERE
-    // inside is the render window's business and is tested beside the window:
-    // mobile-webkit takes a fill round chromium does not, which moves the top
-    // of the drawn slice by several turns. What this test owns is the
-    // give-up, and a chase would put the reader on turn 0.
-    expect(await restingTurn(page, messageIds),
-      'the open must rest on a turn the newest page holds')
-      .toBeGreaterThanOrEqual(TURNS_BEHIND_THE_PAGE);
-
-    // The record is KEPT, not retired. A client that does hold the history, or
-    // a later open after a backfill, still lands the reader on their turn.
-    const recorded = await page.evaluate(
-      (key) => localStorage.getItem(key), scrollKey(threadId));
-    expect(recorded, 'giving up must not destroy the reading position').toBe(behindThePage);
+    expect(await restingTurn(page, messageIds), 'the open rests on a loaded turn').toBeGreaterThan(0);
+    const recorded = await page.evaluate((key) => localStorage.getItem(key), scrollKey(threadId));
+    expect(recorded, 'giving up must not destroy the reading position').toBe(beyond);
   });
 
   /** A position the thread SHRANK under lands at once, then holds still.

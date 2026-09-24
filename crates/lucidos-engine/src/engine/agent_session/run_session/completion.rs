@@ -818,6 +818,11 @@ impl LucidosEngine {
                         )
                         .await;
                 }
+                // The user's Discard settles what a stopped child owed its
+                // parent (ADR 0252). A no-op for any other thread.
+                self.event_bus
+                    .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
+                    .await;
                 let discard_branch = worktree_current_branch(wt).await;
                 remove_discarded_worktree(wt, &repo_root, &branch_name, discard_branch.as_deref())
                     .await;

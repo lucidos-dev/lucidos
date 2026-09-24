@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, join } from 'node:path';
 import { chatExchangePropsEqual } from '../ChatExchange';
-import type { Exchange } from '../../../store/thread-events';
+import { turnBodyFolded, type Exchange } from '../../../store/thread-events';
 
 const STEP = { seq: 7, event: { type: 'CodingAgentToolCalled', created: 'T' } as never };
 
@@ -45,6 +45,31 @@ describe('the memo answers to the row clamp', () => {
 
   it('skips the render when the clamp is unchanged', () => {
     expect(chatExchangePropsEqual(props(80), props(80))).toBe(true);
+  });
+});
+
+/** The render window budgets by what the clamped slice DRAWS
+ *  (`rowsDrawnByClamp`). So the slice has to be chosen by the same two
+ *  questions, or the window counts rows this component never renders. */
+describe('the body is chosen by the questions the window asks', () => {
+  const source: string = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'ChatExchange.tsx'), 'utf8');
+
+  it('takes the clamp path by the shared predicate', () => {
+    expect(source).toContain('const clampApplies = headClampApplies(events, showDetails);');
+    expect(source).toMatch(/if \(clampApplies\) \{\s*(\/\/.*\s*)*visible = rowsHidden > 0/);
+  });
+
+  it('builds no body for a folded turn, and asks the shared helper whether it is', () => {
+    expect(source).toContain('turnBodyFolded(collapsedExchanges.value, threadId, exchange)');
+    expect(source).toContain('if (hasEvents && !bodyFolded) {');
+  });
+
+  it('reads a fold by thread and turn', () => {
+    const folds = new Set(['t1:1']);
+    expect(turnBodyFolded(folds, 't1', exchange())).toBe(true);
+    expect(turnBodyFolded(folds, 't2', exchange())).toBe(false);
+    expect(turnBodyFolded(new Set(), 't1', exchange())).toBe(false);
   });
 });
 

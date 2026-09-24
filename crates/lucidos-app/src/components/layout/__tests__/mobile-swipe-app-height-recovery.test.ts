@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { computeAppHeight, keyboardBandPx } from '../MobileSwipeContainer';
+import { computeAppHeight, heldBandPx, keyboardBandPx } from '../MobileSwipeContainer';
 
 // iOS PWA suspend/resume frequently dismisses the on-screen keyboard without
 // firing a fresh visualViewport `resize` event. The vv.resize handler is the
@@ -237,6 +237,59 @@ describe('keyboardBandPx', () => {
   });
 });
 
+// Lowering the band takes padding out from under a reader who may be scrolled
+// into it. The browser then clamps scrollTop and the content jumps, which is
+// how a mobile Save press lost its release to the layout moving under it.
+describe('heldBandPx', () => {
+  // The measured case: a 365px band, scrolled to 513 of a 513 maximum.
+  const intoTheBand = { paddingPx: 365, scrollTop: 513, scrollHeight: 1325, clientHeight: 812 };
+
+  it('keeps the padding the scroll position still needs when the band drops', () => {
+    expect(heldBandPx({ ...intoTheBand, bandPx: 0 })).toBe(365);
+  });
+
+  it('keeps only the part of the band the reader is scrolled into', () => {
+    expect(heldBandPx({ ...intoTheBand, scrollTop: 300, bandPx: 0 })).toBe(152);
+  });
+
+  it('holds nothing when the scroll position is inside the new range', () => {
+    expect(heldBandPx({ ...intoTheBand, scrollTop: 148, bandPx: 0 })).toBe(0);
+  });
+
+  it('holds nothing for a scroller the band does not pad', () => {
+    expect(heldBandPx({ ...intoTheBand, paddingPx: 0, bandPx: 0 })).toBe(0);
+  });
+
+  it('holds nothing once the live band covers what is needed', () => {
+    // A fresh reserve at focusin clears a leftover hold.
+    expect(heldBandPx({ ...intoTheBand, bandPx: 365, heldPx: 365 })).toBe(0);
+  });
+
+  it('drains as the reader scrolls back toward the content', () => {
+    expect(heldBandPx({ ...intoTheBand, scrollTop: 400, bandPx: 0, heldPx: 365 })).toBe(252);
+  });
+
+  it('lets go at the top, where no padding is needed', () => {
+    // Content shorter than the pane: the formula alone would keep one.
+    expect(heldBandPx({ paddingPx: 365, scrollTop: 0, scrollHeight: 812, clientHeight: 812, bandPx: 0, heldPx: 365 })).toBe(0);
+  });
+
+  it('lets go once the content it anchored has shrunk', () => {
+    // A form closed under the hold: the reader's anchor is gone, and keeping
+    // the padding would leave them looking at a blank band.
+    const shrunk = { paddingPx: 365, scrollTop: 300, scrollHeight: 1000, clientHeight: 700 };
+    expect(heldBandPx({ ...shrunk, bandPx: 0, heldPx: 365, anchorContentPx: 960 })).toBe(0);
+  });
+
+  it('keeps holding while the content it anchored is intact', () => {
+    expect(heldBandPx({ ...intoTheBand, bandPx: 0, heldPx: 365, anchorContentPx: 960 })).toBe(365);
+  });
+
+  it('never grows back when the reader scrolls down again', () => {
+    expect(heldBandPx({ ...intoTheBand, bandPx: 0, heldPx: 200 })).toBe(200);
+  });
+});
+
 describe('the band reaches the scroll container', () => {
   const mobileCss: string = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf-8');
 
@@ -259,9 +312,14 @@ describe('the band reaches the scroll container', () => {
     );
   });
 
-  it('is spent as padding inside the pane scroller', () => {
+  it('is spent as padding inside the pane scroller, a hold included', () => {
     expect(mobileCss).toMatch(
-      /\.mobile-swipe-pane \.content-pane-body \{\s*padding-bottom: var\(--keyboard-band, 0px\);/,
+      /\.mobile-swipe-pane \.content-pane-body \{\s*padding-bottom: max\(var\(--keyboard-band, 0px\), var\(--keyboard-band-hold, 0px\)\);/,
     );
+  });
+
+  it('holds the scroll anchors before it writes a lower band', () => {
+    // The order is the fix: layout must never see the band gone and no hold.
+    expect(swipeSource).toMatch(/holdScrollAnchors\(px\);\s*lastSetBand = px;\s*document\.documentElement\.style\.setProperty\('--keyboard-band'/);
   });
 });

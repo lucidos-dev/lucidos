@@ -343,6 +343,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         }
 
         let mut cmd = build_command(&args, cli_dir);
+        let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
@@ -363,6 +364,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             control_rx,
             cancel,
             initial_session_id,
+            stream_state,
         ));
 
         Ok(RunningAgent {
@@ -571,6 +573,9 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if permission_mode.needs_auto_opt_in() {
         cmd.env(AUTO_MODE_OPT_IN_ENV, "1");
     }
+    // Engine-owned, so it goes AFTER `apply_lucidos_env`. A workspace value
+    // then becomes the relay's upstream instead of bypassing the relay.
+    stamp_vertex_relay(&mut cmd, args, super::vertex_relay::port());
     // Root-cause fix for the stray-SIGTERM truncation bug: give CC its OWN
     // process group so a group-wide signal to the engine never reaches it.
     // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
@@ -592,6 +597,51 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
     // only effective knob is never consulted. See ADR 0075.
     cmd
+}
+
+/// Point the session's Vertex calls at the engine's relay, so an
+/// always-thinking model's notes come back (`runtime::vertex_relay`). A Vertex
+/// base URL the session would otherwise use becomes the relay's upstream.
+///
+/// Set for every session, not only Vertex ones: Claude Code reads the variable
+/// only on Vertex, and a settings file can switch Vertex on out of our sight.
+///
+/// A temporary measure: `docs/temporary-measures.md` § "Claude Code's Vertex
+/// calls go through the Vertex relay".
+fn stamp_vertex_relay(
+    cmd: &mut tokio::process::Command,
+    args: &SpawnArgs<'_>,
+    relay_port: Option<u16>,
+) {
+    use super::vertex_relay::{relay_base_url, ENV_VERTEX_BASE_URL};
+    let Some(port) = relay_port else { return };
+    let user_base = args
+        .user_env_vars
+        .iter()
+        .find(|(name, _)| name == ENV_VERTEX_BASE_URL)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(ENV_VERTEX_BASE_URL).ok());
+    match relay_base_url(port, args.thread_id, user_base.as_deref()) {
+        Some(url) => {
+            cmd.env(ENV_VERTEX_BASE_URL, url);
+        }
+        None => crate::log!(
+            "[ClaudeCode] no signing secret, so thread {} runs without the Vertex relay",
+            args.thread_id
+        ),
+    }
+}
+
+/// Whether `cmd` sends its Vertex calls through the relay. Read back off the
+/// command, so the parser's view cannot drift from what the spawn stamped.
+fn relays_vertex_calls(cmd: &tokio::process::Command) -> bool {
+    let name = std::ffi::OsStr::new(super::vertex_relay::ENV_VERTEX_BASE_URL);
+    cmd.as_std().get_envs().any(|(key, value)| {
+        key == name
+            && value
+                .and_then(|v| v.to_str())
+                .is_some_and(super::vertex_relay::is_relay_url)
+    })
 }
 
 /// Which of Claude Code's own permission modes a session runs in, resolved
@@ -816,10 +866,11 @@ pub(crate) fn format_exit_status(
 /// detached `driver_task`, off the cancel UX path, so the wait costs no
 /// interactive latency. See `spawn_env::graceful_kill_child_process_group`.
 ///
-/// Shared with both Codex drivers, which tear down the same way and reap the
-/// same browsers. Tuning this upward is the documented answer to a fresh
-/// pile-up, and a driver holding its own literal would sit out that fix.
-pub(super) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Shared with both Codex drivers and the background-task registry, which tear
+/// down the same way and reap the same browsers. Tuning this upward is the
+/// documented answer to a fresh pile-up, and a caller holding its own literal
+/// would sit out that fix.
+pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
@@ -835,6 +886,7 @@ async fn driver_task(
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
     cancel: CancellationToken,
     mut session_id: Option<String>,
+    mut stream_state: CcStreamState,
 ) {
     // Capture the child pid before the wait arm consumes the Child:
     // `tokio::process::Child::id()` returns `None` once `wait()` resolves, and
@@ -850,11 +902,9 @@ async fn driver_task(
     // group-kill below: after reaping, the pid (hence the group id) may be
     // recycled, so signalling the group would risk unrelated processes.
     let mut child_reaped = false;
+    // `stream_state` spans lines of THIS stream, and only this one. The driver
+    // task owns it, so it lives and dies with the subprocess.
     let mut line_buf = String::new();
-    // Parse state that spans lines of THIS stream, and only this one. Owned by
-    // the driver task, so it lives and dies with the subprocess and no other
-    // session can see it. Today it holds the per-message usage dedup.
-    let mut stream_state = CcStreamState::default();
     loop {
         tokio::select! {
             read_result = stdout_reader.read_line(&mut line_buf) => {

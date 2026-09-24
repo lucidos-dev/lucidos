@@ -415,6 +415,7 @@ fn gated_router() -> axum::Router {
             "/threads/:thread_id/messages",
             axum::routing::get(|| async { "ok" }),
         )
+        .route("/preferences", axum::routing::put(|| async { "ok" }))
         .layer(axum::middleware::from_fn(super::enforce_app_reach));
     axum::Router::new().nest(super::super::API_V1_PREFIX, inner)
 }
@@ -468,6 +469,75 @@ async fn a_stamped_call_is_refused_per_method() {
     assert_eq!(
         status_of("GET", "/api/v1/env-vars", Some("habit-tracker")).await,
         axum::http::StatusCode::OK
+    );
+}
+
+/// `/preferences` is an `App` route, yet a key the agent may not write is
+/// refused to an app too. Otherwise an app turns the command guard off, raises
+/// the tool-call cap, or opens the engine bind that `/network-config` keeps
+/// host-only.
+#[tokio::test]
+async fn a_stamped_write_of_a_human_only_preference_is_refused() {
+    use axum::http::StatusCode;
+    for query in [
+        "key=command_guard",
+        "key=network_bind",
+        "key=max_tool_calls",
+        "key=provider_enabled_vertex",
+        "key=command%5Fguard",
+        "key=theme&key=command_guard",
+    ] {
+        assert_eq!(
+            status_of(
+                "PUT",
+                &format!("/api/v1/preferences?{query}"),
+                Some("habit-tracker")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an app wrote the human-only preference in `{query}`"
+        );
+    }
+}
+
+/// The bridge stamps the decoded app id, and `fetch` sends a Latin-1 character
+/// as one raw byte. A stamp that is not ASCII is still a stamp.
+#[tokio::test]
+async fn a_stamp_that_is_not_ascii_is_still_refused() {
+    use tower::ServiceExt as _;
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/api/v1/preferences?key=command_guard")
+        .header(
+            APP_ID_HEADER,
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let status = gated_router()
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status();
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn an_app_still_writes_an_ordinary_preference_and_the_shell_writes_any() {
+    use axum::http::StatusCode;
+    assert_eq!(
+        status_of(
+            "PUT",
+            "/api/v1/preferences?key=theme",
+            Some("habit-tracker")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of("PUT", "/api/v1/preferences?key=command_guard", None).await,
+        StatusCode::OK,
+        "Settings writes the human-only keys through this same route"
     );
 }
 

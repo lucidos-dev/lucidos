@@ -232,6 +232,20 @@ pub(in crate::api) async fn delete_thread_family(
     let surviving_parent = parent_outside_family(&mut tx, thread_uuid)
         .await
         .map_err(internal)?;
+    // A deleted child that still owed its surviving parent a card settles it
+    // (ADR 0252, ADR 0254). Read now, while the row exists; delivered after
+    // the commit, because the card's projection writes the child's row, which
+    // this transaction holds locked.
+    let owed_card = match surviving_parent {
+        Some(_) => {
+            state
+                .engine
+                .event_bus
+                .owed_child_card(thread_uuid, crate::engine::event_bus::ChildSettle::Deleted)
+                .await
+        }
+        None => None,
+    };
     let coding_agents = recorded_branches(&mut tx, &coding_agent_members(&family))
         .await
         .map_err(internal)?;
@@ -251,6 +265,9 @@ pub(in crate::api) async fn delete_thread_family(
     // Before the emit. The frame is what makes every client re-read the list,
     // and a re-read that lands first reads the stale counts.
     repair_ancestor_counts(&state, surviving_parent).await;
+    if let Some(card) = owed_card {
+        state.engine.event_bus.deliver_owed_child_card(card).await;
+    }
 
     state
         .engine

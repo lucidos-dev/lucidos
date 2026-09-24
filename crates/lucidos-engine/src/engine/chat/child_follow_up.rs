@@ -190,6 +190,9 @@ pub enum FollowUpDelivery {
     /// answer the question (that route requires `mode == Human`), so it sits in
     /// the channel until a human answers.
     WaitingForUserAnswer,
+    /// A coding-agent child waiting on a human: an open question, or older
+    /// held messages. The message is held and delivered once a human replies.
+    Held,
     /// Not in flight. A fresh turn starts now.
     Revived,
 }
@@ -253,7 +256,9 @@ impl FollowUpDelivery {
             // Nothing to preempt (`Revived`), or preempting would break a
             // promise (`WaitingForUserAnswer`), or the caller did not ask
             // (`Running`).
-            Self::Running | Self::WaitingForUserAnswer | Self::Revived => FollowUpUrgency::Normal,
+            Self::Running | Self::WaitingForUserAnswer | Self::Held | Self::Revived => {
+                FollowUpUrgency::Normal
+            }
         }
     }
 
@@ -271,6 +276,10 @@ impl FollowUpDelivery {
             Self::WaitingForUserAnswer => {
                 "The child is parked on a question or a permission card. It will not read \
                  this until a human answers."
+            }
+            Self::Held => {
+                "The child is waiting on a human, so this is held. It is delivered once a human \
+                 replies."
             }
             Self::Revived => "The child was not working, so a fresh turn starts now.",
         }
@@ -429,10 +438,24 @@ impl crate::engine::LucidosEngine {
             return Err(ChildFollowUpError::ChildDiscarded(child_thread_id));
         }
 
+        // The router holds this message for a coding-agent child waiting on a
+        // human (ADR 0256), so the ack has to say so.
+        let held = row.uses_coding_agent()
+            && super::held_messages::message_is_held(
+                pool,
+                child_thread_id,
+                crate::engine::thread_events::ActorMode::Agent,
+                None,
+            )
+            .await;
         let ack = FollowUpAck {
             child_thread_id,
             child_title: row.label(),
-            delivered_to: FollowUpDelivery::from_status(row.status, urgency),
+            delivered_to: if held {
+                FollowUpDelivery::Held
+            } else {
+                FollowUpDelivery::from_status(row.status, urgency)
+            },
         };
         Ok((row, ack))
     }

@@ -105,6 +105,8 @@ impl ThreadEvent {
         match self {
             Self::MessageReceived { .. } => "MessageReceived",
             Self::QueuedMessageRemoved { .. } => "QueuedMessageRemoved",
+            Self::MessageHeld { .. } => "MessageHeld",
+            Self::HeldMessageReleased { .. } => "HeldMessageReleased",
             Self::TextStreamed { .. } => "TextStreamed",
             Self::ThoughtStreamed { .. } => "ThoughtStreamed",
             Self::ContextCaptured { .. } => "ContextCaptured",
@@ -166,6 +168,7 @@ impl ThreadEvent {
             Self::CommandCheckpointReverted { .. } => "CommandCheckpointReverted",
             Self::WorktreeCleaned { .. } => "WorktreeCleaned",
             Self::ChildThreadCompleted { .. } => "ChildThreadCompleted",
+            Self::ChildThreadStopped { .. } => "ChildThreadStopped",
             Self::ContextDismissed { .. } => "ContextDismissed",
             Self::ContextKeptOpen { .. } => "ContextKeptOpen",
             Self::ImageDescribed { .. } => "ImageDescribed",
@@ -214,6 +217,8 @@ impl ThreadEvent {
     pub const RESERVED_TYPE_NAMES: &'static [&'static str] = &[
         "MessageReceived",
         "QueuedMessageRemoved",
+        "MessageHeld",
+        "HeldMessageReleased",
         "TextStreamed",
         "ThoughtStreamed",
         "ContextCaptured",
@@ -275,6 +280,7 @@ impl ThreadEvent {
         "CommandCheckpointReverted",
         "WorktreeCleaned",
         "ChildThreadCompleted",
+        "ChildThreadStopped",
         "ContextDismissed",
         "ContextKeptOpen",
         "ImageDescribed",

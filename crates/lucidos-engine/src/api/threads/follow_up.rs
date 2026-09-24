@@ -73,7 +73,7 @@ pub(in crate::api) struct FollowUpResponse {
     /// The child's human-meaningful handle. Callers name the child by this and
     /// never by uuid: no screen in Lucidos is labelled with a uuid.
     child_title: String,
-    /// `running` | `interrupted` | `waiting-for-user-answer` | `revived`.
+    /// `running` | `interrupted` | `waiting-for-user-answer` | `held` | `revived`.
     /// Kebab-case because it is a public API parameter value (`CLAUDE.md`).
     delivered_to: &'static str,
     /// One sentence saying what that means, so a caller does not have to keep
@@ -90,6 +90,7 @@ fn delivered_to_wire(delivery: FollowUpDelivery) -> &'static str {
         FollowUpDelivery::Running => "running",
         FollowUpDelivery::Interrupted => "interrupted",
         FollowUpDelivery::WaitingForUserAnswer => "waiting-for-user-answer",
+        FollowUpDelivery::Held => "held",
         FollowUpDelivery::Revived => "revived",
     }
 }

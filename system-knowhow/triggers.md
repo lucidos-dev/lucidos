@@ -46,7 +46,7 @@ what the user asked for is delivery into this conversation, and only
 `await_event` does that. It costs nothing while it watches: the call returns
 immediately, the turn ends normally, and the engine re-opens the thread when the
 event lands, so the report arrives where they are reading. It is one-shot, so you
-re-arm per event, and consecutive subscriptions are capped (the tool description
+re-arm per event, and how often you re-arm is capped (the tool description
 carries the number), which is exactly why an unbounded promise belongs to a
 trigger instead.
 
@@ -427,6 +427,8 @@ The scheduler auto-creates an error notification when a trigger fails. Don't dou
 
 By default, trigger runs are unattended — their threads go straight to Archive when they finish, and only surface in the Current section if the user follows up with a message. This is right for most cron triggers (silent imports, periodic syncs, idle nudges).
 
+A run that stops to ask the user a question, or to ask permission, always surfaces in Current, whatever `go_to_review` says. It stays there until the user answers or stops it.
+
 Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in the Current section on completion so it's not lost in Archive.
 
 | User phrasing that answers it | Flag |
@@ -527,6 +529,8 @@ Source event id: 7a9c2c5f-…
 
 …carries the UUID of the event that fired the trigger. Pass that value to `send_notification`'s `event_id`. The push tap then deep-links to the exact event the trigger was about — the question card pulses on land, no scrolling needed.
 
+**Only a thread event qualifies.** A workspace domain event (anything `emit_event` wrote, such as `E2ETestsPassed`) gets a `Source event id` line too, but it lives in no thread. No transcript can show it, so `send_notification` refuses it as `event_id`, and `lucidos notify` refuses it as `--event-id`. Omit `event_id` for those, and the tap opens the notification card. The same refusal covers an event from a different thread than the one the tap opens.
+
 For schedule (cron) triggers there is no source event, so no `event_id`. For on-event triggers that notify about *a different* event (e.g. fire on `CodingAgentIdled` but notify about the last `UserQuestionAsked`), look the right event up yourself with `query_events` and use that id.
 
 #### Worked example: push when agent needs me
@@ -574,7 +578,7 @@ When the engine fires a script trigger that subscribes to a domain event, it set
 |---|---|---|
 | `TRIGGER_EVENT_TYPE` | Always on event fires | The matched event name (e.g. `UserQuestionAsked`). Use as a fallback title or when the script genuinely needs to branch on type. |
 | `TRIGGER_EVENT_PAYLOAD` | Always on event fires | The source event's payload, serialized as JSON. Parse with `json.loads(os.environ["TRIGGER_EVENT_PAYLOAD"])`. |
-| `TRIGGER_EVENT_ID` | When the source event has a row id | The `events.id` (UUID) of the source row. Pass to `lucidos notify --event-id` so the push tap scroll-and-pulses the exact card. |
+| `TRIGGER_EVENT_ID` | When the source event has a row id | The `events.id` (UUID) of the source row. Pass it to `lucidos notify --event-id`, beside `--thread-id "$TRIGGER_EVENT_THREAD_ID"`, so the push tap scroll-and-pulses the exact card. A domain event has no thread, so leave it out then: the engine refuses an event outside the linked thread. |
 | `TRIGGER_EVENT_THREAD_ID` | Only for *thread-scoped* source events | The thread the source event lives on. Pass to `lucidos notify --tap navigate --thread-id` so the push deep-links to the originating conversation instead of the trigger's own thread (which is `LUCIDOS_THREAD_ID`). |
 
 The trigger's own thread is `LUCIDOS_THREAD_ID` (same env var every spawned subprocess gets). `TRIGGER_EVENT_THREAD_ID` is the *source* event's thread — these are different threads. A script that mixes them up will deep-link the push into the trigger's own (uninteresting) thread instead of where the user actually needs to act.
@@ -674,6 +678,8 @@ The categories are: **email**, **external API** (mutating HTTP), **cloud CLI** (
 **The grant is set by the user, not by you.** The `create_trigger` / `update_trigger` tools do **not** accept a grant field, and that is deliberate: an autonomous agent can't widen its own unattended authority. The user grants side-effects in the trigger's settings UI (the "Allowed side-effects" checkboxes). So when you build a trigger whose intent needs an irreversible side-effect (e.g. "email me the digest every morning"), **tell the user** they must tick the matching side-effect (here, *Send email or messages*) in the trigger's settings; with command safety on, the run otherwise fails the first time it tries to send. If command safety is off, none of this applies and the command runs unguarded.
 
 **The grant also flows to coding-agent work the trigger spawns.** When a trigger's intent launches a *coding-agent thread* (Claude Code / Codex), directly or via a sub-thread an orchestrator spawns, that thread runs **unattended**, with no human to answer the coding agent's permission cards. Instead of hanging on a card forever, the engine resolves each request from the same side-effect grant (it walks the spawn tree to its root trigger and inherits that trigger's grant): benign in-workspace work (reads, in-workspace edits, git, `lucidos data write` to `data/`) is auto-allowed, an irreversible side-effect is allowed only if its category is in the grant, and a catastrophic command is always denied. Unlike the chat command guard (which fails the *whole* run on an ungranted side-effect), the coding-agent path denies just the one request, and the agent gets the denial and works around it or reports the step failed. This is independent of the command safety toggle. So a coding-agent trigger that needs, say, a mutating HTTP call still needs the user to tick **Call external APIs** on the trigger; otherwise that one call is denied (the rest of the run proceeds). See `coding-agent-events.md` § "Unattended auto-resolution".
+
+The flow follows child spawns only. A top spawn, by `spawn_thread` with `relation: "top"` or by `lucidos spawn-thread` without `--relation child`, is independent of the trigger: its cards wait for a human. Spawn the coding agent as a child when the run must finish unattended. A spawn into another workspace is always a top spawn, so it always asks.
 
 ## Edit, don't recreate
 

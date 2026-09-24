@@ -643,12 +643,11 @@ html:not([data-theme="light"]) .action-btn-confirm {
     /* A cell must never break mid-word, because a break opportunity inside a
      * word lowers the column's MIN-CONTENT width to a single character, and a
      * column that can be one character wide is one the table layout will make
-     * one character wide. Two rules reach in and do exactly that, so both are
-     * overridden here: `word-break: break-word` on .response-content
-     * (mobile.css), which despite its name means `overflow-wrap: anywhere`,
-     * and `word-break: break-all` on .markdown-content a (below). The
-     * replacement, `overflow-wrap: break-word`, still breaks a token that
-     * genuinely does not fit, but does not count toward min-content. */
+     * one character wide. `word-break: break-word` on .markdown-content and
+     * .response-content does exactly that, since despite its name it means
+     * `overflow-wrap: anywhere`, so it is overridden here. The replacement,
+     * `overflow-wrap: break-word`, still breaks a token that genuinely does
+     * not fit, but does not count toward min-content. */
     word-break: normal;
     overflow-wrap: break-word;
     /* No single column may exceed a comfortable line length. Auto table layout
@@ -769,7 +768,8 @@ html:not([data-theme="light"]) .action-btn-confirm {
     text-decoration: underline;
     text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
     text-underline-offset: 0.125rem;
-    word-break: break-all;
+    /* No `word-break` here. A link inherits the container's, which wraps link
+       text at its spaces and breaks a long URL only where it cannot fit. */
 }
 
 @media (hover: hover) {

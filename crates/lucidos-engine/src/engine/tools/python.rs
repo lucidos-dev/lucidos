@@ -276,11 +276,8 @@ impl LucidosEngine {
             log!("[PythonBg] failed to emit BackgroundBashStarted: {}", e);
         }
 
-        // Reuse the bash watcher — same registry, same completion
-        // contract, same auto-wake for parked CC sessions. The watcher's
-        // wake text refers to "Background task" (language-agnostic, not
-        // "Background bash task") so the LLM sees the right framing for
-        // both bash- and python-spawned tasks.
+        // Reuse the bash watcher: same registry, same completion event,
+        // and so the same event wait re-opens the thread.
         self.spawn_bash_completion_watcher(thread_id, task_id.clone(), finish_rx);
 
         Ok(serde_json::json!({

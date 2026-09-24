@@ -24,12 +24,13 @@ mod dispatcher;
 mod register;
 
 pub(crate) use agent_surface::CancelEventWaitOutcome;
-/// Re-exported so the `await_event` tool description interpolates the real cap.
-/// A restated number would silently drift from the refusal the model hits.
-pub(crate) use register::MAX_CONSECUTIVE_SUBSCRIPTIONS;
-/// Same reason: the schema's `maximum` must be the cap the refusal uses.
+/// Re-exported so the `await_event` schema's `maximum` is the cap the refusal
+/// uses.
 pub(crate) use register::MAX_TIMEOUT_SECS;
 pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
+/// Re-exported so the `await_event` tool description interpolates the real cap.
+/// A restated number would silently drift from the refusal the model hits.
+pub(crate) use register::{MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_SECS};
 
 use std::collections::HashMap;
 
@@ -601,9 +602,38 @@ pub fn delivery_reentry_text(event_type: &str, payload: &Value, reason: &str) ->
     format!(
         "An event you subscribed to has arrived (you were waiting because: {reason}).\n\n\
          {event_type}:\n{}{WAIT_SPENT_NOTICE}",
-        serde_json::to_string_pretty(payload)
+        serde_json::to_string_pretty(&tail_long_strings(payload))
             .unwrap_or_else(|_| "<unserializable payload>".to_string()),
     )
+}
+
+/// The most of any one string field a re-entry prints.
+const REENTRY_STRING_MAX_BYTES: usize = 4000;
+
+/// The payload with every string over [`REENTRY_STRING_MAX_BYTES`] cut to its
+/// tail.
+///
+/// A re-entry becomes the next turn's prompt, and some payloads carry a whole
+/// log: a `BackgroundBashCompleted` holds up to a megabyte of stdout. The TAIL
+/// is kept because that is where a build or test run reports how it ended.
+/// The marker leads, so the reader knows the start is missing before reading.
+fn tail_long_strings(value: &Value) -> Value {
+    match value {
+        Value::String(s) if s.len() > REENTRY_STRING_MAX_BYTES => {
+            let start = s.ceil_char_boundary(s.len() - REENTRY_STRING_MAX_BYTES);
+            Value::String(format!(
+                "[{start} earlier bytes cut, the full value is in the event]\n…{}",
+                &s[start..]
+            ))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(tail_long_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), tail_long_strings(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// The text an expiry re-entry carries.

@@ -365,6 +365,9 @@ pub(crate) const MAX_IMAGE_BASE64_BYTES: usize = 4_500_000;
 /// Larger images waste tokens without improving understanding.
 const MAX_IMAGE_DIMENSION: u32 = 2048;
 
+/// Longest image side Claude accepts. A longer side fails the whole request.
+const PROVIDER_MAX_IMAGE_SIDE: u32 = 8000;
+
 impl ChatImage {
     /// Always compress images for LLM consumption: re-encode as JPEG (quality 85)
     /// and cap dimensions at `MAX_IMAGE_DIMENSION`. This reduces token usage and
@@ -447,24 +450,38 @@ impl ChatImage {
         }
     }
 
-    /// Ensure this image's base64 payload fits the LLM's per-image size target,
-    /// compressing (JPEG re-encode + downscale via [`compress`]) only when it's
-    /// over. Images already within budget pass through untouched — no re-encode,
-    /// no quality loss, original format preserved.
+    /// Fit this image to what a model accepts. It runs [`compress`] when the
+    /// base64 payload is over `MAX_IMAGE_BASE64_BYTES` or either side is over
+    /// `PROVIDER_MAX_IMAGE_SIDE`. Otherwise it returns the image untouched, in
+    /// its original format, with no quality loss.
     ///
-    /// This is the single decision point for "is this image small enough to send
-    /// to a model". Every LLM-bound image path routes through it — chat message
-    /// blocks, the image-description pass, and `read_file` — so the
-    /// compress-or-skip rule lives in exactly one place and an oversized photo
-    /// can't reach a provider's hard limit (Claude rejects images over 5 MB).
+    /// This is the single decision point for "can this image go to a model".
+    /// Every LLM-bound image path routes through it: chat message blocks, the
+    /// image-description pass, `read_file` and `view_image`. A full-page
+    /// screenshot is often under the byte limit but over the side limit.
     ///
     /// [`compress`]: ChatImage::compress
     pub(crate) fn fit_for_llm(self) -> Self {
-        if self.base64.len() <= MAX_IMAGE_BASE64_BYTES {
-            self
-        } else {
+        if self.base64.len() > MAX_IMAGE_BASE64_BYTES || self.exceeds_provider_max_side() {
             self.compress()
+        } else {
+            self
         }
+    }
+
+    /// Reads only the image header. An image it cannot read counts as within
+    /// bounds, because [`ChatImage::compress`] could not decode it either.
+    fn exceeds_provider_max_side(&self) -> bool {
+        use base64::Engine as _;
+
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&self.base64) else {
+            return false;
+        };
+        image::ImageReader::new(std::io::Cursor::new(raw))
+            .with_guessed_format()
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+            .is_some_and(|(w, h)| w.max(h) > PROVIDER_MAX_IMAGE_SIDE)
     }
 }
 
@@ -1830,6 +1847,48 @@ mod tests {
         let result = img.fit_for_llm();
         assert_eq!(result.base64, "AAAA");
         assert_eq!(result.mime_type, "image/png");
+    }
+
+    /// A single-colour PNG: a page background compresses to very few bytes.
+    fn make_flat_png(width: u32, height: u32) -> ChatImage {
+        let flat: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(width, height, Rgba([240, 240, 240, 255]));
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        flat.write_to(&mut png_buf, image::ImageFormat::Png)
+            .unwrap();
+        let img = ChatImage {
+            base64: base64::engine::general_purpose::STANDARD.encode(png_buf.into_inner()),
+            mime_type: "image/png".to_string(),
+        };
+        assert!(img.base64.len() <= MAX_IMAGE_BASE64_BYTES);
+        img
+    }
+
+    #[test]
+    fn fit_for_llm_keeps_an_image_the_provider_accepts_byte_identical() {
+        // Over the 2048 px compress cap, but within Claude's limits.
+        let img = make_flat_png(3000, 7900);
+        let original = img.base64.clone();
+        let result = img.fit_for_llm();
+        assert_eq!(result.base64, original);
+        assert_eq!(result.mime_type, "image/png");
+    }
+
+    #[test]
+    fn fit_for_llm_downscales_a_tall_image_that_is_small_in_bytes() {
+        // A full-page screenshot: few bytes, but taller than Claude's 8000 px limit.
+        let img = make_flat_png(1485, 8420);
+
+        let result = img.fit_for_llm();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.base64)
+            .unwrap();
+        let loaded = image::load_from_memory(&decoded).unwrap();
+        let (w, h) = image::GenericImageView::dimensions(&loaded);
+        assert!(
+            w <= MAX_IMAGE_DIMENSION && h <= MAX_IMAGE_DIMENSION,
+            "dimensions {w}x{h} must be <= {MAX_IMAGE_DIMENSION}"
+        );
     }
 
     #[test]

@@ -995,9 +995,10 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
 
 /** Whether a thread needs the user's attention. It sits in the Current or
  *  Saved section AND the agent is stuck waiting on the user: a question or a
- *  permission request, both of which surface as `waiting_for_user_answer`, or
- *  a failed turn. This is the "nothing progresses until you act" subset, where
- *  a change merely READY to apply is `threadInReview`, a separate view.
+ *  permission request, both of which surface as `waiting_for_user_answer`, a
+ *  failed turn, or a *stopped child* whose parent waits on it (ADR 0252). This
+ *  is the "nothing progresses until you act" subset, where a change merely
+ *  READY to apply is `threadInReview`, a separate view.
  *
  *  Both statuses are mutually exclusive with `running`, so no running guard is
  *  needed. A composing or discarded thread never qualifies. Shared by
@@ -1022,7 +1023,11 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
   // coding-agent turn that failed with one counts here, instead of hiding
   // behind the change. It is in the Review view too, since `threadInReview`
   // only excludes a RUNNING thread.
-  return status === 'waiting_for_user_answer' || status === 'failed';
+  //
+  // A stopped child is idle, so no status says it. Its parent is asleep until
+  // the user continues, archives or discards it, and nothing else will.
+  return status === 'waiting_for_user_answer' || status === 'failed'
+    || thread.meta.isStoppedChild === true;
 }
 
 /** Whether a thread is ready for review. It sits in the Current or Saved

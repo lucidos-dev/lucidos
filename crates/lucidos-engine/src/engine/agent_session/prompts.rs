@@ -136,8 +136,10 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     (`.claude/skills/implementation-plan/SKILL.md`) — it turns the prompt, any grill/design \
     thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records a \
     PROPOSED plan marker via `lucidos planned mark --plan <path>`. A proposed plan does NOT \
-    unblock editing: present the plan to the user, then ASK FOR APPROVAL WITH THE QUESTION TOOL \
-    named in the ASKING USERS section, offering `Approve` and `Request changes`. That pair is a \
+    unblock editing: summarize the plan in your message, then ASK FOR APPROVAL WITH THE QUESTION \
+    TOOL named in the ASKING USERS section, offering `Approve` and `Request changes`. The card \
+    renders under your message, so its question is one short line that never repeats the \
+    summary. The option pair is a \
     FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers no real fork. If \
     it offers one (a narrower scope, one layer instead of two), that fork takes the second slot \
     and `Request changes` is dropped, never carried alongside it as a third. The approval itself \
@@ -146,9 +148,9 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     approves, run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do \
     source edits and Apply unblock. Picking a fork is an approval too: revise the plan file to \
     that variant, re-commit, then run `lucidos planned approve`. If the user requests changes \
-    instead, revise the plan file, re-commit, and present it again, asking the same way (the \
-    marker stays proposed until approved). If this is genuinely a local fix, acknowledge that \
-    instead with \
+    instead, revise the plan file, re-commit, and ask again: the new message names only what \
+    changed, and the plan file holds the rest (the marker stays proposed until approved). If \
+    this is genuinely a local fix, acknowledge that instead with \
     `lucidos planned mark --simple \"<one-line reason>\"` (no \
     approval needed). A gate-satisfying marker MUST \
     exist before the change can be applied: Claude \
@@ -175,19 +177,6 @@ const RESTART_NOT_REJECTION_RULE: &str = "RESTART CONTEXT — NOT A REJECTION: T
     those signals. Re-confirm where you left off (the git log/diff steps above) and continue the \
     same plan, unless the user has since told you otherwise in a new message.";
 
-/// Tell the agent that "Task not found" after a task ends is expected. The
-/// engine evicts the bg-bash registry record on completion, and the agent's own
-/// task-list entries are cleaned up too. Without the rule the agent reads the
-/// error as a failure and retries.
-///
-/// Covers all three lookup tools, so one sighting in any prompt inoculates the
-/// model. Chat-style prompts only: merge-conflict sessions run no bg tasks.
-const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends, its registry \
-    record is evicted — so subsequent `TaskOutput`, `TaskUpdate`, or `TaskList` calls referencing \
-    that id return errors like \"Task not found\" or \"task already completed\". This is \
-    **expected**, not a bug. Treat the error as confirmation the task is done; do NOT retry the \
-    call.";
-
 /// Teach the *build slot* wrapper to sessions in somebody else's repo.
 ///
 /// Only those. A Lucidos-source session needs none of it: `make lint` and
@@ -202,91 +191,56 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
     frees when your command exits, or if the kernel kills it.";
 
 /// Tell the coding agent that background processes do NOT outlive the turn that
-/// started them.
+/// started them, and name the two waits that work.
 ///
 /// A coding-agent session is a per-turn subprocess. When the turn goes idle the
 /// engine tears down the whole process group, the agent and every child it
 /// spawned (`lifecycle::terminate_decision`,
-/// `runtime::spawn_env::graceful_kill_child_process_group`). Nothing re-invokes
-/// the agent when a backgrounded job later finishes: that wake path exists only
-/// for the *chat* agent's tracked `run_bash_background` tool. Left alone the
+/// `runtime::spawn_env::graceful_kill_child_process_group`). Left alone the
 /// agent trusts its Bash tool's native "runs across turns" contract, which is
-/// true for the standalone CLI and false here.
+/// true for the standalone CLI and false here. Claude Code also dropped its
+/// blocking `TaskOutput` wait, so the rule must not name one.
 ///
-/// The second half of the rule is about the COST of that wait. "Wait inside the
-/// turn" alone reads as "tick until done", and the cheapest-looking tick is the
-/// tool default of 120000 ms. Both waits can block instead: a foreground command
-/// accepts an explicit `timeout` up to 600000 ms, and `TaskOutput` takes
-/// `block: true` with the same ceiling. Naming those two ceilings is what turns
-/// twenty polls into four. Spell the numbers the same way here as in the prompt
-/// string and the test needles, so one grep finds every site.
+/// The two shapes are a foreground call and a *background task*. The first
+/// names its 600000 ms ceiling, because the tool default of 120000 ms cuts a
+/// long build off. The second is `lucidos background-task run`: the engine
+/// owns the job and arms an event wait. The agent ends its turn, and no
+/// request re-reads the context while the work runs. See
+/// `docs/plans/2026-09-23-coding-agents-wait-on-background-tasks-through-event-waits.md`.
 ///
-/// Fewer calls is only half the saving, because `TaskOutput` is not a delta:
-/// every call replays the task's whole accumulated output. Four blocking calls
-/// therefore cost four copies of the build log unless the task is quiet.
-/// Redirecting stdout and stderr to a log file at spawn time is what makes it
-/// quiet. The obvious `sleep N; tail -c` improvisation does not: a fixed sleep
-/// ignores an early exit, so it trades one waste for another.
+/// The example log path is per-worktree (`$(basename "$PWD")`), because
+/// concurrent sessions share `/tmp` and a fixed name truncates another
+/// session's log.
 ///
-/// The blocking call is named rather than dropped, even though Claude Code's
-/// own `TaskOutput` description now points at the task's output file. Reading a
-/// file is not a WAIT. A Lucidos turn that stops issuing tool calls has its
-/// process group torn down under the running task.
-///
-/// The example log path is per-worktree (`$(basename "$PWD")`) rather than a
-/// fixed `/tmp/run.log`. Concurrent sessions share `/tmp`, and the second to
-/// open a fixed name truncates the first's log under a running build. That
-/// basename is `deterministic_worktree_path`'s `thread-<short_thread_id>`, so it
-/// is already unique. It is deliberately not the worktree-local `.lucidos/`
-/// that `/harden` writes to, which is Lucidos-checkout-only: four flavors here
-/// run in an external repo or an app worktree.
-///
-/// The foreground half carries a trap worth naming in the prompt. Overrunning
-/// the tool timeout KILLS the command, so maxing it out is only safe when the
-/// run fits. An uncertain estimate belongs on the background path. Applies to
-/// chat-style prompts only; merge-conflict sessions run no builds.
-///
-/// The subagent arm exists because Claude Code flipped its `Agent` tool to
-/// async by default. A launch now returns before the work does, so a `/harden`
-/// Phase 2 fan-out yields three detached agents and no reports. Facing a hard
-/// "do not end the turn" with no named wait, one session improvised two stalls:
-/// a filler subagent whose whole prompt was the word `placeholder`, then a
-/// fabricated question that parked a live thread on an unanswerable card.
-/// Naming `run_in_background: false` is what removes the incentive.
+/// The subagent arm exists because Claude Code runs an `Agent` launch in the
+/// background by default. Facing "do not end the turn" with no named wait, one
+/// session improvised a filler subagent and then a fabricated question. Naming
+/// `run_in_background: false` is what removes the incentive.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
-    ends (you go idle), the Lucidos engine terminates your whole process group — you and every \
+    ends (you go idle), the Lucidos engine terminates your whole process group: you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
     detached job) is therefore KILLED the instant you end the turn, and nothing re-invokes you \
-    when it would have finished; the next turn just starts it over from scratch. So NEVER kick \
-    off a long-running command in the background and then end your turn expecting to be woken \
-    with its result — you won't be. Instead: run the command in the FOREGROUND (that keeps your \
-    turn open while it runs), or, for work too long for a single foreground command's tool \
-    timeout, start it in the background and wait it out WITHIN THE SAME TURN. Only finish once \
-    you actually have the command's result. WAIT IN AS FEW CALLS AS YOU CAN — having to wait is \
-    not a reason to poll on a short tick. Foreground: set the timeout EXPLICITLY to its maximum \
-    (Claude Code's Bash tool takes `timeout: 600000`, i.e. 10 minutes; its 120000 ms DEFAULT is \
-    what silently cuts a long build off at 2 minutes) so one blocking call covers the whole run \
-    — but OVERRUNNING that ceiling kills the command and throws the work away, so send anything \
-    that might exceed 10 minutes to the background instead of gambling on the estimate. \
-    Background: call `TaskOutput` with `block: true` and `timeout: 600000` — it returns the \
-    instant the task exits, or after 10 minutes; re-issue it until the task is done, with no \
-    cliff if you guessed the duration wrong. A 40-minute build costs ~4 blocking calls that way, \
-    versus ~20 polls at the 2-minute default. Also REDIRECT ITS OUTPUT TO A LOG FILE \
-    (`<cmd> > /tmp/$(basename \"$PWD\").log 2>&1`): every `TaskOutput` call re-dumps the task's \
-    ENTIRE accumulated output, not just the new part, so an un-redirected chatty build re-floods \
-    your context on every wait. Redirected, the wait is nearly free and you `tail` the log for \
-    detail. Tick on a short interval only when you deliberately want live \
-    progress or an early abort, never as the default way to wait. \
-    SUBAGENTS ARE BACKGROUND WORK TOO: under Claude Code the `Agent` tool runs one in the \
-    BACKGROUND BY DEFAULT, returning the instant it launches and delivering its report later \
-    as a `<task-notification>`. That notification never reaches you if your turn ended first, \
-    because the subagent dies with your process group. Launch a subagent whose result you need \
-    with `run_in_background: false`, which blocks and hands you the report inline. A fan-out \
-    still costs ONE wait: put every `Agent` call in a single assistant message and they run in \
-    parallel. For one you already backgrounded, block on its task id with `TaskOutput`, \
-    `block: true`, `timeout: 600000`. NEVER improvise a stall instead: a filler subagent, a \
-    sleep loop, or a fabricated question to hold the turn open. Those waste the turn, and a \
-    fabricated question also parks the thread on a card the user must clear.";
+    when it would have finished. There is no blocking wait tool for background work either. \
+    Use one of two shapes. FOREGROUND, for anything that surely fits in 10 minutes: set the \
+    timeout EXPLICITLY to its maximum (Claude Code's Bash tool takes `timeout: 600000`; its \
+    120000 ms DEFAULT silently cuts a long build off at 2 minutes). Overrunning that ceiling \
+    kills the command and throws the work away, so do not gamble on the estimate. BACKGROUND \
+    TASK, for anything longer or uncertain: `lucidos background-task run -- '<cmd>'` hands the \
+    command to the engine, which runs it in your worktree and arms an event wait on its \
+    completion. When it prints `watched`, say what you are waiting for and END YOUR TURN: \
+    nothing is blocking, the thread re-opens with the exit status and the tail of the output, \
+    and waiting inside the turn would only re-read your whole context. If it prints \
+    `unwatched`, nothing will wake you: stop the task and run the command in the foreground. \
+    REDIRECT a chatty command's output to a log file (`<cmd> > /tmp/$(basename \"$PWD\").log \
+    2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE BACKGROUND \
+    WORK TOO: under Claude Code the `Agent` tool runs one in the BACKGROUND BY DEFAULT, and its \
+    report never reaches you if your turn ends first, because the subagent dies with your \
+    process group. Launch a subagent whose result you need with `run_in_background: false`, \
+    which blocks and hands you the report inline. A fan-out still costs ONE wait: put every \
+    `Agent` call in a single assistant message and they run in parallel. NEVER improvise a \
+    stall instead: a filler subagent, a sleep loop, or a fabricated question to hold the turn \
+    open. Those waste the turn, and a fabricated question also parks the thread on a card the \
+    user must clear.";
 
 /// Send the coding agent's DECISIONS through the structured `AskUserQuestion`
 /// tool, which the Lucidos UI renders as clickable buttons. Forbids post-work
@@ -432,10 +386,10 @@ const ASK_USER_QUESTION_RULE: &str =
      for a human. So a dummy question costs the user an interruption they have to clear. \
      Worse, if your own background work then streams steps into the thread it OVERTAKES the \
      card and kills its buttons, so nobody can clear it at all. When you need to wait, use \
-     the blocking wait named in the background-process rule.\n\n\
+     a wait the background-process rule names.\n\n\
      NEVER parallel-call `AskUserQuestion` alongside other tools — if you're asking a \
      question, stop the assistant message after the `AskUserQuestion` tool_use and do not \
-     include any sibling tool_uses (no Bash, no Read, no TaskOutput, no second \
+     include any sibling tool_uses (no Bash, no Read, no Agent, no second \
      AskUserQuestion). Lucidos's PreToolUse hook blocks `AskUserQuestion` for up to 24h, \
      but any sibling tool_uses in the same message dispatch in parallel and emit progression \
      events while the question is still on-screen — at which point the user's typed comment \
@@ -682,15 +636,12 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
 /// agent its reasoning is not shown so it puts must-see content in a visible
 /// message.
 const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
-    YOUR REASONING IS NOT SHOWN TO THE USER: In this UI your extended thinking / reasoning is \
-    NOT displayed — the user sees only your visible assistant messages and your tool calls, never \
-    your private reasoning. So any content the user must see or act on — draft copy you want \
-    approved, the options behind a question, a snippet you want reviewed, a summary of what you \
-    found — MUST go in a visible assistant message (or a structured tool field the UI renders, \
-    such as a question tool's `question` / `options`), NEVER only in your reasoning. Do not \
-    reference content as if the user can see it (\"the six lines above\", \"as shown in my \
-    analysis\") unless you actually put it in a visible message this turn. When in doubt, write \
-    it in the message.";
+    YOUR REASONING IS NOT SHOWN TO THE USER: The user sees only your visible assistant messages \
+    and your tool calls, never your reasoning. So anything they must see or act on (draft copy \
+    to approve, the options behind a question, a snippet to review, what you found) MUST go in a \
+    visible assistant message, or in a tool field the UI renders, such as a question tool's \
+    `question` / `options`. Never reference content as if they saw it (\"the six lines above\") \
+    unless you put it in a visible message this turn.";
 
 /// Sibling of [`REASONING_NOT_VISIBLE_RULE`], riding the same
 /// [`append_backend_rules`] chokepoint, and the same shape of mistake: the
@@ -860,7 +811,6 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
@@ -880,7 +830,6 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(true),
     )
@@ -912,7 +861,6 @@ pub(super) fn external_repo_system_prompt(
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
@@ -920,7 +868,6 @@ pub(super) fn external_repo_system_prompt(
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
@@ -945,7 +892,6 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          {commit_cadence}\n\n\
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{build_slot}",
         branch = branch_name,
@@ -954,7 +900,6 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
@@ -992,7 +937,6 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
@@ -1007,7 +951,6 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(true),
     )
@@ -1072,7 +1015,6 @@ pub(super) fn app_worktree_system_prompt(
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          SESSION SUMMARY: Output a structured summary of what was implemented in this \
          session. List each change with a brief description. This is the last thing you \
@@ -1084,7 +1026,6 @@ pub(super) fn app_worktree_system_prompt(
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
@@ -1122,7 +1063,6 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
-         {task_lifecycle}\n\n\
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
@@ -1130,7 +1070,6 @@ pub(super) fn app_worktree_recovery_system_prompt(
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
-        task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
@@ -1556,34 +1495,26 @@ mod tests {
             for needle in [
                 "BACKGROUND PROCESSES DON'T SURVIVE A TURN",
                 "run_in_background",
-                // The two workable patterns must both survive a rewrite:
-                // foreground, or wait-to-completion inside the same turn.
+                // The two waits that work must both survive a rewrite. The
+                // foreground call names its ceiling, or it degrades into the
+                // 120000 ms default that cuts a long build off.
                 "FOREGROUND",
-                "WITHIN THE SAME TURN",
-                // …and so must the half that makes the wait cheap. Without the
-                // 600000 ms ceiling named for BOTH shapes, "wait inside the
-                // turn" degrades back into ticking on the 120000 ms Bash
-                // default — ~20 round-trips for one release build.
-                "WAIT IN AS FEW CALLS AS YOU CAN",
                 "`timeout: 600000`",
-                "`block: true`",
-                // Fewer calls only helps if each call is small, and
-                // `TaskOutput` is not a delta: it replays the task's whole
-                // accumulated output every time. Without the redirect half,
-                // ~4 blocking waits on a chatty build still cost ~4 copies of
-                // its log, so pin both the fact and the fix. Pin the fix by its
-                // instruction rather than by the example path, which is free to
-                // change without weakening the rule.
-                "re-dumps the task's ENTIRE accumulated output",
-                "REDIRECT ITS OUTPUT TO A LOG FILE",
+                // The background task is the event-wait answer: the engine owns
+                // the job and re-opens the thread, so the agent ENDS its turn
+                // rather than re-reading its context on every in-turn wait.
+                "lucidos background-task run",
+                "END YOUR TURN",
+                "`unwatched`",
+                // A long log re-read into context is the other cost, so the
+                // redirect stays. Pinned by its instruction, not the example.
+                "REDIRECT a chatty command's output to a log file",
                 // A subagent is background work, and Claude Code's `Agent` tool
-                // now runs one in the background by DEFAULT. Without this arm
-                // the rule reads as Bash-only. That gap met a hard "don't end
-                // the turn" and produced two invented stalls: a filler subagent
-                // whose prompt was one word, then a fabricated question that
-                // parked a live thread on a card nobody could answer. Pin the
-                // default that removes the incentive, the one-message fan-out
-                // that keeps it cheap, and the ban on improvising a stall.
+                // runs one in the background by DEFAULT. Without this arm the
+                // rule reads as Bash-only, and that gap once produced a filler
+                // subagent and then a fabricated question. Pin the default that
+                // removes the incentive, the one-message fan-out that keeps it
+                // cheap, and the ban on improvising a stall.
                 "SUBAGENTS ARE BACKGROUND WORK TOO",
                 "`run_in_background: false`",
                 "single assistant message",
@@ -1954,6 +1885,12 @@ mod tests {
                         "{label} ({agent:?}) must tell the agent its reasoning is not shown (`{needle}`)",
                     );
                 }
+                // The Vertex relay makes notes before a tool call visible, so
+                // the stopgap that sent them into the card must stay gone.
+                assert!(
+                    !full.contains("just before a tool call"),
+                    "{label} ({agent:?}) still carries the hidden-notes stopgap",
+                );
             }
         }
         // The backend-independent prepend must not have broken the Codex
@@ -2387,6 +2324,9 @@ mod tests {
                 // agent may flip the marker after revising the plan to match.
                 "that fork takes the second slot",
                 "Picking a fork is an approval too",
+                // The card renders under the agent's message. A card restating
+                // the summary makes the user read the plan twice.
+                "never repeats the summary",
             ] {
                 assert!(
                     base.contains(needle),
@@ -2593,66 +2533,22 @@ mod tests {
         }
     }
 
-    /// Background-task lookup tools (`TaskOutput`, `TaskUpdate`, `TaskList`)
-    /// return "Task not found" / "task already completed" once the engine has
-    /// evicted a finished task's registry record. Without explicit guidance,
-    /// CC was treating these as failures and retrying — nightly workspace-
-    /// learning flagged the same shape on two consecutive nights (5/day on
-    /// `TaskOutput`, then 3 `TaskUpdate` in a single thread within 1 minute).
-    /// Pin the lifecycle note in every chat-style prompt so the inoculation
-    /// can't be dropped by a future edit. The conflict-resolution prompt is
-    /// intentionally excluded — it doesn't run bg tasks.
+    /// Claude Code no longer has `TaskOutput`, `TaskUpdate` or `TaskList`. A
+    /// prompt naming one sends the agent to a tool that answers "No such tool
+    /// available", after which it improvises a wait. No flavor may name them,
+    /// for either backend.
     #[test]
-    fn chat_style_prompts_carry_task_lifecycle_note() {
-        let cases: &[(&str, String)] = &[
-            (
-                "worktree_system_prompt",
-                worktree_system_prompt("feature/x", "dev"),
-            ),
-            (
-                "external_repo_system_prompt",
-                external_repo_system_prompt("Acme", "feature/x", "origin/main"),
-            ),
-            (
-                "recovery_system_prompt",
-                recovery_system_prompt("feature/x", "dev"),
-            ),
-            (
-                "external_repo_recovery_system_prompt",
-                external_repo_recovery_system_prompt("Acme", "feature/x"),
-            ),
-        ];
-        for (label, prompt) in cases {
-            assert!(
-                prompt.contains("TASK LIFECYCLE"),
-                "{label} must carry the TASK LIFECYCLE rule so CC stops retrying \
-                 \"Task not found\" errors on completed bg tasks",
-            );
-            // Assert the exact comma-joined trio phrase. A per-tool
-            // `prompt.contains("TaskOutput")` would trivially pass because
-            // ASK_USER_QUESTION_RULE also mentions `TaskOutput` ("no Bash,
-            // no Read, no TaskOutput, no second AskUserQuestion") — so a
-            // future edit could drop TASK_LIFECYCLE_RULE entirely and the
-            // single-name check would still be satisfied. Pinning the
-            // contiguous phrase guarantees the trio is named *together* and
-            // can only come from TASK_LIFECYCLE_RULE.
-            assert!(
-                prompt.contains("`TaskOutput`, `TaskUpdate`, or `TaskList`"),
-                "{label} must name all three lookup tools in the lifecycle \
-                 rule's exact comma-joined form — partial coverage would let \
-                 CC keep retrying the missing tool against stale ids",
-            );
-            // The expected-behavior framing is what stops the retry — without
-            // it, CC reads the named tools and the "not found" string as
-            // diagnosis instructions instead of as a benign signal.
-            assert!(
-                prompt.contains("expected"),
-                "{label} must frame the error as expected behavior, not a bug",
-            );
-            assert!(
-                prompt.contains("do NOT retry") || prompt.contains("do not retry"),
-                "{label} must explicitly tell CC not to retry the call",
-            );
+    fn no_prompt_names_a_task_tool_claude_code_removed() {
+        for (label, prompt) in all_prompt_flavors() {
+            for (agent, backend) in all_backends() {
+                let full = append_backend_rules(prompt.clone(), agent);
+                for gone in ["TaskOutput", "TaskUpdate", "TaskList"] {
+                    assert!(
+                        !full.contains(gone),
+                        "{label} for {backend} must not name `{gone}`, which Claude Code removed"
+                    );
+                }
+            }
         }
     }
 

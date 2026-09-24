@@ -1802,7 +1802,7 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
         .find("resolve_pending_permissions_as_superseded")
         .expect("the coding-agent-only supersede block must still exist");
     let question_supersede = source
-        .find("resolve_pending_question_as_superseded")
+        .find("resolve_pending_question_as_superseded(")
         .expect("the message router must supersede an unanswerable open question");
 
     assert!(
@@ -1812,6 +1812,34 @@ fn the_question_supersede_is_wired_below_the_answer_fast_path() {
     assert!(
         permission_supersede < question_supersede,
         "the question supersede belongs in the coding-agent-only block, beside the permission one"
+    );
+
+    // ADR 0255: a child's completion must not supersede a question the user
+    // can still answer. The decision is unit-tested, so pin that it gates.
+    let keep_check = source
+        .find("follow_up_keeps_open_question")
+        .expect("the supersede must consult follow_up_keeps_open_question");
+    assert!(
+        permission_supersede < keep_check && keep_check < question_supersede,
+        "the keep-open check must gate the question supersede"
+    );
+
+    // ADR 0256: an agent-sent message is held before anything can supersede
+    // the question. A human message releases older held ones after its own
+    // supersedes, so the human is recorded as resolving any open card.
+    let hold = source
+        .find("held_messages::message_is_held")
+        .expect("the router must hold agent messages behind an open question");
+    let release = source
+        .find("deliver_held_messages")
+        .expect("a human message must release the held messages");
+    assert!(
+        fast_path < hold && hold < permission_supersede,
+        "the hold sits after the answer fast path, before any supersede"
+    );
+    assert!(
+        question_supersede < release,
+        "the release follows the human message's own supersedes"
     );
 }
 

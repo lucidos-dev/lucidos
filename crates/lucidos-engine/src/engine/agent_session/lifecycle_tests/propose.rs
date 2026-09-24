@@ -52,9 +52,9 @@ fn normal_idle_during_shutdown_does_nothing() {
 #[test]
 fn terminate_decision_default_terminates() {
     assert_eq!(
-        terminate_decision(0, 0, false, false),
+        terminate_decision(0, 0, false),
         TerminateDecision::Terminate,
-        "nothing queued, nothing owed, no reservation, no bg bash: terminate is the default"
+        "nothing queued, nothing owed, no reservation: terminate is the default"
     );
 }
 
@@ -66,7 +66,7 @@ fn terminate_decision_default_terminates() {
 fn terminate_decision_warm_up_turn_terminates() {
     let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 0, false);
     assert_eq!(
-        terminate_decision(0, awaiting, false, false),
+        terminate_decision(0, awaiting, false),
         TerminateDecision::Terminate,
         "a warm-up turn owes nothing after its Result: terminate"
     );
@@ -80,7 +80,7 @@ fn terminate_decision_warm_up_turn_terminates() {
 fn terminate_decision_merged_claude_code_turn_terminates() {
     let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 3, false);
     assert_eq!(
-        terminate_decision(0, awaiting, false, false),
+        terminate_decision(0, awaiting, false),
         TerminateDecision::Terminate,
         "a merged Claude Code turn owes nothing: terminate so the API-drop resume can run"
     );
@@ -95,7 +95,7 @@ fn terminate_decision_merged_claude_code_turn_terminates() {
 fn terminate_decision_claude_code_result_predating_a_forward_keeps_alive() {
     let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 2, true);
     assert_eq!(
-        terminate_decision(0, awaiting, false, false),
+        terminate_decision(0, awaiting, false),
         TerminateDecision::KeepAliveForFollowup {
             queued: 0,
             awaiting_result: 1,
@@ -112,7 +112,7 @@ fn terminate_decision_claude_code_result_predating_a_forward_keeps_alive() {
 #[test]
 fn terminate_decision_queued_followup_keeps_alive() {
     assert_eq!(
-        terminate_decision(1, 0, false, false),
+        terminate_decision(1, 0, false),
         TerminateDecision::KeepAliveForFollowup {
             queued: 1,
             awaiting_result: 0,
@@ -129,7 +129,7 @@ fn terminate_decision_queued_followup_keeps_alive() {
 fn terminate_decision_codex_still_owes_a_result_keeps_alive() {
     let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 2, false);
     assert_eq!(
-        terminate_decision(0, awaiting, false, false),
+        terminate_decision(0, awaiting, false),
         TerminateDecision::KeepAliveForFollowup {
             queued: 0,
             awaiting_result: 1,
@@ -145,7 +145,7 @@ fn terminate_decision_codex_still_owes_a_result_keeps_alive() {
 fn terminate_decision_codex_fully_settled_terminates() {
     let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 1, false);
     assert_eq!(
-        terminate_decision(0, awaiting, false, false),
+        terminate_decision(0, awaiting, false),
         TerminateDecision::Terminate,
         "Codex has answered every forwarded input: terminate"
     );
@@ -157,7 +157,7 @@ fn terminate_decision_codex_fully_settled_terminates() {
 #[test]
 fn terminate_decision_armed_redirect_keeps_alive() {
     assert_eq!(
-        terminate_decision(0, 0, true, false),
+        terminate_decision(0, 0, true),
         TerminateDecision::KeepAliveForFollowup {
             queued: 0,
             awaiting_result: 0,
@@ -167,31 +167,15 @@ fn terminate_decision_armed_redirect_keeps_alive() {
     );
 }
 
-/// Chat-agent's `run_bash_background` is the long-standing skip.
-/// `spawn_bash_completion_watcher` re-wakes CC via `msg_tx` on
-/// completion; killing here would force the wake path through stale-
-/// session recovery.
+/// A running background task is not a follow-up. Its completion re-opens the
+/// thread through an event wait, which resumes a terminated session. Holding
+/// an idle subprocess for up to an hour would buy nothing.
 #[test]
-fn terminate_decision_chat_bg_bash_keeps_alive() {
-    assert_eq!(
-        terminate_decision(0, 0, false, true),
-        TerminateDecision::KeepAliveForBgBash,
-        "chat-agent bg bash pending: keep CC alive for the auto-wake"
-    );
-}
-
-/// Precedence: a queued follow-up is the strongest signal, outranking
-/// the bg-bash flag. User-initiated input takes priority.
-#[test]
-fn terminate_decision_followup_wins_over_bg_bash() {
-    assert_eq!(
-        terminate_decision(1, 0, false, true),
-        TerminateDecision::KeepAliveForFollowup {
-            queued: 1,
-            awaiting_result: 0,
-            redirect_pending: false,
-        },
-        "user follow-up beats chat-agent bg bash: consume the message first"
+fn terminate_decision_has_no_background_task_keep_alive() {
+    const LIFECYCLE_SRC: &str = include_str!("../lifecycle.rs");
+    assert!(
+        !LIFECYCLE_SRC.contains("KeepAliveForBgBash"),
+        "a background task must not keep an idle coding-agent subprocess alive"
     );
 }
 

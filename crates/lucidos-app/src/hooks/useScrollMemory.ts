@@ -14,8 +14,9 @@ import {
   applyFollowSeed,
   type FollowResumeFrom,
 } from '../components/chat/scrollState';
-import { ANCHOR_ATTR, anchorTargetTop, anchorTurnIsClamped, readScrollAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorTargetTop, anchorTurnIsClamped, readRowAnchor, readScrollAnchor, rowTargetTop, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
+import { postClientLog } from '../utils/clientLog';
 import { watchUserAction } from '../utils/userAction';
 
 /** True iff the container's current measurement can hold the saved offset
@@ -62,6 +63,12 @@ const FOLLOWING_PREFIX = 'following:';
  *  near", `relTop` being the pixel offset the anchored turn's top sat at. */
 const ANCHOR_PREFIX = 'anchor:';
 
+/** The stored form of a reading position that names a step ROW:
+ *  `row:<relTop>:<rowEventId>`. Laid out like `ANCHOR_PREFIX` and for the same
+ *  reasons. The finer of the two, and the one written wherever the turn at the
+ *  line has a step row at or above it (`readRowAnchor`). */
+const ROW_PREFIX = 'row:';
+
 /** Where a thread opens. A TURN the reader was parked on (`ANCHOR_PREFIX`), the
  *  live edge they asked to ride (`LIVE_EDGE_VALUE`), or a bare pixel offset.
  *  `null` for no saved position at all, which `resetOnEmpty` turns into the top.
@@ -77,11 +84,17 @@ const ANCHOR_PREFIX = 'anchor:';
 export type SavedScroll =
   | { kind: 'offset'; top: number; armed?: true }
   | { kind: 'live-edge' }
-  | ({ kind: 'anchor'; armed?: true } & ScrollAnchor);
+  | ({ kind: 'anchor'; armed?: true } & ScrollAnchor)
+  | ({ kind: 'row'; armed?: true } & RowAnchor);
 
 /** The stored form of an anchor, the one writer of `ANCHOR_PREFIX`. */
 function formatScrollAnchor(anchor: ScrollAnchor): string {
   return `${ANCHOR_PREFIX}${Math.round(anchor.relTop)}:${anchor.eventId}`;
+}
+
+/** The stored form of a row anchor, the one writer of `ROW_PREFIX`. */
+function formatRowAnchor(anchor: RowAnchor): string {
+  return `${ROW_PREFIX}${Math.round(anchor.relTop)}:${anchor.rowEventId}`;
 }
 
 /** Put the armed marker in front of a place, the one writer of
@@ -114,7 +127,14 @@ export function parseSavedScroll(raw: string | null): SavedScroll | null {
     // `live-edge` is a value we never write, and says the same thing twice.
     return place === null || place.kind === 'live-edge' ? place : { ...place, armed: true };
   }
-  if (raw.startsWith(ANCHOR_PREFIX)) return parseAnchor(raw.slice(ANCHOR_PREFIX.length));
+  if (raw.startsWith(ANCHOR_PREFIX)) {
+    const parsed = parseIdAt(raw.slice(ANCHOR_PREFIX.length));
+    return parsed && { kind: 'anchor', eventId: parsed.id, relTop: parsed.relTop };
+  }
+  if (raw.startsWith(ROW_PREFIX)) {
+    const parsed = parseIdAt(raw.slice(ROW_PREFIX.length));
+    return parsed && { kind: 'row', rowEventId: parsed.id, relTop: parsed.relTop };
+  }
   const n = Number.parseFloat(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return { kind: 'offset', top: Math.floor(n) };
@@ -126,13 +146,13 @@ export function parseSavedScroll(raw: string | null): SavedScroll | null {
  *  `12abc` as 12. A malformed value is one we did not write, and guessing at it
  *  would put the reader somewhere nobody asked for. It is signed: the ordinary
  *  anchor sits at or above the viewport top. */
-function parseAnchor(rest: string): SavedScroll | null {
+function parseIdAt(rest: string): { id: string; relTop: number } | null {
   const sep = rest.indexOf(':');
   if (sep < 1) return null;
   const relTop = rest.slice(0, sep);
-  const eventId = rest.slice(sep + 1);
-  if (!/^-?\d+$/.test(relTop) || eventId === '') return null;
-  return { kind: 'anchor', eventId, relTop: Number(relTop) };
+  const id = rest.slice(sep + 1);
+  if (!/^-?\d+$/.test(relTop) || id === '') return null;
+  return { id, relTop: Number(relTop) };
 }
 
 /** What is RECORDED under `key`, or null for nothing legible.
@@ -276,6 +296,11 @@ export interface ScrollMemoryOptions {
    *  renders markdown a round at a time. Left running past the restore, it pays
    *  the whole cost of a landing nobody will make. */
   onRestoreSettled?: () => void;
+  /** True while work done on the restore's behalf is waiting on something
+   *  other than the transcript growing: ThreadView's chase for a reading
+   *  position behind the loaded page is a request in flight. The deadline is
+   *  pushed out meanwhile, bounded by `ANCHOR_RESTORE_CEILING_MS`. */
+  restoreIsBusy?: () => boolean;
 }
 
 /** The options an attachment reads LIVE, whose current value belongs to
@@ -283,7 +308,7 @@ export interface ScrollMemoryOptions {
  *  hands them over as one getter so the attachment cannot capture them at setup
  *  and go stale. The flip side: reading one after the attachment stopped being
  *  current reads the NEXT thing's value. See `observed` below. */
-export type ScrollMemoryLive = Pick<ScrollMemoryOptions, 'shouldRestore' | 'onRestoreSettled'>;
+export type ScrollMemoryLive = Pick<ScrollMemoryOptions, 'shouldRestore' | 'onRestoreSettled' | 'restoreIsBusy'>;
 
 /** Wire one scroll container to one storage key: restore on attach, persist on
  *  scroll, flush on teardown. Returns the teardown.
@@ -383,7 +408,7 @@ export function attachScrollMemory(
     // then no saved position: not a bottom nobody asked for, and not a turn
     // whose id means nothing among these children.
     if (value?.kind === 'live-edge' && !followsLiveEdge) return null;
-    if (value?.kind === 'anchor' && !anchorsToContent) return null;
+    if ((value?.kind === 'anchor' || value?.kind === 'row') && !anchorsToContent) return null;
     // The armed marker is the one part that is DROPPED rather than rejected
     // with its value. It qualifies a place this container can still honour, and
     // the follow is one global: arming from here would hand the transcript's
@@ -398,6 +423,17 @@ export function attachScrollMemory(
    *  the branch it takes below. Anything running LATER re-reads instead: an arm
    *  this open makes changes the answer under it. */
   const saved: SavedScroll | null = readSaved();
+
+  /** Say ONCE per open which rule placed the reader, for the transcript alone.
+   *  A report like "it opened at the bottom" then names its route in
+   *  engine.log (`[Client/scroll] restore`) rather than needing a repro. Two
+   *  words and the record's form, no content. */
+  let reported = false;
+  const reportRestore = (outcome: string) => {
+    if (reported || !anchorsToContent) return;
+    reported = true;
+    postClientLog('scroll', 'restore', { outcome, form: saved?.kind ?? 'none' });
+  };
 
   /** Say ONCE that nothing will place the reader from this thread's record any
    *  more, so work done on behalf of the restore can stop (`onRestoreSettled`).
@@ -497,11 +533,12 @@ export function attachScrollMemory(
   const offsetFor = (record: SavedScroll): number | null => {
     const top = record.kind === 'anchor'
       ? (anchorTurnIsClamped(el, record) ? null : anchorTargetTop(el, record))
+      : record.kind === 'row' ? rowTargetTop(el, record)
       : record.kind === 'offset' ? record.top
       : null;
     if (top === null) return null;
     if (isFullyRestorable(top, el.scrollHeight, el.clientHeight)) return top;
-    if (record.kind !== 'anchor') return null;
+    if (record.kind === 'offset') return null;
     return Math.max(0, el.scrollHeight - el.clientHeight);
   };
 
@@ -524,6 +561,7 @@ export function attachScrollMemory(
     if (saved.kind === 'offset' && saved.top === 0) {
       markNavigationScroll(el, 0);
       restoring = false;
+      reportRestore('landed');
       return;
     }
     tryRestore();
@@ -539,6 +577,7 @@ export function attachScrollMemory(
       return;
     }
     markNavigationScroll(el, top);
+    reportRestore(el.scrollTop < el.scrollHeight - el.clientHeight - 1 ? 'landed' : 'landed-at-bottom');
     stopRestore();
   };
 
@@ -560,7 +599,7 @@ export function attachScrollMemory(
   const ceilingReached = () => Date.now() - restoreStartedAt >= ANCHOR_RESTORE_CEILING_MS;
 
   const keepWaitingForAnchor = () => {
-    if (saved?.kind !== 'anchor' || deadlineTimer === null) return;
+    if ((saved?.kind !== 'anchor' && saved?.kind !== 'row') || deadlineTimer === null) return;
     if (el.scrollHeight === lastHeight) return;
     lastHeight = el.scrollHeight;
     if (ceilingReached()) return;
@@ -591,7 +630,14 @@ export function attachScrollMemory(
       deadlineTimer = setTimeout(onDeadline, RESTORE_DEADLINE_MS);
       return;
     }
+    // A chase in flight has not failed, it has not answered yet. Its fold
+    // changes the height, which the walk then extends on as usual.
+    if (live().restoreIsBusy?.() && !ceilingReached()) {
+      deadlineTimer = setTimeout(onDeadline, RESTORE_DEADLINE_MS);
+      return;
+    }
     tryRestore(true);
+    if (restoring) reportRestore('gave-up');
     stopRestore();
   };
 
@@ -615,6 +661,7 @@ export function attachScrollMemory(
    *  A link SUPERSEDED by a newer claim still lands, yet neither announces nor
    *  latches its resolve, so a dead second link can position over it. */
   const standDownForDeepLink = () => {
+    reportRestore('deep-link');
     // Also retires the restore observers, which is a no-op at attach (none are
     // armed yet) and the whole point from the claim broadcast. Clears a rescue
     // already in flight too, which is what the re-arm below replaces.
@@ -754,6 +801,8 @@ export function attachScrollMemory(
    *  container that is not windowed. */
   const currentPlace = (): string | null => {
     if (anchorsToContent) {
+      const row = readRowAnchor(el);
+      if (row) return formatRowAnchor(row);
       const anchor = readScrollAnchor(el);
       if (anchor) return formatScrollAnchor(anchor);
       // Children, yet not one of them nameable, means a container nobody can
@@ -979,6 +1028,7 @@ export function attachScrollMemory(
     // Gated on `followsLiveEdge` like the record's own live-edge branch, the
     // follow being one global while this hook serves three containers.
     const seeded = followsLiveEdge && applyFollowSeed(el);
+    reportRestore(seeded ? 'follow-seed' : 'top');
     // Browsers preserve scrollTop across children-shrink, so a shared
     // container needs an explicit reset; non-shared containers opt out. Skipped
     // when the seed armed, which wrote the live edge instead and would be undone
@@ -993,6 +1043,7 @@ export function attachScrollMemory(
     // while the live edge is wherever the content currently ends.
     resumeFollowingBottom(el);
     restoring = false;
+    reportRestore('live-edge');
   } else if (saved.armed) {
     // Armed, but parked away from the edge. Pick the request back up and put
     // them on their turn, in that order: the arm must be standing before the
@@ -1034,7 +1085,10 @@ export function attachScrollMemory(
     deadlineTimer = setTimeout(onDeadline, RESTORE_DEADLINE_MS);
     // The wait belongs to the reader too: the first thing they DO retires it
     // (see `stopUserWatch`). Armed last, so the writes above cannot trip it.
-    stopUserWatch = watchUserAction(() => stopRestore());
+    stopUserWatch = watchUserAction(() => {
+      reportRestore('reader-took-over');
+      stopRestore();
+    });
   }
 
   /** Arm the content watch, for an ANCHORING container only.

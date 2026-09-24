@@ -2,6 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-15
+- **Narrowed by**: [0255](0255-an-engine-reentry-keeps-a-live-question.md). An
+  engine re-entry, such as a child's completion, no longer supersedes a
+  question the user can still answer.
+- **Narrowed by**: [0256](0256-an-agent-message-waits-behind-an-open-question.md).
+  An agent-sent message waits behind a question the user can still answer.
 
 ## Context
 

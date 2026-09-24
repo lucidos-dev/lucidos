@@ -84,9 +84,10 @@ export interface BootResult {
  * settles first, so nothing async can feed it. That is why the values arrive in
  * its own body rather than over a channel. See `api/sdk_prefs.rs`.
  *
- * The shell seeds nothing and falls through to storage, unchanged.
+ * The shell seeds nothing and falls through to storage, unchanged. The SDK's
+ * `autocorrectStamp.ts` reads the same seed, through this function.
  */
-function servedPrefs(): Record<string, string> | null {
+export function servedPrefs(): Record<string, string> | null {
   // `globalThis`, not `window`. The engine writes `window.__lucidosPrefs`, and
   // in a browser the two are one object. This form also runs where there is no
   // `window` at all.

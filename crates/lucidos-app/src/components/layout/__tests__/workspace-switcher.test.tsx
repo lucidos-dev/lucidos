@@ -9,8 +9,10 @@
  *
  * The hook-bearing wrapper (the expanded flag, the fetch, the skeleton gate) is
  * deliberately not exercised: it holds no branch this cannot see, and its two
- * real properties (no request until the row is expanded, state resets when the
- * menu closes) are structural rather than renderable. See the plan.
+ * real properties (no request until the row is expanded, the list resets when
+ * the menu closes) are structural rather than renderable. See the plan. The
+ * one decision it makes on mount, whether to reopen unfolded, is pure and
+ * pinned below as `initiallyExpanded`.
  *
  * The placeholder itself is the one thing in it with a checkable property, and
  * `skeletonShape` is why: the shimmer tree needs a `SkeletonProvider` and the
@@ -19,7 +21,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { VNode } from 'preact';
-import { workspacesMenuRow, workspaceSwitcherList, skeletonShape } from '../WorkspaceSwitcher';
+import { workspacesMenuRow, workspaceSwitcherList, skeletonShape, initiallyExpanded } from '../WorkspaceSwitcher';
 import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
@@ -291,6 +293,20 @@ describe('the loading placeholder', () => {
     // An unfolded list pushes the rows below it down, so the cheaper guess is
     // the one that moves less when it is wrong.
     expect(skeletonShape(null, MANAGE)).toEqual({ rows: 2, manage: true });
+  });
+});
+
+describe('the remembered expand state', () => {
+  it('reopens unfolded where the list can be fetched', () => {
+    expect(initiallyExpanded(true, true)).toBe(true);
+    expect(initiallyExpanded(true, false)).toBe(false);
+  });
+
+  it('never unfolds where the control plane is out of reach', () => {
+    // Expanding is what fires the listing, and on a direct engine-port page
+    // that request 404s. A device that unfolded the list under the gateway
+    // must not carry that into a page that cannot serve it.
+    expect(initiallyExpanded(false, true)).toBe(false);
   });
 });
 

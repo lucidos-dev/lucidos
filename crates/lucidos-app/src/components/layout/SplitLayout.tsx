@@ -3,6 +3,7 @@ import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RAT
 import { focusPane } from '../../store/actions/pane';
 import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
 import { splitBounds } from '../../store/paneMinimums';
+import { startDividerDrag } from './dividerDrag';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import type { ComponentChildren } from 'preact';
 
@@ -15,7 +16,6 @@ const dividerDblGate = createDblClickGate();
 
 export function SplitLayout({ threadPane, contentPane }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
 
   // Bring a persisted ratio that is no longer legal up to the floor, ONCE, as
   // soon as the split has a width. `migratedSplitRatio` explains why nothing
@@ -43,13 +43,9 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
   const onDividerDown = useCallback((e: PointerEvent) => {
     dividerDblGate.record();
     e.preventDefault();
-    dragging.current = true;
     const container = containerRef.current;
-    const target = e.currentTarget as HTMLElement;
     if (!container) return;
 
-    // Capture pointer so we get all move/up events even if pointer leaves the element
-    target.setPointerCapture(e.pointerId);
     beginPaneResize();
 
     // CLAMPED drag: the divider stops at each pane's minimum while the pointer
@@ -70,28 +66,15 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     // width is re-read per move, since the window can resize under the drag.
     const bounds = splitBounds();
     const onMove = (e: PointerEvent) => {
-      if (!dragging.current || !container) return;
       const rect = container.getBoundingClientRect();
       if (rect.width <= 1) return;
       splitRatio.value = clampSplitRatio(e.clientX - rect.left, rect.width, bounds);
     };
 
-    const cleanup = () => {
-      dragging.current = false;
-      target.removeEventListener('pointermove', onMove);
-      target.removeEventListener('pointerup', cleanup);
-      target.removeEventListener('pointercancel', cleanup);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+    startDividerDrag(e, onMove, () => {
       localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatio.value));
       endPaneResize();
-    };
-
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    target.addEventListener('pointermove', onMove);
-    target.addEventListener('pointerup', cleanup);
-    target.addEventListener('pointercancel', cleanup);
+    });
   }, []);
 
   const onDividerDblClick = useCallback(() => {

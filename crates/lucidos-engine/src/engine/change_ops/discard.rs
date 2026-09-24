@@ -85,6 +85,8 @@ impl LucidosEngine {
     /// resulting `ChangeDiscarded` events so the chip reads "You" rather than
     /// the engine fallback.
     pub async fn discard_pending_for_thread(&self, thread_id: Uuid, actor: Option<MessageOrigin>) {
+        // Before the loop, so a thread with no change yet still loses its tasks.
+        self.abandon_background_tasks(thread_id, "Discard").await;
         let pending = match self.changes().pending_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -150,7 +152,7 @@ impl LucidosEngine {
                 change.branch_name,
                 thread_id
             );
-            if let Err(e) = self.discard_change(change.id, actor.clone()).await {
+            if let Err(e) = self.discard_change_quietly(change.id, actor.clone()).await {
                 log!(
                     "[Changes] Reconcile: failed to discard stale change {} for thread {}: {}",
                     change.id,
@@ -176,7 +178,36 @@ impl LucidosEngine {
             .await;
     }
 
-    /// Discard a single pending change.
+    /// Discard a single pending change because the user asked to.
+    ///
+    /// Also settles the thread's parent when the thread still owed it a card
+    /// (ADR 0252). The engine's own reconciles call
+    /// [`Self::discard_change_quietly`] instead: no user discarded anything
+    /// there, and a parent must not be told so.
+    pub async fn discard_change(
+        &self,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let thread_id = self
+            .changes()
+            .get_by_id(change_id)
+            .await?
+            .and_then(|change| change.thread_id);
+        if let Some(thread_id) = thread_id {
+            // Still running in the worktree the discard is about to reset.
+            self.abandon_background_tasks(thread_id, "Discard").await;
+        }
+        self.discard_change_quietly(change_id, actor).await?;
+        if let Some(thread_id) = thread_id {
+            self.event_bus
+                .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Discard a single pending change, and tell no parent.
     ///
     /// Phase 6.3 of the CC resume architecture: Discard preserves the thread's
     /// worktree directory and the branch ref so the thread stays alive and the
@@ -190,7 +221,7 @@ impl LucidosEngine {
     /// same branch (multi-change-on-one-branch case), skip the worktree reset
     /// — the other changes' commits would be wiped along with this one. The
     /// branch and worktree stay as-is, preserving the still-pending work.
-    pub async fn discard_change(
+    pub(crate) async fn discard_change_quietly(
         &self,
         change_id: Uuid,
         actor: Option<MessageOrigin>,

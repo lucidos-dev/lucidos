@@ -255,6 +255,13 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/threads/:id/blobs", Host, &[]),
     ("/threads/:id/compose", Host, &[]),
     ("/threads/:thread_id/answer-question", Host, &[]),
+    ("/threads/:thread_id/background-tasks", Agent, &[]),
+    ("/threads/:thread_id/background-tasks/:task_id", Agent, &[]),
+    (
+        "/threads/:thread_id/background-tasks/:task_id/stop",
+        Agent,
+        &[],
+    ),
     ("/threads/:thread_id/cc-diff", Host, &[]),
     ("/threads/:thread_id/continue", Host, &[]),
     ("/threads/:thread_id/event-waits", Agent, &[]),
@@ -338,11 +345,12 @@ pub const APP_ID_HEADER: &str = "x-lucidos-app-id";
 /// It reads the MATCHED route, so it must sit inside the nest where routing
 /// happened, exactly as [`super::mutating_gate`] does.
 pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response {
+    // Lossy, never `to_str`: an app id outside ASCII arrives as raw bytes, and
+    // a stamp that failed to decode must not read as no stamp at all.
     let Some(app_id) = request
         .headers()
         .get(APP_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
     else {
         return next.run(request).await;
     };
@@ -359,24 +367,71 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
         .strip_prefix(super::API_V1_PREFIX)
         .unwrap_or(&route)
         .to_string();
-    if app_may_call(&mounted, request.method().as_str()) {
-        return next.run(request).await;
-    }
-    crate::log!(
-        "[API] Refusing {} {} for app '{}': not app-reachable (ADR 0231)",
-        request.method(),
-        mounted,
-        app_id
-    );
-    ApiError::new(
-        StatusCode::FORBIDDEN,
-        format!(
-            "An app may not call {} {}. See system-knowhow/js-sdk.md, lucidos.request.",
+    if !app_may_call(&mounted, request.method().as_str()) {
+        crate::log!(
+            "[API] Refusing {} {} for app '{}': not app-reachable (ADR 0231)",
             request.method(),
-            mounted
-        ),
-    )
-    .into_response()
+            mounted,
+            app_id
+        );
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "An app may not call {} {}. See system-knowhow/js-sdk.md, lucidos.request.",
+                request.method(),
+                mounted
+            ),
+        )
+        .into_response();
+    }
+    if let Some(key) = human_only_preference(&mounted, request.method(), request.uri().query()) {
+        crate::log!(
+            "[API] Refusing PUT /preferences '{}' for app '{}': a human-only key",
+            key,
+            app_id
+        );
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "An app may not write the preference '{key}'. The user changes it in Settings."
+            ),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// The human-only key a `PUT /preferences` names, if any.
+///
+/// `/preferences` is an `App` route, so an app can keep its own settings. The
+/// keys the agent may not write (`preference_catalog::INTERNAL_KEYS`) include
+/// the security switches: the command guard, the tool-call cap and the network
+/// bind. An app is no more trusted than the agent, so it may not write them
+/// either. Every `key` parameter counts, so a repeated one cannot hide a key.
+fn human_only_preference(
+    mounted: &str,
+    method: &axum::http::Method,
+    query: Option<&str>,
+) -> Option<String> {
+    if mounted != "/preferences" || method != axum::http::Method::PUT {
+        return None;
+    }
+    query?
+        .split('&')
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (form_decode(name) == "key").then(|| form_decode(value))
+        })
+        .find(|key| crate::core::preference_catalog::internal_hint(key).is_some())
+}
+
+/// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`
+/// does. An undecodable one stays raw, and `Query` refuses that request anyway.
+fn form_decode(component: &str) -> String {
+    let spaced = component.replace('+', " ");
+    urlencoding::decode(&spaced)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or(spaced)
 }
 
 #[cfg(test)]

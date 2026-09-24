@@ -89,7 +89,7 @@ const REQUEST_LINE_MARKER: &str = "Request:";
 ///   WOKEN turn later sees the same request again in its history. Keying the
 ///   second half on that block is what makes both terminate: once it exists the
 ///   mock returns plain text and the turn finishes. A prompt-only rule would
-///   subscribe forever and trip the consecutive-subscription cap.
+///   subscribe forever and trip the recent-subscription cap.
 pub fn scripted_await_event(messages: &[Message]) -> Option<String> {
     if already_called(messages, crate::llm::tool_names::AWAIT_EVENT) {
         return None;
@@ -371,7 +371,7 @@ mod tests {
     /// Termination, and it has to hold twice: the loop iteration right after
     /// the call sees the block, and so does the woken turn (which sees its own
     /// request again in history). Without this the mock would re-subscribe
-    /// forever and trip the consecutive-subscription cap.
+    /// forever and trip the recent-subscription cap.
     #[test]
     fn a_turn_that_already_subscribed_does_not_subscribe_again() {
         let mut msgs = assembled("", "MOCK_SUBSCRIBE_ON:ReleasePublished");

@@ -118,6 +118,7 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'image':
     case 'checkpoint':
     case 'event_wait':
+    case 'held_message':
     case 'spoken_reply':
     case 'empty':
       return true;
@@ -149,6 +150,36 @@ export function hidesEarlierProse(events: ResponseEvent[]): boolean {
   const hasSteps = events.some(isStepMechanics);
   const meaningfulTextCount = events.filter(isMeaningfulText).length;
   return hasSteps && meaningfulTextCount >= 2;
+}
+
+/** Does the render window's head clamp decide what this turn's body draws?
+ *
+ *  Not on the collapsed-prose path: turning details off keeps what follows the
+ *  last prose chunk, whatever the clamp says. `ChatExchange` picks its path by
+ *  this, and the window reads it through `rowsDrawnByClamp`. */
+export function headClampApplies(events: ResponseEvent[], showDetails: boolean): boolean {
+  return showDetails || !hidesEarlierProse(events);
+}
+
+/** The reader's view of one turn, as far as its body is concerned. */
+export interface TurnView {
+  showSteps: boolean;
+  showDetails: boolean;
+  /** The reader folded this turn to its `⋯` stub. */
+  folded: boolean;
+}
+
+/** Which of a turn's rows the CLAMPED slice draws, one flag per row.
+ *
+ *  What the render window budgets by (`threadWindow.ts`). A row that renders
+ *  `null` costs nothing and adds no height, so counting it strands the reader:
+ *  a window can fill its whole budget with rows the reader cannot see.
+ *
+ *  A folded turn mounts no body. A turn on the collapsed-prose path ignores the
+ *  clamp. Either way the clamp draws nothing, so every flag is false. */
+export function rowsDrawnByClamp(events: ResponseEvent[], view: TurnView): boolean[] {
+  if (view.folded || !headClampApplies(events, view.showDetails)) return events.map(() => false);
+  return events.map(e => drawsResponseRow(e, view.showSteps));
 }
 
 /** Determine which events are visible when the exchange is collapsed.

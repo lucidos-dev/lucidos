@@ -186,6 +186,10 @@ function cancelScrollAnim() {
  *  claim the transcript's next 64ms of scroll events. */
 let _navScrollAt = -Infinity;
 let _navScrollEl: HTMLElement | null = null;
+/** Where that write left `_navScrollEl`, as the browser settled it, and null
+ *  once a scroll has found the container elsewhere. Read by
+ *  `isWhereWeLastScrolledIt`. */
+let _navScrollTop: number | null = null;
 /** WHICH KIND of write our own last one was. Every one of them marks a
  *  navigation, so the mobile header, the render-window expansion and the mobile
  *  scroll indicator all stand down for it. What the kind adds is what a consumer
@@ -231,6 +235,9 @@ export function markNavigationScroll(el: HTMLElement, top: number) {
   // describes the write being recorded rather than the one before it.
   _navScrollKind = 'placement';
   el.scrollTop = top;
+  // What the browser settled, which a clamp or a fractional offset makes differ
+  // from `top`. The write has already laid the container out, so this is free.
+  _navScrollTop = el.scrollTop;
 }
 
 /** Write `top` and record it as the app HOLDING the reader on the content they
@@ -325,6 +332,29 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
   // write to some other container is not an answer. A caller that names none
   // (the mobile header, which follows whichever pane is active) takes any.
   return !el || _navScrollEl === el;
+}
+
+/** Is `el` still where our own last navigation left it?
+ *
+ *  The half of "was this scroll ours" that no clock can answer. A heavy render
+ *  right after a write can delay its event well past `NAV_SCROLL_EVENT_WINDOW_MS`
+ *  on WebKit. The position still names it.
+ *  1px of slack takes the repaint nudge's deliberate ±1, the rule
+ *  `isWhereWeHeldIt` keeps for held writes.
+ *
+ *  A reader who scrolls leaves the stamp, and `forgetNavigationStamp` retires
+ *  it then, so their return onto the same offset is theirs again. */
+export function isWhereWeLastScrolledIt(el: HTMLElement): boolean {
+  return _navScrollTop !== null && _navScrollEl === el
+    && Math.abs(el.scrollTop - _navScrollTop) <= 1;
+}
+
+/** RETIRE the stamp the moment the container leaves it. Called by `onScroll`,
+ *  beside `forgetHeldLiveEdge` and for the same reason: a number the reader came
+ *  BACK to reads exactly like one they never left. Clears the offset alone, so
+ *  `isNavigationScroll`'s window keeps its element. */
+function forgetNavigationStamp(el: HTMLElement): void {
+  if (_navScrollEl === el && !isWhereWeLastScrolledIt(el)) _navScrollTop = null;
 }
 
 /** Did one of our own PLACEMENTS produce this scroll event: a write that put the
@@ -1317,10 +1347,57 @@ let _gestureAt = -Infinity;
  *  carries reach `pointermove` below and stamp a gesture. That would put the
  *  window over exactly the interactions that must KEEP the follow.
  *
- *  What it buys is the length of a drag. The press itself stamps once, and a
- *  slow haul down the scrollbar can outlast the window. So `pointermove` keeps
- *  the stamp fresh while the thumb is held. */
+ *  The press itself stamps once, and `pointermove` re-stamps any drag the page
+ *  sees. Chromium sends no moves while it drives its own thumb, so the length
+ *  of a thumb drag is `_scrollbarHoldEl`'s to answer. */
 let _scrollbarPressEl: HTMLElement | null = null;
+/** The container a primary press on its OWN box is held on, or null.
+ *
+ *  Wider than `_scrollbarPressEl`, which sees only a classic gutter. An overlay
+ *  scrollbar sits inside the client box, so its press lands here too. The rest
+ *  of the container's own box is padding, where a press scrolls nothing.
+ *  While it lasts, a scroll counts as the reader's (`readerGestureActive`).
+ *  A click on the padding moves nothing, so it cannot retire the follow. */
+let _scrollbarHoldEl: HTMLElement | null = null;
+
+/** Told when a scrollbar hold ends, with the container it was on. */
+const _scrollbarReleaseListeners = new Set<(el: HTMLElement) => void>();
+
+function releaseScrollbar(el: HTMLElement) {
+  if (_scrollbarPressEl === el) _scrollbarPressEl = null;
+  if (_scrollbarHoldEl !== el) return;
+  _scrollbarHoldEl = null;
+  for (const listener of _scrollbarReleaseListeners) listener(el);
+}
+
+/** Is the reader holding `el`'s native scrollbar, or may they be?
+ *
+ *  While they do, Chromium re-applies its own drag position, with no input event
+ *  at all. That undoes an anchor write, so content drawn above the reader would
+ *  jump them by its height. So a grow, and history landing above the reader,
+ *  wait for the release (ADR 0258). */
+export function isScrollbarHeld(el: HTMLElement): boolean {
+  return _scrollbarHoldEl === el;
+}
+
+/** Subscribe to a scrollbar hold ending; returns the unsubscribe. */
+export function onScrollbarReleased(listener: (el: HTMLElement) => void): () => void {
+  _scrollbarReleaseListeners.add(listener);
+  return () => { _scrollbarReleaseListeners.delete(listener); };
+}
+
+/** Resolves once `el`'s scrollbar is not held: at once when it is not, else a
+ *  frame after the release, so the drag has ended before anything lands. */
+export function scrollbarReleased(el: HTMLElement): Promise<void> {
+  if (_scrollbarHoldEl !== el) return Promise.resolve();
+  return new Promise((resolve) => {
+    const unsubscribe = onScrollbarReleased((released) => {
+      if (released !== el) return;
+      unsubscribe();
+      requestAnimationFrame(() => resolve());
+    });
+  });
+}
 
 /** Record MOVEMENT: a wheel notch, a finger travelling, a drag, a scroll key.
  *  Never a bare press. */
@@ -1331,13 +1408,16 @@ function stampGesture(el: HTMLElement) {
 
 /** Did the reader move `el` themselves, counting the coast after a flick?
  *
- *  Freshness is the whole test, with no "still holding" term beside it. A drag
- *  fires movement continuously, so a real one keeps re-stamping. A held-down
- *  term would also be a state that can STICK. A release the page never sees,
- *  such as a touch ending while the PWA is backgrounded, would leave the
- *  reader's hand permanently on the transcript. The first platform scroll after
- *  the resume would then retire the follow. */
+ *  Freshness answers for movement, since a finger or a wheel keeps re-stamping.
+ *  A held scrollbar answers for itself. Chromium drives its own thumb and may
+ *  send no moves, and an overlay thumb press never stamps at all. Read as the
+ *  platform, that drag gets written back to the edge while Chromium re-applies
+ *  its own position, and the two fight every frame.
+ *
+ *  The hold is the one held-down term. The next release anywhere on the page
+ *  ends it, as do a buttonless move, a real blur and a teardown. */
 function readerGestureActive(el: HTMLElement): boolean {
+  if (_scrollbarHoldEl === el) return true;
   return _gestureEl === el && nowMs() - _gestureAt < READER_GESTURE_WINDOW_MS;
 }
 
@@ -1389,7 +1469,12 @@ function attachReaderGestures(el: HTMLElement): () => void {
     // Horizontal only: `.thread-content` is `overflow-x: hidden`, so there is
     // no bottom scrollbar for an `offsetY` arm to ever be right about. Always
     // false where scrollbars overlay, which is every touch device.
-    if (e.target !== el || e.offsetX <= el.clientWidth) return;
+    if (e.target !== el) return;
+    // Only the primary button starts a scrollbar hold. A right-click opens a
+    // context menu, which can swallow the release, and a hold that never ends
+    // blocks the window.
+    if (e.button === 0) _scrollbarHoldEl = el;
+    if (e.offsetX <= el.clientWidth) return;
     _scrollbarPressEl = el;
     stampGesture(el);
   };
@@ -1398,7 +1483,7 @@ function attachReaderGestures(el: HTMLElement): () => void {
     // never saw: over a nested iframe, or while the PWA was backgrounded.
     // Clearing here stops `_scrollbarPressEl` becoming a state that can STICK,
     // where a mouse merely crossing the transcript reads as a drag.
-    if (e.buttons === 0) { if (_scrollbarPressEl === el) _scrollbarPressEl = null; return; }
+    if (e.buttons === 0) { releaseScrollbar(el); return; }
     if (_scrollbarPressEl === el) stampGesture(el);
   };
   // `wheel` and `touchmove` are stamped WHEREVER in the transcript they land,
@@ -1409,7 +1494,16 @@ function attachReaderGestures(el: HTMLElement): () => void {
   // intent whatever they land on. The worst they can be wrong about is a nested
   // scroller, where the reader is still scrolling, just not this box.
   const onMove = () => stampGesture(el);
-  const onUp = () => { if (_scrollbarPressEl === el) _scrollbarPressEl = null; };
+  const onUp = () => releaseScrollbar(el);
+  // Only a real loss of focus, such as switching apps, ends a drag the page
+  // lost track of. Focus moving into an iframe on the page does not.
+  let blurTimer: ReturnType<typeof setTimeout> | undefined;
+  const onBlur = () => {
+    clearTimeout(blurTimer);
+    blurTimer = setTimeout(() => {
+      if (typeof document === 'undefined' || !document.hasFocus()) releaseScrollbar(el);
+    }, 0);
+  };
   const onKey = (e: KeyboardEvent) => {
     // A CHORD is a shortcut, not a scroll key. The two overlap: turn stepping
     // is Cmd+Arrow, and its own keystroke stamping a gesture would defeat the
@@ -1468,6 +1562,9 @@ function attachReaderGestures(el: HTMLElement): () => void {
   root.addEventListener('pointercancel', onUp, { passive: true });
   root.addEventListener('touchend', onUp, { passive: true });
   root.addEventListener('touchcancel', onUp, { passive: true });
+  // A scrollbar hold gates the window's growth (`isScrollbarHeld`), so it
+  // must not outlive a drag the page lost track of.
+  root.addEventListener('blur', onBlur);
 
   return () => {
     el.removeEventListener('pointerdown', onDown as EventListener);
@@ -1480,8 +1577,12 @@ function attachReaderGestures(el: HTMLElement): () => void {
     root.removeEventListener('pointercancel', onUp);
     root.removeEventListener('touchend', onUp);
     root.removeEventListener('touchcancel', onUp);
+    root.removeEventListener('blur', onBlur);
+    clearTimeout(blurTimer);
     if (_gestureEl === el) { _gestureEl = null; _gestureAt = -Infinity; }
-    if (_scrollbarPressEl === el) _scrollbarPressEl = null;
+    // Released, not just forgotten: a history read waiting on the release
+    // (`scrollbarReleased`) would otherwise wait for good.
+    releaseScrollbar(el);
   };
 }
 
@@ -1500,6 +1601,7 @@ export function readerGestureForTest(el: HTMLElement | null, moved = true): void
     _gestureEl = null;
     _gestureAt = -Infinity;
     _scrollbarPressEl = null;
+    _scrollbarHoldEl = null;
     return;
   }
   stampGesture(el);
@@ -3538,6 +3640,7 @@ export function makeScrollObservers(el: HTMLElement) {
     // cannot change: they took their answers on the line above, and each branch
     // that puts the reader back on the edge re-stamps as it writes.
     forgetHeldLiveEdge(el);
+    forgetNavigationStamp(el);
     if (_followingBottom.value) {
       if (scrollRetiresTheRide(atEdge, tookOver, gesture)) stopFollowingBottom();
       // NOT A GESTURE IS NOT THE SAME AS THE PLATFORM, which is the fourth term.

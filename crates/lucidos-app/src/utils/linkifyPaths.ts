@@ -6,6 +6,8 @@
  * nesting to avoid nested anchors and linkifying code content.
  */
 
+import { makeInertBody } from './escapeHtml';
+import { escapeHtmlAttr } from './markedConfig';
 import { addLinkifyMs } from './renderPhaseTimers';
 
 // Cap how many alternatives go into a single regex. WebKit's YARR throws
@@ -851,9 +853,89 @@ export function linkifyPaths(
   }
 }
 
+const TAG_SPLIT = /(<[^>]+>)/;
+
+/** Stands in for a stashed attribute value. A private-use character, so the
+ *  serializer writes it through untouched and no linkifier pattern matches it. */
+const STASH_MARK = '\uE000';
+const STASH_REF = new RegExp(`${STASH_MARK}(\\d+)${STASH_MARK}`, 'g');
+
+/** Rendered HTML as alternating text and tag segments, or null when it cannot
+ *  be split safely.
+ *
+ *  The split reads a tag as `<` up to the next `>`. The serializer writes `>`
+ *  raw inside an attribute value, where it ends the tag early. The URL
+ *  linkifier then splices an anchor into the value. Its quote closes the value,
+ *  and the rest parses as attribute names, such as a live `onmouseover`.
+ *
+ *  Text never holds a raw `<`, so the first cut always starts at a real tag,
+ *  and that segment ends inside an open value. Spotting one proves a cut. Only
+ *  such markup pays for a parse.
+ *
+ *  Null means linkify must return the markup untouched. That markup is already
+ *  sanitized, so declining costs links, never safety. */
+function splitTags(html: string): string[] | null {
+  const segments = html.split(TAG_SPLIT);
+  if (!segments.some(isCutTag)) return segments;
+  const escaped = withAttributeBracketsEscaped(html);
+  if (escaped === null) return null;
+  const resplit = escaped.split(TAG_SPLIT);
+  return resplit.some(isCutTag) ? null : resplit;
+}
+
+function isCutTag(segment: string, index: number): boolean {
+  return index % 2 === 1 && endsInsideValue(segment);
+}
+
+/** Does this tag end inside an attribute value? A quote opens a value only
+ *  right after `=`, and only the same quote closes it. One pass per segment,
+ *  so the whole check stays linear in the markup. */
+function endsInsideValue(tag: string): boolean {
+  let open: string | null = null;
+  let previous = '';
+  for (const c of tag) {
+    if (open) {
+      if (c === open) open = null;
+    } else if ((c === '"' || c === "'") && previous === '=') {
+      open = c;
+    }
+    if (!open && !/\s/.test(c)) previous = c;
+  }
+  return open !== null;
+}
+
+/** Its own inert body, never `renderMarkdown`'s: a shared node would let either
+ *  pass read markup the other left behind. */
+let attributeBody: HTMLElement | null | undefined;
+
+/** `html` reserialized with every `<` and `>` inside an attribute value written
+ *  as an entity. The browser serializes the tree, and only values holding a
+ *  bracket are swapped for a stash mark and put back escaped. */
+function withAttributeBracketsEscaped(html: string): string | null {
+  if (html.includes(STASH_MARK)) return null;
+  if (attributeBody === undefined) attributeBody = makeInertBody();
+  const body = attributeBody;
+  if (!body) return null;
+  body.innerHTML = html;
+  try {
+    const stash: string[] = [];
+    for (const el of Array.from(body.querySelectorAll('*'))) {
+      for (const attr of Array.from(el.attributes)) {
+        if (!/[<>]/.test(attr.value)) continue;
+        stash.push(attr.value);
+        attr.value = `${STASH_MARK}${stash.length - 1}${STASH_MARK}`;
+      }
+    }
+    return body.innerHTML.replace(STASH_REF, (_, i: string) => escapeHtmlAttr(stash[Number(i)]));
+  } finally {
+    body.textContent = '';
+  }
+}
+
 function applyCompiled(html: string, compiled: CompiledLinkify): string {
   const { pathPatterns, pathLookup, appTextToId, appIds } = compiled;
-  const segments = html.split(/(<[^>]+>)/);
+  const segments = splitTags(html);
+  if (!segments) return html;
 
   // Track tag nesting to skip content inside <a> (prevents nested anchors)
   // and <code> (code content should not be linkified).

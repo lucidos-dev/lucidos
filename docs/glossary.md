@@ -497,7 +497,7 @@ The cap counts only completions somebody has CLAIMED, because a claim is the pro
 
 Completion and eviction used to be one call (`take_finished`, which did `tasks.remove`). The dispatch site's order is read, build, emit. A drain landing in that span found neither the entry nor the not-yet-written event row, and reached the agent as `unknown task_id`. Five scheduled trigger runs silently lost a successful result that way between 2026-07-29 and 2026-08-02.
 
-Reading the final state is now `completion_record`, which returns an owned `CompletionRecord` and touches neither the map nor the drain cursor. It is ONE-SHOT: taking the record claims the right to write the event, so a second caller gets `None` even though the entry is still drainable. Retention deliberately does NOT make a finished task look running: `has_running_for_thread` filters on `!is_finished()`, because the agent-session idle handler keeps a coding agent alive while that is true.
+Reading the final state is now `completion_record`, which returns an owned `CompletionRecord` and touches neither the map nor the drain cursor. It is ONE-SHOT: taking the record claims the right to write the event, so a second caller gets `None` even though the entry is still drainable. Retention deliberately does NOT make a finished task look running: `has_running_for_thread` filters on `!is_finished()`, because the engine arms an *event wait* over every task that answers true. Every production spawn goes through `LucidosEngine::start_background_task`, shared by the chat tool and a coding agent's `lucidos background-task` route (the user-facing *background task*).
 
 ### Abandoned background task
 A *background task* whose engine went away under it. The child belongs to the engine process. A restart, a crash or an OOM kills it, and no watchdog is left to reap a status. Until 2026-08-26 nothing then wrote `BackgroundBashCompleted`, so the `Started` row was the task's last word. The engine-armed *event wait* on that `task_id` sat to its own deadline and then re-opened the thread to blame the deadline. `bash_output` said `unknown task_id`, which reads exactly like a typo.
@@ -506,13 +506,13 @@ Both entry points live in `engine/tools/bash_background_recovery.rs`. `settle_ru
 
 It also hands over a task that FINISHED with its completion unclaimed. That watcher may never be scheduled again, and the next boot would then report a success as an engine loss. `settle_abandoned_background_tasks` runs at boot as the fail-closed floor, for the deaths no hook sees, and its anti-join over the event store makes the two idempotent.
 
-Neither note promises the work stopped. After a crash no destructor ran, so `kill_on_drop` never fired. The teardown's kill is a single-pid SIGKILL at the `bash -c` wrapper rather than at its process group. A pipeline or a command list therefore leaves its real work reparented to init. Both rows carry `abandoned: true`, no `exit_code` and no `signal`, and neither is `killed` (which means `bash_kill`, a decision somebody made). `finished_at` is when the loss was recorded, so on the boot path it spans the downtime rather than the task's runtime.
+Neither note promises the work stopped. After a crash no destructor ran, so `kill_on_drop` never fired. The teardown's kill is a SIGKILL to the task's whole process group (ADR 0263), which still misses a process that detached into its own session. Both rows carry `abandoned: true`, no `exit_code` and no `signal`, and neither is `killed` (which means `bash_kill`, a decision somebody made). `finished_at` is when the loss was recorded, so on the boot path it spans the downtime rather than the task's runtime.
 
 Exactly one completion reaches a task, gated by `BackgroundTask::completion_claimed`. Both the teardown and the task's own watchdog take it through `completion_record`, under the registry lock, and the loser writes nothing. `bash_output` reads the last row, so two of them would let a successful release come back reported as abandoned.
 
 The boot sweep is deliberately unbounded in time. An earlier draft settled only tasks inside their own `timeout_secs`, to keep the first boot quiet. That bought a one-time tidiness with a permanent hole: an engine down past the budget left the task unsettled forever. The backfill is cheap by comparison, since the event is `metadata` to the projection and every wait that old was resolved long ago. `bash.rs` still asks `task_start_time` before calling a drained id unknown, for the tasks neither path recorded.
 
-Three readers are served by the row. The engine-armed *event wait*, `bash_output`'s persisted fallback, and the *turn-gap note*, which is how a resumed coding agent hears. Its own delivery is the watcher push, and a teardown suppresses that for every completion, not just an abandoned one. See `docs/plans/2026-08-26-a-background-task-always-reaches-a-terminal-event.md`.
+Three readers are served by the row: the engine-armed *event wait*, which is the delivery, `bash_output`'s persisted fallback, and the *turn-gap note*. The note reports only a completion no event wait delivered. See `docs/plans/2026-08-26-a-background-task-always-reaches-a-terminal-event.md`.
 
 ### Brand badge
 The marker riding the *Lucidos mark*'s corner in the header. There are **two**, on opposite corners, and "brand badge" unqualified means the first. The **state badge** (`BrandBadge`, top-right) runs a one-slot `busy > ready > pending` ladder over engine lifecycle: see *background activity* and *pending engine version*. The **unread badge** (`UnreadBrandBadge`, bottom-right) is the cross-workspace unread count, and reads `crossWorkspaceUnreadTotal`, the same computed `syncWorkspaceAppBadge` writes onto the *app-icon badge*.
@@ -583,6 +583,8 @@ Internal name for the predicate in `is_attention_needing` (`engine/thread_lifecy
 
 ### Event row
 The transcript's one marker for everything that arrives from outside a thread, and for what the thread is waiting on: `components/chat/EventRow.tsx` plus `styles/chat/event-rows.css`. Four kinds share it, because they all answer the same question: an *event wait* (armed, matched, expired, stood down), an *event delivery*, a *child thread* callback (`ChildThreadCompleted`), and a *trigger* fire (`TriggerStarted`). The shape is a card: `mark + subject + state` on one line, then the facts line, then an optional fold. The same markup serves both positions the family occupies, a response body (the wait) and an *initiator panel*'s details (the other three), which is what lets one primitive cover all four.
+
+The child kind also draws the `ChildThreadStopped` note on a parent, and the notice that ends a *stopped child*'s transcript (ADR 0252).
 
 Five rules make the four coherent, and each has a test: **one mark column, always muted** (`○` pending, `↓` arrived, `↵` returned), never a step outcome glyph; **the subject wraps**, because every kind's subject is a sentence somebody wrote; **the state is a word** in a tinted pill (`waiting`, `matched`, `delivered`, `timed out`, `stopped`, `success`, `failure`, `no changes`, `canceled`, `fired`), the tint grouping the word rather than replacing it; **an event type is always the `.event-name` chip**; and **one fold, labelled by its content** (`Payload`, `Summary`, `Prompt`).
 
@@ -1152,6 +1154,8 @@ The gap below the field is a rem plus the strip iOS covers with its keyboard acc
 
 It is reserved at `focusin` from the widest band seen this session, because iOS decides before the keys have animated in. It is `0px` whenever they are down, so no view gains a dead scroll zone. Sources: `docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md`.
 
+**The band hold keeps the content still when the band drops.** Without it, a reader scrolled into the band has their `scrollTop` clamped, and a press lands its release on whatever moved there. So a lower band first sets `--keyboard-band-hold` on each scroller that needs it: the least padding that keeps its `scrollTop` valid (`heldBandPx`). The hold only shrinks, and drains as the reader scrolls back. It goes at the top, once the band covers it, or once the content it anchored shrinks. Sources: `docs/plans/2026-09-24-the-keyboard-band-holds-the-scroll-anchor.md`.
+
 **Never subtract `visualViewport.offsetTop` from a client rect here.** On iOS WebKit the layout viewport slides WITH the visual one for the keyboard. So `getBoundingClientRect` is already in the right frame, and subtracting double-counts. A source-scan tripwire holds the line.
 
 It is an *anchor write*, so the mobile hide-on-scroll header holds still for it. Mobile-only by its mount, `MobileSwipeContainer`. It changes no height in the shell's chain, deliberately: `docs/plans/2026-04-02-ios-header-keyboard-fix.md` lists what every attempt at that chain cost. See `docs/plans/2026-09-19-a-focused-field-stays-above-the-keyboard.md`.
@@ -1328,7 +1332,7 @@ The row dimension was added because the turn budget did nothing on the shape tha
 
 **An EDGE, never a count, in both dimensions.** A count slides forward as the live turn grows, so appending a turn would evict the oldest one the reader was shown. Stored per thread in a module Map, so a PARTIAL edge survives a switch-away-and-back: the reader grew it by scrolling, and re-seeding would make them walk back up on every return.
 
-**A render-all does not survive it** (`reseedOnReopen`). A *deep-link anchor* and the scroll-to-top chevron both set the edge to `WHOLE_THREAD`, which is right for the visit that asked. Nothing narrowed it again, so one tap bought every later open of that thread a full render: a reported 13,683-event thread drew 4,069 rows an open against the 37 its window would have drawn. A fresh open now re-seeds, and the *reading position* walks the window back to the turn the reader was on.
+**A render-all does not survive it** (`reseedOnReopen`). A *deep-link anchor* and the scroll-to-top chevron both set the edge to `WHOLE_THREAD`, which is right for the visit that asked. Nothing narrowed it again, so one tap bought every later open of that thread a full render: a reported 13,683-event thread drew 4,069 rows an open against the 37 its window would have drawn. A fresh open now re-seeds, and the *reading position* walks the window back to the turn the reader was on. **Who stored the window decides it, never its value** (`StoredWindowKind`), since a reader who scrolls up to the first turn also holds `WHOLE_THREAD`.
 
 **Growth is scroll-driven and has no control of its own.** Rows first, then turns: scrolling up into the oldest turn uncovers a budget of its head, and only once that turn is whole does the window reach past it. A per-turn "Show earlier steps" expander shipped twice and was removed twice. The second removal happened because the user disliked it from the first message, so a source-scan tripwire fails if one comes back (`components/chat/__tests__/floor-turn-row-clamp.test.ts`).
 
@@ -1336,9 +1340,26 @@ A GESTURE covers the second case a scroll cannot. A container already at `scroll
 
 `fillAction` covers the case a scroll cannot: a slice shorter than the pane produces no scroll event. It answers grow, page or none, and ThreadView acts until it answers none. That is either a transcript that scrolls or a thread loaded and drawn to its first event. **The page arm is what paging made necessary**, since the window running out of loaded turns no longer means the thread has no more.
 
-A turn the *reading position* names must render WHOLE, not merely be present, because the restore measures that turn's own top edge (ADR 0152).
+A turn the *reading position* names must render WHOLE, not merely be present, because the restore measures that turn's own top edge (ADR 0152). A ROW it names needs only that row drawn (`edgeMustReachRow`).
 
-**A turn the loaded pages do not hold is ABANDONED** (ADR 0234). The walk grows the window and never fetches, so a position behind the newest page opens the thread at the top of that page. Chasing it would spend exactly what paging bought, worst on a phone over a slow link. The record survives, so a client holding the history still lands on the turn. A position INSIDE the loaded pages is honoured exactly, and that is what the walk is for.
+**The stored edge names its turn BY KEY as well as by index** (`storeEdge` / `storedEdge`). A fold of older history grows the list at the front, so a bare index named an older turn for the fold's commit. That render drew every turn the fold brought in, and a restore landed on that page before the re-point shrank it. A render-all is stored with no key, pinned to the first turn. **A reopen reseeds in RENDER**, not in an effect: Preact flushes a component's effects before re-rendering it, so a restore attached against the old window and was moved when it shrank.
+
+**A position the loaded pages do not hold is CHASED, within a bound** (ADR 0234, `readingChaseAction`). The walk reads older history in 2000-event pages, at most `MAX_READING_CHASES` of them, until the turn or row is loaded. Past the bound the thread opens at the top of the newest page, since an unbounded chase would spend exactly what paging bought. The record survives, so a client holding the history still lands on it. A position INSIDE the loaded pages is honoured exactly, and that is what the walk is for.
+
+### Transcript scrollbar
+The scrollbar beside the transcript. It measures the drawn slice, the *render window*, not the whole thread (ADR 0258). No estimate of the undrawn history is right on every thread, since a folded turn draws hundreds of events as a few rows. So on a long thread the thumb jumps and shrinks when older turns draw or a page lands, as in any infinite scroll. The content does not move: the anchor write and the *history hold* keep the reader still.
+
+**While the reader holds the native scrollbar, nothing lands above them.** Window grows and fetched pages wait for the release, since Chromium puts its own drag position back and would undo the anchor write.
+
+**On desktop it is the native scrollbar. On mobile it is a drawn touch indicator** (`components/chat/scrollIndicator.ts`, `hooks/useThreadScrollIndicator.ts`), because the fixed header covers the native one. A touch drag summons it, and it fades once motion stops.
+
+### Scrollbar hold
+A primary press on the transcript scroller's own box, from the `pointerdown` to its release (`isScrollbarHeld` in `components/chat/scrollState.ts`). That box holds its classic gutter, and an overlay thumb, which sits inside the client box. While the hold lasts, nothing lands above the reader: Chromium puts its own drag position back and would undo the anchor write. So a window grow waits, and a fetched page waits at its *landing gate* (ADR 0258).
+
+A pointerup ends it, as do a move with no button held, a real loss of focus and a teardown. A frame after the release, the window grows if the hold put a grow off (`onScrollbarReleased`). Distinct from the *history hold*, which records where the reader was while a read is in flight.
+
+### Landing gate
+What a history read awaits between fetching its events and folding them into the thread (`HistoryLandingGate` in `store/actions/thread-loading.ts`). The read stays in flight meanwhile, so no second one starts. The transcript passes `scrollbarReleased`, so a page lands only after the *scrollbar hold* ends.
 
 ### History hold
 Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the whole-history fetch a *deep-link anchor*'s render-all needs.
@@ -1363,7 +1384,11 @@ Transient by construction: the page behind it carries the boundary, and the fold
 ### Reading position
 Where a reader had parked in a transcript, remembered across a thread switch, a reload, and the app being backgrounded (`lucidos-scroll-thread-<id>` in localStorage, written and restored by `hooks/useScrollMemory.ts`). Since the transcript stopped scrolling itself to the bottom (see *navigation scroll*, and *standing follow* for the one thing that rides the bottom now, on request and never on open), this is the ONLY thing that decides where a thread opens, and it answers every form of the question: a saved position is restored, and a thread with none opens at the TOP of what is rendered (`resetOnEmpty`, which matters because `.thread-content` is one element reused across threads and would otherwise inherit the previous one's offset). There is a THIRD answer, because the transcript is WINDOWED: an offset recorded against a taller render (a session that scrolled up, a *deep-link anchor*'s render-all) is routinely out of reach of the trailing slice the next open renders, and an offset that cannot be honoured opens the thread at the top as well. Never at the bottom. `Math.min(saved.top, max)` used to say otherwise in both places that gave up (the restore deadline, the dead-link rescue below), and since a clamp can only run when the offset is unreachable, `max` was the whole of it: the live edge, three seconds after the reader arrived and settled. The wait itself is spent parked at the top for the same reason rather than on the borrowed offset the shared container arrived holding, so a restore that never becomes possible has already left the reader somewhere honest instead of on a number the save listener would then persist as theirs. EVERY position is saved, the bottom included, and `0` persists as a real position distinct from no save at all. The save is debounced and committed from the attachment's teardown AND on `onPageHide`, because a background is neither: a frozen page's pending timer never runs if the page is then discarded, so the reader's last act would be lost, and the direction that does damage is a lost DISARM (the stale live edge outliving them, so the next open drags them to a bottom they scrolled away from).
 
-**THE TRANSCRIPT RECORDS A TURN**, not a pixel offset (`anchor:<relTop>:<eventId>`, behind the `anchorsToContent` opt-in). It names the turn at the top of the viewport, plus the exact offset that turn's own top sat at. The id it names by is the `.chat-exchange` stamp a *deep-link anchor* also resolves against, so the two cannot disagree about which turn is which. The paragraph below describes the OFFSET form, which every other container still records: neither the content pane nor the thread drawer is windowed.
+**THE TRANSCRIPT RECORDS THE STEP ROW AT THE LINE** (`row:<relTop>:<rowEventId>`), by its tool call's event id, where the turn at the line has one. Otherwise it records the TURN (`anchor:<relTop>:<eventId>`). Both sit behind the `anchorsToContent` opt-in. The row is the finer answer. A coding-agent turn holds hundreds of rows, and the window draws its tail first. A turn anchor measured there landed the reader above their place (ADR 0152).
+
+A row behind the loaded page is chased, at most two 2000-event reads (ADR 0234). Each open reports which rule placed the reader (`[Client/scroll] restore` in engine.log).
+
+For the turn form: It names the turn at the top of the viewport, plus the exact offset that turn's own top sat at. The id it names by is the `.chat-exchange` stamp a *deep-link anchor* also resolves against, so the two cannot disagree about which turn is which. The paragraph below describes the OFFSET form, which every other container still records: neither the content pane nor the thread drawer is windowed.
 
 A pixel offset cannot describe the transcript, whose HEIGHT is not reproducible. Only a trailing slice is rendered, and that slice's top edge is session state, re-seeded from the newest turns on every reload (see *render window*). A number recorded against one slice measures from an edge that has since moved. It either overshoots the next slice, which parked the reader at the top, or lands on different content once the thread has grown. Both were reported together (`docs/plans/2026-08-28-the-transcript-remembers-a-turn-not-a-pixel.md`), and the second is why measuring from the BOTTOM is no answer either: that form survives a resize and breaks the moment a turn is appended.
 
@@ -1469,6 +1494,19 @@ ordinary answer text: it streams whole at its `content_block_stop` and joins
 `content` in block order. A note cut before its stop stays hidden reasoning, so
 a dropped stream still retries. Never shown on any other model, where
 `thinking` text is reasoning.
+
+A Claude Code session gets its notes through the *Vertex relay*. Its parser
+renders each one as the agent's message, by the same rule
+(`anthropic_wire::progress_note`).
+
+### Vertex relay
+The engine's loopback hop between Claude Code and Vertex
+(`runtime/vertex_relay.rs`). Each Claude Code session's
+`ANTHROPIC_VERTEX_BASE_URL` points at it, carrying a signed per-thread token.
+For an always-thinking model it sets `thinking.display: "updates"` and the
+beta, so *progress notes* come back. It forwards everything else unchanged. A
+temporary measure until Claude Code asks for notes on Vertex itself; see ADR
+0260.
 
 ### Thinking mode
 What a Claude adaptive-thinking model does with thinking when a request does
@@ -1910,6 +1948,11 @@ The tri-state result of resolving a worktree directory's 8-hex thread-id prefix 
 
 ### Host-pid kill guard
 `is_protected_host_pid` (`scripts/lib/ports.sh`) — the check that decides whether a pid is a live Lucidos host process the dev scripts must never signal. Consulted by `kill_unprotected_pids`, by `_try_reclaim_stale_lucidos_on_port` (the only path that sends the engine's real stop signal, `kill -USR1` — it ignores SIGTERM), and as a backstop by `webkit_reaper.sh::reap_once`. **Four arms**, and the split between them is the point: `LUCIDOS_HOST_PID` / `LUCIDOS_FRONTEND_PID` and a pidfile scan of `<home>/workspaces/*/.lucidos/{engine,frontend}.pid` read state the **caller owns** and can switch off; the **ancestor** arm (this process and every pid it descends from, a cached `ps -o ppid=` walk from `$$`) and `pid <= 1` **cannot be defeated by the caller**, because a process cannot unset its own parentage. The pidfile scan also covers the **password-database home** (`dscl` / `getent`, never `eval`), so reassigning `HOME` doesn't hide sibling workspaces' engines either. The two undefeatable arms exist because both original arms failed open on 2026-07-28 and `ports_test.sh` — doing nothing worse than sandboxing `HOME` and unsetting env vars, as a good test should — killed the machine's live dev engine twice. Consequence worth knowing before writing a test: **sandboxing `HOME` isolates the port registry but deliberately does NOT disarm host protection**; a pid you need unprotected must be dead (the `kill -0` liveness gate) or synthetic. Distinct from `.claude/hooks/pre-kill.sh`, which blocks `kill`/`pkill`/`lsof | xargs kill` typed directly into a Bash tool call by inspecting the command string, and so cannot see a kill several frames deep inside a sourced shell library. See ADR 0025.
+
+### Host memory watch
+A launchd agent on a development Mac that runs `scripts/memory-watch.sh --once` every 30 seconds, independent of any Lucidos process. Each tick reads every process's physical footprint from one `top` sample. A process over a share of RAM is recorded while it is alive, with its command line, working directory and parent chain, in `~/.lucidos/memory-watch/memory-watch.log`. A process past physical RAM is killed once its record is written. Pid 0 and 1, a pid the *host-pid kill guard* protects, and another user's process are never killed.
+
+A runaway `grep` once filled the VM compressor and froze the host. The jetsam reports kept too little to say who started it, and this watch keeps the rest. Install it from your own checkout with `scripts/memory-watch-install.sh install`, never from a worktree. Distinct from the e2e memory guard in `scripts/lib/host_memory_guard.sh`, which only watches an e2e run. See `scripts/lib/memory_watch.sh`.
 
 ### e2e lock
 The single-writer lock on the shared e2e-test workspace (`<e2e-workspace>/.lucidos/e2e.lock`, `scripts/lib/e2e_lock.sh`), acquired by every e2e entry point before it starts the workspace or spawns a browser. **Machine-wide, not per workspace**: it is one file on one path, so a run in `dev` and a run in `myws` contend for the same lock. Four states (no lock, live-PID lock, stale lock without orphans, stale lock with orphans), the last two being the orphan-safe reclaim; the details and their incidents live in `docs/e2e-test-decisions.md`. A hold is announced by two domain events, `E2ELockAcquired` and `E2ELockReleased`, so a refused run can subscribe with `lucidos await-event` and end its turn instead of sleeping in a loop. **Both endings emit**: a normal release, and a reclaim, which announces the *dead* owner's hold ending because that owner's EXIT trap never ran. The announcement is best effort and bounded, and it is emitted into the emitting subprocess's own workspace, which is why a cross-workspace waiter is delivered nothing and recovers on its `--timeout-secs` deadline instead (ADR 0057). Agent-facing rules: `.claude/skills/e2e-lock-wait/SKILL.md`.
@@ -2507,7 +2550,29 @@ Transient projection that feeds the PresenceCheck protocol's candidate list. `de
 The in-memory `Arc<Mutex<HashMap<Uuid, PendingSlot>>>` on `LucidosEngine` that owns in-flight PresenceCheck slots. `expect(notification_id, expected_pongs)` registers interest and returns an `Arc<Notify>`; `record(req)` appends a pong and signals via `notify_one()` once `expected_pongs` are in (so a pong that lands before the fan-out task awaits doesn't lose its wakeup); `collect(notification_id)` drains the slot. Each `expect()` also sweeps slots older than 5 s so a panicking fan-out task can't leak entries. Lives only in memory and is wiped on engine restart; transient by design. See `crates/lucidos-engine/src/api/presence_pong.rs` and `system-knowhow/notifications.md` §3.
 
 ### Prose field
-A text `<input>`/`<textarea>` holding **natural language the user writes** — the chat prompt, a thread title, a trigger intent or name, an app description, an email subject/body, the free-text prompt dialog — as opposed to the config fields the app is mostly made of (paths, ids, env var names, model ids, API keys, cron expressions, JSON conditions). The distinction exists because `installNoAutofill` (`crates/lucidos-app/src/utils/noAutofill.ts`) stamps `autocomplete`/`autocorrect`/`autocapitalize` = `off` on *every* text field to suppress WebKit's saved-value dropdown; that default protects a config value from an iOS auto-capital but strips a prose field of autocorrection. A prose field spreads `PROSE_TEXT_ATTRS`, a **marker** (`data-prose`) rather than a value: the stamp skips `autocorrect`/`autocapitalize` for it and leaves the browser's own defaults, which already are autocorrect-on and sentence capitalization (`autocomplete="off"` is still stamped, so the dropdown stays suppressed). Marking beats asserting because it never touches Preact's property path — `autocorrect={x}` becomes `el.autocorrect = x`, and since the IDL attribute is a boolean the string `"off"` coerces to `true` and reflects back as `autocorrect="on"`, an inversion this codebase shipped for seven weeks. Turning autocorrect off is therefore the stamp's `setAttribute` alone, never JSX. Pinned by source-scan guards in `noAutofill.test.ts`. See `.claude/rules/frontend.md`.
+A text `<input>` or `<textarea>` holding **natural language the user writes**,
+like the chat prompt, a thread title or a trigger intent. It stands against the
+config fields the app is mostly made of, such as paths, ids, model ids and API
+keys.
+
+The distinction exists because `installNoAutofill`
+(`crates/lucidos-app/src/utils/noAutofill.ts`) stamps `autocomplete`,
+`autocorrect` and `autocapitalize` as `off` on every text field. That suppresses
+WebKit's saved-value dropdown, and it protects a config value from an iOS
+auto-capital. On a prose field it would also strip sentence capitals and
+autocorrection.
+
+A prose field spreads `PROSE_TEXT_ATTRS`, a **marker** (`data-prose`) rather
+than a value. The stamp then leaves its capitalization at the browser default.
+Its autocorrect follows the device's Autocorrect switch, on by default
+everywhere ([ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md)).
+`autocomplete="off"` is still stamped, so the dropdown stays suppressed.
+
+Marking beats asserting because it never touches Preact's property path.
+`autocorrect={x}` becomes `el.autocorrect = x`, and the boolean IDL attribute
+reflects the string `"off"` as `autocorrect="on"`, an inversion this codebase
+shipped for seven weeks. So no JSX ever turns autocorrect off. Pinned by
+source-scan guards in `noAutofill.test.ts`. See `.claude/rules/frontend-css.md`.
 
 ### Ramp / room
 The distinction the product-philosophy lens turns on, applied to a proposal that adds a **surface** or an **integration** (`docs/philosophy.md`, `.claude/rules/philosophy.md`). A **ramp** reaches out to where the user already is and leads back into the *workspace*: an OS notification banner, a share-sheet entry, a widget showing what a *trigger* found, a link in an email, a data source pulled from somebody's cloud, an app downloaded from a store. It holds no state and its whole payload is a way in, so it is wanted. Lucidos deliberately builds ramps inside Apple's and Google's systems, because that is where people already are, and the clause that keeps that honest is that we own the fallback (the headless tarball against the notarized `.dmg`). A **room** is somewhere the user works *instead* of coming to Lucidos: the transcript lives there, the formatting is theirs, the history is theirs, and the workspace is reduced to whatever their protocol can express. Rooms fragment the single memory the product rests on, so they are refused. A proposal that reads as both is a room. Two are already settled as rooms: a chat-platform bridge as *the* interface, and hosting one of our agents (the *Lucidos Agent* or a *coding agent*: the objection does not turn on which) inside another editor via a third-party agent protocol. The distinction is deliberately silent on anything whose destination is our own client (a `lucidos://` scheme, another client of ours); argue those on cost and mechanics, never by citing the philosophy.
@@ -3066,9 +3131,11 @@ A fact established deliberately in an earlier eval thread, required by a later t
 The window between a coding-agent turn's *previous* boundary event and the current turn's triggering event, exclusive at both ends. It is the span in which the user and the engine act on an idle agent's work, and it is invisible to that agent when it resumes: `--resume` replays the agent's own conversation, not the events around it. The boundary set is every event type that can originate a coding-agent turn (`CC_ORIGINATING_EVENT_TYPES` in `agent_session/resume.rs`: `MessageReceived`, `CodingAgentUserMessageSent`, `TriggerStarted`, `ChildThreadCompleted`) plus `CodingAgentPromptSent`, an engine-synthesized prompt that is a real boundary even though it is an audit marker rather than an origin id. Deriving from that shared constant is load-bearing: a hand-listed boundary set silently omitted `TriggerStarted` and `ChildThreadCompleted`, so a turn re-entered by a finished child did not advance the threshold and the *turn-gap note* fired twice for the same event.
 
 ### Turn-gap note
-The *resume-time note* built from the persisted events in the *turn gap* (`agent_session/turn_gap.rs`, `compute_turn_gap_note`). It covers the events a resumed coding agent cannot otherwise see, and whose absence made it describe a discarded change as awaiting Apply: `ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `WorktreeCleaned` and `BackgroundBashCompleted`.
+The *resume-time note* built from the persisted events in the *turn gap* (`agent_session/turn_gap.rs`, `compute_turn_gap_note`). It covers the events a resumed coding agent cannot otherwise see, and whose absence made it describe a discarded change as awaiting Apply: `ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `WorktreeCleaned`, `BackgroundBashCompleted` and `ChildThreadStopped`.
 
-That last one filters itself, which is why it needs no payload predicate. A completion's wake emits `CodingAgentPromptSent`, which is a boundary, so one the agent already heard about falls outside the next gap. What reaches the note is the undelivered one: a shutdown suppresses the push and a crash takes the watcher with it.
+`ChildThreadStopped` is there because it wakes nothing. A coding-agent parent hears about a *stopped child* only through this note (ADR 0252).
+
+`BackgroundBashCompleted` is covered minus the completions an event wait delivered: the query drops one an `EventWaitDelivered` names, since that delivery is the prompt the re-opened turn carries. What reaches the note is the undelivered one, such as a task whose wait a cap refused.
 
 Two kinds are excluded, with the reasons recorded in the module. Ones another mechanism already delivers: `ChildThreadCompleted`, `UserQuestionAnswered` and `CodingAgentPermissionResolved`. Ones a note would only duplicate: the merge-conflict set, `ChangeHardened`, `CodingAgentSettingsChanged`, and the cosmetic thread events.
 

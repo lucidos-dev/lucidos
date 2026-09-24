@@ -907,8 +907,11 @@ impl WorktreeCleanup {
     /// True iff `thread_id` has an outstanding parent↔child fan-in obligation
     /// that requires keeping its worktree alive (ADR 0011, weakness B2):
     ///   (a) `active_children_count > 0` — a direct child is still running; the
-    ///       parent will resume when it finishes, so it needs its worktree.
-    ///   (b) the thread's latest persisted event is a `ChildThreadCompleted` —
+    ///       parent will resume when it finishes, so it needs its worktree. A
+    ///       *stopped child* counts the same way: the parent is still owed its
+    ///       card and will resume when it lands (ADR 0252).
+    ///   (b) the thread's latest persisted event, `ChildThreadStopped` notes
+    ///       aside, is a `ChildThreadCompleted`:
     ///       a child has completed but the parent hasn't processed it yet (the
     ///       exact incident window); this is the same predicate B1's boot sweep
     ///       (`refire_unprocessed_child_completions`) selects on.
@@ -922,19 +925,23 @@ impl WorktreeCleanup {
     /// `true` (keep the worktree) — reclaiming on unverifiable state is the
     /// unsafe direction, matching `try_tier_0`'s pending-change stance.
     async fn has_pending_fan_in(&self, thread_id: Uuid) -> bool {
-        // (a) direct children still running.
-        match sqlx::query_scalar::<_, i64>(
-            "SELECT active_children_count::bigint FROM thread_summaries WHERE thread_id = $1",
+        // (a) direct children still running, or stopped and still owed.
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT t.active_children_count > 0 OR EXISTS ( \
+                 SELECT 1 FROM thread_summaries c \
+                 WHERE c.parent_thread_id = t.thread_id AND c.is_stopped_child \
+                   AND c.archive_state <> 'archived') \
+             FROM thread_summaries t WHERE t.thread_id = $1",
         )
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
         {
-            Ok(Some(count)) if count > 0 => return true,
+            Ok(Some(true)) => return true,
             Ok(_) => {}
             Err(e) => {
                 log!(
-                    "[WorktreeCleanup] active_children_count lookup failed for thread {}: {} — keeping worktree",
+                    "[WorktreeCleanup] children lookup failed for thread {}: {}; keeping worktree",
                     thread_id,
                     e
                 );
@@ -942,10 +949,13 @@ impl WorktreeCleanup {
             }
         }
         // (b) a completed-but-unprocessed child completion is the thread's last
-        // persisted word (no resume emitted a later event).
+        // persisted word (no resume emitted a later event). A sibling's
+        // `ChildThreadStopped` note wakes nothing, so it cannot have processed
+        // the card, and it must not hide it.
         match sqlx::query_scalar::<_, String>(
             "SELECT event_type FROM events \
              WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+               AND event_type <> 'ChildThreadStopped' \
              ORDER BY sequence DESC LIMIT 1",
         )
         .bind(thread_id)

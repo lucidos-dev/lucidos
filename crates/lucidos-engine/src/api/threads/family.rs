@@ -6,10 +6,9 @@
 //! disagreed about the same family. So the recursive CTE, the row shape and the
 //! decision live here, and the verb is a parameter.
 //!
-//! **They differ in exactly one place.** Archive admits a parent in
-//! `WaitingForUserAnswer` and cancel-stamps its question card. Delete refuses
-//! it: there is nothing to stamp when the card is about to go, and a subprocess
-//! parked on the question would be orphaned.
+//! **They refuse the same families.** The verb picks only the refusal slug and
+//! which members the caller then sweeps. Both refuse a parent waiting on the
+//! user: it needs attention, and neither verb may hide it (ADR 0259).
 
 use axum::http::StatusCode;
 use uuid::Uuid;
@@ -46,8 +45,8 @@ impl FamilyRow {
     }
 }
 
-/// Which cascade is asking. The two verbs disagree on one state, so this is a
-/// parameter rather than a second classifier.
+/// Which cascade is asking. It names the refusal, so the frontend can render a
+/// sentence per verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::api) enum FamilyVerb {
     Archive,
@@ -61,14 +60,6 @@ impl FamilyVerb {
         match self {
             Self::Archive => "parent_not_archivable",
             Self::Delete => "parent_not_deletable",
-        }
-    }
-
-    /// Does a parent in `WaitingForUserAnswer` block this verb?
-    fn refuses_a_parked_parent(self) -> bool {
-        match self {
-            Self::Archive => false,
-            Self::Delete => true,
         }
     }
 }
@@ -122,7 +113,7 @@ pub(in crate::api) async fn load_family(
 /// The parent gate refuses three states:
 ///
 ///   1. Running. Live work cannot be terminal, whatever `archive_state` says.
-///   2. `WaitingForUserAnswer`, for [`FamilyVerb::Delete`] only.
+///   2. `WaitingForUserAnswer`. The question needs the user (ADR 0259).
 ///   3. An in-workspace coding-agent thread with a pending change. The user must
 ///      Apply or Discard first, which is what `resolve_actions` already offers
 ///      there. External-repo coding agents are exempt, because Apply cannot
@@ -146,10 +137,10 @@ pub(in crate::api) fn classify_family(
     // archive: rejecting here produced a stuck button. A frontend whose
     // `meta.section` had desynced to inbox offered Archive, the 409 rolled its
     // optimistic flip back, and the button reappeared on every tap.
-    let parked = parent_row.status_enum() == ThreadStatus::WaitingForUserAnswer;
-    if parent_row.status_enum() == ThreadStatus::Running
-        || (parked && verb.refuses_a_parked_parent())
-    {
+    if matches!(
+        parent_row.status_enum(),
+        ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer
+    ) {
         return FamilyDecision::Reject {
             status: StatusCode::CONFLICT,
             body: serde_json::json!({

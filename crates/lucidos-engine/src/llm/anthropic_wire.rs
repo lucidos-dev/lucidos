@@ -30,11 +30,12 @@ pub(crate) const ANTHROPIC_BETA_1M_CONTEXT: &str = "context-1m-2025-08-07";
 /// Beta flag that makes `thinking.display: "updates"` a legal value. Sent as an
 /// `anthropic-beta` HTTP header on both targets: Vertex ignores it in the body
 /// array and then rejects the `display` value.
-const ANTHROPIC_BETA_THINKING_DISPLAY_UPDATES: &str = "thinking-display-updates-2026-08-18";
+pub(crate) const ANTHROPIC_BETA_THINKING_DISPLAY_UPDATES: &str =
+    "thinking-display-updates-2026-08-18";
 
 /// `thinking.display` value that returns the model's notes between tool calls
 /// as text in `thinking` blocks, while its reasoning stays hidden.
-const DISPLAY_PROGRESS_UPDATES: &str = "updates";
+pub(crate) const DISPLAY_PROGRESS_UPDATES: &str = "updates";
 
 /// Whether a response's `thinking` blocks carry progress notes for the user.
 /// Read off the request, so the parser shows thinking text only when the
@@ -690,12 +691,19 @@ fn settle_progress_note(
     let Some(AccumulatedBlock::Thinking(text)) = blocks.get(index) else {
         return false;
     };
-    let note = text.trim();
-    if note.is_empty() || note == INTERRUPTED_PROGRESS_SENTINEL {
+    let Some(note) = progress_note(text) else {
         return false;
-    }
+    };
     blocks[index] = AccumulatedBlock::ProgressNote(note.to_string());
     true
+}
+
+/// The note a finished `thinking` block carries under progress-update display,
+/// or `None` when it carries none for the user. The Claude Code parser shares
+/// this rule, so both agents show the same notes.
+pub(crate) fn progress_note(thinking_text: &str) -> Option<&str> {
+    let note = thinking_text.trim();
+    (!note.is_empty() && note != INTERRUPTED_PROGRESS_SENTINEL).then_some(note)
 }
 
 /// The error for a `tool_use` block whose accumulated arguments do not parse.

@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.39.5 — 2026-09-24
+
+### Changed
+
+- Resize the changed-files list in the diff viewer. Drag the divider, nudge it with the arrow keys, or double-click to reset it. The width is remembered.
+- Coding agents run long commands as background tasks with `lucidos background-task run`, `output` and `stop`. The agent's thread reopens with the result when the task ends. Archiving or discarding the thread stops its tasks.
+- A message sent to a coding agent that waits on your question or permission card is held until you answer. It shows as "Held until you reply" under the card.
+- An Autocorrect switch for iPhone and iPad, under Settings > System > Debugging. Text fields inside apps follow it too.
+- The desktop transcript draws its own scrollbar, sized to the whole thread. The thumb moves only when you scroll.
+- Stopping a sub-thread tells its parent that it stopped. The parent still gets the child's next result, or a canceled note when you archive the child.
+- The Workspaces list in the Lucidos menu opens folded or unfolded, the way you left it on that device.
+- A tap on a toast closes an open popover and still presses the toast's button.
+- Claude Code sessions on Vertex show their progress notes between tool calls.
+- A plan approval card is one short line, and the plan stays in the message. A revised card names only what changed.
+- A permission card that the engine resolved says why.
+- The limit on event waits counts the waits a thread armed in the last hour.
+
+### Fixed
+
+- Tapping a push notification no longer shows an error when the notification points at an event outside its thread.
+- Reading an email no longer marks it read on the mail server.
+- An image with a side over 8000 px is scaled down before it reaches a model, so the turn does not fail.
+- A thread that waits on your answer is never archived.
+- A sub-thread's report no longer replaces a question you can still answer.
+- A Copy button copies only the text it shows.
+- An app cannot change a preference that only you may set, such as the command guard.
+- A link in rendered content cannot add an attribute to the page.
+- A thread a coding agent starts with `lucidos spawn-thread` asks you about a command the guard cannot settle.
+- Stopping a background task stops every process it started.
+- On a phone, a button below a focused field works on the first tap as the keyboard closes.
+- A form that closes on a phone no longer leaves a blank band at the bottom of the thread.
+- Dragging the scrollbar on macOS scrolls the thread without shaking.
+- A thread you scrolled to the top reopens at the top.
+- A long coding-agent turn with its steps hidden scrolls and loads older turns correctly.
+- A short network drop no longer shows "Could not load the rest of this thread."
+- Links in messages wrap at spaces, not in the middle of a word.
+- Repositories come before apps in the composer's agent list.
+- The "Event arrived" chip shows no jump link for an event that has no row to jump to.
+- An engine build no longer stops when another session runs `cargo check`.
 ## v0.39.4 — 2026-09-23
 
 ### Changed

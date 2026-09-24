@@ -158,15 +158,41 @@ finish() {
 }
 
 # Run one Playwright invocation: straight to the terminal as before, and into
-# the project's tally. `tee` puts Playwright in a pipeline, so PIPESTATUS is
-# what carries ITS exit code. Reading `$?` there would read tee's, which is the
+# the project's tally. It runs in the background so its pid can be recorded for
+# the memory sampler's in-chunk stop (host_memory_guard.sh). A FIFO feeds `tee`,
+# so `wait` returns Playwright's own exit code and never tee's. Tee's code is the
 # false-green the repo's own "never pipe a test command" rule warns about.
 run_playwright() {
-    local rc=0
+    local rc=0 fifo tee_pid pw_pid
+    # The sampler already tripped with no runner to interrupt. Nothing new
+    # starts on a host that showed the freeze signature.
+    if host_memory_stopped_mid_chunk; then
+        echo "[e2e-mem] the sampler recorded the freeze signature, so this invocation does not start"
+        return "$HOST_MEMORY_STOP_EXIT"
+    fi
+    fifo="$(mktemp -u "${TMPDIR:-/tmp}/lucidos-pw-fifo.XXXXXX")"
+    if ! mkfifo "$fifo" 2>/dev/null; then
+        # No FIFO means no recorded runner: the sampler can still record a trip,
+        # it just cannot interrupt this invocation.
+        set +e
+        "$@" 2>&1 | tee -a "$PW_TALLY_LOG"
+        rc=${PIPESTATUS[0]}
+        set -e
+        return "$rc"
+    fi
+    tee -a "$PW_TALLY_LOG" < "$fifo" &
+    tee_pid=$!
     set +e
-    "$@" 2>&1 | tee -a "$PW_TALLY_LOG"
-    rc=${PIPESTATUS[0]}
+    "$@" > "$fifo" 2>&1 &
+    pw_pid=$!
+    record_host_memory_runner "$pw_pid"
+    interrupt_host_memory_runner_if_tripped
+    wait "$pw_pid"
+    rc=$?
+    clear_host_memory_runner
+    wait "$tee_pid"
     set -e
+    rm -f "$fifo"
     return "$rc"
 }
 
@@ -477,8 +503,21 @@ run_specs_chunked() {
         # Own output dir per chunk (see set_output_dir) — otherwise each chunk
         # would erase the previous chunk's failure traces/screenshots.
         set_output_dir "$project-$label-$chunk_no"
-        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || rc=$?
+        local chunk_rc=0
+        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || chunk_rc=$?
         start=$(( start + size ))
+        # The sampler interrupted this chunk on the freeze signature. An
+        # interrupted runner's exit code is not a test verdict, so the memory
+        # stop replaces it. No boundary check follows a stop.
+        if host_memory_stopped_mid_chunk; then
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: STOPPED inside the chunk on host memory ──"
+            MEMORY_STOPPED="$project"
+            rc="$(merge_rc "$rc" "$HOST_MEMORY_STOP_EXIT")"
+            break
+        fi
+        if [ "$chunk_rc" -ne 0 ]; then
+            rc="$chunk_rc"
+        fi
         # BETWEEN chunks only. The boundary after the LAST one belongs to the
         # caller, which is the only code that knows whether another phase or
         # another project follows it. A stop needs something left to stop: with
@@ -517,6 +556,12 @@ run_browser_project() {
     # harness verdict: it says the project was not measured, which must not read
     # green, and must not overwrite a real test failure either.
     report_playwright_totals "$project" "$PW_TALLY_LOG" || tally_rc=$?
+    # An invocation the sampler interrupted never printed its summary, so the
+    # tally cannot add up. The memory stop already says so; it is no harness bug.
+    if [ "$tally_rc" -ne 0 ] && [ "$MEMORY_STOPPED" = "$project" ] && host_memory_stopped_mid_chunk; then
+        echo "   (expected: the invocation stopped on host memory did not report)"
+        tally_rc=0
+    fi
     rc="$(merge_rc "$rc" "$tally_rc")"
     return "$rc"
 }
@@ -614,6 +659,11 @@ _run_browser_project_body() {
     # project's invocation would wipe this one's, chunk dirs included.
     set_output_dir "$project"
     run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
+    if host_memory_stopped_mid_chunk; then
+        echo "── $project: STOPPED inside the run on host memory ──"
+        MEMORY_STOPPED="$project"
+        rc="$HOST_MEMORY_STOP_EXIT"
+    fi
     return "$rc"
 }
 
@@ -636,9 +686,14 @@ elif [ -n "$USER_PINNED_PROJECT" ]; then
     [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
     set_output_dir pinned
     # Capture rather than letting `set -e` exit here, so a failing pinned run
-    # still gets drained + classified by finish.
+    # still gets drained + classified by finish. Through run_playwright, so the
+    # sampler can interrupt a pinned run too.
     pinned_rc=0
-    "${CMD[@]}" "${OUTPUT_ARG[@]}" || pinned_rc=$?
+    run_playwright "${CMD[@]}" "${OUTPUT_ARG[@]}" || pinned_rc=$?
+    if host_memory_stopped_mid_chunk; then
+        MEMORY_STOPPED="the pinned run"
+        pinned_rc="$HOST_MEMORY_STOP_EXIT"
+    fi
     finish "$pinned_rc"
 else
     # Run every project even if an earlier one failed, so the user sees all

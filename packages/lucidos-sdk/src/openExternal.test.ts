@@ -241,7 +241,7 @@ describe('ui.openExternal', () => {
  * sdk.js, so if the cache warmed only through theming, those apps would hold a
  * null mode forever and quietly ignore the user's "Ask" choice on every link.
  */
-describe('primeExternalLinkTarget: the cache cannot depend on theming', () => {
+describe('primeDevicePreferences: the cache cannot depend on theming', () => {
   beforeEach(() => {
     prefsResponse = {};
     prefsGet = () => Promise.resolve(prefsResponse);
@@ -259,23 +259,55 @@ describe('primeExternalLinkTarget: the cache cannot depend on theming', () => {
     stubIOSPwa(share);
     prefsResponse.external_link_target = 'ask';
 
-    await mod.primeExternalLinkTarget();
+    await mod.primeDevicePreferences();
     await mod.ui.openExternal(TARGET);
 
     expect(share).toHaveBeenCalledWith({ url: TARGET });
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it('does not fetch off an installed iOS PWA, where the mode is never read', async () => {
+  it('reads on every client, since the Autocorrect switch is read everywhere', async () => {
     vi.resetModules();
     const mod = await import('./ui');
     stubDesktopBrowser();
     const get = vi.fn(() => Promise.resolve({} as Record<string, string>));
     prefsGet = get;
 
-    await mod.primeExternalLinkTarget();
+    await mod.primeDevicePreferences();
 
-    expect(get).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not read again once applyPreferences has landed', async () => {
+    vi.resetModules();
+    const mod = await import('./ui');
+    stubDesktopBrowser();
+    let calls = 0;
+    prefsGet = () => { calls++; return Promise.resolve({}); };
+
+    await mod.ui.applyPreferences();
+    await mod.primeDevicePreferences();
+
+    expect(calls).toBe(1);
+  });
+
+  it('lets a themed app read on its own, and never lets an older answer win', async () => {
+    vi.resetModules();
+    const mod = await import('./ui');
+    const share = vi.fn(() => Promise.resolve());
+    stubIOSPwa(share);
+    // The prime's read hangs until released; applyPreferences answers first.
+    let releasePrime: (prefs: Record<string, string>) => void = () => {};
+    prefsGet = () => new Promise((resolve) => { releasePrime = resolve; });
+    const primed = mod.primeDevicePreferences();
+    prefsGet = () => Promise.resolve({ external_link_target: 'ask' });
+    await mod.ui.applyPreferences();
+
+    releasePrime({ external_link_target: 'safari' });
+    await primed;
+    await mod.ui.openExternal(TARGET);
+
+    expect(share).toHaveBeenCalledWith({ url: TARGET });
   });
 
   it('fetches once even when called repeatedly', async () => {
@@ -286,10 +318,10 @@ describe('primeExternalLinkTarget: the cache cannot depend on theming', () => {
     prefsGet = () => { calls++; return Promise.resolve({ external_link_target: 'ask' }); };
 
     await Promise.all([
-      mod.primeExternalLinkTarget(),
-      mod.primeExternalLinkTarget(),
+      mod.primeDevicePreferences(),
+      mod.primeDevicePreferences(),
     ]);
-    await mod.primeExternalLinkTarget();
+    await mod.primeDevicePreferences();
 
     expect(calls).toBe(1);
   });
@@ -300,7 +332,7 @@ describe('primeExternalLinkTarget: the cache cannot depend on theming', () => {
     stubIOSPwa(() => Promise.resolve());
     prefsGet = () => Promise.reject(new Error('offline'));
 
-    await expect(mod.primeExternalLinkTarget()).rejects.toThrow('offline');
+    await expect(mod.primeDevicePreferences()).rejects.toThrow('offline');
     await mod.ui.openExternal(TARGET);
 
     expect(navigate).toHaveBeenCalledTimes(1);

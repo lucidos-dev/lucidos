@@ -184,6 +184,17 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
   return event.type === 'EventWaitCanceled' && event.cause === 'user_stop';
 }
 
+/** A boundary that holds no turn: it states its own outcome, and nothing
+ *  continues out of it. Grouping opens an exchange for it and hands the
+ *  running turn straight back, and the panel draws its header alone.
+ *
+ *  Two qualify. The user's Stop waiting (`isUserStoppedWait`). And a
+ *  `ChildThreadStopped` on a parent (ADR 0252): a note that a user Stop paused
+ *  one of its children, which wakes nothing, so no response follows it. */
+export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
+  return isUserStoppedWait(event) || event.type === 'ChildThreadStopped';
+}
+
 /** The wait's `reason` as a bare subject, for a label that already said "wait".
  *
  *  Both transcript labels prefix the model's own words with a template carrying

@@ -96,12 +96,14 @@ describe('a paged thread is always reachable', () => {
  *  a visit ends. `reseedOnReopen` has its own unit tests; what they cannot see
  *  is the component's bookkeeping around it, which is where both holes were.
  *
- *  Source scans, because the mark is module state read by a layout effect. */
+ *  Source scans, because the mark is module state read during render. */
 describe('the visit a render-all belongs to', () => {
     it('ends whenever the thread pane lets the thread go', () => {
         // A switch, New chat unmounting the pane, and the layout swapping at
-        // the breakpoint are one teardown, so one clear covers all three.
-        expect(threadViewSource).toContain('if (lastSeededVisit === threadId) lastSeededVisit = null;');
+        // the breakpoint are one teardown, so one clear covers all three. It
+        // clears only a visit this mount holds: a layout swap renders the
+        // incoming mount before the outgoing one tears down.
+        expect(threadViewSource).toContain('if (lastSeededVisit?.threadId === threadId && lastSeededVisit.owner === visitOwner) {');
     });
 
     /** Marking before the events settle spends the visit on a commit that
@@ -109,17 +111,18 @@ describe('the visit a render-all belongs to', () => {
      *  the guard has to come first. */
     it('is marked only once the load has settled', () => {
         const seed = threadViewSource.slice(
-            threadViewSource.indexOf('if (!threadId || !canSeedWindow) return;'),
-            threadViewSource.indexOf('}, [threadId, canSeedWindow]);'),
+            threadViewSource.indexOf('if (threadId && canSeedWindow) {'),
+            threadViewSource.indexOf('const edge = deepLinkRenderAll.value'),
         );
-        expect(seed).toContain('lastSeededVisit = threadId;');
-        expect(seed.indexOf('canSeedWindow')).toBeLessThan(seed.indexOf('lastSeededVisit = threadId;'));
+        expect(seed.length).toBeGreaterThan(0);
+        expect(seed).toContain('lastSeededVisit = { threadId, owner: visitOwner };');
+        expect(seed.indexOf('canSeedWindow')).toBeLessThan(seed.indexOf('lastSeededVisit = { threadId, owner: visitOwner };'));
     });
 
     /** Module-scoped, not a ref: a ref dies with the mount, and the layout
      *  swap remounts this component while the reader is mid-read. */
     it('outlives the component that reads it', () => {
-        expect(threadViewSource).toContain('let lastSeededVisit: string | null = null;');
+        expect(threadViewSource).toContain('let lastSeededVisit: { threadId: string; owner: object } | null = null;');
     });
 });
 
@@ -251,6 +254,14 @@ describe('a reader pinned at the very top', () => {
         expect(effect.match(/requestBackfill\(/g)).toHaveLength(1);
         expect(effect.match(/growRenderWindow\(/g)).toHaveLength(1);
         expect(effect).toContain('if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;\n            reachForOlder();');
+    });
+
+    /** The app's own writes never ask, however late their scroll event lands.
+     *  On WebKit a restore's event came 300ms after the write, and the repaint
+     *  nudge moves a pixel either side of it. Both read as the reader near the
+     *  top, so a reload inside the loaded pages fetched a page nobody asked for. */
+    it('never hears the app landing the reader, however late its event', () => {
+        expect(threadViewSource).toContain('if (isNavigationScroll(el) || isWhereWeLastScrolledIt(el)) return;');
     });
 
     /** Leaving them attached would keep a dead thread's listeners alive on a

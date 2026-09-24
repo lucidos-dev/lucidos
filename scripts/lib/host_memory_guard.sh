@@ -3,7 +3,8 @@
 #
 # The browser projects, mobile-webkit above all, push this host hard. This guard
 # reads it between chunks and stops the run at a clean boundary when the host is
-# genuinely in danger. It is the sibling of host_load_guard.sh (CPU saturation,
+# genuinely in danger. Inside a chunk it stops only on the freeze signature (see
+# "the in-chunk stop" below). It is the sibling of host_load_guard.sh (CPU saturation,
 # exit 75) and webkit_reaper.sh (per-process RSS), and it owns the one thing
 # neither of those can see.
 #
@@ -154,6 +155,8 @@
 #   LUCIDOS_E2E_COMPRESSOR_MAX_PCT   runaway backstop as a share of RAM (default 50)
 #   LUCIDOS_E2E_COMPRESSOR_MAX_GB    runaway backstop absolute; when set it wins
 #   LUCIDOS_E2E_MEM_POLL_SECS        sampler tick in seconds (default 5)
+#   LUCIDOS_E2E_COLLAPSE_TICKS       collapse samples in a row that stop a chunk (default 3)
+#   LUCIDOS_E2E_TRIP_GRACE_SECS      seconds an interrupted chunk gets before SIGKILL (default 15)
 #
 # Four stops, in order: kernel pressure critical, swap distress, the corroborated
 # headroom floor, the runaway backstop. The available floor is max(the MIN_GB,
@@ -565,23 +568,36 @@ _host_mem_sampler_pidfile() {
     printf '%s' "${HOST_MEMORY_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-sampler.pid}"
 }
 
-# One sample line per tick: "<level> <compressor> <available> <swap>". An
-# unreadable dimension is written as "-", so a partial sample still contributes
-# the dimensions it did read instead of being dropped whole.
+# One tick: append "<level> <compressor> <available> <swap>" and echo the
+# collapse streak for the next tick. An unreadable dimension is written as "-",
+# so a partial sample still contributes the dimensions it did read. Returns 1
+# when the samples file cannot be written, which ends the loop.
+_host_mem_sampler_tick() {
+    local file="$1" streak="$2" collapse="$3" ticks="$4" level gb avail swap
+    level="$(_host_mem_read_pressure_level)"
+    gb="$(_host_mem_read_compressor_gb)"
+    avail="$(_host_mem_read_available_gb)"
+    swap="$(_host_mem_read_swap_used_gb)"
+    printf '%s %s %s %s\n' "${level:--}" "${gb:--}" "${avail:--}" "${swap:--}" >> "$file" 2>/dev/null || return 1
+    streak="$(_host_mem_collapse_streak "$streak" "$level" "$avail" "$collapse")"
+    if [ "$streak" -ge "$ticks" ] && [ ! -e "$(_host_mem_trip_file)" ]; then
+        _host_mem_trip_chunk "$avail" "$collapse" "$streak" >&2
+    fi
+    printf '%s' "$streak"
+}
+
 _host_mem_sampler_loop() {
-    local interval="$1" file="$2" level gb avail swap
+    local interval="$1" file="$2" collapse ticks streak=0
     local sleep_pid=""
+    collapse="$(_host_mem_collapse_level_gb)"
+    ticks="$(_host_mem_trip_ticks)"
     # The sleep runs as a child so the trap can reach it. Without this the loop
     # ignores its own stop for up to a full interval, leaving an orphaned sleep
     # behind. Same shape as _host_load_sampler_loop, and the reason it is shaped
     # that way there.
     trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
     while :; do
-        level="$(_host_mem_read_pressure_level)"
-        gb="$(_host_mem_read_compressor_gb)"
-        avail="$(_host_mem_read_available_gb)"
-        swap="$(_host_mem_read_swap_used_gb)"
-        printf '%s %s %s %s\n' "${level:--}" "${gb:--}" "${avail:--}" "${swap:--}" >> "$file" 2>/dev/null || return 0
+        streak="$(_host_mem_sampler_tick "$file" "$streak" "$collapse" "$ticks")" || return 0
         sleep "$interval" &
         sleep_pid=$!
         wait "$sleep_pid" 2>/dev/null || true
@@ -650,8 +666,173 @@ stop_host_memory_sampler() {
         wait "$pid" 2>/dev/null || true
     fi
 
-    rm -f "$pidfile" "$(_host_mem_samples_file)" 2>/dev/null || true
+    # A runner still recorded here means this run is being torn down while
+    # Playwright runs, on a signal. Only the in-memory handle counts: a pid in a
+    # file a dead run left behind may already belong to somebody else.
+    if [ -n "${HOST_MEMORY_RUNNER_PID:-}" ] && kill -0 "$HOST_MEMORY_RUNNER_PID" 2>/dev/null; then
+        echo "[e2e-mem] interrupting the Playwright runner this run left running"
+        _host_mem_stop_runner "$HOST_MEMORY_RUNNER_PID"
+    fi
+    HOST_MEMORY_RUNNER_PID=""
+
+    rm -f "$pidfile" "$(_host_mem_samples_file)" "$(_host_mem_trip_file)" \
+        "$(_host_mem_runner_pidfile)" 2>/dev/null || true
     HOST_MEMORY_SAMPLER_PID=""
+}
+
+# ── the in-chunk stop ───────────────────────────────────────────────────
+# The boundary check cannot act while a chunk runs, and a hung chunk never
+# reaches its boundary. One held the host at 0.3 GB available for 45 minutes,
+# until the Mac rebooted (plan below). So the sampler watches for the one
+# signature the boundary already stops on unconditionally: critical pressure
+# with available memory at or under the collapse level. When that holds for
+# LUCIDOS_E2E_COLLAPSE_TICKS samples in a row, it records the trip and
+# interrupts this run's Playwright invocation.
+#
+# NOTHING ELSE STOPS A CHUNK. Critical alone oscillates on an idle host, and the
+# floor, warn and the backstop keep their boundary rules (ADRs 0177 and 0182).
+#
+# IT COUNTS SAMPLES, NOT SECONDS. A starving host slows the sampler down, and
+# that same night it wrote 95 samples an hour instead of 720.
+#
+# It signals only the pid run_playwright recorded and that pid's descendants by
+# parent pid, never a command-line match (ADR 0025). SIGINT first, which is
+# Playwright's own graceful stop, then SIGKILL to what is left of the tree.
+# Plan: docs/plans/2026-09-24-host-memory-watch-and-in-chunk-stop.md.
+
+_host_mem_trip_file() {
+    printf '%s' "${HOST_MEMORY_TRIP_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-trip}"
+}
+
+_host_mem_runner_pidfile() {
+    printf '%s' "${HOST_MEMORY_RUNNER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-runner.pid}"
+}
+
+# A positive integer, or the default. Zero would trip on the first sample.
+_host_mem_trip_ticks() {
+    local v="${LUCIDOS_E2E_COLLAPSE_TICKS:-3}"
+    case "$v" in '' | *[!0-9]* | 0) v=3 ;; esac
+    printf '%s' "$v"
+}
+
+_host_mem_trip_grace_secs() {
+    local v="${LUCIDOS_E2E_TRIP_GRACE_SECS:-15}"
+    case "$v" in '' | *[!0-9]*) v=15 ;; esac
+    printf '%s' "$v"
+}
+
+# The streak after one sample: one longer on the freeze signature, else 0.
+_host_mem_collapse_streak() {
+    local streak="$1" level="$2" avail="$3" collapse="$4"
+    if [ "$level" = "$HOST_MEMORY_PRESSURE_CRITICAL" ] && [ -n "$avail" ] &&
+        [ -n "$collapse" ] && ! _host_mem_over "$avail" "$collapse"; then
+        echo $((streak + 1))
+    else
+        echo 0
+    fi
+}
+
+# Record and clear the pid of the Playwright invocation now running: in memory
+# for this shell's teardown, and in the file the sampler reads.
+# Never seeded from the environment: only this shell may name its runner.
+HOST_MEMORY_RUNNER_PID=""
+
+record_host_memory_runner() {
+    HOST_MEMORY_RUNNER_PID="$1"
+    echo "$1" > "$(_host_mem_runner_pidfile)" 2>/dev/null || true
+}
+
+clear_host_memory_runner() {
+    HOST_MEMORY_RUNNER_PID=""
+    rm -f "$(_host_mem_runner_pidfile)" 2>/dev/null || true
+}
+
+# A trip that landed while the runner was starting found nothing to interrupt.
+interrupt_host_memory_runner_if_tripped() {
+    host_memory_stopped_mid_chunk || return 0
+    _host_mem_stop_runner "${HOST_MEMORY_RUNNER_PID:-}"
+}
+
+# Returns 0 when the sampler stopped the invocation that just returned, and
+# puts the trip's evidence into MEMORY_STOP_DETAIL for the final verdict.
+host_memory_stopped_mid_chunk() {
+    local file
+    file="$(_host_mem_trip_file)"
+    [ -s "$file" ] || return 1
+    MEMORY_STOP_DETAIL="$(cat "$file" 2>/dev/null)"
+    return 0
+}
+
+_host_mem_trip_chunk() {
+    local avail="$1" collapse="$2" streak="$3"
+    printf '%s\n' "Between two boundaries the kernel reported CRITICAL memory pressure with available memory at $avail GB, at or under the $collapse GB collapse level, for $streak samples in a row. That is the freeze signature, so the run stopped there instead of waiting for the next boundary." \
+        > "$(_host_mem_trip_file)" 2>/dev/null || true
+    echo "[e2e-mem] STOP inside a chunk: pressure critical, available $avail GB, at or under the $collapse GB collapse level, $streak samples in a row. Interrupting the Playwright runner."
+    _host_mem_stop_runner
+}
+
+# ── measurement seams (overridable in tests) ────────────────────────────
+# One "pid ppid" line per process. A test that overrides it with an empty feed
+# gets no descendants, never a fall-back to the real host.
+_host_mem_proc_tree() {
+    ps -axo pid=,ppid= 2>/dev/null
+}
+
+_host_mem_trip_grace_wait() {
+    sleep "$1"
+}
+
+# $1 and its descendants, root first, one per line. The visited set keeps a
+# malformed feed with a cycle from looping.
+_host_mem_descendants() {
+    _host_mem_proc_tree | awk -v root="$1" '
+        { kids[$2] = kids[$2] " " $1 }
+        END {
+            queue = root
+            while (queue != "") {
+                n = split(queue, q, " ")
+                queue = ""
+                for (i = 1; i <= n; i++) {
+                    if (q[i] in seen) continue
+                    seen[q[i]] = 1
+                    print q[i]
+                    m = split(kids[q[i]], k, " ")
+                    for (j = 1; j <= m; j++) queue = queue " " k[j]
+                }
+            }
+        }'
+}
+
+# Interrupt the runner $1, or the one the runner pidfile names.
+_host_mem_stop_runner() {
+    local root="${1:-}" pids p waited=0 grace alive
+    [ -n "$root" ] || root="$(cat "$(_host_mem_runner_pidfile)" 2>/dev/null)"
+    case "$root" in '' | *[!0-9]*) root="" ;; esac
+    if [ -z "$root" ] || [ "$root" -le 1 ]; then
+        echo "[e2e-mem] no Playwright runner is recorded, so there is nothing to interrupt"
+        return 0
+    fi
+    # `command -v`, because a standalone lib test does not source ports.sh.
+    if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$root"; then
+        echo "[e2e-mem] the recorded runner pid $root is protected, leaving it alone"
+        return 0
+    fi
+    kill -0 "$root" 2>/dev/null || return 0
+    pids="$(_host_mem_descendants "$root")"
+    for p in $pids; do kill -INT "$p" 2>/dev/null || true; done
+    grace="$(_host_mem_trip_grace_secs)"
+    while [ "$waited" -lt "$grace" ]; do
+        alive=""
+        for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ -n "$alive" ] || return 0
+        _host_mem_trip_grace_wait 1
+        waited=$((waited + 1))
+    done
+    # Re-read the tree rather than reuse the old list: a pid that died in the
+    # grace may already belong to somebody else.
+    kill -0 "$root" 2>/dev/null || return 0
+    echo "[e2e-mem] the runner ignored the interrupt for ${grace}s, killing its tree"
+    for p in $(_host_mem_descendants "$root"); do kill -KILL "$p" 2>/dev/null || true; done
 }
 
 # Fold every sample since the previous boundary into one worst-case reading, and
@@ -996,6 +1177,12 @@ EOF
 check_host_memory_at_boundary() {
     local where="$1"
     local gb avail swap level level_now gb_now avail_now ceiling floor swap_max
+    # The sampler already tripped, while no runner was recorded to interrupt.
+    # That is the verdict, so no more work starts.
+    if host_memory_stopped_mid_chunk; then
+        echo "[e2e-mem] after $where: STOP, the sampler already recorded the freeze signature"
+        return 1
+    fi
     level="$(_host_mem_read_pressure_level)"
     gb="$(_host_mem_read_compressor_gb)"
     avail="$(_host_mem_read_available_gb)"

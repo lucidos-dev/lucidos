@@ -92,6 +92,20 @@ the wait is over: `onDeadline`, and the dead-link rescue.
 > real and its rows are still arriving, so it counts as not yet resolved.
 > Landing there would settle the restore and stop the walk short.
 
+> **Amended: the position names the step ROW at the line, where the turn has
+> one** (`row:<relTop>:<rowEventId>`). One coding-agent turn holds hundreds of
+> rows, and the window draws its tail first. A turn anchor taken there measured
+> from the clamped top.
+
+> The next open drew the turn whole. It landed the reader above their place, by
+> the height of the rows that had been left out.
+
+> A row carries its tool call's event id, which also survives a fold and a
+> continuation fragment. The walk stops once that row is drawn, rather than
+> drawing the whole turn. A turn with no step rows keeps the turn anchor, and a
+> stored turn anchor still restores. Plan:
+> `docs/plans/2026-09-23-the-reading-position-and-the-thumb-hold-still.md`.
+
 ## Alternatives considered
 
 **A bottom-relative offset.** Survives a re-seeded window, because it measures

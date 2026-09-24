@@ -1062,39 +1062,6 @@ async fn test_child_thread_completed_projection_clears_pending_in_tx() {
     teardown_test_db(&db_name).await;
 }
 
-/// Count the persisted `ChildThreadCompleted` cards sitting on `parent_id`.
-async fn count_completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
-    )
-    .bind(parent_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap()
-}
-
-/// Emit a `ResponseCanceled` with an explicit cause on `thread_id`.
-async fn emit_response_canceled_with_cause(
-    bus: &EventBus,
-    thread_id: Uuid,
-    cause: crate::engine::thread_events::CancelCause,
-) {
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ResponseCanceled {
-            text: "partial work".into(),
-            images: vec![],
-            model: None,
-            reasoning_effort: None,
-            cause,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-}
-
 /// The flip's one dangerous failure mode, and it is silent. Under
 /// `parent_callback_pending` a freshly spawned child owes its parent a card,
 /// which is TRUE, and the storage default is FALSE (a top-level thread owes
@@ -1739,37 +1706,6 @@ async fn a_chat_child_redirect_does_not_report_a_cancellation_to_the_parent() {
         "the in-tx reconcile is cause-agnostic and still runs on the chat lane too",
     )
     .await;
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Companion to the redirect test: the discrimination must not swallow a real
-/// user Stop, which is still a completion the parent has to hear about.
-#[tokio::test]
-async fn user_stop_still_reports_a_cancellation_to_the_parent() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, mut callback_rx) = EventBus::new(pool.clone());
-
-    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
-    emit_cc_session_started(&bus, child_id).await;
-
-    emit_response_canceled_with_cause(
-        &bus,
-        child_id,
-        crate::engine::thread_events::CancelCause::UserStop,
-    )
-    .await;
-
-    assert_eq!(
-        count_completion_cards(&pool, parent_id).await,
-        1,
-        "a user Stop is a real completion and must reach the parent"
-    );
-    assert!(
-        callback_rx.try_recv().is_ok(),
-        "a user Stop must wake the parent"
-    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

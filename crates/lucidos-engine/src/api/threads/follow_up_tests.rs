@@ -94,6 +94,7 @@ fn delivered_to_is_kebab_case_on_the_wire() {
         delivered_to_wire(FollowUpDelivery::WaitingForUserAnswer),
         "waiting-for-user-answer"
     );
+    assert_eq!(delivered_to_wire(FollowUpDelivery::Held), "held");
     assert_eq!(delivered_to_wire(FollowUpDelivery::Revived), "revived");
 }
 

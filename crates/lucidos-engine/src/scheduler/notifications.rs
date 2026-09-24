@@ -239,6 +239,67 @@ pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), 
     Ok(())
 }
 
+/// Refuse a notification that points at an event its thread does not hold.
+///
+/// The page resolves an anchor only inside the thread it opens, so any other
+/// event can never render there. A trigger fired by a domain event hit this: it
+/// passed that event's id, and a domain event lives in no thread. Refused here,
+/// the producer hears why and can retry. Written, the reader meets a dead tap.
+///
+/// Two pairs are checked, each on its own. The row's `link_thread` and
+/// `link_event` drive the inbox card's "Open thread". A thread tap's `to.id` and
+/// `to.event_id` drive the tap. A missing half means no anchor, as before.
+///
+/// The outer `Err` is a lookup that could not run. The inner one is a verdict.
+pub async fn verify_event_anchors(
+    pool: &PgPool,
+    link_thread: Option<Uuid>,
+    link_event: Option<Uuid>,
+    tap: &Tap,
+) -> Result<Result<(), String>, sqlx::Error> {
+    let mut anchors: Vec<(Uuid, Uuid)> = Vec::new();
+    if let (Some(thread), Some(event)) = (link_thread, link_event) {
+        anchors.push((thread, event));
+    }
+    if let Tap::Navigate { to } = tap {
+        if let (NavigateTarget::Thread, Some(id), Some(event)) =
+            (to.target, to.id.as_deref(), to.event_id.as_deref())
+        {
+            let Ok(thread) = Uuid::parse_str(id) else {
+                return Ok(Err(format!("the tap's thread id `{id}` is not a uuid.")));
+            };
+            let Ok(event) = Uuid::parse_str(event.trim()) else {
+                return Ok(Err(format!("the tap's event_id `{event}` is not a uuid.")));
+            };
+            if !anchors.contains(&(thread, event)) {
+                anchors.push((thread, event));
+            }
+        }
+    }
+
+    for (thread, event) in anchors {
+        let location: Option<(Option<Uuid>, String)> =
+            sqlx::query_as("SELECT thread_id, event_type FROM events WHERE id = $1")
+                .bind(event)
+                .fetch_optional(pool)
+                .await?;
+        let refusal = match location {
+            None => format!("event_id {event} names no event."),
+            Some((None, event_type)) => format!(
+                "event_id {event} is a {event_type} event, which belongs to no thread, so no \
+                 tap can land on it. Omit event_id: the tap then opens the notification card."
+            ),
+            Some((Some(home), _)) if home != thread => format!(
+                "event_id {event} is in thread {home}, not in thread {thread} that this \
+                 notification opens. Omit event_id, or tap to thread {home} instead."
+            ),
+            Some(_) => continue,
+        };
+        return Ok(Err(refusal));
+    }
+    Ok(Ok(()))
+}
+
 /// A tap that deep-links to one Settings sub-section, the same way the LLM's
 /// `navigate_ui` does.
 ///
@@ -947,6 +1008,199 @@ mod tests {
         };
         let err = resolve_thread_tap_id(&mut idless, Some(Uuid::new_v4())).expect_err("refused");
         assert!(err.contains("has none"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_event_anchors
+    // -----------------------------------------------------------------------
+
+    async fn seed_event(pool: &PgPool, event_type: &str, thread_id: Option<Uuid>) -> Uuid {
+        let id = Uuid::new_v4();
+        let aggregate = if thread_id.is_some() {
+            "thread"
+        } else {
+            "domain"
+        };
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(thread_id)
+        .bind(aggregate)
+        .bind(thread_id.map(|t| t.to_string()))
+        .execute(pool)
+        .await
+        .expect("seed event");
+        id
+    }
+
+    fn anchored_tap(thread: Uuid, event: Option<Uuid>) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(thread.to_string()),
+                event_id: event.map(|e| e.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The reported bug. A trigger fired by a domain event passed that event's
+    /// id, as its `## Triggering Event` block offered. The tap then opened the
+    /// trigger's own thread, which cannot show a workspace event. So the reader
+    /// met "That event is not shown in this thread".
+    #[tokio::test]
+    async fn a_domain_event_anchor_is_refused_and_named() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let domain = seed_event(&pool, "E2ETestsPassed", None).await;
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(thread),
+            Some(domain),
+            &default_tap(Some(thread), Some(domain)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("refused");
+        assert!(err.contains("E2ETestsPassed"), "names the event: {err}");
+        assert!(err.contains("no thread"), "says why: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_in_another_thread_is_refused_and_names_that_thread() {
+        let (pool, db) = setup_test_db().await;
+        let linked = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(elsewhere)).await;
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(linked),
+            Some(question),
+            &default_tap(Some(linked), Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("refused");
+        assert!(err.contains(&elsewhere.to_string()), "names it: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_naming_no_event_is_refused() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let ghost = Uuid::new_v4();
+
+        let err = verify_event_anchors(&pool, Some(thread), Some(ghost), &Tap::Modal)
+            .await
+            .expect("the check ran")
+            .expect_err("refused");
+        assert!(err.contains("names no event"), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_in_its_own_thread_passes() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(thread)).await;
+
+        verify_event_anchors(
+            &pool,
+            Some(thread),
+            Some(question),
+            &default_tap(Some(thread), Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect("an event in its own thread is a valid anchor");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An explicit tap carries its own pair, which is checked on its own. The
+    /// row's `thread_id` is provenance and may name a different thread.
+    #[tokio::test]
+    async fn an_explicit_tap_is_checked_against_its_own_thread() {
+        let (pool, db) = setup_test_db().await;
+        let provenance = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(target)).await;
+
+        verify_event_anchors(
+            &pool,
+            Some(provenance),
+            None,
+            &anchored_tap(target, Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect("the tap's event is in the tap's thread");
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(provenance),
+            None,
+            &anchored_tap(provenance, Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("the tap's event is in another thread");
+        assert!(err.contains(&target.to_string()), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_tap_event_id_that_is_not_a_uuid_is_refused() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let mut tap = anchored_tap(thread, None);
+        if let Tap::Navigate { to } = &mut tap {
+            to.event_id = Some("evt-latest".into());
+        }
+
+        let err = verify_event_anchors(&pool, Some(thread), None, &tap)
+            .await
+            .expect("the check ran")
+            .expect_err("refused");
+        assert!(err.contains("evt-latest"), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_notification_with_no_anchor_passes() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+
+        verify_event_anchors(&pool, Some(thread), None, &default_tap(Some(thread), None))
+            .await
+            .expect("the check ran")
+            .expect("nothing to check");
+        // An event with no thread to live in is ignored, as it always was.
+        verify_event_anchors(&pool, None, Some(Uuid::new_v4()), &Tap::Modal)
+            .await
+            .expect("the check ran")
+            .expect("no linked thread, so no anchor");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
     }
 
     // -----------------------------------------------------------------------

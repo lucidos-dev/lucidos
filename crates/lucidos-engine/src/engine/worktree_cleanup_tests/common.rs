@@ -303,6 +303,40 @@ pub(crate) async fn insert_child_completed_event(
     .expect("insert ChildThreadCompleted event");
 }
 
+/// Insert a backdated `ChildThreadStopped` note on `parent_id` (ADR 0252).
+pub(crate) async fn insert_child_stopped_event(
+    pool: &PgPool,
+    parent_id: Uuid,
+    child_id: Uuid,
+    age_secs: i64,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'ChildThreadStopped', $3, NOW() - make_interval(secs => $4), $2::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(parent_id)
+    .bind(json!({ "child_thread_id": child_id.to_string() }))
+    .bind(age_secs as f64)
+    .execute(pool)
+    .await
+    .expect("insert ChildThreadStopped event");
+}
+
+/// Insert a child row under `parent_id` that is a *stopped child*.
+pub(crate) async fn insert_stopped_child(pool: &PgPool, parent_id: Uuid, child_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, \
+                                       parent_thread_id, parent_callback_pending, is_stopped_child) \
+         VALUES ($1, 'stopped child', 'claude_code', 1, NOW(), $2, TRUE, TRUE)",
+    )
+    .bind(child_id)
+    .bind(parent_id)
+    .execute(pool)
+    .await
+    .expect("insert stopped child");
+}
+
 /// Set a thread's `active_children_count` directly — the fan-in retention tests
 /// use this to simulate a parent with a direct child still running.
 pub(crate) async fn set_active_children_count(pool: &PgPool, thread_id: Uuid, count: i32) {

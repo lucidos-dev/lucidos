@@ -46,12 +46,13 @@
 //! `ChangeApplyFailed`, `WorktreeCleaned`. Those are the persisted events that
 //! land in the gap and that the replay cannot show the agent.
 //!
-//! `BackgroundBashCompleted` is covered too, and it filters itself. Its watcher
-//! normally pushes a resume prompt at the parked session, and that push emits
-//! `CodingAgentPromptSent`, which is a BOUNDARY. So a completion the agent has
-//! already heard about falls outside the next gap by construction, and what
-//! reaches here is the one nobody delivered: a teardown suppresses the push,
-//! and a crash takes the watcher with it.
+//! `ChildThreadStopped` is covered for the same reason. Unlike its sibling
+//! `ChildThreadCompleted` it wakes nothing, so no turn carries it (ADR 0252).
+//!
+//! `BackgroundBashCompleted` is covered too, minus the ones an event wait
+//! delivered: that delivery is the prompt the re-opened turn carries. What
+//! reaches here is the one nobody delivered. A task whose wait a cap refused
+//! is one example.
 //!
 //! Deliberately NOT covered, because another mechanism already delivers them:
 //! `ChildThreadCompleted` (itself a CC turn origin, it wakes the parent
@@ -66,7 +67,8 @@
 //! own `/harden` run caused it), `CodingAgentSettingsChanged` (the resumed
 //! process already runs with the new model / effort), `ThreadTitleRenamed` /
 //! `ThreadSaved` / `ThreadUnsaved` / `QueuedMessageRemoved` (cosmetic, or
-//! removed before delivery), and `ThreadArchived` / `ThreadDiscarded`
+//! removed before delivery), `MessageHeld` / `HeldMessageReleased` (the
+//! release delivers the message itself), and `ThreadArchived` / `ThreadDiscarded`
 //! (terminal; archive's pending-change discard already arrives as
 //! `ChangeDiscarded`).
 //!
@@ -107,12 +109,13 @@ const COVERED_EVENT_TYPES: &[&str] = &[
     "ChangeReverted",
     "ChangeApplyFailed",
     "WorktreeCleaned",
-    // Every completion, and the boundary set does the filtering for free. A
-    // delivered wake emits `CodingAgentPromptSent`, which IS a boundary, so a
-    // completion the agent already heard about falls before the next gap.
-    // What lands here is the one nobody delivered: the wake is suppressed
-    // during teardown, and a crash takes the watcher with it.
+    // Every completion no event wait delivered. The query drops the delivered
+    // ones, whose delivery is the prompt the re-opened turn already carries.
     "BackgroundBashCompleted",
+    // A user Stop on one of this agent's children. It wakes nothing, so this
+    // note is the only way a coding-agent parent hears the child is alive
+    // (ADR 0252).
+    "ChildThreadStopped",
 ];
 
 /// Turn boundaries that are not turn ORIGINS, so `CC_ORIGINATING_EVENT_TYPES`
@@ -211,6 +214,12 @@ enum GapEvent {
         /// two-month-old loss as something that just happened.
         started_at: String,
     },
+    /// A user Stop paused one of this agent's child threads. See
+    /// [`COVERED_EVENT_TYPES`].
+    ChildStopped {
+        child_thread_id: String,
+        title: String,
+    },
 }
 
 impl GapEvent {
@@ -222,7 +231,9 @@ impl GapEvent {
             | Self::Discarded { change_id }
             | Self::Reverted { change_id }
             | Self::ApplyFailed { change_id, .. } => Some(change_id),
-            Self::WorktreeCleaned { .. } | Self::BackgroundTaskEnded { .. } => None,
+            Self::WorktreeCleaned { .. }
+            | Self::BackgroundTaskEnded { .. }
+            | Self::ChildStopped { .. } => None,
         }
     }
 
@@ -242,9 +253,10 @@ impl GapEvent {
                 branch.is_empty() || session_branch.is_none_or(|current| current == branch)
             }
             Self::WorktreeCleaned { tier, .. } => *tier >= 2,
-            Self::Reverted { .. } | Self::ApplyFailed { .. } | Self::BackgroundTaskEnded { .. } => {
-                false
-            }
+            Self::Reverted { .. }
+            | Self::ApplyFailed { .. }
+            | Self::BackgroundTaskEnded { .. }
+            | Self::ChildStopped { .. } => false,
         }
     }
 }
@@ -325,18 +337,27 @@ pub(crate) async fn compute_turn_gap_note(
     // `payload - 'stdout' - 'stderr'`: no covered type reads either key, and a
     // `BackgroundBashCompleted` carries up to 100 KB of each. Fetching them to
     // build a one-line note is the whole transfer for nothing.
+    //
+    // A completion an event wait already delivered is dropped: the delivery is
+    // the prompt this turn carries, so a note line would say it twice, and
+    // claim nobody told the agent.
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as::<_, (String, serde_json::Value)>(
-        "SELECT event_type, payload - 'stdout' - 'stderr' FROM events \
-         WHERE thread_id = $1 AND event_type = ANY($2) \
-           AND ($3::bigint IS NULL OR sequence < $3) \
-           AND sequence > COALESCE(( \
+        "SELECT e.event_type, e.payload - 'stdout' - 'stderr' FROM events e \
+         WHERE e.thread_id = $1 AND e.event_type = ANY($2) \
+           AND ($3::bigint IS NULL OR e.sequence < $3) \
+           AND e.sequence > COALESCE(( \
              SELECT MAX(sequence) FROM events \
              WHERE thread_id = $1 \
                AND id <> $4 \
                AND ($3::bigint IS NULL OR sequence < $3) \
                AND event_type = ANY($5) \
            ), 0) \
-         ORDER BY sequence ASC",
+           AND NOT (e.event_type = 'BackgroundBashCompleted' AND EXISTS ( \
+             SELECT 1 FROM events d \
+             WHERE d.thread_id = $1 AND d.event_type = 'EventWaitDelivered' \
+               AND d.payload->>'event_id' = e.id::text \
+           )) \
+         ORDER BY e.sequence ASC",
     )
     .bind(thread_id)
     .bind(COVERED_EVENT_TYPES)
@@ -437,6 +458,13 @@ fn parse_gap_event((event_type, payload): (String, serde_json::Value)) -> Option
                     crate::core::shell::TaskOutcome::from_persisted(exit_code, signal).describe()
                 }
             },
+        }),
+        "ChildThreadStopped" => Some(GapEvent::ChildStopped {
+            child_thread_id: str_field(&payload, "child_thread_id"),
+            title: truncate(
+                &str_field(&payload, "child_thread_title"),
+                MAX_DESCRIPTION_CHARS,
+            ),
         }),
         // A covered type the query returned but this match doesn't know would
         // be a programming error; skip it rather than panic mid-resume.
@@ -656,7 +684,27 @@ fn render(
             status,
             started_at,
         })],
+        GapEvent::ChildStopped {
+            child_thread_id,
+            title,
+        } => vec![child_stopped_line(child_thread_id, title)],
     }
+}
+
+/// The bullet for a child a user Stop paused. It says what the
+/// `[CHILD THREAD STOPPED]` block says to a chat parent: the child is alive.
+fn child_stopped_line(child_thread_id: &str, title: &str) -> String {
+    let name = if title.is_empty() {
+        format!("thread {child_thread_id}")
+    } else {
+        format!("\"{title}\" (thread {child_thread_id})")
+    };
+    format!(
+        "- CHILD STOPPED: the user stopped the turn of your child {name}. It is NOT finished \
+         and NOT dead: it waits for the user. A [CHILD THREAD COMPLETED] block arrives when it \
+         next finishes, or a canceled one if the user archives or discards it. Until then, do \
+         not roll back its work, respawn it, or send it a follow-up."
+    )
 }
 
 /// A Discard resets the change's branch to `main`. Whether that is the agent's

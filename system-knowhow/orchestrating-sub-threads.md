@@ -25,6 +25,7 @@ yours to decide, case by case.
 |---|---|---|
 | Parent to its own direct child | `follow_up_child_thread` | An instruction. The only instruction-bearing edge. |
 | Child to parent | `ChildThreadCompleted`, at every terminal turn | A report. Re-opens the parent. |
+| Child to parent | `ChildThreadStopped`, when a user Stop pauses the child | A note. Re-opens nothing. |
 | Any thread to any thread's events | `await_event`, the `events` query | Facts. Never an instruction. |
 | Sibling to sibling | Nothing exists | There is no tool and no route. |
 
@@ -142,10 +143,13 @@ you saw and carry on with your own work.
    stops them both writing.
 2. **Decide what you need to see.** A child's domain events do not re-open you
    unless you subscribed. A child's terminal re-opens you, through
-   `ChildThreadCompleted`. Two terminals deliberately do not: a mid-turn steer,
-   and a transient upstream failure the engine is already resuming past. Both
-   mean the child is still working, and both report at the real terminal. So a
-   card you DO get is never a child mid-retry, and respawning on one is never
+   `ChildThreadCompleted`. Four terminals deliberately do not: a mid-turn steer,
+   a transient upstream failure the engine is already resuming past, a turn
+   that ends holding an event wait, and a user Stop. The first three mean the
+   child is still working, and each reports at the real terminal. A Stop means
+   the child waits for the user: you get a `ChildThreadStopped` note, and the
+   card comes when the user continues, archives or discards it. So a card you
+   DO get is never a child mid-retry or paused, and respawning on one is never
    the right move. See `system-knowhow/thread-events.md`.
 3. **Rule from the record, not from testimony.** When two children disagree,
    read the events and the artifacts yourself. Each child reports its own view,

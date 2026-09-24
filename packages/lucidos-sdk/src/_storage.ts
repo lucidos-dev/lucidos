@@ -56,7 +56,7 @@ function mirrorKey(key: string, session: boolean): string {
 /**
  * Fetch this frame's stored values before anything reads them.
  *
- * Called once at SDK load, beside `primeExternalLinkTarget`, and awaited by the
+ * Called once at SDK load, beside `primeDevicePreferences`, and awaited by the
  * one reader whose answer must be right on the first try: scroll memory. A
  * failure leaves the mirror empty, which reads as "nothing stored" and is what
  * a first visit looks like anyway.

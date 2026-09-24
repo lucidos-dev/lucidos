@@ -77,7 +77,7 @@ NEXT message: a turn builds its prompt once, at the start, so the turn you are
 in finishes in the style it began in. It reaches triggers too, and it changes
 nothing about coding-agent sessions.
 
-**Device scope.** Device-scoped keys (theme, font-family, ui-scale,
+**Device scope.** Device-scoped keys (theme, font-family, ui-scale, autocorrect,
 push_notifications) are stored per-device and override the global value on the
 device that set them. `set_preference` automatically targets the calling device —
 you never pass a device id. This is the trap to remember: setting `theme=dark`
@@ -132,6 +132,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `theme` | device | `light` \| `dark` \| `system` | `system` | Color theme for the calling device. The default `system` follows the OS light/dark setting; `light` and `dark` pin it. |
 | `font-family` | device | `monospace` \| `system` \| `inter` \| `jetbrains-mono` \| `ibm-plex-mono` \| `fira-code` | `fira-code` | UI font for the calling device. The default `fira-code` is served by this engine, so it needs no internet; `inter` / `jetbrains-mono` / `ibm-plex-mono` are fetched from Google Fonts on first use, and `monospace` / `system` use the device's own fonts. Fira Code also enables programming ligatures, on code surfaces only (code blocks, inline code, diffs, file previews); prose and the prompt render literally, because Fira Code's contextual alternates re-space a typed `...` into what reads as two dots. |
 | `ui-scale` | device | number 75–200 | `100` | UI scale percent for the calling device (snaps to 12.5 steps). |
+| `autocorrect` | device | `true` \| `false` | `true` | Whether text fields autocorrect as the user types on the calling device. iOS autocorrect can keep the tap on Send or Submit for itself while it holds a correction. The button then does nothing until the keyboard closes. When a user on an iPhone or iPad reports that, closing the keyboard and tapping again gets through. Offer `false` if it keeps happening. Spell-check underlines and sentence capitals stay either way. The user finds it under **Settings → System → Debugging**, on iPhone and iPad only. An app's own text fields follow it too, through `sdk.js`. |
 | `push_notifications` | device | `enabled` \| `declined` | (unset) | Push notifications for the calling device. `enabled` triggers the OS/browser permission prompt. |
 
 ## Read-only / managed elsewhere

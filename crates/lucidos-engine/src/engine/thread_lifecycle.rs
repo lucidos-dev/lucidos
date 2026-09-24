@@ -255,6 +255,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Queued-message removal is a pure marker over a prior MessageReceived.
         // It must not bump recency, status, section, or message count.
         "QueuedMessageRemoved" => EventClass::Metadata,
+        // A held message and its release are markers. The status stays where
+        // the open question put it; the release's `MessageReceived` moves it.
+        "MessageHeld" | "HeldMessageReleased" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
@@ -355,6 +358,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // of THIS exchange — same shape as a user-message exchange.
         // See docs/plans/2026-05-12-child-completion-card-design.md.
         "ChildThreadCompleted" => EventClass::Start,
+        // Its sibling for a user Stop (ADR 0252). A note on the parent's
+        // timeline, never a turn: the stopped child is alive, and the parent
+        // stays asleep until the `ChildThreadCompleted` that settles it.
+        "ChildThreadStopped" => EventClass::Metadata,
         // Resume-helper input from the retired `dismiss_from_context` tool,
         // and the record of a keep. Pure bookkeeping, no UI surface and no
         // activity bump.
@@ -398,6 +405,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
     vec![
         "MessageReceived",
         "QueuedMessageRemoved",
+        "MessageHeld",
+        "HeldMessageReleased",
         "TextStreamed",
         "ThoughtStreamed",
         "ContextCaptured",
@@ -456,6 +465,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "WorktreeCleaned",
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
+        "ChildThreadStopped",
         "ContextDismissed",
         "ContextKeptOpen",
         // Background-bash lifecycle (run_bash_background trio).
@@ -539,8 +549,9 @@ pub struct TransitionResult {
 /// `is_unattended` is the caller's verdict that nobody is watching this run.
 /// `event_bus_projection_thread.rs` computes it, and only a trigger execution
 /// can qualify: one the user neither opted into reviewing nor followed up on.
-/// It suppresses the inbox surfacing an event would otherwise cause, so the
-/// bottom guard below is the only thing that reads it.
+/// It suppresses the inbox surfacing an event would otherwise cause, except
+/// for an event in `WAITING_FOR_USER_ANSWER_EVENTS`. The bottom guard below is
+/// the only thing that reads it.
 pub fn resolve_transition(
     event_type: &str,
     thread_type: ThreadType,
@@ -658,6 +669,8 @@ pub fn resolve_transition(
         // Events legal for both, no section change
         "MessageReceived"
         | "QueuedMessageRemoved"
+        | "MessageHeld"
+        | "HeldMessageReleased"
         | "TextStreamed"
         | "ThoughtStreamed"
         | "ContextCaptured"
@@ -723,6 +736,9 @@ pub fn resolve_transition(
         // `status_transitions()` on purpose: that table mirrors
         // `update_thread_projection`, and this write is not in it.
         | "ChildThreadCompleted"
+        // Never a status write: a stopped child's note must not wake its
+        // parent (ADR 0252).
+        | "ChildThreadStopped"
         | "ContextDismissed"
         | "ContextKeptOpen"
         // Background bash lifecycle — pure audit / fallback storage for
@@ -788,8 +804,11 @@ pub fn resolve_transition(
         _ => violation("Unknown event type"),
     }?;
 
-    // An unattended run hides on its terminal event. Nobody is watching, so
-    // surfacing it would ask for attention on work the user never started.
+    // An unattended run hides when it lands in the inbox. Nobody is watching,
+    // so surfacing it would ask for attention on work the user never started.
+    //
+    // An event that parks the run on the user is the exception. The run now
+    // needs them, and hiding it would hide the question for good (ADR 0259).
     //
     // Depth is deliberately NOT part of this. A finished sub-thread keeps the
     // inbox state it ran with. Archiving it here writes a state no
@@ -802,6 +821,7 @@ pub fn resolve_transition(
     if is_unattended
         && thread_type != ThreadType::CodingAgent
         && result.new_section == Some(ArchiveState::Inbox)
+        && !WAITING_FOR_USER_ANSWER_EVENTS.contains(&event_type)
     {
         return Ok(TransitionResult {
             new_section: Some(ArchiveState::Archived),
@@ -948,6 +968,27 @@ pub fn thread_is_deletable(
     ) && !descendants_block
 }
 
+/// May `ThreadArchived` land on a thread in `status`? A thread waiting on the
+/// user needs attention, so it is never archived, by any path (ADR 0259).
+///
+/// The EventBus asks this for every `ThreadArchived`, whoever emitted it. The
+/// HTTP archive gate refuses the same thread earlier, with a 409.
+pub fn check_archive_allowed(
+    thread_type: ThreadType,
+    current_section: ArchiveState,
+    status: ThreadStatus,
+) -> Result<(), LifecycleViolation> {
+    if status != ThreadStatus::WaitingForUserAnswer {
+        return Ok(());
+    }
+    Err(LifecycleViolation {
+        event_type: "ThreadArchived".to_string(),
+        thread_type,
+        current_section,
+        reason: "the thread is waiting on the user; answer or stop it first".to_string(),
+    })
+}
+
 /// A thread "needs attention" iff its state requires a user action to
 /// progress. Same shape as `is_blocking` but DROPS the `Running` clause:
 /// a running descendant is delegated work, not pending attention.
@@ -958,6 +999,8 @@ pub fn thread_is_deletable(
 /// - In-workspace CC thread with pending changes — user must Apply or
 ///   Discard before the thread can settle. External-repo CC is the same
 ///   carve-out as `is_blocking` clause 3.
+/// - A *stopped child* that is not archived. Its parent is still owed a
+///   result, and only the user can continue, archive or discard it.
 ///
 /// Drives `thread_summaries.attention_descendant_count`, which bubbles
 /// transitively up the ancestor chain, so a thread with a "needs-attention"
@@ -978,9 +1021,10 @@ pub fn thread_is_deletable(
 /// parked thread wearing an attention badge with no action to take, which is
 /// premature rather than wrong: it will need the user once it wakes.
 ///
-/// Relationship: `is_blocking = is_attention_needing OR status == Running`.
-/// `Archive`-button gating still uses `is_blocking` so a Running descendant
-/// keeps the button hidden.
+/// Relationship: `is_blocking = is_attention_needing OR status == Running`,
+/// minus the stopped-child clause. A stopped child blocks nothing, because
+/// archiving its parent must stay possible (ADR 0252). `Archive`-button gating
+/// still uses `is_blocking` so a Running descendant keeps the button hidden.
 ///
 /// **SQL mirrors** — keep in sync when the predicate changes:
 /// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`
@@ -997,6 +1041,7 @@ pub fn is_attention_needing(
     archive_state: ArchiveState,
     has_pending_changes: bool,
     is_external_repo: bool,
+    is_stopped_child: bool,
 ) -> bool {
     if status == ThreadStatus::WaitingForUserAnswer {
         return true;
@@ -1007,7 +1052,7 @@ pub fn is_attention_needing(
     if has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo {
         return true;
     }
-    false
+    is_stopped_child
 }
 
 /// Every action available for a thread in its current state, in cascade
@@ -1174,6 +1219,16 @@ pub const MESSAGE_COUNT_EVENTS: &[&str] = &[
     "TriggerStarted",
     "CodingAgentUserMessageSent",
     "UserPromptInjected",
+];
+
+/// Event types that park a thread on the user: each sets status
+/// `WaitingForUserAnswer`. Must match the `Set(WaitingForUserAnswer)` rows of
+/// `status_transitions()`, which a test pins.
+pub const WAITING_FOR_USER_ANSWER_EVENTS: &[&str] = &[
+    "UserQuestionAsked",
+    "CodingAgentPermissionRequest",
+    "CommandPermissionRequested",
+    "McpPermissionRequested",
 ];
 
 /// How an event changes thread status.

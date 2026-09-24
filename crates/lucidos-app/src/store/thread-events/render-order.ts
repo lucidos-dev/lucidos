@@ -1,5 +1,5 @@
 import { compareSortKeys, happenedAt, isUningestedMessage } from './exchange-grouping';
-import { isUserStoppedWait } from './thread-event-types';
+import { isTurnlessBoundary } from './thread-event-types';
 import type { Exchange } from './exchange';
 import type { StoredEvent } from './thread-event-types';
 
@@ -74,8 +74,9 @@ function engagedKey(exchange: Exchange, index: number): RenderRow | null {
   // Never picked up. The turn above is still writing and owes this card
   // nothing, so no row above it can be late.
   if (isUningestedMessage(exchange)) return null;
-  // The reader's Stop, which takes no turn and draws no body.
-  if (isUserStoppedWait(exchange.userEvent)) return null;
+  // The reader's Stop, or a stopped child's note: neither takes a turn or
+  // draws a body.
+  if (isTurnlessBoundary(exchange.userEvent)) return null;
   const pickedUp = ingestionStep(exchange);
   if (pickedUp) return rowOf(index, 'step', pickedUp.seq, pickedUp.event);
   return rowOf(index, 'boundary', exchange.userSeq, exchange.userEvent);

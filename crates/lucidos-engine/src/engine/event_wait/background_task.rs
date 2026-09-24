@@ -1,26 +1,22 @@
-//! The wait the ENGINE arms, for a chat turn that ends with background work
-//! still running.
+//! The wait the ENGINE arms over a thread's running background tasks.
 //!
 //! # Why this exists at all
 //!
-//! A background task's completion reaches a **coding-agent** thread by itself:
 //! `spawn_bash_completion_watcher` (`engine/tools/bash.rs`) emits
-//! `BackgroundBashCompleted` and then pushes a synthetic prompt onto the parked
-//! session's `msg_tx`, so the agent resumes and reads the result. That path has
-//! one branch it deliberately cannot take, stated in its own comment: it skips
-//! the push when there is "a chat-mode background bash with no CC session at
-//! all". A chat thread has no parked subprocess to push to.
+//! `BackgroundBashCompleted` and nothing more. A thread only hears about a
+//! finished task if something subscribed to that event. Two callers arm here:
 //!
-//! So a chat thread's only way back was an `await_event` the model had to remember
-//! to arm, and nothing pointed at that pairing. On 2026-08-09 a release thread
-//! spawned Phase A with `run_bash_background`, drained it a few times, and
-//! ended its turn with a status message. Phase A finished five minutes later
-//! and emitted `BackgroundBashCompleted` with nobody subscribed. The thread sat
-//! idle for five hours until the user asked whether the release had happened.
+//! * **The chat turn tail.** Before it, a chat thread's only way back was an
+//!   `await_event` the model had to remember to arm. A release thread once
+//!   ended its turn with Phase A still running, and sat idle for five hours
+//!   after Phase A finished with nobody subscribed.
+//! * **The coding-agent `background-tasks` route**, right after it spawns. A
+//!   coding agent ends its turn to wait, and its process group goes with it.
+//!   The wait is the only thing left to wake it.
 //!
-//! # Why a subscription rather than a second re-entry path
+//! # Why a subscription rather than a direct push
 //!
-//! Mirroring the coding-agent `msg_tx` push would be a second delivery
+//! A push into a parked session would be a second delivery
 //! mechanism with its own one-shot, timeout and loop semantics to get right,
 //! and it would be invisible: the user would see an idle thread that happens to
 //! come back to life later. An *event wait* is already the engine's answer to "re-open
@@ -33,7 +29,7 @@
 //!
 //! * **One wait, every uncovered task.** The `on:` list carries one entry per
 //!   task rather than one wait per task, so a turn that spawned three builds
-//!   spends one live-wait slot and one consecutive-subscription count, not
+//!   spends one live-wait slot and one recent-subscription count, not
 //!   three. Any entry matching re-opens the thread, which is what is wanted: the
 //!   re-entered turn re-runs this tail and re-arms for whatever is still going.
 //! * **Conditioned on `task_id`, always.** A wait subscribes across threads (it
@@ -85,18 +81,23 @@ const ARMED_REASON: &str = "Watching background work started in this thread, so 
 
 impl LucidosEngine {
     /// Arm a wait covering every unfinished background task this thread owns
-    /// that nothing is already watching. Called from the chat turn tail.
+    /// that nothing is already watching. Called from the chat turn tail, and
+    /// by the coding-agent `background-tasks` route right after it spawns.
     ///
-    /// Returns the number of tasks now covered by a wait armed here, which is
-    /// zero in every ordinary case: no background work, or the model armed its
-    /// own subscription, or a cap says no.
+    /// Returns the ids of the running tasks a live wait now covers, whether
+    /// armed here or already there. A running task missing from the list will
+    /// finish unwatched, because a cap or an error said no. A task that had
+    /// already finished is missing too: it was never running to be covered.
     ///
     /// **Every refusal is silent to the user.** There is no tool call to answer
     /// and no turn left to report into, so a cap or a database error is logged
     /// and the tail moves on. That is a real regression back to the stall this
     /// prevents, which is why the log line says so explicitly rather than
     /// noting a skip.
-    pub(crate) async fn arm_wait_for_running_background_tasks(&self, thread_id: Uuid) -> usize {
+    pub(crate) async fn arm_wait_for_running_background_tasks(
+        &self,
+        thread_id: Uuid,
+    ) -> Vec<String> {
         // Cheapest possible early-out first: an in-memory map scan behind a
         // mutex. The overwhelming majority of turns own no background work at
         // all, and everything below this line costs at least one database
@@ -106,7 +107,7 @@ impl LucidosEngine {
         // the registry answers for free would be a worse regression than the
         // stall this fixes.
         if !self.bash_background.has_running_for_thread(thread_id).await {
-            return 0;
+            return Vec::new();
         }
 
         // Now the watermark, and BEFORE the authoritative registry read below.
@@ -129,26 +130,33 @@ impl LucidosEngine {
                     "[EventWait] Could not read the watermark for thread {thread_id}: {e}. \
                      Any background work it owns will finish unwatched."
                 );
-                return 0;
+                return Vec::new();
             }
         };
 
         let running = self.bash_background.running_for_thread(thread_id).await;
         if running.is_empty() {
-            return 0;
+            return Vec::new();
         }
 
         let live = self.live_waits.for_thread(thread_id).await;
-        // Engine-armed waits COUNT toward the consecutive cap, deliberately. A
-        // turn re-entered by one of these can spawn another background task and end
-        // again, and without the count that loop has no bound at all. Counting
-        // stops it at the same ten the model gets, after which the thread goes
-        // quiet, which is exactly today's behaviour and so no regression.
+        let already_covered: Vec<String> = running
+            .iter()
+            .filter(|h| {
+                live.iter()
+                    .any(|w| wait_covers_task(&w.on, &h.task_id, thread_id))
+            })
+            .map(|h| h.task_id.clone())
+            .collect();
+        // Engine-armed waits COUNT toward the recent-subscription cap,
+        // deliberately. A turn re-entered by one of these can spawn another
+        // background task and end again. When those tasks exit at once, that is
+        // a hot loop, and the count stops it at the same rate the model gets.
         //
         // A cap that cannot be EVALUATED must not silently become no cap, the
         // same call `event_wait_caps_refusal` makes, so an unreadable count is
         // passed on as such rather than as a zero.
-        let consecutive = super::register::consecutive_subscriptions(&self.pool, thread_id)
+        let recent = super::register::recent_subscriptions(&self.pool, thread_id)
             .await
             .inspect_err(|e| {
                 crate::log!(
@@ -157,18 +165,18 @@ impl LucidosEngine {
             })
             .ok();
 
-        let plan = plan_wait(&running, &live, consecutive, thread_id);
+        let plan = plan_wait(&running, &live, recent, thread_id);
         let uncovered = match &plan {
             ArmingPlan::Arm(tasks) => tasks,
-            ArmingPlan::NothingUncovered => return 0,
+            ArmingPlan::NothingUncovered => return already_covered,
             // Every refusal is a real regression back to the stall this
             // prevents, so it says so rather than reading as a routine skip.
             ArmingPlan::Refused(why) => {
                 crate::log!(
-                    "[EventWait] Thread {thread_id} ended a turn with unwatched background \
-                     work and nothing will re-open it when that finishes: {why}"
+                    "[EventWait] Thread {thread_id} has unwatched background work and \
+                     nothing will re-open it when that finishes: {why}"
                 );
-                return 0;
+                return already_covered;
             }
         };
 
@@ -203,7 +211,7 @@ impl LucidosEngine {
                 "[EventWait] Could not arm a background-task wait for thread {thread_id}: {e}. \
                  Its background work will finish unwatched."
             );
-            return 0;
+            return already_covered;
         }
         crate::log!(
             "[EventWait] Armed wait {} for thread {thread_id} over {} unwatched background \
@@ -211,7 +219,10 @@ impl LucidosEngine {
             wait.wait_id,
             uncovered.len(),
         );
-        uncovered.len()
+        already_covered
+            .into_iter()
+            .chain(uncovered.iter().map(|h| h.task_id.clone()))
+            .collect()
     }
 }
 
@@ -235,13 +246,13 @@ pub(super) enum ArmingPlan<'a> {
 
 /// Decide whether to arm, and over which tasks.
 ///
-/// `consecutive` is `None` when the count could not be read. That is a refusal,
+/// `recent` is `None` when the count could not be read. That is a refusal,
 /// not a zero: an unreadable event store is exactly when a runaway loop would
 /// do the most damage, which is the same call `event_wait_caps_refusal` makes.
 pub(super) fn plan_wait<'a>(
     running: &'a [RunningTaskHandle],
     live: &[super::LiveWait],
-    consecutive: Option<i64>,
+    recent: Option<i64>,
     thread_id: Uuid,
 ) -> ArmingPlan<'a> {
     let uncovered: Vec<&RunningTaskHandle> = running
@@ -258,7 +269,7 @@ pub(super) fn plan_wait<'a>(
 
     // The live-wait cap. Only this one of `event_wait_caps_refusal`'s three
     // arms applies: the duplicate arm is replaced by the coverage filter above,
-    // and the consecutive cap is the next check.
+    // and the recent-subscription cap is the next check.
     if live.len() >= MAX_LIVE_WAITS_PER_THREAD {
         return ArmingPlan::Refused(format!(
             "it already holds {} live subscriptions, the limit, with {} task(s) unwatched",
@@ -267,10 +278,11 @@ pub(super) fn plan_wait<'a>(
         ));
     }
 
-    match consecutive {
-        Some(n) if n >= super::MAX_CONSECUTIVE_SUBSCRIPTIONS => ArmingPlan::Refused(format!(
-            "it has subscribed {n} times with no message from the user, the limit, with {} \
-             task(s) unwatched",
+    match recent {
+        Some(n) if n >= super::MAX_RECENT_SUBSCRIPTIONS => ArmingPlan::Refused(format!(
+            "it has subscribed {n} times in the last {} minutes with no message from the \
+             user, the limit, with {} task(s) unwatched",
+            super::RECENT_SUBSCRIPTION_WINDOW_SECS / 60,
             uncovered.len(),
         )),
         Some(_) => ArmingPlan::Arm(uncovered),

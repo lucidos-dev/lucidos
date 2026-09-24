@@ -104,9 +104,10 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
 pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
-         Do NOT re-run the `implementation-plan` skill — the plan is already recorded. Present the \
-         plan, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL, offering `Approve` and \
-         `Request changes`. That pair is a FLOOR: `Approve` first, `Request changes` second ONLY \
+         Do NOT re-run the `implementation-plan` skill: the plan is already recorded. Summarize \
+         the plan in your message, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL, offering \
+         `Approve` and `Request changes`. The card's question is one short line that never \
+         repeats the summary. The option pair is a FLOOR: `Approve` first, `Request changes` second ONLY \
          when the plan offers no real fork. If it offers one (a narrower scope, one layer instead \
          of two), that fork takes the second slot and `Request changes` is dropped, never carried \
          alongside it as a third. Approval is a DECISION question, not a post-work confirmation: \
@@ -115,7 +116,8 @@ pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
          implementation, then retry your edit to `{path}`. Picking a fork is an approval too: \
          revise the plan file to that variant, re-commit, then run `lucidos planned approve`. If \
          the user requests changes instead, revise the plan file under docs/plans/, re-commit, \
-         and ask again the same way (the marker stays `proposed` until approved).",
+         and ask again: the new message names only what changed, and the plan file holds the rest \
+         (the marker stays `proposed` until approved).",
         path = file_path,
     );
     deny_envelope(&reason)
@@ -309,6 +311,9 @@ mod tests {
             // must also say the marker can be flipped after revising the plan.
             "that fork takes the second slot",
             "Picking a fork is an approval too",
+            // The card renders under the agent's message. A card restating the
+            // summary makes the user read the plan twice.
+            "never repeats the summary",
         ] {
             assert!(
                 reason.contains(needle),

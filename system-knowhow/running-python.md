@@ -111,13 +111,13 @@ What is guaranteed is that you hear. The engine records the task's
 no `signal`. Your subscription therefore resolves on the next boot rather than
 waiting out its own deadline.
 
-**The two ways it ends differ, and the `stderr` line says which.** A graceful
-stop kills the task and then records it, so the output is everything the task
+**The two ways it ends differ, and the `stderr` line says which.** An orderly
+engine shutdown kills the task and then records it, so the output is everything the task
 wrote. A crash records only that the loss happened, and no output survives.
 
-**Neither promises the work stopped.** A crash kills nothing. A graceful stop
-signals the task's own shell, and that does not reach a pipeline or a command
-list behind it. Either can leave a child running under init.
+**Neither promises the work stopped.** A crash kills nothing. An orderly
+shutdown kills the task's whole process group, but not a process that detached into its
+own session. Either can leave a child running under init.
 
 So on `abandoned: true`, read it as "the engine stopped and the work did not
 finish". Nobody cancelled it, and the missing `exit_code` is not a failure of
@@ -160,7 +160,7 @@ can never tell you different things.
 | Field | Meaning |
 |---|---|
 | `exit_code` | The normal exit status, and **only** that. `null` whenever there wasn't one. |
-| `signal` | The Unix signal that killed the **shell Lucidos spawned**, if one did (a watchdog timeout / `bash_kill` gives `9`). `null` otherwise — including when a signal killed a stage *inside* your pipeline, which arrives as an `exit_code` of `128 + signum`. |
+| `signal` | The Unix signal that killed the **shell Lucidos spawned**, if one did. A watchdog timeout or `bash_kill` gives `15` (SIGTERM), or `9` if the shell ignored SIGTERM through the 3 s grace. `null` otherwise, including when a signal killed a stage *inside* your pipeline, which arrives as an `exit_code` of `128 + signum`. |
 | `status` | Rendered phrase: `"exit code 101"`, `"killed by SIGKILL (signal 9)"`, `"exit code 141 (probable SIGPIPE)"`, or `"exit code unknown"`. `null` while the task is still running. |
 
 The success test is **`exit_code == 0`**, nothing weaker. Specifically:
@@ -171,7 +171,9 @@ The success test is **`exit_code == 0`**, nothing weaker. Specifically:
 - A signal death is not an exit code. A task killed by SIGKILL reports
   `exit_code: null, signal: 9` — never `0`, never `137`, never `-1`.
 - `timed_out: true` (watchdog) and `killed: true` (`bash_kill`) mean the engine
-  ended the task. Both also carry `signal: 9`, since that is how it ended it.
+  ended the task. Both usually carry `signal: 15`. A command that traps SIGTERM
+  and exits on its own carries that exit code instead, and the flag still says
+  who ended it.
 - `abandoned: true` means the engine STOPPED while the task ran. Nothing
   cancelled the work, and no status was ever reaped, so `exit_code` and `signal`
   are `null` and `status` reads `"exit code unknown"`. **`abandoned` overrides

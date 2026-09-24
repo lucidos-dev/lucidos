@@ -39,6 +39,9 @@ export interface ThreadSummary {
    *  the Running case. Consumed by `displaySection` via `count > 0` to bubble
    *  the parent to REVIEW even when sibling descendants are still running. */
   attention_descendant_count: number;
+  /** Whether this thread is a *stopped child* (ADR 0252). Absent on an engine
+   *  that predates the field. */
+  is_stopped_child?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the Waiting status dot: a
    *  thread watching for an event is not finished, and this is what says so on

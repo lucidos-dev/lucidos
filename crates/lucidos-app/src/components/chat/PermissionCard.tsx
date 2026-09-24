@@ -317,6 +317,21 @@ export function resolvedChoice(resolved: {
   return resolved.persist_scope ?? 'allow';
 }
 
+/** The reason a user's own Deny click carries. Mirrors `DENIAL_REASON` in the
+ *  engine's `cc_permission.rs`, `command_permission.rs` and `mcp_permission.rs`. */
+const USER_DENIAL_REASON = 'User denied';
+
+/** What a card the ENGINE resolved says under its buttons: the first sentence
+ *  of its reason. `null` for a user click, whose picked button says it all. */
+export function engineResolutionNote(
+  resolved: { allowed: boolean; reason?: string } | null | undefined,
+): string | null {
+  const reason = resolved?.reason?.trim();
+  if (!reason || reason === USER_DENIAL_REASON) return null;
+  const end = reason.search(/\.\s/);
+  return end === -1 ? reason : reason.slice(0, end + 1);
+}
+
 /** Per-button disabled + state-class. `answered` styling (picked / rejected)
  *  wins over `terminated` so the user's recorded decision stays visible even
  *  if a later abort lands. */
@@ -398,6 +413,7 @@ function PermissionBodyShell({
   selected,
   answered,
   terminated,
+  note,
 }: {
   requestId: string;
   question: ComponentChildren;
@@ -405,6 +421,7 @@ function PermissionBodyShell({
   selected: PermissionChoice | null;
   answered: boolean;
   terminated: boolean;
+  note: string | null;
 }) {
   const primary = buttons.filter(b => b.row === 'primary');
   const secondary = buttons.filter(b => b.row === 'secondary');
@@ -442,6 +459,7 @@ function PermissionBodyShell({
           {renderPermissionButton(spec, state)}
         </div>
       ))}
+      {note && <div class="permission-resolution-note">{note}</div>}
     </div>
   );
 }
@@ -551,6 +569,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       selected={selected}
       answered={answered}
       terminated={!!terminated}
+      note={engineResolutionNote(resolved)}
     />
   );
 }
@@ -795,6 +814,7 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       selected={selected}
       answered={answered}
       terminated={!!terminated}
+      note={engineResolutionNote(resolved)}
     />
   );
 }
@@ -891,6 +911,7 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       selected={selected}
       answered={answered}
       terminated={!!terminated}
+      note={engineResolutionNote(resolved)}
     />
   );
 }

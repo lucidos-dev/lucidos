@@ -123,6 +123,48 @@ export function seedThreadRow({ id, title, parentId, totalChildren = 0, now, sou
   return `INSERT INTO thread_summaries (${cols}) VALUES (${vals})`;
 }
 
+/** Seed an archived coding-agent thread of step-heavy turns, and return its id
+ *  with each turn's prompt id, oldest first. Every turn is a prompt "turn N",
+ *  `stepsPerTurn` Bash calls described "Run echo N.S" with their results, and
+ *  a reply. So a spec can page it, window it, and find any row by its text. */
+export function seedStepHeavyThread({ turns, stepsPerTurn, title }: {
+  turns: number;
+  stepsPerTurn: number;
+  title: string;
+}): { threadId: string; messageIds: string[] } {
+  const threadId = randomUUID();
+  const now = new Date().toISOString();
+  const messageIds: string[] = [];
+  const row = (id: string, type: string, payload: string) =>
+    `('${id}', '${type}', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`;
+
+  const rows: string[] = [];
+  for (let t = 0; t < turns; t++) {
+    const messageId = randomUUID();
+    messageIds.push(messageId);
+    rows.push(row(messageId, 'MessageReceived', `{"text":"turn ${t}","mode":"human","channel":"claude_code"}`));
+    for (let s = 0; s < stepsPerTurn; s++) {
+      const useId = `e2e-${threadId}-${t}-${s}`;
+      rows.push(row(randomUUID(), 'CodingAgentToolCalled',
+        `{"name":"Bash","args":{"command":"echo ${t}.${s}"},"description":"Run echo ${t}.${s}",` +
+        `"channel":"claude_code","tool_use_id":"${useId}","coding_agent":"claude-code",` +
+        `"request_event_id":"${messageId}"}`));
+      rows.push(row(randomUUID(), 'CodingAgentToolResult',
+        `{"name":"","result":"${t}.${s} done","channel":"claude_code","tool_use_id":"${useId}",` +
+        `"coding_agent":"claude-code","request_event_id":"${messageId}"}`));
+    }
+    rows.push(row(randomUUID(), 'ResponseGenerated',
+      `{"text":"Finished turn ${t}.","images":[],"request_event_id":"${messageId}"}`));
+  }
+
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', '${title}', 'claude_code', '${now}', ${turns}, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
+  ].join(';\n'));
+  return { threadId, messageIds };
+}
+
 /** Create a CC thread with a pending change (git branch + DB rows). */
 export function createCCThreadWithChange(titlePrefix: string, suffix: string, opts: {
   requiresRestart?: boolean;

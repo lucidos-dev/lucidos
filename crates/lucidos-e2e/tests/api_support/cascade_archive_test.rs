@@ -476,3 +476,123 @@ async fn archive_does_not_settle_stale_cc_sessions() {
     cleanup_threads(&pool, &[parent_id, child_id]).await;
     pool.close().await;
 }
+
+/// Mark a seeded child as a *stopped child* (ADR 0252): a user Stop ended its
+/// turn and its parent is still owed a card.
+async fn mark_stopped_child(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query(
+        "UPDATE thread_summaries SET is_stopped_child = TRUE, parent_callback_pending = TRUE \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("failed to mark the stopped child");
+}
+
+/// `(payload status)` of every `ChildThreadCompleted` on `parent_id`.
+async fn completion_statuses(pool: &sqlx::PgPool, parent_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'status' FROM events \
+         WHERE thread_id = $1 AND event_type = 'ChildThreadCompleted' ORDER BY sequence",
+    )
+    .bind(parent_id)
+    .fetch_all(pool)
+    .await
+    .expect("failed to read completion cards")
+}
+
+async fn post_archive(thread_id: Uuid) -> u16 {
+    let client = user_client().await;
+    client
+        .post(format!("{}/api/v1/threads/archive", base_url()))
+        .json(&json!({ "thread_id": thread_id.to_string() }))
+        .send()
+        .await
+        .expect("archive request failed")
+        .status()
+        .as_u16()
+}
+
+/// Archiving a stopped child is the user saying "done". Its parent gets the
+/// one canceled card it was owed.
+#[tokio::test]
+async fn archiving_a_stopped_child_sends_its_parent_a_canceled_card() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
+    seed_thread(
+        &pool,
+        child_id,
+        Some(parent_id),
+        true,
+        "idle",
+        "inbox",
+        false,
+        false,
+    )
+    .await;
+    mark_stopped_child(&pool, child_id).await;
+
+    assert_eq!(post_archive(child_id).await, 200);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        completion_statuses(&pool, parent_id).await,
+        vec!["canceled".to_string()],
+        "the parent must get exactly one canceled card"
+    );
+
+    cleanup_threads(&pool, &[parent_id, child_id]).await;
+    pool.close().await;
+}
+
+/// A cascade from the parent archives the stopped child along with it. That
+/// parent is archived too, so it is owed nothing, and a card would pull it
+/// back into the inbox.
+#[tokio::test]
+async fn a_cascade_from_the_parent_sends_no_card_for_a_stopped_child() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
+    seed_thread(
+        &pool,
+        child_id,
+        Some(parent_id),
+        true,
+        "idle",
+        "inbox",
+        false,
+        false,
+    )
+    .await;
+    mark_stopped_child(&pool, child_id).await;
+
+    assert_eq!(
+        post_archive(parent_id).await,
+        200,
+        "a stopped child must not block archiving its parent"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(
+        completion_statuses(&pool, parent_id).await.is_empty(),
+        "a cascade must send the archived parent no card"
+    );
+    let parent_section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(parent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(parent_section, "archived");
+
+    cleanup_threads(&pool, &[parent_id, child_id]).await;
+    pool.close().await;
+}

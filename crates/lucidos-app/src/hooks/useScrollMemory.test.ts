@@ -2998,3 +2998,82 @@ describe('a reading position that names a turn', () => {
     detach();
   });
 });
+
+// ---------------------------------------------------------------------------
+// A READING POSITION THAT NAMES A STEP ROW.
+//
+// A coding-agent turn holds hundreds of rows, and the window draws a turn's
+// tail first. A turn anchor measured there is measured from the wrong top, so
+// the position names the row at the line instead.
+// ---------------------------------------------------------------------------
+describe('a reading position that names a step row', () => {
+  const IDS = ['t0', 't1', 't2'];
+  const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
+  let origRO: unknown;
+  let origMO: unknown;
+
+  beforeEach(() => {
+    localStorage.clear();
+    origRO = (globalThis as any).ResizeObserver;
+    origMO = (globalThis as any).MutationObserver;
+    class Inert { observe() {} disconnect() {} takeRecords() { return []; } }
+    (globalThis as any).ResizeObserver = Inert;
+    (globalThis as any).MutationObserver = Inert;
+  });
+  afterEach(() => {
+    (globalThis as any).ResizeObserver = origRO;
+    (globalThis as any).MutationObserver = origMO;
+  });
+
+  it('parses its stored form, armed or not, and nothing that only looks like it', () => {
+    expect(parseSavedScroll('row:-10:call-7')).toEqual({ kind: 'row', rowEventId: 'call-7', relTop: -10 });
+    expect(parseSavedScroll('following:row:0:call-7'))
+      .toEqual({ kind: 'row', rowEventId: 'call-7', relTop: 0, armed: true });
+    expect(parseSavedScroll('row:abc:call-7')).toBeNull();
+    expect(parseSavedScroll('row:-10:')).toBeNull();
+  });
+
+  it('records the row at the line in preference to its turn', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: 1000, rowsPerTurn: 40 });
+    const detach = attachScrollMemory(el, 'k', opts);
+    el.scrollTop = 1310;
+    el.fireScroll();
+    detach();
+    expect(localStorage.getItem('k')).toBe('row:-10:t1-r12');
+  });
+
+  it('still records the turn where the turn has no rows', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: 1000 });
+    const detach = attachScrollMemory(el, 'k', opts);
+    el.scrollTop = 1310;
+    el.fireScroll();
+    detach();
+    expect(localStorage.getItem('k')).toBe('anchor:-310:t1');
+  });
+
+  it('opens on the row with the turn drawn whole, where it was saved on a clamped one', () => {
+    localStorage.setItem('k', 'row:0:t0-r32');
+    const el = mockTranscript({ ids: IDS, turnHeight: 1000, rowsPerTurn: 40, scrollTop: 0 });
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(800);
+    detach();
+  });
+
+  it('waits while the row is clamped off, rather than landing anywhere', () => {
+    localStorage.setItem('k', 'row:0:t0-r5');
+    const el = mockTranscript({ ids: IDS, turnHeight: 1000, rowsPerTurn: 40, scrollTop: 0 });
+    el.setRowsHidden('t0', 20);
+    const detach = attachScrollMemory(el, 'k', opts);
+    // Parked at the top for the wait, never at the bottom.
+    expect(el.scrollTop).toBe(0);
+    detach();
+  });
+
+  it('a content pane or drawer never reads a row it could not have written', () => {
+    localStorage.setItem('k', 'row:0:t0-r5');
+    const el = mockTranscript({ ids: IDS, turnHeight: 1000, rowsPerTurn: 40, scrollTop: 700 });
+    const detach = attachScrollMemory(el, 'k', { live: () => ({}) });
+    expect(el.scrollTop).toBe(700);
+    detach();
+  });
+});

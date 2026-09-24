@@ -21,6 +21,8 @@ export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]
 export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MessageReceived: 'start',
   QueuedMessageRemoved: 'metadata',
+  MessageHeld: 'metadata',
+  HeldMessageReleased: 'metadata',
   TextStreamed: 'activity',
   ThoughtStreamed: 'activity',
   ContextCaptured: 'metadata',
@@ -78,6 +80,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   McpPermissionResolved: 'activity',
   WorktreeCleaned: 'metadata',
   ChildThreadCompleted: 'start',
+  ChildThreadStopped: 'metadata',
   ContextDismissed: 'metadata',
   ContextKeptOpen: 'metadata',
   BackgroundBashStarted: 'metadata',

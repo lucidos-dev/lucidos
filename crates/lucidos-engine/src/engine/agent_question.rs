@@ -1090,6 +1090,12 @@ pub async fn answer_pending_question(
     )
     .await;
 
+    // The human replied, so agent messages held behind the question go now.
+    // A Cancel keeps them held (ADR 0256).
+    if crate::engine::chat::answer_releases_held_messages(&answer) {
+        engine.spawn_held_message_release(thread_id);
+    }
+
     AnswerResult::Resumed
 }
 

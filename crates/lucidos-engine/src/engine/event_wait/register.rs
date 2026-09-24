@@ -9,9 +9,10 @@
 //! # Four refusals, three of them caps
 //!
 //! * **The subscribability gate** (S3), via `validate_subscribable_event_type`.
-//! * **The consecutive-subscription cap** (S8): 10 registrations with no human
-//!   message in between. Catches a thread awaiting an event kind its own
-//!   re-entry emits, two threads ping-ponging, and a model simply stuck.
+//! * **The recent-subscription cap** (S8): 10 registrations inside one hour
+//!   with no human message in between. Catches a thread awaiting an event kind
+//!   its own re-entry emits, two threads ping-ponging, and a model simply stuck.
+//!   All three re-arm fast, and a serial workflow of long waits does not.
 //! * **The live-wait cap** (S6b): 25 simultaneous waits per thread. It bounds
 //!   how many separate re-entries one burst of events can start on one thread,
 //!   not what a sleeping subscription costs, which is nothing.
@@ -33,10 +34,17 @@ use crate::engine::LucidosEngine;
 /// every reason anyone had for it is indistinguishable from a stalled thread.
 pub(crate) const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 
-/// How many times a thread may subscribe with no human `MessageReceived` in
+/// How many times a thread may subscribe inside
+/// [`RECENT_SUBSCRIPTION_WINDOW_SECS`] with no human `MessageReceived` in
 /// between (S8). Mirrors `max_event_trigger_depth` in intent: the events still
 /// persist, the fan-out just stops.
-pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
+pub(crate) const MAX_RECENT_SUBSCRIPTIONS: i64 = 10;
+
+/// The rolling window [`MAX_RECENT_SUBSCRIPTIONS`] counts over. The cap bounds a
+/// loop, and every loop it names re-arms within seconds. A serial workflow of
+/// half-hour waits does not. A lifetime count cannot tell the two apart, so it
+/// starved every thread with no human in it (ADR 0265).
+pub(crate) const RECENT_SUBSCRIPTION_WINDOW_SECS: i64 = 60 * 60;
 
 /// How many waits one thread may hold at once (S6b).
 ///
@@ -48,9 +56,9 @@ pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 /// fires opens one.
 ///
 /// It is NOT the guard against a runaway thread.
-/// [`MAX_CONSECUTIVE_SUBSCRIPTIONS`] is, and that one bounds a *loop*: a thread
+/// [`MAX_RECENT_SUBSCRIPTIONS`] is, and that one bounds a *loop*: a thread
 /// re-opening itself spends a turn per iteration with no human in it. This cap adds
-/// exactly one thing that one does not. The consecutive counter resets on a
+/// exactly one thing that one does not. The recent counter resets on a
 /// human message, so the standing set a thread carries ACROSS many messages is
 /// bounded here and nowhere else.
 ///
@@ -340,12 +348,13 @@ impl LucidosEngine {
                     .join("; "),
             ));
         }
-        match consecutive_subscriptions(&self.pool, thread_id).await {
-            Ok(n) if n >= MAX_CONSECUTIVE_SUBSCRIPTIONS => Some(format!(
-                "Error: this thread has subscribed {n} times in a row with no message from \
-                 the user, which is the limit. Either this thread keeps re-opening itself, \
-                 or what you are waiting for is not coming. Report where things stand and \
-                 let the user decide."
+        match recent_subscriptions(&self.pool, thread_id).await {
+            Ok(n) if n >= MAX_RECENT_SUBSCRIPTIONS => Some(format!(
+                "Error: this thread has subscribed {n} times in the last {} minutes with \
+                 no message from the user, which is the limit. Either this thread keeps \
+                 re-opening itself, or what you are waiting for is not coming. Report \
+                 where things stand and let the user decide.",
+                RECENT_SUBSCRIPTION_WINDOW_SECS / 60,
             )),
             Ok(_) => None,
             Err(e) => {
@@ -555,7 +564,7 @@ fn humanize_age(age_secs: i64) -> String {
 /// instant for the reason [`arming_lookback_matches`] spells out: `created` is
 /// the database's clock, so the boundary has to be too.
 ///
-/// A free function on the pool, matching [`consecutive_subscriptions`], so the
+/// A free function on the pool, matching [`recent_subscriptions`], so the
 /// SQL can be tested against a real database without standing up an engine.
 /// `aggregate = 'thread'` is the same load-bearing guard `LIVE_WAITS_SQL`
 /// documents. A row whose `event_id` will not parse is skipped rather than
@@ -583,8 +592,10 @@ pub(crate) async fn delivered_event_ids(
         .collect())
 }
 
-/// `EventWaitStarted` events since the last **human** message on this thread.
-/// The S8 counter, derived from events, with no new state.
+/// `EventWaitStarted` events since the last **human** message on this thread,
+/// inside [`RECENT_SUBSCRIPTION_WINDOW_SECS`]. The S8 counter, derived from
+/// events, with no new state. The window is resolved on the database clock,
+/// which stamps `created` (ADR 0053).
 ///
 /// Human specifically: an agent- or engine-authored `MessageReceived` (a child
 /// callback, a trigger fire, an event delivery) is exactly the kind of traffic a
@@ -594,7 +605,7 @@ pub(crate) async fn delivered_event_ids(
 /// A free function on the pool rather than a method, so the SQL that carries
 /// the whole cap can be tested against a real database without standing up an
 /// engine.
-pub(crate) async fn consecutive_subscriptions(
+pub(crate) async fn recent_subscriptions(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
@@ -603,6 +614,7 @@ pub(crate) async fn consecutive_subscriptions(
          WHERE e.aggregate = 'thread' \
            AND e.aggregate_id = $1 \
            AND e.event_type = 'EventWaitStarted' \
+           AND e.created >= now() - make_interval(secs => $2) \
            AND e.sequence > COALESCE(( \
                SELECT MAX(m.sequence) FROM events m \
                WHERE m.aggregate = 'thread' \
@@ -612,6 +624,7 @@ pub(crate) async fn consecutive_subscriptions(
            ), 0)",
     )
     .bind(thread_id.to_string())
+    .bind(RECENT_SUBSCRIPTION_WINDOW_SECS)
     .fetch_one(pool)
     .await?;
     Ok(count)

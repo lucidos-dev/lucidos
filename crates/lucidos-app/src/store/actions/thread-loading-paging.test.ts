@@ -217,6 +217,23 @@ describe('a backfill takes the page behind the floor', () => {
     expect(thread.hasOlderEvents).toBe(false);
   });
 
+  it('holds a fetched page until its landing gate opens, and stays in flight meanwhile', async () => {
+    // The transcript's gate while the reader holds its scrollbar: a held drag
+    // undoes the anchor write that would keep them still (ADR 0258).
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => { open = r; });
+    fetchEvents.mockResolvedValue({ events: page(50, 3), currentAggregate: null, hasMore: false });
+
+    const read = loadOlderThreadEvents(THREAD, THREAD_EVENTS_PAGE_SIZE, () => gate);
+    await settle();
+    expect([...threadMap.value.get(THREAD)!.events.keys()]).toEqual([100, 101, 102]);
+    expect(await loadOlderThreadEvents(THREAD)).toBe(false);
+
+    open();
+    expect(await read).toBe(true);
+    expect([...threadMap.value.get(THREAD)!.events.keys()]).toEqual([50, 51, 52, 100, 101, 102]);
+  });
+
   it('runs one at a time, so a fast scroll cannot double-fetch', async () => {
     let release: (v: unknown) => void = () => {};
     fetchEvents.mockReturnValue(new Promise((r) => { release = r; }));
@@ -249,6 +266,18 @@ describe('a backfill takes the page behind the floor', () => {
     fetchEvents.mockResolvedValue({ events: page(50, 1), currentAggregate: null, hasMore: false });
     expect(await loadOlderThreadEvents(THREAD)).toBe(true);
   });
+
+  it('retries a transport failure once before telling the reader', async () => {
+    // The first request after iOS resumes the PWA often dies on a stale
+    // connection and never reaches the engine. A second attempt succeeds.
+    fetchEvents
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValue({ events: page(50, 1), currentAggregate: null, hasMore: false });
+
+    expect(await loadOlderThreadEvents(THREAD)).toBe(true);
+    expect(fetchEvents).toHaveBeenCalledTimes(2);
+    expect(toasts.value).toEqual([]);
+  });
 });
 
 describe('a whole-thread surface loads the whole thread', () => {
@@ -272,6 +301,25 @@ describe('a whole-thread surface loads the whole thread', () => {
     const after = threadMap.value.get(THREAD)!;
     expect(after.events.has(200)).toBe(true);
     expect(after.hasOlderEvents).toBe(false);
+  });
+
+  it('holds the whole history until its landing gate opens', async () => {
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    fetchEvents.mockResolvedValue({ events: page(100, 2), currentAggregate: null, hasMore: true });
+    await loadThreadEvents(THREAD);
+    await settle();
+
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => { open = r; });
+    fetchEvents.mockReset();
+    fetchEvents.mockResolvedValue({ events: page(1, 4), currentAggregate: null });
+    const read = ensureWholeThreadLoaded(THREAD, () => gate);
+    await settle();
+    expect(threadMap.value.get(THREAD)!.hasOlderEvents).toBe(true);
+
+    open();
+    expect(await read).toBe(true);
+    expect(threadMap.value.get(THREAD)!.hasOlderEvents).toBe(false);
   });
 
   it('WAITS for a backfill rather than skipping past one', async () => {
@@ -350,6 +398,39 @@ describe('a whole-thread surface loads the whole thread', () => {
     // thread already whole and asked for nothing.
     const unpaged = fetchEvents.mock.calls.filter(c => c[1] === undefined);
     expect(unpaged).toHaveLength(1);
+  });
+
+  it('retries a transport failure once before telling the reader', async () => {
+    // The reported case: the up chevron's read died on a stale connection
+    // right after a resume, and toasted with nothing lost but one request.
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    fetchEvents.mockResolvedValue({ events: page(100, 2), currentAggregate: null, hasMore: true });
+    await loadThreadEvents(THREAD);
+    await settle();
+    fetchEvents.mockReset();
+
+    fetchEvents
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValue({ events: page(1, 4), currentAggregate: null });
+
+    expect(await ensureWholeThreadLoaded(THREAD)).toBe(true);
+    expect(fetchEvents).toHaveBeenCalledTimes(2);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('toasts a failure the retry does not cure, and stays willing to retry', async () => {
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    fetchEvents.mockResolvedValue({ events: page(100, 2), currentAggregate: null, hasMore: true });
+    await loadThreadEvents(THREAD);
+    await settle();
+    fetchEvents.mockReset();
+
+    fetchEvents.mockRejectedValue(new TypeError('Load failed'));
+
+    expect(await ensureWholeThreadLoaded(THREAD)).toBe(false);
+    expect(fetchEvents).toHaveBeenCalledTimes(2);
+    expect(toasts.value.some(t => t.type === 'error')).toBe(true);
+    expect(threadMap.value.get(THREAD)!.hasOlderEvents).toBe(true);
   });
 
   it('is a no-op on a thread already loaded to its start', async () => {

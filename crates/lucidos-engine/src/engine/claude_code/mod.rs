@@ -537,10 +537,9 @@ pub enum SettleTerminal {
     /// ago. The status table maps the event to `Running` whatever the answer
     /// kind. So there is no wedge to clean up: the user ended the turn.
     ///
-    /// On a sub-thread this also reports to the parent, where the abort only
-    /// decremented its child counter (`parent_callback::should_callback`).
-    /// Deliberate: a parent waiting on a child the user just cancelled has to
-    /// hear about it. A live child's cancel has always said so.
+    /// On a child thread this makes a *stopped child*, exactly as a live
+    /// child's cancel does: its parent gets a `ChildThreadStopped` note and no
+    /// turn (ADR 0252).
     CanceledQuestion,
 }
 

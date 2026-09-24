@@ -2,7 +2,7 @@ import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
 import { lucidos } from '@lucidos/sdk';
-import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
+import { CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAttr } from './markedConfig';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
@@ -46,13 +46,18 @@ inlineLinkKeepRenderer.link = function({ href, tokens }: Tokens.Link): string {
 };
 
 // Boundary marker for a multiline copy block. Survives marked processing.
-const COPY_MARKER = 'LUCIDOS_COPY_BLOCK';
+// It carries `COPY_ID_NONCE`, because content can write an HTML comment too.
+const COPY_MARKER = `LUCIDOS_COPY_BLOCK_${COPY_ID_NONCE}`;
 const COPY_MARKER_PATTERN = new RegExp(
   `<!--${COPY_MARKER}_START_(\\d+)-->([\\s\\S]*?)<!--${COPY_MARKER}_END_\\1-->`,
   'g',
 );
 
-const CODE_PROTECTION_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
+const CODE_PROTECTION_PATTERN = /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`/g;
+
+/** A label that could open a link reference definition, in any container.
+ *  A definition renders as nothing, so in a copy label it would hide a line. */
+const LINK_DEFINITION_LABEL = /\[([^\]]*)\]:/g;
 
 /** Attribute carrying a copy block's slot while the markup crosses the
  *  sanitizer. `resolveCopyTargets` writes the real payload attribute
@@ -66,27 +71,9 @@ const CODE_PROTECTION_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
  *  content cannot write the payload. */
 const COPY_ID_ATTR = 'data-copy-id';
 
-/** Unguessable prefix on every slot id, so content cannot name a slot.
- *
- *  A bare counter is not enough, and "a forged id only yields text a real block
- *  already offered" was the wrong reassurance: content authors BOTH halves. It
- *  writes a real `<copy>` block, collapsed inside `<details>` where nobody
- *  reads it, then a forged span labelled `brew install lucidos` carrying that
- *  block's id. The label and the payload are then decoupled, which is the whole
- *  attack. With an unguessable prefix there is no id to forge.
- *
- *  Once per module load, not per render: the nonce never reaches the DOM,
- *  because `resolveCopyTargets` removes the attribute it rides on, and the
- *  streaming buffer re-renders per token. */
-const COPY_ID_NONCE = ((): string => {
-  const bytes = new Uint8Array(8);
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-})();
+// Every slot id carries `COPY_ID_NONCE` (markedConfig.ts), so content has no id
+// to forge. The nonce never reaches the DOM: `resolveCopyTargets` removes the
+// attribute it rides on, and `resolveCodeBlockCopy` removes the code one.
 
 /** The slot a `data-copy-id` names, or `undefined` when content wrote it. */
 function copyTextForSlot(attr: string | null, copyTexts: Map<number, string>): string | undefined {
@@ -128,14 +115,18 @@ function preprocessCopyBlocks(md: string, encodedTexts: Map<number, string>): st
     const id = counter++;
     encodedTexts.set(id, restored);
 
+    // The payload is the source text, so the label shows that text too. Raw
+    // HTML or a link definition in it would hide part of what gets copied.
+    const label = escapeHtmlAttr(trimmed).replace(LINK_DEFINITION_LABEL, '&#91;$1]:');
+
     if (!isMultiline) {
       return `<span class="copyable-block" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${id}">` +
-        trimmed +
+        label +
         `<button type="button" class="copy-btn" aria-label="Copy to clipboard">${COPY_ICON}</button>` +
         `</span>`;
     }
 
-    return `<!--${COPY_MARKER}_START_${id}-->\n\n${trimmed}\n\n<!--${COPY_MARKER}_END_${id}-->`;
+    return `<!--${COPY_MARKER}_START_${id}-->\n\n${label}\n\n<!--${COPY_MARKER}_END_${id}-->`;
   });
 
   return safeMd.replace(/\x00CODE(\d+)\x00/g, (_, idx) => codeSlots[parseInt(idx, 10)]);
@@ -257,9 +248,9 @@ const PURIFY_CONFIG = {
   // otherwise keep. `animate` and `set` are already in its SVG denylist, and
   // stay listed so this policy does not rest on that default.
   FORBID_TAGS: ['style', 'animate', 'animateTransform', 'set'],
-  // The clipboard payload, which only `resolveCopyTargets` may write, and
-  // which DOMPurify's defaults would otherwise let content author. See
-  // `COPY_ID_ATTR`.
+  // The two clipboard sources, which only `resolveCopyTargets` and
+  // `resolveCodeBlockCopy` may write, and which DOMPurify's defaults would
+  // otherwise let content author. See `COPY_ID_ATTR`.
   //
   // `style` is NOT here. A kept `position: fixed` does let content paint its
   // own chrome over the app, and `opacity: 0` does hide text from the reader.
@@ -267,7 +258,7 @@ const PURIFY_CONFIG = {
   // `SlidesPreview` and `RenderedDiff`, where authored markup carries inline
   // style as its only styling channel. Forbidding it here silently unstyles
   // every existing deck, so that hole wants a per-caller config.
-  FORBID_ATTR: ['data-copy-text'],
+  FORBID_ATTR: ['data-copy-text', 'data-copy-code'],
   ALLOWED_URI_REGEXP,
 };
 
@@ -287,7 +278,24 @@ export function sanitizeHtmlFragments(html: string): string {
     );
   }
   installUrlSchemeHook();
-  return DOMPurify.sanitize(html.replace(ESCAPE_TO_TEXT_TAG, escapeHtmlAttr), PURIFY_CONFIG);
+  return resolveCodeBlockCopy(
+    DOMPurify.sanitize(html.replace(ESCAPE_TO_TEXT_TAG, escapeHtmlAttr), PURIFY_CONFIG),
+  );
+}
+
+/** Flag each code block the renderer wrote, so its Copy button copies its code.
+ *
+ *  The Copy button copies only inside `data-copy-code`, which the sanitizer
+ *  forbids. So a lookalike wrapper that content wrote copies nothing, however
+ *  it hides text inside. The renderer's own code is escaped text with no
+ *  markup, so its `textContent` is exactly what the reader sees. */
+function resolveCodeBlockCopy(html: string): string {
+  return inDom(html, [CODE_COPY_ATTR], (body) => {
+    for (const el of Array.from(body.querySelectorAll(`[${CODE_COPY_ATTR}]`))) {
+      if (el.getAttribute(CODE_COPY_ATTR) === COPY_ID_NONCE) el.setAttribute('data-copy-code', '');
+      el.removeAttribute(CODE_COPY_ATTR);
+    }
+  });
 }
 
 /** At or above this many columns a table stacks into labeled cards on a phone

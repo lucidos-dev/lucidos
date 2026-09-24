@@ -71,14 +71,14 @@ describe('lucidos.ui.startThread', () => {
 
 describe('isIOSAgent', () => {
   it('true for iPhone / iPad / iPod user agents', async () => {
-    const { isIOSAgent } = await import('./ui');
+    const { isIOSAgent } = await import('./platform');
     expect(isIOSAgent({ userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' })).toBe(true);
     expect(isIOSAgent({ userAgent: 'Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X)' })).toBe(true);
     expect(isIOSAgent({ userAgent: 'Mozilla/5.0 (iPod touch; CPU iPhone OS 15_0 like Mac OS X)' })).toBe(true);
   });
 
   it('true for iPadOS masquerading as a desktop Mac with touch', async () => {
-    const { isIOSAgent } = await import('./ui');
+    const { isIOSAgent } = await import('./platform');
     expect(isIOSAgent({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)',
       platform: 'MacIntel',
@@ -87,13 +87,13 @@ describe('isIOSAgent', () => {
   });
 
   it('false for desktop browsers and touchless Macs', async () => {
-    const { isIOSAgent } = await import('./ui');
+    const { isIOSAgent } = await import('./platform');
     expect(isIOSAgent({ userAgent: 'Mozilla/5.0 (Windows NT 10.0) Chrome/120', platform: 'Win32', maxTouchPoints: 0 })).toBe(false);
     expect(isIOSAgent({ userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)', platform: 'MacIntel', maxTouchPoints: 0 })).toBe(false);
   });
 
   it('false when navigator is unavailable', async () => {
-    const { isIOSAgent } = await import('./ui');
+    const { isIOSAgent } = await import('./platform');
     expect(isIOSAgent(undefined)).toBe(false);
   });
 });

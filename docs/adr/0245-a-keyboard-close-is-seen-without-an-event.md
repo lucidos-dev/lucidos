@@ -2,6 +2,10 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-22
+- **Read first**: [ADR 0262](0262-ios-autocorrect-eats-the-send-tap.md) names
+  the cause. iOS autocorrect keeps the tap, so seeing every keyboard close
+  cannot free the composer. The poll finding no missed close fits that: the
+  closes were never the problem.
 
 ## Context
 

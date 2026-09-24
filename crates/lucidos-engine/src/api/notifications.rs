@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::scheduler::notifications::{default_tap, resolve_thread_tap_id, Tap};
+use crate::scheduler::notifications::{
+    default_tap, resolve_thread_tap_id, verify_event_anchors, Tap,
+};
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
 
 /// Body for `POST /api/v1/notifications` — used by the `lucidos notify` CLI
@@ -74,6 +76,11 @@ pub(super) async fn create_notification(
     // thread, so `current` is refused here rather than resolved.
     resolve_thread_tap_id(&mut tap, None)
         .map_err(|e| ApiError::bad_request(format!("invalid tap: {e}")))?;
+
+    verify_event_anchors(&state.pool, link_thread_id, link_event_id, &tap)
+        .await
+        .map_err(|e| ApiError::internal(format!("could not check event_id: {e}")))?
+        .map_err(ApiError::bad_request)?;
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 

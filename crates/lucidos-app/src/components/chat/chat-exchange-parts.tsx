@@ -2,7 +2,7 @@ import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../..
 import type { Change } from '../../api/client';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
-import { ensureEventTargetResolved, eventHasTarget, showEventWhereItLives } from '../../store/actions/event-navigation';
+import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
 import { LUCIDOS_AGENT_LABEL, awaitedSubject, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus, waitSubscriptionLabel } from '../../store/thread-events';
@@ -27,6 +27,7 @@ import { useSignal } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
 import { useEffect } from 'preact/hooks';
 import type { InitiatorDescriptor } from './ChatExchange';
+import { ROW_ATTR } from './scrollAnchor';
 
 // Presentational sub-components for ChatExchange (panels, bodies, response
 // rendering). Extracted from ChatExchange.tsx; imported back there. The only
@@ -208,7 +209,7 @@ export function EventDeliveryBody({
   eventId?: string;
   payloadJson?: string;
 }) {
-  const jump = useEventJump(eventId);
+  const jump = useEventJump(jumpableEventId(eventId, eventType));
   return eventDeliveryBody({
     eventType,
     payloadJson,
@@ -329,7 +330,10 @@ type TriggerStartedEvent = Extract<Exchange['userEvent'], { type: 'TriggerStarte
  *
  *  The thin hook-holding wrapper; the markup is `triggerFiredBody`. */
 export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
-  const matched = event.invocation?.kind === 'Event' ? event.invocation.event_id : undefined;
+  const invocation = event.invocation;
+  const matched = invocation?.kind === 'Event'
+    ? jumpableEventId(invocation.event_id, invocation.event_type)
+    : undefined;
   const jump = useEventJump(matched);
   return triggerFiredBody({
     event,
@@ -878,6 +882,8 @@ export function InlineStep(
       ref={rowRef}
       class={`inline-step ${className}`}
       data-role="inline-step"
+      /* The reading position names this row (`ROW_ATTR` in scrollAnchor.ts). */
+      {...{ [ROW_ATTR]: event.call_event_id ?? event.result_event_id }}
       /* A row the user can't read at a glance needs naming, and the tooltip
          says what the mark means without a trip through the detail modal. The
          three that earn one are the three that are neither a green check nor a
@@ -1186,6 +1192,25 @@ export function eventWaitRowBody({
     ],
   });
 }
+
+/** An agent-sent message the coding agent holds until a human replies
+ *  (ADR 0256). It stays in the transcript once released, marked delivered;
+ *  the delivered copy is the message below it, so the text sits in a fold. */
+export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type: 'held_message' }> }) {
+  return eventRowBody({
+    kind: 'held',
+    mark: event.released ? 'arrived' : 'pending',
+    state: event.released ? 'released' : 'held',
+    role: 'held-message-row',
+    subject: `Message from ${event.sender}`,
+    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : HELD_MESSAGE_WAITING,
+    tone: event.released ? 'arrived' : 'live',
+    fold: { label: 'Message', body: event.text },
+  });
+}
+
+export const HELD_MESSAGE_WAITING = 'Held until you reply';
+export const HELD_MESSAGE_DELIVERED = 'Delivered';
 
 /** The watched event types as chips, joined by the word the subscription
  *  language itself uses. "or" is `glue` rather than a fact, so the row's middot

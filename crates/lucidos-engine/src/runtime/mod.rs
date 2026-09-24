@@ -9,6 +9,7 @@ mod codex_parse;
 pub mod lucidos_cli;
 pub mod python;
 pub(crate) mod spawn_env;
+pub mod vertex_relay;
 
 pub use agent_runtime::{
     AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent, ControlRequest,

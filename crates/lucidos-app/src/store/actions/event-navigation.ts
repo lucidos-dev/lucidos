@@ -2,7 +2,7 @@ import { effect, signal } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
 import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
-import { computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
+import { UNANCHORABLE_ASYNC_EVENTS, computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
 import { showToast, threadMap, focusedThreadId } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents } from './thread-loading';
@@ -149,6 +149,21 @@ export async function resolveEventTarget(eventId: string): Promise<EventTarget> 
   // what the click path finishes, by loading the rest and asking again.
   if (threadMap.value.get(threadId)?.hasOlderEvents) return { kind: 'unloaded', threadId };
   return { kind: 'nowhere', note: NOTHING_TO_LAND_ON };
+}
+
+/** The event id a row should resolve a jump for, or `undefined` when the
+ *  event's TYPE already rules a jump out.
+ *
+ *  An `UNANCHORABLE_ASYNC_EVENTS` type is never a turn's starter, so
+ *  `deepLinkAnchorForEvent` answers null for it in every thread. Only the type
+ *  says so up front. `resolveEventTarget` answers `unloaded` for such an event
+ *  in a paged thread, which drew a link whose every tap toasted. */
+export function jumpableEventId(
+  eventId: string | undefined,
+  eventType: string | undefined,
+): string | undefined {
+  if (eventType && UNANCHORABLE_ASYNC_EVENTS.has(eventType)) return undefined;
+  return eventId;
 }
 
 /** Settled answers to "does this event have somewhere to go". */

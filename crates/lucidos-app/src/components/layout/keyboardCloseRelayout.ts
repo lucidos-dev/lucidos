@@ -1,18 +1,14 @@
 /** Relayout the shell when the software keyboard closes.
  *
- *  A FIX, not a diagnostic. On an iOS PWA the page sometimes stops receiving
- *  touches entirely once the keyboard dismisses. Layout and `visualViewport`
- *  both report the restored viewport, so every reading the page can take says
- *  healthy. Forcing a relayout frees it, and that is all this module does.
+ *  Goes with the dead-press probe at the end of its quiet period: see that row
+ *  in `docs/temporary-measures.md`. ADR 0262 found the dead composer's cause.
+ *  iOS autocorrect keeps the tap on a button below the text, and no relayout
+ *  reaches that. The keyboard close watched here was the user's recovery, not
+ *  the trigger.
  *
- *  The eighteenth report is where the keyboard close was first read as the
- *  trigger. The page took no touch for 36 seconds, a relayout ran, and the next
- *  tap was served. The reconstruction is
- *  `docs/plans/2026-09-20-the-composer-recovers-when-the-keyboard-closes.md`.
- *
- *  It lives here rather than in `deadPressProbe.ts` because that module is a
- *  temporary measure, and deleting it must not delete this. A leaf: it imports
- *  nothing, so the probe can read its stamp without taking anything else. */
+ *  Until then it relayouts the shell on each close and stamps the close for the
+ *  probe's `silent-since-keyboard` line. A leaf: it imports nothing, so the
+ *  probe can read its stamp without taking anything else. */
 
 /** How close to the layout viewport counts as fully restored.
  *

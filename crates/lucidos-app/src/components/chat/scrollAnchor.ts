@@ -33,6 +33,22 @@ export const ANCHOR_ATTR = 'data-event-id';
  *  walks the rest in. `ChatExchange` stamps it. */
 export const HEAD_CLAMPED_ATTR = 'data-head-clamped';
 
+/** The attribute a step ROW is found by: the event id of the tool call it
+ *  shows (`call_event_id`), else of the result that settled it
+ *  (`result_event_id`). `InlineStep` stamps it.
+ *
+ *  Finer than a turn, which on a coding-agent thread can hold hundreds of
+ *  rows. And stable where a turn's is not: an event id survives the fold, a
+ *  *continuation fragment* and the page boundary alike. */
+export const ROW_ATTR = 'data-row-event';
+
+/** A reading position expressed against a step row: its event id, and the
+ *  offset its top sat at, measured from the container's top. */
+export interface RowAnchor {
+  rowEventId: string;
+  relTop: number;
+}
+
 /** A reading position expressed against a turn.
  *
  *  `relTop` is that turn's top, measured from the container's top. It is at or
@@ -44,34 +60,86 @@ export interface ScrollAnchor {
 }
 
 /** The turn the reader is parked on, or null when nothing on screen can be
- *  named.
- *
- *  BINARY SEARCH, because this runs on every scroll event of the transcript. A
- *  linear scan is unbounded exactly where the transcript is largest: the chevron
- *  and a deep link each render the thread WHOLE and leave the reader at the top.
- *  From there a scan in either direction measures every turn, at up to 120
- *  events a second.
- *
- *  IT RESTS ON ONE INVARIANT: no BOXLESS child sits between two turns. Turns are
- *  laid out in document order, so their tops rise along the list and the
- *  boundary is findable in `log n` rect reads. A boxless child breaks that
- *  order, and one in the middle can make the search answer for an earlier turn.
- *  Today the transcript's only one is the mobile title row at index 0, where the
- *  scan out below recovers. Its other non-turn children (the empty state, a
- *  queued-message group) all carry boxes.
+ *  named. Found off the same boundary search as the row (`childAtLine`).
  *
  *  A reader ABOVE the first named turn still gets an anchor, that turn with a
  *  positive `relTop`. Answering null there would record the top of a re-seeded
  *  window as "no position", which is not where they were. */
 export function readScrollAnchor(el: HTMLElement): ScrollAnchor | null {
+  const line = childAtLine(el);
+  if (!line) return null;
+  const { kids, last, lastRel, relTopOf } = line;
+  // Out from the boundary to the nearest child that can be NAMED. Back from
+  // `last` is the reader's own turn. Forward from it is the earliest turn,
+  // which is the answer for a reader above them all.
+  for (let i = last; i >= 0; i--) {
+    const named = namedAt(kids, i, i === last ? lastRel : relTopOf(i));
+    if (named) return named;
+  }
+  for (let i = last + 1; i < kids.length; i++) {
+    const named = namedAt(kids, i, relTopOf(i));
+    if (named) return named;
+  }
+  return null;
+}
+
+/** The step row the reader is parked on, or null when the turn at the line
+ *  has no step row at or above it.
+ *
+ *  Searched inside the turn at the line only. So the cost is one turn's rows,
+ *  and the answer is never further away than the turn anchor. That turn needs
+ *  no id: a *continuation fragment* has none, and its rows do.
+ *
+ *  Measured from the ROW, so a turn drawn with its head clamped off measures
+ *  the same as the whole turn. A turn anchor taken there measured from the
+ *  clamped top, and landed the reader above their place on the next open. */
+export function readRowAnchor(el: HTMLElement): RowAnchor | null {
+  const line = childAtLine(el);
+  if (!line || line.last < 0) return null;
+  const turn = line.kids[line.last] as HTMLElement;
+  if (typeof turn.querySelectorAll !== 'function') return null;
+  const rows = turn.querySelectorAll<HTMLElement>(`[${ROW_ATTR}]`);
+  // Rows are laid out in document order, so the same boundary search applies.
+  let lo = 0;
+  let hi = rows.length - 1;
+  let found: RowAnchor | null = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const rect = rows[mid].getBoundingClientRect();
+    const rel = rect.top - line.top;
+    if (rect.height > 0 && rel <= 0) {
+      const rowEventId = rows[mid].getAttribute(ROW_ATTR);
+      if (rowEventId) found = { rowEventId, relTop: Math.round(rel) };
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+/** The feed's children, and the boundary: the last child at or above the
+ *  container's top, or -1 when the reader is above them all.
+ *
+ *  BINARY SEARCH, because this runs on every scroll event of the transcript. A
+ *  linear scan is unbounded exactly where the transcript is largest: the chevron
+ *  and a deep link each render the thread WHOLE and leave the reader at the top.
+ *
+ *  IT RESTS ON ONE INVARIANT: no BOXLESS child sits between two turns. Turns are
+ *  laid out in document order, so their tops rise along the list. A boxless
+ *  child reads as below the line, harmless at the head and wrong in the middle.
+ *  Today the only one is the mobile title row at index 0. */
+function childAtLine(el: HTMLElement): {
+  kids: HTMLCollection;
+  last: number;
+  lastRel: number | null;
+  top: number;
+  relTopOf: (i: number) => number | null;
+} | null {
   // THE TURNS, wherever they are parented. The transcript keeps them in a feed
-  // box of its own, which is what rests them on the bottom of the pane
-  // (`.thread-feed` in styles/chat/input-messages.css). The scroller's own
-  // children are then that one box, which carries no id. So the reader's
-  // position went unrecorded, and a reload landed on the window's top.
-  // Every other container that anchors has no feed and is unaffected.
-  //
-  // `top` stays the SCROLLER's, since `relTop` is measured from the scrollport.
+  // box of its own (`.thread-feed` in styles/chat/input-messages.css), whose
+  // wrapper carries no id. `top` stays the SCROLLER's, since `relTop` is
+  // measured from the scrollport.
   const feed = typeof el.querySelector === 'function' ? el.querySelector('.thread-feed') : null;
   const kids = (feed ?? el).children;
   if (!kids || typeof el.getBoundingClientRect !== 'function') return null;
@@ -84,10 +152,6 @@ export function readScrollAnchor(el: HTMLElement): ScrollAnchor | null {
     // all-zero rect, which would otherwise read as sitting exactly on the line.
     return rect.height <= 0 ? null : rect.top - top;
   };
-  // The last child at or above the line, or -1 when the reader is above them
-  // all. A boxless child answers null and reads as BELOW, which is the invariant
-  // above: harmless at the head, wrong in the middle. `lastRel` carries the
-  // boundary's measurement out, so the scan does not pay for it twice.
   let lo = 0;
   let hi = kids.length - 1;
   let last = -1;
@@ -97,18 +161,7 @@ export function readScrollAnchor(el: HTMLElement): ScrollAnchor | null {
     const rel = relTopOf(mid);
     if (rel !== null && rel <= 0) { last = mid; lastRel = rel; lo = mid + 1; } else { hi = mid - 1; }
   }
-  // Then out from the boundary to the nearest child that can be NAMED. Back
-  // from `last` is the reader's own turn. Forward from it is the earliest turn,
-  // which is the answer for a reader above them all.
-  for (let i = last; i >= 0; i--) {
-    const named = namedAt(kids, i, i === last ? lastRel : relTopOf(i));
-    if (named) return named;
-  }
-  for (let i = last + 1; i < kids.length; i++) {
-    const named = namedAt(kids, i, relTopOf(i));
-    if (named) return named;
-  }
-  return null;
+  return { kids, last, lastRel, top, relTopOf };
 }
 
 /** The anchor a child yields, or null when it carries no id or has no box. */
@@ -147,4 +200,16 @@ export function anchorTurnIsClamped(el: HTMLElement, anchor: ScrollAnchor): bool
 function anchorTurn(el: HTMLElement, anchor: ScrollAnchor): HTMLElement | null {
   if (typeof el.querySelector !== 'function') return null;
   return el.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(anchor.eventId)}"]`);
+}
+
+/** The `scrollTop` that puts `anchor`'s row back where it sat, or null while
+ *  that row is not drawn. Same contract as `anchorTargetTop`: null is the WAIT
+ *  signal, and both terms are measured now. */
+export function rowTargetTop(el: HTMLElement, anchor: RowAnchor): number | null {
+  if (typeof el.getBoundingClientRect !== 'function' || typeof el.querySelector !== 'function') return null;
+  const row = el.querySelector<HTMLElement>(`[${ROW_ATTR}="${CSS.escape(anchor.rowEventId)}"]`);
+  if (!row || typeof row.getBoundingClientRect !== 'function') return null;
+  const rect = row.getBoundingClientRect();
+  if (rect.height <= 0) return null;
+  return Math.max(0, Math.round(el.scrollTop + (rect.top - el.getBoundingClientRect().top) - anchor.relTop));
 }

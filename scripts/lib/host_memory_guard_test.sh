@@ -66,6 +66,10 @@ export HOST_PRESSURE_LEVEL_OVERRIDE=1
 # run's file on a host that has one, and a stale sample could stop a test.
 export HOST_MEMORY_SAMPLES_FILE="$SANDBOX/host-memory-samples"
 export HOST_MEMORY_SAMPLER_PIDFILE="$SANDBOX/host-memory-sampler.pid"
+# The in-chunk stop's two files, for the same reason: a real run's runner pidfile
+# must never be read here, let alone signalled.
+export HOST_MEMORY_TRIP_FILE="$SANDBOX/host-memory-trip"
+export HOST_MEMORY_RUNNER_PIDFILE="$SANDBOX/host-memory-runner.pid"
 
 # A critical reading is now re-sampled before it is believed, up to 8 times 5 s
 # apart. Shadow the confirm's wait seam for the WHOLE file and record what it was
@@ -130,7 +134,7 @@ assert_eq() {
 
 assert_says() {
     local file="$1" needle="$2" msg="$3"
-    if grep -qF "$needle" "$file"; then
+    if grep -qF -- "$needle" "$file"; then
         pass "$msg"
     else
         fail "$msg (no '$needle' in output)"
@@ -140,7 +144,7 @@ assert_says() {
 
 assert_silent_about() {
     local file="$1" needle="$2" msg="$3"
-    if grep -qF "$needle" "$file"; then
+    if grep -qF -- "$needle" "$file"; then
         fail "$msg (found '$needle')"
         sed 's/^/      | /' "$file"
     else
@@ -157,10 +161,12 @@ reset_state() {
     HOST_MEMORY_BASELINE_GB=""
     HOST_MEMORY_STOP_COMPRESSOR_GB=""
     HOST_MEMORY_SAMPLER_PID=""
+    HOST_MEMORY_RUNNER_PID=""
     # A window left behind by the peak-sampler tests would be folded into the next
     # test's boundary reading, which is exactly the cross-test leak reset_state
     # exists to prevent.
-    rm -f "$HOST_MEMORY_SAMPLES_FILE" "$HOST_MEMORY_SAMPLER_PIDFILE" 2>/dev/null || true
+    rm -f "$HOST_MEMORY_SAMPLES_FILE" "$HOST_MEMORY_SAMPLER_PIDFILE" \
+        "$HOST_MEMORY_TRIP_FILE" "$HOST_MEMORY_RUNNER_PIDFILE" 2>/dev/null || true
     # Same reason: a previous test's confirm waits would be counted as this one's.
     : > "$CONFIRM_WAITS"
 }
@@ -1466,6 +1472,355 @@ test_the_sampler_never_signals_a_pid_it_did_not_spawn() {
     fi
 }
 
+# ── Test 8b: the in-chunk stop ──────────────────────────────────────────
+# A hung chunk never reaches a boundary, so the sampler itself watches for the
+# freeze signature. These drive one tick at a time through the override seams.
+
+# Run $1 ticks at the current overrides, carrying the streak, and print it.
+run_ticks() {
+    local n="$1" collapse="$2" ticks="$3" s=0 i
+    for i in $(seq 1 "$n"); do
+        s="$(_host_mem_sampler_tick "$HOST_MEMORY_SAMPLES_FILE" "$s" "$collapse" "$ticks")"
+    done
+    echo "streak=$s"
+}
+
+# $3 ticks at pressure $1 and available $2 GB, against a 2.40 GB collapse level.
+ticks_at() {
+    HOST_PRESSURE_LEVEL_OVERRIDE="$1" HOST_AVAIL_GB_OVERRIDE="$2" \
+        HOST_COMPRESSOR_GB_OVERRIDE=17.94 HOST_SWAP_USED_GB_OVERRIDE=0.00 run_ticks "$3" 2.40 3
+}
+
+test_a_collapse_streak_trips_the_chunk() {
+    echo "test: three collapse samples in a row trip the chunk, once"
+    local stops="$SANDBOX/runner-stops"
+    reset_state
+    : > "$stops"
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_stop_runner() { echo stop >> "$stops"; }
+        ticks_at 4 0.30 2
+        [ -e "$HOST_MEMORY_TRIP_FILE" ] && echo "tripped-early"
+        ticks_at 4 0.30 3
+        ticks_at 4 0.30 2
+    ) >"$OUT/trip.out" 2>&1
+    assert_silent_about "$OUT/trip.out" "tripped-early" "two collapse samples do not trip"
+    if [ -s "$HOST_MEMORY_TRIP_FILE" ]; then
+        pass "the third collapse sample writes the trip"
+    else
+        fail "no trip after three collapse samples"
+    fi
+    assert_says "$HOST_MEMORY_TRIP_FILE" "0.30 GB" "the trip names the available reading"
+    assert_says "$HOST_MEMORY_TRIP_FILE" "2.40 GB collapse level" "the trip names the collapse level"
+    assert_says "$OUT/trip.out" "STOP inside a chunk" "the run log announces the stop"
+    assert_eq "1" "$(wc -l < "$stops" | tr -d ' ')" "the runner is interrupted exactly once"
+    assert_eq "7" "$(wc -l < "$HOST_MEMORY_SAMPLES_FILE" | tr -d ' ')" "every tick still appends its sample"
+}
+
+test_only_the_freeze_signature_trips_mid_chunk() {
+    echo "test: critical alone, warn, and a deep dip without critical never trip"
+    local case_ level avail
+    for case_ in "4 11.00" "4 2.41" "2 0.30" "1 0.30"; do
+        level="${case_%% *}"
+        avail="${case_##* }"
+        reset_state
+        (
+            # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+            _host_mem_stop_runner() { :; }
+            ticks_at "$level" "$avail" 10
+        ) >"$OUT/notrip.out" 2>&1
+        if [ -e "$HOST_MEMORY_TRIP_FILE" ]; then
+            fail "pressure $level with $avail GB available tripped the chunk"
+        else
+            pass "pressure $level with $avail GB available runs on for ten samples"
+        fi
+    done
+    # A compressor past the runaway backstop is a boundary rule, never a trip.
+    reset_state
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_stop_runner() { :; }
+        HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_AVAIL_GB_OVERRIDE=30.00 \
+            HOST_COMPRESSOR_GB_OVERRIDE=30.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 run_ticks 10 2.40 3
+    ) >"$OUT/bigcomp.out" 2>&1
+    if [ -e "$HOST_MEMORY_TRIP_FILE" ]; then
+        fail "a 30 GB compressor tripped the chunk"
+    else
+        pass "a 30 GB compressor runs on for ten samples"
+    fi
+    # At the level counts, the same "at or under" the boundary's collapse arm uses.
+    reset_state
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_stop_runner() { :; }
+        ticks_at 4 2.40 3
+    ) >"$OUT/attrip.out" 2>&1
+    if [ -e "$HOST_MEMORY_TRIP_FILE" ]; then
+        pass "available exactly at the collapse level trips"
+    else
+        fail "available exactly at the collapse level did not trip"
+    fi
+}
+
+test_a_broken_streak_starts_over() {
+    echo "test: one healthy sample resets the streak"
+    reset_state
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_stop_runner() { :; }
+        s=0
+        for reading in "4 0.30" "4 0.30" "4 11.00" "4 0.30" "4 0.30" "4 0.30"; do
+            [ -e "$HOST_MEMORY_TRIP_FILE" ] && echo "tripped-on-a-broken-streak"
+            s="$(HOST_PRESSURE_LEVEL_OVERRIDE="${reading%% *}" HOST_AVAIL_GB_OVERRIDE="${reading##* }" \
+                HOST_COMPRESSOR_GB_OVERRIDE=17.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+                _host_mem_sampler_tick "$HOST_MEMORY_SAMPLES_FILE" "$s" 2.40 3)"
+        done
+        echo "streak=$s"
+    ) >"$OUT/broken.out" 2>&1
+    assert_silent_about "$OUT/broken.out" "tripped-on-a-broken-streak" "two plus two collapse samples do not add up"
+    assert_says "$OUT/broken.out" "streak=3" "the streak counts only the unbroken run"
+    if [ -e "$HOST_MEMORY_TRIP_FILE" ]; then
+        pass "the third sample of the new run trips"
+    else
+        fail "the new run of three did not trip"
+    fi
+}
+
+test_the_trip_ticks_knob_falls_back() {
+    echo "test: LUCIDOS_E2E_COLLAPSE_TICKS takes a positive integer or the default"
+    assert_eq "3" "$(_host_mem_trip_ticks)" "the default is three samples"
+    assert_eq "1" "$(LUCIDOS_E2E_COLLAPSE_TICKS=1 _host_mem_trip_ticks)" "an explicit 1 is honoured"
+    assert_eq "3" "$(LUCIDOS_E2E_COLLAPSE_TICKS=0 _host_mem_trip_ticks)" "0 falls back rather than tripping on every sample"
+    assert_eq "3" "$(LUCIDOS_E2E_COLLAPSE_TICKS=3s _host_mem_trip_ticks)" "a typo falls back"
+}
+
+# A synthetic process tree and a kill shim for the runner stop. The shim keeps
+# a liveness file, so `kill -0` answers what the earlier signals did. It never
+# reaches the real kill: every signal is recorded and nothing else happens.
+TREE_KILLS="$SANDBOX/tree-kills"
+TREE_ALIVE="$SANDBOX/tree-alive"
+TREE_WAITS="$SANDBOX/tree-waits"
+tree_reset() {
+    : > "$TREE_KILLS"
+    : > "$TREE_WAITS"
+    printf '%s\n' 4242 4243 4244 6000 5000 900 > "$TREE_ALIVE"
+}
+
+# $1 = 1 when SIGINT ends a process, 0 when the tree ignores it. The rest is
+# the command to run under the shims, _host_mem_stop_runner by default.
+tree_stop_runner() {
+    local int_kills="$1"
+    shift
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_proc_tree() { printf '%s\n' "900 1" "4242 900" "4243 4242" "4244 4243" "6000 4244" "5000 1"; }
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_trip_grace_wait() { echo wait >> "$TREE_WAITS"; }
+        # shellcheck disable=SC2329 # shadows the builtin for the guard under test
+        kill() {
+            local sig="$1" pid="$2"
+            case "$sig" in
+                -0) grep -qx "$pid" "$TREE_ALIVE" ;;
+                *)
+                    echo "$sig $pid" >> "$TREE_KILLS"
+                    if [ "$sig" = "-KILL" ] || [ "$int_kills" = 1 ]; then
+                        grep -vx "$pid" "$TREE_ALIVE" > "$TREE_ALIVE.new"
+                        mv "$TREE_ALIVE.new" "$TREE_ALIVE"
+                    fi
+                    return 0
+                    ;;
+            esac
+        }
+        if [ "$#" -gt 0 ]; then "$@"; else _host_mem_stop_runner; fi
+    )
+}
+
+test_a_trip_interrupts_only_the_recorded_invocation() {
+    echo "test: the stop signals the recorded pid and its descendants, nothing else"
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    tree_stop_runner 1 >"$OUT/tree.out" 2>&1
+    local pid
+    for pid in 4242 4243 4244 6000; do
+        assert_says "$TREE_KILLS" "-INT $pid" "pid $pid in the runner's tree is interrupted"
+    done
+    assert_silent_about "$TREE_KILLS" " 5000" "an unrelated process is never signalled"
+    assert_silent_about "$TREE_KILLS" " 900" "the runner's parent is never signalled"
+    assert_silent_about "$TREE_KILLS" "-KILL" "a tree that exits on the interrupt is not killed"
+}
+
+test_a_runner_that_ignores_the_interrupt_is_killed() {
+    echo "test: a tree still standing after the grace is killed"
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    LUCIDOS_E2E_TRIP_GRACE_SECS=3 tree_stop_runner 0 >"$OUT/treekill.out" 2>&1
+    assert_eq "3" "$(wc -l < "$TREE_WAITS" | tr -d ' ')" "the grace knob sets how long it waits"
+    local pid
+    for pid in 4242 4243 4244 6000; do
+        assert_says "$TREE_KILLS" "-KILL $pid" "pid $pid is killed after the grace"
+    done
+    assert_silent_about "$TREE_KILLS" " 5000" "an unrelated process is still never signalled"
+}
+
+test_a_trip_with_no_safe_runner_signals_nothing() {
+    echo "test: no pidfile, a junk one, pid 1 or a protected pid means no signal"
+    local content
+    for content in "" "not-a-pid" "1" "31337"; do
+        reset_state
+        tree_reset
+        [ -n "$content" ] && echo "$content" > "$HOST_MEMORY_RUNNER_PIDFILE"
+        tree_stop_runner 1 >"$OUT/nosafe.out" 2>&1
+        if [ -s "$TREE_KILLS" ]; then
+            fail "runner pidfile '${content:-absent}' produced a signal: $(tr '\n' ' ' < "$TREE_KILLS")"
+        else
+            pass "runner pidfile '${content:-absent}' signals nothing"
+        fi
+    done
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        is_protected_host_pid() { [ "$1" = 4242 ]; }
+        tree_stop_runner 1
+    ) >"$OUT/protected.out" 2>&1
+    if [ -s "$TREE_KILLS" ]; then
+        fail "a protected runner pid was signalled: $(tr '\n' ' ' < "$TREE_KILLS")"
+    else
+        pass "a protected runner pid is left alone"
+    fi
+}
+
+test_an_empty_tree_feed_signals_only_the_runner() {
+    echo "test: an empty process listing means no descendants, never the real host"
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_proc_tree() { return 0; }
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        _host_mem_trip_grace_wait() { :; }
+        # shellcheck disable=SC2329 # shadows the builtin for the guard under test
+        kill() {
+            case "$1" in
+                -0) grep -qx "$2" "$TREE_ALIVE" ;;
+                *) echo "$1 $2" >> "$TREE_KILLS"; grep -vx "$2" "$TREE_ALIVE" > "$TREE_ALIVE.new"; mv "$TREE_ALIVE.new" "$TREE_ALIVE" ;;
+            esac
+        }
+        _host_mem_stop_runner
+    ) >"$OUT/emptytree.out" 2>&1
+    assert_eq "-INT 4242" "$(tr -d '\r' < "$TREE_KILLS")" "only the recorded pid is interrupted"
+}
+
+test_teardown_interrupts_only_a_runner_this_run_recorded() {
+    echo "test: a torn-down run interrupts its own runner, never one a stale file names"
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    HOST_MEMORY_RUNNER_PID="" tree_stop_runner 1 stop_host_memory_sampler >"$OUT/stale.out" 2>&1
+    if [ -s "$TREE_KILLS" ]; then
+        fail "a runner named only by a stale file was signalled: $(tr '\n' ' ' < "$TREE_KILLS")"
+    else
+        pass "a runner named only by a stale file is left alone"
+    fi
+    reset_state
+    tree_reset
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    HOST_MEMORY_RUNNER_PID=4242 tree_stop_runner 1 stop_host_memory_sampler >"$OUT/torn.out" 2>&1
+    assert_says "$TREE_KILLS" "-INT 4242" "the runner this run recorded is interrupted"
+    assert_says "$TREE_KILLS" "-INT 6000" "and so is its tree"
+    assert_says "$OUT/torn.out" "interrupting the Playwright runner this run left running" "the teardown says so"
+}
+
+test_a_trip_while_the_runner_started_still_reaches_it() {
+    echo "test: interrupt_host_memory_runner_if_tripped acts only on a recorded trip"
+    reset_state
+    tree_reset
+    HOST_MEMORY_RUNNER_PID=4242 tree_stop_runner 1 interrupt_host_memory_runner_if_tripped >"$OUT/notrip2.out" 2>&1
+    if [ -s "$TREE_KILLS" ]; then fail "no trip, yet the runner was signalled"; else pass "no trip means no signal"; fi
+    reset_state
+    tree_reset
+    echo "Between two boundaries the kernel reported CRITICAL memory pressure." > "$HOST_MEMORY_TRIP_FILE"
+    HOST_MEMORY_RUNNER_PID=4242 tree_stop_runner 1 interrupt_host_memory_runner_if_tripped >"$OUT/latetrip.out" 2>&1
+    assert_says "$TREE_KILLS" "-INT 4242" "a trip recorded while the runner started interrupts it"
+}
+
+record_then_stop() {
+    record_host_memory_runner 4242
+    stop_host_memory_sampler
+}
+
+test_the_runner_record_and_the_trip_are_run_scoped() {
+    echo "test: start and stop clear a stale trip and runner record"
+    reset_state
+    echo "stale detail" > "$HOST_MEMORY_TRIP_FILE"
+    echo 4242 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=30.00 \
+        HOST_SWAP_USED_GB_OVERRIDE=0.00 start_host_memory_sampler >"$OUT/scoped.out" 2>&1
+    if [ -e "$HOST_MEMORY_TRIP_FILE" ] || [ -e "$HOST_MEMORY_RUNNER_PIDFILE" ]; then
+        fail "a stale trip or runner record survived the sampler start"
+    else
+        pass "the start clears a stale trip and runner record"
+    fi
+    # Recording signals nothing, and the clear comes before any stop, so no real
+    # pid is ever handed to the teardown's interrupt.
+    record_host_memory_runner 4242
+    assert_eq "4242" "$(cat "$HOST_MEMORY_RUNNER_PIDFILE" 2>/dev/null)" "the runner pid is recorded"
+    assert_eq "4242" "$HOST_MEMORY_RUNNER_PID" "and held in memory"
+    clear_host_memory_runner
+    if [ -e "$HOST_MEMORY_RUNNER_PIDFILE" ] || [ -n "$HOST_MEMORY_RUNNER_PID" ]; then
+        fail "the runner record survived its clear"
+    else
+        pass "the runner record is cleared"
+    fi
+    stop_host_memory_sampler >/dev/null 2>&1
+    # The teardown with a runner still recorded runs under the tree shims, so its
+    # interrupt reaches only the synthetic tree.
+    tree_reset
+    echo "detail" > "$HOST_MEMORY_TRIP_FILE"
+    tree_stop_runner 1 record_then_stop >"$OUT/scopedstop.out" 2>&1
+    if [ -e "$HOST_MEMORY_TRIP_FILE" ] || [ -e "$HOST_MEMORY_RUNNER_PIDFILE" ]; then
+        fail "the trip or runner record survived the sampler stop"
+    else
+        pass "the stop removes the trip and runner record"
+    fi
+}
+
+test_a_trip_is_read_back_as_a_memory_stop() {
+    echo "test: host_memory_stopped_mid_chunk reads the trip and its detail"
+    reset_state
+    if host_memory_stopped_mid_chunk; then
+        fail "no trip file still reads as a stop"
+    else
+        pass "no trip file reads as no stop"
+    fi
+    echo "Inside a running chunk the kernel reported CRITICAL memory pressure." > "$HOST_MEMORY_TRIP_FILE"
+    if host_memory_stopped_mid_chunk; then
+        pass "a trip file reads as a stop"
+    else
+        fail "a trip file did not read as a stop"
+    fi
+    assert_eq "Inside a running chunk the kernel reported CRITICAL memory pressure." \
+        "$MEMORY_STOP_DETAIL" "the trip's detail becomes the stop detail"
+}
+
+test_a_boundary_after_a_trip_stops_on_it() {
+    echo "test: a trip recorded between invocations stops the next boundary"
+    local rc=0
+    reset_state
+    echo "Between two boundaries the kernel reported CRITICAL memory pressure." > "$HOST_MEMORY_TRIP_FILE"
+    HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=30.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 check_host_memory_at_boundary "the boundary after project chromium" \
+        >"$OUT/tripboundary.out" 2>&1 || rc=$?
+    assert_eq "1" "$rc" "a healthy reading does not clear a recorded trip"
+    assert_says "$OUT/tripboundary.out" "already recorded the freeze signature" "the boundary says why it stopped"
+    assert_eq "Between two boundaries the kernel reported CRITICAL memory pressure." \
+        "$MEMORY_STOP_DETAIL" "the trip's detail becomes the stop detail"
+}
+
 test_the_reading_that_stopped_an_earlier_nightly_now_runs_on() {
     echo "test: 14.98 GB with no exported ceiling runs on"
     local rc
@@ -2107,6 +2462,19 @@ test_an_unreadable_dimension_in_the_window_never_erases_the_direct_read
 test_no_samples_falls_back_to_a_single_reading
 test_the_sampler_starts_writes_and_is_reaped
 test_the_sampler_never_signals_a_pid_it_did_not_spawn
+test_a_collapse_streak_trips_the_chunk
+test_only_the_freeze_signature_trips_mid_chunk
+test_a_broken_streak_starts_over
+test_the_trip_ticks_knob_falls_back
+test_a_trip_interrupts_only_the_recorded_invocation
+test_a_runner_that_ignores_the_interrupt_is_killed
+test_a_trip_with_no_safe_runner_signals_nothing
+test_an_empty_tree_feed_signals_only_the_runner
+test_teardown_interrupts_only_a_runner_this_run_recorded
+test_a_trip_while_the_runner_started_still_reaches_it
+test_the_runner_record_and_the_trip_are_run_scoped
+test_a_trip_is_read_back_as_a_memory_stop
+test_a_boundary_after_a_trip_stops_on_it
 test_the_reading_that_stopped_an_earlier_nightly_now_runs_on
 test_explicit_absolute_ceiling_overrides_the_share
 test_compressor_percent_knob_sets_the_runaway

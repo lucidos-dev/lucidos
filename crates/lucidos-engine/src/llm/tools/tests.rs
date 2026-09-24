@@ -956,12 +956,13 @@ fn await_event_description_names_the_real_subscription_cap() {
         .iter()
         .find(|t| t.name == tn::AWAIT_EVENT)
         .expect("await_event must be registered in get_default_tools()");
-    let cap = crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS;
+    let cap = crate::engine::event_wait::MAX_RECENT_SUBSCRIPTIONS;
+    let minutes = crate::engine::event_wait::RECENT_SUBSCRIPTION_WINDOW_SECS / 60;
 
     assert!(
         tool.description
-            .contains(&format!("After {cap} subscriptions in a row")),
-        "the cap must be interpolated from MAX_CONSECUTIVE_SUBSCRIPTIONS, not \
+            .contains(&format!("After {cap} subscriptions in {minutes} minutes")),
+        "the cap and its window must be interpolated from the constants, not \
          restated as a literal that drifts from the refusal the model actually \
          hits:\n{}",
         tool.description

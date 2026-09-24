@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
 // @ts-expect-error: same
@@ -6,10 +6,14 @@ import { dirname, resolve, join } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
+vi.mock('../components/chat/scrollState', () => ({
+  isNavigationScroll: () => false,
+}));
+
 import { INDICATOR_HIDE_DELAY_MS } from './useThreadScrollIndicator';
 // `atRules` is what lets these tests assert WHERE a rule applies, which is the
 // whole point here: the suppression and the replacement have to share one gate.
-import { cssRules, rulesTargeting } from '../styles/__tests__/css-rule-helpers';
+import { cssRules, rulesTargeting, styleSheetPaths } from '../styles/__tests__/css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, '..');
@@ -209,3 +213,29 @@ function tsxFiles(dir: string): string[] {
   }
   return out;
 }
+
+describe('desktop keeps the native scrollbar (ADR 0258)', () => {
+  // Only the touch gate draws our own indicator.
+  const rules = styleSheetPaths(resolve(src, 'styles')).flatMap(f => cssRules(readFileSync(f, 'utf8')));
+
+  it('never hides the transcript\'s native thumb', () => {
+    const thumbRules = rules.filter(
+      r => r.selector.includes('.thread-content') && r.selector.includes('::-webkit-scrollbar-thumb'),
+    );
+    for (const rule of thumbRules) {
+      expect(rule.props.get('background'), rule.selector).not.toBe('transparent');
+      expect(rule.props.get('display'), rule.selector).not.toBe('none');
+    }
+  });
+
+  it('draws the indicator only under the touch gate', () => {
+    const shown = rules.filter(
+      r => r.selector.includes('.thread-scroll-indicator') && r.props.get('display') === 'block',
+    );
+    expect(shown.length).toBeGreaterThan(0);
+    for (const rule of shown) {
+      expect(rule.atRules).toMatch(/hover:\s*none/);
+      expect(rule.atRules).toMatch(/pointer:\s*coarse/);
+    }
+  });
+});

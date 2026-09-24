@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, StoredEvent, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -15,15 +15,15 @@ import { openApp, openAppById } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
-import { ChildCompletionRow } from './ChildCompletionRow';
-import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, liveStepIndex, drawsResponseRow } from '../../store/event-rendering';
+import { ChildCompletionRow, ChildStoppedRow } from './ChildCompletionRow';
+import { headClampApplies, getCollapsedVisibleEvents, splitEventSections, liveStepIndex, drawsResponseRow } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setAgentLive } from './scrollState';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -281,7 +281,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
   const hasEvents = events.length > 0;
   const hasSections = events.some(e => e.type === 'section_break');
-  const dropsEarlierProse = hidesEarlierProse(events);
+  const clampApplies = headClampApplies(events, showDetails);
   const hasSteps = steps.length > 0 || events.some(e => e.type === 'step');
 
   // Is there a body to fold, and therefore a body to draw at all? One
@@ -299,6 +299,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // either way.
   const canCollapse = hasResponse || events.some((e) => drawsResponseRow(e, showSteps));
   const isCollapsed = canCollapse && collapsedExchanges.value.has(`${threadId}:${exchange.userSeq}`);
+  // Narrower than `isCollapsed`, as `ResponsePanel` is: a headerless turn keeps
+  // its body.
+  const bodyFolded = canCollapse && turnBodyFolded(collapsedExchanges.value, threadId, exchange);
 
   function handleLinkClick(e: MouseEvent) {
     const imgTarget = (e.target as HTMLElement).closest('.image-thumbnail') as HTMLImageElement | null;
@@ -523,8 +526,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const { visibleEvents, collapsedFallbackText } = useMemo(() => {
     let visible: ResponseEvent[] = [];
     let fallback = '';
-    if (hasEvents) {
-      if (showDetails || !dropsEarlierProse) {
+    // A folded turn mounts no body, so it renders no markdown for one. That is
+    // also what the render window counts it as (`rowsDrawnByClamp`).
+    if (hasEvents && !bodyFolded) {
+      if (clampApplies) {
         // The render window's head clamp, applied HERE and nowhere earlier.
         // Every verdict above reads the full `events`: whether this turn has
         // sections, whether it is an empty continuation, whether its divider
@@ -543,7 +548,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       }
     }
     return { visibleEvents: visible, collapsedFallbackText: fallback };
-  }, [hasEvents, showDetails, dropsEarlierProse, events, responseHtmlCombined, rowsHidden]);
+  }, [hasEvents, bodyFolded, clampApplies, events, responseHtmlCombined, rowsHidden]);
 
   // Sections tagged with each section's base index in `visibleEvents`, so
   // `renderResponseEvents` can key rows stably as the list grows during
@@ -712,12 +717,15 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // the one resolution that re-enters nothing. So unlike the abort and cancel
   // boundaries it takes no continuation exception: the header line IS the whole
   // turn, and a response panel would be a status badge over an empty body.
-  const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
+  //
+  // A stopped child's note on its parent is the same shape (ADR 0252): it
+  // wakes nothing, so no response ever follows it.
+  const isTurnlessPanel = isTurnlessBoundary(exchange.userEvent);
   // A speech-only turn draws its panel for the WORDS alone. The header is the
   // only thing a status badge sits on. So with no reply yet, the panel would be
   // an empty box under the caller's bubble.
   const speechOnlyHasWords = !isSpeechOnly || canCollapse;
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -768,6 +776,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // holds the LIVE half and drops the wait as it resolves. A toggle
       // defaulting to off would leave a resolved wait recorded nowhere.
       if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
+      // Ungated too: a held message is the user's cue that a reply is owed.
+      if (evt.type === 'held_message') return <HeldMessageRow key={`hm${k}`} event={evt} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
@@ -1102,6 +1112,7 @@ function initiatorSummary(ev: Exchange['userEvent']): string {
     case 'CredentialRequested':          return `Credentials requested: ${ev.provider}`;
     case 'McpConsentRequested':          return `Tool consent requested: ${ev.tool}`;
     case 'ChildThreadCompleted':         return '';
+    case 'ChildThreadStopped':           return '';
     default:                         return '';
   }
 }
@@ -1442,6 +1453,22 @@ export function describeInitiator(
             status={ev.status}
             summary={ev.summary}
             pendingChangeIds={ev.pending_change_ids}
+          />
+        ),
+      };
+    case 'ChildThreadStopped':
+      // The same fan-in raises this in place of the completion card when a
+      // user Stop pauses the child (ADR 0252). Engine plumbing, attributed
+      // like its sibling above.
+      return {
+        variant: 'system',
+        icon: <LucidosGlyph />,
+        label: ENGINE_LABEL,
+        actorClickable: false,
+        details: (
+          <ChildStoppedRow
+            childThreadId={ev.child_thread_id}
+            childThreadTitle={ev.child_thread_title}
           />
         ),
       };

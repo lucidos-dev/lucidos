@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 mod actions;
 mod archive;
+mod background_tasks;
 mod delete;
 mod events_snapshot;
 mod family;
@@ -159,6 +160,18 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/event-waits/:wait_id/cancel",
             post(actions::cancel_thread_event_wait),
+        )
+        .route(
+            "/threads/:thread_id/background-tasks",
+            post(background_tasks::start_background_task),
+        )
+        .route(
+            "/threads/:thread_id/background-tasks/:task_id",
+            get(background_tasks::background_task_output),
+        )
+        .route(
+            "/threads/:thread_id/background-tasks/:task_id/stop",
+            post(background_tasks::stop_background_task),
         )
         // The parent-to-child edge. `:thread_id` is the CHILD; the parent is
         // whoever the thread-bound origin token says the caller is, never a

@@ -6,8 +6,11 @@ if (typeof (globalThis as any).HTMLElement === 'undefined') {
 
 import {
   followingLiveEdge,
+  isScrollbarHeld,
   makeScrollObservers,
+  onScrollbarReleased,
   readerGestureForTest,
+  scrollbarReleased,
   setActiveScrollElement,
   setFollowLiveEdge,
   setAgentLive,
@@ -62,7 +65,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       /** Fire an event at the container's own listeners. `target` defaults to
        *  the container, which is what a press on its scrollbar reports. */
       fire(type: string, event: Record<string, unknown> = {}) {
-        for (const fn of own[type] ?? []) fn({ target: el, ...event });
+        for (const fn of own[type] ?? []) fn({ target: el, button: 0, ...event });
       },
     };
     return el;
@@ -112,6 +115,16 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     onScroll();
   }
 
+  /** A press in the scrollbar gutter, past the client box. */
+  function gutterPress(el: any) {
+    el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
+  }
+
+  /** Fire an event at `window`'s listeners, where the releases live. */
+  function fireWindow(type: string, event: Record<string, unknown> = {}) {
+    for (const fn of windowListeners[type] ?? []) fn(event);
+  }
+
   /** `riding()`, plus the round that records the reader ON the live edge.
    *
    *  The tests above ask only what the listeners make of an input, and the
@@ -136,7 +149,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     // The release goes on `window`: a drag that ends with the pointer outside
     // the transcript would otherwise leave the press recorded forever.
     expect(Object.keys(windowListeners).sort()).toEqual(
-      ['pointercancel', 'pointerup', 'touchcancel', 'touchend'],
+      ['blur', 'pointercancel', 'pointerup', 'touchcancel', 'touchend'],
     );
 
     detachGestures();
@@ -317,7 +330,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     // The press stamps once; a slow haul down the bar can outlast the window,
     // so the moves under it keep the signal fresh.
     const { el, onScroll } = riding();
-    el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
+    gutterPress(el);
     vi.advanceTimersByTime(1000);
     el.fire('pointermove', { buttons: 1 });
     vi.advanceTimersByTime(1000);
@@ -355,7 +368,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     // to wait for. The gutter is outside the client box, which is what makes
     // this the one press that cannot be a content control.
     const { el, onScroll } = riding();
-    el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
+    gutterPress(el);
     platformScrollsTo(el, 900, onScroll);
     expect(followingLiveEdge.value).toBe(false);
   });
@@ -382,7 +395,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     // ordinary hover into a drag.
     const { el, onScroll } = riding();
 
-    el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
+    gutterPress(el);
     el.fire('pointermove', { buttons: 0 }); // the release we never saw
     vi.advanceTimersByTime(2000);           // and the press's own stamp lapses
     el.fire('pointermove', { buttons: 0 }); // now just a hover
@@ -394,12 +407,183 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   it('ends the press on a release anywhere, including outside the transcript', () => {
     const { el, onScroll } = riding();
 
-    el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
-    for (const fn of windowListeners['pointerup'] ?? []) fn({});
+    gutterPress(el);
+    fireWindow('pointerup');
     vi.advanceTimersByTime(2000);           // the press's own stamp lapses
     el.fire('pointermove', { buttons: 1 }); // a drag that belongs to something else
     platformScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(true);
+  });
+
+  describe('a held scrollbar, which the window waits out (ADR 0258)', () => {
+    // While the thumb is held, Chromium puts its own drag position back and
+    // undoes an anchor write. So ThreadView grows the window, and lets history
+    // land above the reader, on the RELEASE, which these exports report.
+    let released: unknown[];
+    let unsubscribe: () => void;
+    let realDocument: any;
+    beforeEach(() => {
+      released = [];
+      unsubscribe = onScrollbarReleased((el) => released.push(el));
+      realDocument = (globalThis as any).document;
+    });
+    afterEach(() => {
+      unsubscribe();
+      (globalThis as any).document = realDocument;
+    });
+
+    it('is held from a gutter press until the release, which is announced once', () => {
+      const { el } = riding();
+      gutterPress(el);
+      expect(isScrollbarHeld(el)).toBe(true);
+
+      fireWindow('pointerup');
+      expect(isScrollbarHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+
+      fireWindow('pointerup');
+      expect(released).toEqual([el]);
+    });
+
+    it('is held by a press on the container inside its client box, where an overlay thumb sits', () => {
+      const { el } = ridingAndAnchored();
+      el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
+      expect(isScrollbarHeld(el)).toBe(true);
+    });
+
+    it('leaves an idle reader where an overlay thumb drag put them', () => {
+      // macOS draws overlay scrollbars, so the press lands inside the client
+      // box. Writing the reader back to the live edge here fought Chromium,
+      // which puts its own drag position back every frame: the content shook
+      // and the thumb would not leave the bottom.
+      const { el, onScroll } = ridingAndAnchored();
+      setAgentLive(false);
+      el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
+      platformScrollsTo(el, 400, onScroll);
+      expect(el.scrollTop).toBe(400);
+      expect(followingLiveEdge.value).toBe(true);
+    });
+
+    it('retires a live ride on an overlay thumb drag, however slow', () => {
+      // Chromium may send no pointer moves while it drives its own thumb, so
+      // the hold itself says the reader is scrolling, not a fresh stamp.
+      const { el, onScroll } = ridingAndAnchored();
+      el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
+      vi.advanceTimersByTime(3000);
+      platformScrollsTo(el, 400, onScroll);
+      expect(el.scrollTop).toBe(400);
+      expect(followingLiveEdge.value).toBe(false);
+    });
+
+    it('answers the platform again once the thumb is released', () => {
+      const { el, onScroll } = ridingAndAnchored();
+      el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
+      fireWindow('pointerup');
+      platformScrollsTo(el, 400, onScroll);
+      expect(el.scrollTop).toBe(2500);
+      expect(followingLiveEdge.value).toBe(true);
+    });
+
+    it('is never held by a press on content, so no release is announced', () => {
+      const { el } = riding();
+      el.fire('pointerdown', { target: { nodeName: 'BUTTON' }, offsetX: 40, offsetY: 12 });
+      expect(isScrollbarHeld(el)).toBe(false);
+      fireWindow('pointerup');
+      expect(released).toEqual([]);
+    });
+
+    it('is never held by a right-click, whose menu can swallow the release', () => {
+      const { el } = riding();
+      el.fire('pointerdown', { button: 2, offsetX: el.clientWidth + 6, offsetY: 200 });
+      expect(isScrollbarHeld(el)).toBe(false);
+    });
+
+    it('still counts a middle-click in the gutter as a scroll, which pages the track', () => {
+      const { el, onScroll } = riding();
+      el.fire('pointerdown', { button: 1, offsetX: el.clientWidth + 6, offsetY: 200 });
+      expect(isScrollbarHeld(el)).toBe(false);
+      platformScrollsTo(el, 900, onScroll);
+      expect(followingLiveEdge.value).toBe(false);
+    });
+
+    it('announces a release it only learns of from a move with no button held', () => {
+      const { el } = riding();
+      gutterPress(el);
+      el.fire('pointermove', { buttons: 0 });
+      expect(isScrollbarHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('lets go when the page loses focus, so a lost drag cannot stall the window', () => {
+      const { el } = riding();
+      gutterPress(el);
+      (globalThis as any).document = { hasFocus: () => false };
+      fireWindow('blur');
+      vi.advanceTimersByTime(0);
+      expect(isScrollbarHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('keeps holding when focus only moves into an iframe on the page', () => {
+      const { el } = riding();
+      gutterPress(el);
+      (globalThis as any).document = { hasFocus: () => true };
+      fireWindow('blur');
+      vi.advanceTimersByTime(0);
+      expect(isScrollbarHeld(el)).toBe(true);
+    });
+
+    it('lets go on teardown, so nothing waiting on the release waits for good', () => {
+      const { el, detachGestures } = riding();
+      gutterPress(el);
+      detachGestures();
+      expect(isScrollbarHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('stops announcing once unsubscribed', () => {
+      const { el } = riding();
+      unsubscribe();
+      gutterPress(el);
+      fireWindow('pointerup');
+      expect(released).toEqual([]);
+    });
+
+    describe('scrollbarReleased', () => {
+      let frames: Array<() => void>;
+      let realRaf: any;
+      beforeEach(() => {
+        frames = [];
+        realRaf = (globalThis as any).requestAnimationFrame;
+        (globalThis as any).requestAnimationFrame = (fn: () => void) => { frames.push(fn); return frames.length; };
+      });
+      afterEach(() => { (globalThis as any).requestAnimationFrame = realRaf; });
+
+      const settled = async (p: Promise<void>) => {
+        let done = false;
+        void p.then(() => { done = true; });
+        await Promise.resolve();
+        return done;
+      };
+
+      it('resolves at once when nothing is held', async () => {
+        const { el } = riding();
+        expect(await settled(scrollbarReleased(el))).toBe(true);
+      });
+
+      it('resolves a frame after the release, so the drag has ended first', async () => {
+        const { el } = riding();
+        gutterPress(el);
+        const landing = scrollbarReleased(el);
+        expect(await settled(landing)).toBe(false);
+
+        fireWindow('pointerup');
+        expect(await settled(landing)).toBe(false);
+
+        for (const frame of frames.splice(0)) frame();
+        expect(await settled(landing)).toBe(true);
+      });
+    });
   });
 });

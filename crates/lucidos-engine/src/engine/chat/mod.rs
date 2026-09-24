@@ -1,5 +1,6 @@
 pub(crate) mod child_follow_up;
 mod events;
+mod held_messages;
 mod images;
 pub(in crate::engine) mod process;
 mod process_cc;
@@ -13,6 +14,7 @@ mod title;
 
 pub(crate) use events::make_message_received;
 pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;
+pub(crate) use held_messages::answer_releases_held_messages;
 pub(crate) use process::PreEmittedOrigin;
 pub(crate) use title::{
     emit_generated_title, exchange_has_both_speakers, generate_thread_title, spawn_naming,

@@ -8,6 +8,25 @@ export function escapeHtmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/** Unguessable, per module load, so content cannot name a copy slot.
+ *
+ *  Content authors both halves of a copy forgery: a real block hidden where
+ *  nobody reads it, and a decoy label carrying that block's slot. Every marker
+ *  the renderer writes carries this nonce, so content has no slot to name.
+ *  `renderMarkdown.ts` states where each marker is resolved. */
+export const COPY_ID_NONCE = ((): string => {
+  const bytes = new Uint8Array(8);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+})();
+
+/** Marks a code block this renderer wrote, so its Copy button gets a payload. */
+export const CODE_COPY_ATTR = 'data-code-copy';
+
 const renderer = new marked.Renderer();
 renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
   const langLabel = lang ? `<span class="code-block-lang">${escapeHtmlAttr(lang)}</span>` : '';
@@ -15,7 +34,7 @@ renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
   // Lang label + copy button share one .code-block-header overlay — see
   // chat.css `.code-block-header` for why this structure (not two absolute
   // siblings of <pre>).
-  return `<div class="code-block-wrapper"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
+  return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
 };
 
 marked.setOptions({

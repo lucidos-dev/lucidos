@@ -447,6 +447,46 @@ impl LucidosEngine {
             }
         }
 
+        // Held messages (ADR 0256). An agent-sent message waits while a human
+        // owes this thread a reply, so it cannot supersede their question.
+        if use_coding_agent == Some(true)
+            && !is_new_thread
+            && !user_message.is_empty()
+            && mode != ActorMode::Human
+            && super::super::held_messages::message_is_held(
+                self.pool(),
+                thread_id,
+                mode,
+                pre_emitted_origin,
+            )
+            .await
+        {
+            self.event_bus
+                .emit(crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: super::super::held_messages::held_message_event(
+                        &self.workspace_path,
+                        user_message,
+                        user_images,
+                        mode,
+                        origin.clone(),
+                    ),
+                    meta: crate::engine::thread_events::EventMeta {
+                        channel: Some(EventChannel::ClaudeCode),
+                        ..crate::engine::thread_events::EventMeta::NONE
+                    },
+                })
+                .await?;
+            log!("[Chat] Held an agent message on thread {}", thread_id);
+            return Ok(terminal_result(
+                String::new(),
+                vec![],
+                request_id,
+                thread_id,
+                false,
+            ));
+        }
+
         // Permission supersede: if this CC thread is waiting on a permission
         // card and the user typed a message instead of clicking a button,
         // resolve the pending permission(s) as denied so the card's buttons
@@ -474,15 +514,35 @@ impl LucidosEngine {
             // releases it. See
             // `crate::engine::agent_question::resolve_pending_question_as_superseded`.
             //
+            // The one exception is an engine re-entry on a question the user
+            // can still answer, such as a child's completion: it cannot kill
+            // the card, so superseding would only throw the question away.
+            //
             // Coding-agent lane only. A chat thread queues a non-answering
             // follow-up as an injection and keeps the question live and
             // answerable, which is the behaviour we want there.
-            crate::engine::agent_question::resolve_pending_question_as_superseded(
-                &self.clone_arc(),
+            if !super::super::process_helpers::follow_up_keeps_open_question(
+                self.pool(),
+                &self.agent_sessions,
                 thread_id,
-                origin.clone(),
+                pre_emitted_origin,
             )
-            .await;
+            .await
+            {
+                crate::engine::agent_question::resolve_pending_question_as_superseded(
+                    &self.clone_arc(),
+                    thread_id,
+                    origin.clone(),
+                )
+                .await;
+            }
+
+            // A human message releases the held messages ahead of itself, so
+            // the agent reads them in send order (ADR 0256). After the
+            // supersedes, so the human is who resolved any open card.
+            if mode == ActorMode::Human {
+                self.clone_arc().deliver_held_messages(thread_id).await;
+            }
         }
 
         // Same supersede for the command-guard permission lane (ADR 0002): a
@@ -1805,14 +1865,11 @@ impl LucidosEngine {
         }
 
         // The turn is over and this thread may still own running background
-        // work. Unlike a coding-agent session, nothing will push its completion
-        // at us (`spawn_bash_completion_watcher` skips the wake for a chat-mode
-        // background bash, having no parked session to push to), so unless the
-        // model armed a subscription itself the finish lands with nobody
-        // watching and the thread simply stops. That is the five-hour release
-        // stall of 2026-08-09. Arming here is the engine noticing on the
-        // model's behalf; it no-ops when there is no background work or when a
-        // wait already covers it.
+        // work. Only an event wait re-opens the thread when it completes. If the
+        // model armed none, the finish lands with nobody watching and the
+        // thread stops: the five-hour release stall behind this code. Arming
+        // here is the engine noticing on the model's behalf; it no-ops when
+        // there is no background work or when a wait already covers it.
         //
         // Gated on a CLEAN end, both halves load-bearing. A cancelled turn is
         // the user pressing Stop or a follow-up superseding this turn: in the

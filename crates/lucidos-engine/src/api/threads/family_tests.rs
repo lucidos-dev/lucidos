@@ -14,7 +14,7 @@
 //
 // Most cases pass `FamilyVerb::Archive`, because archive is the verb whose
 // behaviour was already pinned here. The delete-specific arms live at the
-// bottom, beside the one case where the two verbs answer differently.
+// bottom, beside the parity checks between the two verbs.
 
 use super::{
     classify_family, coding_agent_members, every_member, external_repo_pending, load_family,
@@ -672,29 +672,6 @@ async fn archive_allows_parent_external_repo_cc_with_pending_changes() {
 }
 
 #[tokio::test]
-async fn archive_allows_parent_waiting_for_user_answer() {
-    // CC parent paused on AskUserQuestion is archivable — the cascade
-    // loop's per-thread cancel-stamp resolves the dangling QuestionCard
-    // before ThreadArchived fires.
-    let parent_id = Uuid::new_v4();
-    let family = vec![row(
-        parent_id,
-        true,
-        "waiting_for_user_answer",
-        "inbox",
-        false,
-        false,
-    )];
-    let (to_archive, external_repo_pending) = expect_proceed(
-        &family,
-        parent_id,
-        "expected Proceed when parent CC is WaitingForUserAnswer",
-    );
-    assert_eq!(to_archive, vec![parent_id]);
-    assert!(external_repo_pending.is_empty());
-}
-
-#[tokio::test]
 async fn archive_skips_already_archived_descendants() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -765,7 +742,7 @@ async fn idle_descendants_alongside_archived_and_self() {
 /// CC asks a question, then `CodingAgentIdled` lands without an answer.
 /// The row settles at `status=idle, archive_state=inbox` — `is_blocking`
 /// admits it, so the cascade Proceeds. The dangling QuestionCard then
-/// needs `resolve_pending_question_as_canceled` to cancel-stamp it
+/// needs the archive handler to cancel-stamp it
 /// (otherwise its answer buttons render clickable on the archived thread,
 /// fix commit 3440bed36).
 ///
@@ -897,7 +874,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     assert_eq!(
         found.as_deref(),
         Some(orphan_tool_use_id),
-        "lookup must surface the orphaned question so resolve_pending_question_as_canceled has something to cancel-stamp"
+        "lookup must surface the orphaned question so the archive handler has something to cancel-stamp"
     );
 
     pool.close().await;
@@ -1024,41 +1001,39 @@ async fn external_repo_cc_with_pending_changes_does_not_block() {
 // ── The delete verb ───────────────────────────────────────────────────
 //
 // Delete asks this same classifier, so everything above binds it too. What
-// follows is the one state the two verbs answer differently, plus the parity
-// assertion that keeps them from drifting anywhere else.
+// follows is the parity assertion that keeps the two verbs from drifting.
 
-/// The single divergence. Archive admits a parked parent and cancel-stamps its
-/// question card in its own cascade step. Delete cannot: there is nothing to
-/// stamp when the card is about to go. The subprocess parked on that question
-/// would be left with nobody to answer it.
+/// A thread waiting on the user needs attention, so neither verb may take it.
+/// Archive once admitted it and cancel-stamped the question, which hid the
+/// question from the user for good (ADR 0259).
 #[test]
-fn delete_refuses_a_parent_waiting_on_an_answer_where_archive_admits_it() {
+fn both_verbs_refuse_a_parent_waiting_on_an_answer() {
     let target = Uuid::new_v4();
-    let mut parked = idle_chat(target);
-    parked.status = "waiting_for_user_answer".into();
-    let family = vec![parked];
-
-    let (status, body) = expect_reject(
-        &family,
-        target,
-        FamilyVerb::Delete,
-        "delete must refuse a parent parked on a question",
-    );
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["reason"], "parent_not_deletable");
-    assert_eq!(body["parent_status"], "waiting_for_user_answer");
-
-    let (to_archive, _) = expect_proceed(
-        &family,
-        target,
-        "archive must still admit a parent parked on a question",
-    );
-    assert_eq!(to_archive, vec![target]);
+    for parked in [idle_chat(target), idle_cc(target)] {
+        let family = vec![FamilyRow {
+            status: "waiting_for_user_answer".into(),
+            ..parked
+        }];
+        for (verb, reason) in [
+            (FamilyVerb::Archive, "parent_not_archivable"),
+            (FamilyVerb::Delete, "parent_not_deletable"),
+        ] {
+            let (status, body) = expect_reject(
+                &family,
+                target,
+                verb,
+                "a parent parked on a question must be refused",
+            );
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["reason"], reason);
+            assert_eq!(body["parent_status"], "waiting_for_user_answer");
+        }
+    }
 }
 
-/// Everything except that one state must answer identically, or the lift into
-/// one classifier bought nothing. Each family below is refused, and the two
-/// verbs must agree on the refusal slug as well as on the fact of it.
+/// Each family below is refused, and the two verbs must agree on the refusal
+/// slug as well as on the fact of it. Otherwise the lift into one classifier
+/// bought nothing.
 #[test]
 fn archive_and_delete_refuse_the_same_family() {
     let target = Uuid::new_v4();

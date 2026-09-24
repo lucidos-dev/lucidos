@@ -51,10 +51,10 @@ const TRIM_TRIGGER_BYTES: usize = 2 * MAX_BUFFER_BYTES;
 /// How long a completed task stays drainable after `finished_at`.
 ///
 /// The window that has to be covered is "task completes" to "the agent's next
-/// `bash_output` call". The completion watcher pushes a wake message to a
-/// parked coding agent the instant the task ends, so five minutes is generous
-/// by a wide margin. Past it the caller falls back to the persisted
-/// `BackgroundBashCompleted` row, which carries the same final output.
+/// `bash_output` call". The completion's event wait re-opens the thread the
+/// instant the task ends, so five minutes is generous by a wide margin. Past
+/// it the caller falls back to the persisted `BackgroundBashCompleted` row,
+/// which carries the same final output.
 ///
 /// Time, rather than "evict once drained": drain-once ties eviction to a
 /// reader's action, so it both leaks tasks nobody drains (a timer would be
@@ -93,6 +93,20 @@ pub(super) fn command_prefix(command: &str) -> String {
 #[derive(Clone)]
 pub struct BackgroundBashRegistry {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+}
+
+/// How the watchdog ends a task that is told to stop. Either way it signals
+/// the task's whole process group, so a command list cannot leave its real
+/// work running behind a dead shell. ADR 0263 records why a background task
+/// differs from a foreground `run_bash` here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// SIGTERM, then SIGKILL after `GROUP_TEARDOWN_GRACE`. A trap can release
+    /// a lock, and a Playwright runner can close the browsers it detached.
+    Graceful,
+    /// SIGKILL at once. For the engine's own teardown, which has only
+    /// `REAP_WAIT` to reap before its supervisor force-kills it.
+    Immediate,
 }
 
 /// One captured output stream: the retained bytes, how far the reader has
@@ -189,14 +203,17 @@ struct BackgroundTask {
     /// `outcome.is_some()` are always in step, and a still-running task can
     /// never present a status at all (as opposed to presenting a `0`).
     outcome: Option<TaskOutcome>,
+    /// The watchdog's budget ran out and its signal reached a live child.
     timed_out: bool,
+    /// A stop's signal reached a live child. Set from [`end_task`], never from
+    /// the outcome: a graceful stop can end in a trap's clean exit.
     killed: bool,
     /// The engine is stopping and took this task down as part of stopping.
     ///
     /// Set by [`BackgroundBashRegistry::hand_over_at_teardown`] in the same locked
     /// block that fires the kill, so the outcome the watchdog then reaps is
     /// already labelled. It outranks `killed` on the emitted event: both are
-    /// a SIGKILL from us, and only this one says the work was not called off.
+    /// our signal, and only this one says the work was not called off.
     abandoned: bool,
     /// Single source of truth for "has the watchdog finished?", and the clock
     /// the retention sweep reads. `None` = still running, `Some(t)` = finished
@@ -218,12 +235,9 @@ struct BackgroundTask {
     /// [`sweep_finished`].
     completion_claimed: bool,
     /// Thread that spawned this task. `None` for tests and engine-internal
-    /// callers with no owning thread. Drives `has_running_for_thread` so the
-    /// agent-session idle handler can keep CC alive while bg bash is still
-    /// running for its thread — without this, a CC that idled mid-/harden
-    /// waiting on its own `run_bash_background` tests was killed and the
-    /// change auto-proposed as "done", which caused premature Apply + harden-
-    /// from-scratch on click.
+    /// callers with no owning thread. Scopes the per-thread questions: which
+    /// tasks an engine-armed event wait must cover, which a Discard kills, and
+    /// which an agent may read or stop.
     thread_id: Option<Uuid>,
     /// The watchdog budget this task was spawned with, in seconds. Retained so
     /// [`BackgroundBashRegistry::running_for_thread`] can report the deadline
@@ -232,7 +246,10 @@ struct BackgroundTask {
     /// outlive its own subscription and the completion would land with nobody
     /// watching, which is the stall this whole mechanism exists to prevent.
     timeout_secs: u64,
-    kill_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    kill_signal: Option<tokio::sync::oneshot::Sender<Stop>>,
+    /// Cuts a graceful stop's grace short. The teardown fires it when a stop
+    /// or timeout is already in its grace, out of the kill channel's reach.
+    cut_grace: Arc<Notify>,
     /// Signals the final `finished_at` write, and ONLY that — a buffered
     /// chunk deliberately does not wake the waiter. `bash_output(wait_secs=N)`
     /// means "block up to N seconds"; waking on the first byte made the
@@ -267,6 +284,7 @@ impl BackgroundTask {
             thread_id: None,
             timeout_secs: 600,
             kill_signal: None,
+            cut_grace: Arc::new(Notify::new()),
             finish_notify: Arc::new(Notify::new()),
         }
     }
@@ -413,7 +431,7 @@ impl BackgroundBashRegistry {
     ///
     /// `thread_id` records the spawning thread so `has_running_for_thread`
     /// can answer "does this thread still have unfinished background bash?".
-    /// Production callers (the `run_bash_background` LLM tool) always pass
+    /// Production callers (`LucidosEngine::start_background_task`) always pass
     /// `Some(thread_id)`; tests typically pass `None`.
     pub async fn spawn(
         &self,
@@ -437,13 +455,18 @@ impl BackgroundBashRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
         crate::core::apply_to_subprocess_env(&mut cmd, env);
 
         let mut child = cmd.spawn()?;
+        // Read now: `id()` goes `None` once the child is reaped, and the group
+        // signals below must never outlive the reap.
+        let pid = child.id();
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
 
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+        let cut_grace = Arc::new(Notify::new());
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Redacted here rather than taken as a second parameter. Given both a
@@ -474,6 +497,7 @@ impl BackgroundBashRegistry {
                     thread_id,
                     timeout_secs,
                     kill_signal: Some(kill_tx),
+                    cut_grace: cut_grace.clone(),
                     finish_notify: Arc::new(Notify::new()),
                 },
             );
@@ -499,22 +523,25 @@ impl BackgroundBashRegistry {
             tokio::pin!(timeout_fut);
             let mut timed_out = false;
             let mut killed = false;
-            // Every arm reaps the child and classifies the REAL status. The
-            // timeout and kill arms used to throw it away and report `None`,
-            // which left "the watchdog SIGKILLed it" indistinguishable from
-            // "wait() failed". `child.kill()` already awaits the child, and
-            // tokio caches the status, so the follow-up `wait()` returns it.
+            // Every arm reaps the child and classifies the REAL status, so
+            // "the watchdog ended it" never reads as "wait() failed". A
+            // natural exit signals nothing: only an explicit ending reaches
+            // the group, and a deliberate detach survives (ADR 0263).
             let outcome: TaskOutcome = tokio::select! {
                 exit = child.wait() => TaskOutcome::from_wait(exit),
                 _ = &mut timeout_fut => {
-                    timed_out = true;
-                    let _ = child.kill().await;
-                    TaskOutcome::from_wait(child.wait().await)
+                    let (outcome, signalled) =
+                        end_task(&mut child, pid, Stop::Graceful, &cut_grace).await;
+                    timed_out = signalled;
+                    outcome
                 }
-                _ = kill_rx => {
-                    killed = true;
-                    let _ = child.kill().await;
-                    TaskOutcome::from_wait(child.wait().await)
+                stop = kill_rx => {
+                    // The task entry holds the sender for as long as this runs, so
+                    // an Err cannot happen. `Immediate` is the safe reading anyway.
+                    let stop = stop.unwrap_or(Stop::Immediate);
+                    let (outcome, signalled) = end_task(&mut child, pid, stop, &cut_grace).await;
+                    killed = signalled;
+                    outcome
                 }
             };
             // Wait for both drain tasks to flush remaining buffered bytes
@@ -648,7 +675,7 @@ impl BackgroundBashRegistry {
             return false;
         }
         if let Some(tx) = task.kill_signal.take() {
-            let _ = tx.send(());
+            let _ = tx.send(Stop::Graceful);
             true
         } else {
             false
@@ -656,17 +683,12 @@ impl BackgroundBashRegistry {
     }
 
     /// True iff the registry holds at least one unfinished task that was
-    /// spawned for this thread. The agent-session idle handler reads this
-    /// to decide whether to skip the propose-and-terminate dance at idle —
-    /// a CC subprocess that idled mid-/harden waiting on its own
-    /// `run_bash_background` tests must stay alive until the tests finish,
-    /// otherwise the change auto-proposes as "done" (premature Apply) and
-    /// a click triggers a from-scratch harden in a fresh worktree.
+    /// spawned for this thread. The cheap probe in front of the engine-armed
+    /// event wait, and the todo consumer's "is this thread still working?".
     ///
     /// Retained completions are invisible here, and must stay that way: the
     /// filter is on `!is_finished()`, not on presence in the map. A retained
-    /// task counted as running would pin a coding-agent session open for the
-    /// whole retention window after its work was already done.
+    /// task counted as running would arm a wait for work that is already done.
     pub async fn has_running_for_thread(&self, thread_id: Uuid) -> bool {
         let tasks = self.locked().await;
         tasks
@@ -680,11 +702,9 @@ impl BackgroundBashRegistry {
     /// exactly (`!is_finished()`, never mere presence in the map) so a retained
     /// completion cannot appear here either.
     ///
-    /// Exists for the chat turn tail, which arms an *event wait* per unfinished
-    /// task so a chat thread is re-opened when its background work completes.
-    /// A coding-agent thread gets that wake pushed at it directly by
-    /// `spawn_bash_completion_watcher`; a chat thread has no parked session to
-    /// push to, so the subscription is how it hears. Both halves are needed:
+    /// Exists for the engine-armed *event wait* (the chat turn tail and the
+    /// coding-agent `background-tasks` route), which re-opens the thread when
+    /// its background work completes. Both halves are needed:
     /// the `task_id` because an unconditioned `BackgroundBashCompleted` would
     /// wake on any thread's task, and the deadline because a wait that expires
     /// before its task can is a subscription that guarantees nothing.
@@ -715,6 +735,30 @@ impl BackgroundBashRegistry {
         tasks.get(task_id).is_some_and(|t| !t.is_finished())
     }
 
+    /// Whether this thread spawned the task. `None` when the registry does not
+    /// hold it, which is not a "no": a completed task past its retention window
+    /// is known only to the event store.
+    pub async fn spawned_by(&self, task_id: &str, thread_id: Uuid) -> Option<bool> {
+        let tasks = self.locked().await;
+        tasks.get(task_id).map(|t| t.thread_id == Some(thread_id))
+    }
+
+    /// Kill every running task this thread spawned, and return how many.
+    ///
+    /// For a thread that is going away (Discard, Archive). Each killed task
+    /// still records its completion through its own watcher.
+    pub async fn kill_for_thread(&self, thread_id: Uuid) -> usize {
+        let mut tasks = self.locked().await;
+        tasks
+            .values_mut()
+            .filter(|t| t.thread_id == Some(thread_id) && !t.is_finished())
+            .filter_map(|t| t.kill_signal.take())
+            .map(|tx| {
+                let _ = tx.send(Stop::Graceful);
+            })
+            .count()
+    }
+
     /// Hand the teardown every task whose completion nobody has written yet,
     /// killing the ones still running. Called once, from graceful teardown.
     ///
@@ -741,13 +785,14 @@ impl BackgroundBashRegistry {
             .filter(|(_, t)| !t.completion_claimed)
             .filter_map(|(task_id, t)| {
                 let thread_id = t.thread_id?;
-                // Single-pid, which is all `Child::kill` sends: a pipeline
-                // behind the shell survives. `ENGINE_STOPPED_NOTE` says so.
                 if !t.is_finished() {
                     if let Some(tx) = t.kill_signal.take() {
                         t.abandoned = true;
-                        let _ = tx.send(());
+                        let _ = tx.send(Stop::Immediate);
                     }
+                    // A stop or a timeout already in its grace no longer hears
+                    // the channel, and the grace would outlast `REAP_WAIT`.
+                    t.cut_grace.notify_one();
                 }
                 Some(TeardownTask {
                     thread_id,
@@ -822,7 +867,7 @@ impl BackgroundBashRegistry {
         // block as `finished_at`). Defend anyway rather than unwrapping:
         // `Unknown` is the honest reading, and it renders as words, not a `0`.
         let outcome = task.outcome.unwrap_or(TaskOutcome::Unknown);
-        let (abandoned, killed) = ending(&*task, outcome);
+        let (abandoned, killed) = ending(&*task);
         let (stdout, stdout_dropped) = task.stdout.all();
         let (stderr, stderr_dropped) = task.stderr.all();
         // The caller writes this straight into `BackgroundBashCompleted`, which
@@ -943,33 +988,65 @@ impl BackgroundBashRegistry {
 
 /// Which of the two engine-side endings this was: `(abandoned, killed)`.
 ///
-/// Decided once, here, so no reader re-derives the precedence. Both are the
-/// same SIGKILL down the same channel, and `BackgroundTask::abandoned` is the
-/// only record of who sent it.
+/// Decided once, here, so no reader re-derives the precedence. Both come down
+/// the same channel, and `BackgroundTask::abandoned` is the only record of who
+/// sent the signal.
 ///
-/// **Neither is claimed unless our signal is what ended the task**, which is
-/// exactly `BackgroundTask::killed`: the watchdog sets it only on the arm the
-/// kill receiver won. Three other endings reach here with a signal already
-/// sent or in flight, and each has its own name.
+/// **Neither is claimed unless our signal reached a live child**, which is
+/// exactly `BackgroundTask::killed` (see [`end_task`]). The outcome cannot
+/// decide it: a graceful stop can end in a trap's `exit 143` or even `exit 0`.
+/// Three other endings reach here with a signal sent or in flight, and each
+/// keeps its own name.
 ///
-/// - A normal exit. The teardown fires at every task without a `finished_at`.
-///   That includes one whose child has already gone while the watchdog joins
-///   its drain readers, up to two seconds later. A release that exited 0 in
-///   there really did ship, so `ran_to_exit` keeps its verdict.
+/// - A normal exit just before the signal. `end_task` finds the child already
+///   gone and reports its verdict, so a release that exited 0 really shipped.
 /// - The watchdog's own budget, which never takes the kill signal and so is
 ///   still markable. It reports `timed_out`.
 /// - A signal from outside, a SIGSEGV say, which must keep its own number.
-fn ending(task: &BackgroundTask, outcome: TaskOutcome) -> (bool, bool) {
-    let ran_to_exit = matches!(outcome, TaskOutcome::Exited(_));
-    let ended_by_our_signal = task.killed && !ran_to_exit;
+fn ending(task: &BackgroundTask) -> (bool, bool) {
     // Exclusive on the wire, because they name different deciders. Reporting
     // both would tell the agent `bash_kill` was called on work the shutdown
     // ended. Only one can be true anyway: `bash_kill` and the teardown
     // race for the one kill signal, and the loser marks nothing.
     (
-        ended_by_our_signal && task.abandoned,
-        ended_by_our_signal && !task.abandoned,
+        task.killed && task.abandoned,
+        task.killed && !task.abandoned,
     )
+}
+
+/// End a task the watchdog was told to stop, and reap it. Returns the outcome
+/// and whether our signal reached a live child.
+///
+/// A child that already exited keeps its own verdict and is not signalled:
+/// `try_wait` reaps it, and a reaped pid must never be named again. Otherwise
+/// the signals go to the whole process group while the leader is unreaped,
+/// per `spawn_env::signal_child_process_group`. `cut_grace` ends a graceful
+/// stop's grace early, for a teardown that cannot wait it out.
+async fn end_task(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    stop: Stop,
+    cut_grace: &Notify,
+) -> (TaskOutcome, bool) {
+    if let Ok(Some(status)) = child.try_wait() {
+        return (TaskOutcome::from_wait(Ok(status)), false);
+    }
+    if let Some(pid) = pid {
+        match stop {
+            Stop::Graceful => {
+                crate::runtime::spawn_env::graceful_kill_child_process_group_or_sooner(
+                    pid,
+                    crate::runtime::claude_code::GROUP_TEARDOWN_GRACE,
+                    cut_grace.notified(),
+                )
+                .await
+            }
+            Stop::Immediate => crate::runtime::spawn_env::kill_child_process_group_now(pid),
+        }
+    }
+    // The leader alone, which is all a platform without process groups gets.
+    let _ = child.kill().await;
+    (TaskOutcome::from_wait(child.wait().await), true)
 }
 
 /// Apply the retention policy: drop every completed task past
@@ -1043,9 +1120,9 @@ fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
     // Measure to `finished_at` once the task is done so a late drain reports
     // the task's runtime, not "how long ago it was spawned".
     let until = task.finished_at.unwrap_or_else(Utc::now);
-    // A running task has no outcome yet, so it is neither ending. `ending`
-    // needs one, and `Unknown` is what a status-less task honestly has.
-    let (abandoned, killed) = ending(task, task.outcome.unwrap_or(TaskOutcome::Unknown));
+    // A running task is neither ending: the watchdog sets `killed` only once
+    // it has reaped the child.
+    let (abandoned, killed) = ending(task);
     OutputSnapshot {
         stdout,
         stderr,
@@ -1264,7 +1341,8 @@ mod tests {
         let killed = reg.kill(&task_id).await;
         assert!(killed, "kill should return true for a running task");
 
-        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
+        // Past `GROUP_TEARDOWN_GRACE`, in case the SIGTERM is ignored.
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(20)).await;
         assert!(finished, "killed task did not transition to finished");
 
         let snap = reg
@@ -1274,16 +1352,274 @@ mod tests {
         assert!(snap.finished);
         assert!(snap.killed, "killed flag should be true");
         assert!(!snap.timed_out);
-        // The kill arm used to discard the reaped status and report `None`.
-        // It now records the SIGKILL it actually sent, so the summary can say
-        // *how* the child died rather than just that the engine asked it to.
-        assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(9)));
+        // The reaped status, not `None`: the summary says *how* the child
+        // died. A stop is SIGTERM first, and `sleep` does not trap it.
+        assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(15)));
     }
 
     #[tokio::test]
     async fn kill_returns_false_for_unknown_task() {
         let reg = BackgroundBashRegistry::new();
         assert!(!reg.kill("does-not-exist").await);
+    }
+
+    /// True while `pid` names a live process. A zombie still answers, so
+    /// callers poll: init reaps an orphan a moment after it dies.
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn pid_gone_within(pid: i32, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        while tokio::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        !pid_alive(pid)
+    }
+
+    /// Spawns a command list whose shell stays the parent of a backgrounded
+    /// `sleep`, the shape of `./scripts/e2e.sh > log; echo $? > file`. Returns
+    /// the task and the grandchild's pid.
+    #[cfg(unix)]
+    async fn spawn_with_grandchild(
+        reg: &BackgroundBashRegistry,
+        dir: &Path,
+        timeout_secs: u64,
+        thread_id: Option<Uuid>,
+    ) -> (String, i32) {
+        let pidfile = dir.join("grandchild.pid");
+        let command = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, timeout_secs, dir, &[], thread_id)
+            .await
+            .expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                assert!(pid_alive(pid), "the grandchild died before the test began");
+                return (task_id, pid);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the grandchild never wrote its pid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The nightly e2e bug: a stop SIGKILLed the wrapper shell and left
+    /// `e2e.sh` running, holding the e2e lock.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_ends_the_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, grandchild) = spawn_with_grandchild(&reg, dir.path(), 600, None).await;
+
+        assert!(reg.kill(&task_id).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
+        assert!(
+            pid_gone_within(grandchild, Duration::from_secs(5)).await,
+            "the stop left the task's grandchild running"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn timeout_ends_the_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, grandchild) = spawn_with_grandchild(&reg, dir.path(), 1, None).await;
+
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(30)).await);
+        assert!(
+            pid_gone_within(grandchild, Duration::from_secs(5)).await,
+            "the timeout left the task's grandchild running"
+        );
+    }
+
+    /// Discard and Archive end a thread's tasks the same way a stop does.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_for_thread_ends_the_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundBashRegistry::new();
+        let thread = Uuid::new_v4();
+        let (task_id, grandchild) =
+            spawn_with_grandchild(&reg, dir.path(), 600, Some(thread)).await;
+
+        assert_eq!(reg.kill_for_thread(thread).await, 1);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
+        assert!(pid_gone_within(grandchild, Duration::from_secs(5)).await);
+    }
+
+    /// The teardown has only `REAP_WAIT` to reap, so it skips the grace.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn teardown_ends_the_whole_process_group_without_a_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, grandchild) =
+            spawn_with_grandchild(&reg, dir.path(), 600, Some(Uuid::new_v4())).await;
+
+        assert_eq!(reg.hand_over_at_teardown().await.len(), 1);
+        assert!(
+            reg.wait_until_finished(&task_id, Duration::from_secs(2))
+                .await,
+            "the teardown's kill must reap well inside its 3 s budget"
+        );
+        assert!(pid_gone_within(grandchild, Duration::from_secs(5)).await);
+    }
+
+    /// A teardown landing mid-grace cannot use the spent kill channel, and the
+    /// 3 s grace would use up its 3 s `REAP_WAIT`. It cuts the grace short.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn teardown_cuts_short_a_stop_already_in_its_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        let command = format!("trap '' TERM; touch {}; sleep 300 & wait", ready.display());
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, 600, dir.path(), &[], Some(Uuid::new_v4()))
+            .await
+            .expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "trap never installed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reg.kill(&task_id).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(reg.hand_over_at_teardown().await.len(), 1);
+        assert!(
+            reg.wait_until_finished(&task_id, Duration::from_secs(2))
+                .await,
+            "the teardown sat out the stop's grace"
+        );
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert!(record.killed, "the stop still owns this ending");
+        assert!(!record.abandoned);
+    }
+
+    /// A stop is SIGTERM first, so `e2e.sh` can release its lock and a
+    /// Playwright runner can close the browsers it detached.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_lets_a_term_trap_run_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("trapped");
+        let ready = dir.path().join("ready");
+        let command = format!(
+            "trap 'echo yes > {}; exit 0' TERM; touch {}; sleep 300 & wait",
+            marker.display(),
+            ready.display()
+        );
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, 600, dir.path(), &[], None)
+            .await
+            .expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "trap never installed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(reg.kill(&task_id).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
+        assert!(
+            marker.exists(),
+            "the stop never gave the TERM trap a chance"
+        );
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
+        assert!(
+            snap.killed,
+            "the trap's clean exit must not hide that a stop ended the task"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_still_ends_a_command_that_ignores_term() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        let command = format!("trap '' TERM; touch {}; sleep 300 & wait", ready.display());
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, 600, dir.path(), &[], None)
+            .await
+            .expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "trap never installed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(reg.kill(&task_id).await);
+        assert!(
+            reg.wait_for_finish(&task_id, Duration::from_secs(20)).await,
+            "the SIGKILL after the grace never came"
+        );
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(9)));
+    }
+
+    /// Only an explicit ending signals the group. A task that exits on its
+    /// own keeps ADR 0100's promise: a deliberate detach survives.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_that_exits_on_its_own_leaves_its_detached_child_alone() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "sleep 30 > /dev/null 2>&1 & echo $!",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(10)).await);
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
+        let detached: i32 = snap.stdout.trim().parse().expect("the sleeper's pid");
+
+        let survived = pid_alive(detached);
+        // SAFETY: plain signal to a pid this test started.
+        unsafe {
+            libc::kill(detached, libc::SIGKILL);
+        }
+        assert!(survived, "a natural exit must not signal the task's group");
     }
 
     #[tokio::test]
@@ -1308,9 +1644,8 @@ mod tests {
         assert!(snap.finished);
         assert!(snap.timed_out, "timed_out flag should be true");
         assert!(!snap.killed);
-        // Same as the kill path: the watchdog's own SIGKILL is now recorded
-        // instead of being dropped on the floor.
-        assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(9)));
+        // Same as the kill path: the watchdog records the signal it sent.
+        assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(15)));
         assert_eq!(
             snap.outcome.unwrap().exit_code(),
             None,
@@ -1551,7 +1886,7 @@ mod tests {
         );
 
         assert!(reg.kill(&task_id).await);
-        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(8)).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
         assert!(!reg.is_running(&task_id).await);
         assert!(!reg.is_running("never-spawned").await);
     }
@@ -1617,7 +1952,7 @@ mod tests {
         assert!(stderr.contains("the engine was shutting down"), "{stderr}");
         assert!(
             stderr.contains("may still be running"),
-            "a single-pid SIGKILL cannot promise the pipeline stopped: {stderr}"
+            "a group kill cannot reach a detached session: {stderr}"
         );
         assert!(
             record.stdout.contains("mid-flight"),
@@ -1626,41 +1961,56 @@ mod tests {
         );
     }
 
-    /// [`ending`] as a truth table, which is the only way to cover it. Every
-    /// row below is a real interleaving, and three of them live inside the
-    /// watchdog's 2 s drain join. Racing a real child into that window makes a
-    /// test that fails in both directions under suite load. It says nothing
-    /// about the product when it does.
+    /// [`ending`] only names who decided a signal that landed. Whether it
+    /// landed on a live child is [`end_task`]'s call, tested below.
     #[test]
-    fn ending_claims_nothing_our_signal_did_not_do() {
-        // (abandoned mark, killed arm, reaped outcome) -> (abandoned, killed)
+    fn ending_names_the_decider_of_a_signal_that_landed() {
+        // (abandoned mark, signal landed) -> (abandoned, killed)
         let cases = [
-            // The teardown killed live work. The case the flag exists for.
-            ((true, true, TaskOutcome::Signaled(9)), (true, false)),
-            // `bash_kill` killed live work: same signal, different decider.
-            ((false, true, TaskOutcome::Signaled(9)), (false, true)),
-            // The child exited before either signal arrived, and the release
-            // it was running really did ship.
-            ((true, true, TaskOutcome::Exited(0)), (false, false)),
-            ((false, true, TaskOutcome::Exited(1)), (false, false)),
-            // The watchdog's own budget. Its arm never takes the kill signal,
-            // so the mark can land, but `timed_out` owns this ending.
-            ((true, false, TaskOutcome::Signaled(9)), (false, false)),
-            // A signal from outside, which keeps its own number.
-            ((true, false, TaskOutcome::Signaled(11)), (false, false)),
-            // Nothing engine-side happened at all.
-            ((false, false, TaskOutcome::Exited(0)), (false, false)),
+            // The teardown ended live work. The case the flag exists for.
+            ((true, true), (true, false)),
+            // `bash_kill` ended live work: same channel, different decider.
+            ((false, true), (false, true)),
+            // The child was gone first, or the watchdog's budget ended it and
+            // `timed_out` owns the ending. The mark alone claims nothing.
+            ((true, false), (false, false)),
+            ((false, false), (false, false)),
         ];
-        for ((abandoned_mark, killed_arm, outcome), want) in cases {
+        for ((abandoned_mark, landed), want) in cases {
             let mut task = BackgroundTask::for_test();
             task.abandoned = abandoned_mark;
-            task.killed = killed_arm;
-            assert_eq!(
-                ending(&task, outcome),
-                want,
-                "mark={abandoned_mark} killed={killed_arm} outcome={outcome:?}"
-            );
+            task.killed = landed;
+            assert_eq!(ending(&task), want, "mark={abandoned_mark} landed={landed}");
         }
+    }
+
+    /// A child that exits just before the stop keeps its verdict: a release
+    /// that exited 0 in that window really shipped. It sits unreaped here, as
+    /// in the watchdog's race, and `end_task` must reap it, not signal it.
+    #[tokio::test]
+    async fn end_task_keeps_the_verdict_of_a_child_that_already_exited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let done = dir.path().join("done");
+        let mut cmd = command_shell().command(&format!("touch {}; exit 3", done.display()));
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn");
+        let pid = child.id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (outcome, signalled) = end_task(&mut child, pid, Stop::Graceful, &Notify::new()).await;
+        assert_eq!(outcome, TaskOutcome::Exited(3));
+        assert!(
+            !signalled,
+            "a stop must not claim work that had already ended"
+        );
     }
 
     /// An earlier `bash_kill` owns the ending, and the shutdown must not take
@@ -1721,7 +2071,7 @@ mod tests {
         let record = reg.completion_record(&task_id).await.expect("record");
         assert!(record.timed_out, "its own budget ended it, and says so");
         assert!(!record.abandoned);
-        assert_eq!(record.outcome, TaskOutcome::Signaled(9));
+        assert_eq!(record.outcome, TaskOutcome::Signaled(15));
     }
 
     /// The teardown-versus-watchdog race. Both go through `completion_record`,
@@ -1917,10 +2267,8 @@ mod tests {
         );
     }
 
-    /// Retention must not make a finished task read as running. The
-    /// agent-session idle handler keeps a coding agent alive while this is
-    /// true, so a retained task counted as running would pin the session open
-    /// for the whole grace window.
+    /// Retention must not make a finished task read as running, or the engine
+    /// would arm an event wait for work that is already done.
     #[tokio::test]
     async fn has_running_for_thread_is_false_for_a_retained_finished_task() {
         let reg = BackgroundBashRegistry::new();
@@ -2040,8 +2388,8 @@ mod tests {
         );
         assert!(reg.kill(&task_id).await);
 
-        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(8)).await;
-        assert!(finished, "task did not finish within 8s after kill");
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(20)).await;
+        assert!(finished, "task did not finish within 20s after kill");
 
         let record = reg
             .completion_record(&task_id)
@@ -2068,16 +2416,9 @@ mod tests {
         reg.kill(&task_id).await;
     }
 
-    /// `has_running_for_thread` is the core hook the agent-session idle
-    /// handler uses to decide whether to skip propose+terminate. The pre-
-    /// fix bug was the engine treating a CC that idled while its own
-    /// `run_bash_background` tests were still running as "CC is done":
-    /// the change auto-proposed, CC was killed, and an Apply click then
-    /// fell through `apply_now`'s stale-session fallback into a fresh
-    /// /harden-from-scratch in a `harden-*` worktree. With per-task
-    /// thread_id tracking, the idle handler can ask the registry "does
-    /// my thread still have unfinished bg bash?" and keep CC alive +
-    /// suppress the propose until the bash actually completes.
+    /// `has_running_for_thread` answers per thread, never across threads: the
+    /// engine-armed event wait it gates would otherwise arm on, or skip, work
+    /// that belongs to someone else.
     #[tokio::test]
     async fn has_running_for_thread_tracks_unfinished_tasks_per_thread() {
         let reg = BackgroundBashRegistry::new();
@@ -2112,13 +2453,74 @@ mod tests {
         // Kill → the task is finished → has_running_for_thread flips back,
         // whether or not the entry is still retained for a late drain.
         assert!(reg.kill(&task_id).await);
-        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(20)).await;
         assert!(finished);
 
         assert!(
             !reg.has_running_for_thread(my_thread).await,
             "a finished task must NOT keep registering as running"
         );
+    }
+
+    /// Discard and Archive kill a thread's background tasks through this. It
+    /// must reach every running task of that thread, and nothing of another.
+    #[tokio::test]
+    async fn kill_for_thread_kills_only_that_threads_running_tasks() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let other_thread = Uuid::new_v4();
+        let tmp = std::path::Path::new("/tmp");
+        let (mine_a, _a) = reg
+            .spawn("sleep 30", 60, tmp, &[], Some(my_thread))
+            .await
+            .expect("spawn");
+        let (mine_b, _b) = reg
+            .spawn("sleep 30", 60, tmp, &[], Some(my_thread))
+            .await
+            .expect("spawn");
+        let (theirs, _c) = reg
+            .spawn("sleep 30", 60, tmp, &[], Some(other_thread))
+            .await
+            .expect("spawn");
+
+        assert_eq!(reg.kill_for_thread(my_thread).await, 2);
+        for task_id in [&mine_a, &mine_b] {
+            assert!(reg.wait_for_finish(task_id, Duration::from_secs(20)).await);
+            let record = reg.completion_record(task_id).await.expect("finished");
+            assert!(record.killed, "a thread kill records the task as killed");
+        }
+        assert!(
+            reg.is_running(&theirs).await,
+            "another thread's task must keep running"
+        );
+        assert_eq!(
+            reg.kill_for_thread(my_thread).await,
+            0,
+            "nothing left to kill on a second call"
+        );
+        reg.kill(&theirs).await;
+    }
+
+    /// The ownership check the agent routes use before reading or stopping a
+    /// task by id.
+    #[tokio::test]
+    async fn spawned_by_names_the_owning_thread_and_knows_what_it_does_not_hold() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let (task_id, _rx) = reg
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(my_thread),
+            )
+            .await
+            .expect("spawn");
+        assert_eq!(reg.spawned_by(&task_id, my_thread).await, Some(true));
+        assert_eq!(reg.spawned_by(&task_id, Uuid::new_v4()).await, Some(false));
+        assert_eq!(reg.spawned_by("no-such-task", my_thread).await, None);
+        reg.kill(&task_id).await;
     }
 
     /// `running_for_thread` is the same question `has_running_for_thread`
@@ -2179,7 +2581,7 @@ mod tests {
         // the tail would arm a wait for work that already finished, and that
         // wait can never fire.
         assert!(reg.kill(&task_id).await);
-        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
         assert!(
             reg.running_for_thread(my_thread).await.is_empty(),
             "a finished task must not still be reported as running"

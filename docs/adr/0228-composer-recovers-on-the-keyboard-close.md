@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-20
+- **Read first**: [ADR 0262](0262-ios-autocorrect-eats-the-send-tap.md) names
+  the cause. iOS autocorrect keeps the tap, and no relayout reaches it. The
+  keyboard close below was the user's recovery, not the trigger.
 
 ## Context
 

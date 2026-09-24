@@ -62,15 +62,15 @@ const ENGINE_CRASHED_NOTE: &str =
 /// killed the task and waited for the reap, so the output above it is
 /// everything the task ever wrote.
 ///
-/// **It still does not promise the work stopped.** The kill is a single-pid
-/// SIGKILL at the `bash -c` wrapper rather than at its process group. A
-/// pipeline or a command list therefore leaves its real work reparented to
-/// init, and the commands this exists for are exactly that shape. Telling an
-/// agent to re-run one would start a second release beside the first.
-const ENGINE_STOPPED_NOTE: &str = "[the engine was shutting down, so it killed this task. The \
-                                   work did not finish. Only the task's own shell was signalled, \
-                                   so anything it had piped or detached may still be running: \
-                                   check before starting the same work again]";
+/// The kill reaches the task's whole process group, so a pipeline or a command
+/// list stops with its shell. **It still stops short of "nothing is running".**
+/// A process that left the group, through `setsid` or a browser detaching
+/// itself, is out of reach. Telling an agent to re-run a release that one of
+/// those carried on would start a second beside the first.
+const ENGINE_STOPPED_NOTE: &str = "[the engine was shutting down, so it killed this task and \
+                                   every process in its group. The work did not finish. A \
+                                   process that detached into its own session may still be \
+                                   running: check before starting the same work again]";
 
 /// Tasks with a `BackgroundBashStarted` and no matching `BackgroundBashCompleted`.
 ///

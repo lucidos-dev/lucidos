@@ -1,32 +1,17 @@
 /** Geometry for the mobile transcript's own scroll indicator.
  *
- *  WHY we draw one at all, instead of letting WebKit draw its overlay indicator:
- *  on mobile the app header is `position: fixed` and the header space inside the
- *  transcript is a `::before` spacer INSIDE the scroll container, with the thread
- *  title bar `position: sticky` inside it too (styles/mobile.css). Both are
- *  deliberate, because content has to scroll up UNDER the chrome for
- *  hide-on-scroll to reclaim the space. The consequence is that
- *  `.thread-content`'s box starts at viewport y=0, and a scrollbar is laid out
- *  against its scroller's padding box, so the native indicator's track spans the
- *  full pane including the two header-heights of opaque chrome covering its top.
- *  It therefore painted inside the thread title band and its thumb sat well above
- *  the content it was reporting on. Nothing in CSS insets an overlay indicator: a
- *  `border-top` would shrink the track but is not scrollable, which would kill
- *  hide-on-scroll. So the native one is suppressed on this one scroller and we
- *  position our own against the region the content actually occupies.
+ *  WHY mobile draws one: the app header is `position: fixed`, and the header
+ *  space is a `::before` spacer INSIDE the scroller (styles/mobile.css). Content
+ *  has to scroll up under the chrome for hide-on-scroll to reclaim that space.
+ *  So a native overlay indicator spans the chrome covering the scroller's top,
+ *  and nothing in CSS insets it. We suppress it and draw our own over the region
+ *  the content occupies.
  *
- *  WHY the window arithmetic: the transcript is windowed (threadWindow.ts renders
- *  only a trailing slice of exchanges), so the scroller's own metrics describe the
- *  rendered TAIL, not the thread. Deep in a long conversation that put the native
- *  thumb near the top of its track while the content on screen was nowhere near
- *  the start. These helpers extend the range by an ESTIMATE of the un-rendered
- *  head so the thumb reports position in the thread.
+ *  It measures the DRAWN slice, as a native scrollbar does (ADR 0258). The
+ *  transcript draws a window of a paged thread, and no estimate of the undrawn
+ *  history is right on every thread. So the thumb jumps when older turns draw.
  *
- *  Pure and DOM-free on purpose: the arithmetic is the part worth pinning, and the
- *  misplacement itself only reproduces on a real iOS device (see
- *  utils/scrollbarGutter.ts on why no emulator models WebKit's overlay
- *  scrollbars), so unit tests over these functions are the deterministic gate.
- */
+ *  Pure and DOM-free, so unit tests over these functions are the gate. */
 
 /** Smallest thumb we will draw, in px. Below this a thumb on a very long thread
  *  becomes a dot that is hard to see and hard to read a position from. Matches
@@ -44,10 +29,8 @@ export const MIN_THUMB_PX = 24;
  *  again, so this only ever trades away precision at the short end.
  *
  *  A quarter rather than a half: half a track still reads as a bar rather than a
- *  marker, and clamping a wider band of thread lengths to one size also steadies
- *  the thumb, since a windowed transcript keeps re-estimating its own length as
- *  the render window grows (see estimateUnrenderedHeightPx) and every such
- *  re-estimate resizes an uncapped thumb mid-scroll. */
+ *  marker. Clamping a wider band of lengths to one size also steadies the thumb
+ *  while the render window grows. */
 export const MAX_THUMB_FRACTION = 0.25;
 
 /** What a single scroll event says about why the scroller moved. */
@@ -155,7 +138,7 @@ export function counterScaledRadiusPx(halfWidthPx: number, scaleY: number): numb
   return halfWidthPx / scaleY;
 }
 
-/** Scroller metrics plus the render window, as read from the DOM by the caller. */
+/** Scroller metrics, as read from the DOM by the caller. */
 export interface ScrollIndicatorInput {
   /** `el.scrollTop`, may be negative or past the max during iOS elastic bounce. */
   scrollTop: number;
@@ -163,11 +146,6 @@ export interface ScrollIndicatorInput {
   scrollHeight: number;
   /** `el.clientHeight`. */
   clientHeight: number;
-  /** Index of the first RENDERED exchange (`computeRenderFromIndex`). 0 = the
-   *  whole thread is in the DOM. */
-  renderFromIndex: number;
-  /** Total exchanges in the thread, rendered or not. */
-  totalExchanges: number;
   /** Height of the indicator's track, in px. */
   trackHeightPx: number;
 }
@@ -184,35 +162,8 @@ export interface ScrollIndicatorGeometry {
 const HIDDEN: ScrollIndicatorGeometry = { visible: false, thumbHeightPx: 0, thumbOffsetPx: 0 };
 
 /**
- * Estimated height, in px, of the exchanges that exist above the render window.
- *
- * The scroller cannot answer this: those exchanges are not in the DOM, so they
- * contribute no height. The estimate is the rendered slice's mean exchange
- * height times the number missing. It is biased (the tail of a coding-agent
- * thread carries the longest turns), but it is monotonic in the number missing
- * and it collapses to an exact 0 the moment the window covers everything, which
- * is what makes the thumb settle onto the true position as the user scrolls up
- * and the window grows.
- *
- * Returns 0 whenever the answer would be meaningless: nothing missing, nothing
- * rendered to average over, or a scroller with no content.
- */
-export function estimateUnrenderedHeightPx(input: ScrollIndicatorInput): number {
-  const { renderFromIndex, totalExchanges, scrollHeight } = input;
-  const missing = Math.max(0, Math.min(renderFromIndex, totalExchanges));
-  if (missing === 0) return 0;
-  const rendered = totalExchanges - missing;
-  if (rendered <= 0 || !(scrollHeight > 0)) return 0;
-  return (scrollHeight / rendered) * missing;
-}
-
-/**
- * Thumb size and position within the track.
- *
- * The mapping runs over a VIRTUAL scroll range: the real one extended upward by
- * `estimateUnrenderedHeightPx`. The thumb's size is the viewport's share of that
- * virtual range and its offset is the viewport's position within it, so both
- * halves describe the thread rather than the rendered window.
+ * Thumb size and position within the track: the viewport's share of the
+ * scroller's content, and its position within it.
  *
  * `scrollTop` is clamped before use: iOS elastic bounce reports values below 0
  * and past the maximum, which would otherwise push the thumb out of the track at
@@ -222,27 +173,21 @@ export function computeScrollIndicator(input: ScrollIndicatorInput): ScrollIndic
   const { scrollHeight, clientHeight, trackHeightPx } = input;
   if (!(trackHeightPx > 0) || !(clientHeight > 0) || !(scrollHeight > clientHeight)) return HIDDEN;
 
-  const unrenderedPx = estimateUnrenderedHeightPx(input);
-  const virtualHeight = scrollHeight + unrenderedPx;
-
   const maxScroll = scrollHeight - clientHeight;
   const scrollTop = Math.min(Math.max(0, input.scrollTop), maxScroll);
-  const virtualTop = scrollTop + unrenderedPx;
-  const virtualMaxScroll = virtualHeight - clientHeight;
 
   // Floored so a very long thread still shows something readable, and ceilinged
   // so a short one does not (see MAX_THUMB_FRACTION). The ceiling is itself held
   // to the track, which is what keeps a pane too short to fit the floor from
   // producing a thumb taller than the track it sits in.
-  const rawThumb = (clientHeight / virtualHeight) * trackHeightPx;
+  const rawThumb = (clientHeight / scrollHeight) * trackHeightPx;
   const ceiling = Math.min(trackHeightPx, Math.max(MIN_THUMB_PX, trackHeightPx * MAX_THUMB_FRACTION));
   const thumbHeightPx = Math.min(ceiling, Math.max(MIN_THUMB_PX, rawThumb));
 
   // Position over the travel that is actually left once the floored thumb has
   // taken its share, so the thumb still lands flush with both ends of the track.
-  // virtualMaxScroll > 0 holds because scrollHeight > clientHeight above.
-  const progress = virtualTop / virtualMaxScroll;
-  const thumbOffsetPx = progress * (trackHeightPx - thumbHeightPx);
+  // maxScroll > 0 holds because scrollHeight > clientHeight above.
+  const thumbOffsetPx = (scrollTop / maxScroll) * (trackHeightPx - thumbHeightPx);
 
   return { visible: true, thumbHeightPx, thumbOffsetPx };
 }

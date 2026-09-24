@@ -6,28 +6,33 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The test env is `node` (no jsdom) — stub the DOM classes stampNoAutofill keys
-// off, matching the dom.test.ts pattern. Each stub carries a real attribute map
-// so hasAttribute/setAttribute behave like the DOM.
+// The test env is `node` (no jsdom), so stub the elements stampNoAutofill reads,
+// matching the dom.test.ts pattern. Each stub carries a real attribute map so
+// hasAttribute/setAttribute behave like the DOM, and the `localName` that
+// `isTextEntryField` keys off.
 class AttrEl {
   private attrs = new Map<string, string>();
   hasAttribute(n: string) { return this.attrs.has(n); }
   setAttribute(n: string, v: string) { this.attrs.set(n, v); }
   getAttribute(n: string) { return this.attrs.get(n) ?? null; }
+  removeAttribute(n: string) { this.attrs.delete(n); }
 }
 if (typeof (globalThis as any).Element === 'undefined') {
   (globalThis as any).Element = class Element extends AttrEl {};
 }
 if (typeof (globalThis as any).HTMLInputElement === 'undefined') {
   (globalThis as any).HTMLInputElement = class HTMLInputElement extends (globalThis as any).Element {
+    localName = 'input';
     type = 'text';
   };
 }
 if (typeof (globalThis as any).HTMLTextAreaElement === 'undefined') {
-  (globalThis as any).HTMLTextAreaElement = class HTMLTextAreaElement extends (globalThis as any).Element {};
+  (globalThis as any).HTMLTextAreaElement = class HTMLTextAreaElement extends (globalThis as any).Element {
+    localName = 'textarea';
+  };
 }
 
-import { stampNoAutofill, sweepNoAutofill, PROSE_TEXT_ATTRS } from './noAutofill';
+import { stampNoAutofill, sweepNoAutofill, setProseAutocorrect, PROSE_TEXT_ATTRS } from './noAutofill';
 
 function input(type = 'text') {
   const el = new (globalThis as any).HTMLInputElement();
@@ -142,6 +147,49 @@ describe('PROSE_TEXT_ATTRS', () => {
     stampNoAutofill(el);
     expect(el.getAttribute('autocorrect')).toBe('off');
     expect(el.getAttribute('autocapitalize')).toBe('off');
+  });
+});
+
+// The device's Autocorrect switch. Off is the fix for the dead Send button on
+// iOS: UIKit's autocorrect keeps the tap on a control below the last word.
+describe('the autocorrect switch', () => {
+  it('turns autocorrect off on a prose field when the switch is off', () => {
+    const el = prose();
+    stampNoAutofill(el, false);
+    expect(el.getAttribute('autocorrect')).toBe('off');
+  });
+
+  it('keeps sentence capitalization and spell-check on a prose field', () => {
+    // Only autocorrect follows the switch. Typos stay underlined, and a
+    // sentence still starts with a capital.
+    const el = prose();
+    stampNoAutofill(el, false);
+    expect(el.getAttribute('autocapitalize')).toBeNull();
+    expect(el.getAttribute('spellcheck')).toBeNull();
+  });
+
+  it('leaves a non-prose field exactly as it was', () => {
+    const el = textarea();
+    stampNoAutofill(el, false);
+    for (const a of NO_AUTOFILL) expect(el.getAttribute(a), a).toBe('off');
+  });
+
+  it('re-stamps every mounted field when the switch flips, both ways', () => {
+    // iOS reads the attribute when a field takes focus, so a field stamped
+    // before the flip would otherwise keep the old behavior.
+    const proseField = prose();
+    const configField = textarea();
+    const root = { querySelectorAll: () => [proseField, configField] } as any;
+    sweepNoAutofill(root);
+    expect(proseField.getAttribute('autocorrect')).toBeNull();
+
+    setProseAutocorrect(false, root);
+    expect(proseField.getAttribute('autocorrect')).toBe('off');
+    expect(configField.getAttribute('autocorrect')).toBe('off');
+
+    setProseAutocorrect(true, root);
+    expect(proseField.getAttribute('autocorrect')).toBeNull();
+    expect(configField.getAttribute('autocorrect')).toBe('off');
   });
 });
 

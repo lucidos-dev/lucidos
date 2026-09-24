@@ -117,6 +117,8 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:id/blobs",
     "/threads/:id/compose",
     "/threads/:thread_id/answer-question",
+    "/threads/:thread_id/background-tasks",
+    "/threads/:thread_id/background-tasks/:task_id/stop",
     "/threads/:thread_id/continue",
     "/threads/:thread_id/event-waits",
     "/threads/:thread_id/event-waits/:wait_id/cancel",

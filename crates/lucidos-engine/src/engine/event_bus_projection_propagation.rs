@@ -18,7 +18,8 @@ use crate::engine::thread_lifecycle::{
     is_attention_needing, is_blocking, ArchiveState, ThreadStatus, ThreadType,
 };
 
-/// Sample of the five `thread_summaries` columns that feed `is_blocking`.
+/// Sample of the `thread_summaries` columns that feed `is_blocking` and
+/// `is_attention_needing`.
 /// Loaded before and after every projection update so the projection can
 /// detect a flip and propagate the delta to ancestors via
 /// `blocking_descendant_count`.
@@ -28,6 +29,7 @@ pub(crate) struct BlockingSample {
     archive_state: ArchiveState,
     has_pending_changes: bool,
     is_external_repo: bool,
+    is_stopped_child: bool,
 }
 
 impl BlockingSample {
@@ -48,11 +50,12 @@ impl BlockingSample {
             self.archive_state,
             self.has_pending_changes,
             self.is_external_repo,
+            self.is_stopped_child,
         )
     }
 }
 
-/// Read the five is_blocking-relevant columns for `thread_id`. Returns
+/// Read the blocking- and attention-relevant columns for `thread_id`. Returns
 /// `Ok(None)` when the row doesn't exist (e.g. a thread-start event running
 /// before its own INSERT). The wrapper that calls this treats "no row" as
 /// "was not blocking", so the freshly-inserted row's first sample propagates
@@ -61,9 +64,9 @@ pub(crate) async fn load_blocking_sample(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
 ) -> Result<Option<BlockingSample>, sqlx::Error> {
-    let row: Option<(bool, String, String, bool, bool)> = sqlx::query_as(
+    let row: Option<(bool, String, String, bool, bool, bool)> = sqlx::query_as(
         "SELECT is_coding_agent, status, archive_state, coding_agent_proposed, \
-                coding_agent_is_external_repo \
+                coding_agent_is_external_repo, is_stopped_child \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -76,6 +79,7 @@ pub(crate) async fn load_blocking_sample(
             archive_state_str,
             coding_agent_proposed,
             coding_agent_is_external_repo,
+            is_stopped_child,
         )| {
             BlockingSample {
                 thread_type: if is_coding_agent {
@@ -87,6 +91,7 @@ pub(crate) async fn load_blocking_sample(
                 archive_state: ArchiveState::parse(&archive_state_str),
                 has_pending_changes: coding_agent_proposed,
                 is_external_repo: coding_agent_is_external_repo,
+                is_stopped_child,
             }
         },
     ))
@@ -196,18 +201,66 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
 /// `AND parent_thread_id IS NOT NULL` keeps the write off a parentless row,
 /// which under this polarity would otherwise be told it owes some parent a
 /// card. The storage default is FALSE for exactly that reason.
+///
+/// New work also ends a *stopped child*: the turn it starts is what will
+/// report, so `is_stopped_child` clears in the same write (ADR 0252).
 pub(crate) async fn mark_parent_callback_pending(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE thread_summaries SET parent_callback_pending = TRUE \
+        "UPDATE thread_summaries SET parent_callback_pending = TRUE, is_stopped_child = FALSE \
          WHERE thread_id = $1 AND parent_thread_id IS NOT NULL",
     )
     .bind(child_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Make `child_id` a *stopped child*, because a user Stop just ended its turn
+/// (ADR 0252). Only a child still owed a card qualifies: with the marker
+/// already clear, the parent has heard about this turn and is owed nothing.
+/// A top-thread never matches, having no parent.
+pub(crate) async fn mark_stopped_child(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    child_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE thread_summaries SET is_stopped_child = TRUE \
+         WHERE thread_id = $1 AND parent_thread_id IS NOT NULL AND parent_callback_pending",
+    )
+    .bind(child_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Settle what `child_id` owed its parent, because the parent's
+/// `ChildThreadCompleted` for it just landed. Clears both the marker and
+/// `is_stopped_child`, and returns whether the child WAS stopped.
+///
+/// The caller needs that answer because this write lands on the CHILD's row
+/// inside the PARENT's event. The projection samples attention only for the
+/// thread whose event it is, so a stopped child's settle has to reconcile its
+/// ancestors itself. The row lock keeps the returned value honest under a
+/// concurrent emit.
+pub(crate) async fn settle_parent_callback(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    child_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let was_stopped: Option<bool> = sqlx::query_scalar(
+        "UPDATE thread_summaries t \
+         SET parent_callback_pending = FALSE, is_stopped_child = FALSE \
+         FROM (SELECT thread_id, is_stopped_child FROM thread_summaries \
+               WHERE thread_id = $1 FOR UPDATE) prev \
+         WHERE t.thread_id = prev.thread_id \
+         RETURNING prev.is_stopped_child",
+    )
+    .bind(child_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(was_stopped.unwrap_or(false))
 }
 
 /// Bump the direct parent's `active_children_count` when an event flipped
@@ -289,7 +342,7 @@ pub(crate) async fn reincrement_parent_active_count_if_revived(
 ///
 /// One SQL roundtrip, both columns updated in lockstep — keeps them from
 /// desyncing under concurrent emits.
-async fn reconcile_blocking_descendant_count_for_ancestors(
+pub(crate) async fn reconcile_blocking_descendant_count_for_ancestors(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
@@ -306,12 +359,14 @@ async fn reconcile_blocking_descendant_count_for_ancestors(
          ), \
          descendants AS ( \
             SELECT a.thread_id AS root_id, c.thread_id, c.status, c.archive_state, \
-                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo \
+                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
+                   c.is_stopped_child \
             FROM ancestors a \
             JOIN thread_summaries c ON c.parent_thread_id = a.thread_id \
             UNION \
             SELECT d.root_id, c.thread_id, c.status, c.archive_state, \
-                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo \
+                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
+                   c.is_stopped_child \
             FROM descendants d \
             JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
          ), \
@@ -326,8 +381,9 @@ async fn reconcile_blocking_descendant_count_for_ancestors(
                    COALESCE(COUNT(*) FILTER ( \
                        WHERE d.status = 'waiting_for_user_answer' \
                           OR (d.archive_state <> 'archived' \
-                              AND d.coding_agent_proposed AND d.is_coding_agent \
-                              AND NOT d.coding_agent_is_external_repo) \
+                              AND ((d.coding_agent_proposed AND d.is_coding_agent \
+                                    AND NOT d.coding_agent_is_external_repo) \
+                                   OR d.is_stopped_child)) \
                    ), 0)::int AS attention_cnt \
             FROM ancestors a \
             LEFT JOIN descendants d ON d.root_id = a.thread_id \
@@ -489,14 +545,14 @@ impl EventBus {
                 SELECT t.thread_id AS root_id, \
                        c.thread_id, c.status, c.archive_state, \
                        c.coding_agent_proposed, c.is_coding_agent, \
-                       c.coding_agent_is_external_repo \
+                       c.coding_agent_is_external_repo, c.is_stopped_child \
                 FROM thread_summaries t \
                 JOIN thread_summaries c ON c.parent_thread_id = t.thread_id \
                 UNION \
                 SELECT d.root_id, \
                        c.thread_id, c.status, c.archive_state, \
                        c.coding_agent_proposed, c.is_coding_agent, \
-                       c.coding_agent_is_external_repo \
+                       c.coding_agent_is_external_repo, c.is_stopped_child \
                 FROM descendants d \
                 JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
              ) \
@@ -514,8 +570,9 @@ impl EventBus {
                         COUNT(*) FILTER ( \
                             WHERE status = 'waiting_for_user_answer' \
                                OR (archive_state <> 'archived' \
-                                   AND coding_agent_proposed AND is_coding_agent \
-                                   AND NOT coding_agent_is_external_repo) \
+                                   AND ((coding_agent_proposed AND is_coding_agent \
+                                         AND NOT coding_agent_is_external_repo) \
+                                        OR is_stopped_child)) \
                         ) AS attention_cnt \
                  FROM descendants \
                  GROUP BY root_id \

@@ -11,7 +11,14 @@ use axum::{
     Json,
 };
 
+use std::collections::HashMap;
+
 use crate::api::AppState;
+use crate::engine::agent_question::{
+    answer_pending_question, lookup_pending_question_tool_use_id, AnswerResult,
+};
+use crate::engine::thread_events::AnswerKind;
+use crate::engine::thread_lifecycle::LifecycleViolation;
 
 use super::extract_thread_uuid;
 use super::family::{
@@ -51,10 +58,11 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 /// POST /api/v1/threads/archive — cascading archive of a thread + every descendant.
 ///
 /// Inside one transaction the recursive CTE locks parent + all descendants
-/// (`FOR UPDATE`), then `classify_family` runs the parent gate
-/// (Running / in-workspace CC with pending change — an already-archived parent
-/// is idempotent, not a rejection) and the per-descendant gate via
-/// `is_blocking`. If anyone blocks, the lock is dropped and the caller gets
+/// (`FOR UPDATE`), then `classify_family` runs the parent gate and the
+/// per-descendant gate via `is_blocking`. The parent gate refuses Running, a
+/// thread waiting on the user (ADR 0259), and an in-workspace CC with a pending
+/// change. An already-archived parent is idempotent, not a rejection. If anyone
+/// blocks, the lock is dropped and the caller gets
 /// `409` with a structured body
 /// (`reason: parent_not_archivable | parent_has_pending_changes | descendants_blocking`).
 ///
@@ -64,15 +72,13 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 /// their changes cleared via `emit_change_applied` first, then every member
 /// goes through the per-thread cascade step:
 ///
-///   1. `resolve_pending_question_as_canceled` cancel-stamps any orphaned
-///      QuestionCard so its answer buttons render disabled rather than
-///      dangling clickable on the archived thread. The cascade gate only
-///      blocks `WaitingForUserAnswer` while the surrounding turn is *live* —
-///      a question whose turn ended in `CodingAgentIdled` / `ResponseAborted`
-///      / `ResponseFailed` without an answer leaves the row at `status=idle`
-///      but the QuestionCard dangling, so we always cancel-stamp before
-///      archiving. Fire-and-forget (returns void; conflicts are logged
-///      inside the helper).
+///   1. The orphaned QuestionCard, if any, is cancel-stamped, so its answer
+///      buttons render disabled on the archived thread. A turn can end without
+///      an answer (`CodingAgentIdled`, `ResponseAborted`, `ResponseFailed`).
+///      That leaves the row idle with the card dangling, and the gate admits
+///      it. The card is picked while the family lock is held, so a question
+///      asked after the lock drops is never cancelled (ADR 0259). A conflict
+///      (the user answered first) is logged, not propagated.
 ///   2. `stop_agent(StopReason::Archive)` kills any *live* Claude Code
 ///      subprocess so it doesn't leak in `running_sessions` until engine
 ///      restart — but ONLY when `is_agent_running_for` is true. We do not
@@ -82,19 +88,24 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 ///      inside this request; on a stale-waiting CC family that serialized
 ///      teardown is what made a big archive take ~60s, time the client out,
 ///      and provoke a duplicate-cascade retry. The `ThreadArchived` emit
-///      below settles the projection on its own (Running is gated out;
-///      WaitingForUserAnswer is cancel-stamped in step 1), and the async
-///      worktree-cleanup worker GCs the worktree on its own schedule.
+///      below settles the projection on its own (the gate refuses Running
+///      and WaitingForUserAnswer), and the async worktree-cleanup worker
+///      GCs the worktree on its own schedule.
 ///      Best-effort — errors are logged at warning level, not propagated,
 ///      because we still want the `ThreadArchived` emit to land. Any live
 ///      session reached here was already in the post-idle window (the
 ///      cascade gate rejects `Running`) and doesn't need the 2s
 ///      terminal-event wait the legacy single-thread handler used for
 ///      actively-working CC.
-///   3. `ThreadArchived` emit.
+///   3. `ThreadArchived` emit. The bus refuses it on a member that parked
+///      after the lock dropped, and that member is skipped rather than
+///      failing the call.
 ///
-/// Already-archived rows are skipped — no duplicate emit. Response:
-/// `{"archived": [<uuid>, ...]}`.
+/// Then, when the root still owed its parent a card, the parent gets the
+/// canceled card (ADR 0252, ADR 0254).
+///
+/// Already-archived rows are skipped, so nothing is emitted twice. Response:
+/// `{"archived": [<uuid>, ...]}`, the members this call archived.
 pub(in crate::api) async fn archive_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -132,6 +143,18 @@ pub(in crate::api) async fn archive_thread(
     }
     let to_archive = not_yet_archived(&family);
     let external_repo_pending = external_repo_pending(&family);
+
+    // Under the lock no member can park: a new question's projection write
+    // waits on it. So every question still pending here is an orphan. The loop
+    // cancels exactly these, never one a member asks after the lock drops.
+    let mut orphaned_questions = HashMap::new();
+    for tid in &to_archive {
+        if let Some(tool_use_id) =
+            lookup_pending_question_tool_use_id(state.engine.pool(), *tid).await
+        {
+            orphaned_questions.insert(*tid, tool_use_id);
+        }
+    }
 
     // Commit the FOR UPDATE lock first; emits go through EventBus, each in
     // its own transaction with projection updates. The race window between
@@ -187,19 +210,29 @@ pub(in crate::api) async fn archive_thread(
         state.engine.broadcast_changes_updated().await;
     }
 
+    let mut archived = Vec::with_capacity(to_archive.len());
     for tid in &to_archive {
-        // Cancel-stamp any orphaned QuestionCard so its answer buttons render
-        // disabled instead of dangling clickable on the archived thread.
-        // See the doc comment above for why the cascade gate alone isn't
-        // enough (it admits status=idle threads whose UserQuestionAsked has
-        // no UserQuestionAnswered because the surrounding turn was
-        // terminated without an answer).
-        crate::engine::agent_question::resolve_pending_question_as_canceled(
-            &state.engine,
-            *tid,
-            actor.clone(),
-        )
-        .await;
+        // Cancel-stamp the orphaned QuestionCard, if any, so its answer
+        // buttons render disabled instead of dangling clickable on the
+        // archived thread. See the doc comment above for how a card is
+        // orphaned while its thread sits idle.
+        if let Some(tool_use_id) = orphaned_questions.remove(tid) {
+            if let AnswerResult::Conflict(msg) = answer_pending_question(
+                &state.engine,
+                *tid,
+                tool_use_id,
+                AnswerKind::Canceled,
+                actor.clone(),
+            )
+            .await
+            {
+                log!(
+                    "[API] archive_thread: orphaned question on {}: {}",
+                    tid,
+                    msg
+                );
+            }
+        }
 
         // Stop any *live* Claude Code subprocess so it doesn't leak in
         // `running_sessions` until engine restart. We deliberately gate on a
@@ -217,9 +250,9 @@ pub(in crate::api) async fn archive_thread(
         // For archive that teardown is both wrong-intent (we're discarding the
         // thread, not proposing its work) and unnecessary: the `ThreadArchived`
         // emit below settles the projection on its own (the cascade gate
-        // already rejected status=Running, and WaitingForUserAnswer was
-        // cancel-stamped just above), and the async worktree-cleanup worker
-        // GCs the worktree on its own schedule (Tier 0 reclaims merged/clean
+        // already rejected Running and WaitingForUserAnswer), and the async
+        // worktree-cleanup worker GCs the worktree on its own schedule (Tier 0
+        // reclaims merged/clean
         // worktrees after a short grace; it needs no in-memory session). So
         // archiving a non-live thread is just the cheap `ThreadArchived` emit.
         //
@@ -245,7 +278,7 @@ pub(in crate::api) async fn archive_thread(
             }
         }
 
-        state
+        let emitted = state
             .engine
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -253,9 +286,28 @@ pub(in crate::api) async fn archive_thread(
                 event: crate::engine::thread_events::ThreadEvent::ThreadArchived,
                 meta: crate::engine::thread_events::EventMeta::with_actor(actor.clone()),
             })
-            .await
-            .map_err(internal_json)?;
+            .await;
+        match emitted {
+            Ok(_) => archived.push(*tid),
+            // The bus refused: the member parked after the lock dropped.
+            Err(e) if e.downcast_ref::<LifecycleViolation>().is_some() => {
+                log!("[API] archive_thread: {} not archived: {}", tid, e);
+            }
+            Err(e) => return Err(internal_json(e)),
+        }
     }
 
-    Ok(axum::Json(serde_json::json!({ "archived": to_archive })))
+    // Archiving a child that still owes its parent a card settles it: a
+    // stopped child (ADR 0252) or a waiting one (ADR 0254). Only the thread
+    // the user archived: a descendant caught in this cascade owes its parent
+    // nothing, because that parent is archived too.
+    if archived.contains(&thread_uuid) {
+        state
+            .engine
+            .event_bus
+            .settle_child(thread_uuid, crate::engine::event_bus::ChildSettle::Archived)
+            .await;
+    }
+
+    Ok(axum::Json(serde_json::json!({ "archived": archived })))
 }

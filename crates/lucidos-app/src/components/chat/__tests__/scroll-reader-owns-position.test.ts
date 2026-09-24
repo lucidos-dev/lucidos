@@ -22,7 +22,9 @@ import {
   awayFromBottom,
   getActiveScrollElement,
   isNavigationScroll,
+  isWhereWeLastScrolledIt,
   makeScrollObservers,
+  markNavigationScroll,
   scrollToBottom,
   setActiveScrollElement,
   stopFollowingBottom,
@@ -296,6 +298,76 @@ describe('a navigation owns the scroll event it is about to fire', () => {
 
     await new Promise(r => setTimeout(r, 100)); // past NAV_SCROLL_EVENT_WINDOW_MS
     expect(isNavigationScroll()).toBe(false);
+  });
+});
+
+/** A write's scroll event can arrive long after the window above has lapsed.
+ *  WebKit fires it at the next rendering opportunity, and a heavy render right
+ *  after a restore pushed it 300ms out. The render window then read the app's
+ *  own landing as the reader asking for older turns, and fetched a page. So the
+ *  POSITION the write left says whose event it is, whenever the event arrives. */
+describe('a navigation still owns its scroll event when the event comes late', () => {
+  it('reads a late event on the position it wrote as ours', async () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    markNavigationScroll(el, 818);
+    await new Promise(r => setTimeout(r, 100)); // past NAV_SCROLL_EVENT_WINDOW_MS
+    expect(isNavigationScroll(el)).toBe(false);
+    expect(isWhereWeLastScrolledIt(el)).toBe(true);
+  });
+
+  it('reads the repaint nudge a pixel either side as ours too', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    markNavigationScroll(el, 818);
+    el.scrollTop = 817;
+    expect(isWhereWeLastScrolledIt(el)).toBe(true);
+    el.scrollTop = 819;
+    expect(isWhereWeLastScrolledIt(el)).toBe(true);
+  });
+
+  it('lets the reader go the moment they move', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    markNavigationScroll(el, 818);
+    el.scrollTop = 700;
+    expect(isWhereWeLastScrolledIt(el)).toBe(false);
+  });
+
+  it('records where the browser settled a clamped write', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 1000, clientHeight: 500 });
+    markNavigationScroll(el, 5000);
+    expect(el.scrollTop).toBe(500);
+    expect(isWhereWeLastScrolledIt(el)).toBe(true);
+  });
+
+  /** A stamp that outlived the reader would claim their return. A thread opens
+   *  at 0. A reader who scrolls far down and presses Home lands on 0 in one
+   *  event, and no further event comes to ask for older turns. */
+  it('retires once a scroll finds the container anywhere else', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    const { onScroll } = makeScrollObservers(el);
+    markNavigationScroll(el, 0);
+    el.scrollTop = 3000;
+    onScroll();
+    el.scrollTop = 0;
+    expect(isWhereWeLastScrolledIt(el)).toBe(false);
+  });
+
+  it('holds through its own event and the repaint nudge', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    const { onScroll } = makeScrollObservers(el);
+    markNavigationScroll(el, 818);
+    onScroll();
+    el.scrollTop = 817;
+    onScroll();
+    el.scrollTop = 818;
+    onScroll();
+    expect(isWhereWeLastScrolledIt(el)).toBe(true);
+  });
+
+  it('never speaks for another container', () => {
+    const written = makeEl({ scrollTop: 0, scrollHeight: 8000 });
+    const other = makeEl({ scrollTop: 818, scrollHeight: 8000 });
+    markNavigationScroll(written, 818);
+    expect(isWhereWeLastScrolledIt(other)).toBe(false);
   });
 });
 

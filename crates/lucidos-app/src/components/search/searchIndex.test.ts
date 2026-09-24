@@ -2,6 +2,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged, preferences } from '../../store/store';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 
+// Only `isIOS` is steered. Everything else stays real, so jsdom answers as the
+// desktop browser it is.
+const platformMocks = vi.hoisted(() => ({ isIOS: false }));
+vi.mock('../../utils/platform', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/platform')>()),
+  isIOS: () => platformMocks.isIOS,
+}));
+
 const originalInnerWidth = window.innerWidth;
 
 function setViewportWidth(px: number): void {
@@ -18,6 +26,21 @@ beforeEach(() => {
 afterEach(() => {
   setViewportWidth(originalInnerWidth);
   enginePackaged.value = false;
+  platformMocks.isIOS = false;
+});
+
+describe('settings search: the iOS-only Autocorrect row', () => {
+  it('finds it on iPhone and iPad, by the symptom as well as the name', () => {
+    platformMocks.isIOS = true;
+    for (const query of ['autocorrect', 'send button', 'keyboard']) {
+      const results = getSettingsSearchResults(query, 50);
+      expect(results.some((r) => r.id === 'debugging:autocorrect'), query).toBe(true);
+    }
+  });
+
+  it('hides it everywhere else, where the row does not render', () => {
+    expect(getSettingsSearchResults('autocorrect', 50).some((r) => r.id === 'debugging:autocorrect')).toBe(false);
+  });
 });
 
 describe('settings search — keyboard shortcuts', () => {

@@ -1286,3 +1286,51 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// A coding-agent child parked on the user's question holds a parent's
+/// follow-up (ADR 0256). The ack must say "held", never promise a fresh turn
+/// or claim the message will be read now.
+#[tokio::test]
+async fn a_question_parked_coding_agent_child_acks_held() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (parent, _) = parent_and_child(&bus).await;
+    let cc_child = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: cc_child,
+        event: ThreadEvent::MessageReceived {
+            provider: None,
+            voice_session_id: None,
+            text: "coding task".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    crate::engine::agent_question::aq_test_helpers::emit_user_question(
+        &bus,
+        cc_child,
+        "toolu-open#q0",
+    )
+    .await;
+
+    let ack = authorize(&pool, Some(parent), cc_child).await.unwrap();
+    assert_eq!(ack.delivered_to, FollowUpDelivery::Held);
+    assert!(ack.delivered_to.describe().contains("held"));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

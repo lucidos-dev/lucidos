@@ -19,6 +19,18 @@ function elWith(descendants: Node[] = []): HTMLElement {
   return self as HTMLElement;
 }
 
+/** A fake element whose `closest` answers for the toast layer alone. */
+function fakeElement(inToast: boolean): HTMLElement {
+  return {
+    nodeType: 1,
+    closest: (sel: string) => (inToast && sel === '.toast-container' ? {} : null),
+  } as unknown as HTMLElement;
+}
+
+function toastButton(): HTMLElement {
+  return fakeElement(true);
+}
+
 describe('computeAnchorPosition', () => {
   it('places below when there is room', () => {
     setViewport(1280, 800);
@@ -274,6 +286,56 @@ describe('isOutsidePointerTarget', () => {
     const anchor = elWith();
     const elsewhere = elWith();
     expect(isOutsidePointerTarget(elsewhere, null, anchor)).toBe(true);
+  });
+
+  /** A toast is its own layer, kept live over overlays, so its tap is never
+   *  swallowed. Whether it closes the overlay is `dismissOnToastTap`'s call. */
+  it('treats a tap on a toast as not outside, text nodes included', () => {
+    const panel = elWith();
+    const anchor = elWith();
+    const button = toastButton();
+    const label = { nodeType: 3, parentElement: button } as unknown as Node;
+    expect(isOutsidePointerTarget(button, panel, anchor)).toBe(false);
+    expect(isOutsidePointerTarget(label, panel, anchor)).toBe(false);
+    expect(isOutsidePointerTarget(fakeElement(false), panel, anchor)).toBe(true);
+  });
+
+  /** Light dismiss, as `popover="auto"` does it: the popover closes and the
+   *  same tap still presses the toast button. */
+  it('closes a backdrop-less overlay on a toast tap without swallowing it', () => {
+    const button = toastButton();
+    const onDismiss = vi.fn();
+    const onArm = vi.fn();
+    const h = makeDismissHandlers({ current: elWith() }, elWith(), onDismiss, onArm, () => true, false, true);
+    h.onPointerDown({ target: button, button: 0, isPrimary: true } as unknown as PointerEvent);
+    const touch = { target: button, stopPropagation: vi.fn(), preventDefault: vi.fn() };
+    h.onTouchEnd(touch as unknown as TouchEvent);
+    const click = { target: button, stopPropagation: vi.fn(), preventDefault: vi.fn() };
+    h.onClickCapture(click as unknown as MouseEvent);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(onArm).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+    expect(click.stopPropagation).not.toHaveBeenCalled();
+    expect(click.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('leaves a lower overlay open when a toast tap light-dismisses', () => {
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: elWith() }, elWith(), onDismiss, undefined, () => false, false, true);
+    h.onPointerDown({ target: toastButton(), button: 0, isPrimary: true } as unknown as PointerEvent);
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+
+  it('keeps a backdrop modal open on a toast tap', () => {
+    const button = toastButton();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: elWith() }, elWith(), onDismiss);
+    h.onPointerDown({ target: button, button: 0, isPrimary: true } as unknown as PointerEvent);
+    const click = { target: button, stopPropagation: vi.fn(), preventDefault: vi.fn() };
+    h.onClickCapture(click as unknown as MouseEvent);
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(click.stopPropagation).not.toHaveBeenCalled();
+    expect(click.preventDefault).not.toHaveBeenCalled();
   });
 });
 

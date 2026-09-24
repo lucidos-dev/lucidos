@@ -28,6 +28,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         control_rx,
         cancel.clone(),
         None,
+        CcStreamState::default(),
     ));
     (
         RunningAgent {
@@ -159,6 +160,7 @@ async fn driver_task_flags_stray_signal_kill() {
         control_rx,
         cancel,
         None,
+        CcStreamState::default(),
     ));
 
     // External kill — the engine did NOT cancel. SAFETY: kill with a positive

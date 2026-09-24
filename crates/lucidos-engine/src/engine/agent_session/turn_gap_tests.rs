@@ -769,6 +769,55 @@ async fn apply_failed_quotes_engine_error() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+// -------------------- ChildThreadStopped --------------------
+
+/// ADR 0252: a stopped child wakes nothing, so a coding-agent parent hears
+/// about it only here. The line says the child is alive and moves no ref.
+#[tokio::test]
+async fn a_stopped_child_reaches_the_resumed_parent_as_alive() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ChildThreadStopped {
+            child_thread_id: child_id,
+            child_thread_title: Some("Fix the ticket".into()),
+        },
+    )
+    .await;
+    let current = emit_message_received(&bus, thread_id, "what now?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .expect("a stopped child must produce a note");
+    for needle in [
+        "CHILD STOPPED",
+        "Fix the ticket",
+        "NOT finished",
+        "do not roll back",
+    ] {
+        assert!(
+            note.note.contains(needle),
+            "missing {needle:?}: {}",
+            note.note
+        );
+    }
+    assert!(note.note.contains(&child_id.to_string()), "{}", note.note);
+    assert!(
+        !note.explains_worktree_reset,
+        "a child's Stop moves nothing in the parent's worktree"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 // -------------------- WorktreeCleaned --------------------
 
 /// 13. Tier 1 strips build artifacts from a worktree that can still resume. No
@@ -1035,32 +1084,42 @@ async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 18. The other half: a completion whose wake WAS delivered is not repeated.
-///     The delivery emits `CodingAgentPromptSent`, which is a turn boundary, so
-///     the completion falls before the next gap and needs no filter of its own.
+/// 18. The other half: a completion an event wait delivered is not repeated.
+///     The delivery is the prompt the re-opened turn carries, and it lands
+///     before that turn's origin, so the query has to drop it by name.
 #[tokio::test]
-async fn a_background_completion_whose_wake_landed_is_not_repeated() {
+async fn a_background_completion_an_event_wait_delivered_is_not_repeated() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, BRANCH, None).await;
 
     emit_message_received(&bus, thread_id, "run the suite").await;
-    emit(
+    let completed = emit(
         &bus,
         thread_id,
         completion("task-woke", "cargo test --lib", Some(0), false),
     )
     .await;
-    // What the watcher's wake becomes once `run_session` consumes it.
-    emit_engine_prompt(&bus, thread_id, "Background task task-woke finished").await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitDelivered {
+            wait_id: Uuid::new_v4(),
+            event_id: completed,
+            event_type: "BackgroundBashCompleted".into(),
+            payload: serde_json::json!({"task_id": "task-woke"}),
+            matched_index: 0,
+        },
+    )
+    .await;
     let current = emit_message_received(&bus, thread_id, "how did it go?").await;
 
     assert!(
         compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
             .await
             .is_none(),
-        "the agent already heard about it, so the gap holds nothing to say"
+        "the delivery already told the agent, so the gap holds nothing to say"
     );
 
     pool.close().await;

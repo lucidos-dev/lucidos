@@ -91,7 +91,7 @@ An *event subscription* comes in **two species**, and they share a predicate lan
 Two questions pick between them, and the first one is the one that gets forgotten:
 
 1. **Where does the answer go?** A trigger reaches the user as a notification from its own thread; it cannot continue the conversation they are typing in. `await_event` re-opens the subscribing thread with a new turn, so the report lands in the thread they are reading. "Tell me **here** when X happens" is `await_event`, even though the phrasing sounds like a standing rule.
-2. **How long must it last?** `await_event` is one-shot and you re-arm per event, with consecutive subscriptions capped. A reaction that must outlive the conversation and fire indefinitely is a trigger.
+2. **How long must it last?** `await_event` is one-shot and you re-arm per event, with how often you re-arm capped. A reaction that must outlive the conversation and fire indefinitely is a trigger.
 
 Being blocked is not a precondition. `await_event` is a delivery mechanism as much as a waiting one: a turn that could have ended perfectly well still uses it when the user wants the next X reported into this conversation. And `await_event` is not a stream: if you need every X forever, that is a trigger.
 
@@ -176,7 +176,7 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 | `MemoryRecalled` | The engine's **automatic pre-turn recall**: before the model saw anything, a classifier derived sub-queries, the chat-side memory consumer vector-searched long-term memory, and the hits were injected into the turn's context. Carries `results: usize` (how many were injected) and `queries: Vec<String>` (the classifier's sub-queries). **Not the agent's own lookup**: when the injection misses, the agent calls the `memory` tool's `search` action mid-turn with a query of its own, and that arrives as a `ToolCalled`. Subscribe to this one for "the engine recalled something", to `ToolCalled` for "the agent went looking". Legacy alias: `MemorySearched` (renamed 2026-08-12, because the two names were one word apart and read as the same event). Rows persisted under the old name still deserialize and still render, but **subscriptions do not follow a rename**: `on_event: MemorySearched` on a trigger, and an `await_event` waiting on that name, match the event type as an exact string and so stop firing. Re-point them at `MemoryRecalled`. | per-action | yes | yes (use condition) |
 | `ToolCalled` | The chat agentic loop invoked a tool (`name`, `args`, optional `description`). Distinct from `CodingAgentToolCalled` — those are coding-agent tool calls. | per-action | yes | yes (use condition) |
 | `ToolResult` | The result returned to the chat agentic loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true), and `tool_called_event_id: Uuid`, the id of the `ToolCalled` it answers. **Pair a result with its call by that id, never by position**: a parallel batch of reads answers in completion order, so a result can land before an earlier call's. Only legacy rows lack the id. **Inline image bytes are stubbed out of `result`**, so a tool that returned an image persists something like `[image image/png, 641.2 KB omitted, not embedded in event]` or `[screenshot image/png, 1.5 MB omitted, not embedded in event]` followed by the page DOM. The model that made the call saw the actual image; the stub exists only because a megabyte of base64 per row made heavy threads unloadable. Reading one back via `query_events` means the image was shown and not persisted, never that it failed or was withheld. | per-action | yes | yes (use condition) |
-| `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command) OR `run_python_background` (venv-rooted Python script — the engine wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes it through the same registry). The `command` field captures the exact shell invocation. Paired with a later `BackgroundBashCompleted`. | per-action | yes | yes |
+| `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command), a coding agent's `lucidos background-task run` (the same, in its worktree), OR `run_python_background` (venv-rooted Python script: the engine wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes it through the same registry). The `command` field captures the exact shell invocation. Paired with a later `BackgroundBashCompleted`. | per-action | yes | yes |
 | `BackgroundBashCompleted` | The task ended: natural exit, signal death, watchdog timeout, `bash_kill`, or the engine going away under it. Carries `exit_code: Option<i32>` (set **only** for a normal exit), `signal: Option<i32>` (set only for a signal death; omitted otherwise), `stdout`, `stderr`, `timed_out: bool`, `killed: bool`, `abandoned: bool`. Both `exit_code` and `signal` null means the status was unavailable. Never read that as success. `abandoned: true` is the engine-stop case, written by the teardown emit or the boot sweep, and it is NOT `killed` (which means `bash_kill`). Every started task on a live thread reaches exactly one of these, so a subscription on it is not left waiting on an event nobody will send. The audit-trail counterpart of `Started`. Emitting it does NOT evict the in-memory registry entry: a completed task stays drainable for a few minutes so a `bash_output` landing at the completion instant still gets the final tail, and `bash_output` falls back to this row only once that window closes. Same shape whether the spawning tool was `run_bash_background` or `run_python_background`. | per-action | yes | yes |
 | `ResponseGenerated` | The chat agentic loop terminated with an assistant response. The chat-mode terminator. Carries `text` (`#[serde(skip_serializing_if = "is_empty_str")]`), `images`, `model`, `reasoning_effort`. **`text` may be empty**: when a turn ends on a clean, model-decided stop with no text and no tool calls (a *benign empty completion* — e.g. Gemini `finishReason: STOP` after successful tool calls), the loop emits an empty `ResponseGenerated` rather than `ResponseFailed`, so the thread completes Idle instead of showing a red error. The UI renders a neutral "model returned an empty response" note for an empty-bodied completion. See `classify_empty_completion` (`agentic_loop/helpers.rs`) for the benign-vs-failure split. | one-per-turn | yes | yes |
 | `ResponseCanceled` | User clicked Cancel, clicked Apply / Discard / Archive on a still-running session, or posted a follow-up that interrupted a mid-turn Codex turn. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `SupersededByFollowup` / `Unknown`). Always emit via `thread_events::emit_response_canceled` — it's idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
@@ -212,7 +212,7 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 |---|---|---|---|---|
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
 | `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
-| `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. | high-volume-streaming | yes | **no (blocked)** |
+| `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. A chunk never holds whitespace alone: a paragraph break leads the next chunk instead. Older rows can still hold a bare `"\n\n"`. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentThoughtStreamed` | One chunk of the coding agent's streamed reasoning/thinking (CC's `thinking_delta`; Codex's `item/reasoning/*Delta` or `reasoning` item). Coalesced before persistence. Rendered as the live "Thinking" step's content. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentToolCalled` | One coding-agent tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | per-action | yes | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
@@ -305,6 +305,7 @@ Legacy: historical events with empty `change_id` + `commit_sha` set are from the
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `ChildThreadCompleted` | A child thread spawned by `run_thread` / `run_coding_agent` reached a terminal event (coding agent: `CodingAgentIdled` or `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`). Emitted on the **parent** thread by EventBus fan-in, so the row's own `thread_id` is the PARENT. Fires once per completed TURN, so a child that was followed up on (or continued) reports again. Carries `child_thread_id`, optional `child_thread_title`, `status: ChildCompletionStatus` (snake_case on the wire: `success` / `failure` / `no_changes` / `canceled`), `summary` (truncated to 2000 chars; indexed by `indexable_text`), `pending_change_ids` (omitted from the payload when empty). Queryable by an app via `lucidos.events.query({ event_type: 'ChildThreadCompleted' })`, see § "One table, two enums". | per-action | yes | yes |
+| `ChildThreadStopped` | A user Stop ended a child thread's turn, including Cancel on its question card, and the child is now a *stopped child*. Emitted on the **parent** by the same fan-in, in place of a `ChildThreadCompleted`. It wakes nothing and runs no parent turn: the child is alive, and the parent is still owed the `ChildThreadCompleted` that settles it. Carries `child_thread_id` and optional `child_thread_title`. See § `ChildThreadStopped`. | per-action | yes | yes |
 | `ContextDismissed` | **Retired by ADR 0109 and still readable.** Nothing emits it any more: `dismiss_from_context` is gone, because under *self-curated context mode* the *swept window* takes a result on its own. Existing workspaces hold rows, and the resume helper still honours every one of them, so a body an agent dropped before the change stays dropped. Carries `dismissed_event_id`, the *handle* of the event the body came from. | per-action | yes | yes |
 | `ContextKeptOpen` | The agent set one tool result's clock back to zero, by writing its address under a `[KEEP OPEN]` heading in its *working understanding*. Carries `kept_open_event_id`, the *handle* of the `ToolCalled` behind the result. Same-thread only, and only that type: a keep moves the clock on a `tool_result` block, and nothing else is one. The keep is applied where the span is parsed, so this event is the durable record rather than the mechanism. It applies once, from the reply that wrote it. It exempts the item from no pass: the trimmer at the wall takes held items last and still takes them. Reaches only a workspace running *self-curated context mode*: everywhere else nothing is swept, so a keep would say nothing. | per-action | yes | yes |
 | `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (0 = applied/clean worktree removed after the short grace; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed — the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
@@ -390,7 +391,7 @@ section below for why that wait buys nothing.
 Delivery is the one that bites. It is the only resolution that consumes the
 subscription *and* hands you a payload to act on, so it reads like the wait is
 still running when it is not. A standing in-thread watch is therefore one
-subscription per event, and it is bounded by the consecutive-subscription cap in
+subscription per event, and it is bounded by the recent-subscription cap in
 § "Limits" below: past it the next `await_event` call is refused and you have to
 report back. Do not promise the user "forever" in a thread; that is a trigger's
 job.
@@ -478,10 +479,12 @@ the same turn rather than discovering later:
   many separate re-entries can be outstanding, not on how much you can watch: one
   wait's `on:` list is uncapped, so watching a dozen things in one subscription
   (any entry delivers) costs one of the 25.
-- A thread may subscribe **10 times in a row** with no message from the user in
-  between. That bounds a thread that re-opens itself, two threads ping-ponging,
-  and a model simply stuck. An agent- or engine-authored message does not reset
-  the count, since those are exactly what such a loop is made of.
+- A thread may subscribe **10 times within an hour** with no message from the
+  user in between. That bounds a thread that re-opens itself, two threads
+  ping-ponging, and a model simply stuck, all of which re-arm fast. A serial
+  workflow of long waits never reaches it. An agent- or engine-authored message
+  does not reset the count, since those are exactly what such a loop is made of.
+  Engine-armed waits for background tasks count too.
 
 ## Voice session (a thread being spoken to)
 
@@ -882,13 +885,17 @@ so the live drain and the archived record can never disagree. `N` also counts
 whatever the engine's ~2 MB per-stream ring buffer discarded while the task
 ran, so it is the real gap rather than only the part trimmed at write time.
 
+An *event wait* that delivers this event cuts each stream again, to its last
+4000 bytes, in the prompt it re-opens the thread with. The full row stays in
+the event log, and `bash_output` / `lucidos background-task output` read it.
+
 **Reading the status.** `exit_code` and `signal` are mutually exclusive, and neither is ever a stand-in for a status the engine didn't obtain:
 
 | `exit_code` | `signal` | Meaning |
 |---|---|---|
 | `0` | absent | The command really exited 0. A reader can trust this. |
 | non-zero | absent | Normal exit with that status. |
-| `null` | set | The child was terminated by that Unix signal — `9` SIGKILL (the watchdog timeout and `bash_kill` both use it), `11` SIGSEGV, `13` SIGPIPE (a pipeline producer whose consumer closed the pipe). |
+| `null` | set | The child was terminated by that Unix signal: `15` SIGTERM (the watchdog timeout and `bash_kill` send it first), `9` SIGKILL (their follow-up after a 3 s grace, and the teardown), `11` SIGSEGV, `13` SIGPIPE (a pipeline producer whose consumer closed the pipe). |
 | `null` | absent | The engine could not determine the status. Treat as failure, never as success. Also the shape of rows written before `signal` existed. |
 
 `signal` is omitted from the payload when there is none. So is `abandoned` when false.
@@ -901,7 +908,7 @@ That is what keeps the promise in `system-knowhow/running-python.md` that ending
 
 **The two paths differ, and the `stderr` line says which one wrote the row.** Teardown killed the task and kept its output. The boot sweep kept neither: after a crash no destructor ran at all.
 
-**Neither promises the work stopped**, and that is not hedging. A crash kills nothing. The teardown's SIGKILL reaches the task's own shell but not a pipeline behind it, so either can leave a child reparented to init. Check before re-running the same work.
+**Neither promises the work stopped**, and that is not hedging. A crash kills nothing. The teardown's SIGKILL reaches the task's whole process group. It misses a process that detached into its own session, so either path can leave a child running under init. Check before re-running the same work.
 
 `abandoned` is distinct from `killed`, which means `bash_kill` was called, and outranks it when the engine's own shutdown sent the signal. Reading one as the other says a person or an agent called the work off. One more thing follows from nobody having watched a crashed task exit: `finished_at` is when the loss was recorded, so on the boot path it spans the engine's downtime and is not the task's runtime.
 
@@ -1033,9 +1040,11 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 }
 ```
 
-`status` is `success` / `failure` / `no_changes` / `canceled`. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
+`status` is `success` / `failure` / `no_changes` / `canceled`. `canceled` means the user ended the child: they archived it, discarded its change, or an Apply, Discard or Archive cut its running turn short. A user Stop is never `canceled`: it sends `ChildThreadStopped` instead. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
 
-**The parent is re-opened BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, named with a `child_thread_id` condition. Matching is workspace-wide, so that is any thread's child and not only a descendant of the awaiting thread's: the card is persisted on whichever thread is the parent, and the wait resolves off that row wherever it lands.
+**The parent is re-opened BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant. The engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way. But the subscription still spends part of the recent-subscription budget. It also arms a timeout that can fire while the child is still working.
+
+Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, named with a `child_thread_id` condition. Matching is workspace-wide, so that is any thread's child and not only a descendant of the awaiting thread's: the card is persisted on whichever thread is the parent, and the wait resolves off that row wherever it lands.
 
 **One callback per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
 
@@ -1043,7 +1052,35 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 
 **A terminal the engine is about to resume is not a completion either.** A coding-agent turn that dies on a transient upstream `API Error` emits a real `ResponseFailed`, and the engine resumes the same session seconds later. That `ResponseFailed`, and the `CodingAgentIdled` behind it, fire no `ChildThreadCompleted` and no parent callback: the child is still working, and the resumed turn's own terminal is the report. So a parent sees ONE card for the whole episode, describing what its child actually did rather than the drop it survived. The suppression is conditional on the resume actually being scheduled, never on the error: past `MAX_API_ERROR_AUTO_RESUMES` the thread parks for good and the `failure` card fires normally. See ADR 0199.
 
+**A user Stop is not a completion.** A Stop on the child's running turn, or Cancel on its question card, ends the turn but not the child. One message continues it. The parent gets a `ChildThreadStopped` note instead of this card, and no turn runs. The child's next finished turn sends this card as usual.
+
+If the user archives, deletes, or discards the child's change, this card arrives with status `canceled`. Until then the child counts toward the user's attention. A cancel you issue yourself on your own child is not a Stop of the user's, and still arrives as a `canceled` card. See ADR 0252.
+
+**A turn that ends holding an event wait is not a completion.** A child that arms an *event wait* and ends its turn fires no card. The wait wakes it for another turn, and that turn reports.
+
+Stop waiting and an agent standing its wait down wake nothing. So when an idle child's last wait ends that way, the card it held back arrives then. Archiving a waiting child sends a `canceled` card. A failed turn reports at once, wait or not. See ADR 0254.
+
 **Running more than one child at a time: `system-knowhow/orchestrating-sub-threads.md`.** This edge and the *child follow-up* below are the only two carrying traffic between threads, and nothing carries it sideways. That file is the operating manual for a parent coordinating several children. It covers what a child may do about a sibling's events, and how a ruling reaches a child that already finished.
+
+### `ChildThreadStopped`
+
+```json
+{
+  "type": "ChildThreadStopped",
+  "data": {
+    "child_thread_id": "550e8400-e29b-41d4-a716-446655440000",
+    "child_thread_title": "Sub-task: rename foo to bar"
+  }
+}
+```
+
+A user Stop paused one of this thread's children. The child is **alive**: it is waiting for the user, who may send it a message. Do not roll back its work, respawn it, or send it a follow-up on the strength of this note. Exactly one of three things follows:
+
+- The user continues the child. Its next finished turn sends a `ChildThreadCompleted` with the real status.
+- The user archives or deletes the child, or discards its change. A `ChildThreadCompleted` with status `canceled` arrives.
+- Nothing, for as long as the user leaves it. The child stays a *stopped child* and counts toward their attention.
+
+It never re-opens the parent. A chat parent reads it as a `[CHILD THREAD STOPPED]` block in its history. A coding-agent parent reads it in its turn-gap note. To be told when the child is really done, rely on the `ChildThreadCompleted` fan-in; a wait on `ChildThreadStopped` fires on the Stop itself.
 
 ### `TriggerStarted` / `TriggerCompleted`
 

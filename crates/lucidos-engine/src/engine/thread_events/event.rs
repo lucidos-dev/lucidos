@@ -142,6 +142,25 @@ pub enum ThreadEvent {
     QueuedMessageRemoved {
         removed_message_id: uuid::Uuid,
     },
+    /// An agent-sent message held back from a coding agent, because the thread
+    /// waits on a human: an open question, or older held messages. It stays
+    /// held until a human replies, and is released as an ordinary
+    /// `MessageReceived`. Unlike that event, it moves no status, so the
+    /// question stays answerable. See ADR 0256.
+    MessageHeld {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_image_hashes: Vec<String>,
+        #[serde(default = "default_mode_human")]
+        mode: ActorMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+    },
+    /// A `MessageHeld` was handed to the agent. Emitted just before its
+    /// `MessageReceived`, so a message is released at most once.
+    HeldMessageReleased {
+        held_message_id: uuid::Uuid,
+    },
     TextStreamed {
         text: String,
     },
@@ -1129,6 +1148,17 @@ pub enum ThreadEvent {
         /// children and for CC children that ended without proposing anything.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pending_change_ids: Vec<String>,
+    },
+
+    /// A user Stop ended a child thread's turn, and the child is now a
+    /// *stopped child*. Emitted on the **parent** by the same fan-in as
+    /// `ChildThreadCompleted`, in its place. It wakes nothing: the child is
+    /// alive, and the parent is still owed the `ChildThreadCompleted` that
+    /// settles it (ADR 0252).
+    ChildThreadStopped {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
     },
 
     /// The agent (LLM) asked to drop a prior `ToolCalled` (and its matching

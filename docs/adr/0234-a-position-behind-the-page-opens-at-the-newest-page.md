@@ -26,6 +26,16 @@ Such a position opens the thread at the top of the newest page. The app fetches
 no older history to chase it. A position INSIDE the loaded pages is still
 honoured exactly, which is the walk `reachAnchor` performs.
 
+> **Amended: a position behind the page is chased, within a bound.** The open
+> reads older history in pages of 2000 events, the endpoint's cap, at most
+> twice. A position found that way lands exactly. One further back opens at the
+> newest page, as below.
+
+> On a coding-agent thread, a reader inside one long turn was routinely behind
+> the page. The give-up lost their place on almost every open. Two large reads
+> bound what the rationale below counts as the cost. Plan:
+> `docs/plans/2026-09-23-the-reading-position-and-the-thumb-hold-still.md`.
+
 ## Rationale
 
 Paging exists to make a long thread open fast. A chase spends exactly what

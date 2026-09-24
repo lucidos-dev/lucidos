@@ -1271,9 +1271,13 @@
        zone. Reasoning and sources:
        docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md
 
+       --keyboard-band-hold is the band hold: what a reader scrolled into the
+       band still needs once it drops, so the content never jumps. It drains
+       as they scroll back. docs/plans/2026-09-24-the-keyboard-band-holds-the-scroll-anchor.md
+
        `.has-app-ui` is excluded below: it does not scroll at all. */
     .mobile-swipe-pane .content-pane-body {
-        padding-bottom: var(--keyboard-band, 0px);
+        padding-bottom: max(var(--keyboard-band, 0px), var(--keyboard-band-hold, 0px));
     }
 
     /* Skill UI iframe: content-pane-body must not scroll — the iframe

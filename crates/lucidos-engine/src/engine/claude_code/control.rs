@@ -39,6 +39,14 @@ impl LucidosEngine {
         thread_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Before the session lookup, because the engine owns the tasks: they
+        // outlive the agent's process and are running whether or not a
+        // session is still registered.
+        if let Some(tid) = thread_id.filter(|_| reason.abandons_background_tasks()) {
+            self.abandon_background_tasks(tid, &format!("{reason:?}"))
+                .await;
+        }
+
         let mut guard = self.agent_sessions.lock().await;
 
         if let Some(tid) = thread_id {

@@ -16,7 +16,8 @@ use uuid::Uuid;
 /// Starts every refusal, and is how the query knows one was already sent.
 const REFUSAL_MARKER: &str = "Question card not shown.";
 
-/// The tool result a refused card gets in place of the user's answer.
+/// The tool result a refused card gets in place of the user's answer. Every
+/// agent's notes between tool calls arrive as text, so it asks for prose.
 pub(crate) const CARD_REFUSAL: &str = "Question card not shown. Since the user's last input you \
      have written them nothing. They read only your text and your cards, never your tool results \
      or your reasoning. If they asked something, answer it in plain prose now. If you ran tools, \

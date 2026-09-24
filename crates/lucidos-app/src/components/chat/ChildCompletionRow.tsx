@@ -41,9 +41,23 @@ const CHILD_STATE: Record<ChildCompletionStatus, { verb: string; label: string; 
  *  The title link is the row's origin affordance, which is why the panel's actor
  *  chip is not clickable (see the `ChildThreadCompleted` arm of
  *  `describeInitiator`). */
+/** A link that opens `threadId`, labelled with its title. Routed through
+ *  `focusThreadOrBootstrap` so a thread outside the loaded window still opens. */
+export function threadLink(threadId: string, title: string | undefined | null) {
+  return (
+    <button
+      type="button"
+      class="accent-link"
+      onClick={() => focusThreadOrBootstrap(threadId)}
+      data-thread-id={threadId}
+    >
+      {title?.trim() || 'Untitled thread'}
+    </button>
+  );
+}
+
 export function ChildCompletionRow(props: Props) {
   const { verb, label, tone } = CHILD_STATE[props.status];
-  const titleText = props.childThreadTitle?.trim() || 'Untitled thread';
   const summaryHtml = props.summary.trim() ? renderMarkdown(props.summary) : '';
   const pending = props.pendingChangeIds?.length ?? 0;
   return eventRowBody({
@@ -54,14 +68,7 @@ export function ChildCompletionRow(props: Props) {
     subject: (
       <>
         {`Child thread ${verb}: `}
-        <button
-          type="button"
-          class="accent-link"
-          onClick={() => focusThreadOrBootstrap(props.childThreadId)}
-          data-thread-id={props.childThreadId}
-        >
-          {titleText}
-        </button>
+        {threadLink(props.childThreadId, props.childThreadTitle)}
       </>
     ),
     stateLabel: label,
@@ -79,5 +86,31 @@ export function ChildCompletionRow(props: Props) {
           ),
         }
       : undefined,
+  });
+}
+
+interface StoppedProps {
+  childThreadId: string;
+  childThreadTitle?: string;
+}
+
+/** A user Stop paused one of this thread's children, as an event row
+ *  (ADR 0252). It is the parent-side half of a *stopped child*: the child is
+ *  alive and waits for the user, and this thread was not woken. So the mark is
+ *  the pending one, and the state says who the child is waiting for. */
+export function ChildStoppedRow(props: StoppedProps) {
+  return eventRowBody({
+    kind: 'child',
+    mark: 'pending',
+    state: 'stopped',
+    role: 'child-stopped',
+    subject: (
+      <>
+        {'Child thread stopped: '}
+        {threadLink(props.childThreadId, props.childThreadTitle)}
+      </>
+    ),
+    stateLabel: 'waiting for you',
+    tone: 'halted',
   });
 }

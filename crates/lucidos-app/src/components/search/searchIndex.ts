@@ -3,7 +3,7 @@ import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 import { isMobile } from '../../utils/viewport';
-import { isTauri } from '../../utils/platform';
+import { isIOS, isTauri } from '../../utils/platform';
 import { WORKSPACE_ID } from '../../utils/basePath';
 // The one definition of "this client can actually act on the external-link
 // target", shared with the Settings row and its nav entry so search can never
@@ -41,6 +41,10 @@ interface SettingsSearchEntry {
    *  row behind this flag (Appearance & Behavior → Links → Open links in)
    *  renders only there. */
   iosPwaOnly?: boolean;
+  /** Only surfaced on iPhone and iPad, in a Safari tab and the installed PWA
+   *  alike. Wider than `iosPwaOnly`, and for the same reason: the Autocorrect
+   *  row (Debugging) renders only on iOS, where its bug lives. */
+  iosOnly?: boolean;
   /** Only surfaced under Tauri, for the same reason again: the in-app browser
    *  opens a desktop webview, so its toggle renders nowhere else. */
   tauriOnly?: boolean;
@@ -95,6 +99,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
   { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
+  { id: 'debugging:autocorrect', label: 'Autocorrect', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:autocorrect', keywords: 'autocorrect auto-correct autocorrection keyboard typing spelling send button submit button tap dead nothing happens iphone ipad', iosOnly: true },
   { id: 'debugging:restart-engine', label: 'Restart engine', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:restart-engine', keywords: 'restart engine service launchd relaunch reboot recovery unresponsive stuck', packagedOnly: true },
 
   // System → Overview rows
@@ -223,6 +228,7 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
     (!e.mobileOnly || isMobile())
     && (!e.packagedOnly || enginePackaged.value)
     && (!e.iosPwaOnly || externalLinkTargetConfigurable())
+    && (!e.iosOnly || isIOS())
     && (!e.tauriOnly || isTauri())
     && (!e.gatewayOnly || WORKSPACE_ID !== null);
   const matches = q

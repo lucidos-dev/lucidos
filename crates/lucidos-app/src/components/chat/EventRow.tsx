@@ -33,7 +33,7 @@ import type { ComponentChildren } from 'preact';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held';
 
 /** What the mark column says. Deliberately not the kind: the mark answers "did
  *  something arrive", which is the one question all four kinds share, so a

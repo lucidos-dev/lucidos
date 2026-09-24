@@ -10,16 +10,16 @@
  *
  * `installWorkspaceStorage` overrides `getItem`/`setItem`/`removeItem` on the
  * `localStorage` instance so every key is transparently prefixed with the
- * workspace id (`ws:<slug>:<key>`), EXCEPT the two cross-workspace picker keys
- * (see `GLOBAL_KEYS`). Those three methods are what every call site uses, so
+ * workspace id (`ws:<slug>:<key>`), EXCEPT the cross-workspace keys in
+ * `GLOBAL_KEYS`. Those three methods are what every call site uses, so
  * all ~40 are covered without per-callsite changes. `clear()`, `key(i)` and
  * `length` are NOT wrapped and still see the raw cross-workspace bucket. A
  * production `localStorage.clear()` would therefore wipe every workspace, so
  * keep those three to tests. EVERYTHING ELSE is workspace-scoped,
  * including the theme, fonts, scale, and the device id (each workspace gets its
- * own device identity). The only escape is the picker keys, which are
- * cross-workspace by definition (written inside a workspace, read by the picker
- * where namespacing is a no-op). The same scoping must be applied in the OTHER
+ * own device identity). The only escape is `GLOBAL_KEYS`, whose keys are
+ * cross-workspace by definition (written in one workspace, read elsewhere).
+ * The same scoping must be applied in the OTHER
  * realms that reach this origin's storage and bypass this prototype override —
  * the `index.html` FOUC IIFE, the engine-served `sdk-prefs.js`
  * (`crates/lucidos-engine/src/api/sdk_prefs.rs`), and the SDK
@@ -36,7 +36,11 @@
  * `workspaceStorage.install.ts`, imported on the first line of `main.tsx`.
  */
 
-import { LAST_WORKSPACE_KEY, LAST_WORKSPACE_COUNT_KEY } from './lastWorkspace';
+import {
+  LAST_WORKSPACE_KEY,
+  LAST_WORKSPACE_COUNT_KEY,
+  WORKSPACE_SWITCHER_EXPANDED_KEY,
+} from './lastWorkspace';
 
 /** Prefix for every namespaced key: `ws:<workspaceId>:<originalKey>`. */
 const NAMESPACE_PREFIX = 'ws:';
@@ -45,11 +49,12 @@ const NAMESPACE_PREFIX = 'ws:';
 const MIGRATION_MARKER = '__migrated';
 
 /**
- * The ONLY keys that stay raw (unscoped). Both are cross-workspace by definition:
- * written from inside a workspace (`/<slug>/`, where storage is namespaced) but
- * read by the picker (`/~/` or `/`, where namespacing is a no-op and storage is
- * raw). A namespaced key would never match across those contexts, so they MUST
- * stay raw on both ends (see `lastWorkspace.ts`).
+ * The ONLY keys that stay raw (unscoped). All three are cross-workspace by
+ * definition. The picker reads the first two at `/~/` or `/`, where storage is
+ * raw, but a workspace at `/<slug>/` writes them. The switcher's expand state is
+ * written in one workspace and read in the next one the user switches to. A
+ * namespaced key would never match across those contexts, so they MUST stay raw
+ * on both ends (see `lastWorkspace.ts`).
  *
  * Everything else — theme, fonts, scale, device id, nav history, etc. — is
  * workspace-scoped. Notably `lucidos-device-id` is per-workspace now: each
@@ -59,6 +64,7 @@ const MIGRATION_MARKER = '__migrated';
 export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   LAST_WORKSPACE_KEY,
   LAST_WORKSPACE_COUNT_KEY,
+  WORKSPACE_SWITCHER_EXPANDED_KEY,
 ]);
 
 /**
@@ -74,7 +80,7 @@ const APPEARANCE_SEED_KEYS: readonly string[] = [
   'lucidos-animation-speed-slider',
 ];
 
-/** A key is global (kept raw) iff it is in the picker-key allowlist. */
+/** A key is global (kept raw) iff it is in the cross-workspace allowlist. */
 export function isGlobalKey(key: string): boolean {
   return GLOBAL_KEYS.has(key);
 }

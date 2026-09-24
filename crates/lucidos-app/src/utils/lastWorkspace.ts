@@ -1,5 +1,7 @@
 /**
- * "Last active workspace" memory (gateway topology, ADR 0014).
+ * Device-global memory for switching workspaces: the last active workspace, the
+ * last listing's size, and whether the in-app switcher was left unfolded. The
+ * first is the one with history (gateway topology, ADR 0014).
  *
  * The gateway shows the picker at the smart root (`/`, when several workspaces
  * are registered) and at the sigil (`/~/`, where the installed PWA launches via
@@ -81,5 +83,29 @@ export function recallLastWorkspaceCount(): number | null {
     return Math.min(n, MAX_SKELETON_ROWS);
   } catch {
     return null;
+  }
+}
+
+/** Device-global key holding whether the in-app switcher's list was left
+ *  unfolded. Raw for the same reason as the two keys above: a tap on a peer
+ *  lands in that workspace's namespace, where a scoped key would read as unset. */
+export const WORKSPACE_SWITCHER_EXPANDED_KEY = 'lucidos-workspace-switcher-expanded';
+
+/** Record whether the switcher list is unfolded (best-effort). */
+export function rememberWorkspaceSwitcherExpanded(expanded: boolean): void {
+  try {
+    localStorage.setItem(WORKSPACE_SWITCHER_EXPANDED_KEY, expanded ? '1' : '0');
+  } catch {
+    /* storage off: the next menu open just starts folded */
+  }
+}
+
+/** Whether the switcher list was last left unfolded. Folded when nothing valid
+ *  is recorded. */
+export function recallWorkspaceSwitcherExpanded(): boolean {
+  try {
+    return localStorage.getItem(WORKSPACE_SWITCHER_EXPANDED_KEY) === '1';
+  } catch {
+    return false;
   }
 }

@@ -228,8 +228,9 @@ describe('Settings leaf-setting reachability', () => {
 
   it('keeps each search entry gated on the same platform as the row it lands on', () => {
     // The flags exist so search never offers a result that lands on nothing.
-    // These two rows are the only platform-conditional ones left in Settings.
+    // These three rows are the platform-conditional ones in Settings.
     expect(findSettingsEntry('appearance:external-link-target')?.iosPwaOnly).toBe(true);
     expect(findSettingsEntry('appearance:in-app-browser')?.tauriOnly).toBe(true);
+    expect(findSettingsEntry('debugging:autocorrect')?.iosOnly).toBe(true);
   });
 });

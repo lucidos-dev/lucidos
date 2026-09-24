@@ -115,11 +115,6 @@ pub(super) enum TerminateDecision {
         /// and its caller has not routed the message yet.
         redirect_pending: bool,
     },
-    /// The chat-agent's `run_bash_background` LLM tool still has a task running
-    /// for this thread. `spawn_bash_completion_watcher` pushes a resume prompt
-    /// into `msg_tx` when the bash completes. Killing the subprocess here would
-    /// force that wake through stale-session recovery.
-    KeepAliveForBgBash,
 }
 
 /// Decide whether to terminate the CC subprocess at idle.
@@ -138,15 +133,17 @@ pub(super) enum TerminateDecision {
 /// check-increment-send in `chat::process`, and an unbounded-channel send is
 /// synchronous, so a message that was sent is in the channel.
 ///
-/// Precedence: followup > chat-agent bg bash > terminate. With all three windows
-/// empty this returns `Terminate`, which also carries a turn that died on a
-/// transient upstream API error to the idle exit. A false positive there
-/// silently cancels that recovery.
+/// With all three windows empty this returns `Terminate`, which also carries a
+/// turn that died on a transient upstream API error to the idle exit. A false
+/// positive there silently cancels that recovery.
+///
+/// A running background task is deliberately NOT a reason to stay alive. Its
+/// completion re-opens the thread through an *event wait*, which resumes a
+/// terminated session like any other follow-up.
 pub(super) fn terminate_decision(
     queued: usize,
     awaiting_result: u32,
     redirect_pending: bool,
-    bg_bash_running: bool,
 ) -> TerminateDecision {
     if queued > 0 || awaiting_result > 0 || redirect_pending {
         TerminateDecision::KeepAliveForFollowup {
@@ -154,8 +151,6 @@ pub(super) fn terminate_decision(
             awaiting_result,
             redirect_pending,
         }
-    } else if bg_bash_running {
-        TerminateDecision::KeepAliveForBgBash
     } else {
         TerminateDecision::Terminate
     }

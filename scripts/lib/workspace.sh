@@ -1582,7 +1582,9 @@ select_cargo_lock_holders() {
         # the basename so a rustup/homebrew `cargo` shim still matches and a
         # `claude` / `node` / `codex` subprocess never does.
         comm="$(ps -p "$p" -o comm= 2>/dev/null || true)"
-        [ "${comm##*/}" = "cargo" ] && printf '%s\n' "$p"
+        # `if`, never `&&`: the caller assigns this output under `set -e`. A
+        # false `&&` as the loop's last command returns 1 and ends the caller.
+        if [ "${comm##*/}" = "cargo" ]; then printf '%s\n' "$p"; fi
     done
 }
 

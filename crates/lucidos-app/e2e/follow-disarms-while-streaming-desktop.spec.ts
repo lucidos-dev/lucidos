@@ -124,19 +124,10 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
   });
 
   /* THE SCROLLBAR is the other way a desktop reader moves a transcript, and it
-   * is deliberately NOT covered here: Playwright cannot drive Chromium's
-   * scrollbar. A drag was written and run, and its own harness check (drag the
-   * thumb with nothing riding, assert the container moved) failed with
-   * scrollTop unchanged at 766, so the synthetic pointer events never grip the
-   * thumb. Chromium hit-tests its scrollbars outside the path CDP's
-   * `Input.dispatchMouseEvent` feeds, so there is nothing to aim at.
-   *
-   * That leaves the gutter press covered only by
-   * `src/components/chat/__tests__/reader-gesture-listeners.test.ts`, which
-   * builds the `pointerdown` itself and therefore assumes the two things a
-   * browser would have to prove: that Chromium dispatches one to the element
-   * for a scrollbar press at all, and that `offsetX` really does exceed
-   * `clientWidth` there. Worth knowing when reading that test, and worth not
-   * re-attempting here without first checking whether the driver has grown the
-   * ability. */
+   * is not covered here. Headless Chromium launches with `--hide-scrollbars`,
+   * so there is no thumb for a pointer to grip. Dropping that flag gives a real
+   * one: `transcript-native-scrollbar-holds-the-content-desktop.spec.ts` drags
+   * it, which also shows Chromium dispatching the gutter `pointerdown` that
+   * `src/components/chat/__tests__/reader-gesture-listeners.test.ts` builds by
+   * hand. A follow-disarm case can reuse that setup. */
 });

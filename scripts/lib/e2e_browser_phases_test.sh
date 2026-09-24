@@ -120,6 +120,7 @@ lift webkit_phase_selection
 lift report_webkit_phase_selection
 lift run_specs_chunked
 lift _run_browser_project_body
+lift run_browser_project
 
 # shellcheck source=/dev/null
 source "$LIFTED"
@@ -145,10 +146,23 @@ WEBKIT_PHASE_APPLIED=""
 
 STUB_PW_RC=0
 STUB_BOUNDARY_FAIL_AT=""
+# The in-chunk stop. STUB_TRIP_ON_CALL is the Playwright invocation (1-based)
+# during which the sampler trips, and that call returns STUB_TRIP_RC, the code a
+# SIGINTed runner exits with. STUB_FAIL_ON_CALL makes one call fail on its own.
+STUB_TRIP_ON_CALL=""
+STUB_TRIP_RC=130
+STUB_FAIL_ON_CALL=""
+PW_CALLS=0
+TRIPPED=""
 
 reset_stubs() {
     STUB_PW_RC=0
     STUB_BOUNDARY_FAIL_AT=""
+    STUB_TRIP_ON_CALL=""
+    STUB_TRIP_RC=130
+    STUB_FAIL_ON_CALL=""
+    PW_CALLS=0
+    TRIPPED=""
 }
 
 # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
@@ -161,9 +175,30 @@ set_output_dir() { OUTPUT_ARG=(--output="stub-output/$1"); }
 
 # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
 run_playwright() {
+    PW_CALLS=$((PW_CALLS + 1))
     echo "playwright: $*"
+    if [ "$PW_CALLS" = "$STUB_TRIP_ON_CALL" ]; then
+        TRIPPED=1
+        return "$STUB_TRIP_RC"
+    fi
+    [ "$PW_CALLS" = "$STUB_FAIL_ON_CALL" ] && return 1
     return "$STUB_PW_RC"
 }
+
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+host_memory_stopped_mid_chunk() {
+    [ -n "$TRIPPED" ] || return 1
+    # shellcheck disable=SC2034 # the real one sets it for report_memory_stop
+    MEMORY_STOP_DETAIL="stub trip"
+    return 0
+}
+
+# The tally of a project whose last invocation printed no summary: it cannot add
+# up, so the real reporter returns 1. STUB_TALLY_RC stands in for that.
+STUB_TALLY_RC=0
+PW_TALLY_LOG="$SANDBOX/tally-stub"
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+report_playwright_totals() { echo "tally: $1"; return "$STUB_TALLY_RC"; }
 
 # Fails at exactly one named boundary, so a test can place the stop where it
 # wants it and leave every other boundary green.
@@ -662,6 +697,141 @@ test_a_phase_selection_on_an_unsplittable_set_says_it_ran_everything() {
     assert_eq "" "$WEBKIT_PHASE_APPLIED" "a selection that narrowed nothing is not recorded as a narrowing"
 }
 
+# ── the in-chunk stop ───────────────────────────────────────────────────
+# The sampler interrupts a chunk that holds the freeze signature. The run must
+# then read as a memory stop: exit 71, MEMORY_STOPPED set, nothing more started.
+
+test_a_trip_inside_a_nav_chunk_stops_the_run_as_a_memory_stop() {
+    echo "test: a trip inside nav chunk 1/2 stops the run, and nav chunk 2/2 never starts"
+    local rc=0
+    reset_stubs
+    STUB_TRIP_ON_CALL=2
+    drive_in "$FAKE" "$OUT/tripnav.out" || rc=$?
+    assert_eq "71" "$rc" "the interrupted chunk's own code gives way to the memory stop"
+    assert_eq "mobile-webkit" "$MEMORY_STOPPED" "the stop is recorded against the project"
+    assert_says "$OUT/tripnav.out" "nav chunk 1/2: STOPPED inside the chunk on host memory" "the trace says where it stopped"
+    assert_silent_about "$OUT/tripnav.out" "nav chunk 2/2: 1 specs" "the next chunk never starts"
+    assert_silent_about "$OUT/tripnav.out" "boundary: mobile-webkit nav chunk 1/2" "no boundary check runs after a trip"
+}
+
+test_a_trip_inside_the_cc_phase_skips_navigation() {
+    echo "test: a trip inside the CC phase skips the whole navigation phase"
+    local rc=0
+    reset_stubs
+    STUB_TRIP_ON_CALL=1
+    drive_in "$FAKE" "$OUT/tripcc.out" || rc=$?
+    assert_eq "71" "$rc" "the run exits with the memory stop code"
+    assert_says "$OUT/tripcc.out" "phase 2/2 SKIPPED: stopped on host memory" "navigation is skipped and says why"
+    assert_eq "1" "$(grep -c '^playwright:' "$OUT/tripcc.out")" "only the interrupted chunk ran"
+    assert_silent_about "$OUT/tripcc.out" "boundary: mobile-webkit phase 1/2 (CC)" "the phase boundary is not checked again"
+}
+
+test_a_failing_chunk_outranks_a_later_trip() {
+    echo "test: a real failure before the trip keeps its code"
+    local rc=0
+    reset_stubs
+    STUB_FAIL_ON_CALL=1
+    STUB_TRIP_ON_CALL=2
+    drive_in "$FAKE" "$OUT/failtrip.out" || rc=$?
+    assert_eq "1" "$rc" "the failing CC chunk is not hidden by the stop"
+    assert_eq "mobile-webkit" "$MEMORY_STOPPED" "the stop is still recorded"
+}
+
+test_a_trip_inside_a_single_pass_project_stops_it() {
+    echo "test: a trip during a one-pass project reads as a memory stop"
+    local rc=0 prev="$PWD"
+    reset_stubs
+    STUB_TRIP_ON_CALL=1
+    MEMORY_STOPPED=""
+    # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
+    OUTPUT_ARG=()
+    cd "$FAKE" || return
+    _run_browser_project_body chromium >"$OUT/tripone.out" 2>&1 || rc=$?
+    cd "$prev" || return
+    assert_eq "71" "$rc" "the project exits with the memory stop code"
+    assert_eq "chromium" "$MEMORY_STOPPED" "the stop is recorded against that project"
+    assert_says "$OUT/tripone.out" "chromium: STOPPED inside the run on host memory" "the trace says it stopped"
+}
+
+# run_playwright itself, lifted under another name because the stub above owns
+# the real one. It must record the runner's pid, and keep its old contract: the
+# output reaches the terminal and the tally, and the code is Playwright's own.
+REAL_RUN_PW="$SANDBOX/real-run-playwright.sh"
+sed -n '/^run_playwright() {/,/^}/p' "$BROWSER_SH" | sed '1s/^run_playwright()/real_run_playwright()/' > "$REAL_RUN_PW"
+if ! grep -q '^real_run_playwright() {' "$REAL_RUN_PW"; then
+    echo "FATAL: could not lift run_playwright() out of scripts/e2e-browser.sh." >&2
+    exit 1
+fi
+
+test_an_interrupted_project_still_exits_as_a_memory_stop() {
+    echo "test: a tally broken by the interrupt does not turn the stop into a failure"
+    local rc=0 prev="$PWD"
+    reset_stubs
+    STUB_TRIP_ON_CALL=1
+    STUB_TALLY_RC=1
+    MEMORY_STOPPED=""
+    # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
+    OUTPUT_ARG=()
+    cd "$FAKE" || return
+    run_browser_project chromium >"$OUT/tallytrip.out" 2>&1 || rc=$?
+    assert_eq "71" "$rc" "the project still exits with the memory stop code"
+    assert_says "$OUT/tallytrip.out" "did not report" "the tally says why it did not add up"
+    reset_stubs
+    STUB_TALLY_RC=1
+    MEMORY_STOPPED=""
+    rc=0
+    run_browser_project chromium >"$OUT/tallyplain.out" 2>&1 || rc=$?
+    cd "$prev" || return
+    assert_eq "1" "$rc" "without a stop, a tally that does not add up still fails the project"
+    STUB_TALLY_RC=0
+}
+
+test_run_playwright_does_not_start_after_a_trip() {
+    echo "test: run_playwright refuses to start once the sampler has tripped"
+    local rc=0 ran="$SANDBOX/ran"
+    rm -f "$ran"
+    (
+        # shellcheck source=/dev/null
+        source "$REAL_RUN_PW"
+        # shellcheck disable=SC2034 # read by the lifted run_playwright
+        TRIPPED=1
+        real_run_playwright sh -c "touch '$ran'"
+    ) >"$OUT/notstarted.out" 2>&1 || rc=$?
+    assert_eq "71" "$rc" "it returns the memory stop code"
+    if [ -e "$ran" ]; then fail "the command ran after a trip"; else pass "the command never ran"; fi
+    assert_says "$OUT/notstarted.out" "does not start" "it says why"
+}
+
+test_run_playwright_records_its_runner_and_keeps_its_contract() {
+    echo "test: run_playwright records the runner pid and keeps output and exit code"
+    local rc=0 log="$SANDBOX/runner-log" pid
+    reset_stubs
+    : > "$log"
+    (
+        PW_TALLY_LOG="$SANDBOX/tally"
+        : > "$PW_TALLY_LOG"
+        # shellcheck source=/dev/null
+        source "$REAL_RUN_PW"
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        record_host_memory_runner() { echo "record $1" >> "$log"; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        clear_host_memory_runner() { echo "clear" >> "$log"; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        interrupt_host_memory_runner_if_tripped() { echo "late-check" >> "$log"; }
+        # shellcheck disable=SC2016 # expanded by the inner sh, not here
+        real_run_playwright sh -c 'echo "pid=$$"; echo out-line; echo err-line >&2; exit 3'
+    ) >"$OUT/realpw.out" 2>&1 || rc=$?
+    assert_eq "3" "$rc" "the code is the command's own"
+    assert_says "$OUT/realpw.out" "out-line" "stdout reaches the terminal"
+    assert_says "$OUT/realpw.out" "err-line" "stderr reaches the terminal"
+    assert_says "$SANDBOX/tally" "out-line" "stdout reaches the tally"
+    assert_says "$SANDBOX/tally" "err-line" "stderr reaches the tally"
+    pid="$(sed -n 's/^pid=//p' "$OUT/realpw.out")"
+    assert_says "$log" "record $pid" "the recorded pid is the runner's own"
+    assert_before "$log" "record" "clear" "the record is cleared once the runner returns"
+    assert_before "$log" "record" "late-check" "a trip that landed during the start is checked once recorded"
+}
+
 test_the_cc_phase_runs_first_and_nav_second
 test_both_phases_still_shard
 test_desktop_specs_are_excluded_from_both_phases
@@ -684,6 +854,13 @@ test_the_cc_phase_alone_runs_only_cc_and_says_so
 test_a_garbage_phase_value_runs_both_phases
 test_a_nav_only_run_composes_with_a_chunk_range
 test_a_phase_selection_on_an_unsplittable_set_says_it_ran_everything
+test_a_trip_inside_a_nav_chunk_stops_the_run_as_a_memory_stop
+test_a_trip_inside_the_cc_phase_skips_navigation
+test_a_failing_chunk_outranks_a_later_trip
+test_a_trip_inside_a_single_pass_project_stops_it
+test_run_playwright_records_its_runner_and_keeps_its_contract
+test_an_interrupted_project_still_exits_as_a_memory_stop
+test_run_playwright_does_not_start_after_a_trip
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

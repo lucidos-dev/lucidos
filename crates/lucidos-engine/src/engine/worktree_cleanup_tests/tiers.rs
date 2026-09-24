@@ -818,6 +818,71 @@ async fn fan_in_active_children_keeps_archived_worktree() {
     teardown_test_db(&db_name).await;
 }
 
+/// Fan-in retention, stopped-child half (ADR 0252). A user Stop paused this
+/// parent's child, so the parent is still owed a card and resumes when it
+/// lands. It keeps its worktree exactly as it does for a running child.
+#[tokio::test]
+async fn fan_in_stopped_child_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_stopped_child(&pool, parent_id, Uuid::new_v4()).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "a parent with a stopped child must keep its worktree"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A sibling's `ChildThreadStopped` wakes nothing, so it cannot have
+/// processed the completion card before it. The card still guards the
+/// worktree.
+#[tokio::test]
+async fn fan_in_card_behind_a_stopped_note_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_child_completed_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+    insert_child_stopped_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "an unprocessed card must keep guarding the worktree past a later note"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Even build-artifact stripping (Tier 1) waits for disk pressure now: with
 /// comfortable disk and a non-archived thread, a day-idle worktree keeps its
 /// `target/`/`node_modules/` so the next reopen is fully warm.

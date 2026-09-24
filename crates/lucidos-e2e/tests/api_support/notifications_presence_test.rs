@@ -633,12 +633,40 @@ async fn create_and_read_back(body: serde_json::Value) -> serde_json::Value {
         .clone()
 }
 
+/// Seed one event row and return its id. `None` seeds a workspace domain
+/// event, which lives in no thread.
+///
+/// The engine refuses an event its thread does not hold. So a test expecting
+/// the write to succeed needs a real row to point at.
+async fn seed_event(event_type: &str, thread: Option<uuid::Uuid>) -> uuid::Uuid {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e DB");
+    let event = uuid::Uuid::new_v4();
+    let aggregate = if thread.is_some() { "thread" } else { "domain" };
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate, thread_id) \
+         VALUES ($1, $2, '{}'::jsonb, NOW(), COALESCE($3::text, $2), $4, $3)",
+    )
+    .bind(event)
+    .bind(event_type)
+    .bind(thread)
+    .bind(aggregate)
+    .execute(&pool)
+    .await
+    .expect("seed event");
+    event
+}
+
 /// A tapless notification that names a source event deep-links to it, so one
 /// tap lands on the event instead of on the inbox card.
 #[tokio::test]
 async fn a_tapless_notification_with_an_event_navigates_to_it() {
-    let thread = uuid::Uuid::new_v4().to_string();
-    let event = uuid::Uuid::new_v4().to_string();
+    let thread_id = uuid::Uuid::new_v4();
+    let thread = thread_id.to_string();
+    let event = seed_event("UserQuestionAsked", Some(thread_id))
+        .await
+        .to_string();
     let row = create_and_read_back(serde_json::json!({
         "title": unique_marker("derived-tap"),
         "message": "should deep-link to the event",
@@ -671,11 +699,13 @@ async fn a_tapless_notification_without_an_event_opens_the_card() {
 /// something else.
 #[tokio::test]
 async fn an_explicit_tap_survives_the_derivation() {
+    let thread = uuid::Uuid::new_v4();
+    let event = seed_event("UserQuestionAsked", Some(thread)).await;
     let row = create_and_read_back(serde_json::json!({
         "title": unique_marker("explicit-tap"),
         "message": "caller asked for the card",
-        "thread_id": uuid::Uuid::new_v4().to_string(),
-        "event_id": uuid::Uuid::new_v4().to_string(),
+        "thread_id": thread.to_string(),
+        "event_id": event.to_string(),
         "tap": { "kind": "modal" },
     }))
     .await;
@@ -696,6 +726,45 @@ async fn create_expecting_refusal(body: serde_json::Value) -> (u16, String) {
     let status = resp.status().as_u16();
     let reason = resp.text().await.expect("read refusal body");
     (status, reason)
+}
+
+/// A domain event lives in no thread, so no transcript can show it. A trigger
+/// fired by one used to pass its id, and the tap then reported "That event is
+/// not shown in this thread". The engine refuses it while the caller can fix it.
+#[tokio::test]
+async fn a_domain_event_anchor_is_refused() {
+    let event = seed_event("E2ETestsPassed", None).await;
+    let (status, reason) = create_expecting_refusal(serde_json::json!({
+        "title": unique_marker("domain-event-anchor"),
+        "message": "should never be stored",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+        "event_id": event.to_string(),
+    }))
+    .await;
+    assert_eq!(status, 400, "a domain event must be refused, got {reason}");
+    assert!(
+        reason.contains("belongs to no thread"),
+        "must say why, got: {reason}"
+    );
+}
+
+/// An event from another thread cannot render in the one the tap opens either.
+#[tokio::test]
+async fn an_event_from_another_thread_is_refused() {
+    let elsewhere = uuid::Uuid::new_v4();
+    let event = seed_event("UserQuestionAsked", Some(elsewhere)).await;
+    let (status, reason) = create_expecting_refusal(serde_json::json!({
+        "title": unique_marker("foreign-event-anchor"),
+        "message": "should never be stored",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+        "event_id": event.to_string(),
+    }))
+    .await;
+    assert_eq!(status, 400, "a foreign event must be refused, got {reason}");
+    assert!(
+        reason.contains(&elsewhere.to_string()),
+        "must name its thread, got: {reason}"
+    );
 }
 
 /// A tap whose thread id names no thread is a dead deep link. The reader meets

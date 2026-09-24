@@ -71,36 +71,84 @@ export const WINDOW_EXPAND_MARGIN_PX = 1600;
  *  without a cycle. */
 export const SCROLLABLE_SLACK_PX = 10;
 
-/** Most fill expansions one thread may take. A backstop, not a budget.
+/** Most fill expansions that DREW something one thread may take. A backstop,
+ *  not a budget.
  *
- *  A round takes either ONE oversized turn or up to `WINDOW_STEP` ordinary
- *  ones. An oversized turn blew the budget alone, so it fills a pane by itself,
- *  and `WINDOW_STEP` ordinary ones fill it between them. Real threads therefore
- *  take one round, sometimes two.
+ *  A round takes either `ROW_BUDGET` drawn rows of the floor turn, ONE
+ *  oversized turn, or up to `WINDOW_STEP` ordinary ones. Each of those fills a
+ *  pane, so real threads take one round, sometimes two.
  *
- *  The cap covers the degenerate case where neither holds: a reader who has
- *  FOLDED oversized turns leaves rows that parse their markdown and draw no
- *  height. Four bounds that at a few times the seed's own cost. Reaching it
- *  leaves the up chevron, which renders the whole thread in one press. */
+ *  A round that drew nothing is not charged (`settleFillLedger`), and it is
+ *  nearly free: a row that draws nothing renders `null`. With steps hidden, a
+ *  coding-agent turn can run hundreds of such rows between two lines of prose.
+ *  The fill must cross them to reach something the reader can see. */
 export const MAX_FILL_EXPANSIONS = 4;
 
-/** Most pages of history one thread's FILL may fetch. A backstop, not a budget.
+/** Most pages of history that DREW something one thread's FILL may fetch. A
+ *  backstop, not a budget.
  *
  *  A render round costs a fold; this costs a request. What ends the loop is the
  *  transcript overflowing, or the thread reaching its first event. Both arrive
  *  within a page or two of any real thread.
  *
- *  This covers the shape where neither does: a page whose events all draw no
- *  height, against a pane no page can fill. Reaching the cap leaves the up
- *  chevron, which loads the whole thread in one press. */
+ *  A page that folded in rows yet drew nothing is not charged
+ *  (`settleFillLedger`). The chevron, the other way out, would load the whole
+ *  thread anyway. A page that FAILED folded nothing in, so it stays charged,
+ *  and a failing endpoint is asked at most this many times. */
 export const MAX_FILL_BACKFILLS = 4;
+
+/** What the fill measures a round by. */
+export interface FillReading {
+  /** Rows the window draws. */
+  drawn: number;
+  /** Sequence of the oldest event this client holds, `Infinity` with none.
+   *  Only a page that lands moves it, never an event streamed onto the live
+   *  turn. So a failed page on a live thread still reads as no progress. */
+  floor: number;
+}
+
+/** A thread's fill rounds, charged against `MAX_FILL_EXPANSIONS` and
+ *  `MAX_FILL_BACKFILLS`, and the last round with the reading it was taken at. */
+export interface FillLedger {
+  grow: number;
+  page: number;
+  last: ({ kind: 'grow' | 'page' } & FillReading) | null;
+}
+
+export const EMPTY_FILL_LEDGER: FillLedger = { grow: 0, page: 0, last: null };
+
+/** Refund the last round if it made progress yet drew nothing.
+ *
+ *  A grow always made progress: it is charged only when the edge moved. A page
+ *  made progress when the history floor moved older. A failed page moved
+ *  nothing, so it stays charged.
+ *
+ *  This is what keeps the loop finite. Every refunded round moved the edge up
+ *  or pulled history in, and a thread has only so much of either. */
+export function settleFillLedger(ledger: FillLedger, now: FillReading): FillLedger {
+  const { last } = ledger;
+  if (!last) return ledger;
+  const progressed = last.kind === 'grow' || now.floor < last.floor;
+  if (!progressed || now.drawn > last.drawn) return { ...ledger, last: null };
+  return { ...ledger, [last.kind]: ledger[last.kind] - 1, last: null };
+}
+
+/** May the fill take another round of this kind? */
+export function fillRoundAllowed(ledger: FillLedger, kind: 'grow' | 'page'): boolean {
+  return ledger[kind] < (kind === 'grow' ? MAX_FILL_EXPANSIONS : MAX_FILL_BACKFILLS);
+}
+
+/** The ledger once a round of this kind has been taken at `now`. */
+export function chargeFillRound(ledger: FillLedger, kind: 'grow' | 'page', now: FillReading): FillLedger {
+  return { ...ledger, [kind]: ledger[kind] + 1, last: { kind, ...now } };
+}
 
 /** One exchange's share of the budget: its steps plus its own user bubble. */
 export function exchangeRenderCost(exchange: { steps: readonly unknown[] }): number {
   return exchange.steps.length + 1;
 }
 
-/** How many of the FLOOR exchange's rendered rows the window may draw.
+/** How many of the FLOOR exchange's DRAWN rows the window may uncover a round.
  *
  *  The budget above picks WHICH turns render, and it has one hard floor: a turn
  *  larger than the whole budget must still draw, or the transcript is blank.
@@ -113,11 +161,25 @@ export function exchangeRenderCost(exchange: { steps: readonly unknown[] }): num
  *  head arrives as the reader scrolls toward it, through the same expansion
  *  older turns arrive through.
  *
- *  Counted in RENDERED rows, not raw events, unlike `STEP_BUDGET`. In a
- *  tool-heavy turn about half the raw events draw no row of their own, a result
- *  settling the row its call opened. So 80 rows is about what 160 raw events
- *  cost. */
+ *  Counted in rows the reader's view DRAWS (`rowsDrawnByClamp`), not raw
+ *  events. A row that draws nothing renders `null`, so it costs nothing and
+ *  fills no height. With steps hidden, a coding-agent turn is mostly such rows,
+ *  and a budget that counted them could fill with rows the reader cannot see.
+ *  With every row drawn, 80 is about what 160 raw events cost. */
 export const ROW_BUDGET = 80;
+
+/** Most rows of the floor exchange one round may uncover, drawn or not.
+ *
+ *  A row hidden by the view today draws the moment the reader shows steps,
+ *  and the edge is never re-seeded on that toggle. So this bounds what one
+ *  toggle can make render at once. A silent run longer than this takes more
+ *  than one round, which the fill does not charge. */
+export const ROW_CEILING = ROW_BUDGET * 4;
+
+/** One exchange's rows, in the order `ChatExchange` renders them: `true` for a
+ *  row the reader's current view draws. Its length is the exchange's row count,
+ *  which is the unit `WindowEdge.rowsHidden` counts in. */
+export type RowsAt = (index: number) => readonly boolean[];
 
 /** The window's top edge. Two dimensions, because one turn can outweigh a whole
  *  transcript.
@@ -134,8 +196,15 @@ export interface WindowEdge {
 }
 
 /** The whole window, rendered. What a deep link and the scroll-to-top chevron
- *  set, and the only edge that is safe to compare against by value. */
+ *  set, and the only edge that is safe to compare against by value. A reader
+ *  who scrolls up to the first turn reaches the same value, so it never says
+ *  who asked for it: see `StoredWindowKind`. */
 export const WHOLE_THREAD: WindowEdge = { exchange: 0, rowsHidden: 0 };
+
+/** How a thread's stored window came to be. `render-all` is a NAVIGATION's
+ *  claim, stored by a deep link or the up chevron. `grown` is the seed or the
+ *  reader's own scrolling, including a window grown to the first turn. */
+export type StoredWindowKind = 'render-all' | 'grown';
 
 /** Must a deep link's render-all be WRITTEN to this thread's stored edge?
  *
@@ -151,12 +220,39 @@ export function deepLinkMustPersist(stored: WindowEdge | undefined): boolean {
   return !stored || edgeHasMoreAbove(stored);
 }
 
-/** How many leading rows to hide in an exchange drawing `rowCount` of them.
+/** How many leading rows to hide so the rest draw `budget` of them.
  *
- *  Never all of them: a turn admitted to the window draws something, the same
- *  floor `countWithinBudget` keeps one level up. */
-export function seedRowsHidden(rowCount: number, budget = ROW_BUDGET): number {
-  return Math.max(0, rowCount - Math.max(1, budget));
+ *  Walks back from the newest row until `budget` drawn rows are uncovered, so
+ *  every row that draws nothing on the way costs nothing. It stops early at
+ *  `ceiling` rows uncovered, drawn or not.
+ *
+ *  Never hides every row: a turn admitted to the window shows something, the
+ *  same floor `countWithinBudget` keeps one level up. */
+export function seedRowsHidden(
+  rows: readonly boolean[],
+  budget = ROW_BUDGET,
+  ceiling = ROW_CEILING,
+): number {
+  const wanted = Math.max(1, budget);
+  const stop = Math.max(0, rows.length - Math.max(1, ceiling));
+  let drawn = 0;
+  for (let i = rows.length - 1; i > stop; i--) {
+    if (rows[i] && ++drawn === wanted) return i;
+  }
+  return stop;
+}
+
+/** How many drawn rows the window holds: the floor exchange's uncovered tail,
+ *  and every exchange after it whole. What the fill measures a round by. */
+export function drawnRowsInWindow(edge: WindowEdge, total: number, rowsAt: RowsAt): number {
+  let drawn = 0;
+  for (let i = Math.max(0, edge.exchange); i < total; i++) {
+    const rows = rowsAt(i);
+    for (let r = i === edge.exchange ? edge.rowsHidden : 0; r < rows.length; r++) {
+      if (rows[r]) drawn++;
+    }
+  }
+  return drawn;
 }
 
 /** Is anything left above this edge, whether a whole turn or the head of one? */
@@ -166,23 +262,22 @@ export function edgeHasMoreAbove(edge: WindowEdge): boolean {
 
 /** The edge a thread opens at.
  *
- *  `rowCountAt` folds one exchange and reports how many rows it draws. A
- *  callback rather than a number, because only the FLOOR exchange's row count
- *  is ever needed. Folding every exchange to find out would be the cost the
- *  window exists to avoid. `exchangeRenderCost` stays O(1) for that reason and
- *  counts raw events, which is a different unit and cannot answer this. */
-export function seedWindowEdge(
-  costs: readonly number[],
-  rowCountAt: (index: number) => number,
-): WindowEdge {
+ *  `rowsAt` folds one exchange. A callback rather than a value, because only
+ *  the FLOOR exchange's rows are ever needed. Folding every exchange to find
+ *  out would be the cost the window exists to avoid. `exchangeRenderCost` stays
+ *  O(1) for that reason and counts raw events, which is a different unit and
+ *  cannot answer this. */
+export function seedWindowEdge(costs: readonly number[], rowsAt: RowsAt): WindowEdge {
   const exchange = computeRenderFromIndex(costs.length, seedRenderCount(costs));
-  return { exchange, rowsHidden: seedRowsHidden(rowCountAt(exchange)) };
+  return { exchange, rowsHidden: seedRowsHidden(rowsAt(exchange)) };
 }
 
 /** The edge after one scroll-up round.
  *
  *  Rows first, then turns. Scrolling up into a turn is a request for its head,
- *  and uncovering that is the cheaper of the two moves. Only once the turn is
+ *  and uncovering that is the cheaper of the two moves. A row round uncovers
+ *  `ROW_BUDGET` drawn rows, or the whole head if it draws fewer, and always at
+ *  least one row. Only once the turn is
  *  whole does the window reach past it, and the turn it reaches is clamped in
  *  its own turn.
  *
@@ -191,42 +286,72 @@ export function seedWindowEdge(
 export function expandWindowEdge(
   edge: WindowEdge,
   costs: readonly number[],
-  rowCountAt: (index: number) => number,
+  rowsAt: RowsAt,
 ): WindowEdge {
   if (edge.rowsHidden > 0) {
-    return { exchange: edge.exchange, rowsHidden: Math.max(0, edge.rowsHidden - ROW_BUDGET) };
+    const hidden = rowsAt(edge.exchange).slice(0, edge.rowsHidden);
+    return { exchange: edge.exchange, rowsHidden: seedRowsHidden(hidden) };
   }
   const current = renderCountFromFloor(costs.length, edge.exchange);
   const next = expandRenderCount(costs, current);
   if (next === current) return edge;
   const exchange = computeRenderFromIndex(costs.length, next);
-  return { exchange, rowsHidden: seedRowsHidden(rowCountAt(exchange)) };
+  return { exchange, rowsHidden: seedRowsHidden(rowsAt(exchange)) };
 }
 
-/** Is the exchange at `index` rendered WHOLE?
- *
- *  Whole, not merely present, and that is what the *reading position* needs.
- *  ADR 0152 restores a turn by its own `relTop`, measured from its top edge. A
- *  turn whose head is still clamped off cannot place the reader. */
-export function edgeReachesIndex(edge: WindowEdge, index: number): boolean {
+/** Is row `row` of the exchange at `index` drawn? Row 0 asks whether the
+ *  exchange is drawn WHOLE, which a *reading position* naming a turn needs:
+ *  ADR 0152 restores a turn by its own top edge. One naming a row needs that
+ *  row alone, not the whole turn above it. */
+export function edgeReachesRow(edge: WindowEdge, index: number, row: number): boolean {
   if (index > edge.exchange) return true;
-  return index === edge.exchange && edge.rowsHidden === 0;
+  return index === edge.exchange && edge.rowsHidden <= row;
 }
 
-/** Does the window owe another round to reach `index` whole?
+/** Does the window owe another round to reach row `row` of the exchange at
+ *  `index`?
  *
  *  ThreadView's `reachAnchor` decision in one place, so the walk's termination
  *  is answerable without a component. Three ways it is already done, and each
  *  ends the walk for good. A negative index is a saved position naming a turn
- *  this thread has not got. The turn is rendered whole. Nothing is left above.
+ *  this thread has not got. The row is drawn. Nothing is left above.
  *
  *  It shrinks monotonically under `expandWindowEdge`, which always takes either
  *  a budget of rows or at least one exchange while any remain. So a walk driven
  *  off this terminates. */
-export function edgeMustReachIndex(edge: WindowEdge, index: number): boolean {
+export function edgeMustReachRow(edge: WindowEdge, index: number, row: number): boolean {
   if (index < 0) return false;
-  if (edgeReachesIndex(edge, index)) return false;
+  if (edgeReachesRow(edge, index, row)) return false;
   return edgeHasMoreAbove(edge);
+}
+
+/** Most reads of older history one visit spends chasing a *reading position*
+ *  behind the loaded page, at `READING_CHASE_PAGE_SIZE` events each. ADR 0234
+ *  weighs the cost: a bounded chase on the open of a thread parked far back,
+ *  against losing the reader's place. */
+export const MAX_READING_CHASES = 2;
+
+/** Events per chase read: the endpoint's own cap (`MAX_EVENTS_PAGE`), so two
+ *  reads reach 4000 events back. */
+export const READING_CHASE_PAGE_SIZE = 2000;
+
+/** What the reading-position walk does about a target no loaded turn holds.
+ *
+ *  - `wait`: a read is already running, whose fold re-runs the walk. Or the
+ *    pane has no box to hold the reader across a fold, which a collapsed split
+ *    gives, and its ResizeObserver asks again.
+ *  - `chase`: read the next page of older history.
+ *  - `give-up`: nothing older, or the bound is spent. The thread opens where a
+ *    thread with no reachable position opens. */
+export function readingChaseAction(state: {
+  readInFlight: boolean;
+  paneMeasurable: boolean;
+  hasOlderEvents: boolean;
+  chasesSpent: number;
+}): 'wait' | 'chase' | 'give-up' {
+  if (state.readInFlight || !state.paneMeasurable) return 'wait';
+  if (state.hasOlderEvents && state.chasesSpent < MAX_READING_CHASES) return 'chase';
+  return 'give-up';
 }
 
 /** How many contiguous exchanges ending just before `endExclusive` fit in
@@ -436,16 +561,19 @@ export function anythingAbove(
  *  `reachAnchor` walks the window up to it a budgeted round per frame, which is
  *  the chunked way to the same place (ADR 0152).
  *
- *  A PARTIAL edge is kept, and that is the other half of the rule. The reader
- *  grew it by scrolling, it describes where they actually are, and re-seeding
- *  it would make them walk back up on every return. Only the claim goes. */
+ *  A window the READER grew is kept, and that is the other half of the rule.
+ *  It describes where they actually are, and re-seeding it would make them
+ *  walk back up on every return. Only the claim goes.
+ *
+ *  So the question is who stored the window, never its value. A reader who
+ *  scrolled to the first turn holds `WHOLE_THREAD` too. Read as a claim, their
+ *  thread would open on the newest turns and jump when the walk arrives. */
 export function reseedOnReopen(
-  stored: WindowEdge | undefined,
+  stored: StoredWindowKind | undefined,
   deepLinkClaimedThisVisit: boolean,
 ): boolean {
   if (deepLinkClaimedThisVisit) return false;
-  if (!stored) return false;
-  return !edgeHasMoreAbove(stored);
+  return stored === 'render-all';
 }
 
 /** Whether a "scroll to top" must render the FULL thread before scrolling.

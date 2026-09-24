@@ -11,7 +11,9 @@ Use this skill to convert settled design intent into an executable implementatio
 
 The output is **always a checked-in plan file** at `docs/plans/YYYY-MM-DD-<slug>.md` (the repo convention; date = today, slug = a short kebab-case description), written and committed before the first code edit. Also surface a brief summary in the conversation, but the committed file is the source of truth.
 
-**Enforcement (the Planned marker) + human approval.** Lucidos requires a gate-satisfying *Planned marker* on the branch before any source edit and before Apply. Running this skill records a **proposed** marker for you (after committing the plan file, run `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`). A proposed plan does **not** unblock editing: it awaits the human's approval. **Present the plan, then ask for approval with the `AskUserQuestion` tool** (see "Asking for approval" below). Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying; only then are source edits and Apply unblocked. If the user requests changes, revise the plan file, re-commit, and ask again the same way (the marker stays proposed until approved). For genuinely local fixes that don't warrant a plan, the agent acknowledges instead with `lucidos planned mark --simple "<one-line reason>"` (no approval needed); that path does not use this skill.
+**Enforcement (the Planned marker) + human approval.** Lucidos requires a gate-satisfying *Planned marker* on the branch before any source edit and before Apply. Running this skill records a **proposed** marker for you (after committing the plan file, run `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`). A proposed plan does **not** unblock editing: it awaits the human's approval. **Summarize the plan in your message, then ask for approval with the `AskUserQuestion` tool** (see "Asking for approval" below).
+
+Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying; only then are source edits and Apply unblocked. If the user requests changes, revise the plan file and re-commit. Then ask again, with a message naming only what changed (the marker stays proposed until approved). For genuinely local fixes that don't warrant a plan, the agent acknowledges instead with `lucidos planned mark --simple "<one-line reason>"` (no approval needed); that path does not use this skill.
 
 ## When nobody can be asked: the unattended run
 
@@ -101,7 +103,7 @@ and § "Step 3 detail". The reasoning and the rejected alternatives are in
 
 ## Required Output
 
-Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md` (date = today, slug = a short kebab-case description of the work) using the structure below, then commit it (`docs(plans): <summary>`) before starting the first phase. Immediately after committing, record the **proposed** marker: `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`. Then surface a short summary of the plan in the conversation (the committed file is the source of truth) and ask for approval as described below. Do **not** start editing yet: the edit gate stays closed while the marker is `proposed`.
+Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md`, using the structure below. The date is today, and the slug is a short kebab-case description of the work. Commit it (`docs(plans): <summary>`) before starting the first phase. Immediately after committing, record the **proposed** marker: `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`. Then summarize the plan in your message (the committed file is the source of truth) and ask for approval as described below. Do **not** start editing yet: the edit gate stays closed while the marker is `proposed`.
 
 ### Asking for approval
 
@@ -125,7 +127,11 @@ This is a **DECISION** question, not a post-work confirmation, so the "never ask
 
 **Prose is not a lighter-touch version of the tool, it is silence.** The tool call is the only thing that parks the thread in `WaitingForUserAnswer`, and that state is the sole input to `thread_lifecycle::is_attention_needing`: it lights the needs-attention badge, keeps the thread in the Current section, bubbles up the ancestor chain, and is a fire condition for the "When agent needs me" trigger that notifies the user. A question typed into your final message ends the turn instead, so the thread is indistinguishable from a finished one and nobody is told you are waiting.
 
-When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. **A fork answer is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
+When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. **A fork answer is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. If the user requests changes instead, revise the plan file, re-commit, and ask again (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
+
+**The message carries the plan; the card only asks.** The card renders right under your message, so the user reads both. Put the summary in the message. Keep the card's question to one short line, such as "Approve the plan above?". When the second option is a fork, name that trade-off in a few words. Never restate the summary in the card.
+
+**A re-ask names only what changed.** The user has already read the plan, so the new message says what moved and why, in a sentence or two. The committed file holds the rest.
 
 ```md
 ## Implementation Plan

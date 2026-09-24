@@ -209,6 +209,34 @@ fn the_delivery_text_carries_the_event_and_the_reason() {
     assert!(text.contains("waiting to apply"), "{text}");
 }
 
+/// A delivery becomes the next turn's prompt, so a payload carrying a whole log
+/// must not arrive whole. A `BackgroundBashCompleted` holds up to a megabyte of
+/// stdout; the re-entry keeps the tail, where a build says how it ended.
+#[test]
+fn the_delivery_text_keeps_only_the_tail_of_a_long_output() {
+    let mut stdout = "compiling crate\n".repeat(70_000);
+    stdout.push_str("test result: FAILED. 3 passed; 1 failed");
+    let text = delivery_reentry_text(
+        "BackgroundBashCompleted",
+        &json!({"task_id": "t1", "exit_code": 101, "stdout": stdout, "stderr": ""}),
+        "waiting for the build",
+    );
+    assert!(
+        text.len() < 10_000,
+        "a megabyte of stdout must not reach the prompt, got {} bytes",
+        text.len()
+    );
+    assert!(
+        text.contains("test result: FAILED"),
+        "keeps the tail: {text}"
+    );
+    assert!(text.contains("earlier bytes cut"), "says it cut: {text}");
+    assert!(
+        text.contains("\"exit_code\": 101"),
+        "keeps short fields: {text}"
+    );
+}
+
 /// An expiry re-enters the thread rather than dropping it, and the text has to
 /// steer the model away from subscribing again to the same thing: a silent
 /// re-subscribe loop would be the polling this feature replaces, with extra
@@ -2277,27 +2305,21 @@ async fn the_lost_reentry_sweep_skips_a_discarded_thread() {
     teardown_test_db(&db_name).await;
 }
 
-// ── the consecutive-park cap (I13) ───────────────────────────────────
+// ── the recent-subscription cap (I13) ────────────────────────────────
 
 #[tokio::test]
-async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
+async fn recent_subscriptions_counts_only_since_the_last_human_message() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    use super::register::consecutive_subscriptions;
+    use super::register::recent_subscriptions;
 
     let thread_id = Uuid::new_v4();
     seed_thread(&bus, thread_id).await; // a human message
-    assert_eq!(
-        consecutive_subscriptions(&pool, thread_id).await.unwrap(),
-        0
-    );
+    assert_eq!(recent_subscriptions(&pool, thread_id).await.unwrap(), 0);
 
     emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
     emit_subscribe(&bus, thread_id, vec![sub("ResponseGenerated", None)]).await;
-    assert_eq!(
-        consecutive_subscriptions(&pool, thread_id).await.unwrap(),
-        2
-    );
+    assert_eq!(recent_subscriptions(&pool, thread_id).await.unwrap(), 2);
 
     // An AGENT message must NOT reset the counter: cross-thread ping-pong is
     // made of exactly those, so counting it would disarm the cap it should trip.
@@ -2322,16 +2344,53 @@ async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
     )
     .await;
     assert_eq!(
-        consecutive_subscriptions(&pool, thread_id).await.unwrap(),
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
         2,
         "an agent message is not a human in the loop"
     );
 
     seed_thread(&bus, thread_id).await; // a real human follow-up
     assert_eq!(
-        consecutive_subscriptions(&pool, thread_id).await.unwrap(),
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
         0,
         "a human message resets the streak"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The cap bounds a loop, and a loop is fast. A serial workflow whose waits each
+/// last longer than the window must never accumulate towards it.
+#[tokio::test]
+async fn recent_subscriptions_forgets_waits_older_than_the_window() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    use super::register::{recent_subscriptions, RECENT_SUBSCRIPTION_WINDOW_SECS};
+
+    let thread_id = Uuid::new_v4();
+    seed_thread(&bus, thread_id).await;
+    emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
+    emit_subscribe(&bus, thread_id, vec![sub("ResponseGenerated", None)]).await;
+
+    // Age the first wait past the window, on the database clock (ADR 0053).
+    sqlx::query(
+        "UPDATE events SET created = now() - make_interval(secs => $2 + 60) \
+         WHERE id = (SELECT id FROM events \
+                     WHERE aggregate = 'thread' AND aggregate_id = $1 \
+                       AND event_type = 'EventWaitStarted' \
+                     ORDER BY sequence LIMIT 1)",
+    )
+    .bind(thread_id.to_string())
+    .bind(RECENT_SUBSCRIPTION_WINDOW_SECS)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
+        1,
+        "a wait armed before the window is serial progress, not a loop"
     );
 
     pool.close().await;

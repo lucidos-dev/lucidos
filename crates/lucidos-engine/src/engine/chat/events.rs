@@ -7,7 +7,10 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 /// Bad-base64 / unsupported-mime entries are dropped + logged; the event
 /// still emits with the surviving hashes, matching the migration's
 /// partial-failure policy.
-fn images_to_hashes(workspace: &Path, images: Option<&[crate::api::ChatImage]>) -> Vec<String> {
+pub(super) fn images_to_hashes(
+    workspace: &Path,
+    images: Option<&[crate::api::ChatImage]>,
+) -> Vec<String> {
     let Some(images) = images else {
         return Vec::new();
     };

@@ -114,6 +114,61 @@ async fn assert_children_counters(
     assert_eq!(total, expected_total, "{} — total_children_count", msg);
 }
 
+/// Count the persisted `ChildThreadCompleted` cards sitting on `parent_id`.
+async fn count_completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Emit a `ResponseCanceled` with an explicit cause on `thread_id`.
+async fn emit_response_canceled_with_cause(
+    bus: &EventBus,
+    thread_id: Uuid,
+    cause: crate::engine::thread_events::CancelCause,
+) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: "partial work".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// How many parent wakes are queued on `rx`, draining them.
+fn drain_callbacks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ParentCallback>) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// `(status, summary)` of the newest `ChildThreadCompleted` on `parent_id`.
+async fn newest_completion_card(pool: &PgPool, parent_id: Uuid) -> (String, String) {
+    sqlx::query_as(
+        "SELECT payload->>'status', payload->>'summary' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 /// Helper: emit a MessageReceived event for a thread with an optional parent.
 async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, text: &str) {
     bus.emit(BusEvent::Thread {
@@ -419,6 +474,7 @@ mod idle_reconcile_counts;
 mod initiator_actor;
 mod live_event_waits;
 mod origin_and_resume;
+mod parked_thread_archive;
 mod proposed_apply_cycle;
 mod recovery_and_pipeline;
 mod recursion_guard;
@@ -428,5 +484,7 @@ mod section_review;
 mod serialization_persistence;
 mod serialization_sse;
 mod session_lifecycle;
+mod stopped_child;
 mod thread_state_and_eviction;
 mod voice_session_projection;
+mod waiting_child;

@@ -947,6 +947,13 @@
     margin-left: var(--space-md);
 }
 
+/* Holds the unfolded list's height while it loads, before the skeleton's delay
+   gate opens. Hidden rather than absent, so a fast load swaps it for the list
+   with no growth: the menu can open already unfolded. */
+.brand-menu-ws-reserve {
+    visibility: hidden;
+}
+
 /* The workspace rows, and ONLY them. Manage workspaces is a sibling of this box
    rather than its last child (see `workspaceSwitcherList`), so it stays on
    screen whatever the row count: inside, it was the row you had to scroll to

@@ -70,6 +70,22 @@ else
     pass "CC-like process $FAKE_CC_PID correctly skipped"
 fi
 
+echo "test: a non-cargo process listed LAST does not end a set -e caller"
+# build_or_find_engine assigns the output under `set -e`. Another session's
+# shell running `cargo check` can be pgrep's last match. A failing last test
+# then made that assignment end the calling script silently.
+out="$(
+    set -e
+    pgrep() { printf '%s\n' "$FAKE_CARGO_PID" "$FAKE_CC_PID"; }
+    selected="$(select_cargo_lock_holders)"
+    printf 'reached %s\n' "$selected"
+)"
+if [ "$out" = "reached $FAKE_CARGO_PID" ]; then
+    pass "the caller carried on, holding only the cargo process"
+else
+    fail "the caller stopped at the assignment (output='$out')"
+fi
+
 echo ""
 echo "select_cargo_lock_holders: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
