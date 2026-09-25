@@ -33,6 +33,7 @@ pub mod mock;
 #[path = "purity_tests.rs"]
 mod purity_tests;
 
+use crate::core::technical_literacy::TechnicalLiteracy;
 use decision::DecisionChoice;
 pub use language::SpokenLanguage;
 pub use provider::{AudioFormat, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
@@ -294,23 +295,34 @@ Only their words end a call. Silence does not, because somebody who stops \
 talking is thinking. Never call this because you have run out of things to say.
 Work in flight keeps going. This ends the call and never the work.";
 
-/// What this workspace's talker is told, language included.
+/// What this workspace's talker is told, language and technical literacy
+/// included.
 ///
-/// The language belongs here rather than in the resident block. That block is
-/// what the talker KNOWS, and which language to speak is a rule it follows.
-/// Saying it in both places is how the two come to disagree.
+/// Both belong here rather than in the resident block. That block is what the
+/// talker KNOWS, and how to speak is a rule it follows. Saying it in both
+/// places is how the two come to disagree.
 ///
-/// A workspace-level fact, so the prefix a session opens with is still stable
-/// across that workspace's calls and still worth caching. Nothing per-session
-/// may follow it in.
-pub fn instructions_for(language: Option<&SpokenLanguage>) -> String {
-    match language {
-        None => TALKER_INSTRUCTIONS.to_string(),
-        Some(language) => format!(
-            "{}\n\nSpeak {}. Use it even when the caller uses another language.",
-            TALKER_INSTRUCTIONS, language.name
-        ),
+/// Both are workspace-level facts, so the prefix a session opens with is still
+/// stable across that workspace's calls and still worth caching. Nothing
+/// per-session may follow them in.
+pub fn instructions_for(
+    language: Option<&SpokenLanguage>,
+    literacy: Option<TechnicalLiteracy>,
+) -> String {
+    let mut instructions = TALKER_INSTRUCTIONS.to_string();
+    if let Some(language) = language {
+        instructions.push_str(&format!(
+            "\n\nSpeak {}. Use it even when the caller uses another language.",
+            language.name
+        ));
     }
+    if let Some(level) = literacy {
+        instructions.push_str(&format!(
+            "\n\nHow technical to be with the caller:\n{}",
+            level.rules()
+        ));
+    }
+    instructions
 }
 
 #[cfg(test)]
@@ -431,11 +443,13 @@ mod tests {
                 id: "opt-0".to_string(),
                 label: "Run the tail now".to_string(),
                 description: Some("Chunks 25-33".to_string()),
+                preview: None,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
                 label: "Leave it".to_string(),
                 description: None,
+                preview: None,
             },
         ]
     }
@@ -545,7 +559,7 @@ mod tests {
     /// running for the caller, which is a promise rather than a condition.
     #[test]
     fn the_talker_is_never_asked_about_the_doers_state() {
-        let assembled = instructions_for(SpokenLanguage::resolve("Norwegian").as_ref());
+        let assembled = instructions_for(SpokenLanguage::resolve("Norwegian").as_ref(), None);
         let whole = format!(
             "{} {} {} {}",
             assembled, DELEGATE_TOOL_DESCRIPTION, ANSWER_TOOL_DESCRIPTION, HANGUP_TOOL_DESCRIPTION
@@ -600,7 +614,7 @@ mod tests {
     fn explaining_itself_still_names_no_second_agent() {
         let whole = format!(
             "{} {} {} {}",
-            instructions_for(SpokenLanguage::resolve("Norwegian").as_ref()),
+            instructions_for(SpokenLanguage::resolve("Norwegian").as_ref(), None),
             DELEGATE_TOOL_DESCRIPTION,
             ANSWER_TOOL_DESCRIPTION,
             HANGUP_TOOL_DESCRIPTION
@@ -630,19 +644,32 @@ mod tests {
     #[test]
     fn the_talker_is_told_which_language_to_speak() {
         let known = SpokenLanguage::resolve("Norwegian Bokmål");
-        let spoken = instructions_for(known.as_ref());
+        let spoken = instructions_for(known.as_ref(), None);
         assert!(spoken.contains("Speak Norwegian Bokmål."), "{}", spoken);
         assert!(spoken.starts_with(TALKER_INSTRUCTIONS));
 
         let unmapped = SpokenLanguage::resolve("Klingon");
-        assert!(instructions_for(unmapped.as_ref()).contains("Speak Klingon."));
+        assert!(instructions_for(unmapped.as_ref(), None).contains("Speak Klingon."));
     }
 
     /// Auto leaves the prefix exactly as it was, so a workspace that never set
     /// a language opens the session it opened before.
     #[test]
     fn no_language_leaves_the_instructions_untouched() {
-        assert_eq!(instructions_for(None), TALKER_INSTRUCTIONS);
+        assert_eq!(instructions_for(None, None), TALKER_INSTRUCTIONS);
+    }
+
+    /// The talker speaks to the user directly, so it follows their technical
+    /// literacy like every other agent does.
+    #[test]
+    fn the_talker_is_told_how_technical_to_be() {
+        let language = SpokenLanguage::resolve("Norwegian");
+        for level in TechnicalLiteracy::ALL {
+            let spoken = instructions_for(language.as_ref(), Some(level));
+            assert!(spoken.starts_with(TALKER_INSTRUCTIONS));
+            assert!(spoken.contains("Speak Norwegian."));
+            assert!(spoken.ends_with(&level.rules()), "{level:?} is missing");
+        }
     }
 
     /// A workspace-level fact, so the cached prefix is stable across its calls.
@@ -651,8 +678,8 @@ mod tests {
     fn two_calls_on_one_workspace_open_with_the_same_prefix() {
         let language = SpokenLanguage::resolve("Norwegian");
         assert_eq!(
-            instructions_for(language.as_ref()),
-            instructions_for(language.as_ref())
+            instructions_for(language.as_ref(), None),
+            instructions_for(language.as_ref(), None)
         );
     }
 

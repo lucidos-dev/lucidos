@@ -14,6 +14,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { applyNavFocus } from '../shared/focusMarker';
 import { resolveTriggerScrollStep } from './triggerScrollStep';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { scrollBehavior } from '../../utils/motion';
 
 const UNGROUPED_KEY = '__ungrouped__';
 
@@ -147,7 +148,7 @@ function TriggersLoaded({
       `[data-trigger-id="${CSS.escape(step.triggerId)}"]`,
     );
     if (!el) return;
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
     applyNavFocus(el);
     triggerScrollTarget.value = null;
   }, [triggerScrollTarget.value, triggersData, collapsed, listRef]);

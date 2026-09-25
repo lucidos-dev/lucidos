@@ -40,6 +40,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("AbortCause", "engine/thread_events/cause.rs"),
     ("CancelCause", "engine/thread_events/cause.rs"),
     ("EventWaitCancelCause", "engine/thread_events/cause.rs"),
+    ("FormRequestOutcome", "engine/thread_events/form_request.rs"),
     ("EventChannel", "engine/thread_events/channel.rs"),
     ("TriggerInvocation", "engine/thread_events/channel.rs"),
     ("AnswerKind", "engine/thread_events/question.rs"),
@@ -47,6 +48,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("TodoItem", "engine/thread_events/todo.rs"),
     ("TodoStatus", "engine/thread_events/todo.rs"),
     ("ChildCompletionStatus", "engine/thread_events/session.rs"),
+    ("SubThreadPendingChange", "engine/thread_events/session.rs"),
     ("SessionEndReason", "engine/thread_events/session.rs"),
     ("VoiceSessionEndReason", "engine/thread_events/session.rs"),
     ("ApiUsage", "engine/types.rs"),
@@ -1253,7 +1255,7 @@ mod unit {
         assert!(!ir.transient.contains("MessageReceived"));
         assert_eq!(
             ir.transient.len(),
-            14,
+            10,
             "the transient list changed; check `is_persisted` and the frontend's \
              `TransientEvent` union together"
         );

@@ -6,8 +6,8 @@ use crate::runtime::CodingAgent;
 
 use super::{
     AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, EventWaitCancelCause,
-    MessageOrigin, QuestionOption, SessionEndReason, TodoItem, TriggerInvocation,
-    VoiceSessionEndReason,
+    FormRequestOutcome, MessageOrigin, QuestionOption, SessionEndReason, TodoItem,
+    TriggerInvocation, VoiceSessionEndReason,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -517,6 +517,13 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
+    /// The coding agent read an input the engine forwarded to it. Until then
+    /// the input is owed, and the session keeps its subprocess (ADR 0268).
+    CodingAgentInputRead {
+        /// The event that carried the input: the `MessageReceived` for a
+        /// message.
+        input_event_id: uuid::Uuid,
+    },
     /// Emitted when the engine detects that a coding-agent session ended without
     /// running the required hardening. A recovery hardening session is spawned
     /// automatically. This is NOT a completion event: the thread stays active
@@ -927,8 +934,59 @@ pub enum ThreadEvent {
     },
 
     // Interactive (persisted)
+    //
+    // *Form requests*: the agent asked the user to act on something it put in
+    // front of them. Each carries a `request_id` and stays open until one
+    // `FormRequestResolved` names it, so a request survives a reload or a lost
+    // stream frame. `payload` is the JSON the client renders from, and it
+    // never holds a secret.
+    /// Credential form request. Resolved by the credential save or the form's
+    /// Cancel (`POST /api/v1/form-requests/{request_id}/cancel`).
+    #[serde(alias = "CredentialPromptRequested", alias = "CredentialRequest")]
     CredentialRequested {
-        provider: String,
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Plugin install request awaiting user confirmation. It carries the
+    /// JSON preview `install_plugin` emitted: manifest, file list, overwrites
+    /// and an optional `setup`. The frontend renders the install panel from
+    /// it. `request_id` is the preview's `install_id`.
+    /// Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`.
+    #[serde(alias = "PluginInstallRequest")]
+    PluginInstallRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Plugin uninstall request awaiting user confirmation. It carries the
+    /// JSON preview `uninstall_plugin` emitted: plugin name and version, plus
+    /// the file list split into still-on-disk and already-missing. The
+    /// frontend renders the uninstall panel from it. `request_id` is the
+    /// preview's `uninstall_id`. Resolved by
+    /// `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`.
+    #[serde(alias = "PluginUninstallRequest")]
+    PluginUninstallRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Email send awaiting user confirmation. `payload` is the draft.
+    /// Resolved by `POST /api/v1/email/send` or the form's Cancel.
+    #[serde(alias = "EmailConfirmRequest")]
+    EmailConfirmRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// The provider's authorization page for `connect_oauth_account`.
+    /// `payload` is the `{target: "url", url, purpose: "oauth"}` navigation
+    /// the client opens, on the device the meta actor names. The flow's
+    /// listener resolves it when its wait ends.
+    OAuthAuthorizationRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Closes the form request `request_id` names. Emitted once per request.
+    FormRequestResolved {
+        request_id: uuid::Uuid,
+        outcome: FormRequestOutcome,
     },
     McpConsentRequested {
         tool: String,
@@ -1144,10 +1202,17 @@ pub enum ThreadEvent {
         /// `ResponseGenerated` (truncated to 2000 chars), or the failure error
         /// for `Failure`. Indexed by [`ThreadEvent::indexable_text`].
         summary: String,
-        /// IDs of changes the child left in `pending` state. Empty for chat
-        /// children and for CC children that ended without proposing anything.
+        /// IDs of changes the child left in `pending` state on its OWN branch.
+        /// Empty for chat children and for CC children that ended without
+        /// proposing anything.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pending_change_ids: Vec<String>,
+        /// Pending changes held anywhere below the child: its sub-threads, at
+        /// any depth. Kept apart from `pending_change_ids` so the parent can
+        /// tell whose change is whose. An orchestrator's children hold the
+        /// changes while the orchestrator holds none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sub_thread_pending_changes: Vec<super::SubThreadPendingChange>,
     },
 
     /// A user Stop ended a child thread's turn, and the child is now a
@@ -1156,6 +1221,18 @@ pub enum ThreadEvent {
     /// alive, and the parent is still owed the `ChildThreadCompleted` that
     /// settles it (ADR 0252).
     ChildThreadStopped {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
+    },
+
+    /// A child thread was moved to top level: it is no longer this thread's
+    /// child. Emitted on the **former parent**, never on the child, so ADR
+    /// 0011's "latest event is a card" predicates stay true on the child.
+    ///
+    /// The projection cuts the edge when it applies this event. The child keeps
+    /// running, and its result goes nowhere but its own timeline (ADR 0278).
+    ChildThreadDetached {
         child_thread_id: uuid::Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child_thread_title: Option<String>,
@@ -1460,38 +1537,9 @@ pub enum ThreadEvent {
     },
     #[serde(alias = "PreambleCompleting")]
     PreambleCompleted,
-    // Request events — trigger frontend modals/actions. Past-tense framing
-    // (a request was made; the frontend chooses whether to act). The persisted
-    // sibling `CredentialRequested` is a distinct audit-log entry; this
-    // transient one carries the JSON payload that drives the modal. (Chat MCP
-    // consent moved off this pattern to the persisted in-thread
-    // `McpPermissionRequested` permission card.)
-    #[serde(alias = "CredentialRequest")]
-    CredentialPromptRequested {
-        payload: String,
-    },
-    /// Plugin install request awaiting user confirmation. It carries the
-    /// JSON preview `install_plugin` emitted: manifest, file list, overwrites
-    /// and an optional `setup`. The frontend renders the install panel from
-    /// it.
-    /// Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`.
-    #[serde(alias = "PluginInstallRequest")]
-    PluginInstallRequested {
-        payload: String,
-    },
-    /// Plugin uninstall request awaiting user confirmation. It carries the
-    /// JSON preview `uninstall_plugin` emitted: plugin name and version, plus
-    /// the file list split into still-on-disk and already-missing. The
-    /// frontend renders the uninstall panel from it. Resolved by
-    /// `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`.
-    #[serde(alias = "PluginUninstallRequest")]
-    PluginUninstallRequested {
-        payload: String,
-    },
-    #[serde(alias = "EmailConfirmRequest")]
-    EmailConfirmRequested {
-        payload: String,
-    },
+    // Request events: past-tense framing (a request was made; the frontend
+    // chooses whether to act). A request the user must answer is a persisted
+    // *form request* instead, above.
     #[serde(alias = "PushNotificationRequest")]
     PushNotificationRequested,
     #[serde(alias = "RefreshAppUI")]

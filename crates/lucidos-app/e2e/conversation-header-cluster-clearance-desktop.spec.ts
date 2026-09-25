@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, gotoWithRetry, navigateToApp, openThreadDrawer } from './helpers';
+import { assertHealthy, gotoWithRetry, navigateToApp, openThreadDrawer, stampOverlayBuild } from './helpers';
 
 /**
  * The Conversation header's centred brand cluster never paints on a flanking
@@ -153,12 +153,6 @@ async function waitForScaleApplied(page: Page): Promise<void> {
   );
 }
 
-/** Stamp the packaged build's one horizontal difference. */
-async function stampOverlayBuild(page: Page): Promise<void> {
-  await page.evaluate(() =>
-    document.documentElement.setAttribute('data-titlebar-overlay', ''));
-}
-
 // The web build is swept alongside the packaged one as a control rather than as
 // padding. It never reproduced the bug, its toggle resting at 0.5rem. What it
 // says is that the fix did not move the collision to the other client.
@@ -188,10 +182,10 @@ test.describe('the Conversation header cluster clears both flanking controls', (
     });
 
     test(`${build}: at the pane's own floor, drawer open`, async ({ page }) => {
-      // The toggle moves to the Conversation pane's leading edge here, so the
-      // leading end is one button with no inset at all. Narrower than the shut
-      // state on both builds, and swept anyway: the drawer takes its width off
-      // the split, so the pane reaches its floor from a different direction.
+      // The toggle rests in the header's corner over the drawer here, so the
+      // Conversation row's leading end is empty. Swept anyway: the drawer takes
+      // its width off the split, so the pane reaches its floor from a
+      // different direction.
       if (packaged) await stampOverlayBuild(page);
       await openThreadDrawer(page);
       await page.waitForFunction((want) => {

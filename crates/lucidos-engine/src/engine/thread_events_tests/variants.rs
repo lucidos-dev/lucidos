@@ -52,6 +52,57 @@ fn image_uploaded_is_persisted() {
     assert!(event.is_persisted());
 }
 
+/// A *form request* waits on the user, so it has to outlive the one stream
+/// frame that announced it. Its resolution is what stops it being offered.
+#[test]
+fn form_requests_and_their_resolution_are_persisted() {
+    use crate::engine::thread_events::FormRequestOutcome;
+    let request_id = uuid::Uuid::nil();
+    let payload = || "{}".to_string();
+    for event in [
+        ThreadEvent::CredentialRequested {
+            request_id,
+            payload: payload(),
+        },
+        ThreadEvent::PluginInstallRequested {
+            request_id,
+            payload: payload(),
+        },
+        ThreadEvent::PluginUninstallRequested {
+            request_id,
+            payload: payload(),
+        },
+        ThreadEvent::EmailConfirmRequested {
+            request_id,
+            payload: payload(),
+        },
+        ThreadEvent::OAuthAuthorizationRequested {
+            request_id,
+            payload: payload(),
+        },
+        ThreadEvent::FormRequestResolved {
+            request_id,
+            outcome: FormRequestOutcome::Canceled,
+        },
+    ] {
+        assert!(
+            event.is_persisted(),
+            "{} must be persisted",
+            event.event_type()
+        );
+    }
+}
+
+/// A navigation is an act-now hint, not a question. Replayed on a reconnect,
+/// a stale one would move the user's view unasked.
+#[test]
+fn a_navigation_stays_transient() {
+    assert!(!ThreadEvent::NavigationRequested {
+        payload: "{}".to_string()
+    }
+    .is_persisted());
+}
+
 /// ContextCaptured is the unified replacement for Thinking-with-tokens +
 /// ContextTokensMeasured + ContextAssembled. One event per LLM call carries
 /// the full picture: producer, model + budget, per-section breakdown
@@ -295,6 +346,7 @@ fn child_thread_completed_event_round_trips() {
         status: ChildCompletionStatus::Success,
         summary: "All green".into(),
         pending_change_ids: vec!["change-1".into()],
+        sub_thread_pending_changes: vec![],
     };
     let v = serde_json::to_value(&evt).unwrap();
     assert_eq!(v["type"], "ChildThreadCompleted");
@@ -313,6 +365,7 @@ fn child_thread_completed_event_type_is_pascal_case_name() {
         status: ChildCompletionStatus::NoChanges,
         summary: String::new(),
         pending_change_ids: vec![],
+        sub_thread_pending_changes: vec![],
     };
     assert_eq!(evt.event_type(), "ChildThreadCompleted");
     assert!(evt.is_persisted());
@@ -329,6 +382,7 @@ fn child_thread_completed_skips_empty_optional_fields() {
         status: ChildCompletionStatus::Failure,
         summary: "boom".into(),
         pending_change_ids: vec![],
+        sub_thread_pending_changes: vec![],
     };
     let v = serde_json::to_value(&evt).unwrap();
     assert!(v.get("child_thread_title").is_none());
@@ -367,6 +421,7 @@ fn child_thread_completed_indexable_text_returns_summary() {
         status: ChildCompletionStatus::Success,
         summary: "deployment finished cleanly".into(),
         pending_change_ids: vec![],
+        sub_thread_pending_changes: vec![],
     };
     assert_eq!(evt.indexable_text(), Some("deployment finished cleanly"));
 }
@@ -514,7 +569,8 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::CredentialRequested {
-        provider: String::new(),
+        request_id: uuid::Uuid::nil(),
+        payload: String::new(),
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::McpConsentRequested {

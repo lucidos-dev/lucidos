@@ -17,6 +17,7 @@ mod judgment;
 mod mcp;
 mod memory;
 mod models;
+pub(crate) mod navigate;
 mod notifications;
 pub(crate) mod plugins;
 mod preferences;
@@ -68,27 +69,6 @@ use crate::llm::tool_names as tn;
 /// happens to start with `Error reading…` / `Error executing…` / etc. (the
 /// pre-typed dispatch silently stamped those as `success: true`).
 pub(crate) type ToolOutcome = Result<String, String>;
-
-/// What the agent is told after landing on Settings → System → Backup.
-///
-/// A tool result describing a screen is a promise about that screen, and this
-/// one had rotted into the opposite: it advertised a cloud-backup list and an
-/// in-app Restore button (both gone, restore moved to the workspace picker) and
-/// implied the page connects the provider account. Settings → Accounts owns
-/// that, and a 2026-08-05 session sent a user hunting for accounts on the Backup
-/// page because two sources (this string and `system-knowhow/backups.md`) said
-/// so. Kept as a named const so `backup_navigation_names_the_accounts_page`
-/// can pin it.
-const BACKUP_SETTINGS_NAVIGATED: &str = "Navigated to Settings → System → Backup. The UI shows:\n\
-     - A health card: last run outcome, last cloud backup + age, staleness warning\n\
-     - The provider dropdown (Google Drive / Dropbox), and a red line linking to \
-       Settings → Accounts when the selected provider has no connected account\n\
-     - 'Back up now', the schedule dropdown, and the retention dropdown\n\
-     - Show/generate the encryption key (required to restore, cannot be recovered)\n\
-     This page does NOT connect the provider account, and has no account UI at all: \
-     that is Settings → Accounts, and it is the only place to do it. Do not tell the \
-     user to connect an account here. Restore is not in the app either, it happens \
-     from the workspace picker.";
 
 /// Lift a raw `String` tool result into a `ToolOutcome` using the legacy
 /// "starts with `Error:`" convention. Single source for the legacy lift —
@@ -320,7 +300,8 @@ impl LucidosEngine {
             tn::LIST_THREADS => self.execute_list_threads(args, thread_id).await,
             tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
             tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
-            tn::LIST_CHANGES => self.execute_list_changes().await,
+            tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
+            tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
             tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
             tn::APPLY_AS_THEY_SETTLE => self.execute_apply_as_they_settle(thread_id).await,
@@ -366,52 +347,23 @@ impl LucidosEngine {
         todo::todo_tool_impl(&self.event_bus, &self.pool, args, thread_id).await
     }
 
-    /// Resolve the turn's originating device into a `MessageOrigin` for
-    /// device-scoping an emitted event.
-    ///
-    /// The device that sent the prompt that triggered this turn, so the frontend
-    /// can act only on the screen the user is actually at. A turn with no device
-    /// (trigger / scheduled / background) yields `None`, which the frontend
-    /// reads as "unscoped" and falls back to its focused-thread / offer
-    /// behaviour.
-    pub(crate) async fn turn_device_actor(
+    /// The turn's *last used device*: the device of the user's newest action
+    /// since the turn began, so a question answered from another device moves
+    /// it there. `device_id` is the device that started the turn.
+    pub(crate) async fn last_used_device(
         &self,
-        device_id: Option<&str>,
-    ) -> Option<crate::engine::thread_events::MessageOrigin> {
-        let did = device_id?;
-        let label = crate::core::DeviceStore::display_name(&self.pool, did)
-            .await
-            .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, did));
-        Some(crate::engine::thread_events::MessageOrigin::Device {
-            device_id: did.to_string(),
-            label,
-        })
-    }
-
-    /// Ask the frontend to navigate. The one emitter of `NavigationRequested`
-    /// from a tool call, so every navigate is device-scoped the same way.
-    ///
-    /// Two callers: `navigate_ui` (the agent moving the UI) and the OAuth flow
-    /// (handing the authorization URL to whichever browser the user configured,
-    /// rather than the engine shelling out to one).
-    pub(crate) async fn request_navigation(
-        &self,
-        payload: &serde_json::Value,
         thread_id: uuid::Uuid,
         device_id: Option<&str>,
-    ) -> Result<(), String> {
-        let actor = self.turn_device_actor(device_id).await;
-        self.event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id,
-                event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
-                    payload: serde_json::to_string(payload).unwrap_or_default(),
-                },
-                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
-            })
+    ) -> Option<String> {
+        let anchor = crate::engine::in_flight_request_event_id(
+            &self.active_threads,
+            &self.pool,
+            thread_id,
+            crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        )
+        .await;
+        crate::engine::agent_context::last_used_device(&self.pool, thread_id, anchor, device_id)
             .await
-            .map(|_| ())
-            .map_err(|e| format!("failed to emit NavigationRequested: {}", e))
     }
 
     async fn execute_navigate_ui(
@@ -420,99 +372,15 @@ impl LucidosEngine {
         thread_id: uuid::Uuid,
         device_id: Option<&str>,
     ) -> ToolOutcome {
-        let target = match args.get("target").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => t,
-            _ => return Err("Error: target is required".to_string()),
-        };
-        log!(
-            "[Navigate] navigate_ui thread={} target={} app_id={:?} id={:?} device={:?}",
+        let last_used = self.last_used_device(thread_id, device_id).await;
+        navigate::navigate_ui_impl(
+            &self.event_bus,
+            &self.pool,
+            args,
             thread_id,
-            target,
-            args.get("app_id").and_then(|v| v.as_str()),
-            args.get("id").and_then(|v| v.as_str()),
-            device_id
-        );
-        // Same guard the notification tap takes, and for the same reason: the
-        // page dereferences this id with no way to ask what was meant.
-        // `current` resolves to the calling thread. A value that is neither
-        // alias nor uuid is refused here, rather than toasted at the reader.
-        // The whole args object rides the NavigationRequested event, so the
-        // resolved value is written back into it. The clone is scoped to the
-        // one target that can be rewritten, so no other arm holds a second
-        // name for the same args.
-        let payload;
-        let payload = if target == "thread" {
-            let mut owned = args.clone();
-            crate::api::resolve_thread_id_in_nav_payload(&mut owned, Some(thread_id))
-                .map_err(|e| format!("Error: {e}"))?;
-            payload = owned;
-            &payload
-        } else {
-            args
-        };
-        if let Err(e) = self.request_navigation(payload, thread_id, device_id).await {
-            return Err(format!("Error: {}", e));
-        }
-
-        // Return contextual help so the LLM knows what the UI offers
-        let settings_view = args.get("settings_view").and_then(|v| v.as_str());
-        if target == "settings" && settings_view == Some("models") {
-            return Ok("Navigated to Settings → Models. The UI shows:\n\
-                - The active Chat & triggers model (the model picker) and reasoning effort\n\
-                - Image generation and background-task models (title, image description, memory)\n\
-                - Providers (Anthropic, OpenAI, OpenRouter, xAI, local) and the model registry\n\
-                Tell the user they can change the active model from the picker here. To switch \
-                it for them instead, use set_preference(key='chat_model'); to add a model to the \
-                picker, use manage_models."
-                .to_string());
-        }
-        if target == "settings" && settings_view == Some("backup") {
-            return Ok(BACKUP_SETTINGS_NAVIGATED.to_string());
-        }
-        if target == "settings" && settings_view == Some("environment-variables") {
-            return Ok(
-                "Navigated to Settings → System → Environment variables. The UI shows:\n\
-                - The user's environment variables as NAME = value rows\n\
-                - Buttons to add, edit, or delete a variable\n\
-                These are non-secret values injected into every subprocess Lucidos spawns \
-                (run_bash, run_python, scheduled scripts, coding agents), which pick a change up \
-                on the next spawn with no restart. The engine loads the same store into its own \
-                process environment once at startup, so a variable the engine itself reads \
-                changes only after an engine restart. For secrets like API keys, the user should \
-                use credentials instead."
-                    .to_string(),
-            );
-        }
-
-        if target == "url" {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.is_empty() {
-                return Err("Error: url is required when target is 'url'".to_string());
-            }
-            // Two hedges, both earned by an agent over-claiming. It does NOT
-            // name a surface: where the URL lands is the client's decision
-            // (`openUrl`), the in-app panel only when the user has that
-            // preference on in the desktop app, otherwise their system browser
-            // or a new tab, and naming one of the three had the agent telling
-            // users to look at a panel that was never going to open. And it
-            // does NOT claim the page opened: all this call did was emit the
-            // request. A browser can still refuse it (a blocked popup, which is
-            // exactly what a navigate from a chat turn hits, since the client
-            // handles it with no user activation), in which case the client
-            // offers the user an Open button instead.
-            return Ok(format!(
-                "Sent a request to the user's device to open {}. Emitted is not the \
-                 same as open: the client may be unable to open it (a blocked popup, \
-                 for one) and offer the user an Open button instead, so tell them you \
-                 have sent them the page rather than stating it is already on their \
-                 screen. It opens wherever they have configured links to open (the \
-                 in-app browser panel, their system browser, or a new tab), so refer \
-                 to it as their browser rather than naming one.",
-                url
-            ));
-        }
-
-        Ok(format!("Navigated to {}", target))
+            last_used.as_deref(),
+        )
+        .await
     }
 
     async fn execute_send_notification(
@@ -856,6 +724,57 @@ impl LucidosEngine {
         }
     }
 
+    /// LLM tool: move a child thread this thread spawned to top level
+    /// (ADR 0278). The caller is `execute_tool`'s ambient thread, as for a
+    /// follow-up, so the model picks which child but never who it is.
+    async fn execute_detach_child_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::{ChildDetachError, DetachCaller};
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: detach_child needs a thread_id: the child's uuid, from the threads \
+                 tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let child_thread_id: uuid::Uuid = raw_id.parse().map_err(|_| {
+            format!(
+                "Error: '{raw_id}' is not a thread id. detach_child addresses a child by uuid, \
+                 never by title. List your own children with the threads tool's 'list' action \
+                 and my_children: true."
+            )
+        })?;
+
+        match self
+            .detach_child_thread(
+                DetachCaller::Agent(Some(caller_thread_id)),
+                child_thread_id,
+                crate::engine::thread_events::EventMeta::NONE,
+            )
+            .await
+        {
+            Ok(ack) => Ok(format!(
+                "Moved \"{}\" to top level. It keeps running on its own. You will not get \
+                 its result and can no longer follow up on it.",
+                ack.child_title
+            )),
+            Err(e @ (ChildDetachError::NotYourChild(_) | ChildDetachError::UnknownThread(_))) => {
+                Err(format!(
+                    "Error: {e} List your own children with the threads tool's 'list' action \
+                     and my_children: true."
+                ))
+            }
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
     /// LLM tool: list thread summaries for the workspace. Mirrors
     /// `GET /api/v1/threads/list` and `lucidos threads list`.
     ///
@@ -925,10 +844,14 @@ impl LucidosEngine {
     /// branches awaiting Apply). The in-thread mirror of `GET /api/v1/changes`
     /// and `lucidos changes list` — calls the same projection reads in-process
     /// rather than shelling out to the CLI. Read-only.
-    async fn execute_list_changes(&self) -> ToolOutcome {
+    async fn execute_list_changes(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let scope = pending_scope_arg(args, thread_id)?;
         let proj = self.changes();
-        let mut pending = proj
-            .list_pending()
+        let pending = crate::core::changes::list_pending_for_readers(self.pool(), proj, scope)
             .await
             .map_err(|e| format!("Error: failed to list pending changes: {}", e))?;
         // A small applied window gives the LLM enough recent history to confirm
@@ -937,9 +860,6 @@ impl LucidosEngine {
             .list_recently_applied(10, None)
             .await
             .map_err(|e| format!("Error: failed to list applied changes: {}", e))?;
-        crate::core::changes::enrich_thread_titles(self.pool(), &mut pending)
-            .await
-            .map_err(|e| format!("Error: failed to enrich pending change titles: {}", e))?;
         crate::core::changes::enrich_thread_titles(self.pool(), &mut applied)
             .await
             .map_err(|e| format!("Error: failed to enrich applied change titles: {}", e))?;
@@ -1036,7 +956,7 @@ impl LucidosEngine {
     }
 
     /// LLM tool: the sweep. Apply everything pending that has settled, then
-    /// keep going as the threads still working land theirs.
+    /// keep going as the threads still settling land theirs.
     ///
     /// Runs the engine's own Apply All press, so this is the button's rule
     /// rather than a second copy of it: same filters, same durable batch, same
@@ -1101,7 +1021,10 @@ impl LucidosEngine {
         let actor = Some(agent_tool_actor(thread_id));
         let reason = crate::engine::standing_apply::DISARMED_BY_OWNER;
         let canceled = match target {
-            Some(target) => usize::from(self.drop_standing_apply(target, reason, actor).await),
+            Some(target) => self
+                .drop_standing_apply(target, reason, actor)
+                .await
+                .map(usize::from),
             None => {
                 self.drop_standing_applies(
                     crate::engine::standing_apply::DisarmScope::All,
@@ -1110,7 +1033,8 @@ impl LucidosEngine {
                 )
                 .await
             }
-        };
+        }
+        .map_err(|e| format!("Error: the standing apply may still be armed: {e}"))?;
         self.broadcast_changes_updated().await;
         serde_json::to_string(&serde_json::json!({ "canceled": canceled }))
             .map_err(|e| format!("Error: failed to serialise the cancel: {e}"))
@@ -1270,8 +1194,8 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
 /// The `changes` tool's wording for a refused Apply. Pure, so every branch is
 /// asserted without booting an engine.
 ///
-/// It names `apply_when_settled` for ONE refusal, the working thread. A
-/// standing apply drops at once on a parked thread. Naming it there would swap
+/// It names `apply_when_settled` for ONE refusal, the settling thread. A
+/// standing apply drops at once on a parked one. Naming it there would swap
 /// a refusal the caller can act on for one it cannot.
 pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRefusal) -> String {
     use crate::api::changes::ChangeActionRefusal as R;
@@ -1280,11 +1204,12 @@ pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRe
              merge. Its branch's commits cancelled out. Tell the user to discard it from the \
              Changes panel."
             .to_string(),
-        R::ThreadWorking => {
-            "Error: the coding-agent thread that proposed this change is still working, so Apply \
-             is withheld. It may commit again on the same branch, and applying now would merge a \
-             branch it is still writing to. Use the 'apply_when_settled' action to apply it the \
-             moment that thread finishes."
+        R::ThreadSettling => {
+            "Error: the coding-agent thread that proposed this change has not finished: it is \
+             still working, or waiting on an event it will wake for. So Apply is withheld. It may \
+             commit again on the same branch, and applying now would merge a branch it is still \
+             writing to. Use the 'apply_when_settled' action to apply it the moment that thread \
+             finishes."
                 .to_string()
         }
         // Deliberately never spells the standing-apply action, not even to
@@ -1292,10 +1217,10 @@ pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRe
         // tool. The test beside this asserts the bare absence, rather than
         // trusting the model to read the "not".
         R::ThreadParked => {
-            "Error: the thread that proposed this change is parked, on a question or an event \
-             wait. It wakes on the answer or the delivery and may commit again, so Apply is \
-             withheld. Waiting for it will not help either: a standing apply drops at once on a \
-             parked thread. Tell the user, who can answer it or stop the wait, and then apply."
+            "Error: the thread that proposed this change is parked: it is waiting on a question, \
+             or its turn failed. It may commit again once it moves on, so Apply is withheld. \
+             Waiting for it will not help either: a standing apply drops at once on a parked \
+             thread. Tell the user, who can answer it or continue it, and then apply."
                 .to_string()
         }
         R::ActionUnavailable => "Error: the thread that proposed this change does not offer \
@@ -1531,6 +1456,27 @@ fn parse_source_arg(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// The `changes` list's `sub_threads_of` argument, settled into a scope. The
+/// `current` alias resolves to the calling thread, and any other non-uuid, or
+/// a non-string, is refused rather than widened to every change.
+fn pending_scope_arg(
+    args: &serde_json::Value,
+    caller: uuid::Uuid,
+) -> Result<crate::core::changes::PendingScope, String> {
+    use crate::core::changes::PendingScope;
+    match args.get("sub_threads_of") {
+        None | Some(serde_json::Value::Null) => Ok(PendingScope::All),
+        Some(serde_json::Value::String(raw)) => {
+            crate::api::resolve_thread_id_arg(raw, Some(caller))
+                .map(PendingScope::SubThreadsOf)
+                .map_err(|e| format!("Error: sub_threads_of: {e}"))
+        }
+        Some(other) => Err(format!(
+            "Error: sub_threads_of must be a thread id string or 'current', got {other}"
+        )),
     }
 }
 

@@ -20,7 +20,7 @@ import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
 import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import { getUnreachableEngineMsg } from './connection';
-import { getDeviceId, pendingDeviceRegistration } from './devices';
+import { getDeviceId } from './devices';
 import { generateUuid } from '../../utils/uuid';
 import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, type StoredEvent, type QueuedMessage } from '../thread-events';
 import { getDraft } from '../composeDrafts';
@@ -592,13 +592,6 @@ export async function sendMessage(
     // waiting for the thread's previous POST costs the user nothing visible and
     // is what keeps the engine's record in the order they pressed send.
     if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
-    // This body claims `mode: 'human'`, which the engine accepts only from a
-    // device it can resolve, so the send must not overtake its own startup
-    // registration. `null` on every send but the very first, and skipping the
-    // await is what keeps a lone send synchronous (same reason as the chain
-    // above). See `pendingDeviceRegistration`.
-    const pendingRegistration = pendingDeviceRegistration();
-    if (pendingRegistration) await pendingRegistration;
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
     // The pick (if any) is now stamped on the sent message and becomes the

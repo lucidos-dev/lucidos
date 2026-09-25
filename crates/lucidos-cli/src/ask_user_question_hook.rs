@@ -13,24 +13,12 @@ pub(crate) struct HookPayload {
     pub(crate) tool_input: ToolInput,
 }
 
+/// The questions stay raw JSON: the engine's `parse_ask_user_question_inputs`
+/// owns their schema. A typed copy here dropped every field it did not name,
+/// which is how option pictures (`preview`) never reached the card.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ToolInput {
-    pub(crate) questions: Vec<HookQuestion>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct HookQuestion {
-    pub(crate) question: String,
-    pub(crate) header: String,
-    #[serde(rename = "multiSelect")]
-    pub(crate) multi_select: bool,
-    pub(crate) options: Vec<HookOption>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct HookOption {
-    pub(crate) label: String,
-    pub(crate) description: String,
+    pub(crate) questions: serde_json::Value,
 }
 
 pub(crate) fn parse_hook_payload(raw: &str) -> Result<HookPayload, BoxError> {
@@ -63,12 +51,11 @@ pub(crate) fn run() -> Result<(), BoxError> {
     std::io::stdin().read_to_string(&mut stdin_buf)?;
     let payload = parse_hook_payload(&stdin_buf)?;
 
-    let questions_json = serde_json::to_value(&payload.tool_input.questions)?;
     let body = AskUserQuestionRequestBody {
         thread_id: &thread_id,
         tool_use_id: &payload.tool_use_id,
         session_id: &payload.session_id,
-        questions: questions_json,
+        questions: payload.tool_input.questions,
     };
 
     let endpoint = format!("{}/api/v1/internal/ask-user-question", workspace.base_url());
@@ -146,10 +133,41 @@ mod tests {
         let parsed = parse_hook_payload(raw).expect("valid payload");
         assert_eq!(parsed.tool_use_id, "toolu_abc");
         assert_eq!(parsed.session_id, "sid-1");
-        assert_eq!(parsed.tool_input.questions.len(), 1);
         assert_eq!(
-            parsed.tool_input.questions[0].question,
+            parsed.tool_input.questions.as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed.tool_input.questions[0]["question"],
             "What is your favorite color?"
+        );
+    }
+
+    /// A session put a picture in every option's `preview`, and the card showed
+    /// none: this hook re-typed each option as label plus description and
+    /// dropped the rest. The engine owns the question schema, so the hook
+    /// forwards the questions exactly as Claude Code sent them.
+    #[test]
+    fn parse_hook_payload_keeps_every_option_field_for_the_engine() {
+        let raw = r#"{
+            "session_id": "sid-1",
+            "tool_use_id": "toolu_abc",
+            "tool_input": {
+                "questions": [{
+                    "question": "Which one?",
+                    "multiSelect": false,
+                    "options": [{
+                        "label": "Thinner lines",
+                        "description": "calmest",
+                        "preview": "![Thinner lines](artifacts/thin.png)"
+                    }]
+                }]
+            }
+        }"#;
+        let parsed = parse_hook_payload(raw).expect("valid payload");
+        assert_eq!(
+            parsed.tool_input.questions[0]["options"][0]["preview"],
+            "![Thinner lines](artifacts/thin.png)"
         );
     }
 

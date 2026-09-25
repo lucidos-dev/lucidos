@@ -11,6 +11,7 @@ mod channel;
 mod emit;
 mod event;
 mod event_impl;
+mod form_request;
 mod meta;
 mod question;
 mod session;
@@ -20,9 +21,12 @@ pub use actor::{ActorMode, AgentParticipant, EngineReason, MessageOrigin, Thread
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
+pub use form_request::FormRequestOutcome;
 pub use meta::EventMeta;
 pub use question::{AnswerKind, QuestionOption};
-pub use session::{ChildCompletionStatus, SessionEndReason, VoiceSessionEndReason};
+pub use session::{
+    ChildCompletionStatus, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason,
+};
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use emit::{

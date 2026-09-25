@@ -14,6 +14,7 @@ import { BackupReminderBanner } from './BackupReminderBanner';
 import { ConnectionBanner } from './ConnectionBanner';
 import { IngressBanner } from './IngressBanner';
 import { WebhookRefusalBanner } from './WebhookRefusalBanner';
+import { SlownessBanner } from './SlownessBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -24,15 +25,12 @@ import { getContentTitle, getContentTitleShort, getDiffDescription } from './hea
 import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
+import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
 import { isMobile } from '../../utils/viewport';
 import { isTextInput } from '../../utils/dom';
 
 function ThreadsHeader() {
-  // The Filter button's whole appearance (glyph, active highlight, and the
-  // attention-only badge, which is 0 while the panel is open) comes from the
-  // shared hook, since the mobile header renders the same control.
-  const { filterOpen, toggleFilter, filterButtonActive, FilterButtonIcon, filterButtonBadge,
-          searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
+  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
   // Header regions set the focused pane on `click`, NOT `pointerdown`: in the
   // Tauri build the whole header is a window-drag region (useWindowDragRegion),
@@ -40,9 +38,8 @@ function ThreadsHeader() {
   // the user is moving the window, not picking a pane. A native window drag
   // suppresses the synthetic `click`, so firing focus on click means only a
   // real click (press + release, no drag) moves focus. Off Tauri this is just
-  // "click to focus" and behaves the same as before. The other three regions
-  // (thread-toggle-slot, pane-header-brand, content-header-elements) follow the
-  // same rule.
+  // "click to focus" and behaves the same as before. The other two regions
+  // (pane-header-brand, content-header-elements) follow the same rule.
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
          onClick={() => focusPane('drawer')}>
@@ -63,28 +60,21 @@ function ThreadsHeader() {
           </svg>
         </button>
       </div>
-      {/* The button only toggles: the panel itself renders down in the drawer
-          pane (see ThreadDrawer), so it is not `aria-haspopup` chrome anymore.
-          It is also the panel's only way out, which is what the X glyph says
-          while the panel is up (see useThreadsHeaderState). */}
-      <div class="view-selector-slot">
-        <button
-          class={`icon-btn header-icon threads-header-btn${filterButtonActive ? ' view-selector-active' : ''}`}
-          onClick={toggleFilter}
-          aria-label="Filter threads"
-          aria-expanded={filterOpen}
-          data-tooltip="Filter threads"
-        >
-          <FilterButtonIcon />
-          {filterButtonBadge > 0 && <span class="badge">{filterButtonBadge}</span>}
-        </button>
-      </div>
       {/* The pane's title says what the pane is showing: the list, or the filter
           panel that has taken it over (ThreadFilterPanel, which carries no title
           row of its own so this one is not repeated two rows down). Just
           "Filters": the pane is already the Threads pane, and the drawer is the
           only thing on screen the filter could be filtering. */}
-      <span class="threads-header-title">{filterOpen ? 'Filters' : 'Threads'}</span>
+      <ThreadsPaneTitle class="threads-header-title" />
+      {/* Beside Search at the trailing end, since the row's leading end belongs
+          to the drawer toggle resting over it (.thread-toggle-slot).
+          The button only toggles: the panel itself renders down in the drawer
+          pane (see ThreadDrawer), so it is not `aria-haspopup` chrome anymore.
+          It is also the panel's only way out, which is why it reads as held
+          down while the panel is up (see filterButtonState). */}
+      <div class="view-selector-slot">
+        <ThreadFilterButton class="threads-header-btn" tooltip="Filter threads" />
+      </div>
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}
@@ -284,23 +274,16 @@ export function AppHeader() {
         {/* ─── Desktop: full header ─── */}
         <div class="desktop-header">
           <div class="thread-header-elements">
-            <ThreadsHeader />
-            {/* The drawer toggle, in ONE host for both drawer states. It used to
-                exist twice, once here and once inside the brand, with CSS keyed
-                on data-thread-drawer-open crossfading the pair. That read as the
-                user described it: an icon that had never been on screen sat
-                waiting at the header's leading edge and faded UP from nothing
-                while its twin slid toward it fading DOWN, so for most of the
-                slide the header carried two half-transparent icons that ended up
-                on nearly the same x. One element that TRAVELS between the two
-                positions (shell.css) is the same animation without either of
-                those: it is a part of the header the whole way, at full opacity.
-
-                Focus on click, not pointerdown, so a window drag never shifts
-                focus — see ThreadsHeader. */}
-            <div class="thread-toggle-slot" onClick={onThreadHeaderClick}>
+            {/* The drawer toggle, in ONE host that rests in the header's corner
+                whether the drawer is open or shut (shell.css), so there is one
+                place to look for it. Ahead of the drawer row in the DOM because
+                it sits ahead of it on screen, which keeps Tab in visual order.
+                No focus handler of its own: the button fills the slot and keeps
+                its clicks to itself (ThreadToggleButton). */}
+            <div class="thread-toggle-slot">
               <ThreadToggleButton />
             </div>
+            <ThreadsHeader />
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
             <span class="pane-header-brand" onClick={onThreadHeaderClick}>
@@ -394,6 +377,7 @@ export function AppHeader() {
             words: the mark carries it as strength and motion, and `data-tooltip`
             is a desktop-only surface. */}
         <ConnectionBanner layout="mobile" />
+        <SlownessBanner layout="mobile" />
         <IngressBanner layout="mobile" />
         <WebhookRefusalBanner layout="mobile" />
         <BackupReminderBanner layout="mobile" />

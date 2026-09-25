@@ -78,7 +78,7 @@
         inset 0 0 0 100vmax color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
         0 0 0.375rem color-mix(in srgb, var(--nav-focus-glow) 28%, transparent),
         0 0 1.5rem color-mix(in srgb, var(--nav-focus-glow) 15%, transparent);
-    animation: nav-focus-spotlight-on 0.45s ease-out;
+    animation: nav-focus-spotlight-on calc(0.45s * var(--duration-scale)) ease-out;
     /* Forced-colors fallback, the same one every focus ring in this codebase
        carries (see .icon-btn / .action-btn in shared-components.css): high-contrast
        mode STRIPS box-shadow, so a marker made only of shadows would leave a
@@ -186,7 +186,7 @@
    left alone until someone actually measures a drop; shortening it further is the
    first knob, not a rewrite. */
 .nav-focus-stuck.nav-focus-fading {
-    animation: nav-focus-spotlight-off 0.8s linear forwards;
+    animation: nav-focus-spotlight-off calc(0.8s * var(--duration-scale)) linear forwards;
 }
 
 @keyframes nav-focus-spotlight-off {
@@ -198,22 +198,20 @@
     }
 }
 
-@media (prefers-reduced-motion: reduce) {
-    /* focusMarker.ts also skips the dissolve under reduced motion (it strips both
-       classes at once, so .nav-focus-fading never lands); this is the CSS backstop
-       so neither the turn-on ramp nor the dissolve runs. The marker still appears
-       (instantly, at its resting strength, since the base rule is the resting state)
-       and still clears, just without motion. The fading arm needs its own rule
-       rather than inheriting the one above: it is a two-class selector, so it
-       outranks a bare `.nav-focus-stuck { animation: none }` and would keep
-       animating. */
-    .nav-focus-stuck {
-        animation: none;
-    }
+/* focusMarker.ts also skips the dissolve under reduced motion (it strips both
+   classes at once, so .nav-focus-fading never lands); this is the CSS backstop
+   so neither the turn-on ramp nor the dissolve runs. The marker still appears
+   (instantly, at its resting strength, since the base rule is the resting state)
+   and still clears, just without motion. The fading arm needs its own rule
+   rather than inheriting the one above: it is a two-class selector, so it
+   outranks a bare `.nav-focus-stuck { animation: none }` and would keep
+   animating. */
+:root[data-motion="reduce"] .nav-focus-stuck {
+    animation: none;
+}
 
-    .nav-focus-stuck.nav-focus-fading {
-        animation: none;
-    }
+:root[data-motion="reduce"] .nav-focus-stuck.nav-focus-fading {
+    animation: none;
 }
 
 /* Icon-only buttons: one 2.25rem tap target, three bands by what the control
@@ -418,6 +416,32 @@
     color: var(--accent);
 }
 
+/* A crossfade between layers stacked in one grid cell
+   (components/shared/CrossfadeStack.tsx). Every layer stays mounted, so a swap
+   is a transition that can reverse mid-way. `min-width: 0` lets a text layer
+   shrink and ellipsise inside a capped title. */
+.crossfade-stack {
+    display: grid;
+}
+
+.crossfade-layer {
+    grid-area: 1 / 1;
+    min-width: 0;
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease;
+}
+
+.crossfade-layer[data-current] {
+    opacity: 1;
+}
+
+/* The scaled duration alone is not instant: a transition that short still
+   waits for its start, and Chromium can hold the old value a frame or two
+   under load. So reduced motion cancels it outright. */
+:root[data-motion="reduce"] .crossfade-layer {
+    transition: none;
+}
+
 /* Send → Cancel morph button. Always rendered at the same JSX position
  * across send/cancel/canceling/placeholder so Preact never unmounts the
  * DOM node — class-driven mode changes let the .action-btn background-color
@@ -585,7 +609,7 @@ html[data-theme="dark"] .split-button.open::before {
 }
 
 /* Lift the pills above the ::before frame backing. position+z-index don't change
- * layout, so the steady base holds. flex:1 makes [Apply & Restart] fill the row
+ * layout, so the steady base holds. flex:1 makes [Apply*] fill the row
  * so it + the caret span the same width as the Diff / Discard pills above. */
 .split-button.open .split-button-primary,
 .split-button.open .split-button-caret {
@@ -1012,6 +1036,19 @@ html[data-theme="dark"] .split-button.open::before {
 .nav-history-menu {
     min-width: 11rem;
     max-width: min(20rem, 90vw);
+}
+
+/* A disabled chevron still names itself: its tooltip shows on hover, in every
+   pane. `.icon-btn:disabled` takes pointer events away, which also kills the
+   tooltip, so this gives them back. The hover wash stays off, because every
+   `.icon-btn:hover` wash skips a disabled button.
+
+   Gated on both inert regimes, like `.header-nav-cluster > *` in
+   styles/header-mark.css. A value set on the element beats the `none` those
+   regimes inherit down, so an ungated rule would keep the chevron live behind
+   an open menu or a raised keyboard. */
+:root:not([data-keyboard-active]):not([data-overlay-open]) .nav-chevron:disabled {
+    pointer-events: auto;
 }
 
 /* History rows pair a leading type glyph (thread type for ThreadNav, content
@@ -1621,6 +1658,6 @@ html[data-theme="dark"] .split-button.open::before {
    HOST ONLY, even though the wrapper it sizes is a shared, app-facing class.
    An app iframe has no popup to open, so a zoom cursor there would advertise
    something that cannot happen. */
-.markdown-content .image-scroll-wrapper > img {
+.markdown-content .image-scroll-wrapper > img, .question-body .image-scroll-wrapper > img {
     cursor: zoom-in;
 }

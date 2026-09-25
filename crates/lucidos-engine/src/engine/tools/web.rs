@@ -106,7 +106,7 @@ impl LucidosEngine {
                     Err(e) => Ok(format!("Error: Search failed: {}", e)),
                 }
             }
-            _ => Ok(format!("Unknown web tool: {}", name)),
+            _ => Err(format!("Unknown web tool: {}", name).into()),
         }
     }
 }

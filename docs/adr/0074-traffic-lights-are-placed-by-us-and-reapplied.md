@@ -73,6 +73,33 @@ that retunes the titlebar keeps the cluster centred instead of drifting.
   `traffic_lights::retitle`, which writes the title and re-places in one
   main-thread step. It cannot re-place after tao's `set_title`, because that
   only queues the write.
+- **An appearance change reverts the placement too**, and macOS makes it by
+  itself, for instance when "Auto" appearance follows the time of day. That
+  was the "lights moved while I was away" report. The probe's `appearance`
+  stops measure it: a light-to-dark flip shrinks `NSTitlebarContainerView`
+  back to AppKit's height and leaves the x alone.
+
+  A second observer catches it, on the container's
+  `NSViewFrameDidChangeNotification`. This is the notification rejected below
+  for the resize, and the difference is timing. The block only queues one
+  re-apply with `addOperationWithBlock:` on the main queue, so it runs once
+  AppKit's pass is done. It is no general net: the probe measured the resize
+  and the retitle reverting the buttons' own frames after its block ran.
+
+  Three measured traps shaped it:
+  - **A notification-centre queue does not defer.** Registering the observer
+    with the main queue still ran the block inline, inside AppKit's own
+    `setFrame:`, because the poster was already on that queue.
+  - **A write nested in that `setFrame:` recursed inside AppKit** in full
+    screen, until the stack overflowed. A re-entrancy guard on our block did
+    not stop it: the recursion was AppKit's, not ours.
+  - **Full screen lays the titlebar out continuously**, so the re-apply stands
+    down there. The `Resized` arm re-places on the way out.
+
+  `inset_lights` writes nothing when the placement holds, so the observer's
+  echo of our own write settles in one pass. Other Tauri apps landed on the
+  same shape, a frame-change observer driving one coalesced re-apply on the
+  next main-queue turn.
 - Observers are keyed by Tauri window label and removed on `Destroyed`. A dead
   window's address can be reused, and a stale registration would then place
   lights on somebody else's window.
@@ -92,9 +119,10 @@ that retunes the titlebar keeps the cluster centred instead of drifting.
   misses the CoreAnimation transaction the resize is committed in. Measured:
   every step of an edge drag displayed the cluster at AppKit's own centre
   before the queued event pulled it back down, and the lights danced.
-- **The container's `NSViewFrameDidChangeNotification`.** Probed. It fires
-  while AppKit is still descending the titlebar view tree, before it resets the
-  buttons' x, so the cluster displays at AppKit's x.
+- **The container's `NSViewFrameDidChangeNotification`, synchronously.**
+  Probed. It fires while AppKit is still descending the titlebar view tree,
+  before it resets the buttons' x, so the cluster displays at AppKit's x. It
+  is used, queued, for the appearance change only (see Consequences).
 - **Pinning the container with layout constraints.** Probed. It does hold the
   height across a resize, but leaves that same x behind. It buys a constraint
   fight with the theme frame and still needs a per-resize re-apply.

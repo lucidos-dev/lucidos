@@ -53,6 +53,16 @@ export function previewUrl(
   return withPreviewRevision(base, stamp && stamp.path === path ? stamp.rev : 0);
 }
 
+/** GET a data file's body as text. A non-2xx answer rejects as an `ApiError`,
+ *  so the caller's Loadable keeps the HTTP code (a 404 offers knowhow
+ *  suggestions). */
+function fetchText(url: string): Promise<string> {
+  return fetch(url).then(r => {
+    if (!r.ok) throw new ApiError(r.status, r.statusText || 'fetch failed');
+    return r.text();
+  });
+}
+
 interface Props {
   path: string;
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
@@ -230,13 +240,7 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   // still flash a spinner and drop focus. Each edit session remounts FileEditor
   // (it's gated on `editing`), so a fresh url is captured per session.
   const [fetchUrl] = useState(url);
-  const { loadable, showLoading } = useLoadableFetch<string>(
-    () => fetch(fetchUrl).then(r => {
-      if (!r.ok) throw new ApiError(r.status, r.statusText || 'fetch failed');
-      return r.text();
-    }),
-    [fetchUrl],
-  );
+  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchText(fetchUrl), [fetchUrl]);
   // `null` = not yet seeded from the fetch (distinct from an empty file `''`).
   const [draft, setDraft] = useState<string | null>(null);
   // The last-saved content. Starts as the fetched content and moves to the
@@ -353,13 +357,7 @@ function TextContent({ body, url, path }: { body: TextPreviewBody; url: string; 
   // is showing a type that HAS a rendered form. A `.rs` file is source either
   // way and takes its own grammar (see `sourceLinesFor`).
   const sourceMode = body === 'source' && RENDERABLE_EXTS.includes(ext);
-  const { loadable, showLoading } = useLoadableFetch<string>(
-    () => fetch(url).then(r => {
-      if (!r.ok) throw new ApiError(r.status, r.statusText || 'fetch failed');
-      return r.text();
-    }),
-    [url],
-  );
+  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchText(url), [url]);
   const loaded = loadable.status === 'loaded' ? loadable.data : null;
   const sourceRows = useMemo(
     () => fileRows(loaded === null ? [] : sourceLinesFor(loaded, ext, sourceMode)),

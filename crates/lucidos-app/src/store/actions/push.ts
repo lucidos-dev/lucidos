@@ -247,7 +247,7 @@ export function pushUnsupportedReasonHere(): string | null {
  * Register the service worker, request notification permission,
  * subscribe to push, and send the subscription to the backend.
  *
- * Called when the frontend receives a `push_notification_request` SSE event.
+ * Called only by `setDevicePushEnabled`, the one entry point that turns push on.
  */
 export async function initPushSubscription(): Promise<boolean> {
   if (isTauri()) {

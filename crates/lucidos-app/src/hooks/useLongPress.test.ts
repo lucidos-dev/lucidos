@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { makeLongPressHandlers, type LongPressHandlers } from './useLongPress';
+import { makeLongPressHandlers, type LongPressCallback, type LongPressHandlers } from './useLongPress';
 
 const DELAY = 450;
 
@@ -15,20 +15,20 @@ function clickEvent() {
     stopPropagation: ReturnType<typeof vi.fn>;
   };
 }
-function contextMenuEvent(target: object = {}) {
-  return { preventDefault: vi.fn(), currentTarget: target } as unknown as MouseEvent & {
+function contextMenuEvent(target: object = {}, clientX = 0, clientY = 0) {
+  return { preventDefault: vi.fn(), currentTarget: target, clientX, clientY } as unknown as MouseEvent & {
     preventDefault: ReturnType<typeof vi.fn>;
   };
 }
 
 describe('makeLongPressHandlers', () => {
-  let onLongPress: ReturnType<typeof vi.fn<(target: HTMLElement) => void>>;
+  let onLongPress: ReturnType<typeof vi.fn<LongPressCallback>>;
   let onClick: ReturnType<typeof vi.fn<() => void>>;
   let h: LongPressHandlers;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    onLongPress = vi.fn<(target: HTMLElement) => void>();
+    onLongPress = vi.fn<LongPressCallback>();
     onClick = vi.fn<() => void>();
     h = makeLongPressHandlers(onLongPress, onClick);
   });
@@ -79,10 +79,10 @@ describe('makeLongPressHandlers', () => {
     expect(onLongPress).toHaveBeenCalledTimes(1);
   });
 
-  it('right-click opens via contextmenu without starting a hold timer', () => {
+  it('right-click opens via contextmenu, at the pointer, without starting a hold timer', () => {
     const target = { id: 'btn' };
-    h.onContextMenu(contextMenuEvent(target));
-    expect(onLongPress).toHaveBeenCalledWith(target);
+    h.onContextMenu(contextMenuEvent(target, 120, 340));
+    expect(onLongPress).toHaveBeenCalledWith(target, { x: 120, y: 340 });
   });
 
   it('a right-button pointerdown never arms a hold', () => {

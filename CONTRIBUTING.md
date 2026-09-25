@@ -1,49 +1,40 @@
 # Contributing to Lucidos
 
-Thanks for your interest in Lucidos! This guide covers how to set up the dev
-environment, the branch and PR flow, our commit conventions, and the sign-off we
-require on every contribution. Keep it open in a tab — it's meant to be concrete,
-not exhaustive.
+This guide covers the dev environment, the branch and PR flow, commit
+conventions, and the sign-off every contribution needs.
 
-> **Pre-1.0, expect breakage.** Lucidos is pre-1.0 — the newest `v*` tag is the
-> current version. Until 1.0 the public surfaces — events, the HTTP API, the JS
-> SDK, the database schema, on-disk layout — can change without notice. Pin a
-> commit if you need stability, and don't be surprised when `main` moves under
-> you.
+> **Pre-1.0, expect breakage.** The newest `v*` tag is the current version.
+> Until 1.0, the public surfaces can change without notice: events, the HTTP
+> API, the JS SDK, the database schema, and the on-disk layout. Pin a commit if
+> you need stability.
 
-By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
-How the project is run, and how you can grow into a maintainer, is described in
-[GOVERNANCE.md](GOVERNANCE.md).
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+[GOVERNANCE.md](GOVERNANCE.md) describes how the project is run and how to
+become a maintainer.
 
 ## How this repository works
 
-This repository is a **published mirror**, not the development repo. Lucidos is
-developed in a private source repository, and each release is exported here as a
-single commit. Three consequences are worth knowing before you write any code:
+This repository is a **published mirror**. Lucidos is developed in a private
+source repository, and each release is exported here as a single commit.
 
-- **`main` gains one commit per release.** A release is one commit on `main`,
-  tagged `v<x.y.z>`, carrying the previous release's commit as its single
-  parent. The history is therefore linear and readable: `git log`,
-  `git describe` and a `git diff` between two release tags all work, and a
-  `git pull` fast-forwards.
-  Each commit is still a *snapshot* rather than the source repo's own
-  commit-by-commit history, and the published tree is stripped: internal-only
-  paths (planning docs, the release tooling) never ship.
-- **Your PR is imported, not merged.** A maintainer squashes it onto the previous
-  release tag and ships it in the next release. The release commit carries a
-  `Co-authored-by:` trailer naming your GitHub account, and the change is ported
-  back into the source repo, so it stays in every release after that one.
+- **`main` gains one commit per release.** Each release commit is tagged
+  `v<x.y.z>` and has the previous release's commit as its single parent. The
+  history is linear: `git log`, `git describe` and `git diff` between two
+  release tags all work, and `git pull` fast-forwards. Each commit is a
+  *snapshot* of the source repo. Internal-only paths (planning docs, the
+  release tooling) are stripped from the published tree.
+- **Your PR is imported.** A maintainer squashes it onto the previous release
+  tag and ships it in the next release. The release commit carries a
+  `Co-authored-by:` trailer naming your GitHub account. The change is also
+  ported back into the source repo, so it stays in every later release.
 - **Your PR is then closed with a link to the release containing it.** GitHub
-  will show it as "Closed", never "Merged": that's the mirror's mechanics, not a
-  rejection. If the closing comment says it was released as `v<x.y.z>` and links
-  that release, your change shipped.
+  shows it as "Closed". If the closing comment links a `v<x.y.z>` release,
+  your change shipped.
 
-> **A clone from before `v0.21.0` needs a one-time reset.** Until 2026-08-04
-> each release was a *parentless* commit force-pushed over the last, so the
-> mirror showed a one-commit history with unrelated tags. The repair that
-> chained the published releases rewrote every one of their SHAs. If you cloned
-> or forked before then, `git pull` will conflict or produce a nonsense merge.
-> Adopt the rebuilt history once, and move in-flight work onto it:
+> **A clone from before `v0.21.0` needs a one-time reset.** Chaining the
+> earlier releases into one history changed all of their SHAs. If you cloned
+> or forked before `v0.21.0`, `git pull` will conflict or produce a nonsense
+> merge. Adopt the rebuilt history once, and move in-flight work onto it:
 >
 > ```bash
 > # origin = your fork, upstream = this repository
@@ -53,22 +44,17 @@ single commit. Three consequences are worth knowing before you write any code:
 > git rebase --onto main <commit-you-branched-from>     # replay your work
 > ```
 >
-> Re-forking works just as well if the branch is already shipped. From `v0.21.0`
-> onward a release is ancestry-preserving, so `git pull` is an ordinary
-> fast-forward.
+> If the branch has already shipped, you can re-fork instead.
 
 ## Speak the project's language
 
-Lucidos has a precise vocabulary — **workspace**, **app**, **intent**,
-**knowhow**, **trigger**, **event**, **artifact**, **thread**. These aren't
-interchangeable synonyms; each has a specific meaning. Use the canonical term in
-issues, PRs, commit messages, and code. The two glossaries are the source of
-truth:
+Lucidos uses a precise vocabulary: **workspace**, **app**, **intent**,
+**knowhow**, **trigger**, **event**, **artifact**, **thread**. Each term has a
+specific meaning. Use the canonical term in issues, PRs, commit messages, and
+code. The two glossaries are the source of truth:
 
-- [`system-knowhow/glossary.md`](system-knowhow/glossary.md) — user-facing terms.
-- [`docs/glossary.md`](docs/glossary.md) — dev-only terms (extends the above).
-
-A quick skim before you write will keep the conversation aligned.
+- [`system-knowhow/glossary.md`](system-knowhow/glossary.md): user-facing terms.
+- [`docs/glossary.md`](docs/glossary.md): dev-only terms (extends the above).
 
 ## Set up the dev environment
 
@@ -83,47 +69,41 @@ The short version:
 ./scripts/web-dev.sh -w ~/workspaces/dev
 ```
 
-This brings up PostgreSQL + pgvector in Docker, builds and runs the Rust engine
+This starts PostgreSQL + pgvector in Docker, builds and runs the Rust engine
 natively, and serves the frontend. Each workspace gets its own ports, so several
-can run side by side. See the README for prerequisites (Rust, Docker, Node.js, an
+can run side by side. The README covers prerequisites (Rust, Docker, Node.js, an
 LLM provider), port assignment, and local HTTPS.
 
-The deeper working conventions for the codebase — Rust, events, migrations,
-frontend, testing — live in [`CLAUDE.md`](CLAUDE.md) and the rule files under
-[`.claude/rules/`](.claude/rules/). They apply to humans and AI coding agents
-alike; read the ones relevant to what you're touching.
+The working conventions for the codebase (Rust, events, migrations, frontend,
+testing) live in [`CLAUDE.md`](CLAUDE.md) and the rule files under
+[`.claude/rules/`](.claude/rules/). They apply to humans and AI coding agents.
+Read the ones for the area you change.
 
 ## Branch and PR flow
 
-Pull requests are wanted, and forking is deliberately enabled. Everything up to
-the landing step is the ordinary fork-and-pull-request flow:
-
 1. **Fork** the repository and clone your fork.
 2. **Branch** off `main`. Name the branch after the change, prefixed with its
-   type — e.g. `feat/trigger-group-reorder`, `fix/thread-drawer-spacing`,
+   type: for example `feat/trigger-group-reorder`, `fix/thread-drawer-spacing`,
    `docs/contributing-guide`.
-3. **Make your change**, with tests (see below). Keep the branch focused —
-   one logical change per PR is much easier to review.
+3. **Make your change**, with tests (see below). Keep to one logical change per
+   PR.
 4. **Commit** following our message conventions, **signed off** (see DCO below).
 5. **Open a PR** against `main`. Fill in the
    [pull request template](.github/PULL_REQUEST_TEMPLATE.md) and link the issue
    it addresses.
 6. **A maintainer imports it into a release** and closes the PR with a link to
-   that release, crediting you as co-author — see
+   that release, crediting you as co-author. See
    [How this repository works](#how-this-repository-works).
 
-> **CI does not run on pull requests.** The mirror has workflows, but they are
-> release gates: they fire on release candidates, version tags, and published
-> releases, never on a PR. Nothing checks your branch and there are no status
-> checks to "wait for". Run the relevant suites locally and report what you ran
-> in the PR — a maintainer will not be able to tell green from red otherwise.
-> Releases are cut locally by maintainers; contributors never need to touch the
-> release flow.
+> **CI does not run on pull requests.** The mirror's workflows are release
+> gates. They run on release candidates, version tags, and published releases.
+> Run the relevant suites locally and list what you ran in the PR. Maintainers
+> cut releases locally, so contributors do not touch the release flow.
 
 ## Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/). The subject
-line is `type(scope): summary`, written in the imperative mood:
+line is `type(scope): summary`, in the imperative mood:
 
 ```
 feat(threads): sort drawer by last user action
@@ -133,22 +113,22 @@ refactor(app): rename coding-agent control surface off the "cc" prefix
 ```
 
 Common types: **`feat`**, **`fix`**, **`docs`**, **`refactor`**, **`chore`**,
-**`test`**. The scope is optional but encouraged — use the area you touched
-(`engine`, `threads`, `push`, `app`, `models`, …). Add a body explaining the
-*why* whenever the change isn't self-evident.
+**`test`**. The scope is optional. Use the area you touched (`engine`,
+`threads`, `push`, `app`, `models`, …). Add a body explaining the *why* when
+the change needs it.
 
-If your change touches a documented surface (an event type, the JS SDK, the CLI,
-the plugin manifest, a glossary term, …), update the matching `system-knowhow/*.md`
-**in the same commit** — stale knowhow misleads both contributors and the engine
-LLM that reads it. This rule is spelled out in
-[`.claude/rules/system-knowhow.md`](.claude/rules/system-knowhow.md).
+A change to a documented surface updates the matching `system-knowhow/*.md`
+**in the same commit**. Documented surfaces include event types, the JS SDK, the
+CLI, the plugin manifest, and glossary terms. The engine LLM reads these files.
+[`.claude/rules/system-knowhow.md`](.claude/rules/system-knowhow.md) spells out
+the rule.
 
 ## Sign your work (DCO)
 
 Lucidos requires a [Developer Certificate of Origin](https://developercertificate.org/)
-sign-off on every commit. The DCO is a lightweight statement that you wrote the
-patch, or otherwise have the right to submit it under the project's
-[MIT license](LICENSE). It is **not** a CLA — you keep the copyright to your work.
+sign-off on every commit. The DCO states that you wrote the patch, or have the
+right to submit it under the project's [MIT license](LICENSE). You keep the
+copyright to your work.
 
 Sign off by adding `-s` to your commit:
 
@@ -163,13 +143,12 @@ Signed-off-by: Your Name <your.email@example.com>
 ```
 
 Use your real name and a reachable email. Every commit in a PR must carry the
-trailer; if you forget, `git rebase --signoff main` adds it to the whole branch.
-A PR whose commits aren't signed off can't be released.
+trailer. If you forget, `git rebase --signoff main` adds it to the whole branch.
+A PR with unsigned commits can't be released.
 
 ## Tests
 
-Run the suites for the layers you touched. Because CI never sees your PR, this is
-on you.
+Run the suites for the layers you touched.
 
 | You changed… | Run |
 |---|---|
@@ -180,36 +159,32 @@ on you.
 | Everything, end to end | `./scripts/e2e.sh` (API + browser + WASM + embedder) |
 | Docs / CSS only | no tests needed |
 
-> Don't run bare `cargo test -p lucidos-engine` — the integration tests need a
-> real Postgres, which `make test` (`./scripts/test-engine.sh`) provisions for
-> you. Without it, every DB-backed test panics on connect and reports hundreds of
-> false failures. See [`.claude/rules/testing.md`](.claude/rules/testing.md).
+> Don't run bare `cargo test -p lucidos-engine`. The integration tests need a
+> real Postgres, and `make test` (`./scripts/test-engine.sh`) provisions one.
+> Without it, every DB-backed test panics on connect. See
+> [`.claude/rules/testing.md`](.claude/rules/testing.md).
 
-Bug fixes should come with a failing test that the fix turns green. Refactors that
-change data flow need integration coverage, not just unit tests.
+A bug fix comes with a failing test that the fix turns green. A refactor that
+changes data flow needs integration tests as well as unit tests.
 
 ## Reporting bugs and proposing features
 
 Open an issue using the matching template:
 
-- **Bug report** — something is broken.
-- **Feature request** — something should exist.
-- **Knowhow contribution** — you want to contribute a knowhow doc, app, or
-  trigger. See [`docs/taxonomy.md`](docs/taxonomy.md) and the `building-*.md`
+- **Bug report**: something is broken.
+- **Feature request**: something should exist.
+- **Knowhow contribution**: you want to contribute a knowhow doc, app, or
+  trigger. Read [`docs/taxonomy.md`](docs/taxonomy.md) and the `building-*.md`
   guides under [`system-knowhow/`](system-knowhow/) first.
 
-Before requesting a feature that adds a **surface** (a new place the user
-interacts with Lucidos) or an **integration** (a new relationship with somebody
-else's product), read [`docs/philosophy.md`](docs/philosophy.md) and say in the
-issue how your proposal answers it. That page also lists two ideas already
-settled as a *no*, with the reasoning, so you can tell straight away whether
-yours is one of them. It is deliberately narrow and does not apply to ordinary
-work: nobody will ask you to justify a fix, a refactor or a performance change
-against it.
+A feature request may add a **surface** (a new place the user interacts with
+Lucidos) or an **integration** (a new relationship with somebody else's
+product). For those, read [`docs/philosophy.md`](docs/philosophy.md) and say in
+the issue how your proposal answers it. That page also lists two ideas already
+settled as a *no*. It applies only to surfaces and integrations.
 
 For open-ended questions and discussion, use
-[GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions) rather
-than the issue tracker.
+[GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions).
 
 ## Security
 

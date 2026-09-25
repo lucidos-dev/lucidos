@@ -37,7 +37,7 @@ const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.Inline
  *  fuse below is this scaled by the Animation speed slider plus a little slack,
  *  so the element survives its own fade and then leaves however fast that fade
  *  is running. It is also the fuse that unmounts the cover when no animation
- *  runs at all: under `prefers-reduced-motion: reduce` the CSS drops the
+ *  runs at all: under reduced motion (`data-motion="reduce"`) the CSS drops the
  *  animation, and an `animationend`-driven unmount would then never fire and
  *  leave the pane covered forever (harmless to stretch, since that rule also
  *  makes the cover transparent from its first frame). */

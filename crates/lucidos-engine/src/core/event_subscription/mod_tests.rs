@@ -522,8 +522,11 @@ fn the_incident_names_are_refused_with_the_right_suggestion() {
     );
     assert!(err.contains("Did you mean CredentialCreated"), "{err}");
 
+    // A credential request is a form request now, so its resolution is the
+    // closest real name. The request itself still comes up.
     let err = refuse_near_miss("CredentialRequestResolved").unwrap_err();
-    assert!(err.contains("Did you mean CredentialRequested"), "{err}");
+    assert!(err.contains("Did you mean FormRequestResolved"), "{err}");
+    assert!(err.contains("CredentialRequested"), "{err}");
 }
 
 /// A retired name is caught by exact lookup, never by the heuristic. A rename

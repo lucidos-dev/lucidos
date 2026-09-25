@@ -136,7 +136,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // rather than on the top of a page they then have to scan.
   { id: 'models:opencode-free', label: 'OpenCode Free (keyless)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:opencode-free', keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
   { id: 'models:chat-model', label: 'Model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
-  { id: 'models:response-style', label: 'Response style', subview: 'models', path: 'Settings → Models', anchor: 'models:response-style', keywords: 'response style brevity verbose verbosity concise minimal short shorter terse length yapping waffle rambling output style tone instruction custom' },
+  { id: 'models:response-style', label: 'Response style', subview: 'models', path: 'Settings → Models', anchor: 'models:response-style', keywords: 'response style brevity verbose verbosity concise minimal short shorter terse length yapping waffle rambling output style tone instruction custom learning teach explain why outcome autopilot' },
+  { id: 'models:technical-literacy', label: 'How technical', subview: 'models', path: 'Settings → Models → Response style', anchor: 'models:technical-literacy', keywords: 'technical literacy level jargon plain language simple beginner non-technical developer expert explain vocabulary' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
@@ -154,6 +155,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:theme' },
   { id: 'appearance:typography', label: 'Typography', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:typography' },
   { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:mode' },
+  { id: 'appearance:motion', label: 'Motion', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:motion', keywords: 'reduce motion reduced animation animations calm still accessibility vestibular dizzy spinner pulse slide' },
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:mobile', mobileOnly: true },

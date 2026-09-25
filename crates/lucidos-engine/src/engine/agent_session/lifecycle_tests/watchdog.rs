@@ -567,7 +567,9 @@ fn api_error_resume_opens_a_resume_exchange() {
 fn both_session_exits_reach_the_api_drop_auto_resume() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
     const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");
-    const CALL: &str = "self.maybe_auto_resume_after_api_error(";
+    // No `self`: rustfmt moves a method call onto its own line when the
+    // result is bound, and the call is still the call.
+    const CALL: &str = ".maybe_auto_resume_after_api_error(";
 
     assert!(
         COMPLETION_SRC.contains("async fn maybe_auto_resume_after_api_error("),
@@ -595,7 +597,7 @@ fn both_session_exits_reach_the_api_drop_auto_resume() {
          notices, which is the bug this whole feature exists to fix.",
     );
     let teardown = arm
-        .find("self.clear_cc_debounce(thread_id);")
+        .find("self.clear_spawn_debounce(thread_id);")
         .expect("the idle-exit arm must still tear the session down before returning");
     let drain = arm
         .find("let orphans = lost_followups_to_orphans(")
@@ -711,16 +713,6 @@ fn the_auto_resume_hold_is_taken_before_the_terminal_is_emitted() {
         "the hold must be taken BEFORE the terminal emit: the emit is what runs the fan-in, \
          so a hold taken afterwards cannot withhold anything.",
     );
-
-    // Outside the `if let Some(kind)`, so a classified Result always answers.
-    let terminal_branch = arm
-        .find("if let Some(kind) = terminal_kind {")
-        .expect("the Result arm must still branch on a present terminal");
-    assert!(
-        hold < terminal_branch,
-        "the hold call must sit outside the terminal branch, so every classified Result \
-         gets an answer rather than inheriting one.",
-    );
 }
 
 /// **The hold must not outlive the terminal it names.** It is thread-keyed, so a
@@ -767,6 +759,40 @@ fn the_auto_resume_hold_is_released_inside_the_arm_that_took_it() {
         "the released hold must travel as a per-turn local that `reset_per_turn_flags` \
          clears, not as a register entry that outlives its turn.",
     );
+}
+
+/// **The idle arm writes change state before it idles.** The idle's own emit
+/// builds the parent's completion card, and the card lists the pending changes
+/// as they stand at that moment. A change proposed after the idle reached the
+/// parent as "Pending changes: none".
+///
+/// Source-text, like its siblings: the property is the order of two calls.
+/// `a_completion_card_lists_the_change_proposed_before_the_idle` pins why the
+/// order matters.
+#[test]
+fn the_idle_arm_proposes_before_it_idles() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let idle_emit = arm
+        .find("self.emit_coding_agent_idled(")
+        .expect("the Result arm must still emit this turn's CodingAgentIdled");
+    for write in [
+        "self.propose_change(",
+        "self.reconcile_emptied_pending_change(",
+    ] {
+        let at = arm
+            .find(write)
+            .unwrap_or_else(|| panic!("the Result arm must still call {write}"));
+        assert!(
+            at < idle_emit,
+            "{write} must run BEFORE the idle emit: the idle builds the parent's card, \
+             so a change written afterwards never reaches it",
+        );
+    }
 }
 
 /// The resume helper must not re-derive the decision it is handed. Two copies of
@@ -830,8 +856,8 @@ fn the_resume_actuates_the_decision_rather_than_re_deciding() {
 /// The fix was to stop guessing. Each of the three windows a follow-up can be in
 /// gets a signal that is exact under the lock the decision already holds, so this
 /// guards the two that a future edit could quietly turn back into a guess: the
-/// channel read, and the per-backend settle. Same source-text rationale as its
-/// sibling, and the same honest limit.
+/// channel read, and the read-report ledger (ADR 0268). Same source-text
+/// rationale as its sibling, and the same honest limit.
 /// See `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`.
 #[test]
 fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
@@ -851,14 +877,14 @@ fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
     let decision = arm
         .find("match terminate_decision(")
         .expect("the ExitSubprocess arm must still route through terminate_decision");
-    let settle = arm.find("settle_inputs_awaiting_result(").expect(
-        "the ExitSubprocess arm must settle the forwarded-input count through the shared \
-         per-backend helper. Inlining the rule is how one backend's promise (Codex answers \
-         one input per Result) got applied to the other (Claude Code answers all of them).",
+    let owed = arm.find("inputs.owed()").expect(
+        "the ExitSubprocess arm must read what is still unread from the input ledger. A \
+         count settled at each Result is how a Claude Code input that arrived after the \
+         turn's last tool call was killed with the subprocess (ADR 0268).",
     );
     assert!(
-        settle < decision,
-        "the settle must run before the decision reads its remainder",
+        owed < decision,
+        "the ledger must be read before the decision uses it",
     );
     // Scoped to the call's own argument list rather than the whole arm, so a
     // passing mention of `msg_rx` in a comment cannot satisfy the guard. (It did:
@@ -874,18 +900,12 @@ fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
          this arm holds the same agent_sessions lock the fast-path send takes.",
     );
 
-    // The ordering qualifier on the Claude Code merge rule. Without it the settle
-    // trades the phantom for a dropped message, because `select!` can forward an
-    // input and only then hand the loop a Result that predates it.
+    // Both halves of the ledger. An input is owed from its forward until the
+    // agent reports it read, and nothing else may settle it.
     assert!(
-        RUN_SRC.contains("forwarded_input_unconfirmed = true;")
-            && RUN_SRC.contains("agent_events_queued_at_forward = events_rx.len();")
-            && RUN_SRC.contains("agent_event_may_predate_forward("),
-        "the run loop must arm the forward-ordering state when it forwards an input, record how \
-         many events were ALREADY queued at that moment, and advance it through \
-         `agent_event_may_predate_forward` on every agent event. Dropping the queued-event count \
-         is the buffered-event hole: a Result that sat in the channel the whole time then reads \
-         as proof the agent accepted an input it has never seen.",
+        RUN_SRC.contains("inputs.forwarded(") && RUN_SRC.contains("inputs.observe(&ev)"),
+        "the run loop must record every forwarded input in the ledger and pass every agent \
+         event through `observe`, which is the only place a read report settles one.",
     );
 
     // The `Terminate` branch is what carries an API-drop turn to the idle exit the

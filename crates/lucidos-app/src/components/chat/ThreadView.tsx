@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/ho
 import { focusedThreadId, threadMap, stepsExpanded, detailsExpanded, collapsedExchanges, activeStreamingBuffer, threadsLoaded, awaitedThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
-import { loadThreadEvents, loadOlderThreadEvents, ensureWholeThreadLoaded, forceRetryThreadEvents, threadHistoryReadInFlight, threadLoadInFlightMs } from '../../store/actions/thread-loading';
+import { loadThreadEvents, loadOlderThreadEvents, ensureWholeThreadLoaded, forceRetryThreadEvents, retryThreadEvents, threadHistoryReadInFlight, threadLoadInFlightMs } from '../../store/actions/thread-loading';
 import { checkConnection } from '../../store/actions/connection';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { replaceDocument } from '../../utils/documentNavigation';
@@ -588,7 +588,7 @@ export function threadEmptyStateBody(reason: EmptyReason, showReload: boolean) {
             return (
                 <div class="thread-empty-state thread-empty-error">
                     <p>{message}</p>
-                    <button class="action-btn" onClick={() => forceRetryThreadEvents(reason.threadId)}>Retry</button>
+                    <button class="action-btn" onClick={() => retryThreadEvents(reason.threadId)}>Retry</button>
                     <button class="thread-empty-reload" onClick={() => refreshClient()}>Reload page</button>
                 </div>
             );
@@ -603,7 +603,7 @@ export function threadEmptyStateBody(reason: EmptyReason, showReload: boolean) {
             return (
                 <div class="thread-empty-state thread-empty-error">
                     <p>Can't reach this workspace</p>
-                    <button class="action-btn" onClick={() => { void checkConnection(); forceRetryThreadEvents(reason.threadId); }}>Retry</button>
+                    <button class="action-btn" onClick={() => { void checkConnection(); retryThreadEvents(reason.threadId); }}>Retry</button>
                     {pickerHref && (
                         <button class="thread-empty-reload" onClick={() => replaceDocument(pickerHref)}>
                             Back to workspaces
@@ -1937,7 +1937,7 @@ export function ThreadView() {
         return (
             <div class="thread-view">
                 <div class="thread-content-wrap" key="wrap">
-                    <div class="thread-content visible" key="content">
+                    <div class="thread-content visible" key="content" data-native-context-menu>
                         <ThreadEmptyState key={threadId} reason={waitingReason} />
                     </div>
                     <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />
@@ -1974,7 +1974,7 @@ export function ThreadView() {
                 {/* tabindex makes the transcript a keyboard-focusable scroll
                     region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
                     native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
-                <div class="thread-content visible" key="content" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript">
+                <div class="thread-content visible" key="content" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript" data-native-context-menu>
                     <MobileThreadTitleBar />
 
                     {hasFeed ? (

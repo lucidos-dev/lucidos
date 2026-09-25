@@ -67,6 +67,7 @@ async fn the_write_then_execute_chain_is_refused() {
     // mid-scan makes the command-checkpoint test's whole-tree `git add -A` fail,
     // so hold the tree read guard for the whole test; see `workspace_tree_lock`.
     let _tree = crate::support::workspace_tree_lock().read().await;
+    let _apis = crate::support::apis_json_lock().lock().await;
 
     // Step 1: land the Python files. Allowed, deliberately: ADR 0144 guards
     // what runs, not what is written.

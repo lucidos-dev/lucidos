@@ -136,8 +136,12 @@ impl Rect {
 ///
 /// Two rects, because the clamp asks a display two different questions and the
 /// answers differ by the Dock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Panel {
+    /// tao's name for the monitor, what a [`DisplayAnchor`] matches on. On
+    /// macOS it is `Monitor #<model number>`, stable across a relaunch and a
+    /// change of primary. `None` leaves a frame on this monitor unanchored.
+    name: Option<String>,
     /// The usable frame, menu bar and Dock excluded. Where a window is PLACED,
     /// since neither of those is somewhere a title bar can be grabbed.
     work_area: Rect,
@@ -198,6 +202,120 @@ impl Displays {
         }
         let panels: Vec<Panel> = panels.into_iter().filter(Panel::holds_anything).collect();
         (!panels.is_empty()).then_some(Self { panels, primary })
+    }
+}
+
+/// The display a remembered frame was captured on (ADR 0269).
+///
+/// macOS measures every window from the primary display's corner, and a dock
+/// or an undock can change which display that is. A frame in raw global
+/// coordinates then replays on the wrong display. The anchor lets a restore
+/// shift the frame by however far its display has moved since.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DisplayAnchor {
+    /// The monitor's name, see [`Panel::name`].
+    name: String,
+    /// The display's whole screen at capture time. Its size is half the
+    /// identity, and its origin is what the shift is measured from.
+    screen: Rect,
+}
+
+/// A workspace's frame as the session record keeps it: the global frame, and
+/// the display it was on when that is known.
+///
+/// **The fields are private, so [`resolve`] is the only way to a frame that
+/// can be placed.** A remembered frame taken raw is the defect ADR 0269 fixes.
+///
+/// The frame is flattened into the same four keys an older build writes, and
+/// the anchor is one optional key beside them. So either build reads the
+/// other's record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RememberedFrame {
+    #[serde(flatten)]
+    frame: Rect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<DisplayAnchor>,
+}
+
+impl RememberedFrame {
+    pub(crate) fn new(frame: Rect, display: Option<DisplayAnchor>) -> Self {
+        Self { frame, display }
+    }
+
+    /// A frame with no display behind it, which is what an older record holds.
+    #[cfg(test)]
+    pub(crate) fn unanchored(frame: Rect) -> Self {
+        Self::new(frame, None)
+    }
+}
+
+/// Where a live frame sits on the desk, as far as the session record cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Whereabouts {
+    /// Its title bar is on no attached screen. No drag can put a window there,
+    /// so the system did, and it is not an arrangement (ADR 0269).
+    Orphaned,
+    /// On screen, anchored to the display holding most of it. `None` when that
+    /// display has no name, or the desk could not be read.
+    OnScreen(Option<DisplayAnchor>),
+}
+
+/// Where `frame` sits on `displays`.
+///
+/// The orphan test is the loosest one a user gesture can satisfy: SOME of the
+/// title strip on SOME screen. macOS will not let a drag put the title bar
+/// anywhere else. So a window parked almost off an edge still counts as on
+/// screen, which ADR 0173 and ADR 0204 refused to break.
+///
+/// The home display is measured against each whole SCREEN, like the orphan
+/// test, because the anchor names a display and not its work area.
+pub(crate) fn whereabouts(frame: Rect, displays: &Displays, policy: &Policy) -> Whereabouts {
+    let strip = Rect {
+        height: policy.grab_height.min(frame.height),
+        ..frame
+    };
+    if !displays
+        .panels
+        .iter()
+        .any(|panel| strip.overlap_area(&panel.frame) > 0)
+    {
+        return Whereabouts::Orphaned;
+    }
+    let home = displays
+        .panels
+        .iter()
+        .max_by_key(|panel| frame.overlap_area(&panel.frame));
+    Whereabouts::OnScreen(home.and_then(|panel| {
+        Some(DisplayAnchor {
+            name: panel.name.clone()?,
+            screen: panel.frame,
+        })
+    }))
+}
+
+/// The frame to place for `remembered` on `displays`, before any clamp.
+///
+/// Shifted by how far the anchor display has moved, when exactly one attached
+/// display matches the anchor. None means it is away, and several means
+/// identical monitors at one resolution. Both give back the raw frame, and the
+/// clamp judges whatever comes back.
+pub(crate) fn resolve(remembered: &RememberedFrame, displays: &Displays) -> Rect {
+    let frame = remembered.frame;
+    let Some(anchor) = &remembered.display else {
+        return frame;
+    };
+    let mut matches = displays.panels.iter().filter(|panel| {
+        panel.name.as_deref() == Some(anchor.name.as_str())
+            && panel.frame.width == anchor.screen.width
+            && panel.frame.height == anchor.screen.height
+    });
+    match (matches.next(), matches.next()) {
+        (Some(panel), None) => Rect {
+            x: frame.x + panel.frame.x - anchor.screen.x,
+            y: frame.y + panel.frame.y - anchor.screen.y,
+            ..frame
+        },
+        _ => frame,
     }
 }
 
@@ -398,6 +516,71 @@ pub(crate) fn fit_to_displays(live: Rect, displays: &Displays, policy: &Policy) 
     sanitize(live, displays, policy)
 }
 
+/// The share of the primary's work area a fresh window takes, as a fraction.
+const FRESH_SHARE_NUMERATOR: i64 = 4;
+const FRESH_SHARE_DENOMINATOR: i64 = 5;
+
+/// The largest frame a fresh window takes, so a big external display does not
+/// hand out a wall-sized window nobody asked for.
+const FRESH_MAX_WIDTH_POINTS: i64 = 1680;
+const FRESH_MAX_HEIGHT_POINTS: i64 = 1050;
+
+/// Where a new window opened beside `source` goes: at its size, one title bar
+/// down and to the right, as macOS cascades. The step is the drag handle's
+/// height, which is one title bar.
+///
+/// A step past the edge of `source`'s work area shrinks the window to fit, so
+/// it never lands exactly on top of its source. A step that starts outside the
+/// work area, or a fit below the declared minimum, wraps to its top-left corner.
+pub(crate) fn cascade(source: Rect, displays: &Displays, policy: &Policy) -> Rect {
+    let home = home_work_area(&source, displays, policy).unwrap_or(displays.primary);
+    let x = source.x + policy.grab_height;
+    let y = source.y + policy.grab_height;
+    let fitted = Rect {
+        x,
+        y,
+        width: source.width.min(home.right() - x),
+        height: source.height.min(home.bottom() - y),
+    };
+    let fits = x >= home.x
+        && y >= home.y
+        && fitted.width >= policy.min_width
+        && fitted.height >= policy.min_height;
+    if fits {
+        return fitted;
+    }
+    Rect {
+        x: home.x,
+        y: home.y,
+        width: source.width.min(home.width),
+        height: source.height.min(home.height),
+    }
+}
+
+/// Where a new window with nothing to cascade from goes: most of the primary's
+/// work area, centred on it.
+///
+/// Sized to the screen rather than to a fixed number, so a large display and a
+/// raised UI scale both get room for the panes. Never smaller than the declared
+/// default, unless the work area itself is.
+pub(crate) fn fresh(displays: &Displays, policy: &Policy) -> Rect {
+    let work = displays.primary;
+    let share = |span: i64, max: i64, default: i64| {
+        (span * FRESH_SHARE_NUMERATOR / FRESH_SHARE_DENOMINATOR)
+            .min(max)
+            .max(default)
+            .min(span)
+    };
+    let width = share(work.width, FRESH_MAX_WIDTH_POINTS, policy.default_width);
+    let height = share(work.height, FRESH_MAX_HEIGHT_POINTS, policy.default_height);
+    Rect {
+        x: work.x + (work.width - width) / 2,
+        y: work.y + (work.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// The frame each window is wearing because THIS client corrected it, by label.
 ///
 /// A correction is not an arrangement, and `window_persist` reads this so the
@@ -485,11 +668,10 @@ pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 ///
 /// One reader, so judging a rect the client is ABOUT to write and judging one a
 /// window already wears cannot drift apart.
-fn policy_and_displays(
-    app: &tauri::AppHandle,
-    window: &tauri::Window,
-    label: &str,
-) -> Option<(Policy, Displays)> {
+///
+/// The desk comes off the app rather than a window, because a restore has to
+/// resolve a frame before the window it is for exists.
+fn policy_and_displays(app: &tauri::AppHandle, label: &str) -> Option<(Policy, Displays)> {
     let Some(config) = policy_config(&app.config().app.windows, label).cloned() else {
         eprintln!("[Tauri] No window config to judge `{label}` against: skipping the clamp");
         return None;
@@ -503,11 +685,11 @@ fn policy_and_displays(
         config.width,
         config.height,
     );
-    let Ok(monitors) = window.available_monitors() else {
+    let Ok(monitors) = app.available_monitors() else {
         eprintln!("[Tauri] Could not enumerate monitors: skipping the restore clamp");
         return None;
     };
-    let primary = window
+    let primary = app
         .primary_monitor()
         .ok()
         .flatten()
@@ -553,6 +735,76 @@ fn log_correction(what: &str, before: Rect, after: Rect, displays: &Displays) {
     );
 }
 
+/// [`resolve`], saying so when the anchor moved the frame.
+///
+/// The line names the display, because a window coming back somewhere
+/// unexpected is otherwise a puzzle in arithmetic (ADR 0269).
+fn resolve_logged(remembered: &RememberedFrame, displays: &Displays, label: &str) -> Rect {
+    let resolved = resolve(remembered, displays);
+    if let (Some(anchor), true) = (&remembered.display, resolved != remembered.frame) {
+        let before = remembered.frame;
+        eprintln!(
+            "[Tauri] `{label}` was left on {}, which has moved since: its frame \
+             {}x{} at {},{} restores at {},{} (logical points)",
+            anchor.name, before.width, before.height, before.x, before.y, resolved.x, resolved.y
+        );
+    }
+    resolved
+}
+
+/// The frame to BUILD a window at, for a workspace the record remembers.
+///
+/// Resolved against the desk and not judged, because the window does not exist
+/// yet. [`clamp_restored_geometry`] judges it once the builder has placed it.
+/// An unreadable desk gives back the raw frame.
+pub(crate) fn frame_to_build(
+    app: &tauri::AppHandle,
+    label: &str,
+    remembered: &RememberedFrame,
+) -> Rect {
+    match policy_and_displays(app, label) {
+        Some((_, displays)) => resolve_logged(remembered, &displays, label),
+        None => remembered.frame,
+    }
+}
+
+/// The frame a new window cascades from, when `window` can be one.
+///
+/// `None` for a fullscreen window, whose frame is the whole screen and no
+/// ordinary window should copy, and for a frame that cannot be read.
+pub(crate) fn cascade_source(window: &tauri::Window) -> Option<Rect> {
+    if window.is_fullscreen().unwrap_or(false) {
+        return None;
+    }
+    live_frame(window)
+}
+
+/// The frame to BUILD a new window at: cascaded from `source` when there is
+/// one, else [`fresh`]. `None` only when the desk is unreadable, and the caller
+/// falls back to the declared default.
+pub(crate) fn new_window_frame(
+    app: &tauri::AppHandle,
+    label: &str,
+    source: Option<Rect>,
+) -> Option<Rect> {
+    let (policy, displays) = policy_and_displays(app, label)?;
+    Some(match source {
+        Some(frame) => cascade(frame, &displays, &policy),
+        None => fresh(&displays, &policy),
+    })
+}
+
+/// Where a live window's `frame` sits on the desk, for the session capture.
+///
+/// An unreadable desk answers "on screen, unanchored". The capture then records
+/// the frame unanchored rather than holding the old one on a guess.
+pub(crate) fn whereabouts_now(app: &tauri::AppHandle, label: &str, frame: Rect) -> Whereabouts {
+    match policy_and_displays(app, label) {
+        Some((policy, displays)) => whereabouts(frame, &displays, &policy),
+        None => Whereabouts::OnScreen(None),
+    }
+}
+
 /// The frame to actually place a window at, given the one a record names.
 ///
 /// The same judgement [`clamp_restored_geometry`] makes, taken BEFORE the frame
@@ -562,15 +814,18 @@ fn log_correction(what: &str, before: Rect, after: Rect, displays: &Displays) {
 /// step over: there the stale read was the window's birth size, here it would
 /// be the window-state plugin's.
 ///
-/// A healthy rect comes back unchanged, so the caller can place the result
-/// unconditionally.
-pub(crate) fn sanitized_frame(app: &tauri::AppHandle, label: &str, frame: Rect) -> Rect {
-    let Some(window) = app.get_window(label) else {
-        return frame;
+/// The frame is resolved against its display first (ADR 0269), and the clamp
+/// judges the result. A healthy rect comes back unchanged, so the caller can
+/// place the result unconditionally.
+pub(crate) fn sanitized_frame(
+    app: &tauri::AppHandle,
+    label: &str,
+    remembered: &RememberedFrame,
+) -> Rect {
+    let Some((policy, displays)) = policy_and_displays(app, label) else {
+        return remembered.frame;
     };
-    let Some((policy, displays)) = policy_and_displays(app, &window, label) else {
-        return frame;
-    };
+    let frame = resolve_logged(remembered, &displays, label);
     match sanitize(frame, &displays, &policy) {
         Some(fixed) => {
             log_correction(
@@ -659,7 +914,7 @@ fn clamp_geometry(
     if window.is_fullscreen().unwrap_or(false) {
         return;
     }
-    let Some((policy, displays)) = policy_and_displays(app, &window, label) else {
+    let Some((policy, displays)) = policy_and_displays(app, label) else {
         return;
     };
 
@@ -715,8 +970,8 @@ pub(crate) fn live_frame(window: &tauri::Window) -> Option<Rect> {
     Some(Rect::from_physical(position, size, scale))
 }
 
-/// A monitor as the clamp sees it: its usable frame and its whole screen. Both
-/// are needed, for the reason [`Panel`] gives.
+/// A monitor as the clamp sees it: its name, its usable frame and its whole
+/// screen. Both rects are needed, for the reason [`Panel`] gives.
 ///
 /// Converted through THIS monitor's own scale factor, which is the one tao
 /// multiplied its rects by. A neighbour's factor would put the display
@@ -726,6 +981,7 @@ fn panel_points(monitor: &tauri::Monitor) -> Panel {
     let scale = monitor.scale_factor();
     let area = monitor.work_area();
     Panel {
+        name: monitor.name().cloned(),
         work_area: Rect::from_physical(area.position, area.size, scale),
         frame: Rect::from_physical(*monitor.position(), *monitor.size(), scale),
     }
@@ -776,6 +1032,7 @@ mod tests {
     /// hidden, or on an edge this fixture does not model.
     fn panel_under_a_menu_bar(x: i64, y: i64, width: i64, height: i64, menu_bar: i64) -> Panel {
         Panel {
+            name: None,
             work_area: Rect {
                 x,
                 y: y + menu_bar,
@@ -799,6 +1056,7 @@ mod tests {
     /// One monitor whose whole screen is its work area.
     fn plain_panel(rect: Rect) -> Panel {
         Panel {
+            name: None,
             work_area: rect,
             frame: rect,
         }
@@ -809,7 +1067,7 @@ mod tests {
     /// reported on.
     fn one_panel() -> Displays {
         let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
-        desk(vec![panel], panel.work_area)
+        desk(vec![panel.clone()], panel.work_area)
     }
 
     /// The panel above with the Dock showing along its bottom edge. It takes 80
@@ -817,7 +1075,7 @@ mod tests {
     fn one_panel_with_a_dock() -> Displays {
         let mut panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
         panel.work_area.height -= 80;
-        desk(vec![panel], panel.work_area)
+        desk(vec![panel.clone()], panel.work_area)
     }
 
     /// The panel above plus an external display to its right, for the
@@ -830,7 +1088,7 @@ mod tests {
             width: 2560,
             height: 1440,
         };
-        desk(vec![panel, plain_panel(external)], panel.work_area)
+        desk(vec![panel.clone(), plain_panel(external)], panel.work_area)
     }
 
     /// A 1x laptop panel with a 1x external display beside it: one desk, ONE
@@ -848,14 +1106,17 @@ mod tests {
             width: 2560,
             height: 1440,
         };
-        desk(vec![laptop, plain_panel(external)], laptop.work_area)
+        desk(
+            vec![laptop.clone(), plain_panel(external)],
+            laptop.work_area,
+        )
     }
 
     /// The desk above after the external display is unplugged. Derived from it,
     /// so the two cannot drift into describing different laptops.
     fn the_laptop_alone() -> Displays {
-        let laptop = two_one_x_panels().panels[0];
-        desk(vec![laptop], laptop.work_area)
+        let laptop = two_one_x_panels().panels[0].clone();
+        desk(vec![laptop.clone()], laptop.work_area)
     }
 
     /// The desk the placement bug was reported on: a 1x 5120x1440 ultrawide as
@@ -1077,8 +1338,8 @@ mod tests {
             width: 0,
             height: 0,
         });
-        let displays =
-            Displays::new(vec![nothing, real], real.work_area).expect("the real panel remains");
+        let displays = Displays::new(vec![nothing, real.clone()], real.work_area)
+            .expect("the real panel remains");
         assert_eq!(displays.panels, vec![real]);
     }
 
@@ -1107,8 +1368,9 @@ mod tests {
             width: 2560,
             height: 1440,
         });
-        let displays = Displays::new(vec![laptop, external], laptop.work_area).expect("a desk");
-        assert_eq!(displays.panels, vec![laptop, external]);
+        let displays = Displays::new(vec![laptop.clone(), external.clone()], laptop.work_area)
+            .expect("a desk");
+        assert_eq!(displays.panels, vec![laptop.clone(), external]);
         assert_eq!(displays.primary, laptop.work_area);
     }
 
@@ -1134,7 +1396,7 @@ mod tests {
     #[test]
     fn the_window_the_client_moved_needed_no_correction_at_all() {
         let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 33);
-        let displays = desk(vec![panel], panel.work_area);
+        let displays = desk(vec![panel.clone()], panel.work_area);
         let reported = Rect {
             x: 0,
             y: 33,
@@ -1486,8 +1748,8 @@ mod tests {
             fit_to_displays(sized_on_the_ultrawide, &mixed_dpi_desk(), &policy()),
             None
         );
-        let panel = mixed_dpi_desk().panels[1];
-        let retina_alone = desk(vec![panel], panel.work_area);
+        let panel = mixed_dpi_desk().panels[1].clone();
+        let retina_alone = desk(vec![panel.clone()], panel.work_area);
         let fixed = fit_to_displays(sized_on_the_ultrawide, &retina_alone, &policy())
             .expect("must be corrected");
         assert_eq!((fixed.width, fixed.height), (1728, 1117));
@@ -1639,5 +1901,302 @@ mod tests {
         // corrected into another degenerate one.
         assert!(number("width") >= number("minWidth"));
         assert!(number("height") >= number("minHeight"));
+    }
+
+    // ── A remembered frame is anchored to its display (ADR 0269) ─────────────
+
+    const EXTERNAL: &str = "Monitor #41003";
+    const BUILT_IN: &str = "Monitor #41216";
+
+    fn named(name: &str, panel: Panel) -> Panel {
+        Panel {
+            name: Some(name.to_string()),
+            ..panel
+        }
+    }
+
+    /// The reported desk, docked: a 1x ultrawide as primary, and the 2x
+    /// built-in below it and to the right.
+    fn docked_desk() -> Displays {
+        let external = named(EXTERNAL, panel_under_a_menu_bar(0, 0, 5120, 1440, 30));
+        let built_in = named(BUILT_IN, panel_under_a_menu_bar(1763, 1440, 1728, 1117, 32));
+        let primary = external.work_area;
+        desk(vec![external, built_in], primary)
+    }
+
+    /// The same laptop undocked. The built-in is now the primary, at 0,0, so
+    /// every coordinate on it has moved by (1763, 1440).
+    fn undocked_desk() -> Displays {
+        let built_in = named(BUILT_IN, panel_under_a_menu_bar(0, 0, 1728, 1117, 32));
+        let primary = built_in.work_area;
+        desk(vec![built_in], primary)
+    }
+
+    /// What the capture records for a window wearing `frame` on `displays`.
+    fn captured(frame: Rect, displays: &Displays) -> RememberedFrame {
+        match whereabouts(frame, displays, &policy()) {
+            Whereabouts::OnScreen(anchor) => RememberedFrame::new(frame, anchor),
+            Whereabouts::Orphaned => panic!("{frame:?} is on screen in this fixture"),
+        }
+    }
+
+    fn at(x: i64, y: i64, width: i64, height: i64) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    // The reported defect. A window left under the built-in's menu bar while
+    // undocked was replayed raw after docking, which is the external display.
+    #[test]
+    fn a_frame_left_on_the_built_in_undocked_comes_back_on_it_docked() {
+        let remembered = captured(at(0, 33, 1280, 1084), &undocked_desk());
+        assert_eq!(
+            resolve(&remembered, &docked_desk()),
+            at(1763, 1473, 1280, 1084)
+        );
+    }
+
+    #[test]
+    fn a_frame_left_on_the_built_in_docked_comes_back_on_it_undocked() {
+        let remembered = captured(at(1763, 1473, 1728, 1084), &docked_desk());
+        assert_eq!(
+            resolve(&remembered, &undocked_desk()),
+            at(0, 33, 1728, 1084)
+        );
+    }
+
+    // Nothing moved, so nothing shifts. The ordinary relaunch.
+    #[test]
+    fn a_frame_on_a_display_that_has_not_moved_comes_back_unchanged() {
+        let frame = at(643, 132, 1728, 1084);
+        assert_eq!(
+            resolve(&captured(frame, &docked_desk()), &docked_desk()),
+            frame
+        );
+    }
+
+    // The external is away. The raw frame goes to the clamp, as it always did,
+    // and the clamp is what rescues it onto the built-in.
+    #[test]
+    fn a_frame_whose_display_is_away_comes_back_raw() {
+        let frame = at(643, 132, 1728, 1084);
+        let remembered = captured(frame, &docked_desk());
+        assert_eq!(resolve(&remembered, &undocked_desk()), frame);
+    }
+
+    // Two identical monitors at one resolution. Guessing could land the window
+    // on the wrong one, so neither is chosen.
+    #[test]
+    fn an_anchor_two_displays_match_comes_back_raw() {
+        let left = named(EXTERNAL, plain_panel(at(0, 0, 2560, 1440)));
+        let right = named(EXTERNAL, plain_panel(at(2560, 0, 2560, 1440)));
+        let primary = left.work_area;
+        let twins = desk(vec![left, right], primary);
+        let frame = at(100, 100, 1200, 800);
+        let remembered = RememberedFrame::new(
+            frame,
+            Some(DisplayAnchor {
+                name: EXTERNAL.to_string(),
+                screen: at(500, 0, 2560, 1440),
+            }),
+        );
+        assert_eq!(resolve(&remembered, &twins), frame);
+    }
+
+    // The same model at a different resolution is a different display as far
+    // as a frame is concerned.
+    #[test]
+    fn an_anchor_whose_display_changed_size_comes_back_raw() {
+        let frame = at(1763, 1473, 1280, 1084);
+        let remembered = RememberedFrame::new(
+            frame,
+            Some(DisplayAnchor {
+                name: BUILT_IN.to_string(),
+                screen: at(1763, 1440, 1512, 982),
+            }),
+        );
+        assert_eq!(resolve(&remembered, &undocked_desk()), frame);
+    }
+
+    #[test]
+    fn an_unanchored_frame_comes_back_exactly_as_recorded() {
+        let frame = at(0, 356, 1280, 1084);
+        let remembered = RememberedFrame::unanchored(frame);
+        assert_eq!(resolve(&remembered, &docked_desk()), frame);
+        assert_eq!(resolve(&remembered, &undocked_desk()), frame);
+    }
+
+    // The frame the reported launch restored, as the unplug left it: an
+    // external window at 643,132, read against the built-in alone.
+    #[test]
+    fn a_frame_above_every_screen_is_orphaned() {
+        let frame = at(643, -191, 1728, 1084);
+        assert_eq!(
+            whereabouts(frame, &undocked_desk(), &policy()),
+            Whereabouts::Orphaned
+        );
+        assert_eq!(
+            whereabouts(frame, &docked_desk(), &policy()),
+            Whereabouts::Orphaned
+        );
+    }
+
+    // ADR 0173 and ADR 0204 refused to move a window parked on an edge. A
+    // sliver of title bar on screen is enough to be the user's arrangement.
+    #[test]
+    fn a_window_parked_almost_off_an_edge_is_still_on_screen() {
+        let frame = at(5100, 400, 1200, 800);
+        assert_eq!(
+            whereabouts(frame, &docked_desk(), &policy()),
+            Whereabouts::OnScreen(Some(DisplayAnchor {
+                name: EXTERNAL.to_string(),
+                screen: at(0, 0, 5120, 1440),
+            }))
+        );
+    }
+
+    // A window straddling both displays belongs to the one holding more of it.
+    #[test]
+    fn a_straddling_window_is_anchored_to_the_display_holding_most_of_it() {
+        let frame = at(2000, 1300, 1200, 800);
+        assert_eq!(
+            whereabouts(frame, &docked_desk(), &policy()),
+            Whereabouts::OnScreen(Some(DisplayAnchor {
+                name: BUILT_IN.to_string(),
+                screen: at(1763, 1440, 1728, 1117),
+            }))
+        );
+    }
+
+    // A monitor tao could not name gives nothing to match on later, so the
+    // frame is recorded as an older build would record it.
+    #[test]
+    fn a_frame_on_an_unnamed_display_is_on_screen_and_unanchored() {
+        assert_eq!(
+            whereabouts(at(100, 100, 1200, 800), &one_panel(), &policy()),
+            Whereabouts::OnScreen(None)
+        );
+    }
+
+    // The record keeps the four keys an older build reads, and the anchor is
+    // one key beside them. A rollback must read every frame this build writes.
+    #[test]
+    fn an_anchored_frame_is_readable_by_an_older_build() {
+        let remembered = captured(at(1763, 1473, 1728, 1084), &docked_desk());
+        let json = serde_json::to_string(&remembered).expect("serialize");
+        let as_older_build: Rect = serde_json::from_str(&json).expect("an older build reads it");
+        assert_eq!(as_older_build, at(1763, 1473, 1728, 1084));
+        let back: RememberedFrame = serde_json::from_str(&json).expect("this build reads it");
+        assert_eq!(back, remembered);
+    }
+
+    // An unanchored frame writes exactly the shape an older build wrote, so a
+    // record no display could be read for is byte-for-byte the old one.
+    #[test]
+    fn an_unanchored_frame_writes_the_old_shape() {
+        let json = serde_json::to_value(RememberedFrame::unanchored(at(1, 2, 1200, 800)))
+            .expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({"x": 1, "y": 2, "width": 1200, "height": 800})
+        );
+    }
+
+    // ── Where a new window goes ──────────────────────────────────────────────
+
+    // The macOS cascade: the source's size, one title bar down and to the
+    // right.
+    #[test]
+    fn a_new_window_cascades_from_its_source_at_the_same_size() {
+        assert_eq!(
+            cascade(at(100, 137, 1400, 900), &one_panel(), &policy()),
+            at(128, 165, 1400, 900)
+        );
+    }
+
+    // A step past the bottom edge shrinks the window to fit rather than
+    // letting it hang off the screen.
+    #[test]
+    fn a_cascade_off_the_bottom_shrinks_to_fit() {
+        let work = one_panel().primary;
+        let source = at(200, work.bottom() - 900, 1400, 900);
+        assert_eq!(
+            cascade(source, &one_panel(), &policy()),
+            at(228, 245, 1400, 872)
+        );
+    }
+
+    // A window filling the work area, or tiled to its left half, still gets a
+    // visible step. Wrapping to the top-left would land exactly on top of it.
+    #[test]
+    fn a_cascade_from_a_window_filling_the_work_area_steps_and_shrinks() {
+        let work = one_panel().primary;
+        assert_eq!(
+            cascade(work, &one_panel(), &policy()),
+            at(28, 65, 1700, 1052)
+        );
+        let left_half = Rect {
+            width: work.width / 2,
+            ..work
+        };
+        assert_eq!(
+            cascade(left_half, &one_panel(), &policy()),
+            at(28, 65, 864, 1052)
+        );
+    }
+
+    // Shrinking stops at the declared minimum. Past it, the cascade wraps to
+    // the top-left corner, so repeated New Window never walks off the screen.
+    #[test]
+    fn a_cascade_that_cannot_fit_at_the_minimum_wraps_to_the_top_left() {
+        let work = one_panel().primary;
+        let source = at(work.right() - 480, work.bottom() - 400, 480, 400);
+        assert_eq!(
+            cascade(source, &one_panel(), &policy()),
+            at(work.x, work.y, 480, 400)
+        );
+    }
+
+    #[test]
+    fn a_cascade_stays_on_the_display_of_its_source() {
+        let source = at(1800, 100, 1600, 1000);
+        assert_eq!(
+            cascade(source, &two_panels(), &policy()),
+            at(1828, 128, 1600, 1000)
+        );
+    }
+
+    // The reported window: 1024x768 on the Retina panel at 125% UI scale left
+    // the page about 820 points wide for three panes. The fresh window takes
+    // most of the work area instead.
+    #[test]
+    fn a_fresh_window_takes_most_of_the_work_area_centred() {
+        let work = one_panel().primary;
+        let fresh = fresh(&one_panel(), &policy());
+        assert_eq!((fresh.width, fresh.height), (1382, 864));
+        assert_eq!(fresh.x, work.x + (work.width - fresh.width) / 2);
+        assert_eq!(fresh.y, work.y + (work.height - fresh.height) / 2);
+    }
+
+    #[test]
+    fn a_fresh_window_on_a_large_display_is_capped() {
+        let big = plain_panel(at(0, 0, 3008, 1692));
+        let fresh = fresh(&desk(vec![big.clone()], big.work_area), &policy());
+        assert_eq!(
+            (fresh.width, fresh.height),
+            (FRESH_MAX_WIDTH_POINTS, FRESH_MAX_HEIGHT_POINTS)
+        );
+    }
+
+    // Never below the declared default, unless the screen itself is smaller.
+    #[test]
+    fn a_fresh_window_is_at_least_the_declared_default_that_fits() {
+        let small = plain_panel(at(0, 0, 1152, 720));
+        let fresh = fresh(&desk(vec![small.clone()], small.work_area), &policy());
+        assert_eq!((fresh.width, fresh.height), (1024, 720));
     }
 }

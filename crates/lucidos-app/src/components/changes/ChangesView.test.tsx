@@ -76,9 +76,9 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
 });
 
 describe('changeRowActions: never a disabled change action', () => {
-  it('offers the standing apply, and only that, while the thread is working', () => {
+  it('offers the standing apply, and only that, while the thread is settling', () => {
     const actions = changeRowActions(
-      makeChange({ thread_unsettled: true, thread_working: true }),
+      makeChange({ thread_unsettled: true, thread_settling: true }),
       false,
     );
     expect(actions.map((a) => a.kind)).toEqual(['standing']);
@@ -87,23 +87,23 @@ describe('changeRowActions: never a disabled change action', () => {
 
   it('flips the standing face to a cancel once armed', () => {
     const [action] = changeRowActions(
-      makeChange({ thread_unsettled: true, thread_working: true }),
+      makeChange({ thread_unsettled: true, thread_settling: true }),
       true,
     );
     expect(action).toMatchObject({ kind: 'standing', label: '✓ Applying as it settles' });
   });
 
-  // A parked thread never settles by itself, so an arm on it drops the moment
+  // A question card never settles by itself, so an arm on it drops the moment
   // it is pressed. Offering one is the same broken control in a new coat.
-  it('offers nothing on a change whose thread is parked rather than working', () => {
-    const parked = makeChange({ thread_unsettled: true, thread_working: false });
+  it('offers nothing on a change whose thread is parked on a question', () => {
+    const parked = makeChange({ thread_unsettled: true, thread_settling: false });
     expect(changeRowActions(parked, false)).toEqual([]);
   });
 
   // The thread is working only to finish an apply that hit a conflict, and the
   // resolver lands the change itself. That apply is already in flight.
   it('offers nothing on a change whose apply is resolving merge conflicts', () => {
-    const resolving = makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true });
+    const resolving = makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true });
     expect(changeRowActions(resolving, false)).toEqual([]);
   });
 

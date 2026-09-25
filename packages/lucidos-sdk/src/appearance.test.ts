@@ -10,14 +10,21 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   DEFAULT_FONT_FAMILY,
+  DEFAULT_MOTION,
   DEFAULT_THEME,
   FONT_FAMILY_VALUES,
   FONT_FEATURES_DEFAULT,
+  MOTION_PREFS,
+  REDUCED_MOTION_DURATION_SCALE,
   THEME_BG,
   UI_SCALE_DEFAULT,
   clampUiScale,
+  durationScaleFor,
   fontFeaturesFor,
+  parseAnimationSpeed,
+  parseMotion,
   parseUiScale,
+  resolveReducedMotion,
   resolveFontKey,
   resolveTheme,
   resolveThemePreference,
@@ -182,5 +189,58 @@ describe('ui scale', () => {
       expect(parseUiScale(raw)).toBeNull();
     }
     expect(UI_SCALE_DEFAULT).toBe(100);
+  });
+});
+
+describe('reduced motion', () => {
+  it('follows the OS only under `system`', () => {
+    // The whole contract: 3 values x OS on/off.
+    expect(resolveReducedMotion('system', true)).toBe(true);
+    expect(resolveReducedMotion('system', false)).toBe(false);
+    expect(resolveReducedMotion('reduce', true)).toBe(true);
+    expect(resolveReducedMotion('reduce', false)).toBe(true);
+    expect(resolveReducedMotion('full', true)).toBe(false);
+    expect(resolveReducedMotion('full', false)).toBe(false);
+  });
+
+  it('reads anything unknown as the default, which follows the OS', () => {
+    expect(DEFAULT_MOTION).toBe('system');
+    expect(MOTION_PREFS).toEqual(['system', 'reduce', 'full']);
+    expect(parseMotion('reduce')).toBe('reduce');
+    expect(parseMotion(null)).toBe('system');
+    expect(parseMotion('')).toBe('system');
+    expect(parseMotion('toString')).toBe('system');
+    expect(parseMotion('REDUCE')).toBe('system');
+  });
+});
+
+describe('the animation duration scale', () => {
+  it('is 1 at the slider centre and the reciprocal of the speed elsewhere', () => {
+    expect(durationScaleFor(0, false)).toBe(1);
+    expect(durationScaleFor(10, false)).toBeCloseTo(0.1, 10);
+    expect(durationScaleFor(-10, false)).toBeCloseTo(10, 10);
+  });
+
+  it('collapses under reduced motion whatever the slider says', () => {
+    for (const pos of [-10, 0, 10]) {
+      expect(durationScaleFor(pos, true)).toBe(REDUCED_MOTION_DURATION_SCALE);
+    }
+  });
+
+  it('stays above zero, so a transition still ends and still fires its end event', () => {
+    // A 0s transition never starts, so it fires no `transitionend`. Code
+    // that waits on one would then hang on its fallback timer.
+    expect(REDUCED_MOTION_DURATION_SCALE).toBeGreaterThan(0);
+    // And short enough that the slowest token (0.5s) ends inside one frame.
+    expect(500 * REDUCED_MOTION_DURATION_SCALE).toBeLessThan(16);
+  });
+
+  it('parses a stored slider position, clamping and defaulting', () => {
+    expect(parseAnimationSpeed('3')).toBe(3);
+    expect(parseAnimationSpeed('-4')).toBe(-4);
+    expect(parseAnimationSpeed('99')).toBe(10);
+    expect(parseAnimationSpeed('-99')).toBe(-10);
+    expect(parseAnimationSpeed(null)).toBe(0);
+    expect(parseAnimationSpeed('junk')).toBe(0);
   });
 });

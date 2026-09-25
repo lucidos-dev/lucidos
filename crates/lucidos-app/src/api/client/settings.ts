@@ -1,4 +1,5 @@
 import { API, ApiError, json, text } from './_core';
+import type { FormRequestEvent } from '../../store/thread-events/thread-event-types';
 import { lucidos } from '@lucidos/sdk';
 import type {
   AuthType,
@@ -43,11 +44,35 @@ export function createCredential(body: {
   auth_value: string;
   /** Override the default `CRED_<NAME>` env var name. */
   env_var_name?: string;
+  /** The credential *form request* this save answers. */
+  form_request_id?: string;
 }): Promise<ApiResult> {
   return json(`${API}/credentials`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+// --- Form requests (engine::form_requests) ---
+
+/** One open *form request*, as `GET /api/v1/form-requests/pending` serves it.
+ *  `event` is the request exactly as the stream frame carried it. */
+export interface PendingFormRequest {
+  thread_id: string;
+  request_id: string;
+  event: FormRequestEvent;
+}
+
+export function listPendingFormRequests(): Promise<PendingFormRequest[]> {
+  return json(`${API}/form-requests/pending`);
+}
+
+/** The Cancel of a credential or email form. `resolved: false` means another
+ *  device answered it first, which closes it just the same. */
+export function cancelFormRequest(requestId: string): Promise<{ resolved: boolean }> {
+  return json(`${API}/form-requests/${encodeURIComponent(requestId)}/cancel`, {
+    method: 'POST',
   });
 }
 
@@ -130,6 +155,8 @@ export interface UpdateCredentialBody {
   email?: EmailAccountSettings;
   /** Override the default `CRED_<NAME>` env var name. */
   env_var_name?: string;
+  /** The credential *form request* this save answers (a widening or a repair). */
+  form_request_id?: string;
 }
 
 // The three verbs that act on an EXISTING credential take its `id`, not its
@@ -182,21 +209,34 @@ export async function getCredentialValue(
   }
 }
 
+/** The reads a credential form waits on before it can render: the reveal and
+ *  the email settings. Longer than the default. On a machine under heavy
+ *  memory pressure these sequential reads run past it, and the form a request
+ *  opened then showed only an error. */
+const CREDENTIAL_FORM_READ_TIMEOUT_MS = 30_000;
+
 /** One mint-then-spend round trip. */
 async function revealCredentialOnce(
   id: string
 ): Promise<{ auth_type: string; auth_value: string }> {
   const { token } = await json<{ token: string; expires_in_secs: number }>(
     `${API}/credential-reveal-token?id=${encodeURIComponent(id)}`,
-    { method: 'POST' }
+    { method: 'POST' },
+    CREDENTIAL_FORM_READ_TIMEOUT_MS,
   );
   return json(
-    `${API}/credential-value?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`
+    `${API}/credential-value?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`,
+    undefined,
+    CREDENTIAL_FORM_READ_TIMEOUT_MS,
   );
 }
 
 export function getEmailAccount(name: string): Promise<EmailAccountInfo> {
-  return json(`${API}/email-account?name=${encodeURIComponent(name)}`);
+  return json(
+    `${API}/email-account?name=${encodeURIComponent(name)}`,
+    undefined,
+    CREDENTIAL_FORM_READ_TIMEOUT_MS,
+  );
 }
 
 // --- OAuth Accounts ---
@@ -415,6 +455,8 @@ export function sendEmailConfirmed(draft: {
   reply_to_message_id?: string;
   account: string;
   attachments?: string[];
+  /** The confirm *form request* this send answers. */
+  form_request_id?: string;
 }): Promise<ApiResult> {
   return json(`${API}/email/send`, {
     method: 'POST',

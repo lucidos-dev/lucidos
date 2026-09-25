@@ -77,6 +77,7 @@ impl LucidosEngine {
                     prompt,
                     None,
                     origin_id,
+                    &[],
                     None,
                     &cancel_token,
                     None,
@@ -107,20 +108,24 @@ impl LucidosEngine {
             };
 
             // Idempotency: if another device clicked Apply while CC was
-            // running /harden, the change row is already `"applied"` and the
+            // running /harden, the change row is already applied and the
             // marker has been consumed by the apply. Both arms of the match
             // below would otherwise emit a spurious `ChangeApplyFailed` ~15s
             // after the user saw `ChangeApplied` (Ok arm via the false
             // `branch_is_hardened` post-check; Err arm via the
             // "Hardening failed" fallthrough).
-            let concurrent_status = engine
-                .changes()
-                .get_by_id(change_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|c| c.status);
-            if change_applied_concurrently(concurrent_status.as_deref()) {
+            let concurrent_status = match engine.changes().get_by_id(change_id).await {
+                Ok(change) => change.map(|c| c.status()),
+                Err(e) => {
+                    log!(
+                        "[ClaudeCode] Concurrent-apply check: get_by_id({}): {}. Treating as not applied",
+                        change_id,
+                        e
+                    );
+                    None
+                }
+            };
+            if change_applied_concurrently(concurrent_status) {
                 log!(
                     "[ClaudeCode] Hardening session for change {} found change already applied (concurrent apply) — skipping post-CC failure emit",
                     change_id
@@ -246,22 +251,29 @@ impl LucidosEngine {
         // guard across it freezes every coding-agent session in the workspace
         // on one Discard click. `control.rs` drops the guard before the same
         // call.
-        let live = {
-            let guard = self.agent_sessions.lock().await;
-            guard.get(&thread_id).map(|s| s.worktree_path.clone())
+        let target = {
+            let mut guard = self.agent_sessions.lock().await;
+            super::claim_for_discard(&mut guard, thread_id)?
         };
 
-        let Some(worktree_path) = live else {
+        let super::DiscardTarget::Claimed { worktree, claimant } = target else {
             // No live session, so fall back to stale session handling.
             // discard=true because this is the user-clicked Discard
             // button: explicit user intent.
             return self.end_stale_waiting_session(thread_id, true, actor).await;
         };
-        let wt = worktree_path.ok_or("No worktree for this session")?;
+
+        let claim = crate::engine::agent_session::ChangeClaimGuard::new(
+            self.agent_sessions.clone(),
+            thread_id,
+            claimant,
+        );
 
         self.discard_pending_for_thread(thread_id, actor).await;
 
-        self.reset_worktree_and_idle(thread_id, &wt).await;
+        self.reset_worktree_and_idle(thread_id, &worktree).await;
+
+        claim.release().await;
 
         self.broadcast_changes_updated().await;
 
@@ -389,6 +401,7 @@ impl LucidosEngine {
                     origin,
                     None,
                     crate::engine::FollowUpUrgency::Normal,
+                    None,
                 )
                 .await;
 
@@ -519,32 +532,5 @@ mod tests {
             }
         }
         None
-    }
-
-    /// The guard yields the `Option<Option<PathBuf>>` that tells a missing
-    /// session from a session with no worktree.
-    ///
-    /// Flattening the two is the tempting simplification. It would send a live
-    /// session that has no worktree down the stale-session teardown, which
-    /// discards a change rather than reporting the error.
-    #[test]
-    fn discard_keeps_a_missing_session_distinct_from_a_missing_worktree() {
-        let src = production_src();
-        let at = src
-            .find("pub async fn discard_cc_changes")
-            .expect("discard_cc_changes is still here");
-        let body = &src[at..];
-        let end = body.find("\n    /// ").unwrap_or(body.len());
-        let body = &body[..end];
-        assert!(
-            body.contains(".map(|s| s.worktree_path.clone())"),
-            "the read-out must keep the inner Option, so a live session with no \
-             worktree stays distinguishable from no session at all"
-        );
-        assert!(
-            body.contains(r#".ok_or("No worktree for this session")"#),
-            "a live session with no worktree must still report that error, not \
-             fall through to the stale-session teardown"
-        );
     }
 }

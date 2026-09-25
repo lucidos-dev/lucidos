@@ -54,6 +54,12 @@ describe('bindingFor', () => {
     expect(bindingFor('historyBack')).toEqual({ mod: true, shift: false, alt: true, key: 'j' });
   });
 
+  it('keeps a turn-stepping binding saved before the notification rename', () => {
+    setPrefs({ prevThreadTurn: 'mod+alt+u', nextThreadTurn: 'mod+alt+d' });
+    expect(bindingFor('prevTurnOrNotification')).toEqual({ mod: true, shift: false, alt: true, key: 'u' });
+    expect(bindingFor('nextTurnOrNotification')).toEqual({ mod: true, shift: false, alt: true, key: 'd' });
+  });
+
   it('prefers the current id over the legacy key when both are present', () => {
     setPrefs({ historyBack: 'mod+alt+k', previousThread: 'mod+alt+j' });
     expect(bindingFor('historyBack')).toEqual({ mod: true, shift: false, alt: true, key: 'k' });

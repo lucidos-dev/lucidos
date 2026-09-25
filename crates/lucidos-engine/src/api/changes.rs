@@ -1,6 +1,7 @@
 use super::actor::require_user_actor;
 use super::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use super::*;
+use crate::core::changes::{ChangeStatus, PendingScope};
 use crate::engine::apply_all_driver::ApplyAllOutcome;
 use crate::engine::standing_apply::{DisarmScope, StandingApply, DISARMED_BY_OWNER};
 use crate::engine::{ApplyResult, ApplyStatus};
@@ -69,8 +70,14 @@ pub(super) async fn list_changes(
     // cross-reload truth for the "Applying changes…" toast — the driving
     // `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
     // events aren't replayed. Joined with the other reads — independent query.
-    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r, working_r) = tokio::join!(
-        proj.list_pending(),
+    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r, settling_r) = tokio::join!(
+        crate::core::changes::list_pending_for_readers(
+            pool,
+            proj,
+            query
+                .sub_threads_of
+                .map_or(PendingScope::All, PendingScope::SubThreadsOf),
+        ),
         proj.list_recently_applied(limit + 1, before_ts),
         proj.client_update_since(state.started_at),
         proj.restart_groups_since(state.started_at),
@@ -78,32 +85,23 @@ pub(super) async fn list_changes(
             .fetch_one(pool),
         crate::engine::standing_apply::count_sweep_candidates(pool),
     );
-    let mut pending = pending_r.map_err(ApiError::db)?;
+    let pending = pending_r.map_err(ApiError::db)?;
     let mut applied = applied_r.map_err(ApiError::db)?;
     let client_update = client_update_r.map_err(ApiError::db)?;
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
     let apply_all_in_progress = apply_all_r.map_err(ApiError::db)?;
-    let working_thread_count = working_r.map_err(ApiError::db)?;
+    let settling_thread_count = settling_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
         applied.truncate(limit as usize);
     }
 
-    let (r1, r2, r3) = tokio::join!(
-        crate::core::changes::enrich_thread_titles(pool, &mut pending),
+    let (r1, r2) = tokio::join!(
         crate::core::changes::enrich_thread_titles(pool, &mut applied),
         crate::core::changes::enrich_restart_group_titles(pool, &mut restart_groups),
     );
     r1.map_err(ApiError::db)?;
     r2.map_err(ApiError::db)?;
-    r3.map_err(ApiError::db)?;
-
-    // Flag pending changes whose thread has not settled, mid-turn or parked, so
-    // the UI disables Apply and the bulk paths drop them. Same gate the
-    // per-change endpoint enforces server-side via guard_change_action.
-    crate::core::changes::enrich_pending_state(pool, &mut pending)
-        .await
-        .map_err(ApiError::db)?;
 
     Ok(Json(serde_json::json!({
         "pending": pending,
@@ -118,10 +116,10 @@ pub(super) async fn list_changes(
         // sweep arms a thread that has proposed nothing yet, and the prompt row
         // still has to render its armed state.
         "standing_apply_thread_ids": state.engine.armed_standing_apply_threads(),
-        // Coding-agent threads still working, so a sweep has something to arm.
+        // Coding-agent threads still settling, so a sweep has something to arm.
         // The panel offers "Apply as they settle" off this, and cannot derive
         // it: its thread map holds only the loaded window.
-        "working_thread_count": working_thread_count,
+        "settling_thread_count": settling_thread_count,
     })))
 }
 
@@ -176,20 +174,20 @@ pub(super) async fn revert_change(
 /// [`change_action_refusal`], which owns the rule.
 ///
 /// The three thread-state variants stay apart because only ONE of them can be
-/// waited out with a *standing apply*. `standing_verdict` waits through
-/// `running` and `paused`, and drops on a parked thread at rest. Collapse the
-/// two and a surface points the caller at a control that ends the moment it is
+/// waited out with a *standing apply*. `standing_verdict` waits through a
+/// *settling* thread, and drops on a parked one. Collapse the two
+/// and a surface points the caller at a control that ends the moment it is
 /// pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeActionRefusal {
     /// A pending change whose branch left nothing to merge. Apply only.
     NoFilesLeft,
-    /// The thread is still *working*: running or paused. It will settle, and a
-    /// *standing apply* is what waits for that.
-    ThreadWorking,
-    /// The thread is *parked*: on a question or an event wait. It wakes on the
-    /// answer or the delivery and may commit again, so the change is not
-    /// final. A standing apply cannot wait this out.
+    /// The thread is *settling*: running, paused, or watching an event. It will
+    /// settle by itself, and a *standing apply* is what waits for that.
+    ThreadSettling,
+    /// The thread is *parked*: unsettled, and not settling. It is on a
+    /// question card, or its turn failed while it still watches an event.
+    /// Only the user moves it on, so a standing apply cannot wait it out.
     ThreadParked,
     /// The selector withholds the action for a reason no wait resolves.
     ActionUnavailable,
@@ -218,7 +216,7 @@ pub(crate) async fn change_action_refusal(
     change_id: Uuid,
     action: crate::engine::thread_lifecycle::Action,
 ) -> Result<Option<ChangeActionRefusal>, sqlx::Error> {
-    let row: Option<(Option<Uuid>, String, i32)> =
+    let row: Option<(Option<Uuid>, ChangeStatus, i32)> =
         sqlx::query_as("SELECT thread_id, status, file_count FROM changes WHERE id = $1")
             .bind(change_id)
             .fetch_optional(pool)
@@ -229,7 +227,7 @@ pub(crate) async fn change_action_refusal(
     // reason, and only for Apply: Discard is how the user resolves one. See
     // `core::changes::is_empty_pending_change`.
     if let Some((_, status, file_count)) = row.as_ref() {
-        if status == "pending"
+        if *status == ChangeStatus::Pending
             && *file_count == 0
             && action == crate::engine::thread_lifecycle::Action::Apply
         {
@@ -239,7 +237,7 @@ pub(crate) async fn change_action_refusal(
     let Some((Some(thread_id), status, _)) = row else {
         return Ok(None);
     };
-    if status != "pending" {
+    if status != ChangeStatus::Pending {
         return Ok(None);
     }
     let actions = crate::api::threads::available_thread_actions_for(pool, thread_id).await?;
@@ -248,13 +246,14 @@ pub(crate) async fn change_action_refusal(
     }
     // Two extra reads, on the refusal path only. They ask the two canonical
     // predicates rather than a third copy of their SQL, which is the drift this
-    // whole function exists to stop. `working` is asked first because a running
-    // thread is also unsettled, and working is the stronger, actionable answer.
-    if crate::engine::standing_apply::working_thread_ids(pool, std::iter::once(thread_id))
+    // whole function exists to stop. `settling` is asked first because a
+    // settling thread is often also unsettled, and settling is the stronger,
+    // actionable answer.
+    if crate::engine::standing_apply::settling_thread_ids(pool, std::iter::once(thread_id))
         .await?
         .contains(&thread_id)
     {
-        return Ok(Some(ChangeActionRefusal::ThreadWorking));
+        return Ok(Some(ChangeActionRefusal::ThreadSettling));
     }
     if crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
         .await?
@@ -374,7 +373,7 @@ pub(super) async fn arm_standing_apply(
     // arm to somebody else's change would apply work the owner never saw on
     // this thread's settle.
     if let Some(change_id) = body.change_id {
-        let row: Option<(Option<Uuid>, String)> =
+        let row: Option<(Option<Uuid>, ChangeStatus)> =
             sqlx::query_as("SELECT thread_id, status FROM changes WHERE id = $1")
                 .bind(change_id)
                 .fetch_optional(&state.pool)
@@ -387,7 +386,7 @@ pub(super) async fn arm_standing_apply(
                     "That change belongs to a different thread",
                 ))
             }
-            Some((_, status)) if status != "pending" => {
+            Some((_, status)) if status != ChangeStatus::Pending => {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "That change has already been applied or discarded",
@@ -428,10 +427,13 @@ pub(super) async fn disarm_standing_apply(
         ThreadReachVerb::Apply,
     )
     .await?;
+    // A 404 must mean "nothing was armed": the client reads it as already off.
+    // A failed delete leaves the arm live, so it answers 500 instead.
     let dropped = state
         .engine
         .drop_standing_apply(thread_id, DISARMED_BY_OWNER, actor)
-        .await;
+        .await
+        .map_err(ApiError::db)?;
     if !dropped {
         return Err(ApiError::not_found("No standing apply on that thread"));
     }
@@ -464,7 +466,8 @@ pub(super) async fn disarm_all_standing_applies(
     let disarmed = state
         .engine
         .drop_standing_applies(DisarmScope::All, DISARMED_BY_OWNER, actor)
-        .await;
+        .await
+        .map_err(ApiError::db)?;
     state.engine.broadcast_changes_updated().await;
     Ok(Json(serde_json::json!({ "disarmed": disarmed })))
 }
@@ -472,7 +475,7 @@ pub(super) async fn disarm_all_standing_applies(
 /// Query for `POST /api/v1/changes/apply-all`.
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ApplyAllQuery {
-    /// "Keep going as the rest settle": arm every thread still working, so its
+    /// "Keep going as the rest settle": arm every thread still settling, so its
     /// change applies when it lands.
     #[serde(default)]
     keep_going: bool,
@@ -495,7 +498,7 @@ pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) ->
 /// What "Apply as they settle" says once it has armed. Pure.
 pub(super) fn apply_as_they_settle_message(armed: usize) -> String {
     match armed {
-        0 => "Nothing is working right now, so there is nothing to apply as it settles.".into(),
+        0 => "No thread is still settling, so there is nothing to apply as it settles.".into(),
         1 => "Will apply 1 thread's change as it settles.".into(),
         n => format!("Will apply {n} threads' changes as they settle."),
     }
@@ -623,7 +626,8 @@ pub(super) async fn cancel_apply_all_changes(
     let disarmed = state
         .engine
         .drop_standing_applies(DisarmScope::Sweep, DISARMED_BY_OWNER, actor)
-        .await;
+        .await
+        .map_err(ApiError::db)?;
     if canceled == 0 && disarmed == 0 {
         return Err(ApiError::bad_request("No Apply All batch is running"));
     }
@@ -866,7 +870,7 @@ mod tests {
         pool: &sqlx::PgPool,
         change_id: Uuid,
         thread_id: Option<Uuid>,
-        status: &str,
+        status: ChangeStatus,
         file_count: i32,
     ) {
         sqlx::query(
@@ -886,25 +890,28 @@ mod tests {
         .expect("seed changes");
     }
 
-    /// Every unsettled thread is refused Apply, and the reason tells working
+    /// Every unsettled thread is refused Apply, and the reason tells settling
     /// from parked.
     ///
-    /// The split is the whole point. `standing_verdict` waits through
-    /// `running`. It drops on each parked state at rest. So one shared reason
-    /// would send the caller to a control that ends on its first look.
+    /// The split is the whole point. `standing_verdict` waits through a
+    /// running thread and an event wait. It drops on a question card. So one
+    /// shared reason would send the caller to a control that ends on its first
+    /// look.
     #[tokio::test]
-    async fn an_unsettled_thread_is_refused_and_working_is_told_from_parked() {
+    async fn an_unsettled_thread_is_refused_and_settling_is_told_from_parked() {
         use crate::engine::thread_lifecycle::Action;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
 
-        // Mid-turn, parked on an event wait (with and without a child), and
-        // parked on a question. All of them wake and may commit again.
+        // Mid-turn, watching an event (with and without a child), and parked
+        // on a question. All of them wake and may commit again.
         for (status, waits, children, expected) in [
-            ("running", 0, 0, ChangeActionRefusal::ThreadWorking),
-            ("idle", 1, 0, ChangeActionRefusal::ThreadParked),
-            ("idle", 1, 1, ChangeActionRefusal::ThreadParked),
+            ("running", 0, 0, ChangeActionRefusal::ThreadSettling),
+            ("idle", 1, 0, ChangeActionRefusal::ThreadSettling),
+            ("idle", 1, 1, ChangeActionRefusal::ThreadSettling),
+            // A failed turn keeps its waits, and nothing but the user moves it.
+            ("failed", 1, 0, ChangeActionRefusal::ThreadParked),
             (
                 "waiting_for_user_answer",
                 0,
@@ -915,7 +922,7 @@ mod tests {
             let thread_id = Uuid::new_v4();
             let change_id = Uuid::new_v4();
             seed_cc_thread(&pool, thread_id, status, waits, children).await;
-            seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+            seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
             let refusal = change_action_refusal(&pool, change_id, Action::Apply)
                 .await
@@ -931,11 +938,11 @@ mod tests {
     }
 
     /// The reported reason and `standing_verdict` agree about who can be waited
-    /// out. Only `ThreadWorking` may be answered with a standing apply.
+    /// out. Only `ThreadSettling` may be answered with a standing apply.
     #[test]
-    fn only_the_working_reason_is_one_a_standing_apply_waits_through() {
+    fn only_the_settling_reason_is_one_a_standing_apply_waits_through() {
         use crate::engine::standing_apply::{
-            standing_verdict, ArmedChange, SettleFacts, StandingVerdict,
+            standing_verdict, ArmedChange, SettleFacts, StandingVerdict, TurnSettle,
         };
 
         let facts = |status: &str, waits: bool| SettleFacts {
@@ -943,20 +950,21 @@ mod tests {
             live_event_waits: waits,
             has_diff: true,
             armed_change: ArmedChange::Ready(Uuid::new_v4()),
+            turn_settle: TurnSettle::Settled,
         };
         let waits_it_out = |f: SettleFacts| matches!(standing_verdict(&f), StandingVerdict::Wait);
-        // The state behind ThreadWorking. The arm keeps its place.
-        assert!(
-            waits_it_out(facts("running", false)),
-            "a running thread is what a standing apply waits through",
-        );
-        // The two behind ThreadParked. Each ends the arm on its first look.
-        for (status, waits) in [("idle", true), ("waiting_for_user_answer", false)] {
+        // The states behind ThreadSettling. The arm keeps its place.
+        for (status, waits) in [("running", false), ("paused", false), ("idle", true)] {
             assert!(
-                !waits_it_out(facts(status, waits)),
-                "a parked thread ({status}) drops the arm, so it must not read as working",
+                waits_it_out(facts(status, waits)),
+                "a settling thread ({status}, waits={waits}) is what a standing apply waits through",
             );
         }
+        // The state behind ThreadParked. It ends the arm on its first look.
+        assert!(
+            !waits_it_out(facts("waiting_for_user_answer", false)),
+            "a thread parked on a question drops the arm, so it must not read as settling",
+        );
     }
 
     /// The control: a settled coding-agent thread with a real diff applies.
@@ -975,7 +983,7 @@ mod tests {
             let thread_id = Uuid::new_v4();
             let change_id = Uuid::new_v4();
             seed_cc_thread(&pool, thread_id, "idle", 0, children).await;
-            seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+            seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
             for action in [Action::Apply, Action::Discard] {
                 assert_eq!(
@@ -1009,7 +1017,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed a chat thread");
-        seed_change(&pool, change_id, Some(thread_id), "pending", 3).await;
+        seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
         assert_eq!(
             change_action_refusal(&pool, change_id, Action::Apply)
@@ -1031,7 +1039,7 @@ mod tests {
         let thread_id = Uuid::new_v4();
         let change_id = Uuid::new_v4();
         seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
-        seed_change(&pool, change_id, Some(thread_id), "pending", 0).await;
+        seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 0).await;
 
         assert_eq!(
             change_action_refusal(&pool, change_id, Action::Apply)
@@ -1068,7 +1076,7 @@ mod tests {
         );
 
         let threadless = Uuid::new_v4();
-        seed_change(&pool, threadless, None, "pending", 2).await;
+        seed_change(&pool, threadless, None, ChangeStatus::Pending, 2).await;
         assert_eq!(
             change_action_refusal(&pool, threadless, Action::Apply)
                 .await
@@ -1081,7 +1089,7 @@ mod tests {
         let thread_id = Uuid::new_v4();
         let resolved = Uuid::new_v4();
         seed_cc_thread(&pool, thread_id, "running", 0, 0).await;
-        seed_change(&pool, resolved, Some(thread_id), "applied", 2).await;
+        seed_change(&pool, resolved, Some(thread_id), ChangeStatus::Applied, 2).await;
         assert_eq!(
             change_action_refusal(&pool, resolved, Action::Apply)
                 .await

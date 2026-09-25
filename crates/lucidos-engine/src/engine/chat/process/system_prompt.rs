@@ -19,7 +19,7 @@ const LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS I
      This engine is running from a Lucidos SOURCE CHECKOUT, so you can edit the \
      Lucidos platform's own code: call `run_coding_agent` with `folder` omitted \
      and the session runs against the source tree. A change to Rust or backend \
-     files needs the user to Apply and then trigger the rebuild and restart \
+     files needs the user to Apply and then tap Switch to new version \
      before it is live. You can also edit an installed app \
      (`folder=\"data/apps/<id>\"`) or a repository registered via \
      `manage_repositories`.";
@@ -547,7 +547,7 @@ REFRESHING OPEN WINDOWS:
 
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
-- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered.
+- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered. Saving one shows nothing either: draw it in your reply, or, when asking the user to choose, in an option's description. For a visual choice (colour, layout, type), render real pictures, never ASCII art. Give each option its own picture of only that option.
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception. A `#fragment` arrives as the app's `location.hash`, so name the ITEM when the app reads one: `[Some report](app:pr-understanding#pr-1645)`.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
 - Link a UI panel by its bare name: `[Notifications](notifications)`, `[Settings](settings)`, `[Plugins](plugins)`, or `[Plugins](app-store)` for its catalog. Call it the Plugins panel, never the retired "App Store" or "Store".
@@ -563,7 +563,7 @@ EVENTS (the `events` tool):
 - App UIs reach the platform through the Lucidos SDK (<script src="/api/v1/sdk.js">): lucidos.data.*, lucidos.events.*, lucidos.preferences.*, lucidos.ui.*, lucidos.sse.on, lucidos.proxy(name).fetch. Details: load_knowhow('system-knowhow/js-sdk').
 
 PARALLEL WORK (FAN-OUT):
-- run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
+- run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
 - The resume callback that reports a child's result back here only works for same-workspace children spawned with these tools.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
 - SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. Maximum __MAX_CHILDREN_PER_THREAD__ children per thread, maximum depth 3.
@@ -652,6 +652,45 @@ fn static_prompt_body(
     format!("{}{}", body, coding_surface_section(has_lucidos_source))
 }
 
+/// The preferences a chat turn will not proceed without, as
+/// `(key, instruction, per_device)`. Any missing key flips the turn into setup
+/// mode. Each instruction names a decline value, so a "no" is stored and never
+/// asked again.
+const MANDATORY_PREFS: &[(&str, &str, bool)] = &[
+    ("timezone", "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
+    ("language", "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English). They can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it.", false),
+    ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications: Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again.", true),
+    ("technical_literacy", "- TECHNICAL LITERACY: Ask \"How technical should I be with you?\" as a card with exactly these three options, label then description, word for word: \"Keep it plain\" / \"Everyday words, no jargon.\"; \"Technical\" / \"Technical terms are fine.\"; \"I write software\" / \"Talk to me like a developer.\". Store the pick with preferences(action=\"set\", key=\"technical_literacy\", value=…) as \"non-technical\", \"technical\" or \"developer\". If they decline, set value=\"not-set\" so you don't ask again. Word the rest of this reply at the level they picked.", false),
+];
+
+/// The device of the person who can answer setup questions this turn, if any.
+///
+/// Setup mode tells the model not to proceed until the user answers. A trigger
+/// fire, a sub-thread and a cross-workspace task have nobody to answer, and
+/// none of them carries a sending device. So only a turn a person sent from a
+/// device enters setup mode: a missing preference must never stop automation.
+fn setup_device(is_trigger: bool, device_id: Option<&str>) -> Option<&str> {
+    device_id.filter(|_| !is_trigger)
+}
+
+/// The prompt's setup-or-language block.
+fn setup_or_language_section(missing_instructions: &[&str], user_language: &str) -> String {
+    if missing_instructions.is_empty() {
+        return format!(
+            "USER LANGUAGE: {}\nAlways respond in {}.",
+            user_language, user_language
+        );
+    }
+    log!(
+        "[Chat] Setup required, missing preferences: {}",
+        missing_instructions.join(", ")
+    );
+    format!(
+        "SETUP REQUIRED, DO NOT PROCEED UNTIL COMPLETE:\nThe following settings are not configured. You MUST ask the user for these BEFORE doing anything else. Do NOT answer questions, create tasks, or perform any work until setup is complete.\n{}",
+        missing_instructions.join("\n")
+    )
+}
+
 impl LucidosEngine {
     /// Build the full chat system prompt for this turn, plus the mandatory
     /// missing-preference keys.
@@ -681,30 +720,20 @@ impl LucidosEngine {
         // thread to thread. See `super::turn_clock`.
         let timezone_section = super::turn_clock::timezone_section(user_timezone);
 
-        // (key, instruction, per_device). Any missing key flips this turn into
-        // setup mode.
-        let mandatory_prefs: &[(&str, &str, bool)] = &[
-            ("timezone", "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
-            ("language", "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English) — but they can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it.", false),
-            ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications — Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the current request device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again.", true),
-        ];
-
         let mut missing_instructions = Vec::new();
         let mut missing_pref_keys = Vec::new();
-        for (key, instruction, per_device) in mandatory_prefs {
+        let prefs_to_check = match setup_device(trigger.is_some(), device_id) {
+            Some(did) => MANDATORY_PREFS.iter().map(|pref| (did, pref)).collect(),
+            None => Vec::new(),
+        };
+        for (did, (key, instruction, per_device)) in prefs_to_check {
             // A read that FAILED is not a preference that is unset. Collapsing
             // both into `None` flips the whole turn into "SETUP REQUIRED, DO
             // NOT PROCEED" below, so one transient DB error refuses the user's
             // actual request. Treat an unreadable key as configured: a missed
             // setup nag costs a prompt, a false refusal costs the turn.
             let read = if *per_device {
-                if let Some(did) = device_id {
-                    PreferenceStore::get_for_device(&self.pool, key, did).await
-                } else {
-                    // No device context (child thread, scheduled task), so a
-                    // per-device preference is irrelevant here.
-                    continue;
-                }
+                PreferenceStore::get_for_device(&self.pool, key, did).await
             } else {
                 PreferenceStore::get(&self.pool, key).await
             };
@@ -725,18 +754,7 @@ impl LucidosEngine {
             }
         }
 
-        let language_section = if !missing_instructions.is_empty() {
-            log!(
-                "[Chat] Setup required — missing preferences: {}",
-                missing_instructions.join(", ")
-            );
-            format!("SETUP REQUIRED — DO NOT PROCEED UNTIL COMPLETE:\nThe following settings are not configured. You MUST ask the user for these BEFORE doing anything else. Do NOT answer questions, create tasks, or perform any work until setup is complete.\n{}", missing_instructions.join("\n"))
-        } else {
-            format!(
-                "USER LANGUAGE: {}\nAlways respond in {}.",
-                user_language, user_language
-            )
-        };
+        let language_section = setup_or_language_section(&missing_instructions, user_language);
 
         let system_prompt = workspace_identity_section(
             &self.workspace_name(),
@@ -754,8 +772,9 @@ impl LucidosEngine {
 
         // Resolved here, ABOVE the trigger branch, so a trigger fire and a chat
         // turn cannot take different arms: the workspace's chosen style is the
-        // workspace's chosen style either way. Empty on Standard, which leaves
-        // the body byte-identical to a build that never had this setting.
+        // workspace's chosen style either way. Empty on Standard with no
+        // technical literacy set, which leaves the body byte-identical to a
+        // build that never had this setting.
         let response_style = crate::core::response_style::resolve(&self.pool).await;
 
         let system_prompt = format!(
@@ -949,9 +968,10 @@ mod tests {
         ENGINE_BUILD_POINTER,
     };
     use super::{
-        coding_surface_section, static_prompt_body, workspace_identity_section,
-        ASK_USER_QUESTION_RULE, NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
-        TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
+        coding_surface_section, setup_device, setup_or_language_section, static_prompt_body,
+        workspace_identity_section, ASK_USER_QUESTION_RULE, MANDATORY_PREFS, NAMES_NOT_IDS_RULE,
+        NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, TRIGGER_VS_EVENT_WAIT_RULE,
+        WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
     use crate::llm::ToolCapabilities;
     use std::path::{Path, PathBuf};
@@ -1258,7 +1278,42 @@ mod tests {
     /// Knowhow cannot carry either: the model writes the argument from the
     /// enum and the route shape. Editing routes from the prompt is the parity
     /// the plan settled (philosophy rule 2).
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 119_865;
+    ///
+    /// Raised by 99 to a measured 119,964 for `navigate_ui`'s `device`. A
+    /// navigate reaches exactly one device, and "open it on my Mac" from the
+    /// phone is decided while writing the call. The old ceiling carried 2
+    /// chars of slack, which this absorbed.
+    ///
+    /// Raised by 358 to a measured 120,322 for *technical literacy*, the
+    /// response style's second part. The meter bills its widest level on top
+    /// of the widest style. A workspace with no level set pays nothing.
+    ///
+    /// Raised by 408 to a measured 120,730 for the same design's second pass:
+    /// the lower levels' relevance and steering rules, the reworded Minimal and
+    /// the Learning style. Both are still billed at their widest shipped case.
+    ///
+    /// Raised by 289 to a measured 121,019 for `threads` 'detach_child'
+    /// (ADR 0278), and its routing phrase in the orchestrating knowhow. A
+    /// parent with no way to stop waiting for a child can only stop and
+    /// respawn it, which loses the child's work. It rides the grouped tool
+    /// rather than a standalone one, which would cost several times this.
+    ///
+    /// Raised by 120 to a measured 121,139 for one clause in FILE REFERENCES:
+    /// saving a picture shows the user nothing, and a picture offered for a
+    /// choice goes in an option's description. A coding agent saved a mockup,
+    /// said it had drawn the options, and showed nothing. The user asked for
+    /// the Lucidos agent to carry the same rule.
+    ///
+    /// Raised by 298 to a measured 121,437 for the required `description` on
+    /// `run_bash_background` and `run_python_background`. The engine-armed wait
+    /// names the work by it. Before, the row said only "background work", and
+    /// the user could not tell what the thread was waiting on.
+    ///
+    /// Raised by 131 to a measured 121,568 for the visual-choice clause in
+    /// FILE REFERENCES: real pictures, one per option, never ASCII art. A
+    /// coding agent drew colour options in ASCII, then repeated one sheet of
+    /// all four on every option.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 121_568;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1314,8 +1369,9 @@ mod tests {
         // off: that is the configuration almost every workspace runs. Its
         // todo rule is 31 chars longer, against a `todo_write` schema of
         // nearly a thousand that a mode-on workspace does not pay at all.
-        // The *response style* is billed at its widest SHIPPED section, the
-        // same worst-case rule the source variant takes. A style the user wrote
+        // The *response style* is billed at its widest SHIPPED section, style
+        // and technical literacy together, the same worst-case rule the source
+        // variant takes. A style the user wrote
         // is workspace content, like `user_profile.md`, and this meter measures
         // the engine-authored surface.
         let widest_style = crate::core::response_style::widest_shipped_section();
@@ -1514,7 +1570,7 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_494,
+            2_595,
             "the two frozen enums the SDK is generated from (17 targets, 21 \
              settings views) are 447 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
@@ -1526,7 +1582,10 @@ mod tests {
              so, and the choice is made while writing the call. Raised from \
              2,436 by `system-overview`: Settings > System became a submenu, \
              so `system` opens a list of rows and the versions and restart \
-             the model used to reach there now need their own value",
+             the model used to reach there now need their own value. Raised \
+             from 2,494 by `device`: a navigate reaches one device, and the \
+             user asking from the phone to open it on the laptop is chosen \
+             while writing the call",
         ),
         (
             "request_credential",
@@ -1582,12 +1641,13 @@ mod tests {
         ),
         (
             "threads",
-            1_860,
-            "a third action on a domain whose two existing schemas are almost \
-             entirely a spelled-out `status` enum pinned to `ThreadStatus::ALL` \
-             by a test, repeated across both because `llm_schema` is a const \
-             JSON literal and cannot compose. `search` adds its own summary, \
-             `(requires: q)` and two properties on top of that frozen shape",
+            2_060,
+            "a third and fourth action on a domain whose two existing schemas \
+             are almost entirely a spelled-out `status` enum pinned to \
+             `ThreadStatus::ALL` by a test, repeated across both because \
+             `llm_schema` is a const JSON literal and cannot compose. `search` \
+             adds its own summary, `(requires: q)` and two properties, and \
+             `detach_child` its summary and a `thread_id` (ADR 0278)",
         ),
         (
             "events",
@@ -1915,6 +1975,54 @@ mod tests {
         );
     }
 
+    /// The first chat turn asks for technical literacy. Every value the
+    /// instruction tells the model to store must be one the catalog accepts,
+    /// or the turn stays in setup mode for good.
+    #[test]
+    fn mandatory_setup_asks_for_technical_literacy_with_storable_values() {
+        use crate::core::technical_literacy::SETTABLE_IDS;
+
+        let (_, instruction, per_device) = MANDATORY_PREFS
+            .iter()
+            .find(|(key, _, _)| *key == crate::core::PREF_TECHNICAL_LITERACY)
+            .expect("technical literacy is a mandatory preference");
+        assert!(!per_device, "the level is workspace-global");
+        for id in SETTABLE_IDS {
+            assert!(
+                instruction.contains(&format!("\"{id}\"")),
+                "the setup instruction never offers '{id}'"
+            );
+        }
+        assert!(
+            !instruction.contains("everyday"),
+            "the merged level is never offered"
+        );
+        // The card copy is pinned, so every first-run card reads the same.
+        for level in crate::core::technical_literacy::TechnicalLiteracy::ALL {
+            let option = format!("\"{}\" / \"{}\"", level.card_label(), level.card_line());
+            assert!(instruction.contains(&option), "the card lacks {option}");
+        }
+    }
+
+    /// Only a person on a device can answer a setup question. A trigger fire,
+    /// or a sub-thread or task with no sending device, must never stop on one.
+    #[test]
+    fn only_a_turn_sent_from_a_device_enters_setup_mode() {
+        assert_eq!(setup_device(false, Some("laptop")), Some("laptop"));
+        assert_eq!(setup_device(true, Some("laptop")), None, "a trigger fire");
+        assert_eq!(setup_device(false, None), None, "a sub-thread or task");
+        assert_eq!(setup_device(true, None), None);
+
+        let missing = ["- TECHNICAL LITERACY: ask"];
+        let chat = setup_or_language_section(&missing, "English");
+        assert!(chat.starts_with("SETUP REQUIRED"));
+        assert!(chat.contains("TECHNICAL LITERACY"));
+
+        let configured = setup_or_language_section(&[], "English");
+        assert!(!configured.contains("SETUP REQUIRED"));
+        assert!(configured.contains("Always respond in English."));
+    }
+
     /// Standard costs the prompt nothing, to the character.
     ///
     /// This is the promise the whole setting rests on: a workspace that never
@@ -1957,7 +2065,7 @@ mod tests {
 
         let library = response_style::merge(&[]);
         for style in &library {
-            let section = response_style::section_for(&library, &style.id);
+            let section = response_style::section_for(&library, &style.id, None);
             let body = static_prompt_body(false, 500, ContextMode::Off, &section);
             if style.id == response_style::STANDARD_ID {
                 assert!(!body.contains("RESPONSE STYLE:"));
@@ -2218,6 +2326,24 @@ mod tests {
         assert!(
             section.contains("shows it to YOU"),
             "the section must say a read reaches the agent, not the user:\n{section}"
+        );
+        // A coding agent saved a mockup, wrote "I've drawn out the options",
+        // and drew nothing. Saving is not showing either, and a choice between
+        // pictures puts them on the card.
+        assert!(
+            section.contains("Saving one shows nothing either"),
+            "the section must say a saved image reaches nobody:\n{section}"
+        );
+        assert!(
+            section.contains("in an option's description"),
+            "the section must put pictures on the question card:\n{section}"
+        );
+        // A coding agent drew colour options in ASCII, then put one sheet of
+        // all four on every option. Mirrors `SHOWING_AN_IMAGE_RULE`.
+        assert!(
+            section.contains("never ASCII art")
+                && section.contains("its own picture of only that option"),
+            "the section must show a visual choice as one picture per option:\n{section}"
         );
     }
 

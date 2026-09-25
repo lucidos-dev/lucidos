@@ -24,6 +24,7 @@
  *  focus marker". */
 
 import { watchUserAction } from '../../utils/userAction';
+import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
 
 /** Persistent highlight class (cleared on the first user action) + the transient
  *  fade-out class (runs the wash + glow out to transparent before the marker is
@@ -176,14 +177,6 @@ function retireRefNextFrame(gen: number, dropEl: boolean): void {
   }
 }
 
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  );
-}
-
 /** Apply the navigation focus marker to `el`, superseding any prior marker, and
  *  arm the listeners that dissolve it on the user's next action.
  *
@@ -247,10 +240,10 @@ export function applyNavFocus(el: HTMLElement, opts?: { settleGuard?: () => bool
       _holdOver = true;
       if (_dismissQueued) fadeOutNavFocus();
     },
-    // The hold is time at FULL brightness, so it starts where the ramp ends. Under
-    // reduced motion there is no ramp (the CSS drops it) and the marker is at full
-    // from the first frame, so there is nothing to wait out.
-    (prefersReducedMotion() ? 0 : NAV_FOCUS_RAMP_MS) + NAV_FOCUS_HOLD_MS,
+    // The hold is time at FULL brightness, so it starts where the ramp ends. The
+    // ramp rides the Animation speed slider. Reduced motion collapses it, so the
+    // marker is at full from the first frame.
+    scaledDurationMs(NAV_FOCUS_RAMP_MS) + NAV_FOCUS_HOLD_MS,
   );
 
   _teardown = () => {
@@ -277,7 +270,7 @@ function fadeOutNavFocus(): void {
   _teardown?.();
   _teardown = null;
 
-  const reduced = prefersReducedMotion();
+  const reduced = isReducedMotion();
   if (reduced) {
     el.classList.remove(NAV_FOCUS_STUCK_CLASS);
     el.classList.remove(NAV_FOCUS_FADING_CLASS);
@@ -304,7 +297,7 @@ function fadeOutNavFocus(): void {
     _markedEl = null;
     _refLive = false;
     _teardown = null;
-  }, NAV_FOCUS_FADE_MS);
+  }, scaledDurationMs(NAV_FOCUS_FADE_MS));
   // A supersede / explicit clear cancels this and removes the classes; the pending ref
   // expiry is cancelled separately by `clearNavFocus`, which owns `_cancelRefExpiry`
   // because that one can be armed from either engagement point.

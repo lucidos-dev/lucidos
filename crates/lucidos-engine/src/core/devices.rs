@@ -16,6 +16,54 @@ pub struct Device {
     pub created_at: DateTime<Utc>,
 }
 
+/// A device as the agent context lists it. See [`DeviceStore::recently_seen`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenDevice {
+    pub id: String,
+    /// The name Settings → Devices shows.
+    pub label: String,
+    /// Browser and OS, parsed from the user agent.
+    pub details: Option<String>,
+    pub seen_secs_ago: i64,
+    /// A visible heartbeat within `PRESENCE_STALE_AFTER`.
+    pub visible_now: bool,
+}
+
+/// "Seen" is the newer of the last page load (`last_seen_at`) and the last
+/// visible heartbeat (`device_presence.visible_at`). `$1` is the presence
+/// window in seconds. Ages use the database clock (ADR 0053).
+const SEEN_DEVICE_SELECT: &str = "SELECT d.id, d.name, d.user_agent, \
+        EXTRACT(EPOCH FROM now() - s.seen)::bigint AS seen_secs_ago, \
+        COALESCE(p.visible_at > now() - make_interval(secs => $1), false) AS visible_now \
+     FROM devices d \
+     LEFT JOIN device_presence p ON p.device_id = d.id \
+     CROSS JOIN LATERAL (SELECT GREATEST(d.last_seen_at, p.visible_at) AS seen) s";
+
+fn presence_window_secs() -> f64 {
+    super::device_presence::PRESENCE_STALE_AFTER.num_seconds() as f64
+}
+
+#[derive(sqlx::FromRow)]
+struct SeenDeviceRow {
+    id: String,
+    name: Option<String>,
+    user_agent: Option<String>,
+    seen_secs_ago: i64,
+    visible_now: bool,
+}
+
+impl From<SeenDeviceRow> for SeenDevice {
+    fn from(row: SeenDeviceRow) -> Self {
+        Self {
+            label: resolve_device_name(row.name.as_deref(), &row.id),
+            details: row.user_agent.as_deref().map(parse_user_agent),
+            id: row.id,
+            seen_secs_ago: row.seen_secs_ago,
+            visible_now: row.visible_now,
+        }
+    }
+}
+
 /// What a hand-over did, so the caller can answer without guessing.
 ///
 /// `AlreadyDone` and `NoSuchDevice` are both ordinary outcomes rather than
@@ -176,6 +224,51 @@ impl DeviceStore {
                 .fetch_all(pool)
                 .await?;
         Ok(devices)
+    }
+
+    /// The devices seen most recently, newest first, at most `limit` of them
+    /// and none unseen for `within_days`. The agent context lists these.
+    /// See [`SEEN_DEVICE_SELECT`] for what "seen" means.
+    pub async fn recently_seen(
+        pool: &PgPool,
+        limit: i64,
+        within_days: i32,
+    ) -> Result<Vec<SeenDevice>, sqlx::Error> {
+        let rows: Vec<SeenDeviceRow> = sqlx::query_as(&format!(
+            "{SEEN_DEVICE_SELECT} \
+             WHERE s.seen > now() - make_interval(days => $2) \
+             ORDER BY s.seen DESC \
+             LIMIT $3"
+        ))
+        .bind(presence_window_secs())
+        .bind(within_days)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(SeenDevice::from).collect())
+    }
+
+    /// One device, seen the same way as [`Self::recently_seen`]. `None` when
+    /// no such device exists.
+    pub async fn seen(pool: &PgPool, id: &str) -> Result<Option<SeenDevice>, sqlx::Error> {
+        let row: Option<SeenDeviceRow> =
+            sqlx::query_as(&format!("{SEEN_DEVICE_SELECT} WHERE d.id = $2"))
+                .bind(presence_window_secs())
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.map(SeenDevice::from))
+    }
+
+    /// Record that a device was seen now. Called when a device hides Lucidos:
+    /// the hide deletes its presence row, and without this stamp its age would
+    /// fall back to its last page load.
+    pub async fn mark_seen(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE devices SET last_seen_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 
     /// Rename a device row. **Private on purpose**: [`Self::rename`] emits.
@@ -587,6 +680,94 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// The agent's Known devices list reads the two records the engine already
+    /// keeps: the page-load `last_seen_at` and the visible heartbeat. The newer
+    /// one orders the list, and a device unseen past the window is left out.
+    #[tokio::test]
+    async fn recently_seen_orders_by_the_newer_record_and_drops_stale_devices() {
+        use crate::test_support::seed_device;
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/149.0.0.0 Safari/537.36";
+        let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/604.1";
+        seed_device(&pool, "laptop", Some(mac), Some("My MacBook")).await;
+        seed_device(&pool, "phone", Some(iphone), None).await;
+        seed_device(&pool, "tablet", None, Some("Old tablet")).await;
+        backdate_last_seen(&pool, "laptop", 2).await;
+        backdate_last_seen(&pool, "phone", 1).await;
+        backdate_last_seen(&pool, "tablet", 40).await;
+        // The laptop has not reloaded in two days, but it is showing Lucidos.
+        DevicePresenceStore::record_visible(&pool, "laptop")
+            .await
+            .unwrap();
+
+        let seen = DeviceStore::recently_seen(&pool, 5, 30).await.unwrap();
+        let ids: Vec<&str> = seen.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["laptop", "phone"],
+            "newest first, stale tablet dropped"
+        );
+        assert_eq!(seen[0].label, "My MacBook");
+        assert_eq!(
+            seen[0].details.as_deref(),
+            Some("Chrome/149.0.0.0 on macOS")
+        );
+        assert!(seen[0].visible_now);
+        assert!(
+            seen[0].seen_secs_ago < 60,
+            "the heartbeat is the newer record"
+        );
+        assert_eq!(
+            seen[1].label, "device-phone",
+            "an unnamed device gets its short id"
+        );
+        assert!(!seen[1].visible_now);
+        assert!(seen[1].seen_secs_ago >= 86_000);
+
+        let one = DeviceStore::recently_seen(&pool, 1, 30).await.unwrap();
+        assert_eq!(one.len(), 1, "the limit bounds the list");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Hiding Lucidos deletes the presence row. The device was still seen at
+    /// that moment, so its age must not fall back to a page load days ago.
+    #[tokio::test]
+    async fn a_device_that_hides_lucidos_stays_seen_at_the_hide() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        crate::test_support::seed_device(&pool, "phone", None, Some("My iPhone")).await;
+        backdate_last_seen(&pool, "phone", 3).await;
+        for event in [
+            SystemEvent::DeviceVisible {
+                device_id: "phone".into(),
+            },
+            SystemEvent::DeviceHidden {
+                device_id: "phone".into(),
+            },
+        ] {
+            bus.emit(BusEvent::System(event)).await.unwrap();
+        }
+
+        let seen = DeviceStore::seen(&pool, "phone").await.unwrap().unwrap();
+        assert!(
+            seen.seen_secs_ago < 60,
+            "seen at the hide, not at the page load: {seen:?}"
+        );
+        assert!(!seen.visible_now);
+        assert!(
+            DevicePresenceStore::candidates(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a hidden device is no PresenceCheck candidate"
+        );
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     /// The load-bearing guarantee: a device write and its announcement are one

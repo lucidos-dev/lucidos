@@ -4,12 +4,12 @@ import type { RefObject } from 'preact';
 import {
   deepLinkHasResolved,
   EVENT_RESOLVE_DEADLINE_MS,
-  followPosition,
+  followSurvivesScroll,
   hasPendingEventScroll,
   markNavigationScroll,
   onDeepLinkClaimed,
   onDeepLinkResolved,
-  onFollowArmed,
+  onFollowRideStarted,
   resumeFollowingBottom,
   applyFollowSeed,
   type FollowResumeFrom,
@@ -39,19 +39,10 @@ export function isFullyRestorable(saved: number, scrollHeight: number, clientHei
  *  the two answers share one slot and cannot disagree. */
 export const LIVE_EDGE_VALUE = 'live-edge';
 
-/** The stored marker for a reader who holds a standing follow while parked
- *  somewhere OTHER than the live edge: `following:` in front of either place
- *  form. It is a REQUEST rather than a place, so it sits beside one instead of
- *  replacing it.
- *
- *  ARMED and CARRYING are two states (ADR 0064), and this is the first without
- *  the second. A ride carries its reader only while the thread is running, so
- *  re-entry puts them back on the turn they parked on and re-arms. The growth
- *  branch takes them to the edge once there is something to be carried toward.
- *
- *  The alternative, recording the place OR the request, is what this replaced:
- *  every clamp threw the ride away silently, with the toggle still lit. See
- *  `docs/plans/2026-09-16-the-record-follows-the-request.md`. */
+/** A marker older builds wrote in front of a place, for a standing follow held
+ *  away from the live edge. The follow has no such state any more (ADR 0064),
+ *  so it is never written. A stored one is read as the bare place it marks,
+ *  with no follow. */
 const FOLLOWING_PREFIX = 'following:';
 
 /** The stored form of a reading position that names a TURN:
@@ -77,15 +68,13 @@ const ROW_PREFIX = 'row:';
  *  of them being windowed. It is also what a transcript position written by an
  *  older build still reads as.
  *
- *  `armed` rides ALONGSIDE the two place forms and says the reader holds a
- *  standing follow there (`FOLLOWING_PREFIX`). Absent means they do not, which
- *  is the honest reading of a stored value carrying no marker. `live-edge` is
- *  armed by definition and needs no field. */
+ *  `live-edge` is the one form that holds a standing follow. A place never
+ *  does, so a follow parked away from the edge cannot be recorded. */
 export type SavedScroll =
-  | { kind: 'offset'; top: number; armed?: true }
+  | { kind: 'offset'; top: number }
   | { kind: 'live-edge' }
-  | ({ kind: 'anchor'; armed?: true } & ScrollAnchor)
-  | ({ kind: 'row'; armed?: true } & RowAnchor);
+  | ({ kind: 'anchor' } & ScrollAnchor)
+  | ({ kind: 'row' } & RowAnchor);
 
 /** The stored form of an anchor, the one writer of `ANCHOR_PREFIX`. */
 function formatScrollAnchor(anchor: ScrollAnchor): string {
@@ -95,12 +84,6 @@ function formatScrollAnchor(anchor: ScrollAnchor): string {
 /** The stored form of a row anchor, the one writer of `ROW_PREFIX`. */
 function formatRowAnchor(anchor: RowAnchor): string {
   return `${ROW_PREFIX}${Math.round(anchor.relTop)}:${anchor.rowEventId}`;
-}
-
-/** Put the armed marker in front of a place, the one writer of
- *  `FOLLOWING_PREFIX`. */
-function formatArmedPlace(place: string): string {
-  return `${FOLLOWING_PREFIX}${place}`;
 }
 
 /** Parse a localStorage scroll value. Returns null on missing, invalid or
@@ -117,16 +100,10 @@ function formatArmedPlace(place: string): string {
 export function parseSavedScroll(raw: string | null): SavedScroll | null {
   if (raw === null || raw === '') return null;
   if (raw === LIVE_EDGE_VALUE) return { kind: 'live-edge' };
-  // The armed marker comes off FIRST, and what is left is parsed exactly as an
-  // unmarked value is. So the two forms cannot drift, and a stored value that
-  // carries no marker reaches the same code it always did.
-  if (raw.startsWith(FOLLOWING_PREFIX)) {
-    const place = parseSavedScroll(raw.slice(FOLLOWING_PREFIX.length));
-    // A marker in front of nothing legible is not a position, and it is not a
-    // request either: the request is about the place it qualifies. A marked
-    // `live-edge` is a value we never write, and says the same thing twice.
-    return place === null || place.kind === 'live-edge' ? place : { ...place, armed: true };
-  }
+  // An older build's marker comes off, and what is left is parsed exactly as
+  // an unmarked value is. A marked `live-edge` was never written, and reads as
+  // the edge.
+  if (raw.startsWith(FOLLOWING_PREFIX)) return parseSavedScroll(raw.slice(FOLLOWING_PREFIX.length));
   if (raw.startsWith(ANCHOR_PREFIX)) {
     const parsed = parseIdAt(raw.slice(ANCHOR_PREFIX.length));
     return parsed && { kind: 'anchor', eventId: parsed.id, relTop: parsed.relTop };
@@ -388,10 +365,6 @@ export function attachScrollMemory(
    *  `null` while none has. The dead-link rescue's reference point. See
    *  `standDownForDeepLink` for why it is captured once rather than per claim. */
   let inheritedBeforeDeepLink: number | null = null;
-  /** True while THIS attachment is replaying an arm it read off the record, so
-   *  the arm subscription can tell a replay from a new request. See
-   *  `replayParkedArm`. */
-  let replayingArm = false;
   /** When this attachment started waiting, and how tall the container was at
    *  its last look. The two terms `keepWaitingForAnchor` extends on: elapsed
    *  against the ceiling, and a height that has changed since. */
@@ -409,13 +382,6 @@ export function attachScrollMemory(
     // whose id means nothing among these children.
     if (value?.kind === 'live-edge' && !followsLiveEdge) return null;
     if ((value?.kind === 'anchor' || value?.kind === 'row') && !anchorsToContent) return null;
-    // The armed marker is the one part that is DROPPED rather than rejected
-    // with its value. It qualifies a place this container can still honour, and
-    // the follow is one global: arming from here would hand the transcript's
-    // request to whatever the content pane was showing.
-    if (value !== null && value.kind !== 'live-edge' && value.armed && !followsLiveEdge) {
-      return { ...value, armed: undefined };
-    }
     return value;
   };
 
@@ -473,37 +439,16 @@ export function attachScrollMemory(
    *  rescue, on a page wake, and when a deep-link announces a claim. */
   const openIsOurs = () => live().shouldRestore?.() ?? true;
 
-  /** Pick a recorded standing follow back up for a reader who parked somewhere
-   *  other than the live edge.
+  /** Resume the standing follow `record` holds, for a site that is NOT
+   *  positioning the reader itself. Only the `live-edge` form holds one, and it
+   *  writes today's bottom.
    *
-   *  ALWAYS GUARDED, whichever resume it uses. `onFollowArmed` exists to write
-   *  a NEW request down, so it retires the restore and stamps the live edge on
-   *  the record. Both are wrong for a REPLAY of a parked reader. The request is
-   *  already on disk, and the live edge is not where they were. The restore
-   *  this travels with is what puts them back on their turn. */
-  const replayParkedArm = (from: FollowResumeFrom) => {
-    replayingArm = true;
-    try {
-      resumeFollowingBottom(el, from);
-    } finally {
-      replayingArm = false;
-    }
-  };
-
-  /** Resume whatever standing follow `record` holds, for a site that is NOT
-   *  positioning the reader itself.
-   *
-   *  `live-edge` is its own place, so that form writes today's bottom. A parked
-   *  one arms alone, the ride carrying such a reader only once the thread runs.
-   *
-   *  A DEEP LINK owning the open (`in-place`) overrides that for both forms,
-   *  and a parked record needs it as much as the edge form does. A link landing
-   *  off the live edge ends the ride on purpose. Replaying it would light the
-   *  toggle back up over the event the link exists to show. That branch holds
-   *  the three guards deciding it. */
-  const replayRecordedFollow = (record: SavedScroll | null, edgeFrom: FollowResumeFrom) => {
-    if (record?.kind === 'live-edge') resumeFollowingBottom(el, edgeFrom);
-    else if (record?.armed) replayParkedArm(edgeFrom === 'in-place' ? 'in-place' : 'parked');
+   *  A DEEP LINK owning the open (`in-place`) overrides that. A link landing off
+   *  the live edge ends the ride on purpose. Replaying it would light the toggle
+   *  back up over the event the link exists to show. That branch holds the
+   *  guards deciding it. */
+  const replayRecordedFollow = (record: SavedScroll | null, from: FollowResumeFrom) => {
+    if (record?.kind === 'live-edge') resumeFollowingBottom(el, from);
   };
 
   /** Where a RECORD says this container should sit RIGHT NOW, or null while it
@@ -542,9 +487,7 @@ export function attachScrollMemory(
     return Math.max(0, el.scrollHeight - el.clientHeight);
   };
 
-  /** Put the reader where the record's PLACE says, whatever request rides
-   *  beside it. One expression, so an armed record and a bare one cannot open
-   *  in two different places.
+  /** Put the reader where the record's PLACE says.
    *
    *  A turn lands NOW when it is already rendered, which is every revisit
    *  inside the window the thread opens at. Otherwise the observers below wait
@@ -819,33 +762,24 @@ export function attachScrollMemory(
     return String(Math.floor(el.scrollTop));
   };
 
-  /** The whole reading position RIGHT NOW: the place, and the reader's standing
-   *  request if they hold one. One expression, two callers (the scroll listener
-   *  and the deep-link landing below), so the two cannot disagree.
+  /** The whole reading position RIGHT NOW: the live edge for a rider, or the
+   *  place. One expression, two callers (the scroll listener and the deep-link
+   *  landing below), so the two cannot disagree.
    *
-   *  THE LIVE EDGE LEADS, for a rider who is on it. Every growth round writes
-   *  `scrollTop`, so recording the number would overwrite the request.
-   *
-   *  A rider momentarily OFF it keeps the request all the same, in front of the
-   *  place they are at. Three scrolls move a reader without ending the ride: a
-   *  shrink clamping them down, the platform, and their own gesture on a quiet
-   *  thread.
+   *  THE LIVE EDGE LEADS. Every growth round writes `scrollTop`, so recording
+   *  the number would overwrite the request. A follow that survives a scroll
+   *  holds its reader on the edge, so there is no third answer.
    *
    *  **The question is never the flag alone.** `.thread-content` carries two
    *  scroll listeners, the disarm in `makeScrollObservers` and the save here,
    *  so the flag would answer differently depending on which ran first.
-   *  `followPosition` is order-independent, and answers in ONE call.
+   *  `followSurvivesScroll` is order-independent, and answers in ONE call.
    *
    *  A deep-link landing needs no case of its own. It retires the ride before
    *  recording (see `stopFollowingBottom`), so a landing off the edge answers
    *  with the bare place. That is what the reader asked for. */
-  const currentPosition = (): string | null => {
-    const follow = followsLiveEdge ? followPosition(el) : null;
-    if (follow === 'live-edge') return LIVE_EDGE_VALUE;
-    const place = currentPlace();
-    if (place === null) return null;
-    return follow === 'parked' ? formatArmedPlace(place) : place;
-  };
+  const currentPosition = (): string | null =>
+    followsLiveEdge && followSurvivesScroll(el) ? LIVE_EDGE_VALUE : currentPlace();
 
   /** Record where a deep-link landed as this thread's reading position.
    *
@@ -967,20 +901,16 @@ export function attachScrollMemory(
    *  already at the live edge gets a write the browser clamps to where they
    *  are, and an idle thread then grows nothing. The request is real either
    *  way, so it is recorded from the arm rather than from a scroll that may
-   *  never come. Only the ARM is broadcast (see `onFollowArmed`). That is what
-   *  lets `focusThread` retire the follow on a thread switch without
+   *  never come. Only a ride STARTING is broadcast (`onFollowRideStarted`).
+   *  That lets `focusThread` retire the follow on a thread switch without
    *  overwriting the live edge just recorded for the thread being LEFT. */
   function subscribeToArm() {
     if (!followsLiveEdge) return null;
-    return onFollowArmed(() => {
+    return onFollowRideStarted(() => {
       // The same question `onScroll` asks: a superseded attachment is still
       // subscribed until its deferred teardown, and a follow armed in the
       // thread now on screen is not this key's request.
       if (isCurrent && !isCurrent()) return;
-      // OUR OWN replay of what the record already says. Nothing is new, so
-      // nothing below applies: the request is on disk, and the restore this
-      // travels with is what puts the reader back on their turn.
-      if (replayingArm) return;
       // Anything this attach still has pending is now stale: the reader has
       // asked for the live edge, which outranks any position this hook was
       // going to put them in. Both pending things would land their write ON TOP
@@ -1044,14 +974,6 @@ export function attachScrollMemory(
     resumeFollowingBottom(el);
     restoring = false;
     reportRestore('live-edge');
-  } else if (saved.armed) {
-    // Armed, but parked away from the edge. Pick the request back up and put
-    // them on their turn, in that order: the arm must be standing before the
-    // restore's own write, so the recorder describes an armed reader from the
-    // first scroll event. Nothing takes them to the bottom here. The growth
-    // branch does, once the thread is actually running.
-    replayParkedArm('parked');
-    positionFromRecord();
   } else {
     positionFromRecord();
   }
@@ -1197,10 +1119,6 @@ export function attachScrollMemory(
         // breath: the app comes back, the link lands on the event, and this
         // fires. The deep-link owns the viewport, same as at attach time, so
         // the resume writes nothing there and only picks the request back up.
-        //
-        // A reader who was PARKED when they backgrounded is written nowhere
-        // either way. Their ride carries them only once the thread runs, and
-        // waking is not the thread running.
         replayRecordedFollow(readSaved(), openIsOurs() ? 'live-edge' : 'in-place');
       })
     : null;

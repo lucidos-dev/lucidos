@@ -748,14 +748,12 @@
 
 /* Reduced motion: entrance is instant — no fade, no slide, and never held
    hidden (the keyframe is off, so force the surface fully visible). */
-@media (prefers-reduced-motion: reduce) {
-    .thread-content .welcome-message {
-        opacity: 1;
-    }
+:root[data-motion="reduce"] .thread-content .welcome-message {
+    opacity: 1;
+}
 
-    .thread-content.welcome-revealing .welcome-message {
-        animation: none;
-    }
+:root[data-motion="reduce"] .thread-content.welcome-revealing .welcome-message {
+    animation: none;
 }
 
 /* --- Thread-open skeleton ---------------------------------------------------
@@ -811,10 +809,8 @@
     opacity: 0;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .thread-skeleton-overlay {
-        transition: none;
-    }
+:root[data-motion="reduce"] .thread-skeleton-overlay {
+    transition: none;
 }
 
 .thread-skeleton-exchange {
@@ -872,14 +868,12 @@
     to { opacity: 1; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .thread-skeleton-block {
-        animation: none;
-    }
+:root[data-motion="reduce"] .thread-skeleton-block {
+    animation: none;
+}
 
-    .thread-content.content-entering {
-        animation: none;
-    }
+:root[data-motion="reduce"] .thread-content.content-entering {
+    animation: none;
 }
 
 /* First-run provider onboarding (no LLM provider configured) */
@@ -992,17 +986,6 @@
     background: var(--bg-hover);
     opacity: 1;
 }
-
-/* Error state */
-.error {
-    color: var(--accent-red);
-    padding: 0.75rem;
-    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, transparent);
-    border-radius: 0.375rem;
-    font-size: var(--font-size-md);
-}
-
 
 /* Thread empty state — fallback when no exchanges render. The error/empty
    paths use real text content so iOS Safari can't show blank; the loading
@@ -1217,7 +1200,9 @@
     }
 }
 
-.question-option:active {
+/* A press on a picture is a scroll or a tap to open it, never a choice, so
+   the option does not sink under it. */
+.question-option:active:not(:has(.image-scroll-wrapper:active)) {
     transform: scale(0.99);
 }
 
@@ -1234,6 +1219,43 @@
     font-size: var(--font-size-md);
     line-height: 1.45;
     word-break: break-word;
+}
+
+/* An agent's picture or short text sample for this option. `pre-wrap` keeps a
+   sample's alignment; inline markdown already turned its newlines into <br>. */
+.question-option-preview {
+    grid-column: 1 / -1;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* Pictures can sit in the question, a description or a preview. They size
+   like a reply picture (`.markdown-content .image-scroll-wrapper` in
+   shared-components.css): capped at 24rem tall, a wide one scrolling
+   sideways. Shrunk to the card's width, a mockup was too small to judge.
+   `min-width: 0` lets the scroller narrow instead of widening the card. */
+.question-text,
+.question-option-desc,
+.question-option-preview {
+    min-width: 0;
+}
+
+.question-body .image-scroll-wrapper {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+}
+
+.question-body .image-scroll-wrapper > img {
+    display: block;
+    max-width: none;
+    max-height: 24rem;
+    height: auto;
+    border-radius: 0.25rem;
 }
 
 /* Highlighted: the picked option in Selected answers — accent tint, no border

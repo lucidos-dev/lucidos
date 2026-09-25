@@ -259,3 +259,10 @@ representation of the fan-in:
   self-heal, but **none re-delivers a wake lost to an engine restart** (B1) and
   the warm-worktree gate still **opens on archive / disk pressure** (B2). The gap
   is real on both halves.
+
+**Amended 2026-09-24 by [ADR 0278](0278-a-child-thread-can-move-to-top-level.md).**
+A child can now move to top level, which cuts its edge through a
+`ChildThreadDetached` on the former parent. The guarantee above holds for every
+card written before the move. The emit drops a card for a child that already
+moved out, so none is written after. Both recovery checks skip a trailing
+`ChildThreadDetached`, as they skip a `ChildThreadStopped`.

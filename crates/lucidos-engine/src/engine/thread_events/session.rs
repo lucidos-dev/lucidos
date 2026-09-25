@@ -107,3 +107,21 @@ pub enum ChildCompletionStatus {
     /// transient and the engine resumes the child on next visit.
     Canceled,
 }
+
+/// One pending change held by a sub-thread of the thread a
+/// `ChildThreadCompleted` reports on: any descendant, not the thread itself.
+///
+/// A snapshot taken when the card was sent. The parent reads it to know what
+/// work waits below, so it never reads "no pending changes" over a subtree
+/// full of them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubThreadPendingChange {
+    pub change_id: uuid::Uuid,
+    /// The sub-thread that proposed the change.
+    pub thread_id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_title: Option<String>,
+    /// Same meaning as `PendingThreadState::unsettled`: that sub-thread was still
+    /// working on the change when the card was sent.
+    pub thread_unsettled: bool,
+}

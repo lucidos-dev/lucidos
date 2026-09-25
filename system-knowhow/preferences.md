@@ -57,7 +57,7 @@ in-thread model picker in the compose bar, which writes a per-thread value and
 never touches this account default.
 
 **The style library.** `response_styles` holds ONLY what the user changed. An
-entry whose id is `concise` or `minimal` overrides that shipped style. One with a
+entry whose id is `concise`, `minimal` or `learning` overrides that shipped style. One with a
 fresh kebab-case id adds a style, and removing an entry restores the shipped
 text. `standard` is the off switch and is refused here.
 
@@ -77,7 +77,21 @@ NEXT message: a turn builds its prompt once, at the start, so the turn you are
 in finishes in the style it began in. It reaches triggers too, and it changes
 nothing about coding-agent sessions.
 
-**Device scope.** Device-scoped keys (theme, font-family, ui-scale, autocorrect,
+**Technical literacy is the response style's second part.** `response_style`
+sets the shape of an answer; `technical_literacy` sets how technical the words are.
+Any style works with any level, and the engine joins them in one prompt section.
+A technical user who wants only the outcome is a technical level plus a short
+style, not a lower level. It is also a mandatory preference: the first chat
+turn asks for it, and `not-set` records a decline.
+It reaches chat and triggers from the next message, and a coding-agent session
+or voice call from its next start.
+
+**When the user says how technical they are ("I'm not technical", "I'm a
+developer"), SET `technical_literacy`.** Store only a level they stated or
+picked. Never infer one from how they write: a guess stored here colours every
+answer they get.
+
+**Device scope.** Device-scoped keys (theme, font-family, ui-scale, motion, autocorrect,
 push_notifications) are stored per-device and override the global value on the
 device that set them. `set_preference` automatically targets the calling device —
 you never pass a device id. This is the trap to remember: setting `theme=dark`
@@ -92,8 +106,9 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
 | `chat_model` | global | a model id from the registry | `claude-opus-5` | Default chat model for NEW threads (a running thread reuses its own last-used model, see "How a write propagates"). Use `manage_models(action='list')` to see options. |
 | `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads (a running thread reuses its own last-used effort; clamped per model). |
-| `response_style` | global | the id of a style in the library | `standard` | How much comes back in a chat or trigger answer. `standard` adds nothing, so answers are as they always were. Shipped beside it: `concise` and `minimal`. Both are editable, and the user may add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids that exist here. An id nothing defines falls back to `standard`. |
+| `response_style` | global | the id of a style in the library | `standard` | The shape of a chat or trigger answer: how much comes back, and what it is for. `standard` adds nothing, so answers are as they always were. Shipped beside it: `concise`, `minimal` (the outcome, not the process) and `learning` (explains the why as it goes). All three are editable, and the user may add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids that exist here. An id nothing defines falls back to `standard`. |
 | `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" below. |
+| `technical_literacy` | global | `not-set` \| `non-technical` \| `technical` \| `developer` | `not-set` (adds nothing; set it to clear a level) | How technical the words are in every answer, from plain words with no jargon (`non-technical`, shown as Keep it plain) to engineering terms with no explanation (`developer`). It never sets how much to say. An old `everyday` value reads as `non-technical`. Reaches chat, triggers, coding-agent sessions and voice calls. See "Technical literacy" above. |
 | `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-1` \| `gpt-image-1.5` \| `gpt-image-2` | `auto` | Model used by `generate_image`. |
 | `model_title` | global | a model id | `gemini-3-flash-preview` | Background model for thread titles. |
 | `reasoning_title` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for title generation. Naming a thread needs none of it. |
@@ -113,6 +128,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `vertex_region` | global | text | `europe-west1` | Google Vertex AI region. |
 | `local_base_url` | global | URL | `http://localhost:11434/v1` | Base URL for the `local` OpenAI-compatible provider. |
 | `opencode_free_enabled` | global | `true` \| `false` | `false` | Off by default. `true` makes the keyless OpenCode Free models available in the picker. No account and no API key: requests go anonymously to a third-party relay, and several of those free models may train on what they receive. Turn it on only if the user asked for free models and accepts that. |
+| `proxy_timeout_secs` | global | number 1–600 | `30` | How long the engine proxy waits on one upstream request before it answers 504, in seconds. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body before it answers. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins over it for that entry. A value outside the range is refused on every write path. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up: the notification still counts on the bell badge and waits in the Notifications panel, and no OS push arrives in its place, because a device that is present never gets one. Unlike `push_notifications` this covers every device, so one write silences them all. |
 | `mobile_header_sticky` | global | `true` \| `false` | `true` | Keep the mobile header always visible. |
@@ -132,6 +148,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `theme` | device | `light` \| `dark` \| `system` | `system` | Color theme for the calling device. The default `system` follows the OS light/dark setting; `light` and `dark` pin it. |
 | `font-family` | device | `monospace` \| `system` \| `inter` \| `jetbrains-mono` \| `ibm-plex-mono` \| `fira-code` | `fira-code` | UI font for the calling device. The default `fira-code` is served by this engine, so it needs no internet; `inter` / `jetbrains-mono` / `ibm-plex-mono` are fetched from Google Fonts on first use, and `monospace` / `system` use the device's own fonts. Fira Code also enables programming ligatures, on code surfaces only (code blocks, inline code, diffs, file previews); prose and the prompt render literally, because Fira Code's contextual alternates re-space a typed `...` into what reads as two dots. |
 | `ui-scale` | device | number 75–200 | `100` | UI scale percent for the calling device (snaps to 12.5 steps). |
+| `motion` | device | `system` \| `reduce` \| `full` | `system` | Whether animations are reduced on the calling device. `system` follows the OS reduce-motion switch. `reduce` calms the app whatever the OS says: no slides, pulses or spinners, and transitions become instant. `full` keeps every animation even when the OS asks to reduce. The user finds it under **Settings → Appearance → Motion**. Offer `reduce` to a user who finds the app busy or reports motion discomfort. Apps read it as `data-motion` on `<html>`. |
 | `autocorrect` | device | `true` \| `false` | `true` | Whether text fields autocorrect as the user types on the calling device. iOS autocorrect can keep the tap on Send or Submit for itself while it holds a correction. The button then does nothing until the keyboard closes. When a user on an iPhone or iPad reports that, closing the keyboard and tapping again gets through. Offer `false` if it keeps happening. Spell-check underlines and sentence capitals stay either way. The user finds it under **Settings → System → Debugging**, on iPhone and iPad only. An app's own text fields follow it too, through `sdk.js`. |
 | `push_notifications` | device | `enabled` \| `declined` | (unset) | Push notifications for the calling device. `enabled` triggers the OS/browser permission prompt. |
 

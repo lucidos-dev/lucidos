@@ -304,7 +304,8 @@ pub enum DeliveryRefusal {
 }
 
 impl DeliveryRefusal {
-    /// Every arm, so a test can walk them and a tally can be read back.
+    /// Every arm, so a test can walk them.
+    #[cfg(test)]
     pub const ALL: [DeliveryRefusal; 7] = [
         Self::Disabled,
         Self::BodyNotUtf8,
@@ -345,12 +346,6 @@ impl DeliveryRefusal {
         }
     }
 
-    /// Read a stored key back. `None` for one this engine does not know, which
-    /// a row written by a newer engine can carry.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|r| r.key() == key)
-    }
-
     /// Did this refusal look at the delivery at all?
     ///
     /// One arm answers no, and it is the whole reason a switched-off hook gets
@@ -381,15 +376,7 @@ impl DeliveryRefusal {
 /// Lowercase-hex SHA-256 of `value`, the form `token_hash` stores.
 pub fn digest(value: &str) -> String {
     use sha2::{Digest as _, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    let out = hasher.finalize();
-    let mut s = String::with_capacity(out.len() * 2);
-    for b in out {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    crate::api::hex::hex_lower(&Sha256::digest(value.as_bytes()))
 }
 
 /// A fresh webhook token: 32 bytes of entropy, lowercase hex.
@@ -483,14 +470,7 @@ pub fn sign(cfg: &HmacConfig, secret: &str, canonical: &str) -> String {
         }
     };
     match cfg.encoding {
-        DigestEncoding::Hex => {
-            let mut s = String::with_capacity(raw.len() * 2);
-            for b in &raw {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-            }
-            s
-        }
+        DigestEncoding::Hex => crate::api::hex::hex_lower(&raw),
         DigestEncoding::Base64 => base64::engine::general_purpose::STANDARD.encode(&raw),
     }
 }

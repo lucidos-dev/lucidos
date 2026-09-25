@@ -25,6 +25,7 @@ import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { contentLabel } from './pluginContent';
 import { applyNavFocus } from '../shared/focusMarker';
+import { scrollBehavior } from '../../utils/motion';
 
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
@@ -368,7 +369,7 @@ export function StoreTab() {
     if (!target || !settled) return;
     const el = document.querySelector<HTMLElement>(`[data-plugin-id="${CSS.escape(target)}"]`);
     if (el) {
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
       // Shared navigation focus marker: a sticky background highlight that dissolves
       // on the user's next action, never before its hold has elapsed
       // (components/shared/focusMarker.ts). Same look as chat + settings.

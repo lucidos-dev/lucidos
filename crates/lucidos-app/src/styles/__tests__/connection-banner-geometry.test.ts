@@ -15,7 +15,7 @@
  *    `.claude/rules/frontend-css.md`.
  * 4. No motion. The bar's arrival is the event; a wash pulsing under a sentence
  *    the user is reading is noise, and the absence is what makes a
- *    prefers-reduced-motion guard unnecessary rather than forgotten.
+ *    reduced-motion rule unnecessary rather than forgotten.
  * 5. The dot's first-line offset is derived from the two quantities that decide
  *    it, both of them the ones actually in force, or it drifts off the line the
  *    moment either is retuned. Same derivation as the Lucidos menu's notice.

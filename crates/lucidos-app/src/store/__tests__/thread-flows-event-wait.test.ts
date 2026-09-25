@@ -8,7 +8,7 @@
  *  rather than as *still working*, and it has to say so once, not twice.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
+import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter, TS } from './thread-flows-helpers';
 import { exchangeResponseEvents, exchangeStatus, type ThreadEvent } from '../thread-events';
 import { getCollapsedVisibleEvents, hidesEarlierProse, isStepMechanics } from '../event-rendering';
 import type { ResponseEvent } from '../types';
@@ -48,6 +48,22 @@ describe('a turn parked on an event wait', () => {
     expect(waits(events)).toHaveLength(1);
     expect(steps(events)).toHaveLength(0);
     expect(waits(events)[0]).toMatchObject({ wait_id: 'w1', state: 'waiting', subscriptions: [{ event_type: 'ChangeProposed' }] });
+  });
+
+  /** The row carries when the wait STARTED, and a resolution hours later keeps
+   *  it: the header stamp says when the watch began, not when it ended. */
+  it('keeps the arming time on the row through its resolution', () => {
+    const armedAt = '2026-08-06T11:00:00Z';
+    const { map, id } = makeThread();
+    insertEvents(map, id, [
+      park[0],
+      park[1],
+      { ...park[2], created: armedAt },
+      { type: 'EventWaitExpired', wait_id: 'w1', created: '2026-08-06T12:00:00Z' },
+    ] as Array<ThreadEvent & { created?: string }>);
+
+    const events = exchangeResponseEvents(getExchanges(map, id)[0]);
+    expect(waits(events)).toMatchObject([{ state: 'timed_out', created: armedAt }]);
   });
 
   /** The park is a transcript marker, not step mechanics, so a turn whose ONLY
@@ -181,9 +197,9 @@ describe('a turn parked on an event wait', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
-      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
-      { type: 'ToolResult', name: 'await_event', result: 'ChangeProposed fired' },
-      { type: 'ToolCalled', name: 'send_notification', args: { title: 'Build landed' } },
+      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0, created: '2026-04-17T01:00:00Z' },
+      { type: 'ToolResult', name: 'await_event', result: 'ChangeProposed fired', created: '2026-04-17T01:00:00Z' },
+      { type: 'ToolCalled', name: 'send_notification', args: { title: 'Build landed' }, created: '2026-04-17T01:00:00Z' },
     ] as ThreadEvent[]);
 
     const exchange = getExchanges(map, id)[0];
@@ -192,7 +208,13 @@ describe('a turn parked on an event wait', () => {
     // No `matched_event_id` assertion: `insertEvents` reads a top-level
     // `event_id` as the row's OWN id and strips it, so the delivery's
     // same-named payload field cannot survive this helper.
-    expect(waits(events)[0]).toMatchObject({ state: 'matched', matched_event_type: 'ChangeProposed' });
+    // The row keeps its arming time and learns the delivery's own.
+    expect(waits(events)[0]).toMatchObject({
+      state: 'matched',
+      matched_event_type: 'ChangeProposed',
+      created: TS,
+      matched_at: '2026-04-17T01:00:00Z',
+    });
     // The delivery's own tool call is the only step, and it is the one still running.
     expect(steps(events)).toHaveLength(1);
     expect(exchangeStatus(exchange, '', true)).toBe('streaming');

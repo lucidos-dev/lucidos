@@ -81,10 +81,6 @@
     cursor: pointer;
 }
 
-.memory-force-toggle input[type="checkbox"] {
-    cursor: pointer;
-}
-
 .memory-rebuild-progress {
     display: flex;
     align-items: center;

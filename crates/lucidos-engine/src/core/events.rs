@@ -171,7 +171,7 @@ pub enum ImageRef<'a> {
 /// Metadata-only walk for endpoints that just need (index, source, mime).
 /// One `metadata` syscall per user image, zero reads. Missing blobs still
 /// occupy an index — the index matches `walk_thread_images` and the
-/// thread:N numbering used by `chat/process.rs::msg_image_starts`. The
+/// thread:N numbering used by `chat/process/history.rs::msg_image_starts`. The
 /// API serves a 404 for the missing entry.
 pub fn walk_thread_images_meta<E: HasEventPayload>(
     workspace: &std::path::Path,

@@ -79,8 +79,9 @@ describe('resolveThreadActions', () => {
 
   // A delegating parent: idle apart from a running sub-thread. The child
   // writes its own worktree, so the parent's own change is resolvable (ADR
-  // 0249). A live event wait still withholds both.
-  it('a running sub-thread does not withhold Apply or Discard; an event wait does', () => {
+  // 0249). A live event wait still withholds both, and offers the standing
+  // apply in their place: the wait ends by itself (ADR 0266).
+  it('a running sub-thread does not withhold Apply or Discard; an event wait swaps them for the standing apply', () => {
     const parent = makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true, activeChildrenCount: 2 },
     });
@@ -91,7 +92,7 @@ describe('resolveThreadActions', () => {
     setThread(makeThreadState('t1', {
       meta: { ...parent.meta, liveEventWaitCount: 1 },
     }));
-    expect(kinds(resolveThreadActions('t1'))).toEqual(['save']);
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['apply_when_settled', 'save']);
   });
 
   it('Apply gets a compact "Apply*" marker for a restart-requiring change (restart is the separate switch)', () => {

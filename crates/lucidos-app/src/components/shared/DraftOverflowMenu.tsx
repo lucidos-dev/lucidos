@@ -1,4 +1,4 @@
-import { OverflowMenu, type OverflowMenuOpener } from './OverflowMenu';
+import { OverflowMenu, type HostOpener } from './OverflowMenu';
 import { TrashIcon } from './icons';
 import { discardDraft } from '../../store/actions/threadActions';
 import { draftRowTooltip } from '../drawer/threadRowInfo';
@@ -16,7 +16,7 @@ import type { Scope } from '../../store/store';
  *  destination is read live from the draft's compose `mode` + `scope` — the row
  *  already resolves these for its chips, so they're passed in rather than
  *  re-derived here. */
-export function DraftOverflowMenu({ threadId, mode, scope, contextName, createdAt, stopPropagation, extraClass, tabIndex, openRef }: {
+export function DraftOverflowMenu({ threadId, mode, scope, contextName, createdAt, stopPropagation, extraClass, tabIndex, hostOpener }: {
   threadId: string;
   mode: ComposeChannelMode;
   scope: Scope;
@@ -25,9 +25,9 @@ export function DraftOverflowMenu({ threadId, mode, scope, contextName, createdA
   stopPropagation?: boolean;
   extraClass?: string;
   tabIndex?: number;
-  /** Host-opened mode: no ⋯, the host's gesture opens the menu. The mobile
-   *  drawer row's long press is the only user. See <OverflowMenu>. */
-  openRef?: { current: OverflowMenuOpener | null };
+  /** Lets the drawer row open this menu from its own gesture: a desktop
+   *  right-click, or a mobile long press. See <OverflowMenu>. */
+  hostOpener?: HostOpener;
 }) {
   return (
     <OverflowMenu
@@ -35,7 +35,7 @@ export function DraftOverflowMenu({ threadId, mode, scope, contextName, createdA
       stopPropagation={stopPropagation}
       extraClass={extraClass}
       tabIndex={tabIndex}
-      openRef={openRef}
+      hostOpener={hostOpener}
       infoRows={() => draftRowTooltip(mode, scope, contextName, createdAt)}
       items={({ run }) => (
         // `discardDraft` confirms first and handles its own error/rollback toast,

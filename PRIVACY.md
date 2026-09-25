@@ -1,64 +1,59 @@
 # Privacy
 
-Lucidos is **local-first**: the engine runs on your own machine, and your
-workspace data lives on your filesystem and in a local PostgreSQL database that
-you control. This document explains what is stored locally, and when data leaves
-your machine and why. It also sets out, in full, the one recurring request
-Lucidos makes on its own.
+Lucidos is **local-first**. The engine runs on your machine. Your workspace data
+lives on your filesystem and in a local PostgreSQL database that you control.
+This document lists what Lucidos stores locally and when data leaves your
+machine.
 
-> **Pre-1.0.** Lucidos is pre-1.0 — the newest `v*` tag is the current
-> version. Behaviour can change before 1.0; this document describes the
-> current release. If a change affects what leaves your machine, we'll call it
-> out in the [CHANGELOG](CHANGELOG.md).
+> **Pre-1.0.** The newest `v*` tag is the current version, and this document
+> describes it. Behaviour can change before 1.0. We note any change to what
+> leaves your machine in the [CHANGELOG](CHANGELOG.md).
 
 ## TL;DR
 
-- Your workspace — events, threads, messages, memory, artifacts, settings — is
-  stored **locally** (filesystem + local Postgres). Lucidos has no server, no
-  account, and no cloud sync.
-- **No analytics, no usage statistics, no crash reports.** Nothing about what
-  you do in Lucidos is collected or sent anywhere.
+- Your workspace (events, threads, messages, memory, artifacts, settings) is
+  stored **locally**, on the filesystem and in local Postgres. There is no
+  account and no cloud sync.
+- Lucidos collects **no telemetry**: no analytics, usage statistics, or crash
+  reports.
 - **One recurring request.** Once an hour Lucidos asks `lucidos.dev` whether a
-  newer version is published. It sends your platform, your architecture and the
-  version you run, and nothing else. It is set out in full
-  [below](#update-checks), and you can turn it off.
-- Data leaves your machine **only** when you (or something you set up) invoke a
-  feature that talks to a third party — most importantly an **LLM call**, where
-  your prompt and its context are sent to the provider you configured.
-- Credentials and tokens are stored locally and are sent **only** to the
-  specific third-party API each one belongs to.
+  newer version is published. It sends only your platform, architecture and
+  version. [Update checks](#update-checks) explains how to turn it off.
+- Other data leaves your machine when you, or something you set up, use a
+  feature that talks to a third party. The main case is an **LLM call**: your
+  prompt and its context go to the provider you configured.
+- Credentials are stored locally. Each one goes only to the third-party API it
+  belongs to.
 
 ## What is stored locally
 
-Everything in a workspace lives under your control, in two places (see the
-[README](README.md#workspace-structure) for the on-disk layout):
+A workspace lives in two places (see the [README](README.md#workspace-structure)
+for the on-disk layout):
 
-- **A local PostgreSQL database** (event store, with `pgvector` for memory) —
-  the append-only event log is the source of truth. This includes your
-  conversation history, thread metadata, notifications, memory embeddings,
-  preferences, and the registries below.
-- **Git-tracked files under `data/`** — your artifacts, apps, triggers, and
+- **A local PostgreSQL database** (event store, with `pgvector` for memory). Its
+  append-only event log is the source of truth. It holds your conversation
+  history, thread metadata, notifications, memory embeddings, preferences, and
+  the registries below.
+- **Git-tracked files under `data/`**: your artifacts, apps, triggers, and
   knowhow.
 
-Embeddings for memory are computed **in-process by a local model** (fastembed);
-the text you store is not sent to a third party to be embedded.
+A local model (fastembed) computes memory embeddings in-process, on your
+machine.
 
-Nothing in this section is uploaded anywhere by Lucidos. Backups, exports, and
-moving a workspace between machines are actions **you** take explicitly.
+You make backups, exports, and moves to another machine yourself.
 
 ## Credentials and tokens
 
 API keys, OAuth tokens, SMTP/email logins, and other secrets you add are stored
-locally in your workspace database (the `credentials`, `oauth_accounts`, and
-`email_accounts` tables). They are:
+in your workspace database (the `credentials`, `oauth_accounts`, and
+`email_accounts` tables).
 
-- **Kept on your machine.** A secret never leaves your machine except inside the
-  requests Lucidos makes to the **specific third-party API that credential is
-  for** — e.g. a GitHub token is sent to GitHub, an LLM key to that LLM
-  provider, an SMTP password to your mail server.
-- **Never broadcast in events.** Credential-related events record only the
-  service name, never the secret value, so secrets don't travel over the
-  internal event/SSE stream to connected browser tabs.
+- **Each secret goes only to its own API.** Lucidos sends a secret only in
+  requests to the third-party API it belongs to. A GitHub token goes to GitHub,
+  an LLM key to that LLM provider, and an SMTP password to your mail server.
+- **Events carry the service name only.** Credential-related events record the
+  service name and omit the secret value. Secrets therefore stay off the
+  internal event/SSE stream that reaches connected browser tabs.
 
 You are responsible for the third-party accounts you connect and for the terms
 that govern them.
@@ -67,64 +62,52 @@ that govern them.
 
 ### LLM calls
 
-Lucidos is built around a large language model, and **invoking it sends data off
-your machine.** When the agent runs — when you chat, when a trigger fires, when
-an app or coding-agent thread calls the model — your **prompt and its context**
-are sent to the LLM provider you have configured. That context can include the
-conversation, retrieved memory, and the content of files or artifacts relevant
-to the request.
+Each time the agent runs, it sends your **prompt and its context** to the LLM
+provider you configured. The agent runs when you chat, when a trigger fires, and
+when an app or coding-agent thread calls the model. The context can include the
+conversation, retrieved memory, and the content of relevant files or artifacts.
 
-You choose the provider via configuration (`LUCIDOS_MODEL` and the model
+You choose the provider in configuration (`LUCIDOS_MODEL` and the model
 registry). Supported backends are **Anthropic**, **Google Vertex AI**, and
-**OpenAI**. Whatever is sent is handled under **that provider's terms and
-privacy policy** — review the policy of the provider you use. Lucidos does not
-add a layer of its own in between; it calls the provider you pointed it at,
-using your credentials.
+**OpenAI**. Lucidos calls that provider directly, with your credentials. The
+provider's terms and privacy policy govern what it receives.
 
 ### Tools that make outbound calls on your behalf
 
-Some built-in tools reach the network when the agent uses them. Each is a
-deliberate call made to perform the task you asked for, not background
-collection:
+Some built-in tools reach the network when the agent uses them for a task you
+asked for:
 
-- **`web_search`** — queries a web search service.
-- **`fetch_news`** — queries the public GDELT news API (`api.gdeltproject.org`).
-- **Browser tool** — navigates to and loads the web pages you direct it to.
-- **Email** — sends messages through the SMTP account you configured. (Sent-mail
-  events record envelope metadata only — recipients, subject — never the message
-  body.)
-- **HTTP / API calls** — apps, triggers, and the proxy can call external APIs
-  you set up, authenticated with the credentials you stored.
+- **`web_search`** queries a web search service.
+- **`fetch_news`** queries the public GDELT news API (`api.gdeltproject.org`).
+- **Browser tool** loads the web pages you direct it to.
+- **Email** sends messages through the SMTP account you configured. Sent-mail
+  events record only envelope metadata: recipients and subject.
+- **HTTP / API calls**: apps, triggers, and the proxy can call external APIs you
+  set up, with the credentials you stored.
 
-In addition, local models and assets (for example the embedding model) may be
-**downloaded once** from their source on first use; after that they run locally.
+Some local models and assets, such as the embedding model, download once from
+their source on first use. After that they run locally.
 
 ### Coding-agent threads
 
-When you run a coding-agent thread, Lucidos drives an **external coding-agent
-CLI** as a subprocess — **Claude Code** (`claude`) or **Codex** (`codex`),
-whichever you invoke. That tool is a separate program with its own network
-behaviour:
+A coding-agent thread runs an **external coding-agent CLI** as a subprocess:
+**Claude Code** (`claude`) or **Codex** (`codex`). That CLI is a separate
+program with its own network behaviour:
 
 - It sends the **code and context it works on** to **its own** model provider
-  (Anthropic for Claude Code, OpenAI for Codex), under that tool's and that
-  provider's terms. This is independent of the LLM provider you configured for
-  the Lucidos agent.
-- It runs ordinary developer commands **on your behalf** — `git` operations
-  (clone / fetch / push to the remotes *you* configured) and dependency
-  installs (`npm`, `cargo`, …) that reach the package registries those tools
-  use.
+  (Anthropic for Claude Code, OpenAI for Codex). That tool's and that
+  provider's terms apply. This provider is separate from the one you configured
+  for the Lucidos agent.
+- It runs ordinary developer commands **on your behalf**. These include `git`
+  operations (clone, fetch, push to the remotes *you* configured) and dependency
+  installs (`npm`, `cargo`, …) that reach those tools' package registries.
 
 ### Update checks
 
-Once an hour the **gateway** asks `lucidos.dev` whether a newer version of
-Lucidos is published, so it can offer you the update. This is the only request
-Lucidos makes on a schedule you did not configure. It is also the only one that
-reaches a server the Lucidos project operates.
-
-One request per machine, whatever you are running: the gateway is machine-global
-and every open window reads its one answer. It covers every install, the macOS
-app and the `curl … | sh` runtime alike, on macOS and on Linux.
+Once an hour, the **gateway** asks `lucidos.dev` whether a newer version of
+Lucidos exists. The gateway is machine-global, so each machine sends one request
+per hour. This applies to the macOS app and the `curl … | sh` runtime, on macOS
+and Linux.
 
 **What it sends.** Three values, in the URL:
 
@@ -134,90 +117,66 @@ app and the `curl … | sh` runtime alike, on macOS and on Linux.
 | architecture | `aarch64` | the same |
 | version | `1.2.3` | so the origin can answer an old version correctly |
 
-**What it also reveals.** Like any web request it carries your **IP address**,
-which our CDN (Cloudflare) sees while terminating TLS. An hourly request from
-one address therefore shows that Lucidos was running there. We say so plainly,
-because "platform, architecture and version" alone would be a half-truth.
+The request also carries your **IP address**, which our CDN (Cloudflare) sees.
+An hourly request from one address shows when Lucidos was running there. We use
+aggregate request counts per platform to estimate how many installs exist.
 
-**What it does not send.** No account, no machine identifier, no workspace name
-or count, no counter, and nothing about what you use Lucidos for. It carries no
-cookie and no credentials, and the client follows no redirect.
+**Installing.** The check only reports that an update exists. In the macOS app,
+you click to install and relaunch. A headless install shows the `install.sh`
+command to run.
 
-**What we do with it.** We read aggregate request counts per platform, so the
-project can tell roughly how many installs exist. We retain no per-request
-identity for this route.
-
-**Nothing installs itself.** The check only tells you a version exists. Taking
-it is your click: the macOS app installs and relaunches, and a headless install
-gives you the exact `install.sh` command to run.
-
-**It is on by default, and you are not asked first.** Lucidos does not open with
-a consent dialog about it, for the same reason `npm`, `cargo`, `gh` and Homebrew
-do not. This page is the notice, and the switch named below is the control.
-
-**Turning it off.** Settings > System > Overview > Check for updates automatically, or set
+**Turning it off.** The check is on by default. Turn it off in
+Settings > System > Overview > Check for updates automatically, or set
 `enabled = false` under `[release_check]` in `~/.lucidos/updates.toml`. The
-gateway re-reads that file on every tick, so it stops at once. The **Check for
-Updates** button on that same page still works while it is off. Turning it off
-therefore costs you nothing but the automatic poll.
+change takes effect immediately. The **Check for Updates** button still works
+while it is off.
 
-**A dev build never checks.** A gateway launched from a source checkout makes no
-request at all, whatever its configuration says.
+Dev builds launched from a source checkout skip the check.
 
 ### Release notes
 
-Opening **Settings > System > What's New** fetches the project's published
-changelog. That is what lets the panel show you a release newer than the copy
-you are running. The request goes to
-`raw.githubusercontent.com/lucidos-dev/lucidos/main/CHANGELOG.md` and tells
-GitHub your IP address, under GitHub's privacy policy. It is a plain download of
-a public file. It carries no workspace data, no usage information, and not even
-your version.
+Opening **Settings > System > What's New** downloads the project's published
+changelog, so the panel can show releases newer than your copy. The request goes
+to `raw.githubusercontent.com/lucidos-dev/lucidos/main/CHANGELOG.md`. GitHub
+sees your IP address, under GitHub's privacy policy. It is a plain download of a
+public file, with no workspace data, usage data, or version attached.
 
-Unlike the update check above, this is **not** recurring: it happens when you
-open the panel, never on a schedule, and the answer is reused for hours. If it
-fails, the panel silently shows the release notes that shipped inside your own
-copy, so it still works offline.
+The download happens only when you open the panel, and Lucidos reuses the answer
+for hours. If it fails, the panel silently shows the release notes bundled with
+your copy. So the panel works offline.
 
 ### Plugins and plugin marketplaces
 
-Plugins live in **git repositories**. Installing a plugin clones or fetches from
-the repository its `source` points to; adding a plugin **marketplace** registers
-a git repository that Lucidos can list plugins from. Once a marketplace is
-registered, Lucidos polls it on a periodic background check and **auto-updates**
-installed plugins from their source when a newer version is published.
+Plugins live in **git repositories**. Installing a plugin clones or fetches the
+repository its `source` points to. Adding a plugin **marketplace** registers a
+git repository that Lucidos can list plugins from. Once you register a
+marketplace, Lucidos polls it in a periodic background check. It then
+**auto-updates** installed plugins from their source when a newer version is
+published.
 
-**No marketplace is configured by default** — the marketplace registry is empty
-until you add one, so there is no plugin-related network traffic until you
-install a plugin or add a marketplace yourself.
+The marketplace registry starts empty. Plugin network traffic starts when you
+install a plugin or add a marketplace.
 
 ## Telemetry: there is none
 
-Lucidos collects **no telemetry**. It gathers no analytics and no usage
-statistics, and sends no crash or error report to us or to anyone else. It
-records nothing about what you do with it. Lucidos originates no network traffic
-beyond the activity described above:
+Lucidos collects **no telemetry**: no analytics, no usage statistics, and no
+crash or error reports, to us or anyone else. Its only network traffic is the
+activity described above:
 
-- LLM, tool, coding-agent and plugin calls. Each one serves a task you
-  initiated, or polls a source you configured.
-- The gateway's hourly [update check](#update-checks) against `lucidos.dev`,
-  which sends your platform, architecture and version and nothing else. You can
-  turn it off.
-- The *What's New* panel's download of the published changelog, when you open
-  it.
+- LLM, tool, coding-agent and plugin calls. Each serves a task you started, or
+  polls a source you configured.
+- The gateway's hourly [update check](#update-checks) to `lucidos.dev`. It sends
+  your platform, architecture and version, and you can turn it off.
+- The *What's New* panel's changelog download, when you open it.
 - The service worker's checks against **your own local engine** for a fresh
   frontend build.
 
-The update check is the one item there that reaches a server we operate. It is
-worth being exact about that trade. Until it existed, your privacy here rested
-on our **inability** to see anything: the check went to GitHub, whose logs we
-cannot read. Now it rests on the design above, and on our not looking. That is a
-real change in kind, and we would rather state it than have you find it.
+The update check is the only one of these that reaches a server we operate.
 
 ## Questions and reports
 
 For questions about this document, open a
-[GitHub Discussion](https://github.com/lucidos-dev/lucidos/discussions). If you
-believe you've found a privacy or security **vulnerability** (for example, a way
-data leaks that this document says it shouldn't), please **don't** open a public
-issue — follow the private disclosure process in [SECURITY.md](SECURITY.md).
+[GitHub Discussion](https://github.com/lucidos-dev/lucidos/discussions). To
+report a privacy or security **vulnerability**, such as a data leak this
+document says should not happen, use the private disclosure process in
+[SECURITY.md](SECURITY.md). Do not open a public issue.

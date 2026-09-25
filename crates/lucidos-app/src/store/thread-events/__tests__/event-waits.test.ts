@@ -3,10 +3,12 @@ import {
   describeWaitSubscription,
   eventWaitProjection,
   formatRemaining,
+  groupSubscriptions,
+  plainEventName,
   secondsRemaining,
 } from '../event-waits';
 import { resolveVisualStatus } from '../../../components/shared/ThreadStatusIcon';
-import { awaitedSubject, eventWaitStoppedSummary } from '../thread-event-types';
+import { awaitedSubject, eventWaitStoppedSummary, waitingFor } from '../thread-event-types';
 import type { EventWaitSummary, ThreadEvent } from '../thread-event-types';
 import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';
 
@@ -175,7 +177,7 @@ describe('describeWaitSubscription', () => {
   it('joins entries with "or", matching the per-entry OR the matcher runs', () => {
     expect(
       describeWaitSubscription([{ event_type: 'ChangeProposed' }, { event_type: 'ResponseGenerated' }]),
-    ).toBe('ChangeProposed or ResponseGenerated');
+    ).toBe('change proposed or response generated');
   });
 
   /** The raw operator JSON is developer-facing; the person reading this row is
@@ -184,8 +186,64 @@ describe('describeWaitSubscription', () => {
     const text = describeWaitSubscription([
       { event_type: 'ChangeProposed', condition: { file_count: { $gt: 0 } } },
     ]);
-    expect(text).toBe('ChangeProposed (filtered)');
+    expect(text).toBe('change proposed (matching only)');
     expect(text).not.toContain('$gt');
+  });
+
+  /** One `CodingAgentIdled` per session read as the same name six times. */
+  it('names a repeated event type once, with its condition count', () => {
+    const on = [1, 2, 3].map((n) => ({ event_type: 'CodingAgentIdled', condition: { n } }));
+    expect(describeWaitSubscription([...on, { event_type: 'ChangeProposed' }])).toBe(
+      'coding agent stopped working (3 conditions) or change proposed',
+    );
+  });
+});
+
+/** A person reads the waiting rows, so an event type shows as everyday words.
+ *  Event names are past tense, so one phrase fits a waiting row and an arrival
+ *  card alike. */
+describe('plainEventName', () => {
+  it.each([
+    ['BackgroundBashCompleted', 'background job finished'],
+    ['CodingAgentIdled', 'coding agent stopped working'],
+    ['ChangeProposed', 'change proposed'],
+    ['E2ELockReleased', 'test lock released'],
+  ])('uses the everyday name for %s', (type, words) => {
+    expect(plainEventName(type)).toBe(words);
+  });
+
+  it.each([
+    ['GithubWorkflowRunStateChanged', 'github workflow run state changed'],
+    ['SSEConnectionDropped', 'SSE connection dropped'],
+    ['ReportV2Published', 'report V2 published'],
+  ])('splits any other type into words: %s', (type, words) => {
+    expect(plainEventName(type)).toBe(words);
+  });
+
+  it.each(['', 'lowercase_name'])('leaves an odd input readable: %s', (type) => {
+    expect(plainEventName(type)).toBe(type === '' ? '' : 'lowercase name');
+  });
+});
+
+describe('groupSubscriptions', () => {
+  it('keeps first-seen order and collects each type\'s conditions', () => {
+    expect(groupSubscriptions([
+      { event_type: 'A', condition: { x: 1 } },
+      { event_type: 'B' },
+      { event_type: 'A', condition: { x: 2 } },
+    ])).toEqual([
+      { event_type: 'A', conditions: [{ x: 1 }, { x: 2 }] },
+      { event_type: 'B', conditions: [] },
+    ]);
+  });
+
+  /** An unfiltered entry matches every event of its type, so a sibling's
+   *  filter narrows nothing and the group must not claim it does. */
+  it('drops the conditions of a type that is also watched unfiltered', () => {
+    expect(groupSubscriptions([
+      { event_type: 'A', condition: { x: 1 } },
+      { event_type: 'A' },
+    ])).toEqual([{ event_type: 'A', conditions: [] }]);
   });
 });
 
@@ -233,19 +291,37 @@ describe('awaitedSubject', () => {
   );
 });
 
+/** Every wait label reads `<verb> for <subject>`. A gerund reason keeps a
+ *  colon, since "Waiting for watching" reads as a mistake. */
+describe('waitingFor', () => {
+  it.each([
+    ['the release build to finish', 'Waiting for the release build to finish'],
+    ['waiting for the e2e lock', 'Waiting for the e2e lock'],
+    ['The nightly import', 'Waiting for the nightly import'],
+    ['E2E suite to pass', 'Waiting for E2E suite to pass'],
+    ['something to change', 'Waiting for something to change'],
+    ['morning report to land', 'Waiting for morning report to land'],
+    ['Pending CI checks', 'Waiting for Pending CI checks'],
+    ['watching the deploy', 'Waiting: watching the deploy'],
+    ['Watching background work started in this thread', 'Waiting: Watching background work started in this thread'],
+  ])('frames %s', (reason, label) => {
+    expect(waitingFor('Waiting', reason)).toBe(label);
+  });
+});
+
 /** One phrasing for one concept: this label is the transcript's stop row AND
  *  the header of the turn a user's **Stop waiting** opens, so both inherit the
  *  strip. A legacy row carries no reason and says the one thing it knows. */
 describe('eventWaitStoppedSummary', () => {
   it('does not say "waiting" twice', () => {
     expect(eventWaitStoppedSummary('waiting for the e2e lock')).toBe(
-      'Stopped waiting: the e2e lock',
+      'Stopped waiting for the e2e lock',
     );
   });
 
   it('keeps a reason that never duplicated the verb', () => {
     expect(eventWaitStoppedSummary('the release build to finish')).toBe(
-      'Stopped waiting: the release build to finish',
+      'Stopped waiting for the release build to finish',
     );
   });
 

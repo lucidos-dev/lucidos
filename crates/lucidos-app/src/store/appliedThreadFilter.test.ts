@@ -3,7 +3,7 @@
  * paginates from, as opposed to the live signals the *thread filter panel*'s
  * checkboxes write.
  *
- * The panel covers the list completely (`.thread-filter-panel` is
+ * The panel covers the list completely (`.thread-filter-cover` is
  * `position: absolute; inset: 0` over the pane's own opaque background), so
  * every tick used to re-run the drawer's O(threads) categorization, rebuild
  * every row, and fire a page + archived-count fetch for rows nobody can see,
@@ -121,7 +121,7 @@ describe('appliedThreadFilter', () => {
  *
  * Deliberately scoped to the two files where a live read means "the list", not
  * to every consumer. The panel, its option lists and the header's
- * filter-active highlight all read the live signals on purpose.
+ * Filter glyph all read the live signals on purpose.
  *
  * It forbids the NAMES rather than a particular use of them, which is broader
  * than the rule it enforces and is meant to be: everything either of these two

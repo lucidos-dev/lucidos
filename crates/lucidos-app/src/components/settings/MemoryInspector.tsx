@@ -216,7 +216,11 @@ export function MemoryInspector() {
 
   const importanceParam = [...importanceFilter].join(',');
 
+  // Numbers each read of the entries. A filter or page change can start a read
+  // before the last one answers, and only the newest may land.
+  const entriesRequest = useRef(0);
   const loadEntries = useCallback(async (newOffset: number) => {
+    const request = ++entriesRequest.current;
     entriesLoadable.value = { status: 'loading' };
     try {
       const data = await getMemoryEntries({
@@ -226,9 +230,9 @@ export function MemoryInspector() {
         sort: sortBy,
         importance: importanceParam || undefined,
       });
-      entriesLoadable.value = { status: 'loaded', data };
+      if (request === entriesRequest.current) entriesLoadable.value = { status: 'loaded', data };
     } catch (e) {
-      entriesLoadable.value = toFailed(e);
+      if (request === entriesRequest.current) entriesLoadable.value = toFailed(e);
     }
   }, [sourceFilter, sortBy, importanceParam]);
 

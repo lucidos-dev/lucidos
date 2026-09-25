@@ -106,7 +106,7 @@ export function MicrophonePicker({
     <OverflowMenu
       ariaLabel="Choose a microphone"
       stopPropagation
-      openRef={openRef}
+      hostOpener={{ ref: openRef, trigger: false }}
       items={({ run }) => <MicrophoneList run={run} />}
     />
   );

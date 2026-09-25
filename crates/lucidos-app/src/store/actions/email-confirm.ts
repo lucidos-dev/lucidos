@@ -1,8 +1,9 @@
-import { activeInlineForm, panelOverlay } from '../store';
+import { activeInlineForm, closeInlineForm, panelOverlay } from '../store';
 import type { EmailConfirmForm } from '../store';
 import type { EmailConfirmRequest } from '../types';
 import { pushNavState, replaceNavState } from './navigation';
 import { revealContentPane } from './pane';
+import { cancelFormRequestById } from './form-request-cancel';
 
 /** Open the email confirmation panel for the draft the engine staged. The panel
  *  takes over the content pane; the user stays on whatever menu item they were
@@ -62,4 +63,12 @@ export function markEmailSent(
   };
   replaceNavState();
   return true;
+}
+
+/** The panel's Cancel. Closes it, and answers the request that opened it so it
+ *  is not offered again on this device or any other. */
+export function cancelEmailConfirm(form: EmailConfirmForm): void {
+  closeInlineForm();
+  const requestId = form.request.form_request_id;
+  if (requestId) void cancelFormRequestById(requestId);
 }

@@ -101,6 +101,9 @@ it.
   ranking this decision had just deleted. Holding the pressed control cannot
   produce the drift that amendment answered. So the press wins from every park
   now, and only a ride already carrying the reader outranks it.
+- Amended: no ride outranks the press any more. ADR 0064's follow is one state
+  again, so a press whose hold leaves an armed reader off the live edge retires
+  the ride instead (`honourAnchoredMutation`).
 - A press that collapses the transcript by an order of magnitude reveals the
   mobile header. `useHideOnScroll` re-takes its baseline one frame after the
   anchor write, and a shrink that large settles later. The reader lands near the

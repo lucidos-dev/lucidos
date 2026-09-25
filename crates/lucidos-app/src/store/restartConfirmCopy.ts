@@ -1,5 +1,11 @@
 import type { CommitGroup, CommitGroupKind, PendingCommits } from '../api/client';
-import { GROUP_LABEL, housekeepingLine, pendingCommitsHeadline } from './backgroundActivity';
+import {
+  GROUP_LABEL,
+  comeWithTheNewVersion,
+  describedItems,
+  housekeepingLine,
+  pendingCommitsHeadline,
+} from './backgroundActivity';
 import type { RestartGroup } from './store';
 import type { ConfirmDetails } from './types';
 
@@ -97,16 +103,8 @@ function pendingIntro(total: number, housekeeping: number, described: boolean): 
   // Everything in the range is housekeeping, so the count IS the sentence.
   // Saying "12 commits, including 12 housekeeping commits" is true and reads
   // like a mistake.
-  if (!described) return `${housekeepingLine(total)} since your running version.`;
+  if (!described) return `${housekeepingLine(total)} ${comeWithTheNewVersion(total)}.`;
   return `${pendingCommitsHeadline(total)}, including ${housekeepingLine(housekeeping)}.`;
-}
-
-/** One group's bullets, with the tail the engine capped off named rather than
- *  dropped. A list that silently under-reports its own count is how a reader
- *  concludes a version is smaller than it is. */
-function describedItems(group: CommitGroup): string[] {
-  const hidden = group.total - group.descriptions.length;
-  return hidden > 0 ? [...group.descriptions, `and ${hidden} more`] : [...group.descriptions];
 }
 
 /** The applied changes this restart activates, grouped by the thread that

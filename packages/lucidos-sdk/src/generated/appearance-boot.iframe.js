@@ -34,6 +34,35 @@
     if (theme === "system") return prefersLight ? "light" : "dark";
     return theme;
   }
+  var MOTION_PREFS = ["system", "reduce", "full"];
+  var DEFAULT_MOTION = "system";
+  var MOTION_STORAGE_KEY = "lucidos-motion";
+  var REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+  function parseMotion(raw) {
+    return raw && MOTION_PREFS.includes(raw) ? raw : DEFAULT_MOTION;
+  }
+  function resolveReducedMotion(pref, osReduces) {
+    if (pref === "system") return osReduces;
+    return pref === "reduce";
+  }
+  function motionAttribute(reduced) {
+    return reduced ? "reduce" : "full";
+  }
+  var ANIMATION_SPEED_STORAGE_KEY = "lucidos-animation-speed-slider";
+  var ANIMATION_SPEED_MIN = -10;
+  var ANIMATION_SPEED_MAX = 10;
+  function parseAnimationSpeed(raw) {
+    const n = parseInt(raw != null ? raw : "", 10);
+    if (isNaN(n)) return 0;
+    return Math.max(ANIMATION_SPEED_MIN, Math.min(ANIMATION_SPEED_MAX, n));
+  }
+  function speedMultiplierFor(position) {
+    return Math.pow(10, position / 10);
+  }
+  var REDUCED_MOTION_DURATION_SCALE = 1e-3;
+  function durationScaleFor(sliderPosition, reduced) {
+    return reduced ? REDUCED_MOTION_DURATION_SCALE : 1 / speedMultiplierFor(sliderPosition);
+  }
   function resolveFontKey(stored) {
     return stored && hasOwn(FONT_FAMILY_VALUES, stored) ? stored : DEFAULT_FONT_FAMILY;
   }
@@ -218,6 +247,15 @@
       (served == null ? void 0 : served["ui-scale"]) || (served == null ? void 0 : served["text-size"]) || (served == null ? void 0 : served["font-size"]) || wsLocalGet("lucidos-ui-scale")
     );
     if (scale !== null) d.style.setProperty("--user-ui-scale", `${scale}%`);
+    const reducedMotion = resolveReducedMotion(
+      parseMotion(seeded(served, "motion", MOTION_STORAGE_KEY)),
+      matchMedia(REDUCED_MOTION_QUERY).matches
+    );
+    d.setAttribute("data-motion", motionAttribute(reducedMotion));
+    if (opts.durationScale) {
+      const position = parseAnimationSpeed(wsLocalGet(ANIMATION_SPEED_STORAGE_KEY));
+      d.style.setProperty("--duration-scale", String(durationScaleFor(position, reducedMotion)));
+    }
     try {
       if (opts.styleReset && styleResetRequested(location.search)) {
         wsLocalRemove(STYLE_OVERRIDES_STORAGE_KEY);
@@ -231,9 +269,9 @@
       }
     } catch (e) {
     }
-    return { raw, theme, resolved, prefersLight };
+    return { raw, theme, resolved, prefersLight, reducedMotion };
   }
 
   // src/boot/iframe.ts
-  applyAppearanceBoot({ styleReset: false });
+  applyAppearanceBoot({ styleReset: false, durationScale: false });
 })();

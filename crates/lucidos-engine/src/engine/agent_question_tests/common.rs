@@ -10,6 +10,7 @@ pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
         id: id.into(),
         label: label.into(),
         description: None,
+        preview: None,
     }
 }
 

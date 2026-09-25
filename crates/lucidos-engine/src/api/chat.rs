@@ -318,6 +318,7 @@ pub(crate) async fn process_orphan_chain(
                     None,
                     None,
                     crate::engine::FollowUpUrgency::Normal,
+                    None,
                 )
                 .await
             {
@@ -1284,10 +1285,26 @@ pub(super) async fn chat_submit(
         )
         .await;
 
+    // A coding-agent follow-up is recorded after the ack, not before it, so
+    // the ack alone cannot keep a client's one-at-a-time sends in order. Take
+    // this follow-up's place in the thread's order now, before the ack.
+    let follow_up_turn = match thread_id {
+        Some(tid) if thread_exists && use_coding_agent == Some(true) => {
+            Some(state.engine.follow_up_order.join(tid))
+        }
+        _ => None,
+    };
+
     let engine_for_panic = state.engine.clone();
     let thread_id_for_panic = thread_id;
     let actor_for_apply = origin.clone();
+    let mut follow_up_turn = follow_up_turn;
     let handle = tokio::spawn(async move {
+        // Wait for this follow-up's turn BEFORE taking a capacity slot, so a
+        // later follow-up never holds a slot idle while an earlier one waits.
+        if let Some(turn) = follow_up_turn.as_mut() {
+            turn.wait_for_predecessor().await;
+        }
         // User-initiated work shares the one capacity pool (ADR 0008): take a
         // prioritized slot, held across the whole response. Admits at once
         // when the pool has room; at true pool-max this awaits a free slot
@@ -1326,6 +1343,7 @@ pub(super) async fn chat_submit(
                 origin,
                 None,
                 crate::engine::FollowUpUrgency::Normal,
+                follow_up_turn,
             )
             .await;
 

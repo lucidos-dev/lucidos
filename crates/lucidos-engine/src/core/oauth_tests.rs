@@ -1344,6 +1344,7 @@ async fn callback_survives_a_connection_that_closes_without_sending() {
 fn active_flow(task: tokio::task::JoinHandle<()>, holds_port: bool) -> Option<ActiveCallbackFlow> {
     Some(ActiveCallbackFlow {
         task,
+        request_id: uuid::Uuid::nil(),
         holds_port: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(holds_port)),
     })
 }
@@ -1373,9 +1374,10 @@ async fn releasing_the_callback_port_frees_it_for_an_immediate_rebind() {
     // Let it reach the await point, as a real waiting flow has.
     tokio::task::yield_now().await;
 
-    assert!(
+    assert_eq!(
         release_callback_port(&mut slot).await,
-        "a flow that was still waiting counts as superseded"
+        Some(uuid::Uuid::nil()),
+        "a flow that was still waiting is superseded, and names its form request"
     );
     assert!(slot.is_none(), "the slot is emptied, not left dangling");
 
@@ -1404,7 +1406,7 @@ async fn a_flow_that_already_released_the_port_is_detached_not_aborted() {
     );
 
     assert!(
-        !release_callback_port(&mut slot).await,
+        release_callback_port(&mut slot).await.is_none(),
         "a flow that no longer holds the port supersedes nothing"
     );
     assert!(slot.is_none());
@@ -1417,10 +1419,77 @@ async fn a_flow_that_already_released_the_port_is_detached_not_aborted() {
         .expect("the detached flow must run to completion");
 }
 
+/// The authorization page is a *form request*. Every way its wait can end
+/// closes it, so a reconnect never reopens a page nobody is listening for.
+#[test]
+fn every_end_of_the_callback_wait_answers_the_authorization_page() {
+    use crate::engine::thread_events::FormRequestOutcome;
+    let timed_out: Result<Result<(), String>, ()> = Err(());
+    let provider_error: Result<Result<(), String>, ()> = Ok(Err("access_denied".into()));
+    let callback: Result<Result<(), String>, ()> = Ok(Ok(()));
+    assert_eq!(
+        authorization_outcome(&timed_out),
+        FormRequestOutcome::Expired
+    );
+    assert_eq!(
+        authorization_outcome(&provider_error),
+        FormRequestOutcome::Canceled
+    );
+    assert_eq!(
+        authorization_outcome(&callback),
+        FormRequestOutcome::Completed
+    );
+}
+
+/// The authorization URL is now stored, in an `OAuthAuthorizationRequested`
+/// row. It may carry only what the browser receives anyway: never the client
+/// secret, and never the PKCE verifier (only its challenge).
+#[test]
+fn the_stored_authorization_url_carries_no_secret() {
+    let confidential = ClientAuth::from_secret(Some("s3cr3t-value"));
+    let url = build_authorize_url(
+        "https://auth.example.com/authorize",
+        "client-1",
+        "http://localhost:8765/callback",
+        "read",
+        "state-1",
+        &confidential,
+        &AuthorizeParams::parse(None).unwrap(),
+    );
+    assert!(!url.contains("s3cr3t-value"), "{url}");
+
+    let public = ClientAuth::from_secret(None);
+    let url = build_authorize_url(
+        "https://auth.example.com/authorize",
+        "client-1",
+        "http://localhost:8765/callback",
+        "read",
+        "state-1",
+        &public,
+        &AuthorizeParams::parse(None).unwrap(),
+    );
+    let verifier = public
+        .code_verifier()
+        .expect("a public client has a verifier");
+    assert!(!url.contains(verifier), "{url}");
+    assert!(
+        url.contains("code_challenge="),
+        "the challenge is what it sends"
+    );
+}
+
+/// The engine only asked a client to open the page. A lost frame looks the
+/// same from here, so the timeout must not claim the page was ever shown.
+#[test]
+fn the_timeout_does_not_claim_the_page_opened() {
+    assert!(OAUTH_TIMEOUT_MSG.contains("may not have opened"));
+    assert!(OAUTH_TIMEOUT_MSG.contains("Start the connection again"));
+}
+
 #[tokio::test]
 async fn releasing_an_empty_slot_supersedes_nothing() {
     let mut empty: Option<ActiveCallbackFlow> = None;
-    assert!(!release_callback_port(&mut empty).await);
+    assert!(release_callback_port(&mut empty).await.is_none());
 }
 
 /// `EADDRINUSE` is the one bind failure with a remedy, and it reaches the user

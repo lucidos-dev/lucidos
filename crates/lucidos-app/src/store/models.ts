@@ -51,7 +51,7 @@ export function providerLabel(provider: string): string {
   return PROVIDERS.find((p) => p.value === provider)?.label ?? provider;
 }
 
-/** Reasoning effort levels for Claude Code thinking budget. */
+/** The unified effort ladder, ascending, in the Lucidos Agent's vocabulary. */
 export const REASONING_LEVELS = [
   { value: 'none', label: 'Off' },
   { value: 'low', label: 'Low' },

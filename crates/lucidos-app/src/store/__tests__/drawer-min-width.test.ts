@@ -11,11 +11,15 @@
  *
  * The floor turned symmetric when the Threads title moved off the gap between
  * its two buttons and onto the pane's own middle: a centred title clears the
- * WIDER of the row's two ends on BOTH sides, so the reserve is now paid twice.
+ * WIDER of the row's two ends on BOTH sides, so the wider end is paid twice.
  * Then it turned build-independent: the web client pays the same reserve, so a
  * workspace stops the drawer at the same width in the browser as in the app.
  *
- * Three things are pinned: the arithmetic at both roots and at both leads, the
+ * The two ends are the lead plus the drawer toggle, which rests over the row,
+ * and the padding plus Filter and Search. The first is the wider one up to
+ * about 166% ui-scale, because the lead is a px reserve and the rest is rem.
+ *
+ * Three things are pinned: the arithmetic on both sides of that crossing, the
  * re-clamp a UI-scale change owes a settled drawer, and the fact that the TS
  * mirror of the row's rem parts still matches the CSS declaring them.
  */
@@ -38,50 +42,76 @@ const shellCss: string = readFileSync(
   resolve(here, '../../styles/panels/shell.css'), 'utf-8',
 );
 
-/** The rem parts of the row, mirrored from `computeMinDrawerWidth`'s constants:
- *  a button and a gap at each end, and the title between them. */
-const ROW_REM = 2 * (2.25 + 0.25) + 4.5;
-/** The row's own padding, per end. */
+/** A button and its gap, mirrored from `computeMinDrawerWidth`'s constants. */
+const BUTTON_REM = 2.25 + 0.25;
+/** The title's own room. */
+const TITLE_REM = 4.5;
+/** The row's own trailing padding. */
 const PAD_REM = 0.5;
 const LIGHTS_RESERVE_PX = 80;
 
+/** The row's leading end at a root: the lead, then the drawer toggle. */
+const leadEnd = (rem: number, lead = LIGHTS_RESERVE_PX) => lead + BUTTON_REM * rem;
+/** The row's trailing end at a root: the padding, then Filter and Search. */
+const trailEnd = (rem: number) => (PAD_REM + 2 * BUTTON_REM) * rem;
+
 describe('computeMinDrawerWidth', () => {
-  it('is symmetric around the centred title, paying the lead at both ends', () => {
+  it('is symmetric around the centred title, paying the wider end at both sides', () => {
     // The title is centred on the PANE (`.threads-header-title`), not on the gap
-    // between the two buttons, so the floor is `2 * side + title` rather than a
-    // single run of controls, and whatever leads the row is paid on both sides.
+    // between the controls, so the floor is `2 * side + title` rather than a
+    // single run of controls, and the wider end is paid on both sides.
     expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX))
-      .toBe(Math.ceil(2 * LIGHTS_RESERVE_PX + ROW_REM * 16));
+      .toBe(Math.ceil(2 * leadEnd(16) + TITLE_REM * 16));
     expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX)).toBe(312);
+  });
+
+  it('is sized by the leading end through the everyday scales', () => {
+    // 75% to 162.5%: the px reserve plus the toggle outweighs Filter and Search.
+    for (const rem of [12, 16, 20, 22, 24, 26]) {
+      expect(leadEnd(rem), `${rem}px root`).toBeGreaterThan(trailEnd(rem));
+      expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
+        .toBe(Math.ceil(2 * leadEnd(rem) + TITLE_REM * rem));
+    }
+  });
+
+  it('is sized by the trailing end above about 166% ui-scale', () => {
+    // Filter and Search are all rem, the reserve is not, so from 175% up the
+    // trailing end is the wider one. A floor that kept paying the leading end
+    // there would let the title run under Filter.
+    for (const rem of [28, 32]) {
+      expect(trailEnd(rem), `${rem}px root`).toBeGreaterThan(leadEnd(rem));
+      expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
+        .toBe(Math.ceil(2 * trailEnd(rem) + TITLE_REM * rem));
+    }
+    expect(computeMinDrawerWidth(28, LIGHTS_RESERVE_PX)).toBe(434);
   });
 
   it('scales with the root font size, because the row does', () => {
     // The whole reason the constant had to go: at 125% the same controls need
     // 25% more room, and a px literal does not know that.
     expect(computeMinDrawerWidth(20, LIGHTS_RESERVE_PX))
-      .toBe(Math.ceil(2 * LIGHTS_RESERVE_PX + ROW_REM * 20));
-    expect(computeMinDrawerWidth(20, LIGHTS_RESERVE_PX))
       .toBeGreaterThan(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX));
   });
 
-  it('is what the row costs with only its own padding, plus the lead twice over', () => {
-    // The web row lays out at 0.5rem, and the floor it is held to is the
-    // packaged build's: the difference between the two is `2 * (reserve -
-    // padding)`, 144px at a 16px root, and it is title room the web row gains
-    // rather than anything it has to clear.
-    const rowsOwnPadding = Math.ceil(2 * PAD_REM * 16 + ROW_REM * 16);
-    expect(rowsOwnPadding).toBe(168);
-    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX))
-      .toBe(rowsOwnPadding + 2 * (LIGHTS_RESERVE_PX - PAD_REM * 16));
+  it('holds the web row to the packaged build\'s floor, as title room it gains', () => {
+    // The web row leads with the toggle at 0.5rem, so its own need is the
+    // wider of that end and the trailing one. The floor it is held to is the
+    // packaged build's (ADR 0058). The difference is title room the web row
+    // gains rather than anything it has to clear: 64px at a 16px root.
+    const webRow = Math.ceil(2 * Math.max(leadEnd(16, PAD_REM * 16), trailEnd(16)) + TITLE_REM * 16);
+    expect(webRow).toBe(248);
+    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX) - webRow)
+      .toBe(2 * (leadEnd(16) - trailEnd(16)));
   });
 
-  it('never lets the fixed reserve shrink an end below the row\'s own padding', () => {
-    // The reserve is px and the padding is rem, so at a large enough root the
-    // padding is the wider end and the max() in the floor is what picks it. A
-    // plain "take the reserve" lead would narrow the drawer as the UI scaled up,
-    // which is backwards.
-    expect(computeMinDrawerWidth(200, LIGHTS_RESERVE_PX))
-      .toBe(Math.ceil(2 * PAD_REM * 200 + ROW_REM * 200));
+  it('never stops the drawer narrower than the web row needs, at any root', () => {
+    // The floor is paid with the packaged build's lead on every client. It
+    // must still cover the web row wherever the rem part outgrows the reserve.
+    for (const rem of [12, 16, 24, 32, 48, 200]) {
+      const webRow = Math.ceil(2 * Math.max(leadEnd(rem, PAD_REM * rem), trailEnd(rem)) + TITLE_REM * rem);
+      expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
+        .toBeGreaterThanOrEqual(webRow);
+    }
   });
 
   it('exceeds the retired 260px constant exactly where the bug was reported', () => {
@@ -92,10 +122,11 @@ describe('computeMinDrawerWidth', () => {
 
   it('holds the reserve fixed while the rem part scales', () => {
     // The lights are OS chrome: they do not grow with our root font size, so
-    // doubling the root must double only the rem term.
-    const grew = computeMinDrawerWidth(32, LIGHTS_RESERVE_PX)
+    // growing the root grows only the rem term. 16px to 24px stays on the
+    // leading end, where the reserve is paid.
+    const grew = computeMinDrawerWidth(24, LIGHTS_RESERVE_PX)
       - computeMinDrawerWidth(16, LIGHTS_RESERVE_PX);
-    expect(grew).toBe(ROW_REM * 16);
+    expect(grew).toBe((2 * BUTTON_REM + TITLE_REM) * 8);
   });
 });
 
@@ -126,9 +157,8 @@ describe('minDrawerWidth reads the live root', () => {
     // The user's ask, and the one property that would silently rot if the
     // attribute crept back into the floor: a workspace has to stop the drawer at
     // the same width in the browser as in the packaged app. The attribute still
-    // decides how the row LAYS OUT (`:root[data-titlebar-overlay]
-    // .threads-header` takes the reserve as its padding-left); it decides
-    // nothing about how narrow the drawer may get.
+    // decides how the row LAYS OUT (it moves `--header-lead-inset`, which the
+    // row's lead reads); it decides nothing about how narrow the drawer may get.
     const web = minDrawerWidth();
     const root = document.documentElement;
     const had = root.hasAttribute;
@@ -205,17 +235,22 @@ describe('the TS mirror of the row still matches the CSS', () => {
   const desktopRoot = rules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
   const paneHeader = rules.find(r => r.selector === '.pane-header');
 
-  it('the icon box is 2.25rem, counted twice in the row', () => {
+  const row = rules.find(r => r.selector === '.threads-header' && r.atRules === DESKTOP);
+
+  it('the icon box is 2.25rem: the toggle, Filter and Search', () => {
     expect(desktopRoot?.props.get('--header-icon-box')).toBe('2.25rem');
   });
 
-  it('the row gap is 0.25rem, counted twice in the row', () => {
+  it('the row gap is 0.25rem, one per button', () => {
     expect(paneHeader?.props.get('--pane-header-gap')).toBe('0.25rem');
   });
 
-  it('the row padding is 0 0.5rem, half leading and half trailing', () => {
-    const row = rules.find(r => r.selector === '.threads-header' && r.atRules === DESKTOP);
-    expect(row?.props.get('padding')).toBe('0 0.5rem');
+  it('the row pads 0.5rem at its trailing end and the toggle\'s room at its leading one', () => {
+    expect(row?.props.get('padding')).toBe(`0 ${PAD_REM}rem 0 var(--threads-row-lead)`);
+    // One button and one gap past the lead: the toggle, which rests over the
+    // row. That is `leadEnd`, which the floor pays with the lights reserve.
+    expect(row?.props.get('--threads-row-lead'))
+      .toBe('calc(var(--header-lead-inset) + var(--header-icon-box) + var(--pane-header-gap))');
   });
 
   it('the lights reserve still SUMS to the px value the fallback restates', () => {
@@ -234,36 +269,28 @@ describe('the TS mirror of the row still matches the CSS', () => {
     expect(x + cluster + gap).toBe(LIGHTS_RESERVE_PX);
   });
 
-  it('the overlay build reserves exactly the lead the floor assumes', () => {
-    // The floor says "lights reserve, then the row"; the CSS has to actually
-    // keep that much clear, or the two describe different rows. It used to say
-    // "reserve + icon box + gap", because the Filter button was absolutely
-    // positioned out of the flow and the padding stood in for its footprint.
-    const overlayRow = rules.find(
-      r => r.selector === ':root[data-titlebar-overlay] .threads-header' && r.atRules === DESKTOP,
+  it('the overlay build leads with exactly the reserve the floor assumes', () => {
+    // The floor says "lights reserve, then the toggle"; the CSS has to keep
+    // that much clear, or the two describe different rows. The overlay build
+    // moves the toggle's inset, and the row's lead reads the same inset.
+    const overlayRoot = rules.find(
+      r => r.selector === ':root[data-titlebar-overlay]' && r.atRules === DESKTOP,
     );
-    expect(overlayRow?.props.get('padding-left')).toBe('var(--titlebar-lights-reserve)');
+    expect(overlayRoot?.props.get('--header-lead-inset')).toBe('var(--titlebar-lights-reserve)');
   });
 
-  it('the centred title clamps to the same lead the floor pays twice', () => {
-    // The floor is `2 * (lead + button + gap) + title`, and the doubling is
+  it('the centred title clamps to the same two ends the floor pays twice', () => {
+    // The floor is `2 * max(leadEnd, trailEnd) + title`, and the doubling is
     // there because the title is centred on the PANE. The CSS clamp has to
-    // count the same lead twice or the two disagree about the row: a clamp that
-    // paid it once would let the title run under the Filter button, and a floor
-    // that paid it once would stop the drawer at a width where the title it
-    // reserved 4.5rem for is an ellipsis. The exact clamp expression is pinned
-    // next door, in styles/__tests__/header-band-centering.test.ts.
+    // count the same two ends, or the two disagree about the row. Skip one in
+    // the clamp and the title runs under a control. Skip one in the floor and
+    // the drawer stops where the title is an ellipsis. The exact expression is
+    // pinned next door, in styles/__tests__/header-band-centering.test.ts.
     const title = rules.find(
       r => r.selector === '.threads-header-title' && r.atRules === DESKTOP,
     );
-    expect(title?.props.get('max-width')).toContain('2 * (var(--threads-title-lead)');
-    // …and on the overlay build that lead IS the reserve, which is what the
-    // floor's `leadPx` argument carries on every build.
-    const overlayTitle = rules.find(
-      r => r.selector === ':root[data-titlebar-overlay] .threads-header-title'
-        && r.atRules === DESKTOP,
-    );
-    expect(overlayTitle?.props.get('--threads-title-lead'))
-      .toBe('var(--titlebar-lights-reserve)');
+    const clamp = title?.props.get('max-width') ?? '';
+    expect(clamp).toContain('2 * max(var(--threads-row-lead),');
+    expect(clamp).toContain(`${PAD_REM}rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))`);
   });
 });

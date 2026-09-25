@@ -508,8 +508,8 @@ async fn startup_skips_already_resolved_permission_requests() {
 #[tokio::test]
 async fn typed_message_supersedes_pending_permission() {
     use crate::engine::cc_permission::{
-        resolve_pending_permissions_as_superseded, PermissionEntry, PermissionState,
-        SUPERSEDED_REASON,
+        resolve_pending_permissions_as_superseded, PermissionAnswer, PermissionEntry,
+        PermissionState, SUPERSEDED_REASON,
     };
     use std::sync::Mutex;
 
@@ -571,11 +571,11 @@ async fn typed_message_supersedes_pending_permission() {
 
     resolve_pending_permissions_as_superseded(&pool, &bus, &pending, thread_id, None).await;
 
-    // The in-memory waiter received a deny.
+    // The in-memory waiter was woken, and told nobody decided.
     assert_eq!(
         rx.recv().await.ok(),
-        Some(false),
-        "blocked MCP handler must be unblocked with a deny"
+        Some(PermissionAnswer::Withdrawn(SUPERSEDED_REASON)),
+        "blocked MCP handler must be unblocked without reading as a user deny"
     );
 
     // Exactly one Resolved emitted, carrying allowed=false + the superseded reason.
@@ -837,8 +837,8 @@ async fn permission_resolution_does_not_resurrect_idle_thread() {
 #[tokio::test]
 async fn idle_sweep_clears_pending_permission_without_resurrecting() {
     use crate::engine::cc_permission::{
-        resolve_pending_permissions_as_session_ended, PermissionEntry, PermissionState,
-        SESSION_ENDED_REASON,
+        resolve_pending_permissions_as_session_ended, PermissionAnswer, PermissionEntry,
+        PermissionState, SESSION_ENDED_REASON,
     };
     use std::sync::Mutex;
 
@@ -896,8 +896,8 @@ async fn idle_sweep_clears_pending_permission_without_resurrecting() {
 
     assert_eq!(
         rx.recv().await.ok(),
-        Some(false),
-        "the still-blocked MCP waiter must be unblocked with a deny"
+        Some(PermissionAnswer::Withdrawn(SESSION_ENDED_REASON)),
+        "the still-blocked MCP waiter must be unblocked without reading as a user deny"
     );
 
     let (resolved_count, allowed, reason): (i64, Option<bool>, Option<String>) = sqlx::query_as(

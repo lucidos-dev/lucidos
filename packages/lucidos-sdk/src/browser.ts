@@ -5,6 +5,7 @@ import { installKeyboardForwarding } from './keyboardForward';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
 import { installAutocorrectStamp } from './autocorrectStamp';
+import { installNoKeyCodeText } from './noKeyCodeText';
 import { isBridged } from './_bridge';
 import { primeBridgedStorage } from './_storage';
 import { installHostOps } from './hostOps';
@@ -17,6 +18,9 @@ if (typeof document !== 'undefined') {
   // from the first-paint seed or the default of on, and the prime below
   // corrects it to the device's stored value.
   installAutocorrectStamp();
+  // An arrow key with nowhere to move the caret types a square in the desktop
+  // app. The host's own guard cannot reach this frame, so it refuses here too.
+  installNoKeyCodeText();
   // Answer the host's own requests: capture, app switch, fragment delivery. It
   // reached through `contentWindow` for all three until an opaque origin closed
   // that. Installed unconditionally, so the host can ask the same way whichever

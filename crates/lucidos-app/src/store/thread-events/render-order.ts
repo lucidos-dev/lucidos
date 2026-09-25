@@ -74,8 +74,8 @@ function engagedKey(exchange: Exchange, index: number): RenderRow | null {
   // Never picked up. The turn above is still writing and owes this card
   // nothing, so no row above it can be late.
   if (isUningestedMessage(exchange)) return null;
-  // The reader's Stop, or a stopped child's note: neither takes a turn or
-  // draws a body.
+  // The reader's Stop, or a note that a child stopped or moved to top level:
+  // none takes a turn or draws a body.
   if (isTurnlessBoundary(exchange.userEvent)) return null;
   const pickedUp = ingestionStep(exchange);
   if (pickedUp) return rowOf(index, 'step', pickedUp.seq, pickedUp.event);
@@ -127,7 +127,8 @@ function resultRejoinsItsCall(exchange: Exchange, event: StoredEvent): boolean {
  * - **A. A message still in the queue.** `engagedKey` ends that window.
  * - **B. A result rejoining its call**, forgiven against the card that opened
  *   between the two and against no other.
- * - **C. The reader's Stop-waiting panel**, which takes no turn (ADR 0049).
+ * - **C. A turnless boundary** (`isTurnlessBoundary`), such as the reader's
+ *   Stop-waiting panel, which takes no turn (ADR 0049).
  */
 export function renderOrderViolations(exchanges: Exchange[]): RenderOrderViolation[] {
   const violations: RenderOrderViolation[] = [];

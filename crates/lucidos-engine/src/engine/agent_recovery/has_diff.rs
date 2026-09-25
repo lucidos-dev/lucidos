@@ -63,25 +63,17 @@ pub async fn recover_orphan_cc_permission_requests(
     );
 
     for (thread_id, request_id) in rows {
-        event_bus
-            .emit_or_log(
-                crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event:
-                        crate::engine::thread_events::ThreadEvent::CodingAgentPermissionResolved {
-                            request_id,
-                            allowed: false,
-                            reason: Some(
-                                "Coding agent terminated before answering: request expired"
-                                    .to_string(),
-                            ),
-                            persist_scope: None,
-                        },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
-                },
-                "[Recovery] CodingAgentPermissionResolved (orphan)",
-            )
-            .await;
+        crate::engine::cc_permission::emit_coding_agent_permission_resolved(
+            event_bus,
+            thread_id,
+            request_id,
+            false,
+            Some("Coding agent terminated before answering: request expired".to_string()),
+            None,
+            EventMeta::NONE,
+            "[Recovery] CodingAgentPermissionResolved (orphan)",
+        )
+        .await;
     }
 }
 
@@ -188,11 +180,9 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
 /// single-signal Diff button design treats them as first-class — they get
 /// the Diff signal, just no Apply path).
 ///
-/// Sequential per-thread for simplicity. The git lookup is a single
-/// `git rev-list` subprocess; at the expected scale (a few dozen active CC
-/// threads) the cumulative cost is negligible compared to the rest of
-/// engine boot. Buffered concurrency would only matter for hundreds of
-/// threads, which we don't expect.
+/// Threads reconcile concurrently, up to [`RECOVERY_GIT_CONCURRENCY`]. Each
+/// one writes only its own row, and the sweep runs before the HTTP bind, so
+/// its git calls sit directly on the boot splash.
 ///
 /// `lucidos_repo_root` is the main Lucidos repo path used for CC threads not
 /// bound to an external repo (`cc_repo_id IS NULL`). Tests inject a temp
@@ -260,114 +250,29 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
     }
 
     let total = active_threads.len();
-    let mut visited = 0usize;
-    let mut skipped_no_branch = 0usize;
-    let mut missing_worktree = 0usize;
     let started = std::time::Instant::now();
 
-    for ActiveCcThread {
-        thread_id,
-        cc_repo_id,
-        coding_agent_kind,
-    } in active_threads
-    {
-        // Look up the latest SessionStarted's branch. Most-recent wins because
-        // a thread may have multiple SessionStarted events (initial + resume +
-        // hardening); the last one names the live branch.
-        let branch: Option<String> = match sqlx::query_scalar(
-            "SELECT payload->>'branch' FROM events \
-             WHERE event_type = 'SessionStarted' AND thread_id = $1 \
-               AND payload->>'branch' IS NOT NULL AND payload->>'branch' != '' \
-             ORDER BY sequence DESC LIMIT 1",
-        )
-        .bind(thread_id)
-        .fetch_optional(pool)
+    let outcomes: Vec<HasDiffOutcome> = {
+        use futures::StreamExt;
+        futures::stream::iter(active_threads.into_iter().map(|thread| {
+            reconcile_one_active_thread(
+                pool,
+                workspace_path,
+                lucidos_repo_root,
+                &repo_root_by_id,
+                thread.thread_id,
+                thread.cc_repo_id,
+                thread.coding_agent_kind,
+            )
+        }))
+        .buffer_unordered(RECOVERY_GIT_CONCURRENCY)
+        .collect()
         .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                log!(
-                    "[Recovery] Failed to look up branch for thread {} during coding_agent_has_diff sweep: {}",
-                    thread_id,
-                    e
-                );
-                continue;
-            }
-        };
-
-        let branch_name = match branch {
-            Some(b) => b,
-            None => {
-                // Active CC thread with no SessionStarted carrying a branch
-                // is a projection invariant violation — every active CC
-                // thread MUST have at least one SessionStarted with a branch.
-                // If we hit this it's a real bug worth surfacing, not a
-                // silent skip.
-                log!(
-                    "[Recovery WARN] active CC thread {} has no SessionStarted with branch — projection invariant violated, skipping",
-                    thread_id
-                );
-                skipped_no_branch += 1;
-                continue;
-            }
-        };
-
-        // App coding-agent threads live in the WORKSPACE git repo (their branch
-        // holds the `data/apps/<id>/` edits) and carry a NULL `cc_repo_id`. Route
-        // them to `workspace_path` BEFORE the `cc_repo_id` branch — a NULL
-        // `cc_repo_id` otherwise falls through to `lucidos_repo_root`, where the
-        // `lucidos-<agent>-app-...` branch does not exist, so `proposal_files_for_branch`
-        // comes back empty and the sweep wipes `coding_agent_has_diff` to FALSE on
-        // every restart (hiding the WaitingBanner Diff button and the standalone
-        // WIP diff button). Mirrors the kind routing in
-        // `propose_one_held_back_change`.
-        let repo_root = if coding_agent_kind.as_deref() == Some("app") {
-            workspace_path.to_path_buf()
-        } else {
-            match cc_repo_id.as_deref() {
-                Some(rid) => repo_root_by_id.get(rid).cloned().unwrap_or_else(|| {
-                    log!(
-                        "[Recovery WARN] cc_repo_id {} not found in repositories map for thread {} — falling back to lucidos_repo_root",
-                        rid,
-                        thread_id
-                    );
-                    lucidos_repo_root.to_path_buf()
-                }),
-                None => lucidos_repo_root.to_path_buf(),
-            }
-        };
-
-        // Resolve the worktree the same way production code does. The
-        // deterministic path is the last-resort fallback inside
-        // `resolve_worktree_path`; using it directly here would skip the
-        // (1) `CodingAgentIdled.worktree_path` lookup and the (2)
-        // `git worktree list` branch match. Skipping (1)+(2) would make the
-        // sweep wipe `coding_agent_has_diff` for every legacy thread whose
-        // worktree lives at a non-deterministic path
-        // (e.g. `.lucidos/worktrees/cc-<random>` from before Phase 6.1) —
-        // exactly the population the sweep is supposed to recover for.
-        let worktree_path = resolve_worktree_path(
-            pool,
-            thread_id,
-            workspace_path,
-            &repo_root,
-            Some(&branch_name),
-        )
-        .await;
-        if !worktree_path.exists() {
-            missing_worktree += 1;
-        }
-
-        reconcile_thread_coding_agent_has_diff(
-            pool,
-            thread_id,
-            &repo_root,
-            &branch_name,
-            &worktree_path,
-        )
-        .await;
-        visited += 1;
-    }
+    };
+    let count = |wanted: HasDiffOutcome| outcomes.iter().filter(|o| **o == wanted).count();
+    let missing_worktree = count(HasDiffOutcome::VisitedMissingWorktree);
+    let visited = count(HasDiffOutcome::Visited) + missing_worktree;
+    let skipped_no_branch = count(HasDiffOutcome::NoBranch);
 
     log!(
         "[Recovery] coding_agent_has_diff sweep: visited {}/{} active CC threads ({} skipped (no branch), {} missing worktree, {}ms)",
@@ -377,6 +282,119 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
         missing_worktree,
         started.elapsed().as_millis()
     );
+}
+
+/// What reconciling one thread did, for the sweep's summary counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HasDiffOutcome {
+    Visited,
+    VisitedMissingWorktree,
+    NoBranch,
+    LookupFailed,
+}
+
+async fn reconcile_one_active_thread(
+    pool: &sqlx::PgPool,
+    workspace_path: &Path,
+    lucidos_repo_root: &Path,
+    repo_root_by_id: &std::collections::HashMap<String, PathBuf>,
+    thread_id: Uuid,
+    cc_repo_id: Option<String>,
+    coding_agent_kind: Option<String>,
+) -> HasDiffOutcome {
+    // Look up the latest SessionStarted's branch. Most-recent wins because
+    // a thread may have multiple SessionStarted events (initial + resume +
+    // hardening); the last one names the live branch.
+    let branch: Option<String> = match sqlx::query_scalar(
+        "SELECT payload->>'branch' FROM events \
+         WHERE event_type = 'SessionStarted' AND thread_id = $1 \
+           AND payload->>'branch' IS NOT NULL AND payload->>'branch' != '' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            log!(
+                "[Recovery] Failed to look up branch for thread {} during coding_agent_has_diff sweep: {}",
+                thread_id,
+                e
+            );
+            return HasDiffOutcome::LookupFailed;
+        }
+    };
+
+    let branch_name = match branch {
+        Some(b) => b,
+        None => {
+            // Every active CC thread MUST have a SessionStarted with a
+            // branch. A thread without one violates a projection invariant,
+            // so surface it rather than skip it silently.
+            log!(
+                "[Recovery WARN] active CC thread {} has no SessionStarted with branch: projection invariant violated, skipping",
+                thread_id
+            );
+            return HasDiffOutcome::NoBranch;
+        }
+    };
+
+    // App coding-agent threads live in the WORKSPACE git repo (their branch
+    // holds the `data/apps/<id>/` edits) and carry a NULL `cc_repo_id`. Route
+    // them to `workspace_path` BEFORE the `cc_repo_id` branch. Otherwise a NULL
+    // `cc_repo_id` falls through to `lucidos_repo_root`, which lacks the branch.
+    // `proposal_files_for_branch` then comes back empty, and every restart
+    // wipes `coding_agent_has_diff` to FALSE, hiding both Diff buttons. Mirrors
+    // the kind routing in `propose_one_held_back_change`.
+    let repo_root = if coding_agent_kind.as_deref() == Some("app") {
+        workspace_path.to_path_buf()
+    } else {
+        match cc_repo_id.as_deref() {
+            Some(rid) => repo_root_by_id.get(rid).cloned().unwrap_or_else(|| {
+                log!(
+                    "[Recovery WARN] cc_repo_id {} not found in repositories map for thread {}; falling back to lucidos_repo_root",
+                    rid,
+                    thread_id
+                );
+                lucidos_repo_root.to_path_buf()
+            }),
+            None => lucidos_repo_root.to_path_buf(),
+        }
+    };
+
+    // Resolve the worktree the same way production code does. The
+    // deterministic path is the last-resort fallback inside
+    // `resolve_worktree_path`; using it directly here would skip the
+    // (1) `CodingAgentIdled.worktree_path` lookup and the (2)
+    // `git worktree list` branch match. Skipping (1)+(2) would make the
+    // sweep wipe `coding_agent_has_diff` for every legacy thread whose
+    // worktree lives at a non-deterministic path
+    // (e.g. `.lucidos/worktrees/cc-<random>` from before Phase 6.1), which
+    // is exactly the population the sweep is supposed to recover for.
+    let worktree_path = resolve_worktree_path(
+        pool,
+        thread_id,
+        workspace_path,
+        &repo_root,
+        Some(&branch_name),
+    )
+    .await;
+    let worktree_missing = !worktree_path.exists();
+
+    reconcile_thread_coding_agent_has_diff(
+        pool,
+        thread_id,
+        &repo_root,
+        &branch_name,
+        &worktree_path,
+    )
+    .await;
+    if worktree_missing {
+        HasDiffOutcome::VisitedMissingWorktree
+    } else {
+        HasDiffOutcome::Visited
+    }
 }
 
 /// Engine-startup entry point for the `coding_agent_has_diff` reconciliation

@@ -1,10 +1,9 @@
 use super::*;
 
 #[test]
-fn install_lucidos_cli_skill_writes_file() {
+fn write_lucidos_cli_skill_writes_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let cli = tempfile::tempdir().unwrap();
-    install_lucidos_cli_skill(tmp.path(), Some(cli.path())).unwrap();
+    write_lucidos_cli_skill(tmp.path(), LUCIDOS_CLI_SKILL).unwrap();
     let skill = tmp.path().join(".claude/skills/lucidos-cli/SKILL.md");
     let content = std::fs::read_to_string(&skill).unwrap();
     assert!(content.contains("lucidos data write"));
@@ -68,18 +67,6 @@ fn cli_docs_name_the_two_legitimate_completion_waits() {
             );
         }
     }
-}
-
-#[test]
-fn install_lucidos_cli_skill_skips_when_no_cli_dir() {
-    let tmp = tempfile::tempdir().unwrap();
-    install_lucidos_cli_skill(tmp.path(), None).unwrap();
-    let skill = tmp.path().join(".claude/skills/lucidos-cli/SKILL.md");
-    assert!(
-        !skill.exists(),
-        "skill must not be installed when binary is missing — \
-         otherwise CC sees a skill for a tool it can't run"
-    );
 }
 
 #[test]

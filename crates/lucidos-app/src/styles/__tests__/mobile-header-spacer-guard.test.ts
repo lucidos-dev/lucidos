@@ -50,7 +50,7 @@ describe('mobile fixed-header spacer', () => {
    * separate "is X in the group" assertions would just be a list.
    */
   it('the filter panel reserves it too, since it covers the list', () => {
-    for (const subject of ['.thread-drawer-list::before', '.thread-filter-panel::before']) {
+    for (const subject of ['.thread-drawer-list::before', '.thread-filter-cover::before']) {
       expect(
         spacerRule!.selector,
         `${subject} is not in the mobile header-spacer group, so whatever it shows ` +
@@ -65,18 +65,14 @@ describe('mobile fixed-header spacer', () => {
    * become a double gap: this pins the shape the pairing is derived from, so
    * that change fails here rather than silently making the guard wrong.
    *
-   * The panel is ONE scroll box, so the `::before` is its first scrolling
-   * child, exactly as in the list it covers. It briefly was not: it became a
-   * flex column with a pinned Close footer and an inner scrolling body, and
-   * this guard was rewritten twice to follow that shape. The footer is gone
-   * again (the header's Filter button is the way out, wearing an X while the
-   * panel is up), so the scroll is back on the panel and `.thread-filter-panel-body`
-   * no longer exists to assert anything about.
+   * The panel shows in ONE scroll box, its cover, so the `::before` is the
+   * cover's first scrolling child, exactly as in the list it covers. The panel
+   * fades on a layer inside that box, which keeps the scroll where it was.
    */
   it('the panel really is a cover, not a child of the list', () => {
-    const panel = block(drawerCss, '.thread-filter-panel {');
+    const panel = block(drawerCss, '.thread-filter-cover {');
     expect(decl(panel, 'position')).toBe('absolute');
     expect(decl(panel, 'inset')).toBe('0');
-    expect(decl(panel, 'overflow-y')).toBe('auto');
+    expect(decl(panel, 'overflow-y')).toBe('scroll');
   });
 });

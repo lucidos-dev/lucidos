@@ -1185,7 +1185,7 @@ impl LucidosEngine {
             };
             // Known here rather than read back: the background persist task
             // may not have written this round's deltas yet.
-            let spoke_this_round = flush_text.as_deref().is_some_and(|t| !t.trim().is_empty());
+            let round_text = flush_text.clone().unwrap_or_default();
             if let Some(flush) = flush_text {
                 self.event_bus
                     .emit_or_log(
@@ -1981,41 +1981,53 @@ impl LucidosEngine {
                     .emit_tool_called(thread_id, &meta, tool_call, tool_calls_made, max_tool_calls)
                     .await;
 
-                if tool_call.name == tn::ASK_USER_QUESTION
-                    && human_can_answer
-                    && !spoke_this_round
-                    && crate::engine::question_card_gate::refuse_card(
+                let card_refusal = if tool_call.name == tn::ASK_USER_QUESTION && human_can_answer {
+                    use crate::engine::question_card_gate::{refuse_card, RoundText};
+                    let round = if response.content_is_progress_notes {
+                        RoundText::Notes(&round_text)
+                    } else {
+                        RoundText::Reply(&round_text)
+                    };
+                    refuse_card(
                         &self.pool,
                         thread_id,
                         &tool_call.id,
+                        tool_call
+                            .arguments
+                            .get("questions")
+                            .unwrap_or(&serde_json::Value::Null),
+                        Some(round),
                     )
                     .await
-                {
+                } else {
+                    None
+                };
+                if let Some(refusal) = card_refusal {
                     // Not an error: flagging it would trip the CallRejected
                     // re-ask, which tells the model its `question` was empty.
                     if response.tool_calls.len() == 1 {
                         last_call_was_error = false;
                     }
+                    let refusal = refusal.text();
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ToolResult {
                                     name: tool_call.name.clone(),
-                                    result: crate::engine::question_card_gate::CARD_REFUSAL
-                                        .to_string(),
+                                    result: refusal.clone(),
                                     images: vec![],
                                     success: false,
                                     tool_called_event_id,
                                 },
                                 meta: meta.clone(),
                             },
-                            "[AgenticLoop] ToolResult (question card refused, silent work)",
+                            "[AgenticLoop] ToolResult (question card refused)",
                         )
                         .await;
                     tool_outputs.push(ToolOutput {
                         tool_use_id: tool_call.id.clone(),
-                        text: crate::engine::question_card_gate::CARD_REFUSAL.to_string(),
+                        text: refusal,
                         event_id: tool_called_event_id,
                     });
                     continue;
@@ -2367,14 +2379,13 @@ impl LucidosEngine {
                 // table at the same time.
                 let mut split = split_tool_result(&result);
 
-                // Front-end confirm-flow sentinels (credentials, plugin install,
-                // plugin uninstall, email confirm): emit the transient
-                // ThreadEvent that drives the panel/modal, and — for sentinels
-                // whose raw JSON would mislead the LLM (install/uninstall let
-                // it parse `overwrites` and chat-ask, see git history) —
-                // replace tool_result_text so the model only sees a one-line
-                // wait notice. EmailConfirm passes through unredacted because
-                // its tool description already explains the modal flow.
+                // Form-request sentinels (credentials, plugin install, plugin
+                // uninstall, email confirm): emit the persisted request that
+                // drives the form. Where the raw JSON would mislead the LLM
+                // (install/uninstall let it parse `overwrites` and chat-ask),
+                // the model sees a one-line wait notice instead. EmailConfirm
+                // passes through unredacted: its tool description already
+                // explains the confirm flow.
                 let sentinel_event = match_sentinel(split.event_text()).map(|m| {
                     if let Some(redacted) = m.redacted_text {
                         split.redact(redacted);
@@ -2393,18 +2404,15 @@ impl LucidosEngine {
                 .await;
 
                 if let Some((label, event)) = sentinel_event {
-                    use crate::engine::event_bus::BusEvent;
-                    use crate::engine::thread_events::EventMeta;
-                    self.event_bus
-                        .emit_or_log(
-                            BusEvent::Thread {
-                                thread_id,
-                                event,
-                                meta: EventMeta::NONE,
-                            },
-                            label,
-                        )
-                        .await;
+                    crate::engine::form_requests::emit_request(
+                        &self.pool,
+                        &self.event_bus,
+                        thread_id,
+                        event,
+                        meta.clone(),
+                        label,
+                    )
+                    .await;
                 }
 
                 if is_error {

@@ -159,22 +159,17 @@ impl LucidosEngine {
             )
         } else if let Some(ref change) = conflict_change {
             // Conflict mode: run in the merge worktree where the merge is in progress
-            let wt_path_str = change
-                .merge_worktree_path
-                .as_ref()
-                .ok_or("Conflict change has no merge worktree path — was the merge started?")?;
-            let temp_branch = change
-                .merge_temp_branch
-                .as_ref()
-                .ok_or("Conflict change has no merge temp branch")?;
-            let cwd = PathBuf::from(wt_path_str);
+            let merge = change
+                .merge_worktree()
+                .ok_or("Conflict change has no merge worktree. Was the merge started?")?;
+            let cwd = PathBuf::from(&merge.path);
             let system_prompt = conflict_resolution_system_prompt().to_string();
             // The merge worktree + temp branch belong to the in-progress
             // merge, not to this spawn — keep them on failure.
             (
                 cwd.clone(),
                 system_prompt,
-                temp_branch.clone(),
+                merge.temp_branch.clone(),
                 Some(cwd),
                 false,
                 false,
@@ -754,6 +749,13 @@ impl LucidosEngine {
         // Codex session needs the CLI + question teaching just as much as a
         // fresh one.
         let system_prompt = append_backend_rules(system_prompt, coding_agent);
+        // Every flavor talks to the same user. Read at spawn, so a change
+        // reaches the next session rather than a running one.
+        let literacy = crate::core::technical_literacy::read(&self.pool).await;
+        let system_prompt = format!(
+            "{system_prompt}{}",
+            crate::core::technical_literacy::coding_agent_section(literacy)
+        );
         Ok(SpawnWorktreeContext {
             cwd,
             system_prompt,

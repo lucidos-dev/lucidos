@@ -32,7 +32,43 @@ import { inAppBrowserAvailable } from './preferences';
 // (module re-init).
 let filePreviewRestoreAttempted = false;
 
-export async function loadArtifacts(): Promise<void> {
+// One listing at a time. A request that arrives while one is in flight asks
+// for one more, run when it lands: that listing began before whatever the
+// request announced, so its answer may not hold it. Overlapping listings
+// instead finished in any order, and an older answer could land last.
+let listingInFlight: Promise<void> | null = null;
+let listAgain = false;
+
+/** Load the Files list. Resolves once the list reflects every request made
+ *  before this call returned. */
+export function loadArtifacts(): Promise<void> {
+  if (listingInFlight) {
+    listAgain = true;
+    return listingInFlight;
+  }
+  listingInFlight = (async () => {
+    try {
+      do {
+        listAgain = false;
+        await listArtifactsOnce();
+      } while (listAgain);
+    } finally {
+      listingInFlight = null;
+    }
+  })();
+  return listingInFlight;
+}
+
+/** Refresh the Files list after an announced change, if this page ever asked
+ *  for it. `not-loaded` means nothing here needs the list, so fetching it would
+ *  be waste. `failed` still refreshes, so one bad fetch cannot latch the list
+ *  stale. A request while a listing is in flight is never dropped: see
+ *  `loadArtifacts`. */
+export function refreshArtifacts(): void {
+  if (artifacts.value.status !== 'not-loaded') void loadArtifacts();
+}
+
+async function listArtifactsOnce(): Promise<void> {
   setLoadingIfFresh(artifacts);
   try {
     const data = await listArtifacts();

@@ -46,6 +46,23 @@ export function styleSheetPaths(root: string): string[] {
   return out;
 }
 
+/** Every shipping TS/TSX source under `root`, recursively: tests, `__tests__`
+ *  and `generated/` skipped. The script-side twin of `styleSheetPaths`, for a
+ *  scan asking "does any source do X". */
+export function clientSourcePaths(root: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(root)) {
+    const path: string = resolve(root, entry);
+    if (statSync(path).isDirectory()) {
+      if (entry === '__tests__' || entry === 'generated') continue;
+      out.push(...clientSourcePaths(path));
+    } else if (/\.tsx?$/.test(entry) && !/\.test\.tsx?$/.test(entry)) {
+      out.push(path);
+    }
+  }
+  return out;
+}
+
 /** Body of the first rule/at-rule block whose header matches `needle`, starting
  *  the search at `from`. Brace-matched, so a nested block (a `:root` inside a
  *  `@media`) is returned whole instead of being cut at the first `}`. */
@@ -99,6 +116,16 @@ export function cssRules(css: string): CssRule[] {
     });
   });
   return out;
+}
+
+/** The root the client publishes reduced motion on (`utils/motion.ts`). */
+export const REDUCED_MOTION_ROOT = ':root[data-motion="reduce"]';
+
+/** Whether every member of a rule's selector list applies only under reduced
+ *  motion. The stylesheets key on the attribute, never on the media query, so
+ *  the in-app Motion setting reaches them in both directions. */
+export function isReducedMotionRule(rule: CssRule): boolean {
+  return selectorList(rule.selector).every(s => s.startsWith(REDUCED_MOTION_ROOT));
 }
 
 /**

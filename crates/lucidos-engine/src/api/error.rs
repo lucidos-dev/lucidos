@@ -23,6 +23,10 @@ use axum::Json;
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// A machine-readable slug beside the message, for a refusal the client
+    /// must tell apart from its siblings. The body carries it only when set,
+    /// so every other error keeps its exact bytes.
+    pub reason: Option<&'static str>,
 }
 
 impl ApiError {
@@ -30,7 +34,21 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            reason: None,
         }
+    }
+
+    /// Attach the machine-readable `reason` slug.
+    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// A status given as a bare number, the way an engine error type declares
+    /// it beside its taxonomy. A number that is no HTTP status becomes a 500.
+    pub(crate) fn with_code(code: u16, message: impl Into<String>) -> Self {
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self::new(status, message)
     }
 
     /// 400 Bad Request.
@@ -75,17 +93,39 @@ impl From<StatusCode> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        let body = match self.reason {
+            Some(reason) => serde_json::json!({ "error": self.message, "reason": reason }),
+            None => serde_json::json!({ "error": self.message }),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn body_of(e: ApiError) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(e.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A reason slug rides beside the message only when a handler sets one.
+    /// Every other error body keeps its exact bytes.
+    #[tokio::test]
+    async fn a_reason_is_added_only_when_set() {
+        assert_eq!(
+            body_of(ApiError::new(StatusCode::CONFLICT, "busy")).await,
+            serde_json::json!({ "error": "busy" })
+        );
+        assert_eq!(
+            body_of(ApiError::new(StatusCode::CONFLICT, "busy").with_reason("apply_in_progress"))
+                .await,
+            serde_json::json!({ "error": "busy", "reason": "apply_in_progress" })
+        );
+    }
 
     #[test]
     fn bare_status_carries_its_canonical_reason() {

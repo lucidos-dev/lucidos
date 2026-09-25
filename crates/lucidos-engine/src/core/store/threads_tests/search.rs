@@ -87,6 +87,62 @@ async fn search_threads_by_text_matches_per_token_across_events() {
     teardown_test_db(&db).await;
 }
 
+/// The `limit` cut keeps the tiers ranking puts first: an exact title, then a
+/// title holding the query as a phrase. Newer threads in a lower tier must not
+/// push an old one out, or the hit the user most likely meant never shows.
+#[tokio::test]
+async fn search_threads_by_text_cuts_by_title_tier_before_recency() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+    let store = EventStore::new(pool.clone());
+
+    let age = |id: Uuid, days: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE thread_summaries SET last_activity = NOW() - make_interval(days => $2) \
+                 WHERE thread_id = $1",
+            )
+            .bind(id)
+            .bind(days)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let exact = Uuid::new_v4();
+    insert_thread(&pool, exact, "Search  Ranking").await;
+    age(exact, 90).await;
+    let phrase = Uuid::new_v4();
+    insert_thread(&pool, phrase, "Notes on search ranking").await;
+    age(phrase, 60).await;
+    for title in [
+        "Search ranking v2",
+        "Ranking the search box",
+        "Ranking of search",
+        "Search: the ranking",
+    ] {
+        insert_thread(&pool, Uuid::new_v4(), title).await;
+    }
+
+    let hits = store
+        .search_threads_by_text("search ranking", 3)
+        .await
+        .unwrap();
+    let titles: Vec<&str> = hits.iter().map(|h| h.info.title.as_str()).collect();
+    assert_eq!(
+        hits[0].info.thread_id,
+        exact.to_string(),
+        "titles={titles:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.info.thread_id == phrase.to_string()),
+        "an old phrase title must outlast newer scattered-token titles. titles={titles:?}"
+    );
+
+    teardown_test_db(&db).await;
+}
+
 /// LIKE metacharacters in the query must be escaped, otherwise a token like
 /// `foo_bar` matches `fooXbar` and `50%` matches everything starting with 50.
 #[tokio::test]

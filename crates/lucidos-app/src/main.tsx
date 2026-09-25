@@ -14,7 +14,8 @@ import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installNoAutofill } from './utils/noAutofill';
 import { currentAutocorrect } from './store/actions/preferences';
 import { installNoDrag } from './utils/noDrag';
-import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
+import { installNativeContextMenuPolicy } from './utils/nativeContextMenu';
+import { installNoKeyCodeText } from './utils/noKeyCodeText';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
@@ -83,7 +84,8 @@ installToastPressProbe();
 // Preferences have not loaded yet, so this is the mirror, or on when it is empty.
 installNoAutofill(currentAutocorrect());
 installNoDrag();
-installNoFunctionKeyText();
+installNativeContextMenuPolicy();
+installNoKeyCodeText();
 // Both render roots, so a near-miss drop cannot navigate the picker document
 // either (utils/strayFileDrop.ts).
 installStrayFileDropGuard();

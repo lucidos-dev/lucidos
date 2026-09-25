@@ -5,8 +5,12 @@ import type {
   AnswerKind,
   EventSubscription,
   EventWaitCancelCause,
+  FormRequestEvent,
+  FormRequestOutcome,
+  QuestionOption,
 } from './thread-events/thread-event-types';
 import type { ApiUsage, ContextProducer, ContextSection } from '../generated/thread-event-wire';
+import type { Tap } from '@lucidos/sdk';
 
 // Generated from the Rust payload types. Re-exported so a consumer reaching
 // for the wire shape and one reaching for a view model share one spelling.
@@ -272,6 +276,15 @@ export type ResponseEvent =
       released: boolean;
     }
   | {
+      /** A *form request* the agent sent (engine `engine/form_requests.rs`).
+       *  `resolution` lands with its `FormRequestResolved`. Until then the
+       *  row can reopen the form. Not `outcome`, which names a step's verdict
+       *  and is read generically across rows. */
+      type: 'form_request';
+      request: FormRequestEvent;
+      resolution?: FormRequestOutcome;
+    }
+  | {
       type: 'image';
       base64: string;
       mime_type: string;
@@ -285,7 +298,7 @@ export type ResponseEvent =
       type: 'question';
       tool_use_id: string;
       question: string;
-      options: Array<{ id: string; label: string; description?: string }>;
+      options: QuestionOption[];
       /** When set, the question is resolved and the card renders that state
        *  instead of action buttons. Either the user picked or typed, or it was
        *  closed for them: dismissed, or replaced by their next message. */
@@ -358,6 +371,9 @@ export type ResponseEvent =
        *  `EventWaitCanceled`, which carries no copy of what it stopped. */
       subscriptions: EventSubscription[];
       reason: string;
+      /** When the row's own event was recorded: the arming for a wait, the
+       *  stop for a `canceled` row. A resolution keeps the arming's time. */
+      created?: string;
       /** Empty on a stop row built from a pre-2026-08-07 `EventWaitCanceled`,
        *  which carries no deadline of its own. */
       expires_at: string;
@@ -372,6 +388,8 @@ export type ResponseEvent =
        *  and its deep link into the source event. */
       matched_event_type?: string;
       matched_event_id?: string;
+      /** Set on `matched`: when the delivery was recorded, for the pill. */
+      matched_at?: string;
       /** Set on `canceled`: how it was stopped, which is what the row's note
        *  says. Absent on a pre-2026-08-07 row. */
       cause?: EventWaitCancelCause;
@@ -407,8 +425,6 @@ export type ResponseEvent =
        *  `exchangeResponseEvents`, never sent by the backend. */
       type: 'empty';
     };
-
-import type { Tap } from '@lucidos/sdk';
 
 // A notification
 export interface Notification {
@@ -872,6 +888,10 @@ export interface ToastItem {
 
 // Credential request from SSE (engine needs credentials)
 export interface CredentialRequest {
+  /** The *form request* this form answers, stamped by the client from the
+   *  event. Absent for a form a Settings button opened. Save and Cancel send
+   *  it, so the request closes on every device. */
+  form_request_id?: string;
   service?: string;
   /** The *credential scope* to seed, one form row per host. A set, because one
    *  key often covers several hostnames of one provider (ADR 0161): a token
@@ -1092,6 +1112,9 @@ export interface PluginUninstallRequest {
 
 // Email confirmation request from SSE (engine wants user to confirm sending)
 export interface EmailConfirmRequest {
+  /** The *form request* this panel answers, stamped by the client from the
+   *  event. Send and Cancel pass it on. */
+  form_request_id?: string;
   to: string[];
   subject: string;
   body: string;

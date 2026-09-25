@@ -34,7 +34,7 @@ afterEach(() => {
 describe('endClaudeCodeAndApply 409 safety timeout', () => {
   it('clears applyingNowThreadIds after safety timeout on 409', async () => {
     // Simulate: page was reloaded (applyingNowThreadIds is empty),
-    // but backend still has apply_now_in_progress = true.
+    // but the backend still holds the change claim for its apply.
     mockedApplyNow.mockRejectedValueOnce(new ApiError(409, 'Already applying'));
     await endClaudeCodeAndApply('thread-1');
 
@@ -57,6 +57,33 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
 
     // Advance past timeout — should not re-add the thread
     vi.advanceTimersByTime(60_000);
+    expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
+  });
+
+  it('shows the engine\'s own words when an apply holds the session, and keeps the spinner', async () => {
+    const message = 'An apply is already in progress for this thread. It finishes on its own';
+    mockedApplyNow.mockRejectedValueOnce(
+      new ApiError(409, message, { error: message, reason: 'apply_in_progress' }),
+    );
+    await endClaudeCodeAndApply('thread-1');
+
+    const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
+    expect(toast?.message).toContain(message);
+    expect(toast?.spinning).toBe(true);
+    expect(applyingNowThreadIds.value.has('thread-1')).toBe(true);
+  });
+
+  it('never calls a Discard in progress an apply, and drops the applying state', async () => {
+    const message = 'A discard is already in progress for this thread. Try again once it has finished';
+    mockedApplyNow.mockRejectedValueOnce(
+      new ApiError(409, message, { error: message, reason: 'discard_in_progress' }),
+    );
+    await endClaudeCodeAndApply('thread-1');
+
+    const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
+    expect(toast?.message).toContain(message);
+    expect(toast?.message).not.toMatch(/applying/i);
+    expect(toast?.spinning).toBeFalsy();
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
   });
 

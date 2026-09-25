@@ -18,11 +18,12 @@ import {
 } from '../../utils/styleOverrides';
 
 import {
-  DEFAULT_FONT_FAMILY, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
-  SYSTEM_THEME_SETTLE_MS, THEMES, THEME_BG,
+  DEFAULT_FONT_FAMILY, DEFAULT_MOTION, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
+  MOTION_PREFS, MOTION_STORAGE_KEY, SYSTEM_THEME_SETTLE_MS, THEMES, THEME_BG,
   UI_SCALE_DEFAULT, clampUiScale, fontFeaturesFor, parseUiScale, resolveTheme,
-  type FontFamily, type ThemePref,
+  type FontFamily, type MotionPref, type ThemePref,
 } from '@lucidos/appearance';
+import { motionPreference } from '../../utils/motion';
 import { AUTOCORRECT_STORAGE_KEY, defaultAutocorrect } from '@lucidos/text-entry';
 
 /** Re-exported so the components that already import these from the store keep
@@ -75,13 +76,15 @@ function currentPreference<T extends string>(
   return defaultValue;
 }
 
-/** Take a switch's device-local mirror from what the engine just served. An
- *  absent key CLEARS it rather than leaving it: unset means the default, and a
- *  cache kept there would outlive a reset and keep answering for a preference
- *  nobody holds. */
-function cacheServedSwitch(key: string, storageKey: string): void {
+const SWITCH_VALUES = ['true', 'false'] as const;
+
+/** Take a preference's device-local mirror from what the engine just served.
+ *  An absent or invalid value CLEARS it rather than leaving it: unset means the
+ *  default, and a cache kept there would outlive a reset and keep answering for
+ *  a preference nobody holds. */
+function cacheServedValue(key: string, storageKey: string, validValues: readonly string[]): void {
   const served = preferences.value.status === 'loaded' ? preferences.value.data[key] : undefined;
-  if (served === 'true' || served === 'false') {
+  if (served !== undefined && validValues.includes(served)) {
     localStorage.setItem(storageKey, served);
   } else {
     localStorage.removeItem(storageKey);
@@ -738,6 +741,22 @@ export function setAutocorrect(enabled: boolean): Promise<void> {
   }, true);
 }
 
+// --- Motion ---
+
+/** This device's motion preference. A stored value wins; unset falls to the
+ *  mirror, then to `system`, which follows the OS. The mirror is what the boot
+ *  script reads, so first paint and this agree. */
+export function currentMotion(): MotionPref {
+  return currentPreference('motion', MOTION_PREFS, DEFAULT_MOTION, MOTION_STORAGE_KEY);
+}
+
+export function setMotion(pref: MotionPref): Promise<void> {
+  return savePreference('motion', pref, () => {
+    localStorage.setItem(MOTION_STORAGE_KEY, pref);
+    motionPreference.value = pref;
+  }, true);
+}
+
 // --- Chat model & reasoning effort ---
 
 const REASONING_VALUES = REASONING_LEVELS.map(l => l.value);
@@ -794,6 +813,31 @@ export const RESPONSE_STYLE_DEFAULT = 'standard';
 
 export function setResponseStyle(id: string): Promise<void> {
   return savePreference('response_style', id);
+}
+
+/** The response style's second part. Mirrors `technical_literacy::IDS` in
+ *  `core/technical_literacy.rs`, pinned by `technicalLiteracy.mirror.test.ts`. */
+export const TECHNICAL_LITERACY_LEVELS = ['non-technical', 'technical', 'developer'] as const;
+export type TechnicalLiteracy = (typeof TECHNICAL_LITERACY_LEVELS)[number];
+
+/** A retired level that reads as `non-technical`, as it does in the engine. */
+const MERGED_EVERYDAY = 'everyday';
+
+/** The stored level, or `null` when unset. An unknown value reads as unset,
+ *  which is also what the engine does with it. */
+export function currentTechnicalLiteracy(): TechnicalLiteracy | null {
+  if (preferences.value.status !== 'loaded') return null;
+  const v = preferences.value.data['technical_literacy']?.trim();
+  if (v === MERGED_EVERYDAY) return 'non-technical';
+  return TECHNICAL_LITERACY_LEVELS.find((level) => level === v) ?? null;
+}
+
+/** The value that clears the level. Mirrors `technical_literacy::NOT_SET_ID`. */
+export const TECHNICAL_LITERACY_NOT_SET = 'not-set';
+
+/** `null` clears the level. */
+export function setTechnicalLiteracy(level: TechnicalLiteracy | null): Promise<void> {
+  return savePreference('technical_literacy', level ?? TECHNICAL_LITERACY_NOT_SET);
 }
 
 // --- Max tool calls (the per-turn tool-call cap) ---
@@ -928,10 +972,12 @@ export async function loadPreferences(): Promise<void> {
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
-    cacheServedSwitch('notification_toasts', NOTIFICATION_TOASTS_KEY);
+    cacheServedValue('notification_toasts', NOTIFICATION_TOASTS_KEY, SWITCH_VALUES);
     // The cache first: a stale mirror would otherwise answer for an unset key.
-    cacheServedSwitch('autocorrect', AUTOCORRECT_STORAGE_KEY);
+    cacheServedValue('autocorrect', AUTOCORRECT_STORAGE_KEY, SWITCH_VALUES);
     setProseAutocorrect(currentAutocorrect());
+    cacheServedValue('motion', MOTION_STORAGE_KEY, MOTION_PREFS);
+    motionPreference.value = currentMotion();
     selectedCodingAgent.value = currentCodingAgentDefault();
     // LAST, deliberately: the three applies above write properties the remote
     // is allowed to override, so the overrides go on top of them.

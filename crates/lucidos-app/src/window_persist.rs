@@ -236,8 +236,9 @@ pub(crate) fn persist_window_state_only(app: &tauri::AppHandle) {
 ///
 /// A workspace with no remembered frame still gets a window, built at the
 /// default size.
-pub(crate) fn resolve_window_session_plan() -> &'static [(String, Option<window_restore::Rect>)] {
-    static PLAN: std::sync::OnceLock<Vec<(String, Option<window_restore::Rect>)>> =
+pub(crate) fn resolve_window_session_plan(
+) -> &'static [(String, Option<window_restore::RememberedFrame>)] {
+    static PLAN: std::sync::OnceLock<Vec<(String, Option<window_restore::RememberedFrame>)>> =
         std::sync::OnceLock::new();
     PLAN.get_or_init(|| {
         // Dev restores nothing: it shares the packaged app-data dir and
@@ -278,7 +279,7 @@ pub(crate) fn readable_window_session() -> window_session::WindowSession {
 ///
 /// A file read per call is right here. Every caller is a click or a banner tap,
 /// and a stale answer would place the window wrong.
-pub(crate) fn remembered_frame(url: &str) -> Option<window_restore::Rect> {
+pub(crate) fn remembered_frame(url: &str) -> Option<window_restore::RememberedFrame> {
     window_session::frame_for_url(&readable_window_session(), url)
 }
 
@@ -430,6 +431,7 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
                 // what makes the answer expire on the user's first drag. See
                 // `window_restore::is_wearing_a_rescue`.
                 rescued: window_restore::is_wearing_a_rescue(&label, frame),
+                whereabouts: window_restore::whereabouts_now(app, &label, frame),
                 label,
                 url: url.to_string(),
                 frame,

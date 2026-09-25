@@ -17,9 +17,9 @@ import {
   awayFromBottom,
   followingLiveEdge,
   setFollowLiveEdge,
-  setAgentLive,
   stopFollowingBottom,
 } from '../scrollState';
+import { osReducesMotion } from '../../../utils/motion';
 
 // ---------------------------------------------------------------------------
 // stepThreadTurn — chevron reconciliation on the landing position
@@ -65,16 +65,15 @@ function makeContainer(opts: { scrollTop: number; scrollHeight: number; clientHe
 }
 
 describe('stepThreadTurn — down chevron on the last turn', () => {
-  let restoreMatchMedia: () => void;
+  let restoreMotion: () => void;
   let restoreGCS: () => void;
 
   beforeEach(() => {
     awayFromBottom.value = false;
     // Force reduced motion so the jump is a synchronous scrollTop write (no rAF
     // animation loop to drive/await in the node test env).
-    const origMM = globalThis.matchMedia;
-    (globalThis as any).matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
-    restoreMatchMedia = () => { (globalThis as any).matchMedia = origMM; };
+    osReducesMotion.value = true;
+    restoreMotion = () => { osReducesMotion.value = false; };
     // Deterministic clearance: turnLandingClearancePx reads scroll-margin-top; pin it
     // to 8px so the landing gap is stable across environments.
     const origGCS = (globalThis as any).getComputedStyle;
@@ -84,7 +83,7 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
 
   afterEach(() => {
     setActiveScrollElement(null);
-    restoreMatchMedia();
+    restoreMotion();
     restoreGCS();
   });
 
@@ -167,16 +166,14 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
  * taking them anyway.
  */
 describe('stepThreadTurn and the standing follow', () => {
-  let restoreMatchMedia: () => void;
+  let restoreMotion: () => void;
   let restoreGCS: () => void;
 
   beforeEach(() => {
     awayFromBottom.value = false;
     stopFollowingBottom();
-    setAgentLive(true);
-    const origMM = globalThis.matchMedia;
-    (globalThis as any).matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
-    restoreMatchMedia = () => { (globalThis as any).matchMedia = origMM; };
+    osReducesMotion.value = true;
+    restoreMotion = () => { osReducesMotion.value = false; };
     const origGCS = (globalThis as any).getComputedStyle;
     (globalThis as any).getComputedStyle = () => ({ scrollMarginTop: '8px', display: 'block' });
     restoreGCS = () => { (globalThis as any).getComputedStyle = origGCS; };
@@ -185,7 +182,7 @@ describe('stepThreadTurn and the standing follow', () => {
   afterEach(() => {
     stopFollowingBottom();
     setActiveScrollElement(null);
-    restoreMatchMedia();
+    restoreMotion();
     restoreGCS();
   });
 
@@ -225,33 +222,14 @@ describe('stepThreadTurn and the standing follow', () => {
     expect(followingLiveEdge.value).toBe(true);
   });
 
-  it('keeps the ride when the thread is IDLE, whatever the step does', () => {
-    // Same rule as the scroll disarm: stepping back through a thread nothing is
-    // writing to is browsing, and the reader's next submit should still carry
-    // them to the live edge.
-    ridingLongThread();
-    setAgentLive(false);
-
-    stepThreadTurn(-1);
-
-    expect(awayFromBottom.value).toBe(true);
-    expect(followingLiveEdge.value).toBe(true);
-  });
-
-  it('and LEAVES the reader on the turn once the step\'s own scroll event lands', () => {
-    // Keeping the ride is only half of what an idle step promises: the reader
-    // has to still be ON the turn afterwards. The case above asserts the flag
-    // and attaches no observers, so it never delivers the scroll event a
-    // `scrollTop` write fires a frame later, and that event is where the
-    // platform-scroll correction runs. A step is unstamped (it writes through
-    // `markNavigationScroll`, not `markHeldScroll`) and a chord is deliberately
-    // not a gesture, so the correction read it as the platform and wrote the
-    // reader straight back to the bottom: ⌘↑ landed and undid itself, toggle
-    // still lit. Caught by /harden on 2026-08-13, before it shipped.
+  it('LEAVES the reader on the turn once the step\'s own scroll event lands', () => {
+    // A step writes through `markNavigationScroll`, and a chord is not a
+    // gesture. The platform-scroll correction must still not write the reader
+    // back to the bottom. The step retired the ride itself, so nothing is left
+    // to correct for.
     const el = ridingLongThread();
     const { onScroll } = makeScrollObservers(el);
-    onScroll();                 // the arm's own event, recording them on the edge
-    setAgentLive(false);
+    onScroll();                 // the arm's own event
 
     stepThreadTurn(-1);
     const landed = el.scrollTop;
@@ -259,6 +237,6 @@ describe('stepThreadTurn and the standing follow', () => {
     onScroll();                 // the step's trailing scroll event
 
     expect(el.scrollTop).toBe(landed);
-    expect(followingLiveEdge.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(false);
   });
 });

@@ -187,6 +187,10 @@ struct BackgroundTask {
     /// `BackgroundBashCompleted` carries it. Held here so the registry can name
     /// its own tasks: the watcher and the teardown sweep both read it.
     command: String,
+    /// What the task is, in the starting agent's words ("the e2e sweep").
+    /// `None` when the agent gave none. The engine-armed *event wait* names
+    /// the task by this, and by its command only in its absence.
+    description: Option<String>,
     /// The secret VALUES this task's environment carries, from
     /// [`crate::core::injected_secret_values`]. Both exits redact against it.
     /// So a child that echoes its own environment cannot put a credential in
@@ -272,6 +276,7 @@ impl BackgroundTask {
         BackgroundTask {
             started_at: Utc::now(),
             command: "cargo build".to_string(),
+            description: None,
             secrets: Vec::new(),
             stdout: Stream::default(),
             stderr: Stream::default(),
@@ -303,13 +308,18 @@ impl BackgroundTask {
 }
 
 /// One unfinished background task, as [`BackgroundBashRegistry::running_for_thread`]
-/// reports it: what to watch for, and how long the watching has to last.
+/// reports it: what to watch for, how long the watching has to last, and what
+/// to call it where the user reads the wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningTaskHandle {
     /// Matches the `task_id` on the eventual `BackgroundBashCompleted`, which
     /// is what makes a subscription specific to THIS task rather than to any
     /// background task finishing anywhere in the workspace.
     pub task_id: String,
+    /// The starting agent's own name for the task, when it gave one.
+    pub description: Option<String>,
+    /// Redacted and cut by [`command_prefix`]: safe to show the user.
+    pub command: String,
     /// When the watchdog kills the child if it has not exited. The task cannot
     /// outlive this, so a wait armed to at least this instant cannot be
     /// outlived by the task either.
@@ -433,6 +443,9 @@ impl BackgroundBashRegistry {
     /// can answer "does this thread still have unfinished background bash?".
     /// Production callers (`LucidosEngine::start_background_task`) always pass
     /// `Some(thread_id)`; tests typically pass `None`.
+    ///
+    /// `description` is the agent's name for the work. A blank one counts as
+    /// none, so the wait falls back to the command rather than to nothing.
     pub async fn spawn(
         &self,
         command: &str,
@@ -440,6 +453,7 @@ impl BackgroundBashRegistry {
         cwd: &Path,
         env: &[(String, String)],
         thread_id: Option<Uuid>,
+        description: Option<&str>,
     ) -> Result<
         (String, tokio::sync::oneshot::Receiver<()>),
         Box<dyn std::error::Error + Send + Sync>,
@@ -485,6 +499,10 @@ impl BackgroundBashRegistry {
                 BackgroundTask {
                     started_at: Utc::now(),
                     command: safe_prefix,
+                    description: description
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .map(String::from),
                     secrets,
                     stdout: Stream::default(),
                     stderr: Stream::default(),
@@ -715,6 +733,8 @@ impl BackgroundBashRegistry {
             .filter(|(_, t)| t.thread_id == Some(thread_id) && !t.is_finished())
             .map(|(task_id, t)| RunningTaskHandle {
                 task_id: task_id.clone(),
+                description: t.description.clone(),
+                command: t.command.clone(),
                 watchdog_deadline: t.started_at + chrono::Duration::seconds(t.timeout_secs as i64),
             })
             .collect()
@@ -1177,7 +1197,7 @@ mod tests {
     async fn spawn_returns_task_id_and_output_is_drainable() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo hi", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn("echo hi", 5, std::path::Path::new("/tmp"), &[], None, None)
             .await
             .expect("spawn");
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
@@ -1214,6 +1234,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &secret_env(),
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -1245,6 +1266,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &secret_env(),
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -1273,6 +1295,7 @@ mod tests {
                 5,
                 std::path::Path::new("/tmp"),
                 &[],
+                None,
                 None,
             )
             .await
@@ -1331,7 +1354,14 @@ mod tests {
     async fn kill_terminates_running_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -1396,7 +1426,7 @@ mod tests {
         let pidfile = dir.join("grandchild.pid");
         let command = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
         let (task_id, _finish_rx) = reg
-            .spawn(&command, timeout_secs, dir, &[], thread_id)
+            .spawn(&command, timeout_secs, dir, &[], thread_id, None)
             .await
             .expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1490,7 +1520,7 @@ mod tests {
         let command = format!("trap '' TERM; touch {}; sleep 300 & wait", ready.display());
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn(&command, 600, dir.path(), &[], Some(Uuid::new_v4()))
+            .spawn(&command, 600, dir.path(), &[], Some(Uuid::new_v4()), None)
             .await
             .expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1530,7 +1560,7 @@ mod tests {
         );
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn(&command, 600, dir.path(), &[], None)
+            .spawn(&command, 600, dir.path(), &[], None, None)
             .await
             .expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1567,7 +1597,7 @@ mod tests {
         let command = format!("trap '' TERM; touch {}; sleep 300 & wait", ready.display());
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn(&command, 600, dir.path(), &[], None)
+            .spawn(&command, 600, dir.path(), &[], None, None)
             .await
             .expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1604,6 +1634,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -1626,7 +1657,7 @@ mod tests {
     async fn timeout_kills_long_running_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 1, std::path::Path::new("/tmp"), &[], None)
+            .spawn("sleep 30", 1, std::path::Path::new("/tmp"), &[], None, None)
             .await
             .expect("spawn");
 
@@ -1674,6 +1705,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -1711,7 +1743,14 @@ mod tests {
     async fn repeat_drain_within_retention_is_empty_but_still_finished() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo once", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo once",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
@@ -1742,7 +1781,14 @@ mod tests {
     async fn finished_task_is_evicted_after_the_grace_window() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo stale", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo stale",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
@@ -1779,6 +1825,7 @@ mod tests {
                     5,
                     std::path::Path::new("/tmp"),
                     &[],
+                    None,
                     None,
                 )
                 .await
@@ -1846,6 +1893,7 @@ mod tests {
                     std::path::Path::new("/tmp"),
                     &[],
                     None,
+                    None,
                 )
                 .await
                 .expect("spawn");
@@ -1877,7 +1925,14 @@ mod tests {
     async fn is_running_is_false_for_a_retained_finished_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         assert!(
@@ -1910,6 +1965,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(my_thread),
+                None,
             )
             .await
             .expect("spawn");
@@ -2027,6 +2083,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2059,6 +2116,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2088,6 +2146,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2116,7 +2175,14 @@ mod tests {
     async fn hand_over_at_teardown_takes_the_unclaimed_and_skips_the_thread_less() {
         let reg = BackgroundBashRegistry::new();
         let (orphan, _rx1) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         let (done, _rx2) = reg
@@ -2126,6 +2192,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2169,6 +2236,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2206,6 +2274,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(Uuid::new_v4()),
+                None,
             )
             .await
             .expect("spawn");
@@ -2222,7 +2291,14 @@ mod tests {
     async fn wait_until_finished_is_false_for_a_running_and_an_unknown_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -2254,6 +2330,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -2280,6 +2357,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(my_thread),
+                None,
             )
             .await
             .expect("spawn");
@@ -2300,7 +2378,14 @@ mod tests {
     async fn completion_record_does_not_evict_the_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo done", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo done",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
@@ -2337,7 +2422,14 @@ mod tests {
     async fn completion_record_does_not_consume_the_drain_cursor() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo payload", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo payload",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
@@ -2374,6 +2466,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -2407,7 +2500,7 @@ mod tests {
     async fn completion_record_returns_none_while_running() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 5", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn("sleep 5", 60, std::path::Path::new("/tmp"), &[], None, None)
             .await
             .expect("spawn");
         // Don't wait — task is still running.
@@ -2437,6 +2530,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(my_thread),
+                None,
             )
             .await
             .expect("spawn");
@@ -2471,15 +2565,15 @@ mod tests {
         let other_thread = Uuid::new_v4();
         let tmp = std::path::Path::new("/tmp");
         let (mine_a, _a) = reg
-            .spawn("sleep 30", 60, tmp, &[], Some(my_thread))
+            .spawn("sleep 30", 60, tmp, &[], Some(my_thread), None)
             .await
             .expect("spawn");
         let (mine_b, _b) = reg
-            .spawn("sleep 30", 60, tmp, &[], Some(my_thread))
+            .spawn("sleep 30", 60, tmp, &[], Some(my_thread), None)
             .await
             .expect("spawn");
         let (theirs, _c) = reg
-            .spawn("sleep 30", 60, tmp, &[], Some(other_thread))
+            .spawn("sleep 30", 60, tmp, &[], Some(other_thread), None)
             .await
             .expect("spawn");
 
@@ -2514,6 +2608,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(my_thread),
+                None,
             )
             .await
             .expect("spawn");
@@ -2550,6 +2645,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 Some(my_thread),
+                None,
             )
             .await
             .expect("spawn");
@@ -2588,6 +2684,54 @@ mod tests {
         );
     }
 
+    /// The wait names a task by what `running_for_thread` reports, so the
+    /// agent's description and the redacted command must both reach it. A
+    /// blank description is none, or the wait would name the task by nothing.
+    #[tokio::test]
+    async fn running_for_thread_reports_the_description_and_the_redacted_command() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let tmp = std::path::Path::new("/tmp");
+        let (described, _rx1) = reg
+            .spawn(
+                "sleep 30",
+                60,
+                tmp,
+                &[],
+                Some(my_thread),
+                Some("  the nightly sweep "),
+            )
+            .await
+            .expect("spawn");
+        let (blank, _rx2) = reg
+            .spawn(
+                "psql postgres://u:hunter2@h:5432/d -c 'select pg_sleep(30)'",
+                60,
+                tmp,
+                &[],
+                Some(my_thread),
+                Some("   "),
+            )
+            .await
+            .expect("spawn");
+
+        let running = reg.running_for_thread(my_thread).await;
+        let find = |id: &str| running.iter().find(|h| h.task_id == id).expect("reported");
+        assert_eq!(
+            find(&described).description.as_deref(),
+            Some("the nightly sweep")
+        );
+        assert_eq!(find(&blank).description, None);
+        assert!(
+            !find(&blank).command.contains("hunter2"),
+            "the command shown to the user must be the redacted one: {}",
+            find(&blank).command
+        );
+
+        reg.kill(&described).await;
+        reg.kill(&blank).await;
+    }
+
     /// Tasks spawned without a thread_id (test fixtures, engine-internal
     /// jobs) must never appear under `has_running_for_thread` for any
     /// thread — otherwise a stray engine job would falsely keep an
@@ -2598,7 +2742,14 @@ mod tests {
         let some_thread = Uuid::new_v4();
 
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -2626,7 +2777,14 @@ mod tests {
         // `wait_holds_full_budget_while_output_keeps_arriving`).
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo eager", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo eager",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
@@ -2674,6 +2832,7 @@ mod tests {
                 30,
                 std::path::Path::new("/tmp"),
                 &[],
+                None,
                 None,
             )
             .await
@@ -2772,7 +2931,14 @@ mod tests {
         // finished one reports its total runtime, not time-since-spawn.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 1.2", 30, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 1.2",
+                30,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -2825,7 +2991,14 @@ mod tests {
         // registers before re-reading `finished_at`.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 0.3", 5, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 0.3",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -2856,7 +3029,14 @@ mod tests {
         // finished=false so it knows to keep polling (or give up).
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -2907,6 +3087,7 @@ mod tests {
                 10,
                 std::path::Path::new("/tmp"),
                 &[],
+                None,
                 None,
             )
             .await
@@ -2971,6 +3152,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
                 &[],
                 None,
+                None,
             )
             .await
             .expect("spawn");
@@ -3029,6 +3211,7 @@ mod tests {
                 timeout_secs,
                 std::path::Path::new("/tmp"),
                 &[],
+                None,
                 None,
             )
             .await

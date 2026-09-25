@@ -63,7 +63,7 @@ vi.mock('./menu', () => ({
 }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
-vi.mock('./devices', () => ({ getDeviceId: vi.fn(), pendingDeviceRegistration: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
@@ -105,6 +105,15 @@ describe('handleGlobalEvent: standing apply', () => {
     expect(standingApplyThreadIds.value.has('t1')).toBe(false);
     expect(showToast).toHaveBeenCalledOnce();
     expect(String(showToast.mock.calls[0][0])).toContain('parked on a question');
+  });
+
+  // A fire ends the arm too. Missing this left the flag armed after the change
+  // applied, and its cancel answered 404.
+  it('StandingApplyFired clears the thread and leaves the report to the apply', () => {
+    standingApplyThreadIds.value = new Set(['t0', 't1']);
+    handleGlobalEvent('StandingApplyFired', { thread_id: 't1', change_id: 'c1' });
+    expect([...standingApplyThreadIds.value]).toEqual(['t0']);
+    expect(showToast).not.toHaveBeenCalled();
   });
 
   it('says nothing when the owner cancelled it, which they already saw', () => {

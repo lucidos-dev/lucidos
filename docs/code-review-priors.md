@@ -366,9 +366,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the race — so a settle inside the callee would emit a terminal against a
   working session. Only the caller knows whether it owns the turn. For the same
   reason any caller-side backstop must carve that error out (the `Nothing` arm in
-  `continue_recovery`); re-flag only if the guard stops returning `Err` for a
-  live-session collision. (`agent_session/run_session/run.rs`,
-  `agent_recovery/helpers.rs`, `engine_impl/construction.rs`.)
+  `continue_recovery`). The spawn debounce's `DUPLICATE_SPAWN_ERROR` is the same
+  lost race before the winner registers. It settles only when
+  `coding_agent_owns_thread` says no spawn owns the thread. Re-flag only if the
+  guard stops returning `Err` for a live-session collision.
+  (`agent_session/run_session/run.rs`, `agent_recovery/helpers.rs`,
+  `engine_impl/construction.rs`.)
+
+- **`coding_agent_owns_thread` then settle is not atomic, on purpose.** A new
+  spawn can start between the ownership check and the `StaleSettle` emit, and
+  every settle path shares that window (watchdog, boot sweep, user Stop). It
+  needs a fresh request in the microseconds after the earlier owner finished,
+  and closing it means locking spawn entry across an async DB emit. The slot is
+  entered before the debounce stamp, so a spawn moving from starting to live is
+  always seen. Re-flag only with a trigger wider than a same-instant request.
+  (`claude_code/control.rs`, `agent_session/spawns_in_flight.rs`.)
 
 - **`STALE_RESUME_ERROR` is returned to the caller rather than retried inside
   `run_session`, and that is not a missing abstraction.** Three callers each
@@ -523,7 +535,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   wear the reassuring pause glyph. The apparent loose end, a transient abort that
   skips the parent decrement while the child reads `failed`, is closed elsewhere:
   `active_thread_statuses()` counts neither `paused` nor `failed`, so the boot
-  `rebuild_active_children_count` reconciles the parent either way. Re-flag only
+  `rebuild_children_counts` reconciles the parent either way. Re-flag only
   if `is_transient` gains an actor axis, or if a caller starts deriving a
   user-visible status from it again.
   (`crates/lucidos-engine/src/engine/thread_events/cause.rs`.)
@@ -1043,22 +1055,34 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a judgment site loses its chat path, or if the tool gains
   one. Either would move a default rather than merely look like it should.
 
-- **`change_action_refusal` reporting a `paused` thread as `ThreadWorking` even
-  when it also holds a wait is correct, not a missed parked case.** A reviewer
-  reads the working check running first, finds a thread that is paused AND
-  parked, and calls the classification wrong. `standing_verdict` matches on
-  STATUS first for the same reason: `running` and `paused` both mean more work
-  is promised, whatever else is pending. So the gate and the resolver agree
-  exactly, and the UI agrees too, since `available_thread_actions` offers
-  `ApplyWhenSettled` on precisely those two statuses.
+- **`change_action_refusal` reporting a thread watching an event as
+  `ThreadSettling`, not `ThreadParked`, is correct.** A reviewer sees an idle
+  thread whose Apply is withheld and expects the parked reason. But a live
+  event wait ends by itself, so `standing_verdict` waits through it (ADR 0266).
+  The refusal points the caller at the standing apply for that reason.
+  `ThreadParked` is what is left: a question card, or a failed turn still
+  holding a wait.
 
-  The arm may still drop later, once the turn resumes and settles to `idle`
-  with the wait live. That is the standing apply's own documented lifecycle,
-  reached identically by pressing the button. The gate's wording does not claim
-  otherwise: ADR 0233 says "drops on a parked thread at rest".
+  The gate, the resolver and the UI read one definition of a settling thread:
+  `SETTLING_THREAD_SQL`, mirrored by `available_thread_actions`. A thread both
+  on a question card and holding a wait is parked, since only the user ends
+  the card.
 
-  Re-flag only if `standing_verdict` stops matching on status first, or if
-  `working_thread_ids` and `SWEEPABLE_THREAD_STATUSES` diverge.
+  Re-flag only if `standing_verdict` and `SETTLING_THREAD_SQL` diverge, or if
+  the resolver starts re-taking a verdict on `EventWaitDelivered` or
+  `EventWaitExpired`.
+
+- **A standing apply left armed after `AnchorMissing` is correct, not a
+  stranded arm.** `thread_to_resolve` skips `EventWaitDelivered` and
+  `EventWaitExpired`, so a resolution whose wake anchor failed to persist
+  re-takes no verdict. But the thread is stranded too: it holds a dangling call
+  that the boot orphan sweep settles, and the user then presses Continue. Firing
+  in between would merge a branch the agent is about to resume (ADR 0106). The
+  arm resolves on the thread's next event or on `recover_standing_applies` at
+  boot (ADR 0266, "A lost wake still resolves").
+
+  Re-flag only if `AnchorMissing` gains an in-process recovery that wakes the
+  thread without a restart. That path would then have to re-take the verdict.
 
 - **`AuxModelSource` collapsing to `Option` at every production call site is
   the point, not dead structure.** A reviewer sees `resolve_selection` and
@@ -1093,6 +1117,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag with a tighter matcher that still catches a call through a fresh
   local binding. That is the shape a receiver-aware check tends to miss.
+
+- **An enum whose every variant is `#[cfg]`-gated out still compiles.** The
+  gateway's `slowness::pressure::PressureReading` gates `MacOs` and `Linux`
+  on their own OS, so on any other OS the enum has no variants. A reviewer
+  reads that as a compile error. It is not: Rust accepts an empty enum, the
+  derives handle it, and a `match self` with every arm gated out is exhaustive
+  over an uninhabited type. A `rustc -D warnings` build of that exact shape
+  exits 0. Re-flag only with a use that needs a value of the type, such as a
+  constructor outside the gated platform modules.
 
 ## Desktop client (Tauri, macOS)
 
@@ -1143,29 +1176,48 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if something starts reading the applied value back.
   (`lucidos-app/src/desktop.rs`, the macOS unread-indicator thread in `launch`.)
 
-- **The function-key text guard runs unconditionally on purpose, and gating it
-  on Tauri does not buy what a reviewer expects.** `installNoFunctionKeyText`
-  (`utils/noFunctionKeyText.ts`) cancels a `beforeinput` whose data is entirely
-  AppKit function-key codepoints, and it installs in the web build too. Codex
-  flagged that twice in one hardening run, once against the original
-  0xF700-0xF8FF bound and again after the narrowing: a browser client can no
-  longer type a private-use glyph in the range through an IME.
+- **The key-code text guard runs unconditionally on purpose, and gating it on
+  Tauri does not buy what a reviewer expects.** `installNoKeyCodeText`
+  (`utils/noKeyCodeText.ts`, and its SDK twin) cancels a `beforeinput` whose
+  data is entirely key codes, by `isKeyCodeTextInsertion` in the SDK's
+  `textEntry.ts`. It installs in the web build too. Codex flagged that twice in
+  one hardening run, once against the original 0xF700-0xF8FF bound and again
+  after the narrowing: a browser client can no longer type a private-use glyph
+  in the range through an IME.
+
+  The C0 control codes the rule now also refuses carry no such cost. No IME or
+  keyboard layout commits one as text, and tab and both line breaks stay
+  allowed.
 
   The mechanism is real and the trigger is remote. The insertion has to be
-  ENTIRELY function-key codepoints, and a paste puts its content on
+  ENTIRELY key codes, and a paste puts its content on
   `dataTransfer` and leaves `data` null, so pasting one is untouched. What is
   left is an IME or a Character Viewer committing a lone glyph in a 72-codepoint
   window Apple assigns to keys.
 
   The gate is not the remedy for that. A Character Viewer glyph is likeliest on
   macOS, so a Tauri-only guard keeps the collateral where it hurts and drops the
-  protection everywhere else. Whether the fallthrough is Tauri-only was never
-  verified either, and the same WebKit lives in the iOS PWA. Narrowing the bound
-  to the last assigned constant was the real answer, and it is already applied.
+  protection everywhere else. The fallthrough is now known to need tao's
+  content view (`docs/temporary-measures.md` has the row). Still, an
+  unconditional guard costs nothing a browser can type. Narrowing the bound to
+  the last assigned constant was the real answer, and it is applied.
   Re-flag only with a client that demonstrably types such a glyph, or with
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A failed confirm fetch that parks the repository list on `failed` is the
+  Loadable contract, not a lost cache.** `installUnregisteredRepoTargetReset`
+  in `store/actions/compose.ts` refetches the list before dropping a compose
+  target missing from it. A reviewer reads a failed refetch replacing a usable
+  loaded list as the background check breaking the picker.
+
+  Every refetch of that list does the same, the `RepositoryRemoved` one
+  included. `.claude/rules/frontend.md` requires a failed load to look
+  different from an empty or stale one. The picker retries a failed list when
+  it opens (`retryFailedDestinationLists`), and the watch re-checks once that
+  load lands. Re-flag only with a path that parks the list on `failed` and
+  never offers the retry.
 
 - **A backfill re-point that stores `grown` over a render-all is not a lost
   claim.** A reviewer sees the re-point effect in `ThreadView.tsx` call
@@ -2203,7 +2255,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`store/actions/oauth.ts`) fronts the window only when `oauthAuthFlow` names
   the provider the event carries, OR when it names no provider at all, and that
   second arm reads like a hole in the check. It is the only thing the agent path
-  can say: the engine's `NavigationRequested` for an authorization
+  can say: the engine's `OAuthAuthorizationRequested` form request
   (`engine/tools/credentials.rs`) carries `purpose: "oauth"` and a URL, no
   provider, so the page opening it does not know which provider it is
   authorizing. Plumbing one through would not close the gap either, because the
@@ -2439,8 +2491,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag with a case that reads as ordinary agent prose.
   (`crates/lucidos-app/src/utils/linkifyPaths.ts`.)
 
-- **The waiting indicator naming MORE sub-threads than `activeChildrenCount` is
-  the honest direction, not an off-by-one.** `activeSubThreads`
+- **The waiting indicator naming MORE sub-threads than the server counts is
+  the honest direction, not an off-by-one.** `unfinishedSubThreads`
   (`components/chat/WaitingPanel.tsx`) resolves rows from `threadMap` and
   subtracts only in one direction: a shortfall becomes an "and N more" row, and
   a surplus is listed. Codex flagged the surplus as P2 on the branch that added
@@ -2450,8 +2502,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the drawer row reads the same `effectiveThreadStatus` this does. The cut would
   also land on the newest child, which is the one that just started and the
   reason the count is briefly behind. Every listed row is a real sub-thread of
-  this parent, mid-turn by the same predicate the engine uses
-  (`active_thread_statuses()`).
+  this parent, unfinished by the engine's own two counts: mid-turn
+  (`active_thread_statuses()`), or a *waiting child* (ADR 0254).
 
   The asymmetry with the `count <= 0` early return is deliberate and is the
   performance gate: the count decides WHETHER the thread is waiting on children,
@@ -2545,12 +2597,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 - **`readScrollAnchor` scanning the transcript's children is NOT a duplicate of
   `recordAnchor`'s scan, and unifying them was weighed and declined.** Both walk
-  `.thread-content`'s children against the container's top and skip boxless
+  the turns inside `.thread-feed` against the container's top and skip boxless
   ones, so a reviewer reads the second as copy-paste of the first.
 
   They answer different questions, and the difference is load-bearing both ways.
   `recordAnchor` (`scrollState.ts`, inside `makeScrollObservers`) wants ANY
-  child to hold the reader still across a reflow, chrome included. Above the
+  turn to hold the reader still across a reflow, with or without an id. Above the
   first one it deliberately answers null, so the correction is a no-op there.
   `readScrollAnchor` (`scrollAnchor.ts`) must name a child that survives a
   reload, so it takes only a `data-event-id` one. It falls back to the earliest
@@ -2864,6 +2916,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the cursor becomes inclusive, if a page is ever fetched without
   `before`, or if anything starts inserting events older than the floor.
+
+- **An appearance key falling back from the served value to its local mirror
+  is deliberate, `motion` included.** A reviewer sees `seeded()` in
+  `packages/lucidos-sdk/src/boot/appearanceBoot.ts`, or `prefs['motion'] ||
+  wsLocalGet(...)` in `ui.ts`. It reads a stale mirror as outliving a deleted
+  preference.
+
+  A device-scoped value can be absent from a served object for harmless reasons,
+  such as a device id that changed. `resolveThemePreference` documents the same
+  precedence for the same reason: a missing server value must not clobber what
+  the device last settled on. The shell also clears the mirror whenever the
+  engine serves no value (`cacheServedValue` in `store/actions/preferences.ts`),
+  so a real reset reaches the next load.
+
+  Re-flag only if the shell stops clearing the mirror on an absent served value.
 
 ## Scripts (bash)
 
@@ -4145,6 +4212,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Product copy
 
+- **An event-type chip showing plain words, with the raw type only on its
+  tooltip, is not an accessibility regression.** A reviewer sees
+  `data-tooltip={chip.name}` on an inert `<code>` in `eventNameChip`
+  (`components/chat/EventRow.tsx`) and on the waiting panel's plain span. It
+  reads the raw type as hidden from keyboard and screen-reader users.
+
+  The plain phrase (`plainEventName`) IS the accessible content: it says what
+  the event means, which the raw type never did for most readers. The raw type
+  is optional detail for someone writing a subscription. Touch reaches it by
+  long press, as every `data-tooltip` does. A pressable chip also names the raw
+  type in its `aria-label`. See
+  `docs/plans/2026-09-25-waiting-rows-speak-plain-words.md`.
+
+  Re-flag only if a surface drops the raw type entirely, or shows it nowhere a
+  pointer or a long press can reach.
+
 - **"apps and automations you describe" is the settled positioning line, and
   "automations" there is not a stray synonym for *trigger*.** A glossary-minded
   reviewer reads the word as a near-synonym the canonical-term rule bans, since
@@ -4159,3 +4242,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag only where **trigger** is the canonical word: technical prose, a tool
   schema, a type name, a DB column.
+
+- **`CredentialRequested` changed shape with no serde default, deliberately.**
+  It was `{ provider }` and is now `{ request_id, payload }`, a persisted *form
+  request*. "Old rows stop deserializing" is right about the mechanism and wrong
+  about the data: the `{ provider }` variant was
+  defined in the enum's first commit and never had a production emitter. So no
+  row with that shape exists, and the transient `CredentialPromptRequested` left
+  none either. Re-flag only with evidence of a real `{ provider }` row.
+  (`engine/thread_events/event.rs`, ADR 0275.)

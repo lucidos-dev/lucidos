@@ -44,6 +44,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   CodingAgentToolResult: 'activity',
   CodingAgentUserMessageSent: 'start',
   CodingAgentPromptSent: 'activity',
+  CodingAgentInputRead: 'metadata',
   CodingAgentIdled: 'action_required',
   ContinuationRequested: 'start',
   MissingHardeningDetected: 'start',
@@ -68,6 +69,11 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   MergeResolutionCleared: 'metadata',
   UserPromptInjected: 'start',
   CredentialRequested: 'activity',
+  PluginInstallRequested: 'activity',
+  PluginUninstallRequested: 'activity',
+  EmailConfirmRequested: 'activity',
+  OAuthAuthorizationRequested: 'activity',
+  FormRequestResolved: 'metadata',
   McpConsentRequested: 'activity',
   CodingAgentSettingsChanged: 'metadata',
   UserQuestionAsked: 'action_required',
@@ -81,6 +87,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   WorktreeCleaned: 'metadata',
   ChildThreadCompleted: 'start',
   ChildThreadStopped: 'metadata',
+  ChildThreadDetached: 'metadata',
   ContextDismissed: 'metadata',
   ContextKeptOpen: 'metadata',
   BackgroundBashStarted: 'metadata',
@@ -194,7 +201,8 @@ export function availableThreadActions(
       actions.push('archive');
     }
   }
-  if (threadType === 'claude_code' && (status === 'running' || status === 'paused')) {
+  const watching = hasLiveEventWaits && status !== 'waiting_for_user_answer' && status !== 'failed';
+  if (threadType === 'claude_code' && (status === 'running' || status === 'paused' || watching)) {
     actions.push('apply_when_settled');
   }
   actions.push(isSaved ? 'unsave' : 'save');

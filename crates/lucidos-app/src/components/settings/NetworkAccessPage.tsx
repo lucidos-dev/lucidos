@@ -150,14 +150,13 @@ export function NetworkAccessPage() {
         </div>
       ) : (
         <>
-          <div class="settings-row-options" role="radiogroup" aria-label="Engine network bind">
+          <div class="segmented-control" role="group" aria-label="Engine network bind">
             {MODE_OPTIONS.map((opt) => (
               <button
                 key={opt.mode}
                 type="button"
-                role="radio"
-                aria-checked={mode === opt.mode}
-                class={`settings-option${mode === opt.mode ? ' active' : ''}`}
+                aria-pressed={mode === opt.mode}
+                class={`segmented-btn${mode === opt.mode ? ' active' : ''}`}
                 data-tooltip={opt.hint}
                 onClick={() => setMode(opt.mode)}
               >

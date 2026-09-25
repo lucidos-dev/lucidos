@@ -824,12 +824,11 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
 /// The headline case: a coding-agent thread that proposed a change and then
 /// parked on an event wait. This is the `e2e-lock-wait` shape.
 ///
-/// A Running thread differs by one offer, and the difference is deliberate.
-/// ADR 0168 gives a working thread the standing apply, which a parked one
-/// cannot carry: `engine::standing_apply` resolves a parked thread at once, so
-/// arming it would drop on the first look.
+/// It offers exactly what a Running thread offers: no close action, plus the
+/// standing apply. A wait ends by itself, so a standing apply waits it out
+/// rather than applying work the wake will extend (ADR 0266).
 #[test]
-fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
+fn a_parked_cc_thread_with_a_change_offers_what_a_running_one_does() {
     let parked = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Idle,
@@ -840,7 +839,7 @@ fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
         false,
         false,
     );
-    assert_eq!(parked, vec![Action::Save]);
+    assert_eq!(parked, vec![Action::ApplyWhenSettled, Action::Save]);
 
     let running = available_thread_actions(
         ThreadType::CodingAgent,
@@ -889,7 +888,33 @@ fn a_parked_thread_can_still_discard_its_unsent_draft() {
         true, // has_unsent_draft
         false,
     );
-    assert_eq!(actions, vec![Action::DiscardDraft, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![Action::DiscardDraft, Action::ApplyWhenSettled, Action::Save]
+    );
+}
+
+/// A question card outranks a wait held beside it, and so does a failed turn.
+/// Neither settles by itself, so the standing apply is not offered: it would
+/// drop on its first look.
+#[test]
+fn a_live_wait_beside_a_question_or_a_failure_offers_no_standing_apply() {
+    for status in [ThreadStatus::WaitingForUserAnswer, ThreadStatus::Failed] {
+        let actions = available_thread_actions(
+            ThreadType::CodingAgent,
+            status,
+            ArchiveState::Inbox,
+            true,
+            false,
+            true, // has_live_event_waits
+            false,
+            false,
+        );
+        assert!(
+            !actions.contains(&Action::ApplyWhenSettled),
+            "{status:?} with a live wait must not offer a standing apply: {actions:?}"
+        );
+    }
 }
 
 /// A chat thread has no change to resolve, so parking changes nothing for it.

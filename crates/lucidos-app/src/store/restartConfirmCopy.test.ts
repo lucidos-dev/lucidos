@@ -52,7 +52,7 @@ describe('the new-version shape', () => {
   it('describes the range, and folds housekeeping into the count', () => {
     const copy = restartConfirmCopy(true, COMMITS, []);
     expect(copy.details).toEqual({
-      intro: '5 commits since your running version, including 2 housekeeping commits (docs, tests, chores).',
+      intro: '5 commits come with the new version, including 2 housekeeping commits (docs, tests, chores).',
       groups: [
         { header: 'New', items: ['ui: a modal that says what it brings'] },
         { header: 'Fixed', items: ['composer: the close survives', 'todo: the guard reads once'] },
@@ -74,7 +74,7 @@ describe('the new-version shape', () => {
       total: 1,
       groups: [{ kind: 'fixed', total: 1, descriptions: ['the one thing'] }],
     };
-    expect(restartConfirmCopy(true, one, []).details?.intro).toBe('1 commit since your running version.');
+    expect(restartConfirmCopy(true, one, []).details?.intro).toBe('1 commit comes with the new version.');
   });
 
   it('states an all-housekeeping range once rather than twice', () => {
@@ -85,9 +85,16 @@ describe('the new-version shape', () => {
       groups: [{ kind: 'housekeeping', total: 3, descriptions: [] }],
     };
     expect(restartConfirmCopy(true, chores, []).details).toEqual({
-      intro: '3 housekeeping commits (docs, tests, chores) since your running version.',
+      intro: '3 housekeeping commits (docs, tests, chores) come with the new version.',
       groups: [],
     });
+    const chore: PendingCommits = {
+      total: 1,
+      groups: [{ kind: 'housekeeping', total: 1, descriptions: [] }],
+    };
+    expect(restartConfirmCopy(true, chore, []).details?.intro).toBe(
+      '1 housekeeping commit (docs, tests, chores) comes with the new version.',
+    );
   });
 
   it('falls back to the applied changes when git could not answer', () => {

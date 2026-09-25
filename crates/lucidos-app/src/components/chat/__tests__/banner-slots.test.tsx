@@ -252,7 +252,7 @@ describe('getBannerActions', () => {
       isArchiving: false,
       showDiff: false,
     });
-    const ctx = { open: true, openedViaKeyboard: false, run: (fn: () => void) => () => fn(), anchor: null };
+    const ctx = { openedViaKeyboard: false, run: (fn: () => void) => () => fn(), anchor: null };
     const menu = members[0].menuRows!(ctx);
     expect(buttonLabels(menu)).toEqual(['Apply', 'Discard']);
   });

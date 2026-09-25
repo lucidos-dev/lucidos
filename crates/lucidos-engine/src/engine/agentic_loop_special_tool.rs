@@ -646,13 +646,6 @@ impl LucidosEngine {
                     _ => None,
                 };
 
-                if spawn_app_id.is_some() && repo_id.is_some() {
-                    return Some(
-                        "Error: Cannot pass both `app_id` and `repo_id` — an app \
-                         coding-agent thread is not a repo"
-                            .to_string(),
-                    );
-                }
                 let caller_title = tool_args["title"].as_str();
                 let images = resolved_images.as_deref().or(user_images);
                 let cc_thread_id = uuid::Uuid::new_v4();
@@ -1208,10 +1201,19 @@ impl LucidosEngine {
                     .await
                 };
 
-                let (result, is_error) = match outcome {
+                let (mut result, is_error) = match outcome {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
+                // The same form-request handling as the main loop. Without it a
+                // form this sub-loop asks for never opens, and its raw JSON
+                // reaches the model as if the call had returned.
+                let form_request = super::match_sentinel(&result).map(|m| {
+                    if let Some(redacted) = m.redacted_text {
+                        result = redacted;
+                    }
+                    (m.label, m.event)
+                });
                 self.event_bus
                     .emit_or_log(
                         BusEvent::Thread {
@@ -1234,6 +1236,17 @@ impl LucidosEngine {
                         "[IntentLoop] ToolResult",
                     )
                     .await;
+                if let Some((label, event)) = form_request {
+                    crate::engine::form_requests::emit_request(
+                        &self.pool,
+                        &self.event_bus,
+                        thread_id,
+                        event,
+                        EventMeta::NONE,
+                        label,
+                    )
+                    .await;
+                }
 
                 result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: tc.id.clone(),

@@ -31,7 +31,8 @@ WRONG (burns two tool calls per wait, doubles context, stalls the turn):
 
 ```python
 # Tool call 1: spawn
-run_python_background(code="result = expensive_thing(); print(result)")
+run_python_background(code="result = expensive_thing(); print(result)",
+                      description="the expensive calculation")
 # → task_id = "abc"
 
 # Tool call 2: sleep-poll  ← ANTIPATTERN
@@ -45,7 +46,8 @@ RIGHT (one drain call does the wait AND the read):
 
 ```python
 # Tool call 1: spawn
-run_python_background(code="result = expensive_thing(); print(result)")
+run_python_background(code="result = expensive_thing(); print(result)",
+                      description="the expensive calculation")
 # → task_id = "abc"
 
 # Tool call 2: drain with server-side wait — blocks the full 60 s,

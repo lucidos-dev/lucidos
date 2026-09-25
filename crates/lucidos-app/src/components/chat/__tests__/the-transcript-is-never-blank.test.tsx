@@ -87,7 +87,7 @@ describe('a loaded thread with nothing to draw', () => {
 
 describe('every state a turn can be in', () => {
   const EVERY_STATUS: ExchangeStatus[] = [
-    'pending', 'queued', 'streaming', 'coding-agent-working', 'awaiting-answer',
+    'pending', 'queued', 'held', 'streaming', 'coding-agent-working', 'awaiting-answer',
     'done', 'interrupted', 'canceled', 'error', 'aborted',
   ];
 

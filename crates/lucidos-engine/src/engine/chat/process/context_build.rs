@@ -316,17 +316,9 @@ pub(crate) fn build_capture_sections(
         // The same cap and the same gate as the static sections above. A
         // resumed tool pair is a prior turn's work, which is exactly what a
         // two-turn task's replay needs to show.
-        let content = if capture_body {
-            Some(match cap {
-                Some(cap) if pair_body.len() > cap => truncate_head_tail(&pair_body, cap),
-                _ => pair_body,
-            })
-        } else {
-            None
-        };
         capture_sections.push(ContextSection {
             name: format!("ToolUse: {}", tool_name),
-            content,
+            content: truncate(&pair_body),
             budget_delta_chars: pair_chars,
             content_chars: Some(pair_chars),
             role: ContextRole::PriorMessage,

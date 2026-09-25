@@ -35,6 +35,7 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { useTooltip } from '../../hooks/useTooltip';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { isInteractiveTarget } from '../../utils/dom';
+import { errorDetail } from '../../utils/errorDetail';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { watchTitlebarBand } from '../../store/actions/trafficLights';
@@ -436,7 +437,7 @@ export function WorkspacePicker() {
     try {
       await fetchWorkspaces();
     } catch (e) {
-      workspaces.value = { status: 'failed', error: String(e) };
+      workspaces.value = toFailed(e);
     }
   }
 
@@ -671,7 +672,7 @@ export function WorkspacePicker() {
     try {
       await fn();
     } catch (e) {
-      error.value = String(e);
+      error.value = errorDetail(e);
     } finally {
       busy.value = false;
     }

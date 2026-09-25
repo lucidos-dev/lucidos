@@ -1,6 +1,6 @@
 import { useEffect } from 'preact/hooks';
 import { effect } from '@preact/signals';
-import { connectionStatus, databaseReachable, threadsLoaded } from '../store/store';
+import { connectionStatus, databaseReachable, scaledDurationMs, threadsLoaded } from '../store/store';
 import {
   bootSplashPlaysNoReveal,
   bootSplashPresent,
@@ -19,7 +19,9 @@ export const BOOT_SPLASH_SAFETY_MS = 15_000;
 /** Keep the splash up at least this long (since navigation start) in a final
  *  (non-reload) document so the inline mark reveal — which the workspace document
  *  plays once, see index.html — always finishes at least once before we dismiss,
- *  even if the app reports ready sooner. Matches the reveal's tail (~1.15s). */
+ *  even if the app reports ready sooner. Matches the reveal's tail (~1.15s) at
+ *  1x. The floor is scaled with the reveal, so under reduced motion, which has
+ *  no reveal to protect, it all but vanishes. */
 export const BOOT_SPLASH_MIN_REVEAL_MS = 1_200;
 
 /** Delay before the status text updates to a phase word. Set well beyond a normal
@@ -49,7 +51,7 @@ function msSinceLoad(): number {
  *      is what made every such reload read as a relaunch. */
 export function remainingRevealMs(elapsedMs: number, revealSkipped: boolean): number {
   if (revealSkipped) return 0;
-  return Math.max(0, BOOT_SPLASH_MIN_REVEAL_MS - elapsedMs);
+  return Math.max(0, scaledDurationMs(BOOT_SPLASH_MIN_REVEAL_MS) - elapsedMs);
 }
 
 /** The workspace is "ready" — and the boot splash may fade — once the engine

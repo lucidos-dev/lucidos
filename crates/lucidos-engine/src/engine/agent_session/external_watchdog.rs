@@ -280,7 +280,14 @@ impl ExternalWatchdog {
                     let still_running =
                         crate::engine::claude_code::thread_is_running(&self.pool, c.thread_id)
                             .await
-                            .unwrap_or(false);
+                            .unwrap_or_else(|e| {
+                                log!(
+                                    "[ExternalWatchdog] thread={} running-state probe failed: {}; not recovering this tick",
+                                    c.thread_id,
+                                    e
+                                );
+                                false
+                            });
                     if !still_running {
                         log!(
                             "[ExternalWatchdog] thread={} past ceiling / exited-stale but no longer `running` (awaiting user answer / already settled) — not recovering",

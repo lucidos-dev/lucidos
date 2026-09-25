@@ -218,11 +218,6 @@ export function cameraIsAvailable(): boolean {
   });
 }
 
-/** Check if user prefers reduced motion */
-export function prefersReducedMotion(): boolean {
-  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
-
 /** Does this device have a hover-capable pointer — i.e. a real mouse/trackpad
  *  plus (in practice) a keyboard, as opposed to a touch-only phone/tablet? The
  *  exact JS mirror of the CSS `@media (hover: hover)` gate, so JS focus behaviour

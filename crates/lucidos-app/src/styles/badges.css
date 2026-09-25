@@ -24,7 +24,7 @@
  * centred box carries one trailing gap with no glyph after it, and centring
  * that box parks the digits half a gap to the left.
  *
- * One badge inherits any today: the collapsed-section count, from the 0.05em
+ * One badge inherits any today: the section count, from the 0.05em
  * its section title wears. The title's font is the larger of the two, so the
  * pill inherits 6.5% of its OWN em. At 200% ui-scale that put the digits
  * 0.65px left of the pill's middle, about two device pixels on a phone, and
@@ -37,13 +37,33 @@
  * not acquire the lean. NOT gated below: this half needs no new feature. */
 .badge,
 .drawer-view-count,
-.collapse-count-badge,
+.section-count-badge,
 .drawer-badge,
 .brand-menu-ws-badge,
 .ws-picker-badge,
 .thread-status-question-badge {
     letter-spacing: normal;
 }
+
+/* ── And where it sits on the PIXEL GRID ──────────────────────────────────
+ *
+ * Chrome paints a baseline on a whole CSS pixel, and a pill's edges too, each
+ * rounding on its own. So a digit centred in layout still landed up to a pixel
+ * off, and WHICH way depended on where the badge sat. Moved by a sixteenth of
+ * a pixel, the same badge jumped a whole pixel against its pill. That is why
+ * the mark's unread count sat low.
+ *
+ * Both roundings agree when the pill's height and the baseline's offset inside
+ * it are whole pixels. So each badge states the height it was designed at as
+ * `--badge-height`, and the rule below derives the box from it. The baseline
+ * sits a whole-pixel padding above the bottom edge. The height is whichever of
+ * the two whole pixels at or just below the design splits more evenly around
+ * the cap band. Never above: a count sized by its row's line would grow the
+ * row, and a section header would jump as it collapsed.
+ *
+ * Measured at eight sub-pixel positions and at 100, 125 and 150% ui-scale, every
+ * badge now draws identically wherever it sits. Its glyph lands within a
+ * quarter pixel of the middle, in Chrome and in WebKit alike. */
 
 /* Gated on support, so a browser without `text-box-trim` keeps exactly the
    flex centring each badge already declares. Nothing to fall back to, and
@@ -52,43 +72,50 @@
     /* The trim applies to the block container holding the text. A flex
        container's text lives in an ANONYMOUS item, which inherits none of it,
        so each badge stops being a flex box and `align-content` takes over the
-       job `align-items` was doing.
+       job `align-items` was doing. Aligned to the END, because the trimmed
+       box's bottom edge IS the baseline.
 
        `inline-block` rather than `block`: every badge here is absolutely
        positioned or a flex item, so both blockify to the same shrink-to-fit
-       box, and this is the one that also survives a badge landing in a plain
-       line of text. */
-    .badge,
+       box. This one also survives a badge landing in a plain line of text.
+
+       The two dots that wear `.badge` draw no glyph, so they keep the box their
+       own rules give them. `:where()` weighs nothing, so neither does the
+       `:not()` around it, and this still ties with every rule it re-homes.
+
+       A badge with no `--badge-height` gets an invalid box, so its height and
+       padding stay at their initial values. The plain per-view count is one,
+       since it draws no pill. */
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
     .drawer-view-count,
-    .collapse-count-badge,
+    .section-count-badge,
     .drawer-badge,
     .brand-menu-ws-badge,
     .ws-picker-badge,
     .thread-status-question-badge {
         display: inline-block;
         text-align: center;
-        align-content: center;
+        align-content: end;
         text-box-trim: trim-both;
         text-box-edge: cap alphabetic;
-    }
-
-    /* These two take their HEIGHT from the line box the trim shrinks, so they
-       would lose a few pixels of pill. `1lh` IS that line box, stated, so each
-       keeps the exact box it has today at any font or ui-scale. Every other
-       badge already states a `height` or a `min-height`. */
-    .collapse-count-badge,
-    .brand-menu-ws-badge {
-        min-height: 1lh;
+        --badge-floor: round(down, var(--badge-height), 1px);
+        --badge-box: clamp(var(--badge-floor) - 1px,
+            round(1cap + 2 * round((var(--badge-floor) - 0.5px - 1cap) / 2, 1px), 1px),
+            var(--badge-floor));
+        height: var(--badge-box);
+        min-height: 0;
+        padding-block: 0 round((var(--badge-box) - 1cap) / 2, 1px);
     }
 
     /* The one badge whose content is not text. While the engine is building,
        the brand badge holds a spinning glyph instead of the "!", and a line box
-       trimmed to a cap band it has no part in would park it off centre. It
-       keeps the flex centring. */
+       trimmed to a cap band it has no part in would park it off centre. So
+       would the padding that lifts a baseline. It keeps the flex centring. */
     .badge:has(.brand-badge-spinner) {
         display: flex;
         align-items: center;
         justify-content: center;
         text-box-trim: none;
+        padding-block: 0;
     }
 }

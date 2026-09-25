@@ -593,13 +593,12 @@ pub(super) fn arm_followup_redirect(
     // Keep the interrupted turn's idle from terminating the subprocess. A flag
     // rather than a count, because the thing being expressed is a promise ("a
     // message is coming"), not a quantity, and it has to hold across a window in
-    // which the message provably is not in `msg_rx` yet. It needs no special case
-    // for a silent-resume / warm-up turn, which the old arithmetic did: a count of
-    // 1 was ambiguous between "the initial turn owes a Result" and "a follow-up is
-    // queued", so the pre-count had to bump twice to clear the `> 1` threshold.
-    // Race-free with respect to the idle handler: the run loop flips `is_waiting`
-    // under the same `agent_sessions` lock we hold here, and `is_in_flight()` was
-    // just observed true, so the idle decision runs strictly after we release.
+    // which the message provably is not in `msg_rx` yet.
+    // The run loop flips `is_waiting` under the lock we hold here. We just saw the
+    // turn in flight, so the idle decision runs strictly after we release. The
+    // turn may still end on its own first, with its `Result` already in. Then
+    // `mark_turn_boundary` retires the flag, the actor and the permit below, and
+    // leaves only this promise.
     s.redirect_followup_pending = true;
     s.cancel_actor = origin.clone();
     // Mark this interrupt as a redirect (not a Stop click) so the run_session

@@ -16,9 +16,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  covers which inputs produce one, but through a fake listener registry rather
  *  than a browser's. Neither can see the two things only a real engine has:
  *  whether a real wheel over a real transcript reaches the listener at all, and
- *  whether the live term is actually TRUE while the agent works
- *  (`setAgentLive`, published from `ChatExchange` off the thread projection,
- *  which no unit test drives).
+ *  whether the ride really holds the reader while the agent works.
  *
  *  Desktop only, like its sibling: the mobile header's own scroll compensation
  *  is a second writer over the same offset. */

@@ -605,6 +605,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let database_url = lucidos_engine::core::database_url();
     log!("[Startup] Connecting to PostgreSQL...");
+    let mut boot_stages = lucidos_engine::boot_report::BootStageTimer::start();
 
     // Resolve the Vertex project WITHOUT requiring the `gcloud` binary, so a
     // packaged build works from the user's existing ADC. The subprocess call is
@@ -744,6 +745,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
     log!("[Startup] PostgreSQL connected");
+    boot_stages.lap("engine setup");
 
     // Retire the legacy per-workspace `data/.env` into the
     // environment_variables table. Needs the DB and its migrations, and is
@@ -957,6 +959,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The recovery sweeps below run before the HTTP server binds, so narrate
     // them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
+    boot_stages.lap("pre-recovery setup");
 
     // Acquired BEFORE any reset or recovery below. A respawn is not atomic. The
     // gateway spawns this engine before the previous one exits, so the sweeps
@@ -973,6 +976,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lucidos_engine::engine::startup_lease::DEFAULT_MAX_WAIT,
     )
     .await;
+    boot_stages.lap("startup lease");
 
     // A respawn sidecar means the previous engine died unexpectedly, so record
     // it in the audit timeline. Emits before recovery, so the timeline reads
@@ -1005,6 +1009,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &shared_engine.event_bus,
     )
     .await;
+    // Plugin staging and OAuth listeners lived in the previous engine's memory,
+    // so a form request resting on one can no longer be answered.
+    lucidos_engine::engine::form_requests::expire_memory_backed_requests(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+    )
+    .await;
     // A voice session died with the process holding its socket, so every
     // unpaired start belongs to a call that is already over.
     lucidos_engine::voice::recovery::settle_orphan_voice_sessions(
@@ -1012,6 +1023,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &shared_engine.event_bus,
     )
     .await;
+    boot_stages.lap("orphan requests");
 
     // Reset threads orphaned in 'running' by the previous engine process. The
     // recovery below sets the correct status.
@@ -1044,33 +1056,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Startup] Failed to reset orphaned waiting threads: {}", e);
     }
 
-    // Reconcile active_children_count in either drift direction. The query and
+    // Reconcile the three child counts in either drift direction. The query and
     // its reasons live with the in-tx reconcile it must agree with, so the two
     // cannot drift apart on what "in flight" means.
-    if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_active_children_count(
-        shared_engine.pool(),
-    )
-    .await
+    if let Err(e) =
+        lucidos_engine::engine::event_bus::EventBus::rebuild_children_counts(shared_engine.pool())
+            .await
     {
-        log!("[Startup] Failed to reconcile active_children_count: {}", e);
-    }
-
-    // Reconcile total_children_count
-    if let Err(e) = sqlx::query(
-        "WITH child_counts AS ( \
-           SELECT parent_thread_id, COUNT(*) AS cnt \
-           FROM thread_summaries WHERE parent_thread_id IS NOT NULL \
-           GROUP BY parent_thread_id \
-         ) \
-         UPDATE thread_summaries p SET total_children_count = cc.cnt \
-         FROM child_counts cc \
-         WHERE p.thread_id = cc.parent_thread_id \
-           AND p.total_children_count != cc.cnt",
-    )
-    .execute(shared_engine.pool())
-    .await
-    {
-        log!("[Startup] Failed to reconcile total_children_count: {}", e);
+        log!("[Startup] Failed to reconcile the child counts: {}", e);
     }
 
     // Reconcile blocking_descendant_count. The two resets above move child rows
@@ -1106,6 +1099,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // this consumer must see to flip abandoned todos, and a tokio broadcast
     // channel does not replay history for a late subscriber.
     lucidos_engine::engine::todo_consumer::spawn(shared_engine.clone());
+    boot_stages.lap("summary resets");
 
     // Recover worktrees whose in-flight session an engine crash interrupted. An
     // idle session stays idle, shown in the waiting UI for the user to act on.
@@ -1113,11 +1107,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine
         .recover_orphaned_threads(&recovering_threads)
         .await;
+    boot_stages.lap("worktree recovery");
 
     // Recover orphan `ToolCalled` events, left by an engine that died mid-tool.
     // Without this the thread's next LLM call rebuilds an assistant `tool_use`
     // block whose pair is missing, and the provider rejects the request.
     shared_engine.recover_orphan_tool_calls().await;
+    boot_stages.lap("orphan tool calls");
 
     // Reconcile `thread_summaries.coding_agent_has_diff` against on-disk git
     // for every active coding-agent thread. Live updates flow through the
@@ -1130,6 +1126,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shared_engine.workspace_path(),
     )
     .await;
+    boot_stages.lap("has-diff sweep");
 
     // Propose changes never surfaced at idle: an idle coding-agent thread with
     // a committed branch diff but no pending change. A safety net for any
@@ -1151,6 +1148,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // before the HTTP server, so the first SSE payload is honest.
     lucidos_engine::engine::agent_recovery::reconcile_emptied_changes_on_startup(&shared_engine)
         .await;
+    boot_stages.lap("change reconcile");
 
     // Re-deliver parent-resume re-entries lost to the restart (ADR 0011). The
     // in-memory channel was recreated empty above. So a blocking child that
@@ -1214,6 +1212,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.settle_abandoned_background_tasks().await;
 
     shared_engine.rebuild_event_waits().await;
+    boot_stages.lap("event waits");
 
     // Rebuild the Apply-All batch registry from the durable table and resolve
     // any batch the previous process abandoned mid-flight. Runs AFTER the agent
@@ -1228,6 +1227,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // that settled while the engine was down gets its apply now, and one that
     // failed gets its report. Same ordering rule as the batch recovery above.
     shared_engine.recover_standing_applies().await;
+    boot_stages.lap("apply recovery");
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 
@@ -1317,6 +1317,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine
         .settle_unresumed_switch_threads(&resumed_switch_threads)
         .await;
+    boot_stages.lap("switch resumes");
 
     let pool = shared_engine.pool().clone();
 
@@ -1328,6 +1329,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Only now: draining consults trigger pause and deletion state, which the
     // scheduler's event replay just loaded.
     shared_engine.thread_queue.start_draining();
+    boot_stages.lap("scheduler");
 
     // Resolved BEFORE the router is built, because it decides whether the
     // router carries a door (`api::local_auth`). The port it will be paired
@@ -1429,6 +1431,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .map(|v| v.trim().to_string());
     let scheme = net_config::tls_scheme_from(tls_cert.as_deref(), tls_key.as_deref());
+    boot_stages.lap("router");
+    log!("[Startup] Boot stages: {}", boot_stages.summary());
 
     // Serve every resolved address concurrently, sharing the one graceful-shutdown
     // `Handle` so a single shutdown stops all sockets. A bind failure on any

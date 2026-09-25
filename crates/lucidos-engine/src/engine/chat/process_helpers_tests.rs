@@ -333,13 +333,11 @@ fn redirect_skips_urgent_claude_code_child_wake() {
 use super::arm_followup_redirect;
 
 /// A live Codex session mid-turn: alive (`process_exited=false`), not at a turn
-/// boundary (`is_waiting=false`), owing one Result for the turn it is running.
+/// boundary (`is_waiting=false`).
 fn codex_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
     let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     s.coding_agent = CodingAgent::Codex;
-    s.inputs_awaiting_result
-        .store(1, std::sync::atomic::Ordering::Release);
     (s, msg_rx)
 }
 
@@ -379,36 +377,12 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
     );
 }
 
-#[test]
-fn arm_redirect_keeps_warmup_turn_alive() {
-    // A silent-resume / warm-up turn owes no Result of its own. Under the old
-    // counter that made it a special case: a lone +1 landed at 1, below the `> 1`
-    // threshold, and the interrupted warm-up turn's idle killed the queued
-    // follow-up, so the pre-count had to bump twice. A reservation flag says the
-    // same thing for every turn shape, with no arithmetic to get wrong.
-    let thread_id = Uuid::new_v4();
-    let mut sessions = HashMap::new();
-    let (session, _msg_rx) = codex_in_flight_session();
-    session
-        .inputs_awaiting_result
-        .store(0, std::sync::atomic::Ordering::Release);
-    sessions.insert(thread_id, session);
-
-    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_some());
-    assert!(
-        sessions.get(&thread_id).unwrap().redirect_followup_pending,
-        "a warm-up turn that owes nothing must still be reserved for the incoming follow-up"
-    );
-}
-
 /// A live Claude Code session mid-turn, the shape the 2026-08-06 incident had:
-/// alive, not at a turn boundary, owing one Result for its own turn.
+/// alive, not at a turn boundary.
 fn claude_code_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
     let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     debug_assert_eq!(s.coding_agent, CodingAgent::ClaudeCode);
-    s.inputs_awaiting_result
-        .store(1, std::sync::atomic::Ordering::Release);
     (s, msg_rx)
 }
 
@@ -516,6 +490,50 @@ fn arm_redirect_skips_child_wake() {
 fn arm_redirect_none_when_no_session() {
     let mut sessions = HashMap::new();
     assert!(arm_followup_redirect(&mut sessions, Uuid::new_v4(), true, false, &None).is_none());
+}
+
+/// The late redirect, replayed step by step in the order the audit traced.
+///
+/// 1. The agent's `Result` is in, and the run loop is still inside the `Result`
+///    arm doing git work. The shared `is_waiting` is still false.
+/// 2. A follow-up arms a redirect. The turn reads in flight, so it stores the
+///    flag, the actor and an interrupt permit.
+/// 3. The loop reaches the boundary, and the idle decision takes the promise.
+///
+/// Nothing aimed at the ended turn may survive into the next one. A stale flag
+/// relabels the next real Stop as superseded. A stale permit interrupts the
+/// follow-up's own turn as soon as `msg_rx` wins the `select!`.
+#[test]
+fn a_redirect_armed_inside_the_result_arm_does_not_outlive_its_turn() {
+    let thread_id = Uuid::new_v4();
+    let (session, _msg_rx) = codex_in_flight_session();
+    let mut sessions = HashMap::from([(thread_id, session)]);
+    let origin = Some(crate::engine::thread_events::MessageOrigin::Device {
+        device_id: "d-1".into(),
+        label: "My iPhone".into(),
+    });
+
+    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &origin).is_some());
+
+    let s = sessions.get_mut(&thread_id).unwrap();
+    crate::engine::agent_session::lifecycle::mark_turn_boundary(s);
+    assert!(
+        std::mem::take(&mut s.redirect_followup_pending),
+        "the follow-up promise survives to the idle decision, which keeps the subprocess"
+    );
+
+    assert!(
+        !s.redirect_followup,
+        "the next real Stop would render as superseded"
+    );
+    assert_eq!(
+        s.cancel_actor, None,
+        "the next Stop would inherit this device"
+    );
+    assert!(
+        futures::FutureExt::now_or_never(s.interrupt.notified()).is_none(),
+        "the stored permit would interrupt the follow-up's own turn"
+    );
 }
 
 // --- follow_up_keeps_open_question ----------------------------------------

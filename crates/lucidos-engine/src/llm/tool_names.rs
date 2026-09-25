@@ -1,5 +1,5 @@
 /// Canonical tool name constants — single source of truth for all tool name strings.
-/// Used by tool definitions (tools.rs), tool dispatch (execute_tool, handle_special_tool),
+/// Used by tool definitions (llm/tools/), tool dispatch (execute_tool, handle_special_tool),
 /// and the agentic loop for caching/circuit-breaker checks.
 // File operations
 pub const READ_FILE: &str = "read_file";
@@ -128,13 +128,14 @@ pub const QUERY_EVENTS: &str = "query_events";
 pub const COUNT_EVENTS: &str = "count_events";
 pub const LIST_EVENT_TYPES: &str = "list_event_types";
 
-// Thread queries (script/trigger-facing introspection) — grouped `threads` tool
-// (list/count) from the capability parity manifest; the flat names below stay as
+// Thread reads, plus moving a child to top level: the grouped `threads` tool
+// (list/count/search/detach_child) from the capability parity manifest; the flat names below stay as
 // back-compat aliases. (Spawning is the standalone run_thread/run_coding_agent.)
 pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
 pub const SEARCH_THREADS: &str = "search_threads";
+pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
 
 // Changes (pending coding-agent-proposed changes) — grouped `changes` tool
 // (list/apply) from the capability parity manifest; flat names below are aliases.
@@ -142,10 +143,11 @@ pub const CHANGES: &str = "changes";
 pub const LIST_CHANGES: &str = "list_changes";
 pub const APPLY_CHANGE: &str = "apply_change";
 /// Arm a *standing apply* on one change: it applies when its thread settles,
-/// and drops with a report if the thread parks or fails (ADR 0168 clause 5).
+/// waiting through an event wait. It drops with a report if the thread parks
+/// on a question or fails (ADR 0168 clause 5, ADR 0266).
 pub const APPLY_WHEN_SETTLED: &str = "apply_when_settled";
 /// Arm the sweep: apply everything pending that has settled, and keep going as
-/// the threads still working land theirs.
+/// the threads still settling land theirs.
 pub const APPLY_AS_THEY_SETTLE: &str = "apply_as_they_settle";
 /// Take a *standing apply* back: one thread's, or every one in the workspace.
 /// The off for both arms above (philosophy rule 2: prompt-first).

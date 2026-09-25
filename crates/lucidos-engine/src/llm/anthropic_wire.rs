@@ -592,6 +592,7 @@ pub(crate) async fn parse_claude_stream(
     let mut tool_calls = Vec::new();
     let mut thinking_chars: usize = 0;
     let mut thinking_blocks: usize = 0;
+    let mut wrote_reply = false;
 
     // A turn can carry more than one text block (Anthropic interleaves
     // thinking and text). They are separate blocks in the wire format, not a
@@ -610,7 +611,10 @@ pub(crate) async fn parse_claude_stream(
 
     for block in blocks {
         match block {
-            AccumulatedBlock::Text(text) => append_content(&text),
+            AccumulatedBlock::Text(text) => {
+                wrote_reply |= !text.trim().is_empty();
+                append_content(&text);
+            }
             AccumulatedBlock::ProgressNote(note) => {
                 thinking_blocks += 1;
                 append_content(&note);
@@ -655,6 +659,7 @@ pub(crate) async fn parse_claude_stream(
     }
 
     Ok(LlmResponse {
+        content_is_progress_notes: content.is_some() && !wrote_reply,
         content,
         tool_calls,
         stop_reason: turn_meta.stop_reason,
@@ -2635,6 +2640,51 @@ mod tests {
             response.content.clone().unwrap()
         );
         assert_eq!(response.thinking_blocks, Some(2));
+        assert!(!response.content_is_progress_notes, "a reply came after it");
+    }
+
+    /// The refund incident's shape: the model drafted a message in its
+    /// reasoning, and only a note came back before the question card.
+    #[tokio::test]
+    async fn a_round_with_only_a_note_before_its_tool_call_is_flagged() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"thinking","thinking":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"thinking_delta","thinking":"Here it is now: the steps."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"#,
+            r#""content_block":{"type":"tool_use","id":"toolu_1","name":"ask_user_question","input":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"#,
+            r#""delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"#,
+            r#""usage":{"output_tokens":40}}"#,
+            "\n\n"
+        );
+        let response = parse_claude_stream(
+            sse_response(BODY),
+            &None,
+            ThinkingDisplay::ProgressUpdates,
+            "Test",
+        )
+        .await
+        .expect("a note-then-tool turn parses");
+
+        assert_eq!(
+            response.content.as_deref(),
+            Some("Here it is now: the steps.")
+        );
+        assert_eq!(response.tool_calls.len(), 1);
+        assert!(response.content_is_progress_notes);
     }
 
     /// Without progress-update display, the same text is reasoning. It must
@@ -2655,6 +2705,7 @@ mod tests {
         assert_eq!(*seen.lock().expect("callback mutex"), "The port is 8080.");
         assert_eq!(response.thinking_blocks, Some(2));
         assert!(response.thinking_chars.unwrap() > 0);
+        assert!(!response.content_is_progress_notes, "only the reply shows");
     }
 
     /// An interrupted response can end on a progress block holding a fixed

@@ -73,11 +73,12 @@ const DEADLINE_MARGIN: Duration = Duration::minutes(5);
 /// namespace of ours).
 const ENGINE_TOOL_USE_PREFIX: &str = "engine:bg-task-wait";
 
-/// What the user reads in the waiting indicator. Engine-authored, so it
-/// says who armed it: a subscription the user did not see the agent ask for is
-/// otherwise indistinguishable from one it did.
-const ARMED_REASON: &str = "Watching background work started in this thread, so the thread \
-                            re-opens when it finishes";
+/// The longest one task's name may run in the wait's reason, in characters.
+/// The reason is one line in the transcript, and a command can be kilobytes.
+const LABEL_MAX_CHARS: usize = 80;
+
+/// How many tasks the reason names before it counts the rest.
+const LABELS_SHOWN: usize = 3;
 
 impl LucidosEngine {
     /// Arm a wait covering every unfinished background task this thread owns
@@ -197,7 +198,7 @@ impl LucidosEngine {
             thread_id,
             &tool_use_id,
             on,
-            ARMED_REASON,
+            &armed_reason(uncovered),
             timeout_secs,
             watermark,
         );
@@ -280,8 +281,8 @@ pub(super) fn plan_wait<'a>(
 
     match recent {
         Some(n) if n >= super::MAX_RECENT_SUBSCRIPTIONS => ArmingPlan::Refused(format!(
-            "it has subscribed {n} times in the last {} minutes with no message from the \
-             user, the limit, with {} task(s) unwatched",
+            "it has started {n} waits in the last {} minutes that no other thread ended, \
+             with no message or answer from the user, the limit, with {} task(s) unwatched",
             super::RECENT_SUBSCRIPTION_WINDOW_SECS / 60,
             uncovered.len(),
         )),
@@ -308,6 +309,54 @@ fn wait_covers_task(on: &[EventSubscription], task_id: &str, thread_id: Uuid) ->
         Some(thread_id),
     );
     EventSubscription::any_matches(on, BACKGROUND_BASH_COMPLETED, &payload)
+}
+
+/// What the user reads on the wait's transcript row, after `Waiting for `. So
+/// it is a noun phrase naming the work, never a sentence about waiting.
+///
+/// The wait fires on the FIRST covered task to finish, so several tasks read as
+/// "the first of", which is what actually re-opens the thread.
+fn armed_reason(tasks: &[&RunningTaskHandle]) -> String {
+    match tasks {
+        [one] => format!("{} to finish", task_label(one)),
+        many => {
+            let mut names: Vec<String> = many
+                .iter()
+                .take(LABELS_SHOWN)
+                .map(|h| task_label(h))
+                .collect();
+            if many.len() > LABELS_SHOWN {
+                names.push(format!("{} more", many.len() - LABELS_SHOWN));
+            }
+            format!(
+                "the first of {} background jobs to finish: {}",
+                many.len(),
+                names.join("; ")
+            )
+        }
+    }
+}
+
+/// A task by the agent's own name for it, or by its command when it gave none.
+fn task_label(task: &RunningTaskHandle) -> String {
+    match &task.description {
+        Some(description) => one_short_line(description),
+        None => format!(
+            "the background command \"{}\"",
+            one_short_line(&task.command)
+        ),
+    }
+}
+
+/// Collapse every run of whitespace, newlines included, to one space, and cut
+/// at [`LABEL_MAX_CHARS`] with an ellipsis.
+fn one_short_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= LABEL_MAX_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(LABEL_MAX_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Seconds until the wait should expire: past the last watchdog deadline among

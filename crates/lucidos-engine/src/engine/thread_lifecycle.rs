@@ -234,9 +234,9 @@ pub enum Action {
     Discard,
     Apply,
     /// Arm a *standing apply*: the change applies once the thread settles (ADR
-    /// 0168 clause 5). Offered exactly where `Apply` is withheld because the
-    /// thread is still working, so a control that cannot act is replaced by the
-    /// one that can. Serializes as `"apply_when_settled"`.
+    /// 0168 clause 5). Offered while the thread is *settling*: running, paused,
+    /// or watching an event. Where `Apply` is withheld, a control that cannot act
+    /// is replaced by the one that can. Serializes as `"apply_when_settled"`.
     ApplyWhenSettled,
     Archive,
     /// Retention toggle — present for any focused thread (mutually exclusive
@@ -258,6 +258,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // A held message and its release are markers. The status stays where
         // the open question put it; the release's `MessageReceived` moves it.
         "MessageHeld" | "HeldMessageReleased" => EventClass::Metadata,
+        // A read acknowledges an input already recorded. It starts no work and
+        // moves no status.
+        "CodingAgentInputRead" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
@@ -315,6 +318,14 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "CodingAgentToolResult" => EventClass::Activity,
         "CodingAgentPromptSent" => EventClass::Activity,
         "CredentialRequested" | "McpConsentRequested" => EventClass::Activity,
+        // Form requests arrive inside the turn that asked, like the tool step
+        // they follow. The resolution usually lands after the turn ended, so it
+        // is Metadata: an answered form must not read as the thread working.
+        "PluginInstallRequested"
+        | "PluginUninstallRequested"
+        | "EmailConfirmRequested"
+        | "OAuthAuthorizationRequested" => EventClass::Activity,
+        "FormRequestResolved" => EventClass::Metadata,
         // Terminal
         "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => EventClass::Terminal,
         "SessionEnded" | "ThreadArchived" | "TriggerCompleted" => EventClass::Terminal,
@@ -362,6 +373,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // timeline, never a turn: the stopped child is alive, and the parent
         // stays asleep until the `ChildThreadCompleted` that settles it.
         "ChildThreadStopped" => EventClass::Metadata,
+        // The edge to a child was cut (ADR 0278). Bookkeeping on the former
+        // parent: it wakes nothing and moves no section.
+        "ChildThreadDetached" => EventClass::Metadata,
         // Resume-helper input from the retired `dismiss_from_context` tool,
         // and the record of a keep. Pure bookkeeping, no UI surface and no
         // activity bump.
@@ -428,6 +442,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentToolResult",
         "CodingAgentUserMessageSent",
         "CodingAgentPromptSent",
+        "CodingAgentInputRead",
         "CodingAgentIdled",
         "ContinuationRequested",
         "MissingHardeningDetected",
@@ -452,6 +467,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "MergeResolutionCleared",
         "UserPromptInjected",
         "CredentialRequested",
+        "PluginInstallRequested",
+        "PluginUninstallRequested",
+        "EmailConfirmRequested",
+        "OAuthAuthorizationRequested",
+        "FormRequestResolved",
         "McpConsentRequested",
         "CodingAgentSettingsChanged",
         "UserQuestionAsked",
@@ -466,6 +486,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
         "ChildThreadStopped",
+        "ChildThreadDetached",
         "ContextDismissed",
         "ContextKeptOpen",
         // Background-bash lifecycle (run_bash_background trio).
@@ -598,6 +619,7 @@ pub fn resolve_transition(
         | "CodingAgentToolResult"
         | "CodingAgentUserMessageSent"
         | "CodingAgentPromptSent"
+        | "CodingAgentInputRead"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
         | "ContinuationRequested" => match thread_type {
@@ -704,6 +726,13 @@ pub fn resolve_transition(
         | "MergeResolutionCleared"
         | "UserPromptInjected"
         | "CredentialRequested"
+        | "PluginInstallRequested"
+        | "PluginUninstallRequested"
+        | "EmailConfirmRequested"
+        | "OAuthAuthorizationRequested"
+        // A form request resolves whenever the user answers, often long after
+        // the turn, and in whatever section the thread sits by then.
+        | "FormRequestResolved"
         | "McpConsentRequested"
         // Compose lifecycle — orthogonal to section/status machinery.
         | "ThreadStarted"
@@ -739,6 +768,8 @@ pub fn resolve_transition(
         // Never a status write: a stopped child's note must not wake its
         // parent (ADR 0252).
         | "ChildThreadStopped"
+        // Never a status write either: moving a child out wakes no one.
+        | "ChildThreadDetached"
         | "ContextDismissed"
         | "ContextKeptOpen"
         // Background bash lifecycle — pure audit / fallback storage for
@@ -909,9 +940,9 @@ pub fn display_section(
 /// Source of truth for the descendants_block_archive computation in the
 /// thread_summaries projection.
 ///
-/// **SQL mirrors** — keep in sync when the predicate changes:
-/// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`
-///   (recursive CTE recomputing the column from scratch).
+/// **SQL mirrors**: keep in sync when the predicate changes.
+/// - `event_bus_projection_propagation.rs::BLOCKING_DESCENDANT_FILTER`, which
+///   both the boot rebuild and the per-ancestor reconcile read.
 /// - The most recent backfill migration applying this WHERE clause is
 ///   `20260518132821_blocking_count_running_overrides_archived.sql`. CTEs
 ///   can't share a function across migrations, so any new backfill must
@@ -1026,12 +1057,9 @@ pub fn check_archive_allowed(
 /// archiving its parent must stay possible (ADR 0252). `Archive`-button gating
 /// still uses `is_blocking` so a Running descendant keeps the button hidden.
 ///
-/// **SQL mirrors** — keep in sync when the predicate changes:
-/// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`
-///   (the recursive CTE there recomputes BOTH columns in one pass — see the
-///   `attention_cnt` clause).
-/// - `event_bus_projection_propagation.rs::reconcile_blocking_descendant_count_for_ancestors`
-///   (the per-ancestor reconcile updates BOTH columns in lockstep).
+/// **SQL mirrors**: keep in sync when the predicate changes.
+/// - `event_bus_projection_propagation.rs::ATTENTION_DESCENDANT_FILTER`, which
+///   both the boot rebuild and the per-ancestor reconcile read.
 /// - The backfill in `20260522091904_add_attention_descendant_count.sql`
 ///   inlines the same WHERE clause. CTEs can't share a function across
 ///   migrations, so any new backfill must inline it again.
@@ -1140,12 +1168,17 @@ pub fn available_thread_actions(
             actions.push(Action::Archive);
         }
     }
-    // The standing apply, offered while the thread is still working. Running
-    // and Paused are the two states a standing apply can wait through: every
-    // other resting state resolves it at once, so offering it there would arm
-    // something that drops on its first look. See `engine::standing_apply`.
+    // The standing apply, offered while the thread is *settling*: running,
+    // paused, or watching an event without a question card open. Those are the
+    // states a standing apply waits through (ADR 0266). Every other state
+    // resolves it at once, so offering it there would arm something that drops
+    // on its first look. Mirrors `SETTLING_THREAD_SQL` in
+    // `engine::standing_apply`.
+    let watching = has_live_event_waits
+        && status != ThreadStatus::WaitingForUserAnswer
+        && status != ThreadStatus::Failed;
     if thread_type == ThreadType::CodingAgent
-        && (status == ThreadStatus::Running || status == ThreadStatus::Paused)
+        && (status == ThreadStatus::Running || status == ThreadStatus::Paused || watching)
     {
         actions.push(Action::ApplyWhenSettled);
     }
@@ -1291,6 +1324,9 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
+        // The projection keeps `WaitingForUserAnswer` instead: an injection
+        // under an open question waits for the answer. The coarse rule model
+        // cannot express that, as with `preserving_verdict`.
         (
             "UserPromptInjected",
             StatusTransition {
@@ -1508,10 +1544,11 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // **No event-wait row sets a status, and that absence is the rule, not
         // an omission.** A subscription does not hold its thread's turn:
         // registration happens mid-turn and the turn's own terminator decides
-        // the status, while a resolution lands on a thread that is either idle
-        // or running something unrelated. The delivery's wake sets Running
-        // through its own `UserPromptInjected`, which is where that transition
-        // belongs, and a cancel leaves the thread exactly as it found it.
+        // the status, while a resolution lands on a thread that is idle,
+        // running something unrelated, or parked on a question. The delivery's
+        // wake sets Running through its own `UserPromptInjected`, which is
+        // where that transition belongs, and it leaves a parked question alone.
+        // A cancel leaves the thread exactly as it found it.
         //
         // Writing one here is the specific bug to avoid: it would report a
         // running thread as revived, or an idle one as running with no turn

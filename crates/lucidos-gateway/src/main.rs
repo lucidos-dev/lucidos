@@ -55,6 +55,7 @@ mod proxy;
 mod registry;
 mod release_check;
 mod server;
+mod slowness;
 mod stack;
 
 /// Lucidos umbrella release version (e.g. "0.7"), sourced from the repo-root

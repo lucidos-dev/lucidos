@@ -48,11 +48,20 @@
 //!
 //! `ChildThreadStopped` is covered for the same reason. Unlike its sibling
 //! `ChildThreadCompleted` it wakes nothing, so no turn carries it (ADR 0252).
+//! `ChildThreadDetached` too: the user moved a child out, and nothing wakes
+//! the agent to say so (ADR 0278).
 //!
 //! `BackgroundBashCompleted` is covered too, minus the ones an event wait
 //! delivered: that delivery is the prompt the re-opened turn carries. What
 //! reaches here is the one nobody delivered. A task whose wait a cap refused
 //! is one example.
+//!
+//! A **restart that cut off the last turn** is covered as well. The engine
+//! stops the session at teardown. Claude Code then closes the running tool call
+//! with its own "The user doesn't want to proceed" text. Unnamed, that reads as
+//! a user refusal, and the resumed agent stops retrying the work. Only the
+//! gap's newest coding-agent terminal counts (see
+//! [`last_turn_cut_off_by_restart`]), so a finished resume hears nothing.
 //!
 //! Deliberately NOT covered, because another mechanism already delivers them:
 //! `ChildThreadCompleted` (itself a CC turn origin, it wakes the parent
@@ -84,6 +93,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::resume::CC_ORIGINATING_EVENT_TYPES;
+use crate::engine::thread_events::{AbortCause, EventChannel, ThreadEvent};
 
 /// Max number of bullet lines to render before truncating, so a thread that
 /// applied a large batch can't blow up the resumed prompt. Mirrors the
@@ -116,6 +126,10 @@ const COVERED_EVENT_TYPES: &[&str] = &[
     // note is the only way a coding-agent parent hears the child is alive
     // (ADR 0252).
     "ChildThreadStopped",
+    // One of this agent's children was moved to top level. It wakes nothing,
+    // and without the note the agent reads a child that never reports back
+    // (ADR 0278).
+    "ChildThreadDetached",
 ];
 
 /// Turn boundaries that are not turn ORIGINS, so `CC_ORIGINATING_EVENT_TYPES`
@@ -220,6 +234,15 @@ enum GapEvent {
         child_thread_id: String,
         title: String,
     },
+    /// One of this agent's children was moved to top level. See
+    /// [`COVERED_EVENT_TYPES`].
+    ChildMovedOut {
+        child_thread_id: String,
+        title: String,
+    },
+    /// An engine restart stopped the agent's last turn mid-call. See
+    /// [`last_turn_cut_off_by_restart`].
+    RestartCutOffLastTurn,
 }
 
 impl GapEvent {
@@ -233,7 +256,9 @@ impl GapEvent {
             | Self::ApplyFailed { change_id, .. } => Some(change_id),
             Self::WorktreeCleaned { .. }
             | Self::BackgroundTaskEnded { .. }
-            | Self::ChildStopped { .. } => None,
+            | Self::ChildStopped { .. }
+            | Self::ChildMovedOut { .. }
+            | Self::RestartCutOffLastTurn => None,
         }
     }
 
@@ -256,7 +281,9 @@ impl GapEvent {
             Self::Reverted { .. }
             | Self::ApplyFailed { .. }
             | Self::BackgroundTaskEnded { .. }
-            | Self::ChildStopped { .. } => false,
+            | Self::ChildStopped { .. }
+            | Self::ChildMovedOut { .. }
+            | Self::RestartCutOffLastTurn => false,
         }
     }
 }
@@ -334,15 +361,19 @@ pub(crate) async fn compute_turn_gap_note(
                 None
             });
 
-    // `payload - 'stdout' - 'stderr'`: no covered type reads either key, and a
-    // `BackgroundBashCompleted` carries up to 100 KB of each. Fetching them to
-    // build a one-line note is the whole transfer for nothing.
+    // `payload - 'stdout' - 'stderr' - 'text'`: nothing here reads those keys.
+    // A `BackgroundBashCompleted` carries up to 100 KB of each stream, and a
+    // `ResponseGenerated` carries the whole answer. Fetching them to build a
+    // one-line note is the whole transfer for nothing.
+    //
+    // The gap's `Response*` terminals ride the same window, for
+    // `last_turn_cut_off_by_restart`.
     //
     // A completion an event wait already delivered is dropped: the delivery is
     // the prompt this turn carries, so a note line would say it twice, and
     // claim nobody told the agent.
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as::<_, (String, serde_json::Value)>(
-        "SELECT e.event_type, e.payload - 'stdout' - 'stderr' FROM events e \
+        "SELECT e.event_type, e.payload - 'stdout' - 'stderr' - 'text' FROM events e \
          WHERE e.thread_id = $1 AND e.event_type = ANY($2) \
            AND ($3::bigint IS NULL OR e.sequence < $3) \
            AND e.sequence > COALESCE(( \
@@ -360,7 +391,13 @@ pub(crate) async fn compute_turn_gap_note(
          ORDER BY e.sequence ASC",
     )
     .bind(thread_id)
-    .bind(COVERED_EVENT_TYPES)
+    .bind(
+        COVERED_EVENT_TYPES
+            .iter()
+            .chain(ThreadEvent::TERMINATOR_EVENT_TYPES)
+            .copied()
+            .collect::<Vec<&str>>(),
+    )
     .bind(origin_sequence)
     .bind(current_origin_id)
     .bind(boundary_event_types())
@@ -376,7 +413,14 @@ pub(crate) async fn compute_turn_gap_note(
     })
     .ok()?;
 
-    let events: Vec<GapEvent> = rows.into_iter().filter_map(parse_gap_event).collect();
+    let (terminals, covered): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(event_type, _)| {
+        ThreadEvent::TERMINATOR_EVENT_TYPES.contains(&event_type.as_str())
+    });
+
+    let mut events: Vec<GapEvent> = covered.into_iter().filter_map(parse_gap_event).collect();
+    if last_turn_cut_off_by_restart(&terminals) {
+        events.insert(0, GapEvent::RestartCutOffLastTurn);
+    }
 
     if events.is_empty() {
         return None;
@@ -391,6 +435,37 @@ pub(crate) async fn compute_turn_gap_note(
         note: build_note(&events, &facts, session_branch),
         explains_worktree_reset,
     })
+}
+
+/// True when the gap's newest coding-agent terminal is an abort an engine
+/// restart caused. `terminals` is in sequence order.
+///
+/// Only the newest one counts. `ContinuationRequested` is no turn boundary, so
+/// a finished resume shares its gap with the abort before it. The resume's own
+/// terminal then says the restart is behind it.
+///
+/// `EngineShutdown` is the teardown's abort, and `RecoveryAfterRestart` settles
+/// a turn a crash cut off. Every other cause is a different story: a user
+/// cancel, or a subprocess that died on its own under a live engine.
+fn last_turn_cut_off_by_restart(terminals: &[(String, serde_json::Value)]) -> bool {
+    terminals
+        .iter()
+        .rev()
+        .find(|(_, payload)| {
+            payload.get("channel").and_then(|v| v.as_str())
+                == Some(EventChannel::ClaudeCode.as_str())
+        })
+        .is_some_and(|(event_type, payload)| {
+            event_type == "ResponseAborted"
+                && matches!(
+                    payload
+                        .get("cause")
+                        .map(|c| serde_json::from_value::<AbortCause>(c.clone())),
+                    Some(Ok(
+                        AbortCause::EngineShutdown | AbortCause::RecoveryAfterRestart
+                    ))
+                )
+        })
 }
 
 /// Turn one `(event_type, payload)` row into a [`GapEvent`]. Missing fields
@@ -460,6 +535,13 @@ fn parse_gap_event((event_type, payload): (String, serde_json::Value)) -> Option
             },
         }),
         "ChildThreadStopped" => Some(GapEvent::ChildStopped {
+            child_thread_id: str_field(&payload, "child_thread_id"),
+            title: truncate(
+                &str_field(&payload, "child_thread_title"),
+                MAX_DESCRIPTION_CHARS,
+            ),
+        }),
+        "ChildThreadDetached" => Some(GapEvent::ChildMovedOut {
             child_thread_id: str_field(&payload, "child_thread_id"),
             title: truncate(
                 &str_field(&payload, "child_thread_title"),
@@ -579,11 +661,17 @@ fn build_note(
     // rest, and it is kept for that, but enough events still overrun the total.
     // The boot sweep makes that reachable rather than theoretical: it settles
     // every historical unsettled task on a thread at once.
-    let (background, rest): (Vec<&GapEvent>, Vec<&GapEvent>) = events
-        .iter()
-        .partition(|e| matches!(e, GapEvent::BackgroundTaskEnded { .. }));
+    //
+    // A restart line leaves no second trace either, and the caller puts it
+    // at the head of `events`, so it leads this group.
+    let (untraced, rest): (Vec<&GapEvent>, Vec<&GapEvent>) = events.iter().partition(|e| {
+        matches!(
+            e,
+            GapEvent::RestartCutOffLastTurn | GapEvent::BackgroundTaskEnded { .. }
+        )
+    });
 
-    for event in background.into_iter().chain(rest) {
+    for event in untraced.into_iter().chain(rest) {
         let branch = branch_for(event, facts);
         let label = change_label(event.change_id().unwrap_or(""), facts_for(event, facts));
 
@@ -688,23 +776,55 @@ fn render(
             child_thread_id,
             title,
         } => vec![child_stopped_line(child_thread_id, title)],
+        GapEvent::ChildMovedOut {
+            child_thread_id,
+            title,
+        } => vec![child_moved_out_line(child_thread_id, title)],
+        GapEvent::RestartCutOffLastTurn => vec![RESTART_CUT_OFF_LINE.to_string()],
     }
 }
+
+/// The bullet for a turn an engine restart cut off. It quotes the text Claude
+/// Code writes at teardown, so the agent recognises the lines it must discount.
+const RESTART_CUT_OFF_LINE: &str = "- ENGINE RESTART: the Lucidos engine restarted while your \
+    last turn was running, and it stopped your session mid-turn. Your transcript may show a tool \
+    call rejected with a line saying the user doesn't want to proceed and that you should stop \
+    and wait. It may also show \"[Request interrupted by user for tool use]\" or \"[Request \
+    interrupted by user]\". The engine's shutdown wrote those lines, not the user: nobody refused \
+    or interrupted anything. A tool call that was running did not complete. It is safe to run it \
+    again: first check whether it had side effects that may have partly happened, then carry on \
+    with your plan.";
 
 /// The bullet for a child a user Stop paused. It says what the
 /// `[CHILD THREAD STOPPED]` block says to a chat parent: the child is alive.
 fn child_stopped_line(child_thread_id: &str, title: &str) -> String {
-    let name = if title.is_empty() {
-        format!("thread {child_thread_id}")
-    } else {
-        format!("\"{title}\" (thread {child_thread_id})")
-    };
+    let name = child_name(child_thread_id, title);
     format!(
         "- CHILD STOPPED: the user stopped the turn of your child {name}. It is NOT finished \
          and NOT dead: it waits for the user. A [CHILD THREAD COMPLETED] block arrives when it \
          next finishes, or a canceled one if the user archives or discards it. Until then, do \
          not roll back its work, respawn it, or send it a follow-up."
     )
+}
+
+/// The bullet for a child moved to top level. It says what the
+/// `[CHILD THREAD MOVED OUT]` block says to a chat parent.
+fn child_moved_out_line(child_thread_id: &str, title: &str) -> String {
+    let name = child_name(child_thread_id, title);
+    format!(
+        "- CHILD MOVED OUT: your child {name} was moved to top level. It keeps running on its \
+         own, but it is no longer your child: you will not get its result and cannot follow up \
+         on it. Do not wait for it or respawn it."
+    )
+}
+
+/// A child named by title and id, or by id alone when it has no title.
+fn child_name(child_thread_id: &str, title: &str) -> String {
+    if title.is_empty() {
+        format!("thread {child_thread_id}")
+    } else {
+        format!("\"{title}\" (thread {child_thread_id})")
+    }
 }
 
 /// A Discard resets the change's branch to `main`. Whether that is the agent's

@@ -19,7 +19,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { cssRules, type CssRule } from './css-rule-helpers';
+import { REDUCED_MOTION_ROOT, cssRules, isReducedMotionRule, type CssRule } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf8');
@@ -37,11 +37,11 @@ function forPhase(phase: string): CssRule[] {
 
 /** The same rules, split by whether reduced motion is in force. */
 function stillRules(phase: string): CssRule[] {
-  return forPhase(phase).filter((r) => r.atRules.includes('prefers-reduced-motion'));
+  return forPhase(phase).filter((r) => isReducedMotionRule(r));
 }
 
 function movingRules(phase: string): CssRule[] {
-  return forPhase(phase).filter((r) => !r.atRules.includes('prefers-reduced-motion'));
+  return forPhase(phase).filter((r) => !isReducedMotionRule(r));
 }
 
 /**
@@ -143,7 +143,7 @@ describe('a reader who stopped the motion still sees four phases', () => {
       );
       for (const rule of animated) {
         const stopped = stillRules(phase).some(
-          (r) => r.selector === rule.selector && r.props.get('animation') === 'none',
+          (r) => r.selector === `${REDUCED_MOTION_ROOT} ${rule.selector}` && r.props.get('animation') === 'none',
         );
         expect(stopped, `${rule.selector} keeps moving under reduced motion`).toBe(true);
       }

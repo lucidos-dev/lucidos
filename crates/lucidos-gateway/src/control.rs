@@ -45,6 +45,9 @@ pub fn router() -> Router<GatewayState> {
         // `/gateway/status`, which the picker hits every 2s and which must
         // never wait on an outbound request.
         .route("/gateway/check-updates", post(gateway_check_updates))
+        // Is Lucidos slow, and why (ADRs 0274, 0283)? The cached answer only,
+        // since every workspace window polls it.
+        .route("/slowness", get(slowness_status))
         // Every Lucidos install on this machine. Kept off `/gateway/status`
         // for the same reason as the line above: this one walks directories.
         .route("/installs", get(list_installs))
@@ -475,6 +478,14 @@ async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
         "packaged": state.packaged(),
         "release_check": state.release_check().snapshot(),
     }))
+}
+
+/// GET /~/api/v1/control/slowness: the sampler's last answer. It never
+/// samples here, so it answers at once however starved the machine is.
+async fn slowness_status(
+    State(state): State<GatewayState>,
+) -> Json<crate::slowness::SlownessStatus> {
+    Json(state.slowness().snapshot())
 }
 
 /// GET /~/api/v1/control/installs: every Lucidos install on this machine, and
@@ -998,6 +1009,8 @@ mod authz_tests {
         ("GET", "/~/api/v1/control/installs"),
         // A read too, and it names another install's port and slug.
         ("GET", "/~/api/v1/control/workspace-location?name=dev"),
+        // A read that names the apps this user runs.
+        ("GET", "/~/api/v1/control/slowness"),
     ];
 
     async fn control_call(
@@ -1090,6 +1103,28 @@ mod authz_tests {
                 "token {token:?} must not authenticate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn slowness_answers_normal_before_the_first_sample() {
+        use tower::ServiceExt as _;
+        let state = crate::server::GatewayState::for_tests();
+        let response = crate::server::gateway_router(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/~/api/v1/control/slowness")
+                    .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, json!({ "state": "normal" }));
     }
 
     #[tokio::test]

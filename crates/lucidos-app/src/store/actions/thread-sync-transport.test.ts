@@ -78,11 +78,14 @@ vi.mock('../thread-events', () => ({
   modeToInitiator: vi.fn(),
   PENDING_TITLE_PLACEHOLDER: '',
 }));
-vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
+const loadUnreadNotifications = vi.fn(async () => {});
+vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn(), loadUnreadNotifications }));
 vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
+const refreshArtifacts = vi.fn();
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
+  refreshArtifacts,
   openFilePreview: vi.fn(),
   openUrl: vi.fn(),
   normalizeDataPath: vi.fn(),
@@ -99,10 +102,17 @@ vi.mock('./menu', () => ({
 }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
-vi.mock('./devices', () => ({ getDeviceId: vi.fn(), pendingDeviceRegistration: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
+
+const syncPendingFormRequests = vi.fn(async () => {});
+vi.mock('./form-requests', () => ({
+  syncPendingFormRequests,
+  openFormRequest: vi.fn(),
+  closeResolvedFormRequest: vi.fn(),
+}));
 
 const processSSEForReferences = vi.fn();
 vi.mock('./entityReferences', () => ({
@@ -182,6 +192,51 @@ describe('the shell attaching to a transport', () => {
     await vi.runAllTimersAsync();
 
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes the Files list on EVERY open, the first one included', () => {
+    // A file written before an open was announced to nobody. The first open
+    // counts: the page's first listing can finish before it.
+    connectThreadEvents();
+    expect(refreshArtifacts).not.toHaveBeenCalled();
+    opened?.handlers.onOpen();
+    expect(refreshArtifacts).toHaveBeenCalledTimes(1);
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(refreshArtifacts).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the unread notifications on EVERY open, the first one included', () => {
+    // A notification created before an open was announced to nobody. The
+    // first open counts: the page's startup read can finish before it.
+    connectThreadEvents();
+    expect(loadUnreadNotifications).not.toHaveBeenCalled();
+    opened?.handlers.onOpen();
+    expect(loadUnreadNotifications).toHaveBeenCalledTimes(1);
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(loadUnreadNotifications).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the open form requests on EVERY open, the first one included', () => {
+    // A form request emitted while no stream was up reaches the page only
+    // here. The first open counts: a reload drops every frame before it.
+    connectThreadEvents();
+    expect(syncPendingFormRequests).not.toHaveBeenCalled();
+    opened?.handlers.onOpen();
+    expect(syncPendingFormRequests).toHaveBeenCalledTimes(1);
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(syncPendingFormRequests).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the open form requests when the broadcast lags', () => {
+    connectThreadEvents();
+    opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
+    expect(syncPendingFormRequests).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -31,9 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest};
 use super::claude_code::format_exit_status;
-use super::codex::{
-    lucidos_mcp_server_config_json, write_image_files, CodexConfig, CONTINUATION_PROMPT,
-};
+use super::codex::{lucidos_mcp_server_config_json, write_image_files, CodexConfig};
 use super::codex_app_server_parse::{
     parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
 };
@@ -217,11 +215,9 @@ fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::proces
 }
 
 /// Drive one persistent app-server session. See module docs for the contract.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn app_server_driver_task(
     config: CodexConfig,
     resume_session_id: Option<String>,
-    continuation: bool,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
@@ -322,14 +318,6 @@ pub(super) async fn app_server_driver_task(
     let mut model = config.model.clone();
     let mut effort = config.reasoning_effort.clone();
     let mut queue: VecDeque<AgentInput> = VecDeque::new();
-    if continuation {
-        // Engine resumes a mid-turn-interrupted session with no new input —
-        // same synthetic prompt the exec driver injects.
-        queue.push_back(AgentInput {
-            text: CONTINUATION_PROMPT.to_string(),
-            images: Vec::new(),
-        });
-    }
     // True once the thread response has established the session (the id itself
     // lives on `tracker.session_id`). Turns can start only once this is true.
     let mut thread_ready = false;
@@ -395,6 +383,7 @@ pub(super) async fn app_server_driver_task(
         // Start the next queued turn whenever the thread is ready and idle.
         if thread_ready && !turn_in_flight {
             if let Some(input) = queue.pop_front() {
+                let _ = events_tx.send(AgentEvent::InputRead(None));
                 let thread_id = tracker.session_id.clone().unwrap_or_default();
                 tracker.begin_turn();
                 turn_start = std::time::Instant::now();

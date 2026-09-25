@@ -38,7 +38,7 @@ pub(super) enum AppServerLine {
         method: String,
         params: serde_json::Value,
     },
-    /// Unrecognized or non-JSON line — logged by the caller, otherwise ignored.
+    /// Unrecognized or non-JSON line. Ignored, and not logged.
     Other,
 }
 
@@ -497,10 +497,13 @@ impl AppServerTracker {
                     return Vec::new();
                 }
                 let item_id = str_field(params, "itemId");
-                self.streamed.entry(item_id).or_default().push_str(&delta);
+                let streamed = self.streamed.entry(item_id).or_default();
+                let opens_block = streamed.is_empty();
+                streamed.push_str(&delta);
                 vec![AgentEvent::Message {
                     role: "assistant".to_string(),
                     text: delta,
+                    opens_block,
                 }]
             }
             // Streamed reasoning. Codex emits raw reasoning (`textDelta`) or a
@@ -606,6 +609,7 @@ impl AppServerTracker {
                 vec![AgentEvent::Message {
                     role: "assistant".to_string(),
                     text: remainder,
+                    opens_block: streamed.is_empty(),
                 }]
             }
             "commandExecution" => {

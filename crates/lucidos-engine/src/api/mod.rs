@@ -18,6 +18,7 @@ pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
 mod file_response;
+mod form_requests;
 mod frame_capability;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
@@ -56,6 +57,7 @@ pub(crate) mod proxy_pipeline_config;
 pub(crate) mod proxy_script_layer;
 pub(crate) mod proxy_script_runner;
 pub(crate) mod proxy_static_layers;
+pub(crate) mod proxy_timeout;
 pub(crate) mod proxy_token_cache;
 pub(crate) mod proxy_wasm_host;
 pub(crate) mod proxy_wasm_signer;
@@ -162,7 +164,8 @@ pub(super) fn sanitize_leaf_filename(name: &str) -> Option<String> {
 /// Parse an optional UUID query/body string, mapping malformed input to `BAD_REQUEST`.
 ///
 /// Without this, handlers fall back to silently treating malformed ids as `None`
-/// (e.g. "cancel one" becomes "cancel all") — see CLAUDE.md "no silent defaults".
+/// (e.g. "cancel one" becomes "cancel all"). See `.claude/rules/frontend.md`
+/// § No Silent Defaults.
 pub(super) fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, StatusCode> {
     opt.map(Uuid::parse_str)
         .transpose()
@@ -702,6 +705,10 @@ pub struct CreateCredentialRequest {
     /// instead of `CRED_<NAME>`). Validated like a user env var name.
     #[serde(default)]
     pub env_var_name: Option<String>,
+    /// The credential *form request* this save answers, when a request opened
+    /// the form. Any save also answers every open request for its service.
+    #[serde(default)]
+    pub form_request_id: Option<uuid::Uuid>,
 }
 
 /// Body of `PUT /api/v1/credential-base-urls?id=<uuid>`, which replaces one
@@ -735,6 +742,10 @@ pub struct UpdateCredentialRequest {
     /// it back to the default `CRED_<NAME>` form. Validated like a user env var.
     #[serde(default)]
     pub env_var_name: Option<String>,
+    /// The credential *form request* this save answers: a widening or a repair
+    /// that reopened this row.
+    #[serde(default)]
+    pub form_request_id: Option<uuid::Uuid>,
 }
 
 /// Email server settings carried by an `UpdateCredentialRequest` for
@@ -830,7 +841,7 @@ pub struct CreateModelRequest {
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
     /// "openrouter" | "xai" | "opencode-free" | "local". Validated by
-    /// `settings::valid_provider`.
+    /// `core::validate_routes`.
     ///
     /// The single-route shorthand, and what nearly every caller sends. With
     /// `routes` given it is ignored; with neither, the request is refused.
@@ -1188,6 +1199,8 @@ struct ChangesListQuery {
     limit: Option<i64>,
     /// Unix-timestamp cursor for pagination (resolved_at < before)
     before: Option<f64>,
+    /// Narrow `pending` to changes held by this thread's sub-threads.
+    sub_threads_of: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -1402,6 +1415,7 @@ pub fn create_router(
         .merge(command_checkpoint::router())
         .merge(mcp::router())
         .merge(mcp_permission::router())
+        .merge(form_requests::router())
         .merge(internal::router())
         .merge(backup::router())
         .merge(disk_usage::router())

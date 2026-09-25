@@ -48,15 +48,17 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
                         .and_then(|v| v.as_str())
                         .unwrap_or("?")
                         .to_string();
-                    let description = opt
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
+                    let non_empty = |field: &str| {
+                        opt.get(field)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string())
+                    };
                     crate::engine::thread_events::QuestionOption {
                         id: format!("opt-{}", i),
                         label,
-                        description,
+                        description: non_empty("description"),
+                        preview: non_empty("preview"),
                     }
                 })
                 .collect()
@@ -114,6 +116,32 @@ mod tests {
             "missing description must round-trip as None, not empty string"
         );
         assert!(!q.multi_select, "absence of multiSelect defaults to false");
+    }
+
+    /// The incident's shape: Claude Code put each picture in `preview`, and
+    /// the card showed none of them.
+    #[test]
+    fn parse_keeps_an_option_preview_and_drops_a_blank_one() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Which one should I build?",
+                "options": [
+                    { "label": "D", "preview": "![D](artifacts/variant-d.png)" },
+                    { "label": "C", "preview": "  \n" },
+                    { "label": "B" },
+                ],
+            }],
+        });
+        let options = &parse_ask_user_question_inputs(&input)[0].options;
+        assert_eq!(
+            options[0].preview.as_deref(),
+            Some("![D](artifacts/variant-d.png)")
+        );
+        assert!(
+            options[1].preview.is_none(),
+            "a blank preview is no preview"
+        );
+        assert!(options[2].preview.is_none());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { MOTION_PREFS, type MotionPref } from '@lucidos/appearance';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -79,6 +80,7 @@ import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { ImageModel } from '../../store/actions/preferences';
 import { errorDetail } from '../../utils/errorDetail';
+import { motionPreference, scrollBehavior } from '../../utils/motion';
 
 /** Turn scope URLs into short human-readable labels. */
 function formatScopes(scopes: string): string {
@@ -109,19 +111,27 @@ function formatScopes(scopes: string): string {
     .join(', ');
 }
 
+/** System first, as in the Motion row: it is the default for both. */
 const THEMES: Array<{ value: Theme; label: string }> = [
+  { value: 'system', label: 'System' },
   { value: 'light', label: 'Light' },
   { value: 'dark', label: 'Dark' },
-  { value: 'system', label: 'System' },
 ];
 
+const MOTION_LABELS: Record<MotionPref, string> = {
+  system: 'System',
+  reduce: 'Reduce',
+  full: 'Full',
+};
+
+/** Fira Code first, as in the Theme and Motion rows: it is the default. */
 const FONT_OPTIONS: Array<{ value: FontFamily; label: string }> = [
+  { value: 'fira-code', label: 'Fira Code' },
   { value: 'monospace', label: 'Monospace' },
   { value: 'system', label: 'System' },
   { value: 'inter', label: 'Inter' },
   { value: 'jetbrains-mono', label: 'JetBrains Mono' },
   { value: 'ibm-plex-mono', label: 'IBM Plex Mono' },
-  { value: 'fira-code', label: 'Fira Code' },
 ];
 
 const EXTERNAL_LINK_TARGET_OPTIONS: Array<{ value: ExternalLinkTarget; label: string }> = [
@@ -568,7 +578,7 @@ export function SettingsView() {
     if (!target || settingsSubview.value === 'main') return;
     const el = document.querySelector<HTMLElement>(`[data-search-anchor="${target}"]`);
     if (el) {
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
       // The anchor can sit on a settings row, a row LABEL span, or a section
       // title. Land the focus marker on the enclosing .settings-row when there is
       // one so the sticky highlight washes the whole row (its CSS gives it a uniform
@@ -897,7 +907,7 @@ export function SettingsView() {
     // The section header renders in EVERY state, because it carries
     // `data-search-anchor="coding-agents:repositories"` and that anchor is a
     // navigation target (Search Everywhere, and the compose picker's "Register
-    // a repository" row). `SettingsView`'s scroll effect below does one
+    // a repository" row). `SettingsView`'s scroll effect above does one
     // `querySelector` on the commit where the subview mounts and then clears
     // the target whether or not it matched, so an anchor that waits for a fetch
     // is missed on a cold open and the jump silently lands at the top of the
@@ -1308,6 +1318,7 @@ export function SettingsView() {
    *  same way "Chat & triggers" is anchored `models:chat`. */
   function appearanceSection() {
     const theme = currentTheme();
+    const motion = motionPreference.value;
     const font = currentFontFamily();
 
     return (
@@ -1316,14 +1327,45 @@ export function SettingsView() {
           <div class="settings-section-title" data-search-anchor="appearance:theme">Theme</div>
           <div class="settings-row" data-search-anchor="appearance:mode">
             <span class="settings-row-label">Mode</span>
-            <div class="settings-row-options">
+            <div class="segmented-control" role="group" aria-label="Theme mode">
               {THEMES.map((t) => (
                 <button
                   key={t.value}
-                  class={`settings-option ${theme === t.value ? 'active' : ''}`}
+                  type="button"
+                  aria-pressed={theme === t.value}
+                  class={`segmented-btn ${theme === t.value ? 'active' : ''}`}
                   onClick={() => void setTheme(t.value)}
                 >
                   {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div class="settings-row" data-search-anchor="appearance:motion">
+            <span class="settings-row-label">
+              Motion
+              <Explainer title="Motion">
+                <p>
+                  How much Lucidos moves on this device. System follows your
+                  device's reduce-motion setting.
+                </p>
+                <p>
+                  Reduce keeps the app calm: no slides, pulses or spinning, and
+                  changes appear at once. Full keeps every animation, even when
+                  your device asks for less.
+                </p>
+              </Explainer>
+            </span>
+            <div class="segmented-control" role="group" aria-label="Motion">
+              {MOTION_PREFS.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  aria-pressed={motion === m}
+                  class={`segmented-btn ${motion === m ? 'active' : ''}`}
+                  onClick={() => void setMotion(m)}
+                >
+                  {MOTION_LABELS[m]}
                 </button>
               ))}
             </div>

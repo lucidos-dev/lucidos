@@ -16,6 +16,7 @@ fn test_spawn_args<'a>(
 ) -> SpawnArgs<'a> {
     SpawnArgs {
         worktree_path: worktree,
+        coding_agent_kind: Default::default(),
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
@@ -26,7 +27,6 @@ fn test_spawn_args<'a>(
         spawning_event_id: None,
         repo_name: None,
         interactive: false,
-        continuation: false,
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
@@ -42,6 +42,7 @@ fn test_spawn_args_with_event<'a>(
 ) -> SpawnArgs<'a> {
     SpawnArgs {
         worktree_path: worktree,
+        coding_agent_kind: Default::default(),
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
@@ -52,7 +53,6 @@ fn test_spawn_args_with_event<'a>(
         spawning_event_id,
         repo_name: None,
         interactive: false,
-        continuation: false,
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
@@ -68,6 +68,7 @@ fn test_spawn_args_with_repo<'a>(
 ) -> SpawnArgs<'a> {
     SpawnArgs {
         worktree_path: worktree,
+        coding_agent_kind: Default::default(),
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
@@ -78,7 +79,6 @@ fn test_spawn_args_with_repo<'a>(
         spawning_event_id: None,
         repo_name,
         interactive: false,
-        continuation: false,
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
@@ -99,6 +99,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
     ];
     let args = SpawnArgs {
         worktree_path: p,
+        coding_agent_kind: Default::default(),
         workspace_path: p,
         allowed_tools: None,
         system_prompt: None,
@@ -109,7 +110,6 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         spawning_event_id: None,
         repo_name: Some("engine-repo"),
         interactive: false,
-        continuation: false,
         user_env_vars: &user_env,
         claude_config_dir: None,
         binary_override: None,
@@ -1119,4 +1119,25 @@ fn a_session_without_a_relay_keeps_its_own_vertex_url() {
         Some("https://proxy.example/v1")
     );
     assert!(!relays_vertex_calls(&cmd));
+}
+
+/// The replay is how the engine learns an input was read (ADR 0268). A spawn
+/// without it would owe every forwarded input until the silent grace settles it.
+#[test]
+fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let replays = |cmd: &tokio::process::Command| {
+        collect_args(cmd)
+            .iter()
+            .any(|a| a == "--replay-user-messages")
+    };
+
+    assert!(replays(&build_command(
+        &test_spawn_args(p, p, thread_id),
+        None
+    )));
+    let mut resumed_args = test_spawn_args(p, p, thread_id);
+    resumed_args.resume_session_id = Some("sess-1");
+    assert!(replays(&build_command(&resumed_args, None)));
 }

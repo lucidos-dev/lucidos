@@ -110,6 +110,7 @@ describe('ensureThreadInMap', () => {
       message_count: 3,
       section: 'archived',
       active_children_count: 0,
+      waiting_children_count: 2,
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
@@ -127,6 +128,7 @@ describe('ensureThreadInMap', () => {
     expect(thread!.meta.title).toBe('Search Result Thread');
     expect(thread!.meta.channel).toBe('chat');
     expect(thread!.meta.messageCount).toBe(3);
+    expect(thread!.meta.waitingChildrenCount).toBe(2);
     expect(thread!.eventsLoaded).toBe(true);
   });
 

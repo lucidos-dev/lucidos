@@ -354,9 +354,24 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::CredentialRequested {
-                provider: "github".into(),
+                request_id: uuid::Uuid::nil(),
+                payload: "{}".into(),
             },
             "CredentialRequested",
+        ),
+        (
+            ThreadEvent::OAuthAuthorizationRequested {
+                request_id: uuid::Uuid::nil(),
+                payload: "{}".into(),
+            },
+            "OAuthAuthorizationRequested",
+        ),
+        (
+            ThreadEvent::FormRequestResolved {
+                request_id: uuid::Uuid::nil(),
+                outcome: crate::engine::thread_events::FormRequestOutcome::Completed,
+            },
+            "FormRequestResolved",
         ),
         (
             ThreadEvent::McpConsentRequested {
@@ -428,19 +443,23 @@ fn legacy_event_names_deserialize_via_alias() {
             "AppUiCaptureRequested",
         ),
         (
-            r#"{"type":"CredentialRequest","payload":"{}"}"#,
-            "CredentialPromptRequested",
+            r#"{"type":"CredentialRequest","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
+            "CredentialRequested",
         ),
         (
-            r#"{"type":"PluginInstallRequest","payload":"{}"}"#,
+            r#"{"type":"CredentialPromptRequested","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
+            "CredentialRequested",
+        ),
+        (
+            r#"{"type":"PluginInstallRequest","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
             "PluginInstallRequested",
         ),
         (
-            r#"{"type":"PluginUninstallRequest","payload":"{}"}"#,
+            r#"{"type":"PluginUninstallRequest","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
             "PluginUninstallRequested",
         ),
         (
-            r#"{"type":"EmailConfirmRequest","payload":"{}"}"#,
+            r#"{"type":"EmailConfirmRequest","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
             "EmailConfirmRequested",
         ),
         (
@@ -562,7 +581,8 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"ChangeReverted","change_id":"c-1"}"#,
         r#"{"type":"ChangeApplyFailed","change_id":"c-1","error":"merge conflict"}"#,
         // Interactive
-        r#"{"type":"CredentialRequested","provider":"github"}"#,
+        r#"{"type":"CredentialRequested","request_id":"00000000-0000-0000-0000-000000000000","payload":"{}"}"#,
+        r#"{"type":"FormRequestResolved","request_id":"00000000-0000-0000-0000-000000000000","outcome":"canceled"}"#,
         r#"{"type":"McpConsentRequested","tool":"t","args":{}}"#,
     ];
     for json_str in known_types {

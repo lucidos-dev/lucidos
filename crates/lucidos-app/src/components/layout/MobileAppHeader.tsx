@@ -12,6 +12,7 @@ import { getContentTitle, getContentTitleShort, getDiffDescription } from './hea
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
+import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { threadDisplayTitle } from '../../utils/threadTitle';
@@ -38,10 +39,9 @@ export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
 
 /** Mobile threads header — search and filter for the threads pane */
 function MobileThreadsHeader() {
-  // Glyph, active highlight and the attention-only badge all come from the
-  // shared hook, so this row and the desktop one cannot drift.
-  const { filterOpen, toggleFilter, filterButtonActive, FilterButtonIcon, filterButtonBadge,
-          searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
+  // The Filter button and the title are the desktop row's own components, so
+  // the two rows cannot drift.
+  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
@@ -67,18 +67,10 @@ function MobileThreadsHeader() {
             Thread type panel, which renders down in the threads pane itself
             (see ThreadFilterPanel / ThreadDrawer). Packed left in the same slot
             the channel filter + view selector used to share. It is also the
-            panel's only way out, which is what the X glyph says while the panel
-            is up (see useThreadsHeaderState). */}
+            panel's only way out, which is why it reads as held down while the
+            panel is up (see filterButtonState). */}
         <div class="view-selector-slot">
-          <button
-            class={`icon-btn header-icon${filterButtonActive ? ' view-selector-active' : ''}`}
-            onClick={toggleFilter}
-            aria-label="Filter threads"
-            aria-expanded={filterOpen}
-          >
-            <FilterButtonIcon />
-            {filterButtonBadge > 0 && <span class="badge">{filterButtonBadge}</span>}
-          </button>
+          <ThreadFilterButton />
         </div>
         {/* Title is absolutely centered on the row middle (see
             .mobile-header-title); the spacer pins the trailing icons right. It
@@ -86,9 +78,7 @@ function MobileThreadsHeader() {
             taken it over (ThreadFilterPanel carries no title row of its own).
             Just "Filters", matching the desktop row: the pane is already the
             Threads pane. */}
-        <span class="pane-header-title mobile-header-title">
-          {filterOpen ? 'Filters' : 'Threads'}
-        </span>
+        <ThreadsPaneTitle class="pane-header-title mobile-header-title" />
         <div class="pane-header-spacer" />
         {/* No SetupInterviewButton on either mobile header, deliberately: the
             setup interview is a once-or-twice thing, and a permanent icon for it

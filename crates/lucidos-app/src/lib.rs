@@ -9,6 +9,10 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 mod activation;
 mod app_window;
+/// Whether the running `.app` is somewhere it can keep. macOS-only, because
+/// the two traps it detects (a mounted `.dmg`, App Translocation) are macOS ones.
+#[cfg(target_os = "macos")]
+mod bundle_location;
 /// Where the packaged client's own stdout and stderr go. LaunchServices gives a
 /// launched app a sink that discards both, so without this the client's
 /// diagnostics do not exist.
@@ -863,7 +867,7 @@ fn startup_clamp_and_show(app: &tauri::AppHandle) {
                 app,
                 window_persist::resolve_window_session_plan()
                     .first()
-                    .and_then(|(_, frame)| *frame),
+                    .and_then(|(_, frame)| frame.clone()),
             ),
             // Cheap insurance on the first visible frame. The placement above is
             // deferred, so this reads the geometry the window still has. That
@@ -1128,7 +1132,7 @@ pub fn run() {
                     // This is the LATE net, not the one that keeps a live drag
                     // steady: tao queues the event, so it lands a run-loop turn
                     // after AppKit's reset is already on screen, which is what
-                    // `traffic_lights::watch_resizes` fixes. It stays for the
+                    // `traffic_lights::observe_resizes` fixes. It stays for the
                     // moment the notification does not cover, tao's synthetic
                     // resize on leaving fullscreen, where late is right.
                     //
@@ -1354,9 +1358,10 @@ pub fn run() {
 /// `insertText:`, typing raw NSFunctionKey characters into the focused textarea.
 ///
 /// The frontend refuses such a character before it reaches a field
-/// (`utils/noFunctionKeyText.ts`). It has to: an arrow press at the END of the
-/// text falls through to `insertText:` even with this menu in place. So
-/// breaking the menu no longer types squares: watch instead for arrow keys
+/// (`utils/noKeyCodeText.ts`). It has to: an arrow press at the END of the
+/// text still types one with this menu in place. WebKit hands the declined
+/// press back, and tao's content view reinterprets it into the focused field.
+/// So breaking the menu no longer types squares: watch instead for arrow keys
 /// doing nothing at all.
 ///
 /// macOS then grafts on the service-aware items. Cmd+Q maps to "Close to Menu

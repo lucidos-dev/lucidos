@@ -265,7 +265,12 @@ fn generate_typescript() -> String {
     out.push_str("    }\n");
     out.push_str("  }\n");
     out.push_str(
-        "  if (threadType === 'claude_code' && (status === 'running' || status === 'paused')) {\n",
+        "  const watching = hasLiveEventWaits && status !== 'waiting_for_user_answer' \
+         && status !== 'failed';\n",
+    );
+    out.push_str(
+        "  if (threadType === 'claude_code' \
+         && (status === 'running' || status === 'paused' || watching)) {\n",
     );
     out.push_str("    actions.push('apply_when_settled');\n");
     out.push_str("  }\n");

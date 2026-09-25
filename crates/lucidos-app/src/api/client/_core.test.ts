@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { json, API, isTransientFetchError, retryTransientRead, throwIfNotOk, ApiError } from './_core';
+import { json, mutatingFetch, API, isTransientFetchError, retryTransientRead, throwIfNotOk, ApiError } from './_core';
+import { trackDeviceRegistration } from '../../utils/deviceRegistration';
 import { engineRestarting } from '../../store/store';
 
-// While the engine restarts (Apply & Restart) every connection is dropped, so a
+// While the engine restarts (Switch to new version) every connection is dropped, so a
 // GET fired in that window hits a dead socket and surfaces as
 // `TypeError: Load failed` — which the page behind the "Restarting engine…"
 // overlay paints as a spurious "Failed to load…" error. `_core` holds GET reads
@@ -324,5 +325,60 @@ describe('isTransientFetchError / retryTransientRead', () => {
     const read = vi.fn().mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
     await expect(retryTransientRead(read)).rejects.toMatchObject({ name: 'TimeoutError' });
     expect(read).toHaveBeenCalledTimes(2);
+  });
+});
+
+// Every mutation the app sends goes through these two. So this is where a
+// mutation waits for the device registration it needs (ADR 0169).
+describe('a mutation waits for a pending device registration', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+  let finishRegistration: () => void;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockImplementation(() => Promise.resolve(okJson()));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    trackDeviceRegistration(new Promise<void>((resolve) => { finishRegistration = resolve; }));
+  });
+
+  afterEach(async () => {
+    finishRegistration();
+    await Promise.resolve();
+    globalThis.fetch = originalFetch;
+  });
+
+  it('holds a mutatingFetch POST until registration settles', async () => {
+    const sent = mutatingFetch(`${API}/threads`, { method: 'POST', body: '{}' });
+    await Promise.resolve();
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    finishRegistration();
+    await sent;
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds a json() PUT until registration settles', async () => {
+    const sent = json(`${API}/compose/x`, { method: 'PUT', body: '{}' });
+    await Promise.resolve();
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    finishRegistration();
+    await sent;
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  // The send path dispatches a lone send inside the caller's turn, so a
+  // settled registration must cost a mutation not even a microtask.
+  it('sends a mutation at once when registration has settled', async () => {
+    finishRegistration();
+    await Promise.resolve();
+    await Promise.resolve();
+    const sent = mutatingFetch(`${API}/threads`, { method: 'POST', body: '{}' });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    await sent;
+  });
+
+  it('lets a read through without waiting', async () => {
+    await json(`${API}/threads/list`);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

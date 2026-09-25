@@ -6,6 +6,12 @@ use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
+/// The `description` a background tool takes. The engine names the task by it
+/// on the thread's waiting row, so it has to read well after "Set up an event
+/// wait:".
+const BG_DESCRIPTION_PARAM: &str =
+    "The work in the user's words, shown as \"<this> to finish\": \"the nightly e2e sweep\".";
+
 pub(super) fn exec_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -58,9 +64,13 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                     "timeout_secs": {
                         "type": "integer",
                         "description": format!("Seconds before the watchdog kills the child (default {BG_DEFAULT_TIMEOUT_SECS}, max {BG_MAX_TIMEOUT_SECS}).")
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": BG_DESCRIPTION_PARAM
                     }
                 },
-                "required": ["code"]
+                "required": ["code", "description"]
             }),
         },
         ToolDefinition {
@@ -105,9 +115,13 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
                     "timeout_secs": {
                         "type": "integer",
                         "description": format!("Seconds before the watchdog kills the child (default {BG_DEFAULT_TIMEOUT_SECS}, max {BG_MAX_TIMEOUT_SECS}).")
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": BG_DESCRIPTION_PARAM
                     }
                 },
-                "required": ["command"]
+                "required": ["command", "description"]
             }),
         },
         ToolDefinition {

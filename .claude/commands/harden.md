@@ -424,6 +424,30 @@ reaches the transcript, so a permission error goes nowhere. That shipped on
 2026-08-06 with `log-instructions-loaded.sh`. A hook that silently never runs
 looks exactly like a hook that was never added.
 
+### Before the Rust suites: apply rustfmt
+
+When `git diff main...HEAD --name-only` lists any `.rs` file, format before the
+suites run. `make lint` only checks rustfmt, and `make test` is chained after
+it, so one rewrapped line otherwise skips the whole engine suite (ADR 0270).
+
+```bash
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "Uncommitted changes: commit them, then re-run this step."
+else
+  make fmt && { git diff --quiet || git commit -qam "style: rustfmt"; }
+fi
+```
+
+- **Start from a clean tree.** The commit then holds rustfmt output and nothing
+  else. If the guard trips, commit the pending work, then run the step.
+- **A `style: rustfmt` commit does not send you back to Phase 1.** rustfmt is
+  deterministic and changes no behaviour, so there is nothing to re-review. Any
+  other fix still returns to Phase 1, as below.
+- **No `.rs` in the diff, no step.** A docs-only or TS-only diff skips it.
+
+`make lint` still runs `cargo fmt --all --check` afterwards. That is the proof
+the step ran, not a second chance to fail.
+
 ### Then the test suites
 
 **Join the Codex review before you start them.** The engine suite includes

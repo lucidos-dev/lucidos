@@ -60,7 +60,8 @@ Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAg
 That means right now (each example below is one entry inside a trigger's `on` list, see `system-knowhow/triggers.md` for the full subscription shape):
 
 - `event_type: UserQuestionAsked`: works. The typical use is "push me when an interactive question is raised so I can answer from my phone." Pair `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` so the tap deep-links straight to the question, see `triggers.md` for the worked example.
-- `event_type: CodingAgentPermissionRequest` / `CommandPermissionRequested` / `McpPermissionRequested` / `CredentialRequested` — **work**. These are the other blocking-request events that should wake the user. `CommandPermissionRequested` is the chat command-guard card (ADR 0002); `McpPermissionRequested` is the chat MCP-tool card.
+- `event_type: CodingAgentPermissionRequest` / `CommandPermissionRequested` / `McpPermissionRequested`: **work**. These are the other blocking-request events that should wake the user. `CommandPermissionRequested` is the chat command-guard card (ADR 0002); `McpPermissionRequested` is the chat MCP-tool card.
+- `event_type: CredentialRequested` / `PluginInstallRequested` / `PluginUninstallRequested` / `EmailConfirmRequested` / `OAuthAuthorizationRequested`: **work**. These are *form requests*: the agent sent the user a form to fill in or confirm. Pair one with `FormRequestResolved` (same `request_id`) to learn how it ended. See § Form requests.
 - `event_type: ResponseGenerated` / `ResponseFailed` / `CodingAgentIdled` / `ChangeApplied` / `ChangeHardened` / `TriggerCompleted` / `BackgroundBashCompleted` / every `Change*` / every `Thread*` lifecycle event — **work**.
 - `event_type: ToolCalled` / `CodingAgentToolCalled` / `ContextCaptured` / `ImageDescribed` etc. — **work**. Use a per-entry `condition:` filter to scope; without one a chatty per-action variant will fire the trigger many times per turn.
 - `event_type: TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` / `CodingAgentThoughtStreamed`: **refused**, at both surfaces. The matcher never sees a per-token variant, and they would saturate whatever they were wired to.
@@ -138,7 +139,7 @@ The enum splits into two halves, mirrored by `ThreadEvent::is_persisted()`:
 All variants are past tense — events-only model, no command concept (imperative actions are reframed as request events like `AppUiRefreshRequested`). Persistence is orthogonal to tense:
 
 - **Persisted.** `MessageReceived`, `ResponseGenerated`, `CodingAgentIdled`, `ChangeApplied`, etc. Written to the `events` table; replayable; visible to projections, history queries, and (in principle) the trigger matcher.
-- **Transient.** `CumulativeTextUpdated`, `LlmCallRetried`, `AppUiRefreshRequested`, `PluginInstallRequested`, etc. Broadcast over SSE only. Never persisted; never reach the projection or trigger paths. Used for live UI updates (token streaming preview, modal-trigger request events) and child thread broadcasts.
+- **Transient.** `CumulativeTextUpdated`, `LlmCallRetried`, `AppUiRefreshRequested`, `NavigationRequested`, etc. Broadcast over SSE only. Never persisted; never reach the projection or trigger paths. Used for live UI updates (token streaming preview, navigation) and child thread broadcasts.
 
 A trigger on a transient event can never fire — the scheduler's matcher only looks at persisted events.
 
@@ -212,7 +213,7 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 |---|---|---|---|---|
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
 | `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
-| `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. A chunk never holds whitespace alone: a paragraph break leads the next chunk instead. Older rows can still hold a bare `"\n\n"`. | high-volume-streaming | yes | **no (blocked)** |
+| `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. Join a turn's chunks with no separator: each new text block already starts a new paragraph. A chunk never holds whitespace alone: a paragraph break leads the next chunk instead. Older rows can still hold a bare `"\n\n"`, or two blocks with no break between them. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentThoughtStreamed` | One chunk of the coding agent's streamed reasoning/thinking (CC's `thinking_delta`; Codex's `item/reasoning/*Delta` or `reasoning` item). Coalesced before persistence. Rendered as the live "Thinking" step's content. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentToolCalled` | One coding-agent tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | per-action | yes | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
@@ -237,8 +238,22 @@ Not prefixed `CodingAgent*` because the same machinery serves any agent that nee
 | `McpPermissionResolved` | The above was answered (Allow once / Deny / Allow for this thread / Always allow this tool / Always allow this server), or auto-resolved by the engine (superseded / orphan / cancel). Carries `request_id`, `allowed`, optional `reason`, optional `persist_scope` (`narrow` → `Mcp(server:tool)`, `broad` → `Mcp(server:*)`, both persisted to the workspace's `mcp-allowed-tools`; `session` → in-memory per-thread). Flips the thread back to `running` **only from `waiting_for_user_answer`** (a stale resolution on an idle/terminal thread leaves the status unchanged). | per-action | yes | yes |
 | `CommandCheckpointed` | The **command guard** (ADR 0002, Phase 4) bracketed a `ReversibleDanger` command (in-workspace deletion/overwrite) with two snapshots of the workspace's git-visible content: a **pre** image on a safety ref before it ran, and a **post** image after. Diffing the pair is what tells the engine which files the command created, overwrote and deleted, so the card can offer both an Undo and a view of what changed. Emitted **after** the command returns, and only when the two images differ: a command that changed nothing git-visible (typically because its target was gitignored) emits nothing, since its Undo could neither restore nor remove anything. A failed snapshot likewise emits nothing and lets the command run unguarded. Carries `checkpoint_id` (the ref key), `command` (the inspected text), `summary` (the card line), and the counts `restores` / `removes` (what Undo would put back, and what it would delete because the command created it; both 0 on events written before the counts existed). Does not change thread status. | per-action (only when the guard is on AND a command hits the reversible lane AND it changed something git-visible) | yes | yes |
 | `CommandCheckpointReverted` | The user clicked Undo on a `CommandCheckpointed` card (or the engine resolved it): the workspace was restored from the pre image and the files the command created were removed, each only if it still matched what the command wrote. The two refs are kept, so the card's diff stays viewable afterwards. Carries `checkpoint_id`; stamped with the original turn's `request_event_id` so it groups into the same exchange as its checkpoint (the card renders reverted). | per-action | yes | yes |
-| `CredentialRequested` | Persisted audit-log entry: a credential prompt was opened for `provider`. Pairs with the transient `CredentialPromptRequested` SSE request that carries the JSON payload for the modal. | lifecycle | yes | yes |
 | `McpConsentRequested` | Legacy persisted audit-log entry (`tool`, `args`) from the pre-card MCP consent flow. No longer emitted — chat MCP consent now uses the in-thread `McpPermissionRequested` / `McpPermissionResolved` permission card above. Kept as a defined variant for replay of any historical rows. | lifecycle | yes | yes |
+
+## Form requests
+
+A *form request* is something the agent put in front of the user to fill in or confirm. Each carries a `request_id` and a `payload` string (the JSON the client renders from, never a secret). It stays open until exactly one `FormRequestResolved` names its `request_id`. An open request changes no thread status.
+
+Because the request is persisted, a client that missed its stream frame still finds it. The client reads `GET /api/v1/form-requests/pending` on every stream open. The transcript shows each request in its turn, with an Open button while it waits.
+
+| Event | When it fires | Volume | Persisted | Triggerable |
+|---|---|---|---|---|
+| `CredentialRequested` | `request_credential` or `connect_oauth_account` needs a credential the user must type or confirm. `payload` holds `service`, `prompt`, `auth_type`, and optionally `base_urls`, `defaults`, `env_var_name`, or for a widening `existing_credential_id` and `adding_base_urls`. Resolved by the credential save or by `POST /api/v1/form-requests/{request_id}/cancel`. Legacy aliases: `CredentialPromptRequested`, `CredentialRequest`. | per-action | yes | yes |
+| `PluginInstallRequested` | `install_plugin` staged an install. `payload` is the preview (manifest, file list, overwrites, optional setup). `request_id` equals its `install_id`. Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. Legacy alias: `PluginInstallRequest`. | per-action | yes | yes |
+| `PluginUninstallRequested` | `uninstall_plugin` staged an uninstall. `payload` is the preview (plugin name and version, files present and missing). `request_id` equals its `uninstall_id`. Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. Legacy alias: `PluginUninstallRequest`. | per-action | yes | yes |
+| `EmailConfirmRequested` | `send_email` wants the user to confirm a draft. `payload` is the draft. Resolved by `POST /api/v1/email/send` or the cancel route above. Legacy alias: `EmailConfirmRequest`. | per-action | yes | yes |
+| `OAuthAuthorizationRequested` | `connect_oauth_account` asks the user's device to open the provider's authorization page. `payload` is `{target: "url", url, purpose: "oauth"}`, and the meta `actor` names the device that opens it. The flow's listener resolves it when its 120 s wait ends. | per-action | yes | yes |
+| `FormRequestResolved` | A form request closed. Carries `request_id` and `outcome`: `completed` (saved, confirmed, sent, authorized), `canceled` (the user declined, or the provider refused), `superseded` (a newer request for the same credential or plugin in the thread, or a new user message), `expired` (plugin staging or the OAuth listener is gone: TTL, timeout, restart). Emitted once per request. | per-action | yes | yes |
 
 `QUESTION_OVERTAKEN_EVENT_TYPES` constant — the unified set of event names that mean a `UserQuestionAsked` is no longer the latest interactive point on the thread. Once any of these lands after a question, the next typed user text starts a fresh follow-up rather than a `FreeText` answer. Two categories: **terminal** (`ResponseAborted`, `ResponseCanceled`, `ResponseFailed`, `CodingAgentIdled`); **agent progression** — coding agent (`CodingAgentTextStreamed`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `CodingAgentPromptSent`) and chat (`TextStreamed`, `ThoughtStreamed`, `ToolCalled`, `ToolResult`). The coding-agent progression category defends against the parallel-tool-call race: a coding agent can emit a question alongside sibling tool calls in one assistant message, the question path blocks while the siblings dispatch and emit events. Without filtering on those events, the user's next typed comment is silently absorbed as a `FreeText` answer to the dead question.
 
@@ -304,8 +319,9 @@ Legacy: historical events with empty `change_id` + `commit_sha` set are from the
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `ChildThreadCompleted` | A child thread spawned by `run_thread` / `run_coding_agent` reached a terminal event (coding agent: `CodingAgentIdled` or `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`). Emitted on the **parent** thread by EventBus fan-in, so the row's own `thread_id` is the PARENT. Fires once per completed TURN, so a child that was followed up on (or continued) reports again. Carries `child_thread_id`, optional `child_thread_title`, `status: ChildCompletionStatus` (snake_case on the wire: `success` / `failure` / `no_changes` / `canceled`), `summary` (truncated to 2000 chars; indexed by `indexable_text`), `pending_change_ids` (omitted from the payload when empty). Queryable by an app via `lucidos.events.query({ event_type: 'ChildThreadCompleted' })`, see § "One table, two enums". | per-action | yes | yes |
+| `ChildThreadCompleted` | A child thread spawned by `run_thread` / `run_coding_agent` reached a terminal event (coding agent: `CodingAgentIdled` or `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`). Emitted on the **parent** thread by EventBus fan-in, so the row's own `thread_id` is the PARENT. Fires once per completed TURN, so a child that was followed up on (or continued) reports again. Carries `child_thread_id`, optional `child_thread_title`, `status: ChildCompletionStatus` (snake_case on the wire: `success` / `failure` / `no_changes` / `canceled`), `summary` (truncated to 2000 chars; indexed by `indexable_text`), `pending_change_ids` (the child's own branch; omitted when empty), `sub_thread_pending_changes` (every pending change held by the child's sub-threads at any depth, each `{ change_id, thread_id, thread_title?, thread_unsettled }`; omitted when empty). Queryable by an app via `lucidos.events.query({ event_type: 'ChildThreadCompleted' })`, see § "One table, two enums". | per-action | yes | yes |
 | `ChildThreadStopped` | A user Stop ended a child thread's turn, including Cancel on its question card, and the child is now a *stopped child*. Emitted on the **parent** by the same fan-in, in place of a `ChildThreadCompleted`. It wakes nothing and runs no parent turn: the child is alive, and the parent is still owed the `ChildThreadCompleted` that settles it. Carries `child_thread_id` and optional `child_thread_title`. See § `ChildThreadStopped`. | per-action | yes | yes |
+| `ChildThreadDetached` | A child thread was moved to top level (the thread menu's **Move to top level**, the `threads` tool's `detach_child`, or `lucidos threads detach`). Emitted on the **former parent**, never on the child. The projection cuts the edge: the child's `parent_thread_id` becomes null and it becomes a top-level thread. It wakes nothing, and the child keeps running. Carries `child_thread_id` and optional `child_thread_title`. See § `ChildThreadDetached`. | per-action | yes | yes |
 | `ContextDismissed` | **Retired by ADR 0109 and still readable.** Nothing emits it any more: `dismiss_from_context` is gone, because under *self-curated context mode* the *swept window* takes a result on its own. Existing workspaces hold rows, and the resume helper still honours every one of them, so a body an agent dropped before the change stays dropped. Carries `dismissed_event_id`, the *handle* of the event the body came from. | per-action | yes | yes |
 | `ContextKeptOpen` | The agent set one tool result's clock back to zero, by writing its address under a `[KEEP OPEN]` heading in its *working understanding*. Carries `kept_open_event_id`, the *handle* of the `ToolCalled` behind the result. Same-thread only, and only that type: a keep moves the clock on a `tool_result` block, and nothing else is one. The keep is applied where the span is parsed, so this event is the durable record rather than the mechanism. It applies once, from the reply that wrote it. It exempts the item from no pass: the trimmer at the wall takes held items last and still takes them. Reaches only a workspace running *self-curated context mode*: everywhere else nothing is swept, so a keep would say nothing. | per-action | yes | yes |
 | `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (0 = applied/clean worktree removed after the short grace; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed — the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
@@ -439,8 +455,9 @@ re-open its parent.
 **It says the event arrived, never that you were asleep.** Registration does not
 hold your turn, so a match can land while this thread is still working, and the
 engine then folds it into the running turn and tells you it arrived "while you
-were working". The transcript card reads `Event arrived: <type>` for the same
-reason: nothing about a delivery knows which of the two lanes it took.
+were working". The transcript card names the event in plain words and marks it
+`arrived` for the same reason: nothing about a delivery knows which of the two
+lanes it took.
 
 On a *delivery* it also carries `delivered_event_id`, the id of the
 `EventWaitDelivered` above it. The prose is the prompt the model reads and
@@ -479,12 +496,18 @@ the same turn rather than discovering later:
   many separate re-entries can be outstanding, not on how much you can watch: one
   wait's `on:` list is uncapped, so watching a dozen things in one subscription
   (any entry delivers) costs one of the 25.
-- A thread may subscribe **10 times within an hour** with no message from the
-  user in between. That bounds a thread that re-opens itself, two threads
-  ping-ponging, and a model simply stuck, all of which re-arm fast. A serial
-  workflow of long waits never reaches it. An agent- or engine-authored message
-  does not reset the count, since those are exactly what such a loop is made of.
-  Engine-armed waits for background tasks count too.
+- A thread may start **20 counted waits within an hour** with no message or
+  question-card answer from the user in between. **A wait another thread's event
+  ended does not count**, so waiting on other threads one at a time never
+  reaches it, however fast you re-arm. Everything else counts:
+  - a wait ended by this thread's own event;
+  - a wait ended by an event with no known source (`emit_event` writes those);
+  - a wait that timed out, and one not yet ended.
+
+  That bounds a thread that re-opens itself and a model stuck re-arming for
+  something that never comes. An agent- or engine-authored message does not
+  reset the count. Engine-armed waits for this thread's own background tasks
+  count too.
 
 ## Voice session (a thread being spoken to)
 
@@ -586,21 +609,17 @@ reason: it is TypeSafe or nothing.
 
 ## Transient — never persisted, broadcast over SSE only
 
-All transient names are past tense (events-only model). They cannot trigger (the matcher only sees persisted events). They drive live UI state (streaming preview, modal opens, in-app refreshes) and parent-thread fan-out signals. The "request events" carry the JSON payload that drives a frontend modal; the persisted sibling `CredentialRequested` is the audit-log entry that the same request opened a prompt. (The old `McpConsentPromptRequested` transient request was removed — chat MCP consent is now the persisted in-thread `McpPermissionRequested` card, not a modal.)
+All transient names are past tense (events-only model). They cannot trigger (the matcher only sees persisted events). They drive live UI state (streaming preview, in-app refreshes, navigation) and parent-thread fan-out signals. A request the user has to answer is never transient: it is a persisted *form request* (§ Form requests), so a lost stream frame cannot lose it.
 
 | Event | When it fires | Volume |
 |---|---|---|
 | `CumulativeTextUpdated` | One snapshot of the assistant's streaming buffer (cumulative text so far). Emitted at every flush boundary alongside the persisted delta in `TextStreamed`; the frontend just overwrites with the latest snapshot. Legacy alias: `TextStreaming`. | high-volume-streaming |
 | `LlmCallRetried` | The chat agentic loop is retrying an LLM call (rate-limit, transient API error, "retry with different approach" path). Carries `reason: String`. Legacy alias: `Retrying`. | per-action |
 | `PreambleCompleted` | Reserved variant — defined on the enum and skipped by the projection's transient match arm, but **not emitted** by any production code path today. Treat as a stub for future use. Legacy alias: `PreambleCompleting`. | n/a |
-| `CredentialPromptRequested` | Request event — opens the credential prompt modal. Pairs with persisted `CredentialRequested`. Carries `payload: String` (the JSON the modal needs). Legacy alias: `CredentialRequest`. | per-action |
-| `PluginInstallRequested` | Request event — opens the plugin install panel. Carries the JSON preview emitted by `install_plugin` (manifest, file list, overwrites, optional setup). Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. Legacy alias: `PluginInstallRequest`. | per-action |
-| `PluginUninstallRequested` | Request event — opens the plugin uninstall panel. Carries the JSON preview from `uninstall_plugin` (plugin name + version, file list partitioned into still-on-disk vs already-missing). Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. Legacy alias: `PluginUninstallRequest`. | per-action |
-| `EmailConfirmRequested` | Request event — opens the email confirmation modal. Carries `payload: String`. Legacy alias: `EmailConfirmRequest`. | per-action |
 | `PushNotificationRequested` | Request event — prompts the device to register for web push. Empty payload. Legacy alias: `PushNotificationRequest`. | lifecycle |
 | `AppUiRefreshRequested` | Tells any open app iframe with `app_id` to reload itself. Legacy alias: `RefreshAppUI`. | per-action |
 | `AppUiCaptureRequested` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. Legacy alias: `CaptureAppUI`. | per-action |
-| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional `actor` (the originating device — the device that sent the prompt that triggered the turn); the frontend scopes the navigate to that device so it doesn't land on the user's other devices. Absent for trigger/background turns and the SDK app-iframe (nil-thread) path. | per-action |
+| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional device `actor`: the device named in the tool's `device` argument, else the turn's *last used device*. Every page receives the event and drops it unless the actor is its own device. So exactly one device acts: it opens the target if it shows the thread, otherwise it offers an Open button. Absent for a turn with no device and for the SDK app-iframe (nil-thread) path. Nothing reports back whether a page acted. Only a connected page receives it, and nothing stores or retries it. So the `navigate_ui` result says whether the target device had Lucidos visible in the last 2 minutes. When it had not, the result offers `send_notification` with a navigate tap instead, which stays in the inbox. | per-action |
 | `CodingAgentThreadSpawned` | A child coding-agent thread (spawned via `run_coding_agent` / `run_thread`) has started. Carries `cc_thread_id`, `title`, `agent`. SSE-only — the persisted record of the child is its own thread row. Alias: `CcThreadSpawned`. | per-action |
 | `CodingAgentDiffChanged` | A coding-agent worktree post-commit hook reconciled `coding_agent_has_diff` and the value changed. Carries `has_diff` and a full thread aggregate on SSE so the frontend can show or hide the Diff button immediately. Does **not** imply `ChangeProposed` / Apply readiness. | per-action |
 | `ChildrenCountChanged` | A parent or ancestor thread's aggregate metadata changed. Carries the full updated aggregate (`active_children_count`, `total_children_count`, `blocking_descendant_count`, `attention_descendant_count`, …). Fires when (a) a direct child terminates and the parent's active/total counts shift, or (b) any descendant's "blocking" or "attention-needing" predicate flips (Running, WaitingForUserAnswer, or `has_pending_changes` && CodingAgent — see `is_blocking` / `is_attention_needing`), in which case every ancestor on the chain receives the broadcast with its updated counts. Drives the "Active children" badge, the cascading-archive button-hide (via `blocking_descendant_count`), and the Current-bubble routing in `display_section` (via `attention_descendant_count`). | per-action |
@@ -1035,12 +1054,24 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
     "child_thread_title": "Sub-task: rename foo to bar",
     "status": "success",
     "summary": "Renamed all 14 occurrences across 9 files. Tests pass.",
-    "pending_change_ids": ["chg-2025-05-13-…"]
+    "pending_change_ids": ["chg-2025-05-13-…"],
+    "sub_thread_pending_changes": [
+      {
+        "change_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "thread_id": "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+        "thread_title": "Sub-task: update the call sites",
+        "thread_unsettled": false
+      }
+    ]
   }
 }
 ```
 
 `status` is `success` / `failure` / `no_changes` / `canceled`. `canceled` means the user ended the child: they archived it, discarded its change, or an Apply, Discard or Archive cut its running turn short. A user Stop is never `canceled`: it sends `ChildThreadStopped` instead. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
+
+**Two lists, kept apart: the child's own changes and its sub-threads' changes.** `pending_change_ids` names only the child's own branch. An orchestrating child whose own children did the work holds none of it, so that list is empty while work waits below. `sub_thread_pending_changes` lists every change pending anywhere below the child, whatever the child's status. Each entry names its owner (`thread_id`, `thread_title`) and `thread_unsettled`, which means the same as on a change in the `changes` list: `true` if that sub-thread was still working when the card was sent. It is a snapshot, so read the `changes` list for the current state before you apply.
+
+The conversation block reads `Pending changes: none` for the child's own branch, then a `Pending changes in its sub-threads` section when this list is non-empty.
 
 **The parent is re-opened BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant. The engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way. But the subscription still spends part of the recent-subscription budget. It also arms a timeout that can fire while the child is still working.
 
@@ -1081,6 +1112,29 @@ A user Stop paused one of this thread's children. The child is **alive**: it is 
 - Nothing, for as long as the user leaves it. The child stays a *stopped child* and counts toward their attention.
 
 It never re-opens the parent. A chat parent reads it as a `[CHILD THREAD STOPPED]` block in its history. A coding-agent parent reads it in its turn-gap note. To be told when the child is really done, rely on the `ChildThreadCompleted` fan-in; a wait on `ChildThreadStopped` fires on the Stop itself.
+
+### `ChildThreadDetached`
+
+```json
+{
+  "type": "ChildThreadDetached",
+  "data": {
+    "child_thread_id": "550e8400-e29b-41d4-a716-446655440000",
+    "child_thread_title": "Sub-task: rename foo to bar"
+  }
+}
+```
+
+One of this thread's children was moved to top level. It is no longer this thread's child, and it cannot be put back.
+
+- **Nothing was stopped.** A turn in flight finishes, keeps its work and proposes any change. Its result lands on its own timeline only.
+- **This thread gets nothing more from it.** No `ChildThreadCompleted`, no `ChildThreadStopped`, and no follow-up: `follow_up_child_thread` refuses it as not your child. `my_children` no longer lists it.
+- **It still used a child slot.** The cap of ten children counts it, so a move never makes room for another spawn.
+- **A card the child earned before the move still arrives.** Only what happens after the move is cut.
+
+It never re-opens the parent. A chat parent reads it as a `[CHILD THREAD MOVED OUT]` block in its history. A coding-agent parent reads it in its turn-gap note. A parent that armed its own `await_event` on the child's `ChildThreadCompleted` is not told, and that wait runs to its timeout.
+
+The event lands on the parent so that ADR 0011's recovery checks still read the child's own latest event correctly. The engine drops a second move of the same child, so the event appears at most once per child.
 
 ### `TriggerStarted` / `TriggerCompleted`
 

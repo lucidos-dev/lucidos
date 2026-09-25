@@ -21,7 +21,7 @@ import { availableThreadActions, type Action } from '../../generated/thread-life
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
 import { endClaudeCodeAndApply, handleDiscardCCChanges } from './chat-claude-code';
-import { armStandingApply, disarmStandingApply } from './chat-changes';
+import { armStandingApply, disarmStandingApply, APPLY_NEW_VERSION_TOOLTIP } from './chat-changes';
 import { discardCompose, updateCompose } from './compose';
 import { topOverlay, dismissTopOverlay } from '../overlayStack';
 
@@ -215,7 +215,7 @@ function tagAction(
         tooltip: opts.incomplete
           ? 'This change was proposed by a turn that ended in failure. The worktree contents may be partial work. You will be asked to confirm.'
           : opts.requiresRestart
-            ? 'Applies now (non-disruptive). A new engine version builds in the background; you’ll be prompted to switch to it when ready.'
+            ? APPLY_NEW_VERSION_TOOLTIP
             : undefined,
         invoke: async () => {
           if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply'))) return;
@@ -231,8 +231,8 @@ function tagAction(
         // act with the one that can.
         label: opts.armed ? '✓ Applying as it settles' : 'Apply as it settles',
         tooltip: opts.armed
-          ? 'Armed. The change applies when this thread finishes, and drops with a report if the thread parks or fails. Click to cancel.'
-          : 'The thread is still working. Apply its change the moment it finishes.',
+          ? 'Armed. The change applies when this thread finishes, and drops with a report if the thread stops on a question or fails. Click to cancel.'
+          : 'The thread has not finished. Apply its change the moment it does.',
         invoke: () =>
           opts.armed
             ? void disarmStandingApply(threadId)

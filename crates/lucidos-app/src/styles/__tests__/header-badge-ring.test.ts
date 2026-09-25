@@ -19,7 +19,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { block, cssRules, decl, rulesTargeting } from './css-rule-helpers';
+import { REDUCED_MOTION_ROOT, block, cssRules, decl, isReducedMotionRule, rulesTargeting } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -78,13 +78,12 @@ describe('the ring rides every badge on the bar, from one rule', () => {
   });
 
   it('cancels its own transition under reduced motion, in this sheet', () => {
-    // global/modal-overlay.css cancels the BUTTON's transitions centrally. The
-    // ring's cancel cannot join that list. main.tsx imports that sheet before
-    // this one, and both selectors are (0,2,0). The copy there would lose the
-    // tie, and the ring would fade against a button that snapped.
+    // global/modal-overlay.css cancels the BUTTON's transitions centrally, not
+    // this ring's. So the ring's cancel lives beside the transition it cancels,
+    // or the ring would fade against a button that snapped.
     expect(decl(headerBadge, 'transition')).toBe('box-shadow var(--duration-normal)');
     const cancel = cssRules(shellCss).find(r =>
-      r.selector === '.app-header .badge' && r.atRules.includes('prefers-reduced-motion'));
+      r.selector === `${REDUCED_MOTION_ROOT} .app-header .badge` && isReducedMotionRule(r));
     expect(cancel?.props.get('transition'), 'no reduced-motion cancel in shell.css').toBe('none');
   });
 

@@ -19,31 +19,125 @@ pub(crate) enum InPlaceMergeStart {
     /// No live, non-exited session with a worktree — caller falls through to the
     /// dead-session / temp-worktree merge tiers.
     NoLiveSession,
-    /// A merge is already running for this thread (`apply_now_in_progress`).
-    AlreadyInProgress,
-    /// Session claimed; `apply_now_in_progress` is now set. Caller owns clearing it.
+    /// Another operation holds the session's change claim, named here.
+    Claimed(crate::engine::types::ChangeClaim),
+    /// A Stop, Discard or Archive is ending the session (`pending_stop`).
+    SessionStopping,
+    /// Session claimed; `change_claim` is now `Apply`. Caller owns clearing it.
     Ready(crate::engine::change_ops::LiveSessionInfo),
 }
 
-/// Pure decision core of `begin_in_place_merge` — split out so the claim state
-/// machine is unit-testable without standing up a full engine. A session is
-/// claimable for an in-place merge only when it exists, its process is alive,
-/// it has a worktree, and no apply is already running on it.
+/// Pure decision core of `begin_in_place_merge` and `apply_now`, split out so
+/// the claim state machine is unit-testable without a full engine. A session is
+/// claimable when it is live and has a worktree. No apply may already run on
+/// it, and no stop may be ending it.
+///
+/// A pending stop still reads live until the loop breaks out, and a Discard
+/// deletes the branch the merge would publish. `claude_code::stop_refusal`
+/// refuses the other direction.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InPlaceMergeClaim {
     NoLiveSession,
-    AlreadyInProgress,
+    Claimed(crate::engine::types::ChangeClaim),
+    SessionStopping,
     Claim,
 }
 
 pub(crate) fn decide_in_place_merge_claim(
     session: Option<&crate::engine::AgentSession>,
 ) -> InPlaceMergeClaim {
-    match session {
-        None => InPlaceMergeClaim::NoLiveSession,
-        Some(s) if !s.is_live() || s.worktree_path.is_none() => InPlaceMergeClaim::NoLiveSession,
-        Some(s) if s.apply_now_in_progress => InPlaceMergeClaim::AlreadyInProgress,
-        Some(_) => InPlaceMergeClaim::Claim,
+    let Some(s) = session.filter(|s| s.is_live() && s.worktree_path.is_some()) else {
+        return InPlaceMergeClaim::NoLiveSession;
+    };
+    if let Some(holder) = s.change_claim {
+        return InPlaceMergeClaim::Claimed(holder);
+    }
+    if s.pending_stop.is_some() {
+        return InPlaceMergeClaim::SessionStopping;
+    }
+    InPlaceMergeClaim::Claim
+}
+
+/// Release the apply claim that the session behind `claimant` took.
+///
+/// An apply task can outlive the session it claimed, and a replacement on the
+/// same thread takes its own claim. Clearing by thread id alone would release
+/// that one, and a second apply could then merge beside it. `msg_tx` is the
+/// session's identity, as in `SessionEntryGuard`.
+pub(crate) fn release_change_claim(
+    sessions: &mut std::collections::HashMap<Uuid, crate::engine::AgentSession>,
+    thread_id: Uuid,
+    claimant: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+) {
+    if let Some(s) = sessions
+        .get_mut(&thread_id)
+        .filter(|s| s.msg_tx.same_channel(claimant))
+    {
+        s.change_claim = None;
+    }
+}
+
+/// Holds a change claim for work that awaits inside a request future, and
+/// releases it however that work ends. axum drops the future when the client
+/// disconnects. A panic unwinds past any release written after it. Either
+/// would otherwise leave the claim set until the session ends.
+///
+/// `release` frees it under the lock, so the next request never meets a stale
+/// claim. `Drop` covers every other exit: it cannot await the async lock, so it
+/// releases on a detached task, as `SessionEntryGuard` does.
+pub(crate) struct ChangeClaimGuard {
+    sessions: Option<
+        Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, crate::engine::AgentSession>>>,
+    >,
+    thread_id: Uuid,
+    claimant: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+}
+
+impl ChangeClaimGuard {
+    pub(crate) fn new(
+        sessions: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<Uuid, crate::engine::AgentSession>>,
+        >,
+        thread_id: Uuid,
+        claimant: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    ) -> Self {
+        Self {
+            sessions: Some(sessions),
+            thread_id,
+            claimant,
+        }
+    }
+
+    pub(crate) async fn release(mut self) {
+        let Some(sessions) = self.sessions.clone() else {
+            return;
+        };
+        // Disarm only once the lock is held. A cancel while waiting for it
+        // must still leave `Drop` armed to release.
+        let mut map = sessions.lock().await;
+        self.sessions = None;
+        release_change_claim(&mut map, self.thread_id, &self.claimant);
+    }
+}
+
+impl Drop for ChangeClaimGuard {
+    fn drop(&mut self) {
+        let Some(sessions) = self.sessions.take() else {
+            return;
+        };
+        // Outside a runtime the map dies with the process, so nothing is left
+        // to release.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (thread_id, claimant) = (self.thread_id, self.claimant.clone());
+        handle.spawn(async move {
+            release_change_claim(&mut *sessions.lock().await, thread_id, &claimant);
+            log!(
+                "[AgentSession] A change claim on thread {} outlived its work and was released on drop",
+                thread_id
+            );
+        });
     }
 }
 
@@ -141,10 +235,18 @@ impl LucidosEngine {
                         && session.branch_name.is_some()
                         && session.repo_root.is_some() =>
                 {
-                    if session.apply_now_in_progress {
-                        return Err("Apply is already in progress for this thread".into());
+                    match decide_in_place_merge_claim(Some(session)) {
+                        InPlaceMergeClaim::Claimed(holder) => {
+                            return Err(
+                                crate::engine::claude_code::claim_refusal_message(holder).into()
+                            );
+                        }
+                        InPlaceMergeClaim::SessionStopping => {
+                            return Err(crate::engine::claude_code::SESSION_STOPPING_MESSAGE.into());
+                        }
+                        InPlaceMergeClaim::NoLiveSession | InPlaceMergeClaim::Claim => {}
                     }
-                    session.apply_now_in_progress = true;
+                    session.change_claim = Some(crate::engine::types::ChangeClaim::Apply);
                     (
                         session.worktree_path.clone().unwrap(),
                         session.branch_name.clone().unwrap(),
@@ -253,7 +355,7 @@ impl LucidosEngine {
         let engine = self.clone_arc();
         tokio::spawn(async move {
             // Use std::panic::catch_unwind via FutureExt to guarantee cleanup on panic.
-            // tokio::spawn swallows panics — without this, apply_now_in_progress stays
+            // tokio::spawn swallows panics. Without this, change_claim stays
             // stuck forever if apply_now_inner panics.
             let panic_result = std::panic::AssertUnwindSafe(async {
                 // Liveness-based timeout: abort only if CC hasn't emitted any
@@ -307,12 +409,7 @@ impl LucidosEngine {
 
             // Always clear the in-progress flag — runs after normal completion,
             // timeout, error, or panic.
-            {
-                let mut guard = engine.agent_sessions.lock().await;
-                if let Some(session) = guard.get_mut(&thread_id) {
-                    session.apply_now_in_progress = false;
-                }
-            }
+            release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
 
             if let Err(e) = result {
                 log!("[ApplyNow] Failed for thread {}: {}", thread_id, e);
@@ -845,19 +942,20 @@ impl LucidosEngine {
     /// Atomically claim a thread's live session for an in-place merge.
     ///
     /// Locks `agent_sessions` once so the "is there a live session?" check and
-    /// the `apply_now_in_progress` claim can't race a concurrent apply — the
+    /// the `change_claim` claim can't race a concurrent apply. The
     /// `apply_change` Tier-1 path used to do `is_running_for` then a separate
     /// `live_session_info`, a TOCTOU window where two apply calls (e.g. the LLM
     /// calling `apply_change` twice in quick succession) could both start an
     /// in-place merge on the same session and corrupt it by sending two merge
     /// prompts down `msg_tx`. Returns `Ready` with the flag already set; the
-    /// caller MUST clear `apply_now_in_progress` when the merge finishes
+    /// caller MUST clear `change_claim` when the merge finishes
     /// (`spawn_in_place_conflict_recovery` does this in all arms).
     pub(crate) async fn begin_in_place_merge(&self, thread_id: Uuid) -> InPlaceMergeStart {
         let mut guard = self.agent_sessions.lock().await;
         match decide_in_place_merge_claim(guard.get(&thread_id)) {
             InPlaceMergeClaim::NoLiveSession => InPlaceMergeStart::NoLiveSession,
-            InPlaceMergeClaim::AlreadyInProgress => InPlaceMergeStart::AlreadyInProgress,
+            InPlaceMergeClaim::Claimed(holder) => InPlaceMergeStart::Claimed(holder),
+            InPlaceMergeClaim::SessionStopping => InPlaceMergeStart::SessionStopping,
             InPlaceMergeClaim::Claim => {
                 // Re-fetch mutably to set the claim flag; presence + worktree
                 // were validated by `decide_in_place_merge_claim` above under the
@@ -865,7 +963,7 @@ impl LucidosEngine {
                 let s = guard
                     .get_mut(&thread_id)
                     .expect("session present (checked under lock)");
-                s.apply_now_in_progress = true;
+                s.change_claim = Some(crate::engine::types::ChangeClaim::Apply);
                 InPlaceMergeStart::Ready(crate::engine::change_ops::LiveSessionInfo {
                     worktree_path: s
                         .worktree_path
@@ -879,21 +977,22 @@ impl LucidosEngine {
         }
     }
 
-    /// Clear the `apply_now_in_progress` claim for a thread. Used by the
+    /// Clear the `change_claim` claim `claimant` took. Used by the
     /// `apply_change` Tier-1 fast path, which claims the session via
     /// `begin_in_place_merge` then finalizes a clean fast-forward inline (no
     /// background task to clear it). Idempotent — a missing session is a no-op.
-    pub(crate) async fn clear_apply_now_in_progress(&self, thread_id: Uuid) {
-        let mut guard = self.agent_sessions.lock().await;
-        if let Some(s) = guard.get_mut(&thread_id) {
-            s.apply_now_in_progress = false;
-        }
+    pub(crate) async fn clear_change_claim(
+        &self,
+        thread_id: Uuid,
+        claimant: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    ) {
+        release_change_claim(&mut *self.agent_sessions.lock().await, thread_id, claimant);
     }
 
     /// Run the CC-assisted conflict merge as a guarded background task and
     /// finalize, then return immediately. This is the async counterpart of the
     /// `apply_now` spawn: same liveness-timeout (abort if CC goes silent for 10
-    /// minutes), panic guard, and always-clear of `apply_now_in_progress`.
+    /// minutes), panic guard, and always-clear of `change_claim`.
     ///
     /// The caller (`apply_change` Tier 1) has already claimed the session via
     /// `begin_in_place_merge` and run the fast-forward inline; this handles only
@@ -973,12 +1072,7 @@ impl LucidosEngine {
                 };
 
             // Always clear the in-progress claim — normal, timeout, error, panic.
-            {
-                let mut guard = engine.agent_sessions.lock().await;
-                if let Some(s) = guard.get_mut(&thread_id) {
-                    s.apply_now_in_progress = false;
-                }
-            }
+            release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
 
             match result {
                 Ok((pre_sha, post_sha)) => {
@@ -1165,6 +1259,11 @@ impl LucidosEngine {
     /// The half of [`Self::reset_worktree_and_idle`] that is always safe. Use it
     /// when the session must go back to idle but the branch still holds commits
     /// the user owns.
+    ///
+    /// It announces the idle and leaves the session's phase alone. Only the run
+    /// loop writes `is_waiting` and fires `idle_notify`, because only it keeps
+    /// its local copy in step. A Discard can land on a mid-turn session, and a
+    /// write from here made that turn read idle until its `Result`.
     pub(crate) async fn mark_session_idle(&self, thread_id: Uuid, worktree_path: &Path) {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -1172,10 +1271,8 @@ impl LucidosEngine {
         let cc_sid = {
             let mut sessions = self.agent_sessions.lock().await;
             if let Some(s) = sessions.get_mut(&thread_id) {
-                s.is_waiting = true;
                 s.has_changes = false;
                 s.requires_restart = false;
-                s.idle_notify.notify_waiters();
             }
             sessions
                 .get(&thread_id)
@@ -1244,23 +1341,24 @@ pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::types::ChangeClaim;
     use crate::engine::AgentSession;
     use tokio::sync::mpsc;
 
     /// Build a minimal `AgentSession` for claim-decision tests. `worktree` and
-    /// `process_exited` / `apply_now_in_progress` are the fields the claim state
+    /// `process_exited` / `change_claim` are the fields the claim state
     /// machine reads; everything else is inert defaults. The receiver comes back
     /// with it — drop it and the session is a phantom, which the claim treats as
     /// no live session (see `AgentSession::is_live`).
     fn claim_test_session(
         process_exited: bool,
         worktree: Option<&str>,
-        apply_now_in_progress: bool,
+        change_claim: Option<ChangeClaim>,
     ) -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
         let (mut session, msg_rx) = AgentSession::for_test();
         session.is_waiting = !process_exited;
         session.process_exited = process_exited;
-        session.apply_now_in_progress = apply_now_in_progress;
+        session.change_claim = change_claim;
         session.worktree_path = worktree.map(std::path::PathBuf::from);
         (session, msg_rx)
     }
@@ -1275,7 +1373,7 @@ mod tests {
 
     #[test]
     fn claim_none_when_process_exited() {
-        let (s, _msg_rx) = claim_test_session(true, Some("/wt"), false);
+        let (s, _msg_rx) = claim_test_session(true, Some("/wt"), None);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::NoLiveSession
@@ -1284,7 +1382,7 @@ mod tests {
 
     #[test]
     fn claim_none_when_no_worktree() {
-        let (s, _msg_rx) = claim_test_session(false, None, false);
+        let (s, _msg_rx) = claim_test_session(false, None, None);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::NoLiveSession
@@ -1296,20 +1394,166 @@ mod tests {
         // A live session already mid-apply must not be claimed again — this is
         // the guard against the LLM calling `apply_change` twice and starting
         // two in-place merges on one session.
-        let (s, _msg_rx) = claim_test_session(false, Some("/wt"), true);
-        assert_eq!(
-            decide_in_place_merge_claim(Some(&s)),
-            InPlaceMergeClaim::AlreadyInProgress
-        );
+        for holder in [ChangeClaim::Apply, ChangeClaim::Discard] {
+            let (s, _msg_rx) = claim_test_session(false, Some("/wt"), Some(holder));
+            assert_eq!(
+                decide_in_place_merge_claim(Some(&s)),
+                InPlaceMergeClaim::Claimed(holder),
+                "the refusal names who holds the claim"
+            );
+        }
     }
 
     #[test]
     fn claim_ok_when_live_idle_with_worktree() {
-        let (s, _msg_rx) = claim_test_session(false, Some("/wt"), false);
+        let (s, _msg_rx) = claim_test_session(false, Some("/wt"), None);
         assert_eq!(
             decide_in_place_merge_claim(Some(&s)),
             InPlaceMergeClaim::Claim
         );
+    }
+
+    /// A Stop has been accepted and the loop has not broken out yet, so the
+    /// session still reads live. An apply claiming it now would merge on a
+    /// session whose teardown is under way, and a Discard deletes the branch.
+    #[test]
+    fn claim_refused_while_a_stop_is_pending() {
+        use crate::engine::StopReason;
+        for reason in [StopReason::Apply, StopReason::Discard, StopReason::Archive] {
+            let (mut s, _msg_rx) = claim_test_session(false, Some("/wt"), None);
+            s.pending_stop = Some(reason);
+            assert_eq!(
+                decide_in_place_merge_claim(Some(&s)),
+                InPlaceMergeClaim::SessionStopping,
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// An apply task outlives the session it claimed: the session ended, and a
+    /// replacement registered and took its own claim. The old task's release
+    /// must not clear the replacement's, or a second apply merges beside it.
+    #[test]
+    fn an_old_apply_task_leaves_a_replacements_claim_alone() {
+        let thread_id = uuid::Uuid::new_v4();
+        let (old, _old_rx) = claim_test_session(false, Some("/wt"), Some(ChangeClaim::Apply));
+        let old_claimant = old.msg_tx.clone();
+        let (replacement, _rx) = claim_test_session(false, Some("/wt"), Some(ChangeClaim::Apply));
+        let mut sessions = std::collections::HashMap::from([(thread_id, replacement)]);
+
+        release_change_claim(&mut sessions, thread_id, &old_claimant);
+        assert!(
+            sessions[&thread_id].change_claim.is_some(),
+            "the replacement's claim belongs to its own apply"
+        );
+
+        let own_claimant = sessions[&thread_id].msg_tx.clone();
+        release_change_claim(&mut sessions, thread_id, &own_claimant);
+        assert!(sessions[&thread_id].change_claim.is_none());
+    }
+
+    /// An in-session Discard awaits inside its HTTP request. A client that
+    /// disconnects mid-reset drops that future before its release line runs.
+    /// The guard must free the claim anyway, or every Apply, Discard and Stop
+    /// on the thread answers 409 until the session ends.
+    #[tokio::test]
+    async fn a_dropped_change_claim_guard_still_releases_the_claim() {
+        let thread_id = uuid::Uuid::new_v4();
+        let (session, _rx) = claim_test_session(false, Some("/wt"), Some(ChangeClaim::Apply));
+        let claimant = session.msg_tx.clone();
+        let sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+            (thread_id, session),
+        ])));
+
+        drop(ChangeClaimGuard::new(
+            sessions.clone(),
+            thread_id,
+            claimant.clone(),
+        ));
+        for _ in 0..100 {
+            if sessions.lock().await[&thread_id].change_claim.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(sessions.lock().await[&thread_id].change_claim.is_none());
+
+        // Cancelled while `release` waits for a busy map: `Drop` must still free it.
+        sessions
+            .lock()
+            .await
+            .get_mut(&thread_id)
+            .unwrap()
+            .change_claim = Some(ChangeClaim::Discard);
+        let busy = sessions.lock().await;
+        let mut release = Box::pin(
+            ChangeClaimGuard::new(sessions.clone(), thread_id, claimant.clone()).release(),
+        );
+        assert!(futures::FutureExt::now_or_never(&mut release).is_none());
+        drop(release);
+        drop(busy);
+        for _ in 0..100 {
+            if sessions.lock().await[&thread_id].change_claim.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(sessions.lock().await[&thread_id].change_claim.is_none());
+
+        sessions
+            .lock()
+            .await
+            .get_mut(&thread_id)
+            .unwrap()
+            .change_claim = Some(ChangeClaim::Discard);
+        ChangeClaimGuard::new(sessions.clone(), thread_id, claimant)
+            .release()
+            .await;
+        assert!(
+            sessions.lock().await[&thread_id].change_claim.is_none(),
+            "`release` frees it before returning"
+        );
+    }
+
+    /// Every production release goes through `release_change_claim`, so none
+    /// can clear a replacement's claim by thread id alone.
+    #[test]
+    fn the_apply_claim_is_released_in_one_place() {
+        let writers: Vec<(String, usize)> = crate::test_support::source_scan::production_sources()
+            .into_iter()
+            .map(|(path, src)| {
+                let clears = src.matches("change_claim = None").count()
+                    + src.matches("change_claim.take()").count();
+                (path, clears)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert_eq!(
+            writers,
+            vec![("engine/agent_session/apply_now.rs".to_string(), 1)],
+            "only `release_change_claim` may clear the claim"
+        );
+    }
+
+    /// The other direction: a Stop, Discard or Archive is refused while an apply
+    /// holds the claim. A Discard would otherwise wake the apply task's idle
+    /// wait with `Ok`, and the task would merge a branch Discard is deleting.
+    #[test]
+    fn a_stop_is_refused_while_an_apply_holds_the_claim() {
+        use crate::engine::claude_code::{
+            stop_refusal, APPLY_IN_PROGRESS_MESSAGE, DISCARD_IN_PROGRESS_MESSAGE,
+        };
+        let (applying, _rx) = claim_test_session(false, Some("/wt"), Some(ChangeClaim::Apply));
+        assert_eq!(stop_refusal(&applying), Some(APPLY_IN_PROGRESS_MESSAGE));
+        let (discarding, _rx) = claim_test_session(false, Some("/wt"), Some(ChangeClaim::Discard));
+        assert_eq!(
+            stop_refusal(&discarding),
+            Some(DISCARD_IN_PROGRESS_MESSAGE),
+            "a Discard's refusal must never read as an apply in progress"
+        );
+
+        let (free, _rx) = claim_test_session(false, Some("/wt"), None);
+        assert_eq!(crate::engine::claude_code::stop_refusal(&free), None);
     }
 
     /// Regression: clicking Apply on an *app* coding-agent thread with a live

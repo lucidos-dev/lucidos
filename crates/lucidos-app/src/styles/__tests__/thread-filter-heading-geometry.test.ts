@@ -63,6 +63,16 @@ describe('the filter heading reserves a glyph row, checkmark or not', () => {
   });
 });
 
+describe('the filter headings sit on the list headings cap band', () => {
+  it('wraps each heading word in the drawer section label, which carries the trim', () => {
+    // Untrimmed caps ride above their line box's middle, so "STATUS" stood a
+    // hair higher than "PINNED" in the list the panel covers.
+    for (const title of ['Status', 'By thread types']) {
+      expect(panelTsx).toContain(`<span class="drawer-section-label">${title}</span>`);
+    }
+  });
+});
+
 describe('the Repos / Apps heading stands on the rows it spans', () => {
   it('takes the child rows own indent step, not the panel edge', () => {
     const child = decl(block(drawerCss, '.thread-filter-option-child {'), 'padding-left');

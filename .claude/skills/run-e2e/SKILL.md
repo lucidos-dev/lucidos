@@ -51,7 +51,8 @@ your turn: the engine re-opens the thread when the suite finishes, with its
 exit status and the tail of its output.
 
 ```
-lucidos background-task run -- 'mkdir -p .lucidos && ./scripts/e2e.sh > .lucidos/e2e.log 2>&1'
+lucidos background-task run --description "the full e2e suite" \
+  -- 'mkdir -p .lucidos && ./scripts/e2e.sh > .lucidos/e2e.log 2>&1'
 ```
 
 Redirect into the worktree's own gitignored `.lucidos/` rather than a shared
@@ -64,7 +65,8 @@ comes back as exit 0. The exit-file join belongs to `/harden`'s in-turn run
 only. To keep a copy in a file anyway, pass the status on:
 
 ```
-lucidos background-task run -- './scripts/e2e.sh > .lucidos/e2e.log 2>&1; rc=$?; echo $rc > .lucidos/e2e.exit; exit $rc'
+lucidos background-task run --description "the full e2e suite" \
+  -- './scripts/e2e.sh > .lucidos/e2e.log 2>&1; rc=$?; echo $rc > .lucidos/e2e.exit; exit $rc'
 ```
 
 Read the log like this:

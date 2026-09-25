@@ -779,6 +779,18 @@ Use this pattern for all prompts.`;
     it('handles empty input', () => {
       expect(renderMarkdownInline('')).toBe('');
     });
+
+    // The link renderer sees only markdown links. Raw HTML in an agent's
+    // option preview put a live control inside the option <button>. A tap
+    // meant to answer could then navigate the app away.
+    it('unwraps raw interactive HTML, keeping its text', () => {
+      const html = renderMarkdownInline(
+        'a <a href="https://example.com">link</a>, a <button>button</button>, <input value="x"> end',
+      );
+      expect(html).toContain('a link, a button,');
+      expect(html).toContain('end');
+      expect(html).not.toMatch(/<(a|button|input)\b/);
+    });
   });
 
   describe('renderMarkdownInlineWithLinks (phrasing content + live links)', () => {
@@ -1119,14 +1131,16 @@ describe('renderMarkdown images', () => {
     );
   });
 
-  it('rewrites an inline-variant image but does NOT wrap it', () => {
-    // The wrapper is a block scroll container, and both inline helpers must stay
-    // phrasing content that nests inside a <button> or a <span>. An image in a
-    // question or an option label is small by nature, so there is nothing to pan.
+  it('rewrites AND wraps an inline-variant image, like a reply image', () => {
+    // A question card showed an agent's mockups shrunk to the card's width,
+    // with no sideways scroll and no tap to open them. The wrapper is a
+    // `<span>`, so the output stays phrasing content a <button> may hold.
     for (const render of [renderMarkdownInline, renderMarkdownInlineWithLinks]) {
       const html = render('see ![alt](artifacts/x.png) here');
       expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
-      expect(html).not.toContain('image-scroll-wrapper');
+      expect(html).toContain(
+        '<span class="image-scroll-wrapper"><img src="/myws/data/artifacts/x.png" alt="alt"></span>',
+      );
     }
   });
 

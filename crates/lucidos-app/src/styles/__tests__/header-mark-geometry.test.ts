@@ -12,7 +12,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { block, decl, cssRules, rulesTargeting } from './css-rule-helpers';
+import { REDUCED_MOTION_ROOT, block, decl, cssRules, isReducedMotionRule, rulesTargeting } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -273,10 +273,10 @@ describe('the mark says its connection in strength alone', () => {
       '.brand-mark[data-conn="connecting"] .brand-mark-glyph',
     ]);
 
-    const cancels = markRules.filter(r =>
-      r.atRules.includes('prefers-reduced-motion') && r.props.get('animation') === 'none');
+    const cancels = cssRules(markCss).filter(r =>
+      isReducedMotionRule(r) && r.props.get('animation') === 'none');
     expect(
-      cancels.map(r => r.selector),
+      cancels.map(r => r.selector.slice(`${REDUCED_MOTION_ROOT} `.length)),
       'the reduce override must repeat the animated selector, or it loses on specificity',
     ).toEqual(animated.map(r => r.selector));
 

@@ -57,7 +57,7 @@ describe('content pane navigation cover', () => {
   });
 
   it('unmounts the cover on a fuse, never on the animation alone', () => {
-    // `prefers-reduced-motion: reduce` drops the animation, so an
+    // reduced motion drops the animation, so an
     // `animationend`-driven unmount would never fire and the pane would stay
     // covered forever.
     expect(src).toMatch(
@@ -120,7 +120,7 @@ describe('content pane navigation cover', () => {
     // animation without dropping the opacity would park an opaque panel over
     // the view for exactly as long as the animation would have run.
     const rule = css.match(
-      /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.content-nav-cover\s*\{[^}]*\}/,
+      /:root\[data-motion="reduce"\] \.content-nav-cover\s*\{[^}]*\}/,
     )?.[0] ?? '';
     expect(rule).toMatch(/animation:\s*none/);
     expect(rule).toMatch(/opacity:\s*0/);

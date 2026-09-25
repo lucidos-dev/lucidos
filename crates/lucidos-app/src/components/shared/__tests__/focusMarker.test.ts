@@ -9,6 +9,7 @@ import {
   NAV_FOCUS_HOLD_MS,
   NAV_FOCUS_RAMP_MS,
 } from '../focusMarker';
+import { osReducesMotion } from '../../../utils/motion';
 
 /** A fake element with a tracked classList — enough for the marker's class
  *  add/remove. */
@@ -393,9 +394,7 @@ describe('focusMarker', () => {
   // and there is nothing to wait out. Waiting the ramp anyway would overshoot the
   // promised hold; not waiting it in normal motion would undershoot.
   it('under reduced motion the hold starts immediately, since there is no ramp', () => {
-    const matchMedia = vi
-      .spyOn(window, 'matchMedia')
-      .mockImplementation(((q: string) => ({ matches: q.includes('reduce') })) as never);
+    osReducesMotion.value = true;
     try {
       const el = makeEl();
       applyNavFocus(el);
@@ -411,7 +410,7 @@ describe('focusMarker', () => {
       expect(el.classList._classes.has(STUCK)).toBe(false);
       expect(el.classList._classes.has(FADING)).toBe(false);
     } finally {
-      matchMedia.mockRestore();
+      osReducesMotion.value = false;
     }
   });
 

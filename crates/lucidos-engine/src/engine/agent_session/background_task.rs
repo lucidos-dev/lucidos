@@ -61,7 +61,8 @@ fn ends_the_threads_work(event: &crate::engine::thread_events::ThreadEvent) -> b
 
 impl LucidosEngine {
     /// Start `command` as a background task in this thread's worktree, and arm
-    /// the wait that re-opens the thread when it finishes.
+    /// the wait that re-opens the thread when it finishes. The wait names the
+    /// task by `description`, or by its command when there is none.
     ///
     /// `timeout_secs` defaults to the ceiling rather than to the chat tool's
     /// ten minutes. A coding agent reaches for this exactly when the work is
@@ -70,6 +71,7 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
         command: &str,
+        description: Option<&str>,
         timeout_secs: Option<u64>,
     ) -> Result<BackgroundTaskStart, String> {
         let command = command.trim();
@@ -103,7 +105,14 @@ impl LucidosEngine {
 
         let env_vars = self.build_agent_task_env_vars(thread_id).await;
         let (task_id, _started_at) = self
-            .start_background_task(thread_id, command, timeout_secs, &cwd, &env_vars)
+            .start_background_task(
+                thread_id,
+                command,
+                description,
+                timeout_secs,
+                &cwd,
+                &env_vars,
+            )
             .await?;
 
         let covered = self.arm_wait_for_running_background_tasks(thread_id).await;

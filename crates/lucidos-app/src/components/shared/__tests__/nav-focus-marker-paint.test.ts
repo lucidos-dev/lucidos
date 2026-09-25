@@ -269,23 +269,22 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
   });
 
   it('drops both the turn-on and the dissolve under reduced motion', () => {
-    const query = css.match(/@media \(prefers-reduced-motion: reduce\) \{([\s\S]*?)\n\}/)?.[1] ?? '';
-    expect(query).toMatch(/\.nav-focus-stuck\s*\{[^}]*animation:\s*none/);
-    // The fading arm needs its OWN rule here. It is a two-class selector, so it
-    // outranks the bare `.nav-focus-stuck` one above and would keep animating.
-    expect(query).toMatch(/\.nav-focus-stuck\.nav-focus-fading\s*\{[^}]*animation:\s*none/);
+    const R = String.raw`:root\[data-motion="reduce"\]\s+`;
+    expect(css).toMatch(new RegExp(`${R}\\.nav-focus-stuck\\s*\\{[^}]*animation:\\s*none`));
+    // The fading arm needs its OWN rule. It is a two-class selector, so a bare
+    // `.nav-focus-stuck` override could lose to it and leave it animating.
+    expect(css).toMatch(
+      new RegExp(`${R}\\.nav-focus-stuck\\.nav-focus-fading\\s*\\{[^}]*animation:\\s*none`),
+    );
+    // Keyed on the resolved attribute alone, so the in-app Motion setting reaches
+    // it in both directions.
+    expect(css).not.toMatch(/prefers-reduced-motion/);
+  });
 
-    // Both overrides TIE on specificity with the rules they override (0-1-0 against
-    // 0-1-0, 0-2-0 against 0-2-0), so the only thing that makes them win is coming
-    // later in the file. Existence alone is not the contract: hoist this block above
-    // the base rules and reduced motion silently breaks while the assertions above
-    // stay green.
-    const mediaAt = css.indexOf('@media (prefers-reduced-motion');
-    expect(mediaAt).toBeGreaterThan(-1);
-    expect(mediaAt).toBeGreaterThan(css.search(/^\.nav-focus-stuck\s*\{/m));
-    expect(mediaAt).toBeGreaterThan(css.search(/^\.nav-focus-stuck\.nav-focus-fading\s*\{/m));
-    // And exactly one such block, or the one this test read may not be the one that
-    // wins.
-    expect(css.match(/@media \(prefers-reduced-motion/g)?.length).toBe(1);
+  it('rides the Animation speed slider on both the turn-on and the dissolve', () => {
+    expect(declaration(block('.nav-focus-stuck'), 'animation'))
+      .toMatch(/calc\(0\.45s \* var\(--duration-scale\)\)/);
+    expect(declaration(block('.nav-focus-stuck.nav-focus-fading'), 'animation'))
+      .toMatch(/calc\(0\.8s \* var\(--duration-scale\)\)/);
   });
 });

@@ -930,7 +930,9 @@ describe('shadowedEngine', () => {
     expect(shadowedEngine()).toEqual({ engine: '0.26.2', client: '0.36.0' });
 
     // A NEWER engine is the client being stale, which the client updater owns.
-    storeSignals.lucidosRelease.value = '0.40.0';
+    // Kept far above any real release so the version-sources check never
+    // mistakes it for a hardcoded current version.
+    storeSignals.lucidosRelease.value = '99.0.0';
     expect(shadowedEngine()).toBeNull();
 
     storeSignals.lucidosRelease.value = '0.36.0';

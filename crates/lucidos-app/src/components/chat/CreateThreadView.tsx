@@ -13,12 +13,12 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, followIsCarrying } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
-import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
+import type { Exchange, StoredEvent } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceWebKitRepaint } from '../../utils/webkitRepaint';
 import { opensSoftwareKeyboard } from '../../utils/dom';
@@ -102,8 +102,8 @@ export function formatDeliveredPayload(payload: unknown): string | undefined {
 const NO_DELIVERED_EVENT_INFO = new Map<string, DeliveredEventInfo>();
 
 /** The `EventWaitDelivered` id this exchange is the delivery for, if it is one
- *  at all. Exported shape of the "is this a delivery" test, so the cheap
- *  has-any check and the per-exchange lookup can't drift apart. */
+ *  at all. The one "is this a delivery" test, so the cheap has-any check and
+ *  the per-exchange lookup can't drift apart. */
 function deliveryEventId(ex: Exchange): string | undefined {
   const ev = ex.userEvent;
   return ev.type === 'UserPromptInjected' ? ev.delivered_event_id : undefined;
@@ -168,6 +168,7 @@ export function renderExchanges(
   const queuedOrder = queuedRun.queuedOrder.filter(i => !removedQueuedIndices.has(i));
   const queuedIndices = new Set<number>(queuedOrder);
   const queuedCount = queuedOrder.length;
+  const markers = readMarkers(exchanges, threadIsCC);
   const nodes: VNode[] = [];
   let lastModel: string | undefined;
   let lastEffort: string | undefined;
@@ -181,15 +182,34 @@ export function renderExchanges(
   const hasEventDelivery = exchanges.some(ex => deliveryEventId(ex) !== undefined);
   const deliveredEventInfo = hasEventDelivery ? buildDeliveredEventInfo(exchanges) : NO_DELIVERED_EVENT_INFO;
 
-  const renderOne = (ex: Exchange, i: number): VNode => {
+  // For non-queued exchanges only. `queuedRun` drives the queued display, so a
+  // persisted follow-up never leans on exchangeStatus' single-last queued arm.
+  const priorActiveAt = (i: number): boolean =>
+    i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle, threadAwaitingAnswer));
+
+  // **A card that reads "Needs your answer" draws last**, above only the
+  // queued group (ADR 0284). Its props still come from its fold index, so no
+  // status moves with it. Two tests keep a stale card from pinning: a thread
+  // that settled with no park owes no answer, and a card the agent worked past
+  // was left behind.
+  const pinnedOrder: number[] = [];
+  if (threadAwaitingAnswer || !threadIdle) {
+    exchanges.forEach((ex, i) => {
+      if (queuedRun.queuedIndices.has(i) || !opensAwaitingAnswer(ex)) return;
+      const isLast = i === activeIdx;
+      const status = getExchangeStatus(ex, isLast ? streamingBuffer : '', isLast, priorActiveAt(i), threadIsCC, threadIdle, threadAwaitingAnswer);
+      // The tail scan last: only a card still awaiting an answer pays for it.
+      if (status === 'awaiting-answer' && !agentWorkedSince(exchanges, i)) pinnedOrder.push(i);
+    });
+  }
+  const pinnedIndices = new Set(pinnedOrder);
+
+  const renderOne = (ex: Exchange, i: number, pausedBy?: StoredEvent): VNode => {
     // The active exchange plays the 'last' role (gets the stream, reads
     // 'streaming'/'working'); queued follow-ups after it are explicitly flagged.
     const isLast = i === activeIdx;
     const isQueued = queuedIndices.has(i);
-    // Keep the legacy status fallback for non-queued exchanges; queued display
-    // is driven by queuedRun so persisted follow-ups don't depend on
-    // exchangeStatus' single-last queued branch.
-    const priorActive = i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle, threadAwaitingAnswer));
+    const priorActive = priorActiveAt(i);
     // Seed the change-lifecycle card's body from the in-thread ChangeProposed
     // so it paints at final height on first open (see buildProposedChangeInfo).
     const seedChangeId = isChangeLifecycleEvent(ex.userEvent)
@@ -215,6 +235,7 @@ export function renderExchanges(
         streamingBuffer={isLast ? streamingBuffer : ''}
         isLast={isLast}
         isQueued={isQueued}
+        readMarker={markers?.get(i)}
         threadId={threadId}
         hasPriorActive={priorActive}
         priorModel={lastModel}
@@ -225,12 +246,13 @@ export function renderExchanges(
         threadIdle={threadIdle}
         threadAwaitingAnswer={threadAwaitingAnswer}
         threadCanceling={threadCanceling}
-        rowsHidden={i === renderFromIndex ? floorRowsHidden : 0}
+        rowsHidden={i === renderFromIndex && !pinnedIndices.has(i) ? floorRowsHidden : 0}
         proposedChangeDesc={proposedSeed?.description}
         proposedChangeFileCount={proposedSeed?.fileCount}
         matchedEventType={matchedEvent?.eventType}
         matchedEventId={matchedEvent?.eventId}
         matchedPayloadJson={matchedEvent?.payloadJson}
+        pausedBy={pausedBy}
       />
     );
   };
@@ -275,7 +297,6 @@ export function renderExchanges(
       >
         <summary class="queued-message-group-summary">
           <span class="queued-message-group-label">{`Queued (${queuedCount})`}</span>
-          <span class="exchange-status-queued">{'○'}</span>
         </summary>
         <div class="queued-message-group-body">
           {queuedNodes}
@@ -304,6 +325,11 @@ export function renderExchanges(
   // back down the moment a turn ended, unmounting turns the reader had already
   // been shown. Reaching an out-of-view live turn means moving the STORED edge,
   // which is that module's own mechanism.
+  //
+  // A pinned card is rendered at its fold index, so it reads the prior model
+  // it would there, and is emitted at the anchor. Like the queue, it is not
+  // windowed: it is what the reader has to act on.
+  const pinnedNodes: VNode[] = [];
   for (let i = 0; i < exchanges.length;) {
     if (queuedRun.queuedIndices.has(i)) {
       i++;
@@ -311,10 +337,18 @@ export function renderExchanges(
     }
 
     const ex = exchanges[i];
-    if (i >= renderFromIndex) nodes.push(renderOne(ex, i));
+    // See `restartPauseFoldsInto`. The index-based decisions above still see
+    // the pause, so only its panel goes.
+    const folds = restartPauseFoldsInto(ex, exchanges[i + 1]);
+    const pausedBy = i > 0 && restartPauseFoldsInto(exchanges[i - 1], ex)
+      ? exchanges[i - 1].userEvent
+      : undefined;
+    if (pinnedIndices.has(i)) pinnedNodes.push(renderOne(ex, i, pausedBy));
+    else if (i >= renderFromIndex && !folds) nodes.push(renderOne(ex, i, pausedBy));
     advance(ex);
 
     if (i === queuedAnchor) {
+      nodes.push(...pinnedNodes);
       renderQueued();
     }
 
@@ -439,19 +473,6 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     restored = true;
     observer.disconnect();
 
-    // THE RIDE IS THE ONE THING THAT OUTRANKS THE PRESS. It is already carrying
-    // the reader to the live edge, so any hold would be undone by the next
-    // growth round: one press, two motions. Correcting them and then letting
-    // `honourAnchoredMutation` bring them back down moves the transcript UP and
-    // then DOWN for one tap. The freeze has kept the container at
-    // `scrollBefore`, so skipping the correction leaves the live-edge write as
-    // the ONE motion.
-    //
-    // ONE predicate, and `honourAnchoredMutation` reads the same one: this and
-    // it are ONE decision split across the DOM/layout line, so they cannot
-    // disagree. An armed reader on a QUIET thread is carried by nobody, and
-    // gets the correction from every park, the live edge included (ADR 0147).
-    const rideIsCarrying = followIsCarrying();
     // Did the anchor survive the mutation? A detached element does not say so by
     // measuring nothing: it answers an all-zero rect, which reads as content
     // that moved to the top of the thread and would send the reader there.
@@ -479,13 +500,12 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // extensible call inside the freeze. The throw still propagates, since a
     // subscriber failing silently is its own bug (`frontend.md`).
     //
-    // A CARRIED reader gets no write at all here: the snap below is their one
-    // motion. Everyone else gets the mark, whether or not it moves them. The
-    // mark is what stands the growth round's own edge write down
-    // (`keepTheLiveEdge`) and what re-bases the mobile header. Declining to
-    // correct is still the app deciding the reader stays put.
+    // Every press gets the mark, whether or not it moves the reader. The mark is
+    // what stands the growth round's own edge write down (`keepTheLiveEdge`)
+    // and what re-bases the mobile header. Declining to correct is still the app
+    // deciding the reader stays put.
     try {
-      if (!rideIsCarrying) markAnchorScroll(container, wanted);
+      markAnchorScroll(container, wanted);
     } finally {
       container.style.overflow = overflowBefore;
     }
@@ -495,25 +515,21 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // black until a scroll forces a repaint, so trigger it proactively.
     forceWebKitRepaint(container);
 
-    // Tell the transcript that THIS correction was ours, so it cannot read as
-    // the reader scrolling away and retire their standing follow. Only a scroll
-    // may do that (ADR 0064). It also lands a CARRIED reader back on the newest
-    // content. Placed after the unfreeze and the repaint nudge, so any write it
-    // makes fights neither. Still inside this frame, so the reader never sees
-    // the position the mutation left them at.
+    // Tell the transcript that THIS correction was ours, so its scroll event
+    // cannot cancel a pending landing. And retire a standing follow the hold
+    // left off the live edge: the press moved the reader there, so the toggle
+    // must not stay lit (ADR 0064).
     honourAnchoredMutation(container);
 
     // iOS may adjust after unfreeze, so re-check on the frames that follow.
     // Skipped while the app is driving this container's scroll: a tween may be
     // in flight, and re-asserting a pre-tween offset against it is a frame of
-    // jitter for a correction the tween makes moot. Skipped for a carried
-    // reader, for the stronger version of the same reason: there was no
-    // correction to re-assert, and asserting one would drag them off the edge.
+    // jitter for a correction the tween makes moot.
     //
     // NOT skipped for a correction that asked for no movement, which it used to
     // be. That is the press whose turn is the last one, and a mid-mutation
     // clamp moves the reader there as readily as anywhere else.
-    if (!rideIsCarrying && anchored) {
+    if (anchored) {
       let framesLeft = ANCHOR_SETTLE_FRAMES;
       // Where the correction left the container, re-read after each write so a
       // clamp counts as ours. It is the whole reader-took-over test below.

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::core::changes::{Change, RestartGroup};
+use crate::core::changes::{Change, ChangeStatus, RestartGroup};
 
 /// Column projection used by every `query_as::<_, Change>` call. The table has
 /// no `thread_title` column — it's enriched per-response from `thread_summaries`
@@ -124,7 +124,7 @@ impl ChangesProjection {
         sqlx::query(
             "INSERT INTO changes (id, request_id, thread_id, branch_name, repo_root, \
              description, file_count, files, requires_restart, status, created_at, hardened, incomplete) \
-             VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9, 'pending', NOW(), $10, $11) \
+             VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9, $12, NOW(), $10, $11) \
              ON CONFLICT (id) DO UPDATE SET \
                 description = COALESCE($6, changes.description), \
                 files = EXCLUDED.files, \
@@ -144,6 +144,7 @@ impl ChangesProjection {
         .bind(requires_restart)
         .bind(hardened)
         .bind(incomplete)
+        .bind(ChangeStatus::Pending)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -186,7 +187,7 @@ impl ChangesProjection {
             return Ok(());
         };
         let res = sqlx::query(
-            "UPDATE changes SET status = 'applied', resolved_at = NOW(), \
+            "UPDATE changes SET status = $6, resolved_at = NOW(), \
              requires_restart = $2, \
              commits = CASE WHEN cardinality($3::text[]) > 0 THEN $3 ELSE commits END, \
              pre_merge_sha = COALESCE($4, pre_merge_sha), \
@@ -198,6 +199,7 @@ impl ChangesProjection {
         .bind(commits)
         .bind(pre_merge_sha)
         .bind(post_merge_sha)
+        .bind(ChangeStatus::Applied)
         .execute(&mut **tx)
         .await?;
         if res.rows_affected() == 0 {
@@ -230,12 +232,12 @@ impl ChangesProjection {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(ChangeApplyDedup::Proceed);
         };
-        let status: Option<String> =
+        let status: Option<ChangeStatus> =
             sqlx::query_scalar("SELECT status FROM changes WHERE id = $1 FOR UPDATE")
                 .bind(id)
                 .fetch_optional(&mut **tx)
                 .await?;
-        Ok(if status.as_deref() == Some("applied") {
+        Ok(if status == Some(ChangeStatus::Applied) {
             ChangeApplyDedup::Suppress
         } else {
             ChangeApplyDedup::Proceed
@@ -245,7 +247,7 @@ impl ChangesProjection {
     pub(crate) async fn write_status(
         tx: &mut Transaction<'_, Postgres>,
         change_id: &str,
-        status: &str,
+        status: ChangeStatus,
     ) -> sqlx::Result<()> {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
@@ -319,7 +321,7 @@ impl ChangesProjection {
     // distinguishable from "no rows". Degradation lives at the call site,
     // not in the projection.
 
-    /// All pending changes (status = "pending"), ordered by created_at ASC.
+    /// All pending changes, ordered by created_at ASC.
     pub async fn list_pending(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
             "{SELECT_CHANGE} WHERE status = 'pending' ORDER BY created_at ASC"
@@ -404,7 +406,7 @@ impl ChangesProjection {
                 continue;
             };
             if let Some(change) = self.get_by_id(change_id).await? {
-                if change.status == "pending" {
+                if change.is_pending() {
                     return Ok(Some(change));
                 }
             }
@@ -430,17 +432,7 @@ impl ChangesProjection {
         Ok(self
             .get_by_id(change_id)
             .await?
-            .is_some_and(|c| c.status == "pending"))
-    }
-
-    /// Whether any pending change exists for the given branch.
-    pub async fn has_pending_for_branch(&self, branch_name: &str) -> sqlx::Result<bool> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM changes WHERE status = 'pending' AND branch_name = $1)",
-        )
-        .bind(branch_name)
-        .fetch_one(&self.pool)
-        .await
+            .is_some_and(|c| c.is_pending()))
     }
 
     /// Whether any OTHER pending change exists for the given branch (excluding `exclude_id`).
@@ -737,9 +729,9 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     let (status, resolved_at, commits, pre_sha, post_sha) = match terminal {
         Some(t) => {
             let status = match t.0.as_str() {
-                "ChangeApplied" => "applied",
-                "ChangeDiscarded" => "discarded",
-                "ChangeReverted" => "reverted",
+                "ChangeApplied" => ChangeStatus::Applied,
+                "ChangeDiscarded" => ChangeStatus::Discarded,
+                "ChangeReverted" => ChangeStatus::Reverted,
                 _ => unreachable!(),
             };
             if t.0 == "ChangeApplied" {
@@ -756,7 +748,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
                     .map(String::from);
             (status, Some(t.3), commits, pre, post)
         }
-        None => ("pending", None, Vec::new(), None, None),
+        None => (ChangeStatus::Pending, None, Vec::new(), None, None),
     };
 
     let res = sqlx::query(

@@ -1,7 +1,7 @@
 //! `LucidosEngine` event emit helpers for the changes lifecycle. Each
 //! method wraps `event_bus.emit_or_log` for one ChangeProposed-related
 //! `ThreadEvent` (or the `ChangesUpdated` system event), so the call sites
-//! in `change_ops.rs` stay free of the boilerplate.
+//! in `change_ops/` stay free of the boilerplate.
 
 use std::collections::BTreeSet;
 
@@ -44,15 +44,22 @@ async fn changes_updated_payload(
     proj: &crate::core::changes_projection::ChangesProjection,
 ) -> Option<SystemEvent> {
     let (pending_r, applied_r, restart_r) = tokio::join!(
-        proj.list_pending(),
+        crate::core::changes::list_pending_for_readers(
+            pool,
+            proj,
+            crate::core::changes::PendingScope::All,
+        ),
         proj.list_recently_applied(APPLIED_IN_BROADCAST, None),
         proj.requires_restart_since(RESTART_REQUIRED_WINDOW),
     );
-    let (mut pending, mut applied, restart_required) = match (pending_r, applied_r, restart_r) {
+    let (pending, mut applied, restart_required) = match (pending_r, applied_r, restart_r) {
         (Ok(p), Ok(a), Ok(r)) => (p, a, r),
         (perr, aerr, rerr) => {
             if let Err(e) = perr {
-                log!("[Changes] changes_updated_payload: list_pending: {}", e);
+                log!(
+                    "[Changes] changes_updated_payload: list_pending_for_readers: {}",
+                    e
+                );
             }
             if let Err(e) = aerr {
                 log!(
@@ -70,20 +77,8 @@ async fn changes_updated_payload(
             return None;
         }
     };
-    let (r1, r2) = tokio::join!(
-        crate::core::changes::enrich_thread_titles(pool, &mut pending),
-        crate::core::changes::enrich_thread_titles(pool, &mut applied),
-    );
-    if let Err(e) = r1 {
-        log!("[Changes] enrich pending titles: {}", e);
-    }
-    if let Err(e) = r2 {
+    if let Err(e) = crate::core::changes::enrich_thread_titles(pool, &mut applied).await {
         log!("[Changes] enrich applied titles: {}", e);
-    }
-    // The gate the UI disables Apply on, and the one the bulk paths filter by.
-    // A frame without it re-offers Apply on a thread that is still working.
-    if let Err(e) = crate::core::changes::enrich_pending_state(pool, &mut pending).await {
-        log!("[Changes] enrich pending state: {}", e);
     }
     Some(SystemEvent::ChangesUpdated {
         total_pending: pending.len(),
@@ -809,7 +804,7 @@ mod tests {
             SystemEvent::ChangesUpdated { pending, .. } => {
                 assert_eq!(pending.len(), 1, "one pending change, got {:?}", pending);
                 assert!(
-                    pending[0].thread_unsettled,
+                    pending[0].thread_state().unwrap().unsettled(),
                     "the frame must report the thread as unsettled"
                 );
             }

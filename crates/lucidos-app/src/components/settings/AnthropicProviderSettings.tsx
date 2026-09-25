@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
 import { credentials } from '../../store/store';
+import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { Dropdown } from '../shared/Dropdown';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import type { AuthType } from '../../store/types';
@@ -28,7 +29,9 @@ export function AnthropicProviderSettings() {
   const credLoadable = credentials.value;
   const existing = findProviderCredential(credLoadable, ANTHROPIC_SERVICE);
 
-  const [authKind, setAuthKind] = useState<string>('api_key');
+  // Server-backed, so "Replace secret" starts on the stored credential's kind
+  // and a replaced OAuth token is saved as an OAuth token.
+  const [authKind, setAuthKind] = useServerBackedField<string>(existing?.auth_type ?? 'api_key');
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
 

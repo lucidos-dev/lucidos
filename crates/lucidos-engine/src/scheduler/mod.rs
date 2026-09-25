@@ -232,7 +232,7 @@ impl SchedulerManager {
         self.migrate_db_triggers_to_events().await?;
 
         // Replay trigger lifecycle events to rebuild in-memory state
-        self.replay_triggers_from_events().await;
+        self.replay_triggers_from_events().await?;
 
         // Name any replayed schedule that can never fire. Create and update
         // reject those now, so these are triggers stored before the guard
@@ -525,18 +525,17 @@ impl SchedulerManager {
             count
         );
 
-        // Drop the legacy table
-        if let Err(e) = sqlx::query("DROP TABLE IF EXISTS trigger_crons")
-            .execute(&self.pool)
-            .await
-        {
-            log!("[Scheduler] Failed to drop trigger_crons table: {}", e);
-        }
+        drop_legacy_trigger_crons(&self.pool).await;
         Ok(())
     }
 
     /// Replay trigger lifecycle events from the events table to rebuild in-memory state.
-    async fn replay_triggers_from_events(&self) {
+    ///
+    /// A failed read aborts startup. Read as empty, it would run the session
+    /// with no triggers and prune every `trigger.toml` in the rebuild after it.
+    async fn replay_triggers_from_events(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
             "SELECT event_type, payload, created FROM events
              WHERE aggregate = 'trigger'
@@ -544,10 +543,7 @@ impl SchedulerManager {
         )
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_else(|e| {
-            log!("[Scheduler] Failed to replay trigger events: {}", e);
-            vec![]
-        });
+        .map_err(|e| format!("Failed to replay trigger events: {e}"))?;
 
         let event_rows: Vec<TriggerEventRow> = rows
             .into_iter()
@@ -576,10 +572,15 @@ impl SchedulerManager {
                 active
             );
         }
+        Ok(())
     }
 
     /// Replay trigger-group lifecycle events from the events table to rebuild
-    /// the in-memory registry. Symmetric with `replay_triggers_from_events`.
+    /// the in-memory registry.
+    ///
+    /// Unlike `replay_triggers_from_events`, a failed read degrades to no
+    /// groups: they schedule nothing and prune nothing, so the panel shows
+    /// flat sections and startup goes on.
     async fn replay_trigger_groups_from_events(&self) {
         let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
             "SELECT event_type, payload, created FROM events
@@ -753,34 +754,18 @@ impl SchedulerManager {
         let task_id = trigger_id_to_uuid(&config.id);
 
         // Check if already tracked
-        {
-            let tracked = self.tracked_tasks.read().await;
-            if tracked.contains_key(&task_id) {
-                return Ok(());
-            }
+        if self.tracked_tasks.read().await.contains_key(&task_id) {
+            return Ok(());
         }
 
-        let (handle, cancel_token) = spawn_task_runner(
-            config.id.clone(),
-            config.name.clone(),
-            config.schedule.clone(),
-            config.timezone.clone(),
-            self.engine.clone(),
-            self.shutdown_flag.clone(),
-            self.trigger_configs.clone(),
-        );
-
-        {
-            let mut tracked = self.tracked_tasks.write().await;
-            tracked.insert(
-                task_id,
-                TrackedTask {
-                    handle,
-                    task_name: config.name.clone(),
-                    cancel_token,
-                },
-            );
-        }
+        register_and_track(
+            config,
+            &self.tracked_tasks,
+            &self.engine,
+            &self.shutdown_flag,
+            &self.trigger_configs,
+        )
+        .await;
 
         log!(
             "[Scheduler] Registered trigger: {} ({} in {})",
@@ -1289,7 +1274,7 @@ pub(crate) async fn reload_backup_schedule(
 
 mod task_runner;
 use task_runner::{
-    check_task_health_and_restart, handle_domain_event, handle_trigger_event, spawn_task_runner,
+    check_task_health_and_restart, handle_domain_event, handle_trigger_event, register_and_track,
     TrackedTask,
 };
 

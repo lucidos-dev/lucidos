@@ -580,7 +580,7 @@ async fn ensure_embedded(
     database: &str,
     legacy_url: Option<&str>,
 ) -> Result<Provisioned, ProvisionError> {
-    let data = app_data.join("pgdata");
+    let data = embedded_data_dir(app_data);
     let port = ensure_embedded_cluster(bin, lib, &data).await?;
     let url = embedded_database_url(port, database);
 
@@ -621,7 +621,7 @@ async fn teardown_embedded_workspace(
     app_data: &Path,
     database: &str,
 ) -> Result<(), BoxError> {
-    let data = app_data.join("pgdata");
+    let data = embedded_data_dir(app_data);
     if !data.join("PG_VERSION").exists() {
         return Ok(());
     }
@@ -867,8 +867,13 @@ fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
     }
 }
 
+/// The embedded cluster's data directory, shared by every workspace.
+pub(crate) fn embedded_data_dir(app_data: &Path) -> PathBuf {
+    app_data.join("pgdata")
+}
+
 /// First line of `postmaster.pid` — the postmaster PID.
-fn read_postmaster_pid(data: &Path) -> Option<i32> {
+pub(crate) fn read_postmaster_pid(data: &Path) -> Option<i32> {
     std::fs::read_to_string(data.join("postmaster.pid"))
         .ok()?
         .lines()

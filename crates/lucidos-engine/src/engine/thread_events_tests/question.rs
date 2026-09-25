@@ -11,11 +11,13 @@ fn user_question_asked_serialization() {
                 id: "o1".into(),
                 label: "First".into(),
                 description: Some("desc".into()),
+                preview: Some("![first](artifacts/first.png)".into()),
             },
             QuestionOption {
                 id: "o2".into(),
                 label: "Second".into(),
                 description: None,
+                preview: None,
             },
         ],
         worktree_path: Some("/tmp/cc-abc".into()),
@@ -34,7 +36,21 @@ fn user_question_asked_serialization() {
         v["options"][1].get("description").is_none(),
         "None description should be skipped"
     );
+    assert_eq!(v["options"][0]["preview"], "![first](artifacts/first.png)");
+    assert!(
+        v["options"][1].get("preview").is_none(),
+        "None preview should be skipped"
+    );
     assert_eq!(v["worktree_path"], "/tmp/cc-abc");
+}
+
+/// Events are immutable, so every card stored before `preview` existed must
+/// still decode.
+#[test]
+fn question_option_without_preview_still_decodes() {
+    let option: QuestionOption =
+        serde_json::from_value(serde_json::json!({ "id": "opt-0", "label": "A" })).unwrap();
+    assert_eq!(option.preview, None);
 }
 
 #[test]

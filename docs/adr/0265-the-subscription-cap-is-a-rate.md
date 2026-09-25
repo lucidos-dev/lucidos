@@ -1,6 +1,6 @@
 # 0265: The event-wait loop cap counts over a rolling hour, not since the last human message
 
-- **Status**: Accepted
+- **Status**: Accepted, with the Decision superseded by ADR 0280 (the window stays)
 - **Date**: 2026-09-24
 
 ## Context

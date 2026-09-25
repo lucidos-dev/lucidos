@@ -19,6 +19,7 @@
 
 use uuid::Uuid;
 
+use crate::core::changes::ChangeStatus;
 use crate::engine::apply_all_batches::{ApplyFailure, BatchProgress};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
@@ -36,7 +37,7 @@ pub(crate) const DISCARDED_MEMBER_REASON: &str =
     "Change was discarded or removed before the batch finished";
 
 /// How recovery should treat a batch member, derived from its `changes.status`.
-/// `Terminal` covers `discarded`, a missing row, and any unknown status — all
+/// `Terminal` covers a discarded or reverted member and a missing row. All
 /// must become a terminal `Failed` so the batch can complete; leaving such a
 /// member `Pending` would re-drive it into an `apply_change` `Noop` that never
 /// emits a terminal event, stalling the batch forever.
@@ -49,11 +50,11 @@ enum RecoveredMember {
 
 /// Pure mapping from a member's `changes.status` to its recovery classification.
 /// `None` = the change row is gone (treated as terminal).
-fn classify_recovered_member(status: Option<&str>) -> RecoveredMember {
+fn classify_recovered_member(status: Option<ChangeStatus>) -> RecoveredMember {
     match status {
-        Some("applied") => RecoveredMember::Applied,
-        Some("pending") => RecoveredMember::Pending,
-        _ => RecoveredMember::Terminal,
+        Some(ChangeStatus::Applied) => RecoveredMember::Applied,
+        Some(ChangeStatus::Pending) => RecoveredMember::Pending,
+        Some(ChangeStatus::Discarded | ChangeStatus::Reverted) | None => RecoveredMember::Terminal,
     }
 }
 
@@ -405,7 +406,7 @@ impl LucidosEngine {
             // Reconstruct per-member state from the authoritative changes.status.
             for &change_id in &change_ids {
                 let status = match self.changes().get_by_id(change_id).await {
-                    Ok(Some(c)) => Some(c.status),
+                    Ok(Some(c)) => Some(c.status()),
                     Ok(None) => None, // row gone → treat as terminal
                     Err(e) => {
                         log!(
@@ -414,10 +415,10 @@ impl LucidosEngine {
                             change_id,
                             e
                         );
-                        Some("pending".to_string())
+                        Some(ChangeStatus::Pending)
                     }
                 };
-                match classify_recovered_member(status.as_deref()) {
+                match classify_recovered_member(status) {
                     RecoveredMember::Applied => {
                         progress.record_applied(change_id);
                     }
@@ -634,23 +635,22 @@ mod tests {
     #[test]
     fn classify_member_status_mapping() {
         assert_eq!(
-            classify_recovered_member(Some("applied")),
+            classify_recovered_member(Some(ChangeStatus::Applied)),
             RecoveredMember::Applied
         );
         assert_eq!(
-            classify_recovered_member(Some("pending")),
+            classify_recovered_member(Some(ChangeStatus::Pending)),
             RecoveredMember::Pending
         );
         assert_eq!(
-            classify_recovered_member(Some("discarded")),
+            classify_recovered_member(Some(ChangeStatus::Discarded)),
             RecoveredMember::Terminal
         );
-        // Missing row (None) and any unexpected status are terminal.
-        assert_eq!(classify_recovered_member(None), RecoveredMember::Terminal);
         assert_eq!(
-            classify_recovered_member(Some("weird-future-status")),
+            classify_recovered_member(Some(ChangeStatus::Reverted)),
             RecoveredMember::Terminal
         );
+        assert_eq!(classify_recovered_member(None), RecoveredMember::Terminal);
     }
 
     /// Reconstructing a batch where every member resolved (applied or
@@ -662,7 +662,11 @@ mod tests {
         let mut progress = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
         // applied, applied, discarded → all terminal.
         for (i, &id) in ids.iter().enumerate() {
-            match classify_recovered_member(if i < 2 { Some("applied") } else { None }) {
+            match classify_recovered_member(if i < 2 {
+                Some(ChangeStatus::Applied)
+            } else {
+                None
+            }) {
                 RecoveredMember::Applied => {
                     progress.record_applied(id);
                 }

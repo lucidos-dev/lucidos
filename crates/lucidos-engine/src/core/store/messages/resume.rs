@@ -242,10 +242,6 @@ pub(crate) fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uui
 /// (chronological). Each pair emits an assistant `ToolUse` block followed by
 /// a user `ToolResult` block, matching the wire shape Anthropic and OpenAI
 /// providers expect.
-///
-/// Single-pass: events are walked once and partitioned once — the previous
-/// split between `build_resume_tool_blocks` and a separate
-/// `build_resume_tool_emitted_event_ids` did both twice per resume.
 pub(crate) fn build_resume_tool_blocks_with_skip_ids(
     events: &[EventRow],
     n: usize,

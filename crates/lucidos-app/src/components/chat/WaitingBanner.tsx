@@ -1,6 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds } from '../../store/store';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
+import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 import { ArchiveIcon, CheckIcon, DiffIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
@@ -21,7 +22,7 @@ type WaitingState =
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
   | { type: 'actions'; actions: TaggedAction[]; threadId: string; isArchiving: boolean; showDiff: boolean };
 
-/** Banner state passed to `getBannerSlots`. The 'canceling' variant is owned
+/** Banner state passed to `getBannerActions`. The 'canceling' variant is owned
  *  by PromptInput's morphable Send→Cancel button (so the swap can animate the
  *  same DOM node) and must never be passed here — narrow it out at the call
  *  site. */
@@ -93,9 +94,8 @@ export function getWaitingState(): WaitingState | null {
   // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
   // backend projection + recovery sweep, computed by the SAME algorithm the
   // Diff viewer renders). No diff → no button, so it can never drop the user
-  // into an empty diff. This matches `getStandaloneCcDiffButton`, which also
-  // hides when there's nothing to show.
-  const showDiff = thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff;
+  // into an empty diff. `getStandaloneActions` reads the same gate.
+  const showDiff = hasCcDiff(thread);
 
   return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff };
 }
@@ -176,7 +176,8 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
 }
 
 /** The members the row carries when the banner is SUPPRESSED because the thread
- *  is still working: the same Diff, and the standing apply.
+ *  has not settled (working, or watching an event): the same Diff, and the
+ *  standing apply.
  *
  *  Diff is decoupled from `waitingState` so the user-facing rule "branch has a
  *  diff, Diff visible" holds whatever the coding agent's run-state. The
@@ -187,9 +188,7 @@ export function getStandaloneActions(): HeaderActionSpec[] {
   if (!focused) return [];
   const members: HeaderActionSpec[] = [];
   const thread = threadMap.value.get(focused);
-  if (thread && thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff) {
-    members.push(diffAction(focused));
-  }
+  if (thread && hasCcDiff(thread)) members.push(diffAction(focused));
   const standing = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
   if (standing) {
     members.push({
@@ -205,6 +204,12 @@ export function getStandaloneActions(): HeaderActionSpec[] {
     });
   }
   return members;
+}
+
+/** The one Diff gate, shared by the banner and the standalone row so both
+ *  surfaces show and hide Diff together. */
+function hasCcDiff(thread: ThreadState): boolean {
+  return thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff;
 }
 
 function diffAction(threadId: string): HeaderActionSpec {
@@ -269,10 +274,10 @@ function closeSetAction(action: TaggedAction): HeaderActionSpec {
   };
 }
 
-/** Change-action split button: a one-tap primary face (Apply / Apply & Restart)
+/** Change-action split button: a one-tap primary face (Apply / Apply*)
  *  plus a caret menu holding the remaining close-set actions (Discard, Archive).
  *  Diff is NOT in here — it lives permanently outside this cluster as its own
- *  standalone button (getBannerSlots' liftable slot). Built on the generic
+ *  member of `getBannerActions`. Built on the generic
  *  `SplitButton` (the same control the prompt's multi-select answer Submit
  *  uses), so the caret / Overlay-dismiss / inert-primary contract lives in one
  *  place. Labels, tooltips, and handlers all come from the same TaggedActions
@@ -308,7 +313,7 @@ function ChangeActionSplitButton({
 }
 
 /** The Diff button. Rendered in two places: inside the banner via
- *  `getBannerSlots`, and as a standalone slot via `getStandaloneCcDiffButton`.
+ *  `getBannerActions`, and on the standalone row via `getStandaloneActions`.
  *  Both call sites only render it when the branch has a diff to show, so the
  *  button is always clickable, with no disabled form. Same key in both so Preact
  *  treats it as one node across banner and standalone transitions.
@@ -324,7 +329,7 @@ function ChangeActionSplitButton({
  *  is non-destructive and idempotent, so it takes the touch path.
  *
  *  A component rather than a function returning JSX, because it holds a hook and
- *  `getBannerSlots` is called conditionally from `PromptInput`'s render.
+ *  `getBannerActions` is called conditionally from `PromptInput`'s render.
  *
  *  It drops the keyboard itself, because nothing else will now: the shared
  *  `installActionBtnBlurListener` fires for an `.action-btn`, which this no
@@ -350,10 +355,6 @@ export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Reco
   );
 }
 
-function renderDiffButton(threadId: string): ComponentChildren {
-  return <DiffButton key="diff" threadId={threadId} />;
-}
-
 /** The change action a still-working thread offers: arm a *standing apply*, or
  *  cancel the one it carries (ADR 0168 clause 5).
  *
@@ -377,7 +378,7 @@ function renderDiffButton(threadId: string): ComponentChildren {
  *  keeps their keyboard, as the toggles beside it already leave it alone.
  *
  *  A component rather than a function returning JSX, because it reads signals
- *  and `getStandingApplyControl` is called from `PromptInput`'s render. */
+ *  and `getStandaloneActions` is called from `PromptInput`'s render. */
 export function StandingApplyButton({
   threadId,
   action,
@@ -409,7 +410,8 @@ export function StandingApplyButton({
 }
 
 /** The change action for the focused thread's own prompt row, when the banner
- *  is suppressed because the thread is still working.
+ *  is suppressed because the thread has not settled (working, or watching an
+ *  event).
  *
  *  That row used to lift the Diff button and nothing else, so a working
  *  coding-agent thread offered no way to arm an apply at all. Availability
@@ -421,20 +423,4 @@ export function getStandingApplyControl(): ComponentChildren | null {
   const action = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
   if (!action) return null;
   return <StandingApplyButton key="standing-apply" threadId={focused} action={action} />;
-}
-
-/** Diff button decoupled from waitingState: appears whenever the focused
- *  CC thread's branch has a diff, even mid-turn (when getWaitingState
- *  returns 'canceling' and the banner is suppressed). PromptInput uses this
- *  in the slots-fallback path so the user-facing rule "branch has a diff →
- *  Diff visible" holds regardless of CC's run-state. Same `codingAgentHasDiff`
- *  gate as the banner path, so both surfaces show/hide together. */
-export function getStandaloneCcDiffButton(): ComponentChildren | null {
-  const focused = focusedThreadId.value;
-  if (!focused) return null;
-  const thread = threadMap.value.get(focused);
-  if (!thread) return null;
-  if (thread.meta.channel !== 'claude_code') return null;
-  if (!thread.meta.codingAgentHasDiff) return null;
-  return renderDiffButton(focused);
 }

@@ -55,7 +55,7 @@ const ROOTS = [12, 16, 18, 20, 22, 24, 28, 32];
 
 /** The leading end of the row at a given root: where the toggle rests, plus its
  *  box. The web build rests it at the row's own padding, the packaged one at
- *  the lights reserve. Mirrors `--brand-lead-inset` and the `max()` in
+ *  the lights reserve. Mirrors `--header-lead-inset` and the `max()` in
  *  `computeMinThreadPaneWidth`. */
 function leadPx(remPx: number, packaged: boolean): number {
   const inset = packaged ? Math.max(LIGHTS_RESERVE_PX, PAD_REM * remPx) : PAD_REM * remPx;
@@ -179,14 +179,14 @@ describe('the TS mirror of the row still matches the CSS', () => {
   });
 
   it('the web build rests the toggle at the padding the floor falls back to', () => {
-    expect(desktopRoot?.props.get('--brand-lead-inset')).toBe(`${PAD_REM}rem`);
+    expect(desktopRoot?.props.get('--header-lead-inset')).toBe(`${PAD_REM}rem`);
   });
 
   it('the packaged build rests it at the reserve the floor is sized around', () => {
     const overlay = cssRules(shellCss).find(
       r => r.selector === ':root[data-titlebar-overlay]' && r.atRules === DESKTOP,
     );
-    expect(overlay?.props.get('--brand-lead-inset')).toBe('var(--titlebar-lights-reserve)');
+    expect(overlay?.props.get('--header-lead-inset')).toBe('var(--titlebar-lights-reserve)');
     // And the sum that reserve resolves to is the one this file restates.
     const reserve = desktopRoot!.props.get('--titlebar-lights-reserve')!;
     const x = Number(/var\(--titlebar-lights-x, (\d+)px\)/.exec(reserve)?.[1]);

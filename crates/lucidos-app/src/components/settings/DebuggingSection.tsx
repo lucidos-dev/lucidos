@@ -3,6 +3,7 @@ import { currentAutocorrect, currentCaptureContext, setAutocorrect, setCaptureCo
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { isIOS } from '../../utils/platform';
 import { animationSpeed, enginePackaged, preferences, speedMultiplier } from '../../store/store';
+import { reducedMotion } from '../../utils/motion';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { restartControlHome } from './restartControl';
@@ -24,9 +25,9 @@ import { LoadableToggle } from '../shared/LoadableToggle';
  *    directly.
  *  - "Animation speed" scales every UI transition via `speedMultiplier` (a
  *    device-global slider persisted in localStorage, see store.ts/effects.ts).
- *    It lives here as a diagnostic — slowing animations down makes transition
- *    glitches inspectable; reading `animationSpeed.value` in render subscribes
- *    to the signal so the multiplier label updates live as you drag.
+ *    It lives here as a diagnostic: slowing animations down makes transition
+ *    glitches inspectable. The user-facing control is Motion in Appearance,
+ *    and reduced motion wins over this, so the slider disables while it is on.
  *  - "Autocorrect" is the device-scoped `autocorrect` preference, on iOS only.
  *    It works around a UIKit bug rather than diagnosing one (ADR 0262). It
  *    starts on, like autocorrect in any other app, and a device that keeps
@@ -124,6 +125,10 @@ export function DebuggingSection() {
               animations down makes transition glitches easier to inspect.
             </p>
             <p>Per-device, persisted locally, takes effect immediately.</p>
+            <p>
+              While motion is reduced, by Motion in Settings → Appearance or by
+              this device's own setting, animations are off and this has no effect.
+            </p>
           </Explainer>
         </span>
         <div class="settings-row-options" style="gap: 0.5rem; align-items: center">
@@ -132,13 +137,17 @@ export function DebuggingSection() {
             min="-10"
             max="10"
             step="1"
+            disabled={reducedMotion.value}
+            aria-label="Animation speed"
             value={animationSpeed.value}
             onInput={(e) => {
               animationSpeed.value = parseInt((e.target as HTMLInputElement).value);
             }}
             style="width: 7rem"
           />
-          <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">{speedMultiplier.value.toFixed(1)}x</span>
+          <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">
+            {reducedMotion.value ? 'Off' : `${speedMultiplier.value.toFixed(1)}x`}
+          </span>
         </div>
       </div>
       {/* iPhone and iPad only: the bug it works around is in iOS's own

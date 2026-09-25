@@ -9,9 +9,9 @@ import {
   getGatewayStatus,
   reloadGateway,
   openWorkspace,
-  slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
 } from './control';
+import { slugifyWorkspaceName } from '../../utils/slug';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
 // The control plane lives under the reserved sigil namespace

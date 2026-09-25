@@ -1146,7 +1146,7 @@ const EVENTS_DOMAIN: Domain = Domain {
 const CHANGES_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Pending and recently-applied changes as { pending, applied, total_pending }. Read .pending[].id before 'apply'.",
+        summary: "Pending and applied changes. thread_unsettled means its thread is still working. Read .pending[].id before 'apply'.",
         method: Method::Get,
         path: "/changes",
         args: &[],
@@ -1154,14 +1154,14 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "list",
         mutating: false,
         llm_alias: Some("list_changes"),
-        llm_schema: Some("{}"),
+        llm_schema: Some(r#"{"sub_threads_of":{"type":"string","description":"Only its sub-threads' changes. A thread id or 'current'."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "apply",
-        summary: "Merge the coding-agent branch into main, exactly as the Apply button does; returns status, SHAs and restart_required. Refused while its thread is unsettled; the error says what to do. ONLY when the user asked. (requires: change_id)",
+        summary: "Merge the branch into main, as the Apply button does; returns status, SHAs and restart_required. Refused while its thread is unsettled; the error says what to do. ONLY when the user asked. (requires: change_id)",
         method: Method::Post,
         path: "/changes/:change_id/apply",
         args: &[],
@@ -1169,14 +1169,14 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "apply",
         mutating: true,
         llm_alias: Some("apply_change"),
-        llm_schema: Some(r#"{"change_id":{"type":"string","description":"UUID of the pending change to apply. Get it from the 'list' action (.pending[].id)."}}"#),
+        llm_schema: Some(r#"{"change_id":{"type":"string","description":"Pending change UUID, from 'list' (.pending[].id)."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "apply_when_settled",
-        summary: "Apply one thread's change the moment it finishes. Drops with a report if the thread parks or fails. ONLY when the user asked. (requires: thread_id)",
+        summary: "Apply a thread's change once it settles, waiting out event waits. Drops on a question or failure. ONLY when the user asked. (requires: thread_id)",
         method: Method::Post,
         path: "/standing-applies",
         args: &[],
@@ -1184,14 +1184,14 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "applyWhenSettled",
         mutating: true,
         llm_alias: Some("apply_when_settled"),
-        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Thread whose change to apply once it settles."},"change_id":{"type":"string","description":"Bind to this change. Omit when nothing is proposed yet."}}"#),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Thread whose change to apply once it settles."},"change_id":{"type":"string","description":"Omit if nothing is proposed yet."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "apply_as_they_settle",
-        summary: "Apply every settled pending change, then keep going as the working threads land theirs. ONLY when the user asked.",
+        summary: "Apply every settled pending change, then keep going as the settling threads land theirs. ONLY when the user asked.",
         method: Method::Post,
         path: "/changes/apply-all?keep_going=true",
         args: &[],
@@ -1206,7 +1206,7 @@ const CHANGES_OPS: &[Operation] = &[
     },
     Operation {
         action: "cancel_standing_apply",
-        summary: "Take back a standing apply. With thread_id, that thread's. Without, every one here. Stops future applies only.",
+        summary: "Take back a standing apply: thread_id's, or every one here. Stops future applies only.",
         method: Method::Delete,
         path: "/standing-applies",
         args: &[],
@@ -1214,7 +1214,7 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "cancelStandingApply",
         mutating: true,
         llm_alias: Some("cancel_standing_apply"),
-        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Cancel this thread's standing apply. Omit to cancel every one in the workspace."}}"#),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"This thread's standing apply."}}"#),
         llm: None,
         cli: None,
         sdk: None,
@@ -1224,7 +1224,7 @@ const CHANGES_OPS: &[Operation] = &[
 const CHANGES_DOMAIN: Domain = Domain {
     name: "changes",
     tool_name: "changes",
-    tool_summary: "Changes: coding-agent-proposed branches awaiting the Apply button. 'list' is where you find a change's id. Only 'apply' when the user asked.",
+    tool_summary: "Changes: coding-agent branches awaiting Apply. 'list' finds a change's id. Only 'apply' when the user asked.",
     llm: true,
     // `lucidos changes list|apply` is a hand-written CLI; not regenerated. No SDK
     // consumer. Grouped LLM tool only.
@@ -1780,12 +1780,30 @@ const THREADS_OPS: &[Operation] = &[
         cli: Some(false),
         sdk: Some(false),
     },
+    Operation {
+        action: "detach_child",
+        summary: "Stop waiting for one of YOUR direct children: it moves to top level and \
+                  keeps running. Frees no child slot. (requires: thread_id)",
+        method: Method::Post,
+        path: "/threads/:thread_id/detach",
+        args: &[],
+        cli_name: "detach",
+        sdk_name: "detachChild",
+        mutating: true,
+        llm_alias: Some("detach_child_thread"),
+        llm_schema: Some(
+            r#"{"thread_id":{"type":"string","description":"The child's uuid."}}"#,
+        ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
 ];
 
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Introspect threads, far cheaper than querying events for what exists and its status. Both actions take the same optional filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
+    tool_summary: "Read threads, cheaper than querying events for what exists and its status, or stop awaiting a child. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -3236,7 +3254,11 @@ mod tests {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
         // `search` answers "we talked about this", which `list` structurally
         // cannot: it filters by status and channel and never by topic.
-        assert_eq!(threads.actions(), vec!["list", "count", "search"]);
+        // `detach_child` stops waiting for a child (ADR 0278).
+        assert_eq!(
+            threads.actions(),
+            vec!["list", "count", "search", "detach_child"]
+        );
         assert!(threads.llm && !threads.cli && !threads.sdk);
         assert_eq!(domain_for_tool("list_threads").unwrap().name, "threads");
         assert_eq!(

@@ -139,7 +139,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
 
   /**
    * The filter panel COVERS the thread list inside the same pane and scrolls
-   * on its own (`.thread-filter-panel`, position:absolute inset:0 over
+   * on its own (`.thread-filter-cover`, position:absolute inset:0 over
    * `.thread-drawer-list`). So it inherits nothing from the list's header
    * spacer and needs its own, which it shipped without: the panel's first
    * Status rows rendered behind the fixed header.
@@ -168,7 +168,8 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
 
     const result = await page.evaluate(() => {
       const header = document.querySelector('.app-header');
-      const panel = document.querySelector('.mobile-swipe-pane .thread-filter-panel');
+      // The cover is the panel's scroller.
+      const panel = document.querySelector('.mobile-swipe-pane .thread-filter-cover');
       const firstRow = document.querySelector('.mobile-swipe-pane .thread-filter-panel .drawer-view-option');
       if (!header || !panel || !firstRow) return { error: 'missing header, panel or row' };
       return {

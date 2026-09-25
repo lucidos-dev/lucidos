@@ -68,28 +68,32 @@ export function ProviderBlock(props: {
   // press outruns its effect: a save has not happened yet, and a switch-off is
   // a rebuild plus a `/health` probe away. Held, the switch moves under the
   // finger; derived only, it would spring back for the length of a round trip.
-  const [override, setOverride] = useState<boolean | null>(null);
+  const [held, setHeld] = useState<{ open: boolean; wrote: boolean } | null>(null);
+  const override = held?.open ?? null;
   // Nothing is drawn open before the block knows its own state. The config
   // rows never appear under a switch position that is still a guess.
   const open = loaded && blockIsOpen(state, override);
   useEffect(() => {
-    if (overrideIsSettled(state, override)) { setOverride(null); return; }
-    if (override === null) return;
+    if (overrideIsSettled(state, override)) { setHeld(null); return; }
+    // A local expand or collapse wrote nothing, so there is no answer to wait
+    // for. It holds until the state moves, e.g. when the typed key is saved.
+    // Timing it out would fold the key field away mid-setup.
+    if (!held?.wrote) return;
     // A press the engine never agrees with would otherwise be held for good,
     // and the switch would sit in a position nothing backs. Two ways in. The
     // engine can ANSWER and refuse the write, and `savePreference` toasts
     // rather than rejecting, so there is no promise to catch. Or it accepts a
     // write it cannot apply (the FailFast note in `engine/mod.rs`). Dropping
     // the hold shows what is installed, beside the toast that said so.
-    const fuse = setTimeout(() => setOverride(null), OVERRIDE_HOLD_MS);
+    const fuse = setTimeout(() => setHeld(null), OVERRIDE_HOLD_MS);
     return () => clearTimeout(fuse);
-  }, [state, override]);
+  }, [state, held]);
 
   function onToggle(next: boolean): void {
     const action = switchAction(state, next);
     if (action === 'enable') void setProviderEnabled(props.id, true);
     if (action === 'disable') void setProviderEnabled(props.id, false);
-    setOverride(next);
+    setHeld({ open: next, wrote: action === 'enable' || action === 'disable' });
   }
 
   return (

@@ -78,7 +78,7 @@ vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // `../store`), so the mock fn must be vi.hoisted — a plain const isn't
 // initialized yet when the hoisted factory runs.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
-vi.mock('./devices', () => ({ getDeviceId, pendingDeviceRegistration: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId }));
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 // Mirrors the real predicate: a repo-encoded path is handled here, anything
 // else declines so the 'file' branch falls back to openFilePreview.
@@ -277,7 +277,7 @@ function navEvent(sourceThreadId: string) {
   };
 }
 
-// An agent (navigate_ui) navigate carries the originating device as `actor`.
+// An agent (navigate_ui) navigate carries its one target device as `actor`.
 function navEventFromDevice(sourceThreadId: string, deviceId: string) {
   return {
     thread_id: sourceThreadId,
@@ -331,8 +331,8 @@ describe('NavigationRequested scoping', () => {
     expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
   });
 
-  // Agent navigate carries its originating device. It must act only on THAT
-  // device — never the user's other devices, even ones viewing the same thread.
+  // An agent navigate carries its one target device. It must act only on THAT
+  // device, never on the user's other devices, even ones viewing the same thread.
   it('acts when the agent navigate names THIS device (focused thread)', () => {
     getDeviceId.mockReturnValue('this-device');
     focusedThreadId.value = 'thread-A';

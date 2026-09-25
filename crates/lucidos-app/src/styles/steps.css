@@ -99,51 +99,35 @@
     box-shadow: var(--focus-ring);
 }
 
-/* One column for the mark, whatever mark the row ends up carrying, so a column
-   of steps reads as a list rather than as a ragged left edge.
+/* One column for the mark, so a column of steps reads as a list rather than
+   as a ragged left edge. The width holds that column open even on the running
+   row, which draws no mark at all (`StepOutcomeIcon` returns null for it).
 
-   The width is what makes that true, and it is doing two jobs. Across rows, the
-   four outcomes are four different glyphs (see `stepStatus`), and a check, a
-   warning sign and a slashed circle are not the same width in a proportional
-   font, nor even in a monospace one once the font lacks them and the browser
-   falls back per glyph. Within a row, the in-progress step carries NO mark at
-   all: `stepStatus` returns an empty icon, so the slot is an empty span, and a
-   fixed width is the only thing holding the column open while the step runs.
-   That slot used to be `display: none`, which took the span out of the flex
-   line entirely (its width AND the gap after it), so the one row that was still
-   running sat a mark's width to the left of every finished row above it.
-
-   `em`, not `rem`, and deliberately: the box has to match the glyph the ROW
-   renders, and the row sets its own `--font-size-sm` rather than inheriting the
-   root. A rem here would stop tracking the moment that font-size changed. A
-   glyph wider than its box is not clipped, it just reaches into the gap after
-   it, which is why this is a plain `width` rather than a `min-width` that would
-   let the description move.
-
-   Six tenths of an em, and that number is `--font-ui`'s own advance rather than
-   a taste: the stack is monospace (`--font-mono`), where the common faces all
-   step at 0.6em, so the box is now exactly the glyph and carries NO slack at
-   all. It was a full em first and then three quarters, and both left leftover
-   INSIDE the box which sat between the mark and the text it belongs to, adding
-   to the gap after the slot rather than to the mark. So the visible distance
-   from a check to its description was the slack plus the gap, and the mark read
-   as adrift from its own row instead of attached to it. Emptying the box was
-   half the fix; the other half is the tightened `.step-main` gap above, since
-   with no slack left the gap IS the whole of that distance.
-
-   Nothing here assumes every mark fits. Where the face lacks one (the warning
-   sign and the slashed circle are the likely two) the browser substitutes per
-   glyph, and a substitute wider than the slot reaches into the gap instead of
-   pushing the text, exactly the tolerance the paragraph above relies on. What
-   the fixed width buys is that every row starts its text on ONE column, and
-   the number does not change that. */
+   `em`, not `rem`: the box tracks the row's own `--font-size-sm`. It is a hair
+   wider than the 1cap icon inside it, which is all the air the mark needs
+   before the `.step-main` gap. */
 .inline-step .step-icon {
     flex-shrink: 0;
-    width: 0.6em;
+    width: 0.75em;
 }
 
+/* One cap band tall, square, with its bottom edge on the text baseline: the
+   svg is inline, so its baseline is its bottom edge, and the slot sits on the
+   row's baseline. The mark then spans exactly the height of a capital letter
+   in any font. The em pair is the fallback for a browser without `cap`.
+   `overflow: visible` lets the round stroke caps reach past the box. */
+.inline-step .step-icon svg {
+    width: 0.7em;
+    height: 0.7em;
+    width: 1cap;
+    height: 1cap;
+    overflow: visible;
+}
+
+/* Grey, dimmed toward the background: a finished step is the common case, so
+   its mark sits behind the text and only a problem row carries colour. */
 .inline-step.success .step-icon {
-    color: var(--accent-green);
+    color: color-mix(in srgb, var(--text-muted) 70%, var(--bg-primary));
 }
 
 .inline-step.error .step-icon {
@@ -648,6 +632,10 @@
     margin: 0;
     max-height: 25rem;
     overflow-y: auto;
+}
+
+.event-condition-key {
+    color: var(--syntax-key);
 }
 
 /* Reasoning reads as secondary to the answer — slightly muted. */

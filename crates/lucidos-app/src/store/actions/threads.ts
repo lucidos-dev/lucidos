@@ -7,9 +7,10 @@ import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
-import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
+import { saveThread, unsaveThread, archiveThread, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
+import { refreshThreadList } from './thread-list-refresh';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
@@ -57,15 +58,13 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // DIFFERENT one retires it. The position this open restores to may BE that
   // thread's bottom, which writes no scroll for the reader-moved disarm to see.
   //
-  // BEFORE the focus moves, and that order is load-bearing. A signal assignment
-  // runs its subscribers synchronously, and `watchCallLiveness` is one. A call
-  // up on the INCOMING thread flips the transcript live inside
-  // `setFocusedThread`. The wake behind that would carry the OUTGOING thread's
-  // ride, on the element both threads share.
+  // BEFORE the focus moves. A signal assignment runs its subscribers
+  // synchronously, and none of them may find the outgoing ride still armed.
   //
   // The thread being LEFT loses nothing. Its request was recorded as the
-  // live-edge form of its reading position. Only the ARM reaches the recording
-  // side, so a retire writes nothing (see `onFollowArmed`). Re-entry resumes it.
+  // live-edge form of its reading position. Only a ride starting reaches the
+  // recording side, so a retire writes nothing (see `onFollowRideStarted`).
+  // Re-entry resumes it.
   //
   // Re-focusing the thread already open is not an open, and retires nothing.
   // `useScrollMemory` does not re-run on an unchanged key, so a retire would end
@@ -356,16 +355,40 @@ function formatArchiveErrorToast(err: unknown): string {
     }
     if (body.reason === 'parent_not_archivable') {
       // Archive is idempotent: an already-archived target is a no-op success
-      // (200), not a 409, so `parent_not_archivable` is now raised ONLY for
-      // live work (status === 'running'). See `classify_archive_decision` in
-      // crates/lucidos-engine/src/api/threads/archive.rs.
+      // (200), not a 409. So this reason means the thread is running or waiting
+      // on a question. See `classify_family` in
+      // crates/lucidos-engine/src/api/threads/family.rs.
+      if (body.parent_status === 'waiting_for_user_answer') {
+        return "Can't archive yet: this thread is waiting for your answer";
+      }
       return "Can't archive yet — this thread is still running";
     }
     if (body.reason === 'parent_has_pending_changes') {
       return "Can't archive — apply or discard the pending change first";
     }
+    // An apply or Discard holds the thread's session. The engine's message
+    // names which, and says when to try again.
+    if (CHANGE_CLAIM_REFUSALS.has(String(body.reason)) && typeof body.message === 'string') {
+      return `Can't archive yet: ${body.message}`;
+    }
   }
   return `Failed to archive thread: ${errorDetail(err)}`;
+}
+
+/** The archive refusals a change claim gives (see `claim_refusal_slug`). */
+const CHANGE_CLAIM_REFUSALS = new Set(['apply_in_progress', 'discard_in_progress']);
+
+/** The warning for members an archive left behind: each by title, with the
+ *  engine's reason, and that the user can archive again once it is done. */
+export function formatArchiveSkippedToast(skipped: ArchiveSkippedMember[]): string {
+  const lines = skipped.map((m) => {
+    const title = threadMap.value.get(m.thread_id)?.meta.title || 'Untitled thread';
+    return `${title}: ${m.message}`;
+  });
+  const head = skipped.length === 1
+    ? 'One thread was not archived.'
+    : `${skipped.length} threads were not archived.`;
+  return `${head} ${lines.join(' ')} Archive again once that is done.`;
 }
 
 function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean }>): void {
@@ -580,7 +603,7 @@ export function subscriptionsStoppedByArchive(
     message:
       count === 1
         ? 'Archiving stops what this thread is waiting for. It will not fire.'
-        : `Archiving stops ${count} subscriptions. They will not fire.`,
+        : `Archiving stops waiting for ${count} events. They will not fire.`,
     details: { groups },
   };
 }
@@ -732,12 +755,34 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     unfocusThread({ revealPane: false });
   }
 
+  let skipped: ArchiveSkippedMember[] = [];
   try {
-    await archiveThread(threadId);
+    skipped = (await archiveThread(threadId)).skipped ?? [];
+    // A member the engine left unarchived goes back where it was, and the user
+    // is told which and why. The optimistic flip hid it.
+    const skippedIds = new Set(skipped.map((m) => m.thread_id));
+    if (skipped.length > 0) {
+      const restored = new Map(threadMap.value);
+      for (const tid of skippedIds) {
+        const t = restored.get(tid);
+        const snap = snapshot.get(tid);
+        if (t && snap) restored.set(tid, { ...t, meta: { ...t.meta, ...snap } });
+      }
+      threadMap.value = restored;
+      // The target itself stayed open: give it its focus back, as a rejected
+      // archive does, unless the user has moved on meanwhile.
+      if (skippedIds.has(threadId) && focusedThreadId.value === nextId) {
+        focusThread(threadId, { revealPane: false });
+      }
+      showToast(formatArchiveSkippedToast(skipped), 'warning');
+    }
     // Archive landed — now honor a "Discard draft(s)" choice. Deferred until
-    // here so a rejected archive (rolled back below) leaves the draft intact.
+    // here so a rejected archive (rolled back below) leaves the draft intact,
+    // and a skipped member keeps its draft too.
     if (discardDrafts) {
-      for (const id of draftedIds) discardThreadDraft(id);
+      for (const id of draftedIds) {
+        if (!skippedIds.has(id)) discardThreadDraft(id);
+      }
     }
   } catch (e) {
     const restored = new Map(threadMap.value);
@@ -760,4 +805,8 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     for (const tid of cascade) next.delete(tid);
     archivingThreadIds.value = next;
   }
+  // The snapshot is from before the archive. The in-flight guard dropped any
+  // update a skipped member had meanwhile, and its apply or Discard often ends
+  // first. So re-read the list now the guard is off.
+  if (skipped.length > 0) void refreshThreadList();
 }

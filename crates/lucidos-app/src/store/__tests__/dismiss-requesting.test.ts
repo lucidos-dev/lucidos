@@ -108,7 +108,7 @@ describe('Done dismiss does not flash Requesting state', () => {
       expect(state!.isArchiving).toBe(true);
       // During archive the optimistic section flip empties the close set; the
       // disabled "Archive..." spinner is rendered from the isArchiving flag by
-      // getBannerSlots, not from a selector action.
+      // getBannerActions, not from a selector action.
       expect(state!.actions).toEqual([]);
     }
   });

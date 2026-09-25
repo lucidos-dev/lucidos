@@ -741,11 +741,6 @@ export function faceExclusion(face: { disabled: boolean; placeholder: boolean })
   return 'watchable';
 }
 
-/** A face a press is entitled to activate. */
-export function pressIsWatchable(face: { disabled: boolean; placeholder: boolean }): boolean {
-  return faceExclusion(face) === 'watchable';
-}
-
 /** What sat under a finger that no watchable face claimed.
  *
  *  The tenth report is why this exists. Every `missed` line in the ledger

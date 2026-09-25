@@ -5,7 +5,7 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
@@ -14,7 +14,7 @@ import { loadChatModels } from './models';
 import { loadTriggers, loadHistoricalTriggers } from './triggers';
 import { loadThreadQueue } from './threadQueue';
 import { loadTriggerGroups } from './triggerGroups';
-import { loadArtifacts, invalidateFilePreview } from './artifacts';
+import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
@@ -27,29 +27,9 @@ import { loadWebhookRefusals } from './webhookRefusals';
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
 
-/** Should an entity event refresh the `artifacts` list?
- *
- *  `not-loaded` means the user never opened a surface that needs it, and
- *  warming a cache nobody asked for is pure network waste. Every other state
- *  means they DID ask, `failed` included.
- *
- *  Admitting `failed` is what stops one bad fetch latching. `loadArtifacts`
- *  writes `toFailed` on error, which discards the loaded list, so a single
- *  timed-out refresh used to leave every later event unable to retry: the gate
- *  wanted `loaded` and nothing could get back there short of a page reload.
- *  Chat links, the Files panel and the preview all went stale together and
- *  stayed that way.
- *
- *  `loading` is excluded so a burst of events cannot stampede parallel fetches
- *  whose completion order decides the winner. */
-function artifactsWereAskedFor(): boolean {
-  const status = artifacts.value.status;
-  return status === 'loaded' || status === 'failed';
-}
-
 /** Re-probe `/health` and update `llmConfigured` after a provider credential
  *  change. The backend hot-swaps the active LLM provider in an in-process
- *  broadcast subscriber (`spawn_provider_credential_subscriber`), so there is a
+ *  broadcast subscriber (`spawn_provider_config_subscriber`), so there is a
  *  brief race between that swap and this probe: fire one immediate probe (it
  *  usually wins — the in-process rebuild beats the SSE→browser→`/health`
  *  round-trip) plus one short delayed re-check for the loser case. The 5s
@@ -245,8 +225,8 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // File events. `ArtifactImported` is the user-driven import flow;
     // `ArtifactCreated`/`Updated`/`Deleted` fire from `emit_entity_events_for_change_apply`
     // when a coding-agent change lands files in `data/artifacts/`. All four
-    // refresh the same `artifacts` list. The latter three are gated on
-    // `artifactsWereAskedFor`, matching the PluginInstalled pattern: don't warm
+    // refresh the same `artifacts` list. The latter three go through
+    // `refreshArtifacts`, matching the PluginInstalled pattern: don't warm
     // a cache the user hasn't opened. ArtifactImported is unconditional,
     // because the import flow always has a settings panel open.
     //
@@ -263,7 +243,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'ArtifactUpdated':
     case 'ArtifactDeleted':
       invalidateArtifactPreview(data);
-      if (artifactsWereAskedFor()) void loadArtifacts();
+      refreshArtifacts();
       break;
     // `RepositoryImported` is the `git_clone` tool landing a repo's files under
     // `data/artifacts/imported/<name>/` — a BULK ARTIFACT import, not a change
@@ -273,7 +253,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // list, which never contains the clone — so an agent-imported repo never
     // appeared anywhere live.)
     case 'RepositoryImported':
-      if (artifactsWereAskedFor()) void loadArtifacts();
+      refreshArtifacts();
       break;
     // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
     // `lucidos` CLI). These are the API-origin AUDIT events; the paired
@@ -292,9 +272,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // wider reach than the list refresh below: a `config/` or `knowhow/`
       // write changes no artifact list, but it may well be the file on screen.
       if (dataPath) invalidateFilePreview(dataPath);
-      if (dataPath?.startsWith('artifacts/') && artifactsWereAskedFor()) {
-        void loadArtifacts();
-      }
+      if (dataPath?.startsWith('artifacts/')) refreshArtifacts();
       break;
     }
     // Plugin install/uninstall lands files under apps/, knowhow/, triggers/,

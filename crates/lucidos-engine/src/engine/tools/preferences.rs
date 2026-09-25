@@ -7,7 +7,7 @@ use crate::llm::tool_names as tn;
 /// `[PUSH_NOTIFICATION_REQUEST]` marker MUST stay first — the SSE processing loop
 /// (agentic_loop/run.rs) keys off it to emit the thread event that drives the
 /// frontend `initPushSubscription()` handshake.
-const PUSH_ENABLED_REPLY: &str = "[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled for this device. Tell the user what to expect, keyed off the current request device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app — notifications arrive as native macOS notifications governed by System Settings → Notifications (macOS asks for permission on first launch; if no banner appears, allow Lucidos there); do NOT mention browser permission or site settings. Otherwise they are in a web browser or installed PWA — the browser will now ask for notification permission and they should click Allow. Note: in a development build (tauri-dev) native desktop banners don't appear at all — run Lucidos in a browser/PWA to receive notifications while developing. Either way, they'll get notifications for triggered tasks and alerts.";
+const PUSH_ENABLED_REPLY: &str = "[PUSH_NOTIFICATION_REQUEST][ACTION COMPLETED] Push notifications enabled for this device. Tell the user what to expect, keyed off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app: notifications arrive as native macOS notifications governed by System Settings → Notifications (macOS asks for permission on first launch; if no banner appears, allow Lucidos there); do NOT mention browser permission or site settings. Otherwise they are in a web browser or installed PWA, and the browser will now ask for notification permission and they should click Allow. Note: in a development build (tauri-dev) native desktop banners don't appear at all, so run Lucidos in a browser/PWA to receive notifications while developing. Either way, they'll get notifications for triggered tasks and alerts.";
 
 /// Longest stored value `get_preferences` prints in full.
 ///
@@ -273,7 +273,7 @@ impl LucidosEngine {
         match name {
             tn::SET_PREFERENCE => self.execute_set_preference(args, device_id).await,
             tn::GET_PREFERENCES => self.execute_get_preferences(device_id).await,
-            _ => Ok(format!("Unknown preferences tool: {}", name)),
+            _ => Err(format!("Unknown preferences tool: {}", name).into()),
         }
     }
 

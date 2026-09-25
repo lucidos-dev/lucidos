@@ -1,5 +1,6 @@
 use super::cp_helpers::*;
 use super::*;
+use crate::core::changes::{ChangeStatus, MergeShas, MergeWorktree};
 
 #[tokio::test]
 async fn empty_projection_has_no_pending_changes() {
@@ -47,14 +48,14 @@ async fn emit_change_proposed_writes_row_to_changes_table() {
     )
     .await;
 
-    let row: (String, String, String, Option<Uuid>) = sqlx::query_as(
+    let row: (ChangeStatus, String, String, Option<Uuid>) = sqlx::query_as(
         "SELECT status, branch_name, repo_root, thread_id FROM changes WHERE id = $1",
     )
     .bind(change_id)
     .fetch_one(&pool)
     .await
     .expect("row exists in changes table after ChangeProposed");
-    assert_eq!(row.0, "pending");
+    assert_eq!(row.0, ChangeStatus::Pending);
     assert_eq!(row.1, "feat-bug1");
     assert_eq!(row.2, "/repo/bug1");
     assert_eq!(row.3, Some(thread_id));
@@ -84,7 +85,7 @@ async fn aggregate_change_proposed_inserts_pending_change() {
     assert_eq!(pending[0].branch_name, "branch-a");
     assert_eq!(pending[0].repo_root, "/repo");
     assert_eq!(pending[0].thread_id, Some(thread));
-    assert_eq!(pending[0].status, "pending");
+    assert_eq!(pending[0].status(), ChangeStatus::Pending);
     assert_eq!(pending[0].file_count, 2);
     assert!(pending[0].hardened);
 
@@ -300,14 +301,19 @@ async fn change_applied_transitions_to_applied_with_commits() {
     let proj = ChangesProjection::new(pool);
     assert!(proj.list_pending().await.unwrap().is_empty());
     let row = proj.get_by_id(change_id).await.unwrap().expect("row");
-    assert_eq!(row.status, "applied");
+    assert_eq!(row.status(), ChangeStatus::Applied);
     assert!(row.resolved_at.is_some());
     assert_eq!(
         row.commits,
         vec!["feat: x".to_string(), "fix: y".to_string()]
     );
-    assert_eq!(row.pre_merge_sha.as_deref(), Some("aaa"));
-    assert_eq!(row.post_merge_sha.as_deref(), Some("bbb"));
+    assert_eq!(
+        row.merge_shas(),
+        Some(&MergeShas {
+            pre: Some("aaa".into()),
+            post: Some("bbb".into()),
+        })
+    );
     assert!(row.requires_restart);
 
     teardown_test_db(&db).await;
@@ -332,7 +338,7 @@ async fn change_discarded_transitions_to_discarded() {
     let proj = ChangesProjection::new(pool);
     assert!(proj.list_pending().await.unwrap().is_empty());
     let row = proj.get_by_id(change_id).await.unwrap().expect("row");
-    assert_eq!(row.status, "discarded");
+    assert_eq!(row.status(), ChangeStatus::Discarded);
     assert!(row.resolved_at.is_some());
 
     teardown_test_db(&db).await;
@@ -365,7 +371,7 @@ async fn change_reverted_transitions_to_reverted() {
 
     let proj = ChangesProjection::new(pool);
     let row = proj.get_by_id(change_id).await.unwrap().expect("row");
-    assert_eq!(row.status, "reverted");
+    assert_eq!(row.status(), ChangeStatus::Reverted);
 
     teardown_test_db(&db).await;
 }
@@ -440,8 +446,13 @@ async fn merge_resolution_started_sets_worktree_fields() {
 
     let proj = ChangesProjection::new(pool);
     let row = proj.get_by_id(change_id).await.unwrap().unwrap();
-    assert_eq!(row.merge_worktree_path.as_deref(), Some("/tmp/wt"));
-    assert_eq!(row.merge_temp_branch.as_deref(), Some("merge-tmp/x"));
+    assert_eq!(
+        row.merge_worktree(),
+        Some(&MergeWorktree {
+            path: "/tmp/wt".into(),
+            temp_branch: "merge-tmp/x".into(),
+        })
+    );
 
     teardown_test_db(&db).await;
 }
@@ -481,8 +492,7 @@ async fn merge_resolution_cleared_clears_worktree_fields() {
 
     let proj = ChangesProjection::new(pool);
     let row = proj.get_by_id(change_id).await.unwrap().unwrap();
-    assert!(row.merge_worktree_path.is_none());
-    assert!(row.merge_temp_branch.is_none());
+    assert!(row.merge_worktree().is_none());
 
     teardown_test_db(&db).await;
 }
@@ -583,7 +593,11 @@ async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
 
     let after = proj.get_by_id(change_id).await.unwrap().unwrap();
     assert_eq!(after.id, change_id, "same change, corrected in place");
-    assert_eq!(after.status, "pending", "reconcile is not a discard");
+    assert_eq!(
+        after.status(),
+        ChangeStatus::Pending,
+        "reconcile is not a discard"
+    );
     assert_eq!(after.file_count, 0);
     assert!(after.files.is_empty());
     assert!(

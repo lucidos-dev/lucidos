@@ -5,7 +5,7 @@ import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 // Mock loader functions to prevent API calls
 vi.mock('./apps', () => ({ loadApps: vi.fn() }));
 vi.mock('./triggers', () => ({ loadTriggers: vi.fn(), loadHistoricalTriggers: vi.fn() }));
-vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn(), invalidateFilePreview: vi.fn() }));
+vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn(), refreshArtifacts: vi.fn(), invalidateFilePreview: vi.fn() }));
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
@@ -25,7 +25,6 @@ vi.mock('./devices', async () => {
     loadDevices: vi.fn(),
     devices: signal({ status: 'not-loaded' }),
     getDeviceId: vi.fn(() => 'this-device'),
-    pendingDeviceRegistration: vi.fn(),
   };
 });
 // Keep removePinnedAppLocal real (the AppDeleted test asserts on its effect),
@@ -38,7 +37,7 @@ vi.mock('./pinnedApps', async (importOriginal) => ({
 import { processSSEForReferences } from './entityReferences';
 import { loadApps } from './apps';
 import { loadTriggers, loadHistoricalTriggers } from './triggers';
-import { loadArtifacts, invalidateFilePreview } from './artifacts';
+import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
@@ -241,57 +240,32 @@ describe('processSSEForReferences', () => {
   });
 
   // ── Artifact*  (gated, emitted from CC apply) ────────────────────────────
+  // Whether a refresh fetches is `refreshArtifacts`' call, tested beside it:
+  // a list nobody asked for stays unfetched, and one mid-load gets one more.
   describe('Artifact* events from change-apply', () => {
-    it('does not reload when artifacts cache is not-loaded', () => {
-      artifacts.value = { status: 'not-loaded' };
+    it('asks for a list refresh on each event', () => {
       processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
       processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
+      expect(refreshArtifacts).toHaveBeenCalledTimes(3);
       expect(loadArtifacts).not.toHaveBeenCalled();
-    });
-
-    it('reloads on each event when artifacts cache is loaded', () => {
-      artifacts.value = { status: 'loaded', data: [] };
-      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
-      processSSEForReferences('ArtifactUpdated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
-      processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
-      expect(loadArtifacts).toHaveBeenCalledTimes(3);
     });
 
     // `artifact_path` is relative to `artifacts/`; the preview addresses a file
     // the data-relative way. Hand it the bare path and it matches nothing, so
     // an agent overwriting the open file would never refresh it.
     it('offers the preview the data-relative path, not the bare artifact path', () => {
-      artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
       expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/clips/demo.mp4');
     });
 
-    // The list gate and the preview are independent. A preview can be open on
-    // a file this device never listed. A `not-loaded` cache must not swallow
+    // The list and the preview are independent. A preview can be open on a
+    // file this device never listed, so the list's own gate must not swallow
     // the one signal that file has to re-read.
-    it('still offers the preview its path when the artifacts cache is not-loaded', () => {
+    it('offers the preview its path whatever the list holds', () => {
       artifacts.value = { status: 'not-loaded' };
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
-      expect(loadArtifacts).not.toHaveBeenCalled();
       expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/clips/demo.mp4');
-    });
-
-    // `loadArtifacts` writes `toFailed` on error, which discards the loaded
-    // list. Gating the retry on `loaded` therefore latched: one timed-out
-    // refresh and no later event could get the cache back, short of a reload.
-    it('retries after a failed load, so one bad fetch does not latch', () => {
-      artifacts.value = { status: 'failed', error: 'Request timed out after 10000ms' };
-      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c' });
-      expect(loadArtifacts).toHaveBeenCalledTimes(1);
-    });
-
-    // A burst of events must not stampede parallel fetches whose completion
-    // order decides which one wins.
-    it('does not pile on while a load is already in flight', () => {
-      artifacts.value = { status: 'loading' };
-      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c' });
-      expect(loadArtifacts).not.toHaveBeenCalled();
     });
   });
 
@@ -810,30 +784,23 @@ describe('processSSEForReferences', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('RepositoryImported', { url: 'u', branch: 'main', destination: 'd', file_count: 0, skipped_count: 0, commit: '0', files: [] });
       expect(loadRepositories).not.toHaveBeenCalled();
-      expect(loadArtifacts).toHaveBeenCalledTimes(1);
-    });
-
-    it('RepositoryImported does not reload artifacts when that cache is not-loaded', () => {
-      artifacts.value = { status: 'not-loaded' };
-      processSSEForReferences('RepositoryImported', { url: 'u', branch: 'main', destination: 'd', file_count: 0, skipped_count: 0, commit: '0', files: [] });
-      expect(loadArtifacts).not.toHaveBeenCalled();
+      expect(refreshArtifacts).toHaveBeenCalledTimes(1);
     });
   });
 
   describe('DataFile* events', () => {
-    it('reloads artifacts when an artifacts/ path changes and the cache is loaded', () => {
-      artifacts.value = { status: 'loaded', data: [] };
+    it('asks for a list refresh when an artifacts/ path changes', () => {
       processSSEForReferences('DataFileWritten', { path: 'artifacts/notes.md' });
       processSSEForReferences('DataFileEdited', { path: 'artifacts/notes.md', operations_count: 1 });
       processSSEForReferences('DataFileDeleted', { path: 'artifacts/notes.md' });
-      expect(loadArtifacts).toHaveBeenCalledTimes(3);
+      expect(refreshArtifacts).toHaveBeenCalledTimes(3);
     });
 
     it('leaves the artifacts LIST alone for a non-artifacts path', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
       processSSEForReferences('DataFileEdited', { path: 'apps/foo/manifest.json', operations_count: 1 });
-      expect(loadArtifacts).not.toHaveBeenCalled();
+      expect(refreshArtifacts).not.toHaveBeenCalled();
     });
 
     // The preview reaches wider than the list. A `config/` or `knowhow/` write
@@ -842,12 +809,6 @@ describe('processSSEForReferences', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
       expect(invalidateFilePreview).toHaveBeenCalledWith('config/apis.json');
-    });
-
-    it('does not reload when artifacts cache is not-loaded', () => {
-      artifacts.value = { status: 'not-loaded' };
-      processSSEForReferences('DataFileWritten', { path: 'artifacts/notes.md' });
-      expect(loadArtifacts).not.toHaveBeenCalled();
     });
   });
 

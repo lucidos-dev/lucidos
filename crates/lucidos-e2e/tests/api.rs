@@ -161,6 +161,9 @@ mod notifications_presence_test;
 #[path = "api_support/credentials_test.rs"]
 mod credentials_test;
 
+#[path = "api_support/form_requests_test.rs"]
+mod form_requests_test;
+
 #[path = "api_support/oauth_connect_test.rs"]
 mod oauth_connect_test;
 
@@ -190,6 +193,9 @@ mod embedding_model_status_test;
 
 #[path = "api_support/follow_up_test.rs"]
 mod follow_up_test;
+
+#[path = "api_support/detach_test.rs"]
+mod detach_test;
 
 #[path = "api_support/coding_agent_binaries_test.rs"]
 mod coding_agent_binaries_test;

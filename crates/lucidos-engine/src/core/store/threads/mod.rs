@@ -152,6 +152,11 @@ pub struct ThreadSummary {
     pub section: String,
     /// Number of child threads still active (non-zero means parent is "ongoing").
     pub active_children_count: i64,
+    /// Direct children that are not in flight and hold a live *event wait*.
+    /// Such a child has not finished (ADR 0254), so the parent waits on it.
+    /// Disjoint from `active_children_count`. Read by the frontend's Waiting
+    /// dot and waiting indicator, and by no backend predicate.
+    pub waiting_children_count: i64,
     /// Total number of child threads (active + completed).
     pub total_children_count: i64,
     /// Number of *event waits* this thread currently holds unresolved. Read as
@@ -283,6 +288,12 @@ pub struct ThreadSummary {
     /// reload is one of the two places a device learns it (the other is the
     /// `ThreadComposeChanged` broadcast).
     pub compose_epoch: i64,
+    /// Pending changes held by this thread's *sub-threads*, at any depth, not
+    /// counting its own. Filled only by `list_thread_summaries`, the list an
+    /// agent reads its children from, so it is omitted rather than zero on
+    /// every other read path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_sub_thread_change_count: Option<i64>,
 }
 
 /// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
@@ -372,6 +383,7 @@ struct ThreadRow {
     message_count: i64,
     section: String,
     active_children_count: i64,
+    waiting_children_count: i64,
     total_children_count: i64,
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
@@ -438,6 +450,9 @@ pub struct ThreadAggregate {
     pub section: String,
     pub status: String,
     pub active_children_count: i64,
+    /// See `ThreadSummary::waiting_children_count`. Carried on the per-event
+    /// SSE aggregate so a parent's Waiting dot follows its children live.
+    pub waiting_children_count: i64,
     pub total_children_count: i64,
     /// Count of descendants (transitive) currently blocking this thread's
     /// archive. See `ThreadSummary::blocking_descendant_count`. Carried on the
@@ -542,6 +557,7 @@ fn row_to_thread_aggregate(
         section: r.section,
         status: r.status,
         active_children_count: r.active_children_count,
+        waiting_children_count: r.waiting_children_count,
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
@@ -589,7 +605,7 @@ fn thread_cols(alias: &str) -> String {
     format!(
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
-        {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.total_children_count::bigint, \
+        {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
@@ -669,6 +685,7 @@ impl EventStore {
                     saved: r.is_saved,
                     section: r.section,
                     active_children_count: r.active_children_count,
+                    waiting_children_count: r.waiting_children_count,
                     total_children_count: r.total_children_count,
                     blocking_descendant_count: r.blocking_descendant_count,
                     attention_descendant_count: r.attention_descendant_count,
@@ -697,6 +714,7 @@ impl EventStore {
                     compose_mode: r.compose_mode,
                     compose_selection: r.compose_selection,
                     compose_epoch: r.compose_epoch,
+                    pending_sub_thread_change_count: None,
                 })
             })
             .collect()

@@ -5,11 +5,12 @@
  * A banner is a persistent bar between the header and the panes, for a condition
  * that stays true until something changes: backup is off, this workspace is
  * unreachable, webhook deliveries cannot reach it from outside, a webhook is
- * throwing away what does arrive. Four of them exist, and all four can be up at
- * once. That is what makes this a module rather than a pattern copied, since
- * the layout gate is the same sentence in each.
- * And the height reservation is a ResizeObserver whose one subtlety (re-reading
- * the root font size at measure time) is not worth getting right three times.
+ * throwing away what does arrive, the host is short on memory. Five of them
+ * exist, and all five can be up at once. That is what makes this a module
+ * rather than a pattern copied, since the layout gate is the same sentence in
+ * each. And the height reservation is a ResizeObserver whose one subtlety
+ * (re-reading the root font size at measure time) is not worth getting right
+ * five times.
  *
  * The hook lives here beside the pure halves rather than in `src/hooks/`,
  * because it is not a general capability: it publishes the specific contract

@@ -53,6 +53,21 @@ export type Exchange = {
    *  still holds a turn, and `exchangeHoldsNoTurn` has to say so, or the
    *  status machinery steps over the card the work is in. */
   tookTheTurn?: boolean;
+  /** True once the coding agent read the message that opened this exchange,
+   *  set by its `CodingAgentInputRead`. Drives the Sent / Read marker. */
+  inputRead?: true;
+  /** True while a message sent behind a running coding-agent turn waits for
+   *  the agent to read it. It takes no steps meanwhile and renders in the
+   *  bottom queue. See `docs/plans/2026-09-24-unread-coding-agent-messages-queue.md`. */
+  awaitingRead?: true;
+  /** True on the delivered copy of a message the engine held behind an open
+   *  question or permission card (ADR 0256). Its header says it waited. */
+  releasedFromHold?: true;
+  /** Ids of this exchange's `MessageHeld` rows whose delivered copy is folded.
+   *  That copy is now the message's one card, so the held row stops drawing.
+   *  A release with no copy keeps its row, so a lost delivery stays visible.
+   *  Written from outside, like `blockedStepSeqs`. */
+  deliveredHeldIds?: Set<string>;
   /** `seq` of every tool call in this exchange that a permission card is
    *  holding, and of every one a decision refused. The renderer reads them at
    *  the `ToolCalled` / `CodingAgentToolCalled` case and emits `'blocked'` /
@@ -359,11 +374,11 @@ export function exchangeTimestamp(exchange: Exchange): string {
     || new Date().toISOString();
 }
 
-/** Steps that record something ABOUT a turn rather than part of it. Both render
- *  nothing in the response body, and both can land arbitrarily later than the
- *  work: an archive whenever the user gets round to it, a session end at the
- *  next engine shutdown. Skipping them costs nothing: neither draws a row, so
- *  the scan below cannot step over one on its way past them.
+/** Steps that record something ABOUT a turn rather than part of it. None draws
+ *  a row of its own, and each can land arbitrarily later than the work: an
+ *  archive whenever the user gets round to it, a session end at the next
+ *  engine shutdown, a form answered hours after the agent asked. Skipping them
+ *  costs nothing, since the scan below steps over no row on its way past.
  *
  *  They stay steps. `exchangeStatus` reads `SessionEnded` for the shutdown and
  *  session-end verdicts, and dropping either from the walk would change
@@ -371,6 +386,7 @@ export function exchangeTimestamp(exchange: Exchange): string {
 const NON_RESPONSE_STEP_TYPES: ReadonlySet<string> = new Set([
   'ThreadArchived',
   'SessionEnded',
+  'FormRequestResolved',
 ]);
 
 /** Derive the response timestamp: when the turn's last visible step landed.

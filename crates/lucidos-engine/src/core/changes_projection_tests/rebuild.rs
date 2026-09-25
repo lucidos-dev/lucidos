@@ -1,5 +1,6 @@
 use super::cp_helpers::*;
 use super::*;
+use crate::core::changes::{ChangeStatus, MergeWorktree};
 
 /// Simulates the historical write-through gap: events exist in the store
 /// but their `changes` row was never written. `rebuild_missing_from_events`
@@ -46,7 +47,7 @@ async fn rebuild_missing_from_events_recovers_applied_change() {
         .await
         .unwrap()
         .expect("rebuilt row");
-    assert_eq!(row.status, "applied");
+    assert_eq!(row.status(), ChangeStatus::Applied);
     assert_eq!(row.branch_name, "branch-rebuild");
     assert_eq!(
         row.commits,
@@ -91,7 +92,7 @@ async fn rebuild_missing_from_events_recovers_discarded_change() {
         .await
         .unwrap()
         .expect("rebuilt row");
-    assert_eq!(row.status, "discarded");
+    assert_eq!(row.status(), ChangeStatus::Discarded);
     assert!(row.resolved_at.is_some());
 
     teardown_test_db(&db).await;
@@ -151,7 +152,11 @@ async fn rebuild_missing_from_events_uses_latest_proposed_payload() {
         !row.hardened,
         "latest hardened=false stays false absent ChangeHardened"
     );
-    assert_eq!(row.status, "pending", "no terminal event → pending");
+    assert_eq!(
+        row.status(),
+        ChangeStatus::Pending,
+        "no terminal event → pending"
+    );
 
     teardown_test_db(&db).await;
 }
@@ -212,7 +217,7 @@ async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
         row.hardened,
         "ChangeHardened after ChangeProposed flips hardened on"
     );
-    assert_eq!(row.status, "pending");
+    assert_eq!(row.status(), ChangeStatus::Pending);
 
     teardown_test_db(&db).await;
 }
@@ -257,8 +262,13 @@ async fn rebuild_missing_from_events_carries_active_merge_worktree() {
         .await
         .unwrap()
         .expect("rebuilt row");
-    assert_eq!(row.merge_worktree_path.as_deref(), Some("/tmp/wt-rebuild"));
-    assert_eq!(row.merge_temp_branch.as_deref(), Some("merge-tmp/rebuild"));
+    assert_eq!(
+        row.merge_worktree(),
+        Some(&MergeWorktree {
+            path: "/tmp/wt-rebuild".into(),
+            temp_branch: "merge-tmp/rebuild".into(),
+        })
+    );
     assert!(proj
         .with_merge_worktree()
         .await
@@ -317,8 +327,7 @@ async fn rebuild_missing_from_events_clears_resolved_merge_worktree() {
         .await
         .unwrap()
         .expect("rebuilt row");
-    assert!(row.merge_worktree_path.is_none());
-    assert!(row.merge_temp_branch.is_none());
+    assert!(row.merge_worktree().is_none());
 
     teardown_test_db(&db).await;
 }
@@ -363,7 +372,7 @@ async fn rebuild_one_from_events_does_not_panic_when_only_aggregate_proposed_exi
         .unwrap()
         .expect("rebuilt row present");
     assert_eq!(row.branch_name, "branch-single");
-    assert_eq!(row.status, "pending");
+    assert_eq!(row.status(), ChangeStatus::Pending);
 
     teardown_test_db(&db).await;
 }

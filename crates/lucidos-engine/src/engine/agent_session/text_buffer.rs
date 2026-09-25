@@ -21,11 +21,18 @@ impl CodingAgentTextBuffer {
     }
 
     /// Make the next text start a new paragraph. Idempotent, so a run of tool
-    /// calls with no prose between them adds one break, not one each.
+    /// calls with no prose between them adds one break, not one each. Text
+    /// ending in one newline gets the second only.
     pub(crate) fn break_paragraph(&mut self) {
-        if !self.text.is_empty() && !self.text.ends_with(PARAGRAPH_BREAK) {
-            self.text.push_str(PARAGRAPH_BREAK);
+        if self.text.is_empty() || self.text.ends_with(PARAGRAPH_BREAK) {
+            return;
         }
+        let missing = if self.text.ends_with('\n') {
+            "\n"
+        } else {
+            PARAGRAPH_BREAK
+        };
+        self.text.push_str(missing);
     }
 
     /// The tail not yet persisted, or `None` while it holds only whitespace.
@@ -91,13 +98,17 @@ mod tests {
 
     /// One step of a turn, as the agent loop sees it.
     enum Step {
-        Text(&'static str),
+        /// Text that opens a new content block.
+        Block(&'static str),
+        /// More text for the block already open.
+        Delta(&'static str),
         Tool,
     }
 
-    /// Drive the buffer the way the loop does: flush after every text chunk,
-    /// and flush then break the paragraph at every tool call. Returns every
-    /// chunk that would have been stored, plus the buffer.
+    /// Drive the buffer the way the loop does: break the paragraph where a
+    /// block opens, flush after every text chunk, and flush then break the
+    /// paragraph at every tool call. Returns every chunk that would have been
+    /// stored, plus the buffer.
     fn run(steps: &[Step]) -> (Vec<String>, CodingAgentTextBuffer) {
         let mut buf = CodingAgentTextBuffer::default();
         let mut chunks = Vec::new();
@@ -109,7 +120,12 @@ mod tests {
         };
         for step in steps {
             match step {
-                Step::Text(text) => {
+                Step::Block(text) => {
+                    buf.break_paragraph();
+                    buf.push(text);
+                    flush(&mut buf);
+                }
+                Step::Delta(text) => {
                     buf.push(text);
                     flush(&mut buf);
                 }
@@ -135,23 +151,56 @@ mod tests {
     #[test]
     fn a_run_of_silent_tool_calls_stores_no_bare_paragraph_breaks() {
         use Step::*;
-        let (chunks, _) = run(&[Text("A"), Tool, Tool, Tool, Tool, Text("B"), Tool, Tool]);
+        let (chunks, _) = run(&[Block("A"), Tool, Tool, Tool, Tool, Block("B"), Tool, Tool]);
         assert_eq!(chunks, ["A", "\n\nB"]);
     }
 
     #[test]
     fn the_paragraph_break_between_two_blocks_survives() {
         use Step::*;
-        let (chunks, _) = run(&[Text("A"), Tool, Tool, Text("B")]);
+        let (chunks, _) = run(&[Block("A"), Tool, Tool, Block("B")]);
         assert_eq!(chunks.concat(), "A\n\nB");
+    }
+
+    #[test]
+    fn two_blocks_with_no_tool_call_between_are_two_paragraphs() {
+        use Step::*;
+        let (chunks, _) = run(&[Block("then hardening."), Block("Not done yet.")]);
+        assert_eq!(chunks.concat(), "then hardening.\n\nNot done yet.");
+    }
+
+    #[test]
+    fn a_block_ending_in_a_newline_is_completed_not_doubled() {
+        use Step::*;
+        let (chunks, _) = run(&[Block("A\n"), Block("B")]);
+        assert_eq!(chunks.concat(), "A\n\nB");
+    }
+
+    #[test]
+    fn the_first_block_of_a_turn_gets_no_leading_break() {
+        use Step::*;
+        let (chunks, _) = run(&[Block("A")]);
+        assert_eq!(chunks, ["A"]);
+    }
+
+    #[test]
+    fn deltas_within_one_block_join_with_no_separator() {
+        use Step::*;
+        let (chunks, _) = run(&[Block("Hel"), Delta("lo"), Delta(" world."), Block("Next")]);
+        assert_eq!(chunks.concat(), "Hello world.\n\nNext");
     }
 
     #[test]
     fn prose_already_ending_in_a_break_gets_no_second_one() {
         use Step::*;
-        let (chunks, _) = run(&[Text("A\n\n"), Tool, Tool, Text("B")]);
-        assert_eq!(chunks.concat(), "A\n\nB");
-        assert_no_whitespace_only(&chunks);
+        for steps in [
+            vec![Block("A\n\n"), Tool, Tool, Block("B")],
+            vec![Block("A\n\n"), Block("B")],
+        ] {
+            let (chunks, _) = run(&steps);
+            assert_eq!(chunks.concat(), "A\n\nB");
+            assert_no_whitespace_only(&chunks);
+        }
     }
 
     #[test]
@@ -159,8 +208,9 @@ mod tests {
         use Step::*;
         for steps in [
             vec![Tool, Tool],
-            vec![Text("\n\n"), Tool, Text("  \n")],
-            vec![Text("A"), Tool, Text("\n\n"), Tool],
+            vec![Block("\n\n"), Tool, Block("  \n")],
+            vec![Block("A"), Tool, Block("\n\n"), Tool],
+            vec![Block("A"), Block("\n"), Block("  ")],
         ] {
             let (chunks, _) = run(&steps);
             assert_no_whitespace_only(&chunks);
@@ -170,7 +220,7 @@ mod tests {
     #[test]
     fn a_whitespace_text_chunk_leads_the_next_prose_chunk() {
         use Step::*;
-        let (chunks, _) = run(&[Text("A"), Text("\n\n"), Text("B")]);
+        let (chunks, _) = run(&[Block("A"), Delta("\n\n"), Delta("B")]);
         assert_eq!(chunks, ["A", "\n\nB"]);
     }
 
@@ -178,12 +228,13 @@ mod tests {
     fn stored_chunks_join_to_the_buffer_minus_a_whitespace_tail() {
         use Step::*;
         let (chunks, buf) = run(&[
-            Text("One"),
+            Block("One"),
             Tool,
-            Text("Two\n"),
+            Block("Two\n"),
             Tool,
             Tool,
-            Text("Three"),
+            Block("Three"),
+            Block("Four"),
             Tool,
         ]);
         let joined = chunks.concat();
@@ -192,13 +243,13 @@ mod tests {
             .strip_prefix(joined.as_str())
             .expect("chunks are a prefix");
         assert!(tail.trim().is_empty());
-        assert_eq!(joined, "One\n\nTwo\n\n\nThree");
+        assert_eq!(joined, "One\n\nTwo\n\nThree\n\nFour");
     }
 
     #[test]
     fn multibyte_text_flushes_on_char_boundaries() {
         use Step::*;
-        let (chunks, _) = run(&[Text("Blåbær"), Tool, Text("ørret")]);
+        let (chunks, _) = run(&[Block("Blåbær"), Tool, Block("ørret")]);
         assert_eq!(chunks, ["Blåbær", "\n\nørret"]);
     }
 

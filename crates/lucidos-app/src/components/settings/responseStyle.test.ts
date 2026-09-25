@@ -64,6 +64,15 @@ describe('the response style picker', () => {
     }
   });
 
+  it('marks an edited shipped style, and only that one', () => {
+    const library = [
+      ...SHIPPED.map((s) => (s.id === 'concise' ? { ...s, source: 'overridden' as const } : s)),
+      style({ id: 'board-report', label: 'Board report' }),
+    ];
+    const labels = responseStyleOptions(library).map((o) => o.label);
+    expect(labels).toEqual(['Standard', 'Concise (edited)', 'Minimal', 'Board report']);
+  });
+
   it('leads with Standard, the default and the way back', () => {
     expect(responseStyleOptions(SHIPPED)[0].value).toBe(STANDARD_ID);
   });

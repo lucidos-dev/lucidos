@@ -1111,6 +1111,29 @@ fn stale_resume_on_a_continuation_retries_fresh() {
     );
 }
 
+/// The retry above is refused unless the stale-resume arm releases the spawn
+/// debounce. The arm can return inside the window, and then a kept stamp
+/// answers every caller's fresh retry with `DUPLICATE_SPAWN_ERROR`. The release
+/// sits after the teardown wait, so the retry never overlaps the old process.
+#[test]
+fn the_stale_resume_arm_releases_the_spawn_debounce_for_the_retry() {
+    const RUN_SRC: &str = include_str!("../agent_session/run_session/run.rs");
+    let arm_start = RUN_SRC
+        .find("Stale resume detected")
+        .expect("run.rs must still carry the stale-resume arm");
+    let arm = &RUN_SRC[arm_start..];
+    let ret = arm
+        .find("return Err(STALE_RESUME_ERROR.into());")
+        .expect("the stale-resume arm must still return STALE_RESUME_ERROR");
+    let teardown = arm[..ret]
+        .find("let teardown_deadline")
+        .expect("the stale-resume arm must still await the old process teardown");
+    assert!(
+        arm[teardown..ret].contains("self.clear_spawn_debounce(thread_id);"),
+        "the stale-resume arm must clear the spawn debounce after the teardown wait"
+    );
+}
+
 /// The retry is ONE-SHOT: a second stale resume settles instead of retrying
 /// again, so an engine-driven continuation can never loop. (Unreachable in
 /// practice — the retry passes no resume sid and `is_stale_resume_signal`
@@ -1165,6 +1188,27 @@ fn losing_the_race_to_a_live_session_never_settles_it() {
             ),
             ContinueRecovery::Nothing,
             "the winning session owns the turn and will emit its own terminal"
+        );
+    }
+}
+
+/// The same race, lost one step earlier. After a switch, the event-wait
+/// delivery and the boot auto-resume both resume the thread within a second.
+/// The loser hits the spawn debounce before the winner registers its session,
+/// so it never sees `AGENT_ALREADY_RUNNING_ERROR`. A blind settle here marks
+/// the starting turn "Settled stuck response". The winner can also fail before
+/// registering, so the settle is gated on ownership rather than dropped.
+#[test]
+fn losing_the_race_to_a_starting_session_settles_only_if_nobody_owns_it() {
+    use super::{continue_recovery, ContinueRecovery};
+    for retried in [false, true] {
+        assert_eq!(
+            continue_recovery(
+                Some(crate::engine::claude_code::DUPLICATE_SPAWN_ERROR),
+                retried
+            ),
+            ContinueRecovery::SettleUnlessOwned,
+            "the winner may still be starting, or may have failed before registering"
         );
     }
 }

@@ -307,6 +307,31 @@ fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
     );
 }
 
+/// The thread's waiting row names a background task by its `description`, so
+/// both background tools ask for one. Optional, a model would skip it and the
+/// row would fall back to a raw command.
+#[test]
+fn both_background_tools_require_a_description() {
+    let tools = get_default_tools(&ToolCapabilities::all_open());
+    for name in [tn::RUN_BASH_BACKGROUND, tn::RUN_PYTHON_BACKGROUND] {
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} must be in get_default_tools()"));
+        assert_eq!(
+            tool.parameters["properties"]["description"]["type"], "string",
+            "{name} must accept a string `description`"
+        );
+        let required = tool.parameters["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} must declare `required`"));
+        assert!(
+            required.iter().any(|v| v == "description"),
+            "{name} must require `description`, got {required:?}"
+        );
+    }
+}
+
 /// `run_python_background` mirrors `run_bash_background`'s task_id /
 /// drain / kill contract, but lifts the venv + `packages` auto-install
 /// from `run_python`. Pin its registration + schema shape so a refactor

@@ -28,6 +28,8 @@ describe('threadInfoRows', () => {
     createdAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
     updatedAt: new Date(Date.now() - 60_000).toISOString(),
     messageCount: 3,
+    activeChildrenCount: 0,
+    liveEventWaitCount: 0,
     codingAgentProposed: false,
   } as unknown as ThreadMeta;
 
@@ -61,6 +63,14 @@ describe('threadInfoRows', () => {
 
   it('reads "Waiting" when idle with active children (matches the status dot)', () => {
     const rows = threadInfoRows({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'idle');
+    expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
+    expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
+  });
+
+  // A child idling on its own event wait has not finished (ADR 0254), so its
+  // parent waits on it exactly as on a running child.
+  it('reads "Waiting" when idle with a child that waits', () => {
+    const rows = threadInfoRows({ ...base, waitingChildrenCount: 1 } as ThreadMeta, 'idle');
     expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
     expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });

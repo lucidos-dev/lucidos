@@ -264,7 +264,9 @@ pub(in crate::api) async fn delete_thread_family(
     let worktrees_removed = reclaim_worktrees(&state, &coding_agents).await;
     // Before the emit. The frame is what makes every client re-read the list,
     // and a re-read that lands first reads the stale counts.
-    repair_ancestor_counts(&state, surviving_parent).await;
+    if surviving_parent.is_some() {
+        repair_ancestor_counts(&state).await;
+    }
     if let Some(card) = owed_card {
         state.engine.event_bus.deliver_owed_child_card(card).await;
     }
@@ -808,35 +810,15 @@ async fn parent_outside_family(
 /// table. A delete is rare and takes one thread at a time. Recomputing from
 /// ground truth is cheaper than a bespoke query, and cannot disagree with the
 /// boot pass.
-async fn repair_ancestor_counts(state: &AppState, surviving_parent: Option<Uuid>) {
-    let Some(parent) = surviving_parent else {
-        return;
-    };
+async fn repair_ancestor_counts(state: &AppState) {
+    // The child-count rebuild includes `total_children_count`. A count of one
+    // with no child left draws a chevron that expands to nothing.
     use crate::engine::event_bus::EventBus;
-    if let Err(e) = EventBus::rebuild_active_children_count(&state.pool).await {
-        log!("[Delete] Could not rebuild active_children_count: {}", e);
+    if let Err(e) = EventBus::rebuild_children_counts(&state.pool).await {
+        log!("[Delete] Could not rebuild the child counts: {}", e);
     }
     if let Err(e) = EventBus::rebuild_blocking_descendant_count(&state.pool).await {
         log!("[Delete] Could not rebuild the descendant counts: {}", e);
-    }
-    // `total_children_count` has no rebuild of its own, because until now
-    // nothing could reduce it. It counts children a thread ever had, and
-    // archive deliberately leaves it alone so a lifted family keeps its
-    // chevron. A delete is the first thing that removes children. A count of
-    // one with no child left draws a chevron that expands to nothing.
-    if let Err(e) = sqlx::query(
-        "UPDATE thread_summaries p SET total_children_count = ( \
-             SELECT COUNT(*) FROM thread_summaries c WHERE c.parent_thread_id = p.thread_id \
-         ) WHERE p.thread_id = $1 \
-           AND p.total_children_count <> ( \
-             SELECT COUNT(*) FROM thread_summaries c WHERE c.parent_thread_id = p.thread_id \
-         )",
-    )
-    .bind(parent)
-    .execute(&state.pool)
-    .await
-    {
-        log!("[Delete] Could not repair total_children_count: {}", e);
     }
 }
 

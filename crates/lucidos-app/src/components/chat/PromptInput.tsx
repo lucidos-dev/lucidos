@@ -44,7 +44,7 @@ import { reportDraftClobbered } from './deadKeystrokeProbe';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
-import { prefersReducedMotion } from '../../utils/platform';
+import { isReducedMotion } from '../../utils/motion';
 import { createTapGate } from '../../utils/tapGesture';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { errorDetail } from '../../utils/errorDetail';
@@ -402,7 +402,7 @@ export function PromptInput() {
         // Capture the old inline height BEFORE `autoResize` overwrites it.
         // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
         const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
-          && !isMobile() && !prefersReducedMotion();
+          && !isMobile() && !isReducedMotion();
         const fromHeight = animateSwitch ? el.style.height : '';
         autoResize();
         if (animateSwitch && fromHeight) {
@@ -424,7 +424,12 @@ export function PromptInput() {
     wasComposeViewRef.current = isComposeView;
   }, [tid, composeText, overrideSyncSeq]);
 
-  useFontMetricsResize(() => autoResize());
+  // A font change moves the height the SAME value needs. `resizeTextarea` reads
+  // only the value, so it would keep a box too tall after a smaller UI scale.
+  useFontMetricsResize(() => {
+    const el = inputRef.current;
+    if (el && !isTextareaHeightAnimating(el)) remeasureTextarea(el);
+  });
   useWidthRemeasure(inputRef);
 
   function autoResize() {
@@ -1267,7 +1272,7 @@ export function PromptInput() {
     >
       {/* Icon-only: an up-arrow for send, a stop-square while a turn is
           running/canceling. One stable element swaps only its glyph +
-          aria-label/title between states — no unmount, so no mobile blink. */}
+          aria-label/tooltip between states: no unmount, so no mobile blink. */}
       {morphMode === 'cancel' || morphMode === 'canceling'
         ? <StopIcon />
         : <SendArrowIcon />}

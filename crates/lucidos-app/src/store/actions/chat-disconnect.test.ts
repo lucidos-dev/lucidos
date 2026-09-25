@@ -71,7 +71,6 @@ vi.mock('./thread-loading', () => ({
 
 vi.mock('./devices', () => ({
   getDeviceId: () => 'device-test',
-  pendingDeviceRegistration: vi.fn(),
 }));
 
 vi.mock('../../utils/platform', () => ({

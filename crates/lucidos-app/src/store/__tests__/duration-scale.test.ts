@@ -92,6 +92,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "keeps the drawer's list mounted through its width collapse",
   },
   {
+    file: '../../components/drawer/ThreadFilterCover.tsx',
+    expr: /scaledDurationMs\(FILTER_PANEL_FADE_MS\) \+ FILTER_PANEL_FADE_SLACK_MS/,
+    what: 'keeps the filter panel mounted through its fade out',
+  },
+  {
     file: '../../components/layout/ContentPane.tsx',
     expr: /scaledDurationMs\(NAV_COVER_ANIM_MS\) \+ NAV_COVER_SLACK_MS/,
     what: 'unmounts the navigation cover after its clear animation',
@@ -110,6 +115,41 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     file: '../../components/chat/PromptInput.tsx',
     expr: /scaledDurationMs\(TOGGLES_FADE_MS\) \+ TOGGLES_FADE_SLACK_MS/,
     what: 'keeps the compose-destination row mounted through its fade-out',
+  },
+  {
+    file: '../../utils/bootSplash.ts',
+    expr: /scaledDurationMs\(VEIL_FADE_MS\) \+ FADE_REMOVE_SLACK_MS/,
+    what: 'removes the boot splash if its veil fade never reports its end',
+  },
+  {
+    file: '../../hooks/useBootSplashReady.ts',
+    expr: /scaledDurationMs\(BOOT_SPLASH_MIN_REVEAL_MS\) - elapsedMs/,
+    what: 'holds a ready boot splash until its mark reveal has played',
+  },
+  {
+    file: '../../components/shared/focusMarker.ts',
+    expr: /scaledDurationMs\(NAV_FOCUS_FADE_MS\)/,
+    what: 'removes the nav focus marker classes once its dissolve has run',
+  },
+  {
+    file: '../../components/shared/focusMarker.ts',
+    expr: /scaledDurationMs\(NAV_FOCUS_RAMP_MS\) \+ NAV_FOCUS_HOLD_MS/,
+    what: "starts the marker's full-brightness hold where its ramp ends",
+  },
+  {
+    file: '../../components/chat/promptResize.ts',
+    expr: /scaledDurationMs\(HEIGHT_EASE_MS\) \+ HEIGHT_EASE_SLACK_MS/,
+    what: "settles the textarea's draft-switch height ease if transitionend never fires",
+  },
+  {
+    file: '../../components/shared/ImagePopup.tsx',
+    expr: /scaledDurationMs\(SWIPE_COMMIT_MS\) \+ TRANSITION_SLACK_MS/,
+    what: "runs the image viewer's swipe cleanup if transitionend never fires",
+  },
+  {
+    file: '../../components/layout/Drawer.tsx',
+    expr: /scaledDurationMs\(DRAWER_SLIDE_OUT_MS\) \+ DRAWER_SLIDE_OUT_SLACK_MS/,
+    what: 'closes the menu drawer if its slide-out end never arrives',
   },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so

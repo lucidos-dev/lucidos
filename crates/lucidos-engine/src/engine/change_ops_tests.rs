@@ -267,7 +267,7 @@ fn a_live_resolver_owns_its_change_merge() {
 /// `resolver_present = false` here: an engine restart empties `agent_sessions`
 /// so a pairing stranded by a crash has nobody carrying it, and a later
 /// unrelated turn on that same thread is not a resolver either (its session
-/// carries no `conflict_change_id` for this change). Either way the apply falls
+/// carries no conflict binding for this change). Either way the apply falls
 /// through to the ordinary tiers instead of being refused forever.
 #[test]
 fn a_stranded_pairing_with_no_resolver_does_not_block_apply() {
@@ -816,7 +816,7 @@ fn tier2_merge_session_is_detached_from_the_caller_future() {
         after_spawn
     );
     assert!(
-        after_spawn.contains(r#"c.status == "applied""#),
+        after_spawn.contains("c.status() == ChangeStatus::Applied"),
         "the detached reconcile must be gated on the change really applying, not on \
          the merge task merely finishing. Body was:\n{}",
         after_spawn

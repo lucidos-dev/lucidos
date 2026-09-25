@@ -277,18 +277,22 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   }
 }
 
+/** A turn's reply. The compose view's welcome card shares the class but is no
+ *  reply. A wait that counted it passed on a send that never went out. */
+const TURN_RESPONSE_SELECTOR = '.response-content:not(.welcome-message)';
+
 /** Wait for a response to appear and finish streaming (handles dual-layout) */
 export async function waitForResponse(page: Page, timeout = 90_000): Promise<Locator> {
   // Dual-layout: find a physically visible response-content element
-  await page.waitForFunction(() => {
-    const els = document.querySelectorAll('.response-content');
+  await page.waitForFunction((sel) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     });
-  }, undefined, { timeout });
+  }, TURN_RESPONSE_SELECTOR, { timeout });
 
-  const allResponses = page.locator('.response-content');
+  const allResponses = page.locator(TURN_RESPONSE_SELECTOR);
   const count = await allResponses.count();
   let response = allResponses.first();
   for (let i = 0; i < count; i++) {
@@ -639,6 +643,16 @@ export async function blurActiveElement(page: Page): Promise<void> {
   });
 }
 
+/** Give the page the packaged macOS build's one horizontal difference: the
+ *  `data-titlebar-overlay` attribute, which steps the header's leading control
+ *  past the traffic lights. `titlebar_inset_script` also stamps
+ *  `--titlebar-inset`, which only lifts the bar vertically, and the lights' x,
+ *  whose CSS fallback is the value it stamps. No WebDriver reaches the real
+ *  build (ADR 0016), so a spec simulates it this way. */
+export async function stampOverlayBuild(page: Page): Promise<void> {
+  await page.evaluate(() => document.documentElement.setAttribute('data-titlebar-overlay', ''));
+}
+
 /** Get the top position of the app header (dual-layout safe). Returns -999 if not found. */
 export async function getHeaderTop(page: Page): Promise<number> {
   return page.evaluate(() => {
@@ -850,12 +864,15 @@ export async function clickChangeAction(
   await page.locator(`.split-button-menu:visible button:has-text("${label}")`).first().click();
 }
 
-/** Resolve only on the LAST visible status label leaving Working/Requesting.
+/** Resolve only on the LAST visible turn status leaving Working/Requesting.
  *  Earlier turns may still show idle Done/Diff panels mid-stream of a later
- *  turn, so a "any panel exists" check would return early. */
+ *  turn, so a "any panel exists" check would return early.
+ *
+ *  Only a response panel carries a turn's status. A user bubble's Sent, Read
+ *  or Queued tag shares the label class, and a queued message sits last. */
 export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<void> {
   await page.waitForFunction(() => {
-    const labels = document.querySelectorAll('.exchange-status-label');
+    const labels = document.querySelectorAll('.response-panel .exchange-status-label');
     const visible = Array.from(labels).filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
@@ -873,13 +890,13 @@ export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<
  *  test needs the turn ALIVE, e.g. to hit Cancel while it still runs. Waiting
  *  for prose instead can miss a short mock answer entirely. */
 export async function waitForStreamingToStart(page: Page, minLength = 5, timeout = 30_000): Promise<void> {
-  await page.waitForFunction((min) => {
-    const els = document.querySelectorAll('.response-content');
+  await page.waitForFunction(({ sel, min }) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').length > min;
     });
-  }, minLength, { timeout });
+  }, { sel: TURN_RESPONSE_SELECTOR, min: minLength }, { timeout });
 }
 
 /** Wait until the turn holds output a cancel would KEEP: the same measure, with
@@ -894,8 +911,8 @@ export async function waitForStreamingToStart(page: Page, minLength = 5, timeout
  *  Deliberately NOT the default. A short answer can finish between the first
  *  prose and this returning, which takes the Cancel button away with it. */
 export async function waitForKeptOutputToStart(page: Page, minLength = 1, timeout = 30_000): Promise<void> {
-  await page.waitForFunction((min) => {
-    const els = document.querySelectorAll('.response-content');
+  await page.waitForFunction(({ sel, min }) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return false;
@@ -906,7 +923,7 @@ export async function waitForKeptOutputToStart(page: Page, minLength = 1, timeou
       });
       return (settled.textContent ?? '').length > min;
     });
-  }, minLength, { timeout });
+  }, { sel: TURN_RESPONSE_SELECTOR, min: minLength }, { timeout });
 }
 
 /** Wait for CC to start working (status label shows Working/Requesting) */
@@ -958,15 +975,34 @@ export async function assertUserMessagesVisible(page: Page, markers: string[], t
   }).toPass({ timeout });
 }
 
+/** Assert the markers' user messages are all visible and read top to bottom
+ *  in the given order. Polls, for the same reason as the check above. */
+export async function assertUserMessagesInOrder(page: Page, markers: string[], timeout = 15_000): Promise<void> {
+  await expect(async () => {
+    const positions = await page.evaluate(({ sel, ms }) => {
+      const visibleTexts = Array.from(document.querySelectorAll(sel))
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        })
+        .map(el => el.textContent ?? '');
+      return ms.map(m => visibleTexts.findIndex(t => t.includes(m)));
+    }, { sel: USER_MSG_SELECTOR, ms: markers });
+    expect(positions, `User messages not visible: ${markers.join(', ')}`).not.toContain(-1);
+    expect(positions, `User messages out of sent order: ${markers.join(', ')}`)
+      .toEqual([...positions].sort((a, b) => a - b));
+  }).toPass({ timeout });
+}
+
 /** Count visible response-content elements with non-empty text */
 export async function countVisibleResponses(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const els = document.querySelectorAll('.response-content');
+  return page.evaluate((sel) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     }).length;
-  });
+  }, TURN_RESPONSE_SELECTOR);
 }
 
 /** Wait until at least `count` visible response-content elements have non-empty
@@ -979,25 +1015,25 @@ export async function waitForVisibleResponseCount(
   count: number,
   timeout = 90_000,
 ): Promise<void> {
-  await page.waitForFunction((n) => {
-    const els = document.querySelectorAll('.response-content');
+  await page.waitForFunction(({ sel, n }) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     }).length >= n;
-  }, count, { timeout });
+  }, { sel: TURN_RESPONSE_SELECTOR, n: count }, { timeout });
 }
 
 /** Trimmed text of the last visible response-content element, or '' if none. */
 export async function getLatestVisibleResponseText(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const els = document.querySelectorAll('.response-content');
+  return page.evaluate((sel) => {
+    const els = document.querySelectorAll(sel);
     const visible = Array.from(els).filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     });
     return (visible[visible.length - 1]?.textContent ?? '').trim();
-  });
+  }, TURN_RESPONSE_SELECTOR);
 }
 
 /** Count visible thread-row elements (handles dual-layout) */

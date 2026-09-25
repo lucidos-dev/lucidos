@@ -3,6 +3,10 @@ use axum::http::HeaderName;
 use axum::routing::any;
 use axum::Router;
 
+/// The default wait, which every test not about the timeout itself runs under.
+const TEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::api::proxy_timeout::DEFAULT_SECS);
+
 fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut h = HeaderMap::new();
     for (n, v) in pairs {
@@ -816,6 +820,7 @@ async fn run_method_test(method: Method, body: &str) {
         Vec::new(),
         Bytes::copy_from_slice(body.as_bytes()),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -868,6 +873,7 @@ async fn upstream_does_not_see_stripped_headers() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -909,6 +915,7 @@ async fn the_engines_own_trust_headers_never_reach_an_upstream() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -944,6 +951,7 @@ async fn upstream_does_not_see_host_header_from_engine() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -984,6 +992,7 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
         auth_vec,
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1042,6 +1051,7 @@ async fn an_injected_header_replaces_the_callers_own() {
         auth_vec,
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1074,6 +1084,7 @@ async fn a_stale_caller_content_length_does_not_frame_the_body() {
         Vec::new(),
         Bytes::copy_from_slice(signed.as_bytes()),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1136,6 +1147,7 @@ async fn a_produced_header_value_the_codec_refuses_is_refused_not_dropped() {
     let err = forward_with_redirects(
         "comfort",
         &scoped,
+        &CallBudget::start(TEST_TIMEOUT),
         &Method::GET,
         "v1/items",
         None,
@@ -1170,6 +1182,7 @@ async fn forwards_query_param_auth_to_upstream() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1193,6 +1206,7 @@ async fn forwards_query_param_auth_preserves_existing_query() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1211,6 +1225,7 @@ async fn upstream_5xx_passes_through() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1272,6 +1287,7 @@ async fn forward_request_does_not_auto_follow_30x() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
@@ -1371,6 +1387,7 @@ async fn a_redirect_under_a_base_path_does_not_double_the_prefix() {
     let (resp, _) = forward_with_redirects(
         "backend",
         &scoped,
+        &CallBudget::start(TEST_TIMEOUT),
         &Method::GET,
         "items",
         None,
@@ -1396,6 +1413,7 @@ async fn a_redirect_out_of_the_base_path_is_refused() {
     let err = forward_with_redirects(
         "backend",
         &scoped,
+        &CallBudget::start(TEST_TIMEOUT),
         &Method::GET,
         "items",
         None,
@@ -1424,6 +1442,7 @@ async fn a_303_is_replayed_as_a_bodyless_get() {
     let (resp, _) = forward_with_redirects(
         "backend",
         &scoped,
+        &CallBudget::start(TEST_TIMEOUT),
         &Method::POST,
         "jobs",
         None,
@@ -1456,6 +1475,7 @@ async fn upstream_unreachable_returns_502() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -2952,6 +2972,7 @@ async fn a_provider_without_the_opt_in_refuses_an_invalid_certificate() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(
@@ -2968,6 +2989,7 @@ async fn a_provider_without_the_opt_in_refuses_an_invalid_certificate() {
         Vec::new(),
         Bytes::new(),
         Transport::Unverified,
+        TEST_TIMEOUT,
     )
     .await;
     assert_eq!(
@@ -2995,4 +3017,282 @@ async fn the_transport_follows_the_entry_flag() {
         .unwrap();
     assert_eq!(verified.transport, Transport::Verified);
     assert_eq!(unverified.transport, Transport::Unverified);
+}
+
+/// An upstream that answers `ok` after `delay`, however it is asked.
+async fn spawn_slow_upstream(delay: std::time::Duration) -> String {
+    let app = Router::new().fallback(any(move || async move {
+        tokio::time::sleep(delay).await;
+        "ok"
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The wait is the one `forward_request` is handed. Running past it is a 504,
+/// and the body carries neither the URL nor the credential in its query.
+#[tokio::test]
+async fn an_upstream_slower_than_the_timeout_answers_504_without_the_url() {
+    let base = spawn_slow_upstream(std::time::Duration::from_secs(3)).await;
+    let url = format!("{base}/v1/slow?key=secret-value");
+    let log_url = redacted_query_log_url(&format!("{base}/v1/slow"), "key");
+    let resp = forward_request(
+        Method::GET,
+        &url,
+        &log_url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = body_text(resp).await;
+    assert!(body.contains("upstream timeout"), "{body}");
+    assert!(
+        !body.contains("secret-value"),
+        "the credential leaked: {body}"
+    );
+    assert!(!body.contains("/v1/slow"), "the URL leaked: {body}");
+}
+
+/// A wait longer than the upstream's delay lets the call finish. No fixed
+/// client-level limit sits underneath it any more.
+#[tokio::test]
+async fn an_upstream_within_the_timeout_answers_normally() {
+    let base = spawn_slow_upstream(std::time::Duration::from_millis(1500)).await;
+    let url = format!("{base}/v1/slow");
+    let resp = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "ok");
+}
+
+/// The entry's `timeout_secs` reaches the forward through the dispatch path,
+/// and the same entry with a shorter one is cut.
+#[tokio::test]
+async fn an_entry_timeout_reaches_the_forward() {
+    let base = spawn_slow_upstream(std::time::Duration::from_millis(1500)).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    let scoped = ScopedPipeline::bind(&ctx, "slow", base.clone(), Vec::new(), false)
+        .await
+        .expect("an unauthenticated loopback entry binds");
+    for (entry_secs, expected) in [(5.0, StatusCode::OK), (1.0, StatusCode::GATEWAY_TIMEOUT)] {
+        let timeout = crate::api::proxy_timeout::effective(Some(entry_secs), Some("600")).unwrap();
+        let resp = dispatch_scoped(
+            "slow",
+            &scoped,
+            timeout,
+            Method::GET,
+            "v1/slow".to_string(),
+            None,
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(resp.status(), expected, "timeout_secs = {entry_secs}");
+    }
+}
+
+/// An out-of-range `timeout_secs` refuses its own entry, by name and in words
+/// naming the field and the range, and leaves its neighbours working.
+#[test]
+fn an_entry_timeout_out_of_range_refuses_only_that_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(
+        &tmp,
+        r#"{
+          "patient": {"base_url": "https://patient.test", "timeout_secs": 300},
+          "too-long": {"base_url": "https://long.test", "timeout_secs": 601},
+          "zero": {"base_url": "https://zero.test", "timeout_secs": 0}
+        }"#,
+    );
+    let load = load_proxy_config(&ws);
+    assert_eq!(load.providers["patient"].timeout_secs, Some(300.0));
+    assert_eq!(
+        rejected_names(&ws),
+        vec!["too-long".to_string(), "zero".to_string()]
+    );
+    let reason = &load
+        .rejected
+        .iter()
+        .find(|r| r.provider.as_deref() == Some("too-long"))
+        .unwrap()
+        .reason;
+    assert!(reason.contains("'timeout_secs'"), "{reason}");
+    assert!(reason.contains("between 1 and 600"), "{reason}");
+}
+
+/// Every redirect hop starts its own request wait, so a slow chain could run
+/// far past the setting. The call cap stops it with a 504 from the engine,
+/// which is what lets a client wait a fixed time and never cut first.
+#[tokio::test]
+async fn a_slow_redirect_chain_is_cut_by_the_call_cap() {
+    let app = Router::new().fallback(any(|| async {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        (
+            StatusCode::FOUND,
+            [(axum::http::header::LOCATION, "/hop")],
+            "",
+        )
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    let scoped = ScopedPipeline::bind(&ctx, "chain", base, Vec::new(), false)
+        .await
+        .expect("an unauthenticated loopback entry binds");
+
+    let started = std::time::Instant::now();
+    let budget = CallBudget::with_cap(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(1000),
+    );
+    let status = match forward_with_redirects(
+        "chain",
+        &scoped,
+        &budget,
+        &Method::GET,
+        "hop",
+        None,
+        &HeaderMap::new(),
+        &Bytes::new(),
+    )
+    .await
+    {
+        Ok((resp, _)) => resp.status(),
+        Err((status, _)) => status,
+    };
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1800),
+        "the cap must stop the chain near 1 s, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A streamed reply sends its headers at once and its body slowly, so the wait
+/// runs out while the body is read. That is the same timeout, and it answers
+/// 504 rather than the 502 of a broken connection.
+#[tokio::test]
+async fn a_body_that_outlasts_the_timeout_answers_504() {
+    let app = Router::new().fallback(any(|| async {
+        let chunks = futures::StreamExt::then(futures::stream::iter(0..3), |i| async move {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: chunk\n\n"))
+        });
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/stream", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let resp = forward_request(
+        Method::POST,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = body_text(resp).await;
+    assert!(body.starts_with("upstream timeout"), "{body}");
+}
+
+/// A layer that takes two seconds, the way a token refresh or a handshake
+/// script can.
+struct SlowLayer;
+
+#[async_trait::async_trait]
+impl crate::api::proxy_auth_layer::AuthLayer for SlowLayer {
+    fn output_namespace(&self) -> &str {
+        "slow"
+    }
+    fn scope_bindings(&self) -> Vec<crate::api::proxy_auth_layer::ScopeBinding> {
+        Vec::new()
+    }
+    async fn apply(
+        &self,
+        _input: &crate::api::proxy_auth_layer::LayerInput<'_>,
+    ) -> Result<crate::api::proxy_auth_layer::AuthMutation, (StatusCode, String)> {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Ok(Default::default())
+    }
+}
+
+/// The pipeline runs under what is left of the call. So a slow login step
+/// cannot carry the call past its cap, or past a client's fixed wait.
+#[tokio::test]
+async fn a_slow_pipeline_step_is_cut_by_the_call_cap() {
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    let layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> = vec![Arc::new(SlowLayer)];
+    let scoped = ScopedPipeline::bind(&ctx, "slow-login", base, layers, false)
+        .await
+        .expect("a loopback upstream binds");
+    let budget = CallBudget::with_cap(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(500),
+    );
+    let started = std::time::Instant::now();
+    let err = forward_with_redirects(
+        "slow-login",
+        &scoped,
+        &budget,
+        &Method::GET,
+        "v1/items",
+        None,
+        &HeaderMap::new(),
+        &Bytes::new(),
+    )
+    .await
+    .expect_err("the call runs out of time inside the pipeline");
+    assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT, "{}", err.1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the cap must stop the slow step, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        slot.lock().unwrap().is_none(),
+        "no request may reach the upstream"
+    );
 }

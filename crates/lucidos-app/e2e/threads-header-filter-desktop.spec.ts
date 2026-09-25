@@ -45,30 +45,37 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       if (!header) return null;
       const title = header.querySelector('.threads-header-title') as HTMLElement | null;
       const filter = header.querySelector('button[aria-label="Filter threads"]') as HTMLElement | null;
+      const search = header.querySelector('button[aria-label="Search threads"]') as HTMLElement | null;
       const selector = header.querySelector('button[aria-label="Switch thread view"]');
       const rect = (el: HTMLElement | null) => el ? el.getBoundingClientRect() : null;
       return {
         titleTextAlign: title ? getComputedStyle(title).textAlign : '',
         titleLeft: rect(title)?.left ?? 0,
+        titleRight: rect(title)?.right ?? 0,
         filterWidth: rect(filter)?.width ?? 0,
+        filterLeft: rect(filter)?.left ?? 0,
         filterRight: rect(filter)?.right ?? 0,
+        searchLeft: rect(search)?.left ?? 0,
         hasSeparateSelector: !!selector,
       };
     });
 
     const empty = await measure();
     expect(empty, 'visible threads-header').not.toBeNull();
-    // The view selector has been merged into the Filter control — there is no
+    // The view selector has been merged into the Filter control: there is no
     // separate "Switch thread view" button anymore.
     expect(empty!.hasSeparateSelector, 'no separate view-selector button').toBe(false);
     expect(empty!.filterWidth, 'single Filter button is visible').toBeGreaterThan(20);
-    // The Filter button sits left of the Threads title box (the title is flex:1,
-    // so its box starts right after the button).
-    expect(empty!.filterRight, 'Filter button sits left of the Threads title')
-      .toBeLessThanOrEqual(empty!.titleLeft + 1);
-    // The title centres in the gap between the Filter button and the Search icon
-    // (079672700 — "center Threads title between Filter and Search icons").
-    expect(empty!.titleTextAlign, 'Threads title text centres between Filter and Search').toBe('center');
+    // Filter sits at the trailing end, right of the title and just left of
+    // Search. The row's leading end belongs to the drawer toggle.
+    expect(empty!.filterLeft, 'Filter button sits right of the Threads title')
+      .toBeGreaterThanOrEqual(empty!.titleRight - 1);
+    const filterToSearch = empty!.searchLeft - empty!.filterRight;
+    expect(filterToSearch, 'Filter button sits just left of Search').toBeGreaterThanOrEqual(0);
+    expect(filterToSearch, 'Filter button sits just left of Search').toBeLessThanOrEqual(8);
+    // The title is centred on the drawer pane (split-resize-desktop.spec.ts
+    // measures that); its text centres in its own box.
+    expect(empty!.titleTextAlign, 'Threads title text centres in its box').toBe('center');
 
     // The needs-attention badge is absolutely positioned, so even a draft that
     // surfaces per-view counts in the menu must not move the title.
@@ -81,16 +88,13 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
   });
 
   test('the title never runs under a header control, on either desktop build, at the drawer floor', async ({ page }) => {
-    // The packaged macOS build indents the whole row so its leading control
-    // clears the traffic lights, which leaves the least room the title ever
-    // gets. It used to lift the Filter button OUT of the row instead
-    // (`position: absolute` beside the lights, with the row reserving its
-    // footprint back), and the flex-centred title took that space anyway,
-    // printing the funnel glyph through the word. Flex siblings cannot overlap,
-    // so this now guards the arrangement rather than a reserve, on the build
-    // where the row is tightest. Simulated by stamping what
-    // `titlebar_inset_script` stamps: nothing in the CSS keys off Tauri itself,
-    // so this is the same geometry the packaged webview lays out.
+    // The packaged macOS build rests the drawer toggle past the traffic lights.
+    // The row keeps that whole lead free for it, so the title gets the least
+    // room there. The title is centred on the pane and clamped to clear the
+    // wider of the row's two ends: the toggle's room, or Filter and Search.
+    // This checks the clamp at the drawer floor, on the tightest build.
+    // Simulated by stamping what `titlebar_inset_script` stamps: nothing in the
+    // CSS keys off Tauri itself, so this is the geometry the webview lays out.
     await sizeAndOpen(page);
     await page.locator('.threads-header button[aria-label="Filter threads"]').click();
     await expect(page.locator('.thread-drawer .thread-filter-panel')).toBeVisible();
@@ -98,8 +102,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // The TITLE's BOX, not its text run: the text is clipped to the box with an
     // ellipsis, so a range measurement reports the unclipped extent and would
     // read a legitimately truncated title as an overlap. The box is the
-    // structural property anyway. That is exactly what broke: with the button
-    // out of flow the title's box covered it, where a flex sibling cannot.
+    // structural property anyway, since the clamp is what keeps it clear.
     const measure = () => page.evaluate(() => {
       const header = Array.from(document.querySelectorAll('.threads-header'))
         .find((h) => h.getBoundingClientRect().width > 0) as HTMLElement | undefined;
@@ -107,8 +110,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const title = header.querySelector('.threads-header-title') as HTMLElement | null;
       if (!title) return null;
       const box = title.getBoundingClientRect();
-      const overlap = (sel: string) => {
-        const el = header.querySelector(sel) as HTMLElement | null;
+      const overlapOf = (el: Element | null) => {
         if (!el) return -1;
         const r = el.getBoundingClientRect();
         return Math.max(0, Math.min(r.right, box.right) - Math.max(r.left, box.left));
@@ -116,8 +118,11 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const search = header.querySelector('button[aria-label="Search threads"]') as HTMLElement;
       return {
         drawerWidth: header.getBoundingClientRect().width,
-        filter: overlap('button[aria-label="Filter threads"]'),
-        search: overlap('button[aria-label="Search threads"]'),
+        // The toggle is not a member of the row: it rests over the row's
+        // leading end from the header, so it is found from the header.
+        toggle: overlapOf(document.querySelector('.desktop-header .thread-toggle-slot .thread-toggle')),
+        filter: overlapOf(header.querySelector('button[aria-label="Filter threads"]')),
+        search: overlapOf(search),
         titleWidth: box.width,
         searchInside: search.getBoundingClientRect().right
           <= header.getBoundingClientRect().right + 1,
@@ -128,7 +133,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     for (const overlay of [false, true]) {
       const build = overlay ? 'packaged macOS' : 'web';
       // Stamp the build FIRST: the two rows lay out differently (the packaged
-      // one indents past the traffic lights), so a drag run before the attribute
+      // one leads past the traffic lights), so a drag run before the attribute
       // would measure the other build's row. The FLOOR is the same on both
       // (ADR 0058), which is why one `toBeGreaterThan` covers the pair.
       await page.evaluate((on) => {
@@ -166,6 +171,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       expect(g!.titleWidth, `${build}: the title has no room left at all`)
         .toBeGreaterThan(20);
       expect(g!.searchInside, `${build}: the Search button is outside the drawer`).toBe(true);
+      expect(g!.toggle, `${build}: title overlaps the drawer toggle`).toBe(0);
       expect(g!.filter, `${build}: title overlaps the Filter button`).toBe(0);
       expect(g!.search, `${build}: title overlaps the Search button`).toBe(0);
     }
@@ -185,9 +191,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
 
     // The pane header names what the pane is showing, so the panel needs no
     // title row of its own. It needs no footer either: the header's Filter
-    // button is the way out, wearing an X while the panel is up (asserted in its
+    // button is the way out, held down while the panel is up (asserted in its
     // own test below).
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Filters');
+    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Filters');
     await expect(panel.locator('.thread-filter-panel-header')).toHaveCount(0);
     await expect(panel.locator('.thread-filter-panel-footer')).toHaveCount(0);
     await expect(panel.locator('.thread-filter-close')).toHaveCount(0);
@@ -332,65 +338,108 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(panel).toHaveCount(0);
   });
 
-  test('the Filter glyph becomes an X while the panel is up, and that X is the way out', async ({ page }) => {
+  test('the Filter button is held down while the panel is up, and pressing it again is the way out', async ({ page }) => {
     await sizeAndOpen(page);
 
     const filterBtn = page.locator('.threads-header button[aria-label="Filter threads"]');
+    // The glyph on show: the button keeps every glyph mounted for its crossfade.
+    const glyph = filterBtn.locator('.crossfade-layer[data-current] svg');
     const panel = page.locator('.thread-drawer .thread-filter-panel');
 
-    // Closed, the button wears the funnel (FilterIcon's three lines), the glyph
-    // for the default `all` status.
-    await expect(filterBtn.locator('svg line')).toHaveCount(3);
+    // Closed, the button wears the plain funnel (one outline, not filled), the
+    // glyph for an unfiltered `all` view, and it is not pressed.
+    await expect(glyph.locator('path')).toHaveCount(1);
+    await expect(glyph.locator('line, circle')).toHaveCount(0);
+    await expect(glyph).toHaveAttribute('fill', 'none');
+    const funnel = await glyph.innerHTML();
+    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
     await expect(filterBtn).toHaveAttribute('aria-expanded', 'false');
 
     await filterBtn.click();
     await expect(panel).toBeVisible();
 
-    // Open, it wears the X (CloseIcon's two crossed paths). The panel dropped its
-    // Close footer, so this button and Escape are the only exits and the glyph
-    // has to say which one it is.
-    await expect(filterBtn.locator('svg path')).toHaveCount(2);
-    await expect(filterBtn.locator('svg path').first()).toHaveAttribute('d', 'M18 6 6 18');
+    // Open, it is the same funnel, pressed, and no X. At the far end of the
+    // header an X reads as "close this pane".
+    expect(await glyph.innerHTML(), 'opening swapped the funnel').toBe(funnel);
+    await expect(filterBtn).toHaveClass(/view-selector-active/);
     // The accessible NAME does not change with it: this is a disclosure, and
     // aria-expanded is what carries the state.
     await expect(filterBtn).toHaveAttribute('aria-expanded', 'true');
 
-    // Pressing the X closes the panel, and closing is not a commit: the list is
-    // back, the pane title says so, and the funnel is back on the button.
+    // Pressing it again closes the panel, and closing is not a commit: the list
+    // is back, the pane title says so, and the button is released.
     await filterBtn.click();
     await expect(panel).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
+    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
     await expect(page.locator('.thread-drawer .thread-drawer-list')).toBeVisible();
-    await expect(filterBtn.locator('svg line')).toHaveCount(3);
+    expect(await glyph.innerHTML()).toBe(funnel);
+    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
   });
 
-  test('the X sheds the filtered highlight, and picking a status back up puts it on', async ({ page }) => {
-    // While the panel is open the button is an exit, not a status line: the
-    // panel underneath is already saying what the filter is, so the highlight
-    // (and the needs-attention badge with it) comes off the glyph the user is
-    // about to press.
+  test('pressed means the panel is open, and the glyph says what the list is filtered to', async ({ page }) => {
+    // A filtered list must not look like a panel left open. So the highlight
+    // follows the panel alone, and the glyph carries the filter, open or closed.
     await sizeAndOpen(page);
 
     const filterBtn = page.locator('.threads-header button[aria-label="Filter threads"]');
+    // The glyph on show: the button keeps every glyph mounted for its crossfade.
+    const glyph = filterBtn.locator('.crossfade-layer[data-current] svg');
     const panel = page.locator('.thread-drawer .thread-filter-panel');
+    await expect(glyph).toHaveAttribute('fill', 'none');
+    const funnel = await glyph.innerHTML();
 
     // Put a filter on: picking a status applies it and closes the panel, so the
-    // button comes back highlighted.
+    // button comes back released, wearing that status's own glyph.
     await filterBtn.click();
     await panel.locator('.drawer-view-option', { hasText: 'Review' }).click();
     await expect(panel).toHaveCount(0);
-    await expect(filterBtn).toHaveClass(/view-selector-active/);
+    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    const review = await glyph.innerHTML();
+    expect(review, 'the closed button stopped reporting the status').not.toBe(funnel);
 
-    // Reopening drops the highlight even though the filter is still on.
+    // Reopening presses the button and drops the badge, but the glyph stays the
+    // status's own: pressing never swaps what it reports.
     await filterBtn.click();
     await expect(panel).toBeVisible();
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
-    await expect(filterBtn.locator('.badge')).toHaveCount(0);
+    await expect(filterBtn).toHaveClass(/view-selector-active/);
+    expect(await glyph.innerHTML(), 'opening swapped the status glyph').toBe(review);
+    // The badge stays mounted to fade, so what drops is its shown state.
+    await expect(filterBtn.locator('.badge[data-shown]')).toHaveCount(0);
+    await expect(filterBtn.locator('.badge')).toBeHidden();
 
-    // Closing hands the filter's own state back to the button.
+    // Closing releases it and keeps the glyph.
     await filterBtn.click();
     await expect(panel).toHaveCount(0);
-    await expect(filterBtn).toHaveClass(/view-selector-active/);
+    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    expect(await glyph.innerHTML(), 'closing swapped the status glyph').toBe(review);
+
+    // Back on All statuses, the plain funnel returns.
+    await filterBtn.click();
+    await panel.locator('.drawer-view-option', { hasText: 'All statuses' }).click();
+    await expect(panel).toHaveCount(0);
+    expect(await glyph.innerHTML()).toBe(funnel);
+    await expect(glyph).toHaveAttribute('fill', 'none');
+
+    // Narrowing All statuses by thread type fills the funnel, the same glyph
+    // pressed or released.
+    await filterBtn.click();
+    const lucidos = panel.locator(
+      '.thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' },
+    );
+    await lucidos.click();
+    await expect(glyph).toHaveAttribute('fill', 'currentColor');
+    await filterBtn.click();
+    await expect(panel).toHaveCount(0);
+    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    await expect(glyph).toHaveAttribute('fill', 'currentColor');
+
+    // Tick it back on, so the test leaves the list as it found it.
+    await filterBtn.click();
+    await lucidos.click();
+    await expect(glyph).toHaveAttribute('fill', 'none');
+    await filterBtn.click();
+    await expect(panel).toHaveCount(0);
+    expect(await glyph.innerHTML()).toBe(funnel);
   });
 
   test('the panel sits on the thread list own column: same left inset, same edges', async ({ page }) => {
@@ -406,7 +455,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     const geometry = await page.evaluate(() => {
       const px = (el: Element, prop: string) => parseFloat(getComputedStyle(el).getPropertyValue(prop));
       const list = document.querySelector('.thread-drawer .thread-drawer-list')!;
-      const panel = document.querySelector('.thread-drawer .thread-filter-panel')!;
+      // The cover is the box the panel shows in, so it carries the padding.
+      const cover = document.querySelector('.thread-drawer .thread-filter-cover')!;
+      const panel = cover.querySelector('.thread-filter-panel')!;
       const statusRow = panel.querySelector('.drawer-view-option')!;
       const typeRow = panel.querySelector('.thread-filter-option')!;
       const heading = panel.querySelector('.thread-filter-title')!;
@@ -417,11 +468,27 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       list.appendChild(row);
       const listColumn = px(row, 'padding-left');
       row.remove();
+      // Where the words sit inside their heading row. A list heading is built
+      // here rather than found, since a cleared workspace may render none.
+      const wordsOffset = (title: Element) => {
+        const range = document.createRange();
+        range.selectNodeContents(title.querySelector('.drawer-section-label')!);
+        return range.getBoundingClientRect().top - title.getBoundingClientRect().top;
+      };
+      const listHeading = document.createElement('div');
+      listHeading.className = 'list-section-title list-section-title-collapsible';
+      listHeading.innerHTML = '<span class="drawer-section-icon"></span>'
+        + '<span class="drawer-section-label">Pinned</span>';
+      list.prepend(listHeading);
+      const listWords = wordsOffset(listHeading);
+      listHeading.remove();
       return {
+        headingWords: wordsOffset(heading),
+        listWords,
         listColumn,
-        panelTop: px(panel, 'padding-top'),
+        panelTop: px(cover, 'padding-top'),
         listTop: px(list, 'padding-top'),
-        panelLeft: px(panel, 'padding-left'),
+        panelLeft: px(cover, 'padding-left'),
         statusLeft: px(statusRow, 'padding-left'),
         typeLeft: px(typeRow, 'padding-left'),
         headingLeft: px(heading, 'padding-left'),
@@ -437,6 +504,8 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     expect(geometry.statusLeft).toBe(geometry.listColumn);
     expect(geometry.typeLeft).toBe(geometry.listColumn);
     expect(geometry.headingLeft).toBe(geometry.listColumn);
+    // And its words stand at the same height in their row as a list heading's.
+    expect(Math.abs(geometry.headingWords - geometry.listWords)).toBeLessThan(0.1);
   });
 
   test('the Filter button opens reliably and toggles closed (Chrome open-bug regression)', async ({ page }) => {
@@ -452,7 +521,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Re-clicking the toggle closes it, and the pane title goes back.
     await filterBtn.click();
     await expect(panel).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
+    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
 
     // And it opens again on the next click.
     await filterBtn.click();
@@ -480,7 +549,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Reopening lands on the thread list, and the title says so.
     await openThreadDrawer(page);
     await expect(page.locator('.thread-filter-panel')).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
+    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
   });
 
   test('is a pane view, not an overlay: a click elsewhere acts normally and leaves it open', async ({ page }) => {

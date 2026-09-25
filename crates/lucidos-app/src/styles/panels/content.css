@@ -152,28 +152,30 @@
 /* ─── Notification detail (rendered in the content pane) ─── */
 /* The pane's own .content-pane-body scrolls, so the detail lays out at natural
    height — no nested flex:1/overflow scroll region (which had no defined height
-   outside the former modal's flex column). */
+   outside the former modal's flex column).
+   Capped and centred like the transcript (`.thread-content > *`), so on a wide
+   pane the date, the chevrons and the centred actions stay one column. */
 .notification-detail {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    max-width: var(--content-max-width);
+    margin-inline: auto;
 }
 
-/* Nav row above the title: prev/next chevrons at the ends with the date
- * centered between them. The date flexes to fill the middle so it stays centered
- * regardless of the chevrons' fade state; align-items:center sits the single-line
- * date vertically against the 2rem chevrons. The bottom padding is the whole gap
- * down to the title, which sets no top padding of its own. */
+/* Nav row above the title. The date sits on the title's left edge and the
+ * newer/older chevrons on the right. The bottom padding is the whole gap down
+ * to the title, which sets no top padding. */
 .notification-detail-header {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-sm);
     padding: var(--space-md) var(--space-lg) var(--space-lg);
 }
 
 .notification-detail-date {
     flex: 1;
-    text-align: center;
+    min-width: 0;
     font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }
@@ -191,20 +193,19 @@
     overflow-wrap: anywhere;
 }
 
-/* Prev/next chevrons at the ends of the nav row, mirroring the thread-view
- * scroll chevrons (.scroll-to-top / .scroll-to-bottom in chat/input-messages.css)
- * but pointing left/right. Always rendered with a fixed slot (flex: none) so the
- * centered date never shifts; they sit `:disabled` (greyed, no pointer events) at
- * the first / last notification rather than fading out. */
+/* Newer/older chevrons, mirroring the thread-view scroll chevrons
+ * (.scroll-to-top / .scroll-to-bottom in chat/input-messages.css). They sit
+ * `:disabled` (greyed, no pointer events) at either end of the list rather than
+ * fading out, so the group never changes width. */
 .notification-detail-nav {
     flex: none;
-    width: 2rem;
-    height: 2rem;
+    width: var(--scroll-chevron-size);
+    height: var(--scroll-chevron-size);
     border-radius: 50%;
     background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
     backdrop-filter: blur(0.5rem);
     -webkit-backdrop-filter: blur(0.5rem);
-    border: 0.125rem solid var(--border-color);
+    border: 1px solid var(--border-color);
     color: var(--text-secondary);
     cursor: pointer;
     display: flex;
@@ -215,24 +216,37 @@
         color var(--duration-fast), border-color var(--duration-fast);
 }
 
+.notification-detail-nav svg {
+    width: var(--scroll-chevron-glyph);
+    height: var(--scroll-chevron-glyph);
+}
+
 .notification-detail-nav:disabled {
     opacity: 0.3;
     cursor: default;
     pointer-events: none;
 }
 
-/* iOS PWA back-swipe gutter clearance. The content pane is flush to the screen
- * edge on mobile (no .content-pane-body inset), so the default 1rem header
- * padding put the prev chevron's left edge ~16px from the edge — inside iOS's
- * left-edge back-swipe gesture zone, which intermittently swallowed taps on it
- * (the "back chevron doesn't always react; works if I tap toward its centre"
- * report). Inset both chevrons symmetrically so the whole button sits past the
- * gutter while the date stays centred between them; max() keeps the notch
- * safe-area inset in landscape. Mobile-only — desktop has no edge gesture. */
+/* On mobile the older chevron's right edge lines up with the header bell's
+ * drawn glyph right above it. That glyph sits the header row's inline padding
+ * plus half the button's slack inside the screen edge. The 0.625rem is a copy
+ * of `.pane-header`'s --header-padding-x, which is declared on the header and
+ * so cannot be read here. max() keeps the notch safe-area inset in landscape.
+ *
+ * That puts the button partly under `.edge-swipe-zone`, the transparent 1.25rem
+ * strip on the pane's right edge. The z-index lifts it clear, as
+ * `.notification-row-detail-btn` above does and for the same reason. */
 @media (max-width: 768px) {
     .notification-detail-header {
-        padding-left: max(2.25rem, env(safe-area-inset-left, 0px));
-        padding-right: max(2.25rem, env(safe-area-inset-right, 0px));
+        padding-right: max(
+            calc(0.625rem + (var(--mobile-header-icon-box) - var(--mobile-header-glyph-box)) / 2),
+            env(safe-area-inset-right, 0px)
+        );
+    }
+
+    .notification-detail-nav {
+        position: relative;
+        z-index: 2;
     }
 }
 

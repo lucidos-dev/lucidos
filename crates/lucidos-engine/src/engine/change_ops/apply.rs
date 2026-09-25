@@ -59,6 +59,13 @@ pub(crate) async fn resolve_harden_worktree(
     }
 }
 
+/// Where a merge left `main`, and the commit subjects it brought in.
+struct MergedShas {
+    pre_sha: String,
+    post_sha: String,
+    commits: Vec<String>,
+}
+
 impl LucidosEngine {
     /// Why a `BoundedSecurityFix` branch may not apply, or `None` when
     /// everything it puts on main is inside the files it named.
@@ -182,6 +189,56 @@ impl LucidosEngine {
         )
     }
 
+    /// The success tail every merge path shares once `main` has moved:
+    /// announce the apply, refresh what caches the change's files, and build
+    /// the result.
+    async fn finish_merged_apply(
+        &self,
+        change: &crate::core::changes::Change,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+        kind_ctx: &ApplyKindContext,
+        effective_requires_restart: bool,
+        merged: MergedShas,
+    ) -> ApplyResult {
+        let MergedShas {
+            pre_sha,
+            post_sha,
+            commits,
+        } = merged;
+        self.emit_change_applied(
+            change.thread_id.unwrap_or(change_id),
+            change_id,
+            effective_requires_restart,
+            files_have_client_update(&change.files),
+            commits.clone(),
+            change.thread_title.clone(),
+            actor.clone(),
+            Some(pre_sha.clone()),
+            Some(post_sha.clone()),
+        )
+        .await;
+        self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
+            .await;
+        self.emit_entity_events_for_change_apply(
+            &change.files,
+            Some(&pre_sha),
+            Some(&post_sha),
+            actor,
+        )
+        .await;
+        self.broadcast_changes_updated().await;
+        ApplyResult::applied_with_merge(
+            change_id,
+            change.thread_id,
+            effective_requires_restart,
+            pre_sha,
+            post_sha,
+            &commits,
+            change.files.len(),
+        )
+    }
+
     /// Apply a single pending change: merge its branch into main.
     /// `actor` identifies who initiated the apply. HTTP callers construct via
     /// `api::actor::build_message_origin`; engine-internal callers pass `None`.
@@ -203,7 +260,7 @@ impl LucidosEngine {
     /// reason: their result is `Conflict` at return time, so this gate can never
     /// see the eventual `Applied`. The live in-place merge reconciles in
     /// `apply_now_success`; the detached Tier-2 merge reconciles in its spawned
-    /// task, re-reading the change row and gating on `status == "applied"` so the
+    /// task, re-reading the change row and gating on `ChangeStatus::Applied` so the
     /// data-loss trap above still holds.
     ///
     /// The *other* apply-time follow-up — kicking the background engine rebuild
@@ -265,7 +322,7 @@ impl LucidosEngine {
         let kind_ctx = load_apply_kind_context(&self.pool, change.thread_id).await;
         let effective_requires_restart = change.requires_restart && !kind_ctx.is_app();
 
-        if change.status == "applied" {
+        if let ChangeState::Applied(shas) = &change.state {
             // Echo the stored merge SHAs so a re-apply still gives callers
             // a verifiable reference to the original merge. Use the
             // effective restart flag here too — an app re-apply must never
@@ -276,8 +333,8 @@ impl LucidosEngine {
                 thread_id: change.thread_id,
                 restart_required: effective_requires_restart,
                 message: "Change already applied.".to_string(),
-                applied_commit: change.post_merge_sha.clone(),
-                previous_commit: change.pre_merge_sha.clone(),
+                applied_commit: shas.post.clone(),
+                previous_commit: shas.pre.clone(),
                 commits_applied: change.commits.len(),
                 files_changed: change.files.len(),
                 ..ApplyResult::default()
@@ -288,8 +345,8 @@ impl LucidosEngine {
         // one reached the thread. It also gives the Apply spinner the terminal
         // event it waits on. And it advances an Apply All batch past a member
         // somebody discarded mid-run, which the driver waits on this event for.
-        if change.status != "pending" {
-            let msg = format!("Change is already {}", change.status);
+        if !change.is_pending() {
+            let msg = format!("Change is already {}", change.status());
             self.emit_apply_failed(
                 change.thread_id.unwrap_or(change_id),
                 change_id,
@@ -338,44 +395,27 @@ impl LucidosEngine {
                     // We can't reset to main here because the branch ref is
                     // gone, so the worktree is effectively detached at the
                     // pre-merge SHA; the spawn dispatcher handles that case.
-                    let thread_id = change.thread_id.unwrap_or(change_id);
-                    self.emit_change_applied(
-                        thread_id,
-                        change_id,
-                        effective_requires_restart,
-                        files_have_client_update(&change.files),
-                        commits.clone(),
-                        change.thread_title.clone(),
-                        actor.clone(),
-                        Some(pre_sha.clone()),
-                        Some(post_sha.clone()),
-                    )
-                    .await;
-                    self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
-                        .await;
-                    self.emit_entity_events_for_change_apply(
-                        &change.files,
-                        Some(&pre_sha),
-                        Some(&post_sha),
-                        actor.clone(),
-                    )
-                    .await;
-                    self.broadcast_changes_updated().await;
-                    return Ok(ApplyResult::applied_with_merge(
-                        change_id,
-                        change.thread_id,
-                        effective_requires_restart,
-                        pre_sha,
-                        post_sha,
-                        &commits,
-                        change.files.len(),
-                    ));
+                    return Ok(self
+                        .finish_merged_apply(
+                            &change,
+                            change_id,
+                            actor,
+                            &kind_ctx,
+                            effective_requires_restart,
+                            MergedShas {
+                                pre_sha,
+                                post_sha,
+                                commits,
+                            },
+                        )
+                        .await);
                 }
             }
         }
 
         // Clear stale merge worktree metadata if the directory no longer exists
-        if let Some(ref wt) = change.merge_worktree_path {
+        if let Some(merge) = change.merge_worktree() {
+            let wt = &merge.path;
             if !std::path::Path::new(wt).exists() {
                 log!(
                     "[Changes] Stale merge worktree {} no longer exists, clearing metadata",
@@ -407,7 +447,7 @@ impl LucidosEngine {
         // own session is a live session), fast-forwarded `main` at step 2 of
         // the resolver's 5-step merge prompt, and then `apply_now_success` ran
         // `reset --hard main` + `clean -fd` inside the resolver's worktree
-        // while it was still working. `apply_now_in_progress` did not catch it:
+        // while it was still working. `change_claim` did not catch it:
         // only `apply_now` and the Tier-1 path set that flag, never the
         // detached Tier-2 / Tier-3 merge spawns.
         //
@@ -455,8 +495,6 @@ impl LucidosEngine {
         // uses the `docs/plans/` convention or the marker. Per the resolved
         // design decision: if the marker is Missing/Proposed here, refuse the
         // apply (no auto-recovery).
-        // App and external-repo changes are exempt — neither uses the
-        // `docs/plans/` convention or the marker, so don't even query.
         if kind_ctx.is_lucidos_source() {
             let plan_repo_root = std::path::PathBuf::from(&change.repo_root);
             let plan_state = self
@@ -806,7 +844,7 @@ impl LucidosEngine {
                         );
                         // We claimed the in-progress flag in `begin_in_place_merge`;
                         // clear it since we're finalizing inline (no spawned task).
-                        self.clear_apply_now_in_progress(thread_id).await;
+                        self.clear_change_claim(thread_id, &session.msg_tx).await;
                         // apply_now_success emits ChangeApplied, the entity-cache
                         // events (App*/Artifact*), AND AppUiRefreshRequested (for
                         // app threads) internally — no sibling emit needed here.
@@ -859,16 +897,30 @@ impl LucidosEngine {
                          The change will apply automatically when resolution completes.",
                     ));
                 }
-                InPlaceMergeStart::AlreadyInProgress => {
+                InPlaceMergeStart::Claimed(holder) => {
                     log!(
-                        "[Changes] Apply already in progress for thread {} — returning conflict",
+                        "[Changes] Thread {} is claimed by {:?}; returning conflict",
+                        thread_id,
+                        holder
+                    );
+                    return Ok(ApplyResult::conflict(
+                        change_id,
+                        thread_id,
+                        change.files.len(),
+                        crate::engine::claude_code::claim_refusal_message(holder),
+                    ));
+                }
+                InPlaceMergeStart::SessionStopping => {
+                    log!(
+                        "[Changes] Apply refused for {} (thread {}): the session is stopping",
+                        change_id,
                         thread_id
                     );
                     return Ok(ApplyResult::conflict(
                         change_id,
                         thread_id,
                         change.files.len(),
-                        "An apply is already in progress for this thread — it will finish on its own.",
+                        crate::engine::claude_code::SESSION_STOPPING_MESSAGE,
                     ));
                 }
                 // No live session — fall through to the dead-session tiers below.
@@ -924,38 +976,21 @@ impl LucidosEngine {
                         // SessionEnded is terminal-only. Phase 6.2: the
                         // worktree and branch are preserved above so the
                         // next user message resumes the same Claude Code session.
-                        // ChangeApplied below is the user-visible signal.
-                        self.emit_change_applied(
-                            thread_id,
-                            change_id,
-                            effective_requires_restart,
-                            files_have_client_update(&change.files),
-                            commits.clone(),
-                            change.thread_title.clone(),
-                            actor.clone(),
-                            Some(pre_sha.clone()),
-                            Some(post_sha.clone()),
-                        )
-                        .await;
-                        self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
-                            .await;
-                        self.emit_entity_events_for_change_apply(
-                            &change.files,
-                            Some(&pre_sha),
-                            Some(&post_sha),
-                            actor.clone(),
-                        )
-                        .await;
-                        self.broadcast_changes_updated().await;
-                        return Ok(ApplyResult::applied_with_merge(
-                            change_id,
-                            Some(thread_id),
-                            effective_requires_restart,
-                            pre_sha,
-                            post_sha,
-                            &commits,
-                            change.files.len(),
-                        ));
+                        // ChangeApplied is the user-visible signal.
+                        return Ok(self
+                            .finish_merged_apply(
+                                &change,
+                                change_id,
+                                actor,
+                                &kind_ctx,
+                                effective_requires_restart,
+                                MergedShas {
+                                    pre_sha,
+                                    post_sha,
+                                    commits,
+                                },
+                            )
+                            .await);
                     }
                     Err(_) => {
                         // ff failed — CC needs to merge main into the branch,
@@ -1042,12 +1077,12 @@ impl LucidosEngine {
                             // lands. Re-read the row for the same reason the
                             // old inline code did — the cleanup, not this task,
                             // decides whether the change actually applied — and
-                            // gate on `"applied"` so a failed or handed-off
+                            // gate on `Applied` so a failed or handed-off
                             // merge never discards a newer sibling's work (the
                             // data-loss trap `apply_change`'s `Applied` gate
                             // exists to avoid).
                             match engine.changes().get_by_id(change_id).await {
-                                Ok(Some(c)) if c.status == "applied" => {
+                                Ok(Some(c)) if c.status() == ChangeStatus::Applied => {
                                     engine
                                         .discard_orphaned_pending_siblings(
                                             thread_id,
@@ -1163,37 +1198,20 @@ impl LucidosEngine {
                 if !kind_ctx.is_app() {
                     push_main_in_background(repo_root);
                 }
-                self.emit_change_applied(
-                    change.thread_id.unwrap_or(change_id),
-                    change_id,
-                    effective_requires_restart,
-                    files_have_client_update(&change.files),
-                    commits.clone(),
-                    change.thread_title.clone(),
-                    actor.clone(),
-                    Some(shas.0.clone()),
-                    Some(shas.1.clone()),
-                )
-                .await;
-                self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
-                    .await;
-                self.emit_entity_events_for_change_apply(
-                    &change.files,
-                    Some(&shas.0),
-                    Some(&shas.1),
-                    actor.clone(),
-                )
-                .await;
-                self.broadcast_changes_updated().await;
-                return Ok(ApplyResult::applied_with_merge(
-                    change_id,
-                    change.thread_id,
-                    effective_requires_restart,
-                    shas.0,
-                    shas.1,
-                    &commits,
-                    change.files.len(),
-                ));
+                return Ok(self
+                    .finish_merged_apply(
+                        change,
+                        change_id,
+                        actor,
+                        kind_ctx,
+                        effective_requires_restart,
+                        MergedShas {
+                            pre_sha: shas.0,
+                            post_sha: shas.1,
+                            commits,
+                        },
+                    )
+                    .await);
             }
         }
 
@@ -1223,37 +1241,20 @@ impl LucidosEngine {
                         change.branch_name
                     );
                     let commits = commits_in_range(repo_root, &pre_sha, &post_sha).await;
-                    self.emit_change_applied(
-                        change.thread_id.unwrap_or(change_id),
-                        change_id,
-                        effective_requires_restart,
-                        files_have_client_update(&change.files),
-                        commits.clone(),
-                        change.thread_title.clone(),
-                        actor.clone(),
-                        Some(pre_sha.clone()),
-                        Some(post_sha.clone()),
-                    )
-                    .await;
-                    self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
-                        .await;
-                    self.emit_entity_events_for_change_apply(
-                        &change.files,
-                        Some(&pre_sha),
-                        Some(&post_sha),
-                        actor.clone(),
-                    )
-                    .await;
-                    self.broadcast_changes_updated().await;
-                    return Ok(ApplyResult::applied_with_merge(
-                        change_id,
-                        change.thread_id,
-                        effective_requires_restart,
-                        pre_sha,
-                        post_sha,
-                        &commits,
-                        change.files.len(),
-                    ));
+                    return Ok(self
+                        .finish_merged_apply(
+                            change,
+                            change_id,
+                            actor,
+                            kind_ctx,
+                            effective_requires_restart,
+                            MergedShas {
+                                pre_sha,
+                                post_sha,
+                                commits,
+                            },
+                        )
+                        .await);
                 }
             }
         }

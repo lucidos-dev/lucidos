@@ -681,8 +681,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 1.25rem;
-  height: 1.25rem;
+  /* The design height, which styles/badges.css rounds to whole pixels. */
+  --badge-height: 1.25rem;
+  min-width: var(--badge-box, var(--badge-height));
+  height: var(--badge-height);
   padding: 0 0.375rem;
   border-radius: 0.625rem;
   background: rgba(255, 255, 255, 0.92);
@@ -1150,31 +1152,29 @@
 
 /* ── Reduced motion ──────────────────────────────────────────────────────── */
 
-@media (prefers-reduced-motion: reduce) {
-  /* No reveal — squares/final spark are visible at rest, transient sparks stay
-     hidden, so the static mark shows immediately. */
-  .ws-rv-sq,
-  .ws-rv-flash,
-  .ws-rv-final,
-  .ws-picker-dot-booting,
-  .ws-picker-restore-spinner,
-  .ws-picker-reload.is-reloading svg {
-    animation: none;
-  }
-  /* The Network access popover settles instantly instead of fading/expanding.
-     It still never shows a value before it is settled, so the guarantee holds
-     without the motion. */
-  .ws-picker-net-controls,
-  .ws-picker-net-collapse,
-  .ws-picker-net-mode {
-    transition: none;
-  }
-  /* The pairing caret rests visible rather than blinking. It says where the
-     next digit lands, which is a fact rather than an animation. */
-  .pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
-    animation: none;
-    opacity: 1;
-  }
+/* No reveal: squares and the final spark are visible at rest, transient sparks stay
+   hidden, so the static mark shows immediately. */
+:root[data-motion="reduce"] .ws-rv-sq,
+:root[data-motion="reduce"] .ws-rv-flash,
+:root[data-motion="reduce"] .ws-rv-final,
+:root[data-motion="reduce"] .ws-picker-dot-booting,
+:root[data-motion="reduce"] .ws-picker-restore-spinner,
+:root[data-motion="reduce"] .ws-picker-reload.is-reloading svg {
+  animation: none;
+}
+/* The Network access popover settles instantly instead of fading/expanding.
+   It still never shows a value before it is settled, so the guarantee holds
+   without the motion. */
+:root[data-motion="reduce"] .ws-picker-net-controls,
+:root[data-motion="reduce"] .ws-picker-net-collapse,
+:root[data-motion="reduce"] .ws-picker-net-mode {
+  transition: none;
+}
+/* The pairing caret rests visible rather than blinking. It says where the
+   next digit lands, which is a fact rather than an animation. */
+:root[data-motion="reduce"] .pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
+  animation: none;
+  opacity: 1;
 }
 
 /* ── Pairing gate ────────────────────────────────────────────────────────────

@@ -26,8 +26,8 @@ function WelcomeDisclaimer() {
 /** First-run state when the engine booted with no LLM provider configured
  *  (`llmConfigured === false`). The agent can't answer until a provider exists,
  *  so this replaces the setup-interview entry point with calls to action that
- *  deep-link into Settings → Models → Providers. Shown regardless of the
- *  "Don't show this again" dismissal: provider setup is a requirement, not a tip.
+ *  deep-link into Settings → Models → Providers. One dismissal hides both it
+ *  and the starter prompts (`showWelcomeSurface`).
  *
  *  TWO actions, because the first one is unreachable for the very user this
  *  screen exists for. Every credential provider wants a key, and a key wants a

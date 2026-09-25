@@ -5,13 +5,14 @@ import { Explainer } from '../shared/Explainer';
 import { backupReminderBody } from '../layout/BackupReminderBanner';
 import { connectionBannerBody } from '../layout/ConnectionBanner';
 import { ingressBannerBody } from '../layout/IngressBanner';
+import { slownessBannerBody } from '../layout/SlownessBanner';
 import { refusalBannerBody } from '../layout/WebhookRefusalBanner';
 import {
   SAMPLE_INGRESS_OUTAGE,
+  SAMPLE_MEMORY_EPISODE,
+  SAMPLE_UNCLEAR_EPISODE,
   SAMPLE_WEBHOOK_REFUSAL,
   SAMPLE_WEBHOOK_VERIFICATION_REFUSAL,
-} from './communicationSamples';
-import {
   TOAST_PLACEMENT_OPTIONS,
   sampleShortToast,
   sampleLongToast,
@@ -100,11 +101,11 @@ export function CommunicationSurfacesPage() {
         <div class="settings-section-title" data-search-anchor="surfaces:banners">Banners</div>
         <p class="settings-row-note">
           A condition that stays true until something changes. Rendered inline here
-          rather than fired, so neither one has to be provoked into existing.
+          rather than fired, so none of them has to be provoked into existing.
         </p>
-        {/* The real bodies, not copies. Both are already hook-free pure
-            functions for exactly this reason, so the gallery cannot drift from
-            what the app shows. */}
+        {/* The real bodies, not copies. Each is a hook-free pure function for
+            exactly this reason, so the gallery cannot drift from what the app
+            shows. */}
         <div class="surfaces-banner-preview">
           {backupReminderBody({ layout: 'desktop', onSetUp: () => {}, onDismiss: () => {} })}
         </div>
@@ -113,6 +114,20 @@ export function CommunicationSurfacesPage() {
         </div>
         <div class="surfaces-banner-preview">
           {connectionBannerBody({ layout: 'desktop', status: 'connecting', workspace: 'dev' })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {slownessBannerBody({
+            layout: 'desktop',
+            episode: SAMPLE_MEMORY_EPISODE,
+            onDismiss: () => {},
+          })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {slownessBannerBody({
+            layout: 'desktop',
+            episode: SAMPLE_UNCLEAR_EPISODE,
+            onDismiss: () => {},
+          })}
         </div>
         <div class="surfaces-banner-preview">
           {ingressBannerBody({

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'preact/hooks';
+import type { ViewportPoint } from './useAnchoredPopover';
 
 export interface LongPressHandlers {
   onPointerDown(e: PointerEvent): void;
@@ -27,9 +28,14 @@ const DEFAULT_MOVE_TOLERANCE_PX = 10;
 // can never leave the suppressor armed against a later, unrelated click.
 const SUPPRESS_FUSE_MS = 700;
 
+/** Where a right-click landed. A hold passes none: the finger covers the
+ *  point, so its host places the menu against the target instead. */
+export type LongPressCallback = (target: HTMLElement, at?: ViewportPoint) => void;
+
 /** Pure long-press / right-click gesture machine. Returns DOM handlers that
- *  call `onLongPress(target)` when the pointer is held still past `delayMs`
- *  (or on a right-click `contextmenu`), and `onClick()` for an ordinary tap.
+ *  call `onLongPress(target)` when the pointer is held still past `delayMs`,
+ *  or `onLongPress(target, at)` on a right-click `contextmenu`, and
+ *  `onClick()` for an ordinary tap.
  *  The `click` the browser pairs with a fired long-press is swallowed
  *  (`preventDefault` + `stopPropagation`) so the host button's primary action
  *  doesn't also run.
@@ -37,7 +43,7 @@ const SUPPRESS_FUSE_MS = 700;
  *  Exported as a hook-free factory so it's unit-testable with fake timers;
  *  `useLongPress` wires it to a component with stable refs. */
 export function makeLongPressHandlers(
-  onLongPress: (target: HTMLElement) => void,
+  onLongPress: LongPressCallback,
   onClick: () => void,
   opts: LongPressOptions = {},
 ): LongPressHandlers {
@@ -111,7 +117,7 @@ export function makeLongPressHandlers(
       // the fused arm then swallows.
       armed = true;
       armFuse();
-      onLongPress(e.currentTarget as HTMLElement);
+      onLongPress(e.currentTarget as HTMLElement, { x: e.clientX, y: e.clientY });
     },
     onClick(e) {
       if (armed) {
@@ -134,7 +140,7 @@ export function makeLongPressHandlers(
  *  through refs so the handlers always invoke the latest closures without being
  *  rebuilt (which would reset the in-flight gesture). */
 export function useLongPress(
-  onLongPress: (target: HTMLElement) => void,
+  onLongPress: LongPressCallback,
   onClick: () => void,
   opts?: LongPressOptions,
 ): LongPressHandlers {
@@ -145,7 +151,7 @@ export function useLongPress(
   const handlersRef = useRef<LongPressHandlers>();
   if (!handlersRef.current) {
     handlersRef.current = makeLongPressHandlers(
-      (t) => longPressRef.current(t),
+      (t, at) => longPressRef.current(t, at),
       () => clickRef.current(),
       opts,
     );

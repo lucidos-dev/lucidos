@@ -764,7 +764,15 @@ pub async fn restore_archive_into(
             if dump_path.exists() {
                 terminate_other_connections(&database_url)?;
                 pg_restore(&database_url, &dump_path)?;
-                let _ = std::fs::remove_file(&dump_path);
+                // The restore succeeded, so failing it now would be wrong. The
+                // leftover is a full database dump in the workspace root.
+                if let Err(e) = std::fs::remove_file(&dump_path) {
+                    log!(
+                        "[Backup] Restore done, but {} was not removed: {}",
+                        dump_path.display(),
+                        e
+                    );
+                }
             }
             Ok(())
         })

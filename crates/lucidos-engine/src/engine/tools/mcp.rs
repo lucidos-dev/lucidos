@@ -183,7 +183,7 @@ impl LucidosEngine {
                 }
             }
 
-            _ => Ok(format!("Unknown MCP management tool: {}", name)),
+            _ => Err(format!("Unknown MCP management tool: {}", name).into()),
         }
     }
 }

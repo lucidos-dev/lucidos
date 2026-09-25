@@ -349,26 +349,30 @@ impl OpenAiProvider {
                 }
             }
 
-            "response.completed" => {
-                // The terminal event carries the full Response object with
-                // its usage block and a status (+ optional incomplete_details
-                // reason). Capture both so cross-provider analytics has
-                // stop_reason + input/output tokens parity with Vertex.
+            // Both terminal events carry the full Response object with its
+            // usage block and a status. `response.incomplete` adds the
+            // `incomplete_details` reason, such as `max_output_tokens`. Missing
+            // it read a cut-off turn as a truncated stream, and retried it.
+            "response.completed" | "response.incomplete" => {
                 if let Some(resp) = data.get("response") {
                     meta.absorb_responses_completion(resp);
                 }
                 return Ok(true);
             }
 
-            "response.failed" => {
+            // A top-level `error` event carries `code` and `message` on the
+            // event itself.
+            "response.failed" | "error" => {
                 let error_msg = data
                     .pointer("/response/error/message")
                     .or_else(|| data.pointer("/error/message"))
+                    .or_else(|| data.get("message"))
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
                 let error_code = data
                     .pointer("/response/error/code")
                     .or_else(|| data.pointer("/error/code"))
+                    .or_else(|| data.get("code"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("unknown");
                 return Err(
@@ -612,8 +616,8 @@ mod tests {
         let mut item_id_map: HashMap<String, usize> = HashMap::new();
         let mut meta = StreamMeta::default();
 
-        OpenAiProvider::process_responses_chunk(
-            "response.completed",
+        let done = OpenAiProvider::process_responses_chunk(
+            "response.incomplete",
             r#"{"response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"output_tokens":4096}}}"#,
             &mut content,
             &mut tools,
@@ -622,8 +626,33 @@ mod tests {
         )
         .unwrap();
 
+        assert!(done, "response.incomplete is a terminal event");
         assert_eq!(meta.stop_reason.as_deref(), Some("max_output_tokens"));
         assert_eq!(meta.input_tokens, Some(50));
         assert_eq!(meta.output_tokens, Some(4096));
+    }
+
+    /// A top-level `error` event surfaces its own message, never the generic
+    /// truncation error.
+    #[test]
+    fn responses_stream_error_event_carries_its_message() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map: HashMap<String, usize> = HashMap::new();
+        let mut meta = StreamMeta::default();
+
+        let err = OpenAiProvider::process_responses_chunk(
+            "error",
+            r#"{"type":"error","code":"server_error","message":"The server had an error"}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("server_error"), "got: {err}");
+        assert!(err.contains("The server had an error"), "got: {err}");
     }
 }

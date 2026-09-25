@@ -383,7 +383,7 @@ impl LucidosEngine {
         ))
     }
 
-    /// `run_bash_background(command, timeout_secs?)` — spawn a long-running
+    /// `run_bash_background(command, description, timeout_secs?)`: spawn a long-running
     /// shell command and return a `task_id` immediately. Emits
     /// `BackgroundBashStarted`; the watcher emits `BackgroundBashCompleted`
     /// when the child exits or the watchdog kills it. The registry entry
@@ -410,6 +410,7 @@ impl LucidosEngine {
             .start_background_task(
                 thread_id,
                 command,
+                args.get("description").and_then(|v| v.as_str()),
                 timeout_secs,
                 self.workspace_path(),
                 &env_vars,
@@ -428,13 +429,16 @@ impl LucidosEngine {
     /// and start the watcher that records `BackgroundBashCompleted`. Returns
     /// the task id and its start time.
     ///
-    /// Shared by the chat agent's `run_bash_background` and a coding agent's
+    /// Shared by the chat agent's `run_bash_background` and
+    /// `run_python_background`, and by a coding agent's
     /// `lucidos background-task run`. They differ in the directory the task
     /// runs in and in its env: only the chat agent's carries the secrets.
+    /// `description` is the agent's name for the work, shown on the wait.
     pub(crate) async fn start_background_task(
         &self,
         thread_id: uuid::Uuid,
         command: &str,
+        description: Option<&str>,
         timeout_secs: u64,
         cwd: &std::path::Path,
         env_vars: &[(String, String)],
@@ -447,7 +451,14 @@ impl LucidosEngine {
 
         let (task_id, finish_rx) = self
             .bash_background
-            .spawn(command, timeout_secs, cwd, env_vars, Some(thread_id))
+            .spawn(
+                command,
+                timeout_secs,
+                cwd,
+                env_vars,
+                Some(thread_id),
+                description,
+            )
             .await
             .map_err(|e| format!("Error: failed to spawn background command: {}", e))?;
 
@@ -489,7 +500,7 @@ impl LucidosEngine {
     /// the registry and the not-yet-written event row, and surface to the
     /// agent as `unknown task_id` on work that had succeeded. The entry now
     /// stays drainable until the registry's retention sweep takes it.
-    pub(super) fn spawn_bash_completion_watcher(
+    fn spawn_bash_completion_watcher(
         &self,
         thread_id: uuid::Uuid,
         task_id: String,

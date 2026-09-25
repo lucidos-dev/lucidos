@@ -47,6 +47,10 @@ for IDE integrations.
      "Continue from where you left off."; the trait now carries the
      engine's *intent* so runtimes without that side effect can synthesize
      the prompt.
+
+     *Superseded 2026-09-24 (ADR 0272).* The premise was false: current
+     Claude Code continues only under an internal env var. Recovery sends the
+     continuation as a real input, and the flag is gone.
    - `runtime/spawn_env.rs::apply_lucidos_env` — the agent-independent env
      contract (workspace resolution, host protection, PG*, subprocess
      origin, spawn metadata, RUSTC_WRAPPER gate, lucidos-CLI PATH)

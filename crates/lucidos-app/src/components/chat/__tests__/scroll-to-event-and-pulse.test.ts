@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vite
 const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, followPosition, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setAgentLive, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** Is a marker the CURRENT landing? Asked the way `scrollState` asks it. */
@@ -421,16 +421,11 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     vi.useFakeTimers();
     container = makeContainer();
     setActiveScrollElement(container);
-    // The premise of every test in this block. `setAgentLive` is a module
-    // global, so the afterEach un-says it rather than leaving a live thread for
-    // the next block.
-    setAgentLive(true);
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
     stopFollowingBottom();
-    setAgentLive(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -475,7 +470,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(19200);
     // Recorded as the live edge, not as the offset the landing produced. So
     // coming back to the thread resumes the ride instead of parking them.
-    expect(followPosition(container)).toBe('live-edge');
+    expect(followSurvivesScroll(container)).toBe(true);
   });
 
   it('ends the ride when the link lands ABOVE the live edge', () => {
@@ -515,16 +510,14 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('supersedes a tween that was taking the reader somewhere else', () => {
-    // Keeping the ride must not cost the link its ownership of the viewport.
-    // The reader is at the edge, so the ride writes nothing. An up-chevron
-    // glide tapped a frame earlier would otherwise survive it. It would then
-    // carry them to the top, the link's marker left on a turn at the bottom.
+    // The link owns the viewport. Otherwise an up-chevron glide tapped a frame
+    // earlier survives it, and carries the reader away from the link's marker.
+    // The chevron itself ended the ride.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
     makeScrollObservers(container);
 
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
-    setAgentLive(false);         // idle, so the chevron leaves the ride armed
     scrollToTop();                // and its glide is in flight, having moved nobody yet
     expect(container.scrollTop).toBe(9200);
 
@@ -532,7 +525,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     vi.advanceTimersByTime(1500);
 
     expect(container.scrollTop).toBe(9200);
-    expect(followingLiveEdge.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(false);
   });
 
   it('keeps the ride when the link CARRIES a scrolled-up rider to the live edge', () => {
@@ -553,7 +546,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(followingLiveEdge.value).toBe(true);
     // The ride's OWN motion took them there, so its frames are held writes and
     // the position still records as the live edge.
-    expect(followPosition(container)).toBe('live-edge');
+    expect(followSurvivesScroll(container)).toBe(true);
 
     container.scrollHeight = 20000;
     onResize();
@@ -647,6 +640,52 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(19200);
   });
 
+  it('ends a ride armed IN PLACE when the link it waited for never lands', () => {
+    // The in-place resume arms off the edge while the link owns the position.
+    // A dead link moves nobody, so the ride ends with it rather than leaving
+    // the toggle lit over a reader it does not hold.
+    restore = installFakeDom({}); // the target never renders
+    makeScrollObservers(container);
+    container.scrollTop = 3000;
+
+    scrollToEventAndPulse('e-7');
+    resumeFollowingBottom(container, 'in-place');
+    expect(followingLiveEdge.value).toBe(true);
+
+    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('wakes a PARKED follow when the link that held it back expires on a live thread', () => {
+    // A scroll on a waiting thread parks the follow (ADR 0064, the user's
+    // instruction). The thread going live wakes it, except while a link owns
+    // the position. A dead link must not leave it parked on a live thread.
+    restore = installFakeDom({}); // the target never renders
+    const { onScroll } = makeScrollObservers(container);
+    setTranscriptLive(false);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    onScroll();
+    readerGestureForTest(container);
+    container.scrollTop = 3000;   // the reader scrolls up on the waiting thread
+    onScroll();
+    expect(followingLiveEdge.value).toBe(true);
+
+    scrollToEventAndPulse('e-7');
+    setTranscriptLive(true);      // the thread goes live while the link resolves
+    expect(container.scrollTop).toBe(3000);
+
+    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
+    vi.advanceTimersByTime(1500); // and the wake's glide
+
+    expect(container.scrollTop).toBe(9200);
+    expect(followingLiveEdge.value).toBe(true);
+    readerGestureForTest(null, false);
+    setTranscriptLive(false);
+  });
+
   it('does not write the live edge over a link that is still resolving', () => {
     // The follow puts an armed reader back on the live edge when the PLATFORM
     // scrolls them off it (`keepTheLiveEdge`, pinned in
@@ -674,24 +713,11 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 });
 
-describe('a deep-link landing ends the ride on an IDLE thread too', () => {
-  /** The other half of the block above, and the one place the follow does NOT
-   *  follow the idle rule the scroll disarm, the up chevron and turn stepping
-   *  share.
-   *
-   *  Those three describe a moment: where the reader happens to be looking on a
-   *  thread that is doing nothing. Keeping the ride costs them nothing, because
-   *  nothing is running to carry them anywhere. A LINK is different in kind: it
-   *  names ONE event and expects to still be on it later, so the ask has to
-   *  survive the thread waking.
-   *
-   *  It did not. `waiting_for_user_answer` is quiescent (`isRenderedThreadIdle`),
-   *  so a thread parked on a question card reads as IDLE here, and a "needs your
-   *  answer" notification points at exactly such a thread. The reader tapped it,
-   *  landed on the question, kept the lit toggle, answered, and `honourWake`
-   *  wrote them to the live edge the instant the agent picked the answer up. Off
-   *  the event the notification existed to show them, one beat after they got
-   *  there. Reported 2026-08-12; the tests below used to assert that outcome.
+describe('a deep-link landing ends the ride on a thread parked on a question', () => {
+  /** A "needs your answer" notification points at a thread parked on a
+   *  question card, which is quiescent. A LINK names ONE event and expects to
+   *  still be on it later. So a landing off the live edge ends the ride,
+   *  whatever the thread is doing. The follow asks nothing about liveness.
    *
    *  A DEAD link still keeps the ride (the block above): retiring belongs to the
    *  landing, not to the tap. */
@@ -702,13 +728,11 @@ describe('a deep-link landing ends the ride on an IDLE thread too', () => {
     vi.useFakeTimers();
     container = makeContainer();
     setActiveScrollElement(container);
-    // Deliberately never `setAgentLive(true)`: an idle thread is the premise.
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
     setFollowLiveEdge(false); // un-press, so the *follow seed* does not leak
-    setAgentLive(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -762,7 +786,6 @@ describe('a deep-link landing ends the ride on an IDLE thread too', () => {
     // them to the live edge here. Now nothing does.
     const { onResize } = armThenLandOnAnOldTurn();
 
-    setAgentLive(true);
     container.scrollHeight = 20000;
     onResize();
 

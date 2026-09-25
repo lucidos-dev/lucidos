@@ -846,11 +846,13 @@ mod tests {
                     id: "opt-0".to_string(),
                     label: "Run the tail now".to_string(),
                     description: Some("Chunks 25-33, on the current main".to_string()),
+                    preview: None,
                 },
                 QuestionOption {
                     id: "opt-1".to_string(),
                     label: "Leave it for tonight".to_string(),
                     description: None,
+                    preview: None,
                 },
             ],
             multi_select,

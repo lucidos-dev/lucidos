@@ -1,7 +1,7 @@
 import { useRef } from 'preact/hooks';
-import { useLongPress } from '../../hooks/useLongPress';
+import { useLongPress, type LongPressHandlers } from '../../hooks/useLongPress';
 import { viewportIsMobile } from '../../utils/viewport';
-import type { OverflowMenuOpener } from '../shared/OverflowMenu';
+import type { HostOpener, OverflowMenuOpener } from '../shared/OverflowMenu';
 
 /** The pointer handlers a drawer row spreads. Typed on the DOM events, not
  *  Preact's targeted ones, so the row can spread this onto its `<div>` while
@@ -17,9 +17,9 @@ export interface RowGestureHandlers {
 }
 
 export interface RowActionsGesture {
-  /** Handed to the row's overflow menu. Set only on mobile, where its presence
-   *  is what drops the ⋯ trigger and makes this gesture the way in. */
-  openRef?: { current: OverflowMenuOpener | null };
+  /** Handed to the row's overflow menu. `trigger` is false on mobile, where
+   *  the hold replaces the ⋯ as the way in. */
+  hostOpener: HostOpener;
   handlers: RowGestureHandlers;
 }
 
@@ -31,20 +31,59 @@ function startsOnControl(e: { target: EventTarget | null }): boolean {
   return !!(e.target as Element | null)?.closest?.('button');
 }
 
-/** Makes a long press on a drawer row open that row's actions menu, on mobile.
+/** The row's handlers for one layout, given the row's gesture machine. Pure, so
+ *  both layouts are testable without a renderer.
  *
- *  The row's ⋯ trigger is a 31x27px box against the pane's right edge, which is
- *  the hardest place on a phone to reach. So the mobile row drops it and the
- *  whole row becomes the target instead. Desktop is untouched: this returns the
- *  row's ordinary tap handlers and no `openRef`, so the ⋯ still renders.
+ *  **Desktop** keeps the ⋯ and adds a right-click that opens the same menu at
+ *  the pointer (ADR 0285). There is no hold. `press` still owns the click, so
+ *  a ctrl-click's paired click cannot also open the thread. A fresh press
+ *  clears that arm, so the next plain click does. Option+right-click is left
+ *  to the native menu, which ADR 0285 promises everywhere.
  *
- *  A scroll never opens the menu: `useLongPress` cancels the hold once the
- *  pointer travels 10px, and again on `pointercancel`. A fired hold swallows
- *  its own paired click, so the row does not also open the thread.
- *
- *  `onContextMenu` is wired on mobile only. Android fires it for a long press,
+ *  **Mobile** drops the ⋯ and makes the whole row the target: the ⋯ is a
+ *  31x27px box against the pane's right edge, the hardest place on a phone to
+ *  reach. A scroll never opens the menu, since `useLongPress` cancels the hold
+ *  once the pointer travels 10px. Android fires `contextmenu` for a long press,
  *  and would draw the browser's own menu over ours. iOS does not, the callout
  *  being suppressed on `.thread-row` already. */
+export function rowGestureHandlers({ mobile, enabled, press, onPress }: {
+  mobile: boolean;
+  enabled: boolean;
+  /** Built with the row's menu opener and its tap action. */
+  press: LongPressHandlers;
+  onPress?: () => void;
+}): RowGestureHandlers {
+  if (!enabled) return {};
+  const onContextMenu = (e: MouseEvent) => { if (!startsOnControl(e)) press.onContextMenu(e); };
+
+  if (!mobile) {
+    return {
+      onPointerDown: () => {
+        onPress?.();
+        press.cancel();
+      },
+      onContextMenu: (e) => { if (!e.altKey) onContextMenu(e); },
+      onClick: press.onClick,
+    };
+  }
+
+  return {
+    onPointerDown: (e) => {
+      onPress?.();
+      if (startsOnControl(e)) return;
+      press.onPointerDown(e);
+    },
+    onPointerMove: press.onPointerMove,
+    onPointerUp: press.onPointerUp,
+    onPointerLeave: press.onPointerLeave,
+    onPointerCancel: press.onPointerCancel,
+    onContextMenu,
+    onClick: press.onClick,
+  };
+}
+
+/** Makes a drawer row open its actions menu from a gesture: a right-click on
+ *  desktop, a long press on mobile. See {@link rowGestureHandlers}. */
 export function useRowActionsGesture({ onTap, onPress, enabled }: {
   /** The row's ordinary tap action, normally focusing the thread. */
   onTap?: () => void;
@@ -55,36 +94,17 @@ export function useRowActionsGesture({ onTap, onPress, enabled }: {
   enabled: boolean;
 }): RowActionsGesture {
   const openRef = useRef<OverflowMenuOpener | null>(null);
+  const mobile = viewportIsMobile.value;
   // `useLongPress` reads both callbacks through refs, so the handlers it
-  // returns are stable and an in-flight gesture survives a re-render.
+  // returns are stable and an in-flight gesture survives a re-render. A
+  // mobile menu is placed against the row, since a finger covers the point.
   const press = useLongPress(
-    (row) => openRef.current?.(row),
+    (row, at) => openRef.current?.(row, viewportIsMobile.value ? undefined : at),
     () => onTap?.(),
   );
-
-  if (!viewportIsMobile.value || !enabled) {
-    return {
-      handlers: {
-        onPointerDown: enabled ? () => onPress?.() : undefined,
-        onClick: enabled ? () => onTap?.() : undefined,
-      },
-    };
-  }
-
   return {
-    openRef,
-    handlers: {
-      onPointerDown: (e) => {
-        onPress?.();
-        if (startsOnControl(e)) return;
-        press.onPointerDown(e);
-      },
-      onPointerMove: press.onPointerMove,
-      onPointerUp: press.onPointerUp,
-      onPointerLeave: press.onPointerLeave,
-      onPointerCancel: press.onPointerCancel,
-      onContextMenu: (e) => { if (!startsOnControl(e)) press.onContextMenu(e); },
-      onClick: press.onClick,
-    },
+    // Only a row with a live hold may drop its ⋯, or nothing could open it.
+    hostOpener: { ref: openRef, trigger: !(mobile && enabled) },
+    handlers: rowGestureHandlers({ mobile, enabled, press, onPress }),
   };
 }

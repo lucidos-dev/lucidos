@@ -1,16 +1,21 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, focusedThreadId, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, focusedThreadId, threadMap, isThreadStreaming, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
 import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
+import { installUnregisteredRepoTargetReset } from './actions/compose';
 import { installLiveUtteranceRow } from './liveUtterance';
-import { voiceCall, watchCallLiveness } from './voice';
-import { setCallLive } from '../components/chat/scrollState';
+import { watchTranscriptLiveness } from './transcriptLiveness';
+import { setTranscriptLive } from '../components/chat/scrollState';
+import { voiceCall } from './voice';
+import { isOnCall } from '../voice/callState';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
+import { installMotionAttribute } from '../utils/motion';
+import { ANIMATION_SPEED_STORAGE_KEY } from '@lucidos/appearance';
 
 // Sync page title with unread count and workspace name
 effect(() => {
@@ -63,8 +68,12 @@ effect(() => {
 
 // Persist animation speed
 effect(() => {
-  localStorage.setItem('lucidos-animation-speed-slider', String(animationSpeed.value));
+  localStorage.setItem(ANIMATION_SPEED_STORAGE_KEY, String(animationSpeed.value));
 });
+
+// Publish the resolved motion as `data-motion` on <html>, which every reduced
+// motion rule in the stylesheets keys on. The boot script set the first value.
+installMotionAttribute();
 
 // Persist the toast-placement pick, device-local like the slider above.
 // Temporary, and it goes when the shape is chosen (docs/temporary-measures.md).
@@ -75,9 +84,9 @@ effect(() => {
 // Publish the animation-speed slider to CSS. Every --duration-* token in
 // styles/global/base.css is its 1x literal times this, so a plain CSS
 // transition scales with the slider the same way the JS-driven animations
-// (FLIP, toasts) already did. Unitless, because the tokens multiply it into a
-// time; base.css defaults it to 1 for the frame before this effect first runs
-// and for any document that never loads this bundle.
+// (FLIP, toasts) already did. Reduced motion collapses it. Unitless, because
+// the tokens multiply it into a time. The boot script publishes the first
+// value, and base.css defaults it to 1 for any document without either.
 effect(() => {
   document.documentElement.style.setProperty('--duration-scale', String(durationScale.value));
 });
@@ -295,14 +304,23 @@ installSeenTargetWatch();
 // actions/in-app-notification-toast.ts and system-knowhow/notifications.md §4.
 installNotificationToastLifetime();
 
+// A deleted repository stops being the composer's target. See
+// actions/compose.ts `installUnregisteredRepoTargetReset`.
+installUnregisteredRepoTargetReset();
+
 // The caller's bubble appears as they start speaking, rather than when the
 // words finally land. Its own module for the same reason as the watch above:
 // the rule belongs beside the call it reads. See store/liveUtterance.ts.
 installLiveUtteranceRow();
 
-// The transcript's standing follow rides a call as it rides a running turn. A
-// call produces rows with no turn running, so the scroll module has to be told
-// (see `watchCallLiveness`). Wired HERE rather than in `store/voice.ts`: the
-// call is the producer, the transcript the consumer, and a producer must not
-// import a consumer.
-watchCallLiveness({ call: voiceCall, focused: focusedThreadId, setLive: setCallLive });
+// The transcript's follow parks on a scroll unless the thread on screen is
+// live streaming: the agent running, or a call up on it. A call writes no
+// turn, so the projection alone reads it as quiet. See transcriptLiveness.ts.
+watchTranscriptLiveness({
+  focused: focusedThreadId,
+  threads: threadMap,
+  isLive: (thread) => isThreadStreaming(thread)
+    || (isOnCall(voiceCall.value.phase) && voiceCall.value.threadId === thread.meta.id),
+  setLive: setTranscriptLive,
+});
+

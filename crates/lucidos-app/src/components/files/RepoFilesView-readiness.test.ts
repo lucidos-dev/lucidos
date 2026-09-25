@@ -8,8 +8,7 @@ import { repoFilesContentReady } from './RepoFilesView';
 // Gating Changes on the diff alone makes the diff list appear as soon as the
 // diff loads instead of waiting for the whole-repo tree listing (which only All
 // Files needs, and which is often slower). The diff gate still prevents the
-// original "No changes" flash — an empty [] rendered while the diff is in flight
-// (before the single-file overlay opens over it).
+// original "No changes" flash, an empty [] rendered while the diff is in flight.
 describe('repoFilesContentReady', () => {
   it('all mode: ready once the file tree is loaded, regardless of diff', () => {
     expect(repoFilesContentReady({ filesStatus: 'loaded', diffStatus: 'not-loaded', mode: 'all' })).toBe(true);

@@ -12,10 +12,11 @@ import {
   showToast,
   threadMap,
 } from '../../store/store';
-import type { EventSubscription, EventWaitSummary, ThreadState } from '../../store/thread-events';
+import type { EventSubscription, EventWaitSummary, ThreadMeta, ThreadState } from '../../store/thread-events';
 import {
   awaitedSubject,
   formatRemaining,
+  groupSubscriptions,
   secondsRemaining,
   waitSubscriptionLabel,
 } from '../../store/thread-events';
@@ -45,23 +46,24 @@ export function closeWaitingPanel(): void {
  *  visibly stutter. */
 const COUNTDOWN_TICK_MS = 1000;
 
-/** The sub-thread half of a wait: the active children this client can name, and
- *  how many more the server counts. */
+/** The sub-thread half of a wait: the unfinished children this client can
+ *  name, and how many more the server counts. */
 export interface SubThreadWait {
-  /** Active children resolved from the loaded `threadMap`, oldest first. */
+  /** Unfinished children resolved from the loaded `threadMap`, oldest first. */
   threads: ThreadState[];
-  /** Active children `meta.activeChildrenCount` reports that the loaded map
-   *  cannot name, so the panel can say so instead of showing a short list. */
+  /** Unfinished children the server counts that the loaded map cannot name,
+   *  so the panel can say so instead of showing a short list. */
   unresolved: number;
 }
 
 const NO_SUB_THREADS: SubThreadWait = { threads: [], unresolved: 0 };
 
-/** The focused thread's active children, for the *waiting indicator*.
+/** The focused thread's unfinished children, for the *waiting indicator*.
  *
- *  **`activeChildrenCount` decides, and the map only names.** The count is the
- *  server's, reconciled in-transaction against ground truth. `threadMap` is a
- *  paginated cache, which may hold all of a parent's children or none.
+ *  **The server's count decides, and the map only names.** The count is
+ *  `unfinishedChildCount`, reconciled in-transaction against ground truth.
+ *  `threadMap` is a paginated cache, which may hold all of a parent's children
+ *  or none.
  *
  *  So a count of zero returns before walking the map at all. That keeps this
  *  O(1) on almost every thread. The prompt row re-renders on every `threadMap`
@@ -69,34 +71,40 @@ const NO_SUB_THREADS: SubThreadWait = { threads: [], unresolved: 0 };
  *  Almost no thread is waiting on children. The price is one SSE round trip of
  *  lag on a child seen starting before its parent's aggregate lands.
  *
- *  Active means `running` or `waiting_for_user_answer`, which is exactly the
- *  engine's `active_thread_statuses()` and exactly `isMidTurn`. A child that is
- *  idle while holding its own subscription is NOT active, and neither is one
- *  parked on a proposed change.
+ *  Unfinished means mid-turn (`isMidTurn`, the engine's
+ *  `active_thread_statuses()`), or idle while holding its own live event wait
+ *  (ADR 0254). Those are the engine's two counts. A child parked only on a
+ *  proposed change has reported, so it is not listed.
  *
  *  The subtraction runs one way. A shortfall becomes an "and N more" row, and a
  *  surplus is listed rather than cut (`docs/code-review-priors.md`). */
-export function activeSubThreads(
+export function unfinishedSubThreads(
   parentId: string,
   threads: ReadonlyMap<string, ThreadState>,
-  activeChildrenCount: number,
+  unfinishedCount: number,
 ): SubThreadWait {
-  if (activeChildrenCount <= 0) return NO_SUB_THREADS;
+  if (unfinishedCount <= 0) return NO_SUB_THREADS;
   const found: ThreadState[] = [];
   for (const thread of threads.values()) {
     if (thread.meta.parentThreadId !== parentId) continue;
-    if (!isMidTurn(effectiveThreadStatus(thread))) continue;
+    if (!isMidTurn(effectiveThreadStatus(thread)) && thread.meta.liveEventWaitCount <= 0) continue;
     found.push(thread);
   }
   found.sort((a, b) => a.meta.createdAt.localeCompare(b.meta.createdAt));
-  return { threads: found, unresolved: Math.max(0, activeChildrenCount - found.length) };
+  return { threads: found, unresolved: Math.max(0, unfinishedCount - found.length) };
+}
+
+/** How many children the server says have not finished: the two counts are
+ *  disjoint, so they add. */
+function unfinishedChildCount(meta: ThreadMeta | undefined): number {
+  return (meta?.activeChildrenCount ?? 0) + (meta?.waitingChildrenCount ?? 0);
 }
 
 /** The **waiting indicator**: what this thread is waiting for, readable at any
  *  time without scrolling the transcript.
  *
  *  Two things park a thread, and the status dot already merges them: a live
- *  *event wait*, and *sub-threads* still working (`resolveVisualStatus`). Both
+ *  *event wait*, and *sub-threads* not yet finished (`resolveVisualStatus`). Both
  *  say the same thing to the reader. This is not finished, and something else
  *  will wake it. So one control carries the detail for both.
  *
@@ -114,7 +122,7 @@ export function waitingIndicatorAction(): HeaderActionSpec | null {
   const meta = id ? threadMap.value.get(id)?.meta : undefined;
   const waits = meta?.liveEventWaits ?? [];
   const subThreads = id
-    ? activeSubThreads(id, threadMap.value, meta?.activeChildrenCount ?? 0)
+    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
     : NO_SUB_THREADS;
   const summary = waitingIndicatorSummary(waits, subThreads);
   if (!summary) return null;
@@ -157,11 +165,11 @@ export function WaitingPanelHost() {
   const waits = meta?.liveEventWaits ?? [];
   const anchor = waitingPanelAnchor.value;
   // Gated on the panel being OPEN, and not as a micro-optimisation. The walk is
-  // O(loaded threads) on a thread with active children, and the prompt row
+  // O(loaded threads) on a thread with unfinished children, and the prompt row
   // re-renders on every `threadMap` flush. The control's own spec already walks
   // once to decide whether to render, so a closed panel costs nothing.
   const subThreads = anchor && id
-    ? activeSubThreads(id, threadMap.value, meta?.activeChildrenCount ?? 0)
+    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
     : NO_SUB_THREADS;
   const isOpen = anchor !== null && isWaitingForAnything(waits, subThreads);
   // Clamp into the thread pane that owns the indicator. On desktop that keeps
@@ -232,7 +240,7 @@ export function waitingIndicatorSummary(
   const children = subThreadCount(subThreads);
   const soleReason = waits.length === 1 && children === 0 ? waits[0].reason : null;
   const counted = [
-    waits.length > 0 ? plural(waits.length, 'subscription') : null,
+    waits.length > 0 ? plural(waits.length, 'event') : null,
     children > 0 ? plural(children, 'sub-thread') : null,
   ]
     .filter((part): part is string => part !== null)
@@ -322,7 +330,7 @@ export function waitingPanelBody({
       <div class="prompt-bar-popover-body">
         {waits.length > 0 ? (
           <section class="waiting-panel-section" data-role="waiting-subscriptions">
-            {labelled ? <span class="waiting-panel-section-label">Subscriptions</span> : null}
+            {labelled ? <span class="waiting-panel-section-label">Events</span> : null}
             <ul class="event-wait-list">
               {waits.map((wait) => (
                 <EventWaitRow key={wait.wait_id} threadId={threadId} wait={wait} />
@@ -337,7 +345,7 @@ export function waitingPanelBody({
               {subThreads.threads.map((child) => (
                 <SubThreadRow key={child.meta.id} child={child} onOpen={onClose} />
               ))}
-              {/* The server counts more active children than this client can
+              {/* The server counts more unfinished children than this client can
                   name. Say so, rather than show a list that contradicts the
                   thread's own Waiting dot. */}
               {subThreads.unresolved > 0 ? (
@@ -380,20 +388,22 @@ export function SubThreadRow({ child, onOpen }: { child: ThreadState; onOpen: ()
   );
 }
 
-/** The watched event types on one line, with a filtered one pressable so its
- *  `condition` is one tap away.
+/** The watched event types on one line, in plain words, with a filtered one
+ *  pressable so its `condition` is one tap away.
  *
  *  Segments rather than `describeWaitSubscription`'s joined string, because a
  *  string cannot carry a button. The joined LOOK is unchanged: still one muted
- *  mono line reading `A or B`, and an entry with no condition stays plain text.
+ *  line reading `watching for A or B`, and a type with no condition stays plain
+ *  text carrying its raw type as a tooltip. Repeats of one type fold into one
+ *  entry, as on the transcript row.
  *
  *  The modal it opens STACKS over this popover on `overlayStack`. Escape or an
  *  outside click closes the modal and leaves the panel where it was. */
 export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
-  return on.flatMap((s, i) => {
-    const glue = i === 0 ? [] : [<span key={`glue${i}`}>{' or '}</span>];
-    const label = waitSubscriptionLabel(s);
-    const door = eventConditionDoor(s);
+  return groupSubscriptions(on).flatMap((g, i) => {
+    const glue = [<span key={`glue${i}`}>{i === 0 ? 'watching for ' : ' or '}</span>];
+    const label = waitSubscriptionLabel(g);
+    const door = eventConditionDoor(g);
     return [
       ...glue,
       door ? (
@@ -409,10 +419,15 @@ export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
           {label}
         </button>
       ) : (
-        <span key={`sub${i}`}>{label}</span>
+        <span key={`sub${i}`} data-tooltip={g.event_type}>{label}</span>
       ),
     ];
   });
+}
+
+/** The countdown as a phrase: `4m 12s left`, or `due now` at zero. */
+export function countdownText(seconds: number): string {
+  return seconds > 0 ? `${formatRemaining(seconds)} left` : formatRemaining(seconds);
 }
 
 /** One live subscription. The countdown lives in component-local state, never
@@ -444,13 +459,15 @@ function EventWaitRow({ threadId, wait }: { threadId: string; wait: EventWaitSum
   return (
     <li class="event-wait-item">
       <div class="event-wait-main">
-        <span class="event-wait-reason">{wait.reason}</span>
+        {/* The panel's title already says "Waiting for", so the reason drops
+            its own leading "waiting for". */}
+        <span class="event-wait-reason">{awaitedSubject(wait.reason)}</span>
         <code class="event-wait-subscription">{subscriptionLine(wait.on)}</code>
       </div>
       <div class="event-wait-foot">
         <span class="event-wait-meta">
           <span class="event-wait-countdown">
-            {formatRemaining(secondsRemaining(wait.expires_at, now))}
+            {countdownText(secondsRemaining(wait.expires_at, now))}
           </span>
         </span>
         <button

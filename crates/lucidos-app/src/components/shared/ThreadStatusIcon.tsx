@@ -1,4 +1,4 @@
-import type { ThreadStatus, ThreadState } from '../../store/thread-events';
+import type { ThreadMeta, ThreadStatus, ThreadState } from '../../store/thread-events';
 import { effectiveThreadStatus } from '../../store/store';
 import { PauseIcon } from './icons';
 
@@ -10,6 +10,8 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
 
 /** `waiting` covers BOTH ways a thread can be finished-but-not-done: it is
  *  waiting on child threads it spawned, or on an *event wait* it registered.
+ *  A child counts while it is mid-turn, and while it idles on its own event
+ *  wait, since that child has not finished either (ADR 0254).
  *  Neither holds the thread's turn, so both land here with a backend
  *  `status` of `idle`, and both mean the same thing to the reader: something
  *  else will wake this, do not treat it as finished. They deliberately share
@@ -28,7 +30,7 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
  *  `ThreadStatus` values either. */
 export function resolveVisualStatus(
   status: ThreadStatus,
-  hasActiveChildren: boolean,
+  waitsOnSubThreads: boolean,
   codingAgentProposed: boolean,
   hasLiveEventWaits: boolean,
 ): VisualStatus {
@@ -51,8 +53,28 @@ export function resolveVisualStatus(
   // review" invited an Apply that would merge a branch still being worked on.
   if (hasLiveEventWaits) return 'waiting';
   if (codingAgentProposed) return 'changes';
-  if (hasActiveChildren) return 'waiting';
+  if (waitsOnSubThreads) return 'waiting';
   return 'idle';
+}
+
+/** The meta facts `visualStatusFor` reads. */
+type VisualStatusFacts = Pick<
+  ThreadMeta,
+  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentProposed' | 'liveEventWaitCount'
+>;
+
+/** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
+ *  status snapshot of its own. `undefined` meta is a thread the client has not
+ *  loaded, which resolves on the status alone. Every surface that paints a
+ *  dot goes through here, so none of them can drop one of the inputs. */
+export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | undefined): VisualStatus {
+  if (!meta) return resolveVisualStatus(status, false, false, false);
+  return resolveVisualStatus(
+    status,
+    meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
+    meta.codingAgentProposed,
+    meta.liveEventWaitCount > 0,
+  );
 }
 
 /** The single source of truth for a thread's status dot. Every surface that
@@ -63,12 +85,7 @@ export function resolveVisualStatus(
  *  `resolveVisualStatus(effectiveThreadStatus(t), …)` triple at a call site;
  *  call this instead. */
 export function threadVisualStatus(thread: ThreadState): VisualStatus {
-  return resolveVisualStatus(
-    effectiveThreadStatus(thread),
-    thread.meta.activeChildrenCount > 0,
-    thread.meta.codingAgentProposed,
-    thread.meta.liveEventWaitCount > 0,
-  );
+  return visualStatusFor(effectiveThreadStatus(thread), thread.meta);
 }
 
 /** User-facing label + one-line explanation for each status dot, shown in its

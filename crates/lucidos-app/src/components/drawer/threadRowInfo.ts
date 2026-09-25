@@ -1,7 +1,7 @@
 import type { ThreadMeta, ComposeChannelMode } from '../../store/thread-events';
 import type { Scope } from '../../store/store';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
-import { resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
+import { visualStatusFor, type VisualStatus } from '../shared/ThreadStatusIcon';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
 import { formatChannel } from '../../utils/formatChannel';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -65,7 +65,7 @@ export interface TooltipRow {
 }
 
 /** Card word + tone for each resolved `VisualStatus`. The card derives its
- *  Status row from the SAME `resolveVisualStatus` that paints the row's dot (and
+ *  Status row from the SAME `visualStatusFor` that paints the row's dot (and
  *  the dot's own hover tooltip), so the word can never contradict the dot — the
  *  bug this replaced: a thread idle-but-waiting-on-children read "Idle" here
  *  while the dot said "Waiting". The wording is intentionally a touch more
@@ -99,16 +99,8 @@ export function threadInfoRows(meta: ThreadMeta, status: ThreadStatus): TooltipR
   // (test fixtures); production always has them.
   const userAt = meta.lastUserAction || meta.createdAt;
   const agentAt = meta.lastAgentAction || meta.updatedAt || meta.createdAt;
-  // Resolve the visual status from the exact same inputs the dot uses (see
-  // ThreadDrawer's `resolveVisualStatus(status, …)`), so the Status word tracks
-  // the dot, including both "Waiting" cases: active children, and a live event
-  // wait.
-  const visual = resolveVisualStatus(
-    status,
-    meta.activeChildrenCount > 0,
-    meta.codingAgentProposed,
-    meta.liveEventWaitCount > 0,
-  );
+  // The same resolution the dot uses, so the Status word tracks the dot.
+  const visual = visualStatusFor(status, meta);
   const { word, tone } = CARD_STATUS[visual];
   return [
     { label: 'Status', value: word, tone },

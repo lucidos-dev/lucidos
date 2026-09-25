@@ -11,6 +11,7 @@ import {
   activeMenuItem,
   toasts,
   connectionStatus,
+  focusedPane,
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
@@ -60,6 +61,7 @@ const {
   loadNotifications,
   loadMoreNotifications,
   navigateAdjacentNotification,
+  stepViewedNotification,
   viewNotification,
   resetViewDedup,
 } = await import('./notifications');
@@ -94,6 +96,11 @@ function makeNotification(id: string, read: boolean): Notification {
 /** N unread notifications, ids `u0`..`u{N-1}`. */
 function makeUnread(n: number): Notification[] {
   return Array.from({ length: n }, (_, i) => makeNotification(`u${i}`, false));
+}
+
+function loadedRows(list: Loadable<Notification[]>): Notification[] {
+  if (list.status !== 'loaded') throw new Error(`list is ${list.status}`);
+  return list.data;
 }
 
 /** Seed the unread set (the bell badge's single source of truth) directly. */
@@ -310,6 +317,42 @@ describe('navigateAdjacentNotification', () => {
 
     expect(id).toBeNull(); // 'a' is index 0 — nothing newer
     expect(getNotifications).not.toHaveBeenCalled();
+  });
+});
+
+// ⌘↑/⌘↓ step turns in the thread pane. With the Canvas pane focused on a
+// notification, the same keys step the inbox instead.
+describe('stepViewedNotification', () => {
+  beforeEach(() => {
+    notificationsHasMore.value = false;
+    notifications.value = {
+      status: 'loaded',
+      data: [makeNotification('a', true), makeNotification('b', true)],
+    };
+    panelOverlay.value = { type: 'notification-detail', notification: makeNotification('a', true) };
+    focusedPane.value = 'content';
+  });
+
+  it('steps older from the open notification when the content pane is focused', async () => {
+    expect(stepViewedNotification(1)).toBe(true);
+    await Promise.resolve();
+    expect(panelOverlay.value).toMatchObject({ notification: { id: 'b' } });
+  });
+
+  it('claims the key at the end of the list, so it never falls through to the thread', () => {
+    expect(stepViewedNotification(-1)).toBe(true);
+    expect(panelOverlay.value).toMatchObject({ notification: { id: 'a' } });
+  });
+
+  it('declines when another pane is focused', () => {
+    focusedPane.value = 'thread';
+    expect(stepViewedNotification(1)).toBe(false);
+    expect(panelOverlay.value).toMatchObject({ notification: { id: 'a' } });
+  });
+
+  it('declines when no notification is open', () => {
+    panelOverlay.value = null;
+    expect(stepViewedNotification(1)).toBe(false);
   });
 });
 
@@ -882,6 +925,49 @@ describe('unread set is resilient to out-of-order responses', () => {
 
     // The superseded reload must not resurrect the pre-read set.
     expect(unreadCount.value).toBe(0);
+  });
+
+  it('mark-all-read clears the set on the tap, before the server answers', async () => {
+    // Reported: on a slow engine the tap changed nothing for the whole
+    // round-trip, so it read as dead until the error toasts arrived.
+    seedUnread(makeUnread(2));
+    notifications.value = { status: 'loaded', data: makeUnread(2) };
+    const post = deferred<void>();
+    (markAllNotificationsRead as Mock).mockReturnValueOnce(post.promise);
+
+    const pending = markAllRead();
+
+    expect(unreadCount.value).toBe(0);
+    expect(loadedRows(notifications.value).every((n) => n.read)).toBe(true);
+    post.resolve();
+    await pending;
+    expect(unreadCount.value).toBe(0);
+  });
+
+  it('a failed mark-all-read puts the rows back and says so', async () => {
+    seedUnread(makeUnread(2));
+    notifications.value = { status: 'loaded', data: makeUnread(2) };
+    toasts.value = [];
+    (markAllNotificationsRead as Mock).mockRejectedValueOnce(new Error('request timed out'));
+
+    await markAllRead();
+
+    expect(unreadCount.value).toBe(2);
+    expect(loadedRows(notifications.value).some((n) => n.read)).toBe(false);
+    expect(toasts.value.some((t) => t.type === 'error' && /mark all as read/i.test(t.message))).toBe(true);
+  });
+
+  it('a failed mark-all-read reloads instead of restoring when newer state landed', async () => {
+    seedUnread(makeUnread(2));
+    let reject!: (e: unknown) => void;
+    (markAllNotificationsRead as Mock).mockReturnValueOnce(new Promise<void>((_, r) => { reject = r; }));
+    (getNotifications as Mock).mockResolvedValue({ notifications: makeUnread(3), unread_count: 3, has_more: false });
+
+    const pending = markAllRead();
+    markReadOptimistic('elsewhere'); // a newer local mutation claims the set
+    reject(new Error('request timed out'));
+    await pending;
+    await vi.waitFor(() => expect(unreadCount.value).toBe(3));
   });
 
   it('supersedes the stale load AND reconciles when the set is NOT loaded (cold-start deep-link)', async () => {

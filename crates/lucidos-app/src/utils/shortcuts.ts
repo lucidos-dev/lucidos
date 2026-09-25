@@ -12,8 +12,8 @@ export type ShortcutId =
   | 'toggleSubthreads'
   | 'historyBack'
   | 'historyForward'
-  | 'prevThreadTurn'
-  | 'nextThreadTurn'
+  | 'prevTurnOrNotification'
+  | 'nextTurnOrNotification'
   | 'toggleThreadDrawer'
   | 'toggleThreadPane'
   | 'toggleContentPane'
@@ -65,8 +65,8 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
-  { id: 'prevThreadTurn', label: 'Previous turn (thread)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
-  { id: 'nextThreadTurn', label: 'Next turn (thread)', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
+  { id: 'prevTurnOrNotification', label: 'Previous turn (thread) or newer notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
+  { id: 'nextTurnOrNotification', label: 'Next turn (thread) or older notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
   { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
   { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },

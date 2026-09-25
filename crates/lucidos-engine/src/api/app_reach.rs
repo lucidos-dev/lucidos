@@ -142,6 +142,8 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/events/query", App, &["GET"]),
     ("/events/types", App, &["GET"]),
     ("/fonts/fira-code.css", Asset, &[]),
+    ("/form-requests/:request_id/cancel", Host, &[]),
+    ("/form-requests/pending", Host, &[]),
     ("/frontend-preview", Host, &[]),
     ("/frontend-preview/start", Host, &[]),
     ("/frontend-preview/stop", Host, &[]),
@@ -264,6 +266,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ),
     ("/threads/:thread_id/cc-diff", Host, &[]),
     ("/threads/:thread_id/continue", Host, &[]),
+    ("/threads/:thread_id/detach", Host, &[]),
     ("/threads/:thread_id/event-waits", Agent, &[]),
     (
         "/threads/:thread_id/event-waits/:wait_id/cancel",

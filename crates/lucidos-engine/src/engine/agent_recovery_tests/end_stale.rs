@@ -4,7 +4,7 @@ mod end_stale_session_branch_preservation {
     //! which used to silently `git branch -D` the branch in the
     //! `proposal_files=None` arm — losing the user's committed work whenever
     //! the per-commit `ChangeProposed` events hadn't synced into the `changes`
-    //! projection (so `has_pending_for_branch` returned false). Symptom: the
+    //! projection (so the branch had no pending change). Symptom: the
     //! UI shows "No changes to apply — branch is already merged or has no
     //! commits" and the Files diff fails with "unknown revision".
     //!

@@ -11,7 +11,6 @@ import {
   canceledPressReport,
   noLiftReport,
   pressWasAlone,
-  pressIsWatchable,
   faceExclusion,
   underFingerReason,
   distanceOutside,
@@ -246,15 +245,15 @@ describe('canceledPressReport: the system took the gesture', () => {
 
 // A diagnostic that cries wolf gets ignored. What is excluded is a press the
 // app drops on purpose, and NOT a face the previous probe simply did not name.
-describe('pressIsWatchable: every actionable face in the row', () => {
+describe('faceExclusion: every actionable face in the row', () => {
   const LIVE = { disabled: false, placeholder: false };
 
   it('watches an enabled face', () => {
-    expect(pressIsWatchable(LIVE)).toBe(true);
+    expect(faceExclusion(LIVE)).toBe('watchable');
   });
 
   it('ignores the invisible placeholder that holds the row height', () => {
-    expect(pressIsWatchable({ ...LIVE, placeholder: true })).toBe(false);
+    expect(faceExclusion({ ...LIVE, placeholder: true })).toBe('placeholder');
   });
 
   it('names the placeholder ahead of disabled, since that mode is both', () => {
@@ -266,7 +265,7 @@ describe('pressIsWatchable: every actionable face in the row', () => {
   });
 
   it('ignores a disabled face, which is a settling Stop or a busy Apply', () => {
-    expect(pressIsWatchable({ ...LIVE, disabled: true })).toBe(false);
+    expect(faceExclusion({ ...LIVE, disabled: true })).toBe('disabled');
   });
 });
 

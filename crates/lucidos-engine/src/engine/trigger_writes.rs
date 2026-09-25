@@ -124,12 +124,6 @@ pub(crate) struct TriggerRegistryWriter<'a> {
 }
 
 impl TriggerRegistryWriter<'_> {
-    /// Emit a trigger lifecycle event and materialize it into the registry
-    /// before returning, so the caller's next read observes its own write.
-    ///
-    /// A failed emit propagates and applies nothing. Arms no cron job: that
-    /// stays with the scheduler's subscriber, which owns `tracked_tasks` and
-    /// reacts to the same broadcast.
     /// Mint this trigger's slug and write it, both under the one guard.
     ///
     /// The slug is the `data/triggers/<slug>/` directory segment, so two
@@ -159,19 +153,16 @@ impl TriggerRegistryWriter<'_> {
             let slug = crate::triggers::mint_unique_trigger_slug(name, trigger_id, &taken);
             payload["slug"] = Value::String(slug);
         }
-        let write = TriggerWrite::Created;
-        let event = write.into_event(trigger_id.to_string(), payload.clone(), actor);
-        self.event_bus.emit(BusEvent::System(event)).await?;
-        materialize_trigger_event(
-            self.trigger_configs,
-            self.workspace_path,
-            write.event_type(),
-            trigger_id,
-            &payload,
-        );
-        Ok(())
+        self.emit_then_apply(TriggerWrite::Created, trigger_id, payload, actor)
+            .await
     }
 
+    /// Emit a trigger lifecycle event and materialize it into the registry
+    /// before returning, so the caller's next read observes its own write.
+    ///
+    /// A failed emit propagates and applies nothing. Arms no cron job: that
+    /// stays with the scheduler's subscriber, which owns `tracked_tasks` and
+    /// reacts to the same broadcast.
     pub(crate) async fn write(
         &self,
         write: TriggerWrite,
@@ -183,6 +174,19 @@ impl TriggerRegistryWriter<'_> {
         // unguarded writer can be preempted between emitting and applying,
         // and then land its older payload on top of a newer writer's.
         let _guard = self.write_lock.lock().await;
+        self.emit_then_apply(write, trigger_id, payload, actor)
+            .await
+    }
+
+    /// The emit and the registry apply both writers share. The caller holds
+    /// `write_lock` across this call.
+    async fn emit_then_apply(
+        &self,
+        write: TriggerWrite,
+        trigger_id: &str,
+        payload: Value,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let event = write.into_event(trigger_id.to_string(), payload.clone(), actor);
         self.event_bus.emit(BusEvent::System(event)).await?;
         materialize_trigger_event(

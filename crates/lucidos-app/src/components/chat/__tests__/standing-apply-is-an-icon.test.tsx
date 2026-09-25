@@ -59,7 +59,7 @@ function makeChange(): Change {
     commits: [],
     incomplete: false,
     thread_unsettled: true,
-    thread_working: true,
+    thread_settling: true,
   } as Change;
 }
 

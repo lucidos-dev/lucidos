@@ -212,8 +212,9 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
 /// 3. `git sparse-checkout set data/apps/<app_id>`.
 /// 4. `git checkout <branch>`.
 ///
-/// On any step's failure, the worktree dir is removed so the caller can
-/// retry without `git worktree add` complaining about a stale dir.
+/// When a step after the add fails, the worktree this call added is removed so
+/// the caller can retry. A failed add removes nothing: whatever occupies
+/// `wt_path` then is not this attempt's to delete.
 pub(crate) async fn create_sparse_app_worktree(
     workspace_root: &Path,
     app_id: &str,
@@ -224,9 +225,9 @@ pub(crate) async fn create_sparse_app_worktree(
         .to_str()
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
 
+    // Runs only after step 1 succeeded, so it removes a worktree this call
+    // created. Best-effort: the next attempt's add reports anything left over.
     let cleanup = || async {
-        // Best-effort: a failed worktree add may have left an empty dir
-        // behind that the next attempt would refuse to overwrite.
         let _ = git_cmd(&["worktree", "remove", "--force", wt_str], workspace_root).await;
     };
 
@@ -263,9 +264,11 @@ pub(crate) async fn create_sparse_app_worktree(
         )
         .await?
     };
+    // No cleanup on a failed add. git rolls back the directory its own add
+    // created. A `remove --force` here would hit whatever was already at
+    // `wt_path`, possibly a live worktree holding the user's work.
     if !add.status.success() {
         let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
-        cleanup().await;
         return Err(format!("git worktree add failed: {stderr}"));
     }
 
@@ -958,23 +961,15 @@ pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]
 /// revert or carry into its change.
 ///
 /// We mark the path `--skip-worktree` so git ignores the on-disk divergence.
-/// Gated on an actual index↔worktree diff: in the Lucidos repo, where
-/// `.claude/skills/lucidos-cli/SKILL.md` is intentionally tracked and identical
-/// to the embedded copy, there is no diff, so the file is left untouched and
-/// stays normally editable (skip-worktree would otherwise silently swallow a
-/// legitimate edit to the skill source). Best-effort: logs and returns on any
-/// git failure so session start is never blocked.
+/// Gated on an actual index↔worktree diff, so a repo that deliberately tracks
+/// an identical copy keeps it normally editable. Best-effort: logs and returns
+/// on any git failure so session start is never blocked.
 ///
-/// Why skip-worktree is safe here even though it was abandoned for VERSION
-/// files (see `c7c941b49` "Removed all skip-worktree/reset-version hacks"): that
-/// failure needed a `git merge main` over the skip-worktree'd path while `main`
-/// kept *mutating* it, so the merge hit "local changes would be overwritten".
-/// `build.rs` re-committed VERSION on every build. Neither half holds for the
-/// skill. No session spawn merges `main` at all now (ADR 0241). The only merge
-/// reaching this path is Apply's, on a branch the user chose to land. And
-/// skip-worktree blocks `git add -A` from ever committing the divergent copy,
-/// so no guarded session can push a change to this path onto `main`: main's
-/// copy stays frozen and the merge never sees an incoming change.
+/// App and external repos only. Skip-worktree breaks any merge that brings in
+/// a change to the hidden path. Here nothing brings one in: skip-worktree
+/// blocks `git add -A` from committing the divergent copy, so `main`'s copy
+/// stays frozen. The Lucidos source repo edits the skill on `main`, so it never
+/// comes here: see `place_lucidos_cli_skill`.
 ///
 /// `cwd` is the directory the engine wrote the file relative to — CC's cwd: the
 /// app folder for app coding-agent threads, the worktree root otherwise.
@@ -1006,6 +1001,75 @@ pub(crate) async fn hide_phantom_tracked_skill(cwd: &Path, rel_path: &str) {
         Ok(o) if o.status.success() => {}
         Ok(o) => log!(
             "[Git] skip-worktree on {} failed: {}",
+            rel_path,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log!("[Git] {}", e),
+    }
+}
+
+/// Undo `hide_phantom_tracked_skill` on a Lucidos-source worktree an older
+/// engine marked. The hidden copy blocks every merge of `main` that changes it.
+///
+/// Clears the skip-worktree bit, then restores the tracked copy only when git
+/// already stores the on-disk content, so the restore loses nothing. Any other
+/// content may be the agent's own edit, and stays visible as a normal change.
+/// Best-effort, like the hide. Temporary: see `docs/temporary-measures.md`
+/// § "Lucidos-source skill skip-worktree repair".
+pub(crate) async fn unhide_tracked_skill(cwd: &Path, rel_path: &str) {
+    // `ls-files -v` tags a skip-worktree entry `S`. An unknown answer leaves
+    // the bit alone, which only postpones the repair to the next spawn.
+    if !git_answer_when_ok(&["ls-files", "-v", "--", rel_path], cwd, |o| {
+        o.stdout.starts_with(b"S ")
+    })
+    .await
+    .or_unknown(false)
+    {
+        return;
+    }
+
+    match git_cmd(&["update-index", "--no-skip-worktree", "--", rel_path], cwd).await {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            log!(
+                "[Git] clearing skip-worktree on {} failed: {}",
+                rel_path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            log!("[Git] {}", e);
+            return;
+        }
+    }
+
+    let blob = match git_cmd(&["hash-object", "--", rel_path], cwd).await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(_) => return,
+        Err(e) => {
+            log!("[Git] {}", e);
+            return;
+        }
+    };
+    if blob.is_empty() {
+        return;
+    }
+    // An unknown answer keeps the file: a restore overwrites it.
+    if !git_answer(&["cat-file", "-e", &blob], cwd)
+        .await
+        .or_unknown(false)
+    {
+        log!(
+            "[Git] {} held content git does not store; left it as a visible change",
+            rel_path
+        );
+        return;
+    }
+    match git_cmd(&["checkout", "--", rel_path], cwd).await {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log!(
+            "[Git] restoring {} failed: {}",
             rel_path,
             String::from_utf8_lossy(&o.stderr).trim()
         ),

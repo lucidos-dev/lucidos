@@ -1038,6 +1038,7 @@ async fn test_child_thread_completed_projection_clears_pending_in_tx() {
             status: crate::engine::thread_events::ChildCompletionStatus::Success,
             summary: "done".into(),
             pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
         },
         meta: EventMeta::NONE,
     })
@@ -2059,6 +2060,200 @@ async fn a_hold_on_one_child_does_not_silence_its_sibling() {
         count_completion_cards(&pool, parent_id).await,
         1,
         "only the held child stays quiet; the sibling nobody is resuming reports"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Start a coding-agent thread under `parent_id` and have it propose one change.
+async fn spawn_cc_grandchild_with_change(bus: &EventBus, parent_id: Uuid) -> (Uuid, Uuid) {
+    let (thread_id, change_id) = (Uuid::new_v4(), Uuid::new_v4());
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            provider: None,
+            voice_session_id: None,
+            text: "a milestone".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent_id),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    emit_cc_session_started(bus, thread_id).await;
+    emit_cc_idle(bus, thread_id, true, None).await;
+    emit_pending_change(bus, thread_id, change_id).await;
+    (thread_id, change_id)
+}
+
+/// Propose `change_id` on `thread_id`, so it lands as a pending `changes` row.
+async fn emit_pending_change(bus: &EventBus, thread_id: Uuid, change_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            change_id: change_id.to_string(),
+            description: Some("milestone work".into()),
+            files: vec!["a.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: format!("branch-{thread_id}"),
+            repo_root: "/tmp".into(),
+            hardened: false,
+            incomplete: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// The `pending_change_ids` on the one card `parent_id` received.
+async fn card_pending_change_ids(pool: &PgPool, parent_id: Uuid) -> Vec<String> {
+    let ids: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'pending_change_ids' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("the child's card reached its parent");
+    ids.map(|v| serde_json::from_value(v).unwrap())
+        .unwrap_or_default()
+}
+
+/// A parent heard "Pending changes: none" from a child whose change was
+/// proposed 54 ms after its idle. The card is built at the idle, from the
+/// changes as they stand then. So the live idle arm proposes BEFORE it idles:
+/// `the_idle_arm_proposes_before_it_idles` pins that order in `run.rs`.
+#[tokio::test]
+async fn a_completion_card_lists_the_change_proposed_before_the_idle() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    // The order from the report: idle, card, then the proposal.
+    let (late_parent, late_child) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, late_child).await;
+    emit_cc_idle(&bus, late_child, false, None).await;
+    emit_pending_change(&bus, late_child, Uuid::new_v4()).await;
+    assert_eq!(
+        card_pending_change_ids(&pool, late_parent).await,
+        Vec::<String>::new(),
+        "a change proposed after the idle misses the card"
+    );
+
+    // The order the idle arm keeps: the proposal, then the idle.
+    let (parent, child) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child).await;
+    let change_id = Uuid::new_v4();
+    emit_pending_change(&bus, child, change_id).await;
+    emit_cc_idle(&bus, child, false, None).await;
+    assert_eq!(
+        card_pending_change_ids(&pool, parent).await,
+        vec![change_id.to_string()],
+        "a change proposed before the idle is on the card"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An orchestrator's children held every pending change, and its cards to its
+/// parent said "Pending changes: none" each time. The card now carries every
+/// change below the reporting thread, with its owner and whether it settled.
+#[tokio::test]
+async fn a_completion_card_carries_the_pending_changes_of_its_sub_threads() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (master, orchestrator) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, orchestrator).await;
+    let (settled_thread, settled_change) =
+        spawn_cc_grandchild_with_change(&bus, orchestrator).await;
+    let (working_thread, working_change) =
+        spawn_cc_grandchild_with_change(&bus, orchestrator).await;
+    // One of them resumed after proposing and is still working.
+    sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
+        .bind(working_thread)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    emit_cc_idle(&bus, orchestrator, false, None).await;
+
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(master.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the orchestrator's card reached the master");
+    assert!(
+        payload.get("pending_change_ids").is_none(),
+        "the orchestrator's own branch holds nothing: {payload}"
+    );
+    let entries: Vec<crate::engine::thread_events::SubThreadPendingChange> =
+        serde_json::from_value(payload["sub_thread_pending_changes"].clone())
+            .expect("the card lists its sub-threads' changes");
+    let summary: Vec<_> = entries
+        .iter()
+        .map(|e| (e.change_id, e.thread_id, e.thread_unsettled))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (settled_change, settled_thread, false),
+            (working_change, working_thread, true),
+        ]
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The subtree is transitive: a change two levels below the reporting thread
+/// still shows on its card.
+#[tokio::test]
+async fn a_completion_card_reaches_a_change_two_levels_down() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (master, orchestrator) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, orchestrator).await;
+    let (middle, _) = spawn_cc_grandchild_with_change(&bus, orchestrator).await;
+    let (deep_thread, deep_change) = spawn_cc_grandchild_with_change(&bus, middle).await;
+
+    emit_cc_idle(&bus, orchestrator, false, None).await;
+
+    let entries: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload->'sub_thread_pending_changes' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(master.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        entries.as_array().is_some_and(|all| all.iter().any(|e| {
+            e["change_id"] == deep_change.to_string() && e["thread_id"] == deep_thread.to_string()
+        })),
+        "the great-grandchild's change is on the card: {entries}"
     );
 
     pool.close().await;

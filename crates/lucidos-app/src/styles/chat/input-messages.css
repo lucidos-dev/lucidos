@@ -408,7 +408,7 @@
  *
  * The 0.7 is the RESTING look, which shows whenever the animation is off: the
  * reduced-motion reader, and the dwelt connect below. It sits here rather than
- * in the reduced-motion block so the dwelt rule can beat it on source order and
+ * in the reduced-motion rule so the dwelt rule can beat it on source order and
  * hand the glyph back at full. */
 .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
     opacity: 0.7;
@@ -538,19 +538,17 @@
  * dimmer still at the 0.55 its pulse would have carried it to, and the two live
  * phases at full. SPEAKING keeps its deeper fill, which was never the
  * animation's to give. */
-@media (prefers-reduced-motion: reduce) {
-    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
-        animation: none;
-    }
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
+    animation: none;
+}
 
-    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
-        animation: none;
-    }
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
+    animation: none;
+}
 
-    .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
-        animation: none;
-        opacity: 0.55;
-    }
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
+    animation: none;
+    opacity: 0.55;
 }
 
 /* STANDING APPLY: the follow toggle's shape again, accent only and no frame,
@@ -602,15 +600,6 @@
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
     cursor: pointer;
-}
-
-.changes-keep-going input {
-    cursor: pointer;
-    /* An unsized checkbox renders at the UA default, which is a px constant and
-       therefore ignores the ui-scale every rem beside it rides. */
-    width: 0.875rem;
-    height: 0.875rem;
-    margin: 0;
 }
 
 .change-description {
@@ -1024,10 +1013,8 @@
     to { transform: translateY(0); }
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .thread-view.revealing {
-        animation: none;
-    }
+:root[data-motion="reduce"] .thread-view.revealing {
+    animation: none;
 }
 
 .scroll-to-top,
@@ -1040,7 +1027,7 @@
     background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
     backdrop-filter: blur(0.5rem);
     -webkit-backdrop-filter: blur(0.5rem);
-    border: 0.125rem solid var(--border-color);
+    border: 1px solid var(--border-color);
     color: var(--text-secondary);
     cursor: pointer;
     display: flex;
@@ -1052,6 +1039,12 @@
         color var(--duration-fast), border-color var(--duration-fast);
     z-index: calc(var(--z-float) + 1);
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.scroll-to-top svg,
+.scroll-to-bottom svg {
+    width: var(--scroll-chevron-glyph);
+    height: var(--scroll-chevron-glyph);
 }
 
 .scroll-to-top { top: max(calc(env(safe-area-inset-top, 0px) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
@@ -1134,18 +1127,49 @@
     font-size: var(--font-size-sm);
 }
 
+/* The status word and the timestamp beside it share one size and differ
+   plainly: the word is brighter and a dim dot parts them. Near-equal sizes in
+   one grey read as a mistake. The glyphs below keep their own size and colour. */
 .exchange-status-label {
     display: flex;
     align-items: center;
     gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
 }
 
-.exchange-status-check {
-    color: var(--accent-green);
-    font-size: var(--font-size-md);
-    font-weight: bold;
-    margin-left: -0.1875rem;
-    vertical-align: middle;
+/* The dot hangs off the status, out of flow, in the room the timestamp's
+   margin leaves. Two cases draw none. A status ending in a glyph needs no
+   dot, because the glyph already parts the two. A pair stacked on two lines
+   needs none either: the status then sits flush on the cluster's right edge,
+   so its dot lies past that edge, where the clip below hides it.
+   The dot box is 1.25rem: the cluster's 0.5rem column gap plus this margin. */
+.exchange-status-label:not(:has(.exchange-status-glyph)):has(+ .response-timestamp, + .initiator-timestamp) {
+    position: relative;
+}
+
+.exchange-status-label:not(:has(.exchange-status-glyph)):has(+ .response-timestamp, + .initiator-timestamp)::after {
+    content: '\00b7';
+    position: absolute;
+    left: 100%;
+    width: 1.25rem;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+.exchange-status-label:not(:has(.exchange-status-glyph)) + .response-timestamp,
+.exchange-status-label:not(:has(.exchange-status-glyph)) + .initiator-timestamp {
+    margin-left: 0.75rem;
+}
+
+/* Clips only what lies past the right edge, where a stacked status puts its
+   dot. The 0.25rem slack keeps the focus ring of the rightmost field. The dot
+   centres 0.625rem past the edge, so it stays outside the slack. A cluster
+   holding a glyph draws no dot, so it skips the clip: the queued bin's chip
+   and focus ring reach further past the edge than the slack allows. */
+.response-meta:not(:has(.exchange-status-glyph)),
+.initiator-meta:not(:has(.exchange-status-glyph)) {
+    clip-path: inset(-1rem -0.25rem -1rem -1rem);
 }
 
 .exchange-status-x {
@@ -1154,24 +1178,13 @@
     font-weight: bold;
 }
 
+/* Sized in em so the triangle follows the status word. At 1.15em its base
+   sits on the word's baseline and its tip just clears the capitals. */
 .exchange-status-warning {
     color: var(--accent-yellow);
-    font-size: var(--font-size-md);
-    font-weight: bold;
-}
-
-.exchange-status-queued {
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-}
-
-/* Terminal-but-neutral divider header: a question/permission prompt whose turn
-   ended without a response for a non-user-cancel reason (system abort, error,
-   agent raced past). Muted + glyphless — the precise turn cause (Aborted ⚠ /
-   Error ✕) is shown by the response panel + abort boundary, not here. */
-.exchange-status-dropped {
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
+    width: 1.15em;
+    height: 1.15em;
+    flex-shrink: 0;
 }
 
 /* Target, nominal and correction all come from `.icon-btn.inline-icon`
@@ -1214,12 +1227,6 @@
     display: none;
 }
 
-/* The ○ glyph carries its own muted color for the standalone queued bubble;
-   inside the accent-colored group header it should match the header instead. */
-.queued-message-group-summary .exchange-status-queued {
-    color: inherit;
-}
-
 .queued-message-group-label {
     font-weight: 600;
 }
@@ -1230,21 +1237,21 @@
     }
 }
 
-.exchange-status-awaiting {
-    color: var(--text-secondary);
-    font-size: var(--font-size-md);
-    font-weight: bold;
-}
-
-/* The ↳ glyph's ink sits high in its em box — the elbow rides near cap height
-   while the label's lowercase text centers around the x-height — so centering
-   the two line boxes leaves the arrow visibly floating above "Done". Nudge it
-   down so the ink, not the box, lines up. */
+/* Inline in the status word, so it rides the word's baseline. The row's
+   centre line would not do: where a line box centres depends on the font's
+   ascent and descent. An inline SVG's baseline is its bottom edge. The box is
+   14 of the icon's 12-unit cap, lowered by 2, so the stem starts on the cap
+   line and the head hangs just below the baseline, in any font. The margin is
+   the label's gap, and the em values are the fallback where `cap` is unknown. */
 .exchange-status-continued {
     color: var(--text-secondary);
-    font-size: var(--font-size-md);
-    position: relative;
-    top: 0.125rem;
+    margin-left: 0.375rem;
+    width: 0.82em;
+    height: 0.82em;
+    vertical-align: -0.12em;
+    width: calc(1cap * 14 / 12);
+    height: calc(1cap * 14 / 12);
+    vertical-align: calc(-1cap * 2 / 12);
 }
 
 
@@ -1274,8 +1281,10 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 0.7rem;
-    height: 0.7rem;
+    /* The design size, which `badges.css` rounds to whole pixels. */
+    --badge-height: 0.7rem;
+    width: var(--badge-box, var(--badge-height));
+    height: var(--badge-height);
     border-radius: 50%;
     background: var(--text-secondary);
     font-size: var(--font-size-3xs);
@@ -1338,8 +1347,15 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     50% { opacity: 0.3; }
 }
 
-/* Shared by the header recovery dot (panels/shell.css) and the System page's
-   engine-death indicator (settings/system.css) — keyframes are global. */
+/* Reduced motion: the dots rest at their base look. Colour already tells
+   waiting from loading. */
+:root[data-motion="reduce"] .progress-dot-waiting,
+:root[data-motion="reduce"] .progress-dot-loading {
+    animation: none;
+}
+
+/* Used by the System page's engine-death indicator (settings/system.css).
+   Keyframes are global. */
 @keyframes progress-blink-red {
     0%, 100% { background: var(--accent-red); }
     50% { background: transparent; }

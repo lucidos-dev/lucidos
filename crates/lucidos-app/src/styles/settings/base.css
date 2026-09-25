@@ -163,10 +163,16 @@
     color: var(--text-muted);
 }
 
+/* Wraps, so a control too wide to sit beside its label drops under it. The
+   label's flex-basis below is what decides when. Packed to the end, not spaced
+   between: the growing label fills its own line either way, and a control that
+   wraps alone stays on the right instead of jumping to the left edge. */
 .settings-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
-    justify-content: space-between;
+    justify-content: flex-end;
+    gap: var(--space-xs) var(--space-md);
     padding: 0.5rem 0;
 }
 
@@ -218,6 +224,24 @@
     padding-top: 0.375rem;
 }
 
+/* The label's basis is its own text, so the control shares its line exactly
+   when the whole label fits beside it, and drops under it otherwise. A label
+   is never crushed beside a control that does not shrink. A fixed floor here
+   reserved as much room for "Mode" as for a long label, and wrapped a short
+   label's control with room to spare. Growing keeps the control on the right.
+
+   Direct children only: a readout inside .settings-row-options wears the class
+   for its type, and must stay the width of its text. */
+.settings-row > .settings-row-label {
+    flex: 1 1 auto;
+}
+
+/* An empty label is a spacer. As a flex item it would claim a line of its own
+   above a control that wraps, so the row drops it. */
+.settings-row > .settings-row-label:empty {
+    display: none;
+}
+
 /* A row whose control is a FREE-TEXT FIELD stacks: label on its own line, field
    full width underneath. Side by side is right for a toggle, a chip row or a
    dropdown (short control, short label), and wrong for a text field, which wants
@@ -239,9 +263,10 @@
 
 /* The base label's padding-top optically centers it against a control sitting to
    its right. Stacked there is nothing to center against, and it just opens a gap
-   above the label. */
+   above the label. Its flex-basis goes too: in a column it would be a height. */
 .settings-row:has(> .settings-text-input) > .settings-row-label {
     padding-top: 0;
+    flex: none;
 }
 
 /* min-width is what the field defends when it shares the row; stacked it has the
@@ -275,11 +300,12 @@
     padding: 0;
 }
 
+/* A button that opens something from a settings row (the UI scale readout).
+   A pick among options is a .segmented-control instead. */
 .settings-option {
     background: none;
-    /* Border stays 1px at all times so the box geometry never shifts between
-       states; only its COLOUR changes (dim at rest → transparent when lit, where
-       a glow ring takes over the edge — see below). */
+    /* The border stays 1px in every state so the box never shifts; hover only
+       swaps its colour for a glow ring. */
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
     padding: 0.1875rem 0.5rem;
@@ -287,60 +313,27 @@
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
     cursor: pointer;
-    /* `transition: all` also animates box-shadow, so the neon glow below fades
-       in smoothly on hover/select instead of snapping on. */
+    /* `all` also animates box-shadow, so the glow fades in rather than snaps. */
     transition: all var(--duration-normal);
 }
 
+/* A blurred ring rather than a hard accent border: a stroked border aliases at
+   this small radius under fractional UI scaling. */
 @media (hover: hover) {
     .settings-option:hover {
         color: var(--accent);
-        /* Soft glow ring instead of a hard accent border (see .active) so the
-           hover edge is smooth too. */
         border-color: transparent;
         box-shadow:
             0 0 0.1875rem 0.03125rem color-mix(in srgb, var(--accent) 45%, transparent),
             0 0 0.5rem color-mix(in srgb, var(--accent) 22%, transparent);
     }
-}
 
-.settings-option.active {
-    color: var(--accent);
-    /* Draw the lit edge as a soft GLOW RING, not a hard 1px accent border. A
-       stroked border rounds its corners with visible aliasing at this small
-       radius — worse at fractional device pixels under UI scaling — which an
-       outer glow can't hide (that was the "still uneven in the corners" report).
-       A box-shadow ring carrying a touch of blur has no hard corner to alias, so
-       the neon edge stays smooth, and it reads more like a glowing tube anyway.
-       Border kept transparent (not removed) so the box size doesn't shift.
-       Layers: a tight blurred ring (the "tube") + two wider auras (the bloom). */
-    border-color: transparent;
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    box-shadow:
-        0 0 0.1875rem 0.0625rem color-mix(in srgb, var(--accent) 80%, transparent),
-        0 0 0.625rem color-mix(in srgb, var(--accent) 38%, transparent),
-        0 0 1.125rem color-mix(in srgb, var(--accent) 18%, transparent);
-}
-
-/* Light mode: the glow that reads as elegant light-emission on the dark app
-   turns into a heavy blue smudge over white. Keep the smooth blurred edge (still
-   no hard corner to alias) but drop the wide bloom auras and dial the intensity
-   right down — restrained on white, full neon on dark. The active override is
-   after the hover one so the stronger active glow still wins when the selected
-   option is hovered; hover stays behind (hover: hover) like the base rule so it
-   doesn't stick on touch. */
-@media (hover: hover) {
+    /* Restrained on white, where the dark-mode bloom reads as a blue smudge. */
     html[data-theme="light"] .settings-option:hover {
         box-shadow:
             0 0 0.125rem 0.03125rem color-mix(in srgb, var(--accent) 32%, transparent),
             0 0 0.3125rem color-mix(in srgb, var(--accent) 12%, transparent);
     }
-}
-
-html[data-theme="light"] .settings-option.active {
-    box-shadow:
-        0 0 0.125rem 0.03125rem color-mix(in srgb, var(--accent) 55%, transparent),
-        0 0 0.375rem color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 /* Text/password input for settings rows (Providers credential form). */

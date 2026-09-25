@@ -1163,9 +1163,8 @@ impl LucidosEngine {
 
                 // SAFEGUARD: Only block overwrites of binary imports (PDFs, images, etc.)
                 // Text files can always be edited since we have git versioning
-                let extension = path.rsplit('.').next().unwrap_or("").to_lowercase();
                 let is_binary_import = path.starts_with("artifacts/imported/")
-                    && crate::core::is_binary_extension(&extension);
+                    && crate::core::is_binary_extension(&lowercase_extension(path));
 
                 if file_exists && is_binary_import {
                     return Ok(format!(
@@ -1433,17 +1432,12 @@ impl LucidosEngine {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("Copy {} to {}", source, &dst_data_path));
-                let commit_sha = if let Some(app_path) = dst_data_path.strip_prefix("apps/") {
-                    self.app_manager.commit(app_path, &commit_msg)?
-                } else {
-                    self.artifact_manager
-                        .commit_data_path(&dst_data_path, &commit_msg)
-                        .await?
-                };
+                let commit_sha = self
+                    .commit_file_change(&dst_data_path, &dst_path, &commit_msg)
+                    .await?;
 
                 // Emit event for artifacts
-                if dst_data_path.starts_with("artifacts/") {
-                    let artifact_path = dst_data_path.strip_prefix("artifacts/").unwrap();
+                if let Some(artifact_path) = dst_data_path.strip_prefix("artifacts/") {
                     // A copy can land ON the profile, and the new bytes exist
                     // only on disk here, so re-read rather than assume the
                     // source content is what arrived. Before the emit, which can
@@ -1571,7 +1565,7 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                     path, sha_short
                 ))
             }
-            _ => Ok(format!("Unknown file tool: {}", name)),
+            _ => Err(format!("Unknown file tool: {}", name).into()),
         }
     }
 }

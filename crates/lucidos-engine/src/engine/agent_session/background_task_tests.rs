@@ -74,11 +74,12 @@ fn discard_and_archive_abandon_background_tasks_and_nothing_else_does() {
     assert!(!StopReason::UserStop.abandons_background_tasks());
 }
 
-/// The rule above only helps if `stop_agent` acts on it, and before the
-/// session lookup: a Discard on a thread whose agent process already went idle
-/// takes the no-session branch, while its task keeps running.
+/// The rule above only helps if `stop_agent` acts on it on both branches: a
+/// Discard on a thread whose agent process already went idle takes the
+/// no-session branch, while its task keeps running. The kill follows the
+/// refusal check, so a refused stop kills nothing.
 #[test]
-fn stop_agent_kills_the_threads_tasks_before_it_looks_for_a_session() {
+fn stop_agent_kills_the_threads_tasks_whether_or_not_a_session_is_live() {
     let src = crate::test_support::source_scan::read_production_source(
         &crate::test_support::source_scan::src_root().join("engine/claude_code/control.rs"),
     );
@@ -86,10 +87,14 @@ fn stop_agent_kills_the_threads_tasks_before_it_looks_for_a_session() {
     let kill = body
         .find("abandon_background_tasks(")
         .expect("stop_agent must kill the thread's background tasks");
-    let lookup = body
-        .find("self.agent_sessions.lock()")
-        .expect("stop_agent looks the session up");
-    assert!(kill < lookup, "the kill must not depend on a live session");
+    let refusal = body
+        .find("stop_refusal(")
+        .expect("stop_agent asks whether the stop is refused");
+    let branch = body
+        .find("if let Some(stop) = reserved")
+        .expect("stop_agent branches on the session it reserved");
+    assert!(refusal < kill, "a refused stop must kill nothing");
+    assert!(kill < branch, "the kill must not depend on a live session");
     assert!(
         body[..kill].contains("abandons_background_tasks()"),
         "the kill is gated on the stop reason"

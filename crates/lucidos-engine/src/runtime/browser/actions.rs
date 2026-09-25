@@ -17,11 +17,17 @@ impl BrowserRuntime {
         // If headless, check blocklist first
         if !visible {
             if let Some(ref domain) = domain {
-                if let Ok(Some(reason)) = HeadlessBlocklist::is_blocked(&self.pool, domain).await {
-                    return Err(format!(
-                        "{} blocks headless browsers ({}). Retry with visible=true to browse this site.",
-                        domain, reason
-                    ));
+                match HeadlessBlocklist::is_blocked(&self.pool, domain).await {
+                    Ok(Some(reason)) => {
+                        return Err(format!(
+                            "{} blocks headless browsers ({}). Retry with visible=true to browse this site.",
+                            domain, reason
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log!("[Browser] Headless blocklist lookup failed for {domain}: {e}");
+                    }
                 }
             }
         }
@@ -175,11 +181,11 @@ impl BrowserRuntime {
             "text" => {
                 let js = format!(
                     r#"
-                    Array.from(document.querySelectorAll('{}'))
+                    Array.from(document.querySelectorAll({}))
                         .map(el => el.innerText)
                         .join('\n---\n')
                     "#,
-                    selector.replace('\'', "\\'")
+                    js_string_literal(selector)
                 );
                 let result = page
                     .evaluate(js)
@@ -192,11 +198,11 @@ impl BrowserRuntime {
             "html" => {
                 let js = format!(
                     r#"
-                    Array.from(document.querySelectorAll('{}'))
+                    Array.from(document.querySelectorAll({}))
                         .map(el => el.outerHTML)
                         .join('\n')
                     "#,
-                    selector.replace('\'', "\\'")
+                    js_string_literal(selector)
                 );
                 let result = page
                     .evaluate(js)
@@ -209,7 +215,7 @@ impl BrowserRuntime {
             "links" => {
                 let js = format!(
                     r#"
-                    Array.from(document.querySelectorAll('{}'))
+                    Array.from(document.querySelectorAll({}))
                         .map(el => {{
                             if (el.tagName === 'A') {{
                                 return el.href + ' | ' + (el.innerText || el.title || '').trim();
@@ -220,7 +226,7 @@ impl BrowserRuntime {
                         }})
                         .join('\n')
                     "#,
-                    selector.replace('\'', "\\'")
+                    js_string_literal(selector)
                 );
                 let result = page
                     .evaluate(js)
@@ -234,7 +240,7 @@ impl BrowserRuntime {
                 let js = format!(
                     r#"
                     (function() {{
-                        const table = document.querySelector('{}');
+                        const table = document.querySelector({});
                         if (!table) return 'No table found';
                         const rows = Array.from(table.querySelectorAll('tr'));
                         return rows.map(row => {{
@@ -243,7 +249,7 @@ impl BrowserRuntime {
                         }}).join('\n');
                     }})()
                     "#,
-                    selector.replace('\'', "\\'")
+                    js_string_literal(selector)
                 );
                 let result = page
                     .evaluate(js)
@@ -360,11 +366,11 @@ impl BrowserRuntime {
                 .await
                 .map_err(|e| format!("Failed to focus: {}", e))?;
             page.evaluate(format!(
-                "document.querySelector('{}').value = ''",
-                selector.replace('\'', "\\'")
+                "document.querySelector({}).value = ''",
+                js_string_literal(selector)
             ))
             .await
-            .ok();
+            .map_err(|e| format!("Failed to clear: {}", e))?;
         }
 
         // Type the text
@@ -375,15 +381,15 @@ impl BrowserRuntime {
 
         if press_enter {
             page.evaluate(format!(
-                "document.querySelector('{}').dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', keyCode: 13, which: 13}}))",
-                selector.replace('\'', "\\'")
+                "document.querySelector({}).dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', keyCode: 13, which: 13}}))",
+                js_string_literal(selector)
             ))
             .await
             .ok();
             // Also try form submission
             page.evaluate(format!(
-                "document.querySelector('{}').form?.submit()",
-                selector.replace('\'', "\\'")
+                "document.querySelector({}).form?.submit()",
+                js_string_literal(selector)
             ))
             .await
             .ok();
@@ -586,4 +592,11 @@ impl BrowserRuntime {
             screenshot_data.len()
         ))
     }
+}
+
+/// Quote an LLM-supplied selector as a JS string literal. A JSON string is a
+/// valid JS one. Backslashes in a CSS-escaped selector like `.md\:flex`
+/// survive, and no quote in it can close the string.
+fn js_string_literal(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
 }

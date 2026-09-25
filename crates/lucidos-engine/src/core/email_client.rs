@@ -126,10 +126,10 @@ impl EmailClient {
         session.examine(folder).await?;
 
         // Detect non-ASCII in search query (Exchange Online only supports US-ASCII IMAP SEARCH)
-        let has_non_ascii = search.is_some_and(|s| !s.is_ascii());
-        let imap_search = if has_non_ascii {
-            let sanitized = sanitize_search_query(search.unwrap());
-            crate::log!(@Email, "Non-ASCII detected in search, sanitized: {:?} → {:?}", search.unwrap(), &sanitized);
+        let non_ascii_search = search.filter(|s| !s.is_ascii());
+        let imap_search = if let Some(original) = non_ascii_search {
+            let sanitized = sanitize_search_query(original);
+            crate::log!(@Email, "Non-ASCII detected in search, sanitized: {:?} → {:?}", original, &sanitized);
             sanitized
         } else {
             search.map(|s| s.to_string()).unwrap_or_default()
@@ -160,7 +160,7 @@ impl EmailClient {
         }
 
         // When client-side filtering will narrow results, fetch more candidates
-        let fetch_limit = if has_non_ascii {
+        let fetch_limit = if non_ascii_search.is_some() {
             (limit * 3).max(60)
         } else {
             limit
@@ -252,8 +252,7 @@ impl EmailClient {
 
         // When the original search had non-ASCII, the IMAP query was broadened
         // (non-ASCII stripped). Now filter client-side against the original query.
-        if has_non_ascii {
-            let original_search = search.unwrap();
+        if let Some(original_search) = non_ascii_search {
             let before = summaries.len();
             summaries.retain(|email| matches_search_filter(email, original_search));
             summaries.truncate(limit as usize);

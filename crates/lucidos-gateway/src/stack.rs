@@ -207,6 +207,25 @@ fn engine_env_overrides(
     ]
 }
 
+/// The gateway's own cert and key, under names the engine never serves with.
+///
+/// A loopback engine loses `LUCIDOS_TLS_*` so it serves plain HTTP to the
+/// gateway. Its frontend preview still needs the gateway's cert: the device
+/// cookie is `Secure` on a TLS gateway, so a preview on plain HTTP never
+/// receives it off `localhost` (ADR 0267). Empty when the gateway serves plain
+/// HTTP, which tells the engine the gateway's scheme too.
+fn gateway_tls_handoff(cert: Option<&str>, key: Option<&str>) -> Vec<(&'static str, String)> {
+    match (cert, key) {
+        (Some(c), Some(k)) if crate::net_config::serves_tls(cert, key) => vec![
+            // Trimmed, as `serves_tls` and the gateway's own listener trim: a
+            // padded path would pass the check here and fail Vite's `existsSync`.
+            ("LUCIDOS_GATEWAY_TLS_CERT", c.trim().to_string()),
+            ("LUCIDOS_GATEWAY_TLS_KEY", k.trim().to_string()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Spawn a workspace engine: detached, pointed at its workspace dir and
 /// database, told how to call the gateway back for an in-place restart.
 /// Inherits the gateway's environment and overrides the workspace-specific
@@ -244,12 +263,17 @@ pub fn spawn_engine(
     crate::file_backup::exclude(&state_dir, "workspace state dir");
 
     let mut cmd = Command::new(engine_bin);
-    cmd.current_dir(resolved_dir).envs(engine_env_overrides(
-        ws,
-        resolved_dir,
-        database_url,
-        gateway_port,
-    ));
+    cmd.current_dir(resolved_dir)
+        .envs(engine_env_overrides(
+            ws,
+            resolved_dir,
+            database_url,
+            gateway_port,
+        ))
+        .envs(gateway_tls_handoff(
+            std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
+            std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
+        ));
 
     // Never hand a spawned engine a frontend pinned to a coding-agent worktree.
     // This inherit is what makes such a pin self-perpetuating: the worktree's
@@ -558,14 +582,47 @@ pub enum ProbeOutcome {
 /// "alive but the accept loop is starved" (busy), not "refused", so it must read
 /// as `Slow`. Only a genuine non-timeout connect error is `Unreachable`.
 pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> ProbeOutcome {
+    probe_engine(client, scheme, port).await.outcome
+}
+
+/// One health probe, and what a healthy engine said about its database.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EngineProbe {
+    pub outcome: ProbeOutcome,
+    /// `true` unless a healthy engine reported otherwise (ADR 0037).
+    pub database_reachable: bool,
+}
+
+/// [`probe_health`], also reading `database_reachable` from the same body, so
+/// the slowness watch costs the supervisor no second request (ADR 0283).
+pub async fn probe_engine(client: &reqwest::Client, scheme: &str, port: u16) -> EngineProbe {
     let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
+    let outcome = |outcome| EngineProbe {
+        outcome,
+        database_reachable: true,
+    };
     match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => ProbeOutcome::Healthy,
-        Ok(_) => ProbeOutcome::Other,
-        Err(e) if e.is_timeout() => ProbeOutcome::Slow,
-        Err(e) if e.is_connect() => ProbeOutcome::Unreachable,
-        Err(_) => ProbeOutcome::Other,
+        Ok(r) if r.status().is_success() => EngineProbe {
+            outcome: ProbeOutcome::Healthy,
+            database_reachable: r
+                .text()
+                .await
+                .map_or(true, |body| database_reachable(&body)),
+        },
+        Ok(_) => outcome(ProbeOutcome::Other),
+        Err(e) if e.is_timeout() => outcome(ProbeOutcome::Slow),
+        Err(e) if e.is_connect() => outcome(ProbeOutcome::Unreachable),
+        Err(_) => outcome(ProbeOutcome::Other),
     }
+}
+
+/// `database_reachable` from a health body. Only an explicit `false` counts:
+/// an older engine omits the field, and must never read as an outage.
+fn database_reachable(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|health| health.get("database_reachable")?.as_bool())
+        .unwrap_or(true)
 }
 
 /// An engine found answering on a registered port, and when it says it started.
@@ -792,6 +849,19 @@ pub async fn notify_restart_intent(
 mod tests {
     use super::*;
     use crate::registry::Workspace;
+
+    #[test]
+    fn only_an_explicit_false_reads_as_an_unreachable_database() {
+        assert!(!database_reachable(
+            r#"{"status":"ok","database_reachable":false}"#
+        ));
+        assert!(database_reachable(
+            r#"{"status":"ok","database_reachable":true}"#
+        ));
+        // An older engine, and a body that is not JSON at all.
+        assert!(database_reachable(r#"{"status":"ok"}"#));
+        assert!(database_reachable("not json"));
+    }
 
     /// A child that is still running is live, and probing it must NOT reap or
     /// otherwise disturb it: the very next `try_wait` has to still work.
@@ -1375,6 +1445,42 @@ mod tests {
                 .to_string(),
             "the engine must be handed the port this gateway itself resolved"
         );
+    }
+
+    #[test]
+    fn a_tls_gateway_hands_its_pair_on_under_names_the_engine_never_serves_with() {
+        let handed = gateway_tls_handoff(Some("/certs/cert.pem"), Some("/certs/key.pem"));
+        assert_eq!(
+            handed,
+            [
+                ("LUCIDOS_GATEWAY_TLS_CERT", "/certs/cert.pem".to_string()),
+                ("LUCIDOS_GATEWAY_TLS_KEY", "/certs/key.pem".to_string()),
+            ]
+        );
+        assert_eq!(
+            gateway_tls_handoff(Some(" /certs/cert.pem "), Some("/certs/key.pem\n"))[0].1,
+            "/certs/cert.pem"
+        );
+        // The engine serves TLS iff it sees `LUCIDOS_TLS_*`. Handing the pair on
+        // under that name would break the gateway's plain-HTTP proxy hop.
+        assert!(handed.iter().all(|(k, _)| !k.starts_with("LUCIDOS_TLS_")));
+    }
+
+    #[test]
+    fn a_plain_http_gateway_hands_nothing_on() {
+        // The same rule `serves_tls` applies: an empty value is how a launch
+        // script spells unset, so half a pair is no pair.
+        for (cert, key) in [
+            (None, None),
+            (Some("/certs/cert.pem"), None),
+            (Some("/certs/cert.pem"), Some("  ")),
+            (Some(""), Some("/certs/key.pem")),
+        ] {
+            assert!(
+                gateway_tls_handoff(cert, key).is_empty(),
+                "{cert:?} / {key:?}"
+            );
+        }
     }
 
     /// The file is a KEY=VALUE store the dev scripts also write. `swap_ports`

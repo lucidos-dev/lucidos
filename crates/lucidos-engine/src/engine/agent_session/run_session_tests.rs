@@ -408,3 +408,117 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// The reproduction, end to end on the path it took. A switch restarted the
+/// engine mid-build, and the spawn consumer resumed the session with the bare
+/// continue message. The agent answered "You've stopped a Rust build twice, so
+/// I won't start another one". The resumed prompt must name the real cause
+/// before it says to continue.
+#[tokio::test]
+async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
+    use super::run::{build_resume_prompt_text, ResumeSpawnContext, RESUME_NOTE_REFERENT_GUARD};
+    use crate::engine::agent_recovery::{
+        AUTO_RESUME_AFTER_SWITCH_REASON, CONTINUE_RESUME_USER_MESSAGE,
+    };
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{
+        emit_response_aborted, AbortCause, ActorMode, EventChannel, EventMeta, ThreadEvent,
+    };
+    use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
+    use uuid::Uuid;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/restart-resume";
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    start_cc_session(&bus, thread_id, branch, None).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            provider: None,
+            voice_session_id: None,
+            text: "build the preview gateway".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .unwrap();
+
+    // The teardown boundary `abort_in_flight_for_restart` lands mid-build.
+    emit_response_aborted(
+        &bus,
+        thread_id,
+        AbortCause::EngineShutdown,
+        String::new(),
+        vec![],
+        None,
+        None,
+        cc_meta.clone(),
+        "[test] teardown ResponseAborted",
+    )
+    .await;
+
+    let origin_id = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ContinuationRequested {
+                reason: AUTO_RESUME_AFTER_SWITCH_REASON.into(),
+            },
+            meta: cc_meta,
+        })
+        .await
+        .unwrap()
+        .expect("emit produced no EmitResult")
+        .event_id;
+
+    let final_text = build_resume_prompt_text(
+        &pool,
+        thread_id,
+        origin_id,
+        CONTINUE_RESUME_USER_MESSAGE,
+        ResumeSpawnContext {
+            worktree_path: None,
+            last_idle_sha: None,
+            adoption_note: None,
+            session_branch: Some(branch),
+        },
+    )
+    .await;
+
+    let restart_at = final_text
+        .find("ENGINE RESTART")
+        .unwrap_or_else(|| panic!("the resume must name the restart: {final_text}"));
+    let guard_at = final_text
+        .find(RESUME_NOTE_REFERENT_GUARD)
+        .expect("a note block closes with the referent guard");
+    assert!(
+        restart_at < guard_at,
+        "the restart line belongs in the note block: {final_text}"
+    );
+    assert!(
+        final_text.contains("nobody refused or interrupted anything"),
+        "the resume must clear the user of the transcript's rejection: {final_text}"
+    );
+    assert!(
+        final_text.ends_with(CONTINUE_RESUME_USER_MESSAGE),
+        "the continue message still ends the prompt: {final_text}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

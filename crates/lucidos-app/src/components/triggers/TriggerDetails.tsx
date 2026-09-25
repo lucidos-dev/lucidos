@@ -345,9 +345,10 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
-    // go_to_review / side_effect_grant / model / reasoning_effort apply only to
-    // the intent path; `submitTrigger` gates all four on `run.type` so a script
-    // trigger can't persist state left over from an intent → script switch.
+    // go_to_review / side_effect_grant / model / reasoning_effort / provider
+    // apply only to the intent path. `submitTrigger` gates all five on
+    // `run.type`, so a script trigger can't persist state left over from an
+    // intent → script switch.
     await submitTrigger({
       name, run, cronExpressions: finalCrons, triggerId: editingId,
       on, showEvent, goToReview,

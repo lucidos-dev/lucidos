@@ -52,10 +52,8 @@
     pointer-events: none;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .loading-fade-skeleton {
-        transition: none;
-    }
+:root[data-motion="reduce"] .loading-fade-skeleton {
+    transition: none;
 }
 
 /* Self-skeletonizing primitives (components/shared/Skeleton.tsx). The Sk* leaves
@@ -96,10 +94,8 @@
     overflow: hidden;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .sk-bar {
-        animation: none;
-    }
+:root[data-motion="reduce"] .sk-bar {
+    animation: none;
 }
 
 /* Four boxes here can hold focus without being something the user presses, and
@@ -652,7 +648,7 @@
        one snapping while the other glides. The 0.26s here is the 1x default;
        Toast.tsx overrides `animation-duration` inline so both halves also scale
        together with the diagnostic animation-speed slider (speedMultiplier). */
-    animation: toast-in 0.26s cubic-bezier(0.22, 0, 0, 1);
+    animation: toast-in calc(0.26s * var(--duration-scale)) cubic-bezier(0.22, 0, 0, 1);
     display: flex;
     flex-direction: column;
     gap: 0.5rem;

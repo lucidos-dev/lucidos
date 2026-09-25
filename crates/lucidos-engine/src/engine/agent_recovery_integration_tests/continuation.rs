@@ -257,11 +257,13 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     id: "opt-0".into(),
                     label: "Approve".into(),
                     description: None,
+                    preview: None,
                 },
                 QuestionOption {
                     id: "opt-1".into(),
                     label: "Derive the deadline instead".into(),
                     description: None,
+                    preview: None,
                 },
             ],
             worktree_path: None,

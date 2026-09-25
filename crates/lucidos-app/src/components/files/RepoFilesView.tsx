@@ -26,9 +26,8 @@ import { DiffStatsInline, DiffView } from './DiffView';
  *  Gating Changes mode on the diff alone lets the diff list appear as soon as
  *  the diff loads, instead of waiting for the whole-repo tree listing that only
  *  All Files needs (and which is often the slower call). The diff gate still
- *  prevents the "No changes" flash — an empty [] rendered while the diff is in
- *  flight (and before the single-file overlay opens over it). Exported for the
- *  unit test. */
+ *  prevents the "No changes" flash, an empty [] rendered while the diff is in
+ *  flight. Exported for the unit test. */
 export function repoFilesContentReady(opts: {
   filesStatus: Loadable<unknown>['status'];
   diffStatus: Loadable<unknown>['status'];

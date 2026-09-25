@@ -1,4 +1,5 @@
 use super::common::*;
+use crate::core::changes::ChangeStatus;
 use crate::engine::event_bus::EventBus;
 use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -269,7 +270,7 @@ async fn orphan_temp_harden_worktree_removed_when_change_resolved() {
     let change_id = Uuid::new_v4();
     let branch = format!("claude-code/{}", change_id.simple());
     let worktree = add_temp_worktree(&root, "harden-", change_id, &branch).await;
-    insert_change(&pool, change_id, &branch, &root, "applied").await;
+    insert_change(&pool, change_id, &branch, &root, ChangeStatus::Applied).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.temp_worktree_grace = Duration::ZERO; // fresh dir, bypass mtime gate
@@ -302,7 +303,7 @@ async fn orphan_temp_merge_worktree_removed_and_temp_branch_deleted() {
     let change_id = Uuid::new_v4();
     let temp_branch = format!("merge-tmp/{}", change_id.simple());
     let worktree = add_temp_worktree(&root, "merge-", change_id, &temp_branch).await;
-    insert_change(&pool, change_id, &temp_branch, &root, "applied").await;
+    insert_change(&pool, change_id, &temp_branch, &root, ChangeStatus::Applied).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.temp_worktree_grace = Duration::ZERO;
@@ -328,7 +329,7 @@ async fn temp_worktree_skipped_when_change_still_pending() {
     let change_id = Uuid::new_v4();
     let branch = format!("claude-code/{}", change_id.simple());
     let worktree = add_temp_worktree(&root, "harden-", change_id, &branch).await;
-    insert_change(&pool, change_id, &branch, &root, "pending").await;
+    insert_change(&pool, change_id, &branch, &root, ChangeStatus::Pending).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.temp_worktree_grace = Duration::ZERO; // mtime is not the gate here
@@ -354,7 +355,7 @@ async fn temp_worktree_survives_within_grace() {
     let change_id = Uuid::new_v4();
     let branch = format!("claude-code/{}", change_id.simple());
     let worktree = add_temp_worktree(&root, "harden-", change_id, &branch).await;
-    insert_change(&pool, change_id, &branch, &root, "applied").await;
+    insert_change(&pool, change_id, &branch, &root, ChangeStatus::Applied).await;
 
     // Default temp_worktree_grace (2h); the fresh dir is well within it.
     let worker = make_worker(pool.clone(), bus.clone(), root.clone());
@@ -379,7 +380,7 @@ async fn temp_worktree_skipped_when_dirty() {
     let change_id = Uuid::new_v4();
     let branch = format!("claude-code/{}", change_id.simple());
     let worktree = add_temp_worktree(&root, "harden-", change_id, &branch).await;
-    insert_change(&pool, change_id, &branch, &root, "applied").await;
+    insert_change(&pool, change_id, &branch, &root, ChangeStatus::Applied).await;
     tokio::fs::write(worktree.join("uncommitted.txt"), b"wip")
         .await
         .unwrap();
@@ -411,7 +412,7 @@ async fn cc_worktree_not_treated_as_temp() {
     let dir = worktrees_dir(&root).join(format!("cc-{}", id.simple()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     tokio::fs::write(dir.join("file.txt"), b"x").await.unwrap();
-    insert_change(&pool, id, "irrelevant", &root, "applied").await;
+    insert_change(&pool, id, "irrelevant", &root, ChangeStatus::Applied).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.temp_worktree_grace = Duration::ZERO;

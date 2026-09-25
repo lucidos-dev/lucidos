@@ -241,6 +241,9 @@ describe('bootSplash controller', () => {
 
 describe('index.html inline boot splash', () => {
   const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf-8');
+  /** Every reduced-motion rule in the splash stylesheet, as one string. They key
+   *  on the `data-motion` attribute the boot script sets before first paint. */
+  const reducedMotionRules = () => (html.match(/:root\[data-motion="reduce"\][^{]*\{[^}]*\}/g) ?? []).join('\n');
   /** The shell's half of the shared appearance boot script, which owns the
    *  `<html>` canvas paint. The Vite plugin inlines its BUILD into the document
    *  above, so the source is where the rule is readable. */
@@ -854,10 +857,10 @@ describe('index.html inline boot splash', () => {
       expect(html).toMatch(
         /\.boot-splash-formed\s+\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-breathe/,
       );
-      // Named among the selectors the reduced-motion block silences (it is a
-      // list now: the two leaving states are silenced there too).
-      expect(html).toMatch(
-        /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.boot-splash-formed\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/,
+      // Named among the selectors the reduced-motion rule silences (it is a
+      // list: the two leaving states are silenced there too).
+      expect(reducedMotionRules()).toMatch(
+        /:root\[data-motion="reduce"\]\s+\.boot-splash-formed\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/,
       );
     });
   });
@@ -1127,7 +1130,7 @@ describe('index.html inline boot splash', () => {
       expect(html).toMatch(/\.boot-splash-quiet\s*\{[^}]*background:\s*var\(--bg-primary/);
       expect(html).toMatch(/\.boot-splash-quiet\s+\.boot-splash-mark\s*\{[^}]*display:\s*none/);
       expect(html).toMatch(
-        /\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.2s/,
+        /\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*calc\(0\.2s \* var\(--duration-scale, 1\)\)/,
       );
     });
 
@@ -1147,15 +1150,13 @@ describe('index.html inline boot splash', () => {
     });
 
     // The quiet fade needs two-class specificity to beat the `animation`
-    // shorthand on `.boot-splash-leaving`, and a media query adds none. So
-    // without restating the quiet selector inside the reduced-motion block, the
-    // 0.2s rule silently outranks the 0.15s an accessibility preference asked
-    // for. Pin the restatement, not just the plain rule.
-    it('does not let the quiet fade outrank prefers-reduced-motion', () => {
-      const reduced = /@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*?)\n {6}\}/.exec(html)?.[1];
-      expect(reduced).toBeTruthy();
-      expect(reduced).toMatch(
-        /\.boot-splash-leaving,\s*\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
+    // shorthand on `.boot-splash-leaving`. The reduced-motion rule restates the
+    // quiet selector, so the 0.2s rule can never outrank the 0.15s an
+    // accessibility preference asked for. Pin the restatement, not just the
+    // plain rule.
+    it('does not let the quiet fade outrank reduced motion', () => {
+      expect(reducedMotionRules()).toMatch(
+        /:root\[data-motion="reduce"\]\s+\.boot-splash-leaving,\s*:root\[data-motion="reduce"\]\s+\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
       );
     });
   });
@@ -1179,13 +1180,13 @@ describe('index.html inline boot splash', () => {
   // status ghost over the app's own content for most of the fade.
   describe('leaving choreography', () => {
     it('lets the status and the mark leave inside the veil fade', () => {
-      const veil = /\.boot-splash-leaving\s*\{[^}]*animation:\s*boot-splash-out\s+([\d.]+)s/.exec(html);
+      const veil = /\.boot-splash-leaving\s*\{[^}]*animation:\s*boot-splash-out\s+calc\(([\d.]+)s/.exec(html);
       expect(veil).toBeTruthy();
       const veilMs = parseFloat(veil![1]) * 1000;
-      const status = /\.boot-splash-leaving\s+\.boot-splash-status\s*\{[^}]*opacity:\s*0;[^}]*transition:\s*opacity\s+([\d.]+)s/.exec(html);
+      const status = /\.boot-splash-leaving\s+\.boot-splash-status\s*\{[^}]*opacity:\s*0;[^}]*transition:\s*opacity\s+calc\(([\d.]+)s/.exec(html);
       expect(status).toBeTruthy();
       expect(html).toContain('@keyframes boot-mark-out');
-      const mark = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{[^}]*boot-mark-out\s+([\d.]+)s/.exec(html);
+      const mark = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{[^}]*boot-mark-out\s+calc\(([\d.]+)s/.exec(html);
       expect(mark).toBeTruthy();
       // Strictly inside, not merely equal: a brand element still fading when the
       // veil hits zero is the ghost this choreography exists to remove.
@@ -1210,14 +1211,11 @@ describe('index.html inline boot splash', () => {
       expect(formed).not.toMatch(/boot-mark-reveal/);
     });
 
-    // Same trap as the quiet fade above: the exit rules carry two- and
-    // three-class specificity, a media query adds none, so the plain
-    // `.boot-splash-mark` / `.boot-splash-status` rules in the reduced-motion
-    // block would lose and an accessibility preference would get the scale and
-    // the fade anyway.
-    it('silences the exit under prefers-reduced-motion', () => {
-      const reduced = /@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*?)\n {6}\}/.exec(html)?.[1];
-      expect(reduced).toBeTruthy();
+    // Same trap as the quiet fade above: each exit rule meets a reduced-motion
+    // rule naming its own selector, or an accessibility preference would get the
+    // scale and the fade anyway.
+    it('silences the exit under reduced motion', () => {
+      const reduced = reducedMotionRules();
       expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/);
       expect(reduced).toMatch(/\.boot-splash-formed\.boot-splash-leaving\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/);
       expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-status[^{}]*\{\s*transition:\s*none/);

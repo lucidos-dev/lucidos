@@ -688,17 +688,18 @@ booted engine) and every reload restarts its animations, so a breathe would snap
 back to full opacity each time. Overriding animation-NAME alone reuses the shared
 timing: the reveal on first paint, then the mark simply stands there. The
 workspace document, which does not reload, picks the breathe up when it takes
-over. Scoped to no-preference because these rules sit after the shared sheet and
-would otherwise put a name back on the animation it silences for reduced motion. */
-@media (prefers-reduced-motion:no-preference){
-.boot-splash-mark{animation-name:boot-mark-reveal}
-.boot-splash-formed .boot-splash-mark{animation-name:none}
-}
+over. Scoped away from reduced motion because these rules sit after the shared
+sheet and would otherwise put a name back on the animation it silences there.
+`:where` keeps the scope weightless, so the cascade is what it was unscoped. */
+:where(:root:not([data-motion="reduce"])) .boot-splash-mark{animation-name:boot-mark-reveal}
+:where(:root:not([data-motion="reduce"])) .boot-splash-formed .boot-splash-mark{animation-name:none}
 /* The escape link needs nothing here: `.boot-splash-escape` is in the shared
 sheet above, because the app document offers the same link when its own boot
 gives up. This page differs only in WHEN it renders one (outright, on the
 stalled/failed pages, where there is nothing else left to offer). */
-</style></head>
+</style>
+<script>try{var s=location.pathname.split('/')[1],k='lucidos-motion',v=null;try{v=localStorage.getItem(s&&s!=='~'?'ws:'+s+':'+k:k)}catch(e){}var r=v==='reduce'||(v!=='full'&&matchMedia('(prefers-reduced-motion: reduce)').matches);document.documentElement.setAttribute('data-motion',r?'reduce':'full')}catch(e){}</script>
+</head>
 <body>
 <div class="boot-splash">
 "##;
@@ -890,6 +891,42 @@ mod tests {
         // the old `body{font-family:…}` without inheriting is what once left the
         // escape link rendering in the UA serif.
         assert!(!tail.contains("font-"), "{tail}");
+    }
+
+    /// The shared sheet keys reduced motion on `data-motion`, which the app sets
+    /// from the device's Motion setting. This page has no boot script, so a
+    /// small one of its own resolves it before the splash markup parses. It
+    /// reads the workspace-scoped mirror the app's boot script reads. So a
+    /// device that chose Reduce in the app gets a still splash here too.
+    #[test]
+    fn splash_page_resolves_motion_before_the_splash_paints() {
+        let html = splash_page_html("Starting engine", Some(2), false);
+        let contract = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/lucidos-sdk/src/appearance.ts"
+        ))
+        .expect("packages/lucidos-sdk/src/appearance.ts must exist");
+        assert!(
+            contract.contains("export const MOTION_STORAGE_KEY = 'lucidos-motion';"),
+            "the page reads the mirror under the contract's key"
+        );
+        // `ws:<slug>:<key>`, the namespacing `_storage.ts` gives every
+        // workspace-scoped key, with the raw key for the picker.
+        assert!(html.contains("'ws:'+s+':'+k"), "{html}");
+        assert!(html.contains("k='lucidos-motion'"), "{html}");
+        let set = html
+            .find("setAttribute('data-motion'")
+            .expect("the page must set data-motion");
+        let splash = html.find(r#"<div class="boot-splash">"#).unwrap();
+        assert!(
+            set < splash,
+            "data-motion must be set before the splash markup"
+        );
+        // The page's own reveal override must stand down under reduced motion.
+        assert!(html.contains(
+            r#":where(:root:not([data-motion="reduce"])) .boot-splash-mark{animation-name:boot-mark-reveal}"#
+        ));
+        assert!(!html.contains("prefers-reduced-motion:no-preference"));
     }
 
     /// The escape link is one link with one appearance across both surfaces: the
@@ -1093,12 +1130,13 @@ mod tests {
     #[test]
     fn splash_escapes_html_in_the_label() {
         let html = splash_page_html(r#"<script>alert("x")</script> & 'quoted'"#, None, false);
-        // The page ships exactly ONE script of its own (the mark handover), so a
-        // raw tag out of the label would show up as a second one. Counting beats
-        // a bare "contains no <script>": that only held while the page had none.
+        // The page ships exactly TWO scripts of its own: the motion resolver
+        // and the mark handover. So a raw tag out of the label would show up as
+        // a third. Counting beats a bare "contains no <script>": that only held
+        // while the page had none.
         assert_eq!(
             html.matches("<script>").count(),
-            1,
+            2,
             "raw tag survived: {html}"
         );
         assert!(html.contains("&lt;script&gt;"), "{html}");

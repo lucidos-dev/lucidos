@@ -860,8 +860,7 @@ else
     fail "release payload has no numeric held_secs: $rel"
 fi
 # The ordering invariant. A waiter woken by the release retries immediately, so
-# waking one while the lock file is still there would spend one of its ten
-# subscriptions an hour on nothing.
+# waking one while the lock file is still there would spend a turn on nothing.
 if [ "$(emit_marker E2ELockReleased)" = "LOCKFILE_ABSENT" ]; then
     pass "the release is announced only after the lock file is gone"
 else

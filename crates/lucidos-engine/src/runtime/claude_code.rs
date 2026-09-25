@@ -12,8 +12,8 @@ use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
 use super::lucidos_cli::{
-    ensure_workspace_bin_symlink, install_lucidos_cli_skill, lucidos_cli_dir, LUCIDOS_BIN_NAME,
-    LUCIDOS_CLI_SKILL_REL_PATH,
+    ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
+    LUCIDOS_CLI_SKILL,
 };
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
@@ -307,23 +307,13 @@ impl AgentRuntime for ClaudeCodeRuntime {
             super::spawn_env::resolve_binary_override(
                 path,
                 "Claude Code (`claude`)",
-                "coding_agent_claude_path",
+                crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
             )?;
         }
-        if let Err(e) = install_lucidos_cli_skill(args.worktree_path, cli_dir) {
-            crate::log!(
-                "[ClaudeCode] failed to install lucidos-cli skill into {}: {}",
-                args.worktree_path.display(),
-                e
-            );
-        }
-        // A *tracked* copy of the injected skill turns the overwrite above into
-        // a phantom `M` that `.git/info/exclude` cannot hide. Skip-worktree it
-        // so this session never sees a change it did not author. No-op for the
-        // Lucidos repo, where the tracked copy is identical and stays editable.
-        crate::engine::git_ops::hide_phantom_tracked_skill(
+        place_lucidos_cli_skill(
             args.worktree_path,
-            LUCIDOS_CLI_SKILL_REL_PATH,
+            args.coding_agent_kind,
+            LUCIDOS_CLI_SKILL,
         )
         .await;
         ensure_workspace_bin_symlink(args.worktree_path, cli_dir);
@@ -497,6 +487,9 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
+        // Claude Code echoes each stdin input when it consumes it. That echo is
+        // the only proof an input was read (ADR 0268).
+        .arg("--replay-user-messages")
         .arg("--permission-mode")
         .arg(permission_mode.flag())
         .arg("--permission-prompt-tool")

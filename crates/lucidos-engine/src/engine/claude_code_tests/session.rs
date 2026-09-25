@@ -461,6 +461,167 @@ async fn cancel_actor_field_stores_and_drains() {
     );
 }
 
+/// Stop on an entry no loop is listening to must not report "a terminal is
+/// coming". The entry of a session that is exiting mid-turn outlives its loop
+/// for a moment, and a phantom's for longer. Both take the no-session
+/// fallback, which settles a stuck turn.
+#[tokio::test]
+async fn stop_on_an_entry_no_loop_listens_to_takes_the_no_session_fallback() {
+    use super::control::{interrupt_route, InterruptRoute};
+
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut exiting = make_test_session(msg_tx, false);
+    exiting.process_exited = true;
+    assert_eq!(interrupt_route(&exiting), InterruptRoute::NoLoop);
+
+    let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let phantom = make_test_session(msg_tx, false);
+    drop(msg_rx);
+    assert_eq!(interrupt_route(&phantom), InterruptRoute::NoLoop);
+
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        interrupt_route(&make_test_session(msg_tx, false)),
+        InterruptRoute::Interrupt
+    );
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        interrupt_route(&make_test_session(msg_tx, true)),
+        InterruptRoute::AlreadyWaiting
+    );
+}
+
+/// A stop request with no thread id reaches every session. One that a change
+/// claim holds must be refused like a single-thread stop, or a Discard deletes the
+/// branch that apply is merging. The others still stop.
+#[test]
+fn a_thread_less_stop_skips_a_claimed_session() {
+    use super::control::stop_every_session;
+    use crate::engine::StopReason;
+
+    let (claimed_tx, _claimed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut claimed = make_test_session(claimed_tx, true);
+    claimed.change_claim = Some(crate::engine::types::ChangeClaim::Apply);
+    let (free_tx, _free_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (claimed_id, free_id) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut sessions = std::collections::HashMap::from([
+        (claimed_id, claimed),
+        (free_id, make_test_session(free_tx, true)),
+    ]);
+
+    assert!(stop_every_session(&mut sessions, StopReason::Discard).is_ok());
+    assert_eq!(sessions[&claimed_id].pending_stop, None);
+    assert_eq!(sessions[&free_id].pending_stop, Some(StopReason::Discard));
+
+    sessions.remove(&free_id);
+    assert_eq!(
+        stop_every_session(&mut sessions, StopReason::Discard)
+            .unwrap_err()
+            .to_string(),
+        super::APPLY_IN_PROGRESS_MESSAGE,
+        "a stop that stopped nothing reports why"
+    );
+}
+
+/// An in-session Discard releases the lock before it resets the worktree, so
+/// it holds the session's change claim across the reset. Otherwise an apply
+/// from another device, or from the parent's `apply_change`, claims the
+/// session in between and merges work the user just discarded.
+#[test]
+fn an_in_session_discard_holds_the_claim_an_apply_needs() {
+    use super::{claim_for_discard, DiscardTarget};
+    use crate::engine::agent_session::{decide_in_place_merge_claim, InPlaceMergeClaim};
+
+    let thread_id = uuid::Uuid::new_v4();
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = make_test_session(msg_tx, true);
+    session.worktree_path = Some(std::path::PathBuf::from("/tmp/lucidos-test/wt"));
+    let mut sessions = std::collections::HashMap::from([(thread_id, session)]);
+
+    let Ok(DiscardTarget::Claimed { claimant, .. }) = claim_for_discard(&mut sessions, thread_id)
+    else {
+        panic!("a live session with a worktree is claimed for the Discard");
+    };
+    assert_eq!(
+        decide_in_place_merge_claim(sessions.get(&thread_id)),
+        InPlaceMergeClaim::Claimed(crate::engine::types::ChangeClaim::Discard),
+        "an apply must not start while the Discard resets the tree"
+    );
+    assert_eq!(
+        super::stop_refusal(&sessions[&thread_id]),
+        Some(super::DISCARD_IN_PROGRESS_MESSAGE),
+        "and what refuses it says a Discard, not an apply, holds the session"
+    );
+    assert!(
+        claim_for_discard(&mut sessions, thread_id).is_err(),
+        "a second Discard waits its turn too"
+    );
+
+    crate::engine::agent_session::release_change_claim(&mut sessions, thread_id, &claimant);
+    assert_eq!(
+        decide_in_place_merge_claim(sessions.get(&thread_id)),
+        InPlaceMergeClaim::Claim
+    );
+}
+
+/// A Discard landing while a stop is ending the session would reset the tree
+/// under finalize. A missing session and a session with no worktree stay
+/// distinct: only the first takes the stale-session teardown.
+#[test]
+fn an_in_session_discard_refuses_a_stopping_session_and_a_missing_worktree() {
+    use super::{claim_for_discard, DiscardTarget, SESSION_STOPPING_MESSAGE};
+
+    let thread_id = uuid::Uuid::new_v4();
+    let mut sessions = std::collections::HashMap::new();
+    assert!(matches!(
+        claim_for_discard(&mut sessions, thread_id),
+        Ok(DiscardTarget::NoSession)
+    ));
+
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    sessions.insert(thread_id, make_test_session(msg_tx, true));
+    assert_eq!(
+        claim_for_discard(&mut sessions, thread_id)
+            .err()
+            .map(|e| e.to_string())
+            .as_deref(),
+        Some("No worktree for this session")
+    );
+
+    let session = sessions.get_mut(&thread_id).unwrap();
+    session.worktree_path = Some(std::path::PathBuf::from("/tmp/lucidos-test/wt"));
+    session.pending_stop = Some(crate::engine::StopReason::Apply);
+    assert_eq!(
+        claim_for_discard(&mut sessions, thread_id)
+            .err()
+            .map(|e| e.to_string())
+            .as_deref(),
+        Some(SESSION_STOPPING_MESSAGE)
+    );
+}
+
+/// Only the run loop writes the shared `is_waiting`, and it keeps its own
+/// local copy in step. A write from outside desyncs the two. A Discard once
+/// wrote `true` on a mid-turn session. Until the next `Result`, Stop then
+/// answered "already waiting", redirects stopped arming and the watchdog
+/// skipped the session.
+#[test]
+fn only_the_run_loop_writes_the_session_phase() {
+    let writers: Vec<String> = crate::test_support::source_scan::production_sources()
+        .into_iter()
+        .filter(|(_, src)| src.contains(".is_waiting = "))
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        writers,
+        vec![
+            "engine/agent_session/lifecycle.rs".to_string(),
+            "engine/agent_session/run_session/run.rs".to_string(),
+        ],
+        "`mark_turn_boundary` and the run loop are the only writers"
+    );
+}
+
 #[test]
 fn is_engine_injected_path_matches_excluded_paths_only() {
     assert!(super::is_engine_injected_path(".lucidos-workspace"));
@@ -477,7 +638,7 @@ fn is_engine_injected_path_matches_excluded_paths_only() {
 
     // App coding-agent threads run CC inside `<wt>/data/apps/<id>/`, so the
     // engine-injected lucidos-cli skill lands at `data/apps/<id>/.claude/...`
-    // (install_lucidos_cli_skill writes relative to CC's cwd, not the
+    // (place_lucidos_cli_skill writes relative to CC's cwd, not the
     // worktree root). Must match the same as the root-level path or the
     // skill folder shows up as a pending change every app spawn.
     assert!(super::is_engine_injected_path(

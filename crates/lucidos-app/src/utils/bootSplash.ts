@@ -17,6 +17,7 @@
  * own inline splash, so module state does not need to persist — a fresh document
  * gets a fresh, present splash.
  */
+import { scaledDurationMs } from './motion';
 
 const SPLASH_SELECTOR = '.boot-splash';
 const STATUS_SELECTOR = '.boot-splash-status';
@@ -32,12 +33,14 @@ const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
 // The cover itself is permanent either way: do NOT delete it with that measure.
 const QUIET_CLASS_SELECTOR = '.boot-splash-quiet';
 
-// Outlives the longest `.boot-splash-leaving` fade in index.html (the veil's
-// 0.65s; the mark and the status finish inside it), with margin. Used as the
-// removal fallback when `animationend` doesn't fire. It MUST stay ahead of that
-// duration: set below it, this stops being a fallback and becomes the thing that
-// removes the splash, cutting the veil off partway through its dissolve.
-const FADE_REMOVE_MS = 800;
+// The longest `.boot-splash-leaving` fade in index.html, the veil's 0.65s at 1x
+// (the mark and the status finish inside it). The removal fallback, used when
+// `animationend` doesn't fire, is this scaled by the Animation speed slider plus
+// the slack. It MUST stay ahead of the fade: set below it, it stops being a
+// fallback and becomes the thing that removes the splash mid-dissolve. The
+// slack also covers the fixed 0.15s fade reduced motion keeps.
+const VEIL_FADE_MS = 650;
+const FADE_REMOVE_SLACK_MS = 250;
 
 let dismissed = false;
 
@@ -170,5 +173,5 @@ export function dismissBootSplash(): void {
   };
   el.addEventListener('animationend', onAnimationEnd);
   // Fallback: if the fade animation is suppressed (no animationend), still remove.
-  window.setTimeout(remove, FADE_REMOVE_MS);
+  window.setTimeout(remove, scaledDurationMs(VEIL_FADE_MS) + FADE_REMOVE_SLACK_MS);
 }

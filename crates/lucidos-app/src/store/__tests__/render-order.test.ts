@@ -128,7 +128,6 @@ const MID_TURN_BOUNDARIES: Array<{ name: string; event: ThreadEvent }> = [
       arguments_summary: '{}',
     } as ThreadEvent,
   },
-  { name: 'CredentialRequested', event: { type: 'CredentialRequested', provider: 'github' } as ThreadEvent },
   { name: 'McpConsentRequested', event: { type: 'McpConsentRequested', tool: 't', args: {} } as ThreadEvent },
   {
     name: 'ChildThreadCompleted',

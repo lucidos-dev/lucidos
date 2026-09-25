@@ -3,7 +3,7 @@
 //! When a child thread reaches a terminal event, [`EventBus::emit`]'s PostCommit
 //! phase drives these methods to decrement the parent's `active_children_count`,
 //! surface the parent to inbox, and emit the typed `ChildThreadCompleted` onto
-//! the parent thread. Extracted from `event_bus` verbatim — behavior-preserving.
+//! the parent thread.
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -730,6 +730,23 @@ impl EventBus {
             }
         };
 
+        // Changes held below the child, whatever its own status: they are other
+        // threads' work, and an orchestrator's children hold all of it.
+        let sub_thread_pending_changes =
+            match crate::core::changes::sub_thread_pending_changes(&self.pool, child_thread_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::log!(
+                        "[FanOut] sub_thread_pending_changes({}): {}; the card lists none",
+                        child_thread_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
+
         // Emit the typed source-of-truth event onto the parent thread. The
         // `parent_callback_pending` marker is cleared by THIS emit's projection
         // arm (see ChildThreadCompleted in `update_thread_projection`), in
@@ -745,6 +762,7 @@ impl EventBus {
             status,
             summary,
             pending_change_ids,
+            sub_thread_pending_changes,
         };
         // Box::pin here because `emit_or_log → emit → notify_parent_if_child`
         // is the recursion the compiler flags — the emitted ChildThreadCompleted
@@ -1072,8 +1090,10 @@ impl EventBus {
         // thread's last word — scoped to `aggregate = 'thread'` to match
         // `lookup_last_activity` and never let a same-id non-thread event suppress
         // a real fan-in. See the selection rationale above. A later
-        // `ChildThreadStopped` is not a reaction: it wakes nothing, so a card it
-        // follows is still unprocessed (ADR 0252).
+        // `ChildThreadStopped` or `ChildThreadDetached` is not a reaction: it
+        // wakes nothing, so a card it follows is still unprocessed (ADR 0252,
+        // ADR 0278). No card was written after its child moved out, since the
+        // emit refuses one, so every card this finds was earned.
         //
         // The OUTER `e.aggregate = 'thread'` is load-bearing for a second reason.
         // On a DOMAIN event `aggregate_id` holds the event TYPE NAME, not a uuid,
@@ -1096,7 +1116,7 @@ impl EventBus {
                  WHERE later.aggregate = 'thread' \
                    AND later.aggregate_id = e.aggregate_id \
                    AND later.sequence > e.sequence \
-                   AND later.event_type <> 'ChildThreadStopped' \
+                   AND later.event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
                )",
         )
         .fetch_all(&self.pool)

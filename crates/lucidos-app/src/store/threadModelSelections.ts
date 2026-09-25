@@ -20,6 +20,7 @@
 
 import { signal } from '@preact/signals';
 import { threadMap, currentModel, reasoningEffort } from './store';
+import type { StoredEvent } from './thread-events';
 
 export interface ThreadModelOverride {
   /** Lucidos Agent model id (the in-thread mirror of `chat_model`). */
@@ -62,19 +63,21 @@ export function clearThreadModelOverride(threadId: string | null | undefined): v
   threadModelSelections.value = map;
 }
 
-/** The `field` value from the thread's most recent starter event that carried
- *  it. Mirrors the backend's newest-by-sequence lookup so the menu displays what
- *  the next send will actually use. Synthetic failed-send rows carry no model, so
- *  the field filter skips them.
+type StarterEvent = Extract<StoredEvent, { type: 'MessageReceived' | 'TriggerStarted' }>;
+
+/** The non-empty string `read` picks from the thread's most recent starter
+ *  event that carries one. Mirrors the backend's newest-by-sequence lookup so
+ *  the menu displays what the next send will actually use. Synthetic
+ *  failed-send rows carry no model, so the filter skips them.
  *
  *  Both starter kinds count, mirroring the backend's
  *  `IN ('MessageReceived', 'TriggerStarted')`: a chat turn starts with
  *  `MessageReceived`, while a trigger fire starts with `TriggerStarted` and
  *  emits no `MessageReceived` at all. Reading only the former would show the
  *  account model on a trigger thread however the trigger was pinned. */
-function lastThreadMessageField(
+function newestStarterValue(
   threadId: string | null | undefined,
-  field: 'model' | 'reasoning_effort',
+  read: (event: StarterEvent) => unknown,
 ): string | undefined {
   if (!threadId) return undefined;
   const thread = threadMap.value.get(threadId);
@@ -83,7 +86,7 @@ function lastThreadMessageField(
   let bestValue: string | undefined;
   for (const [seq, event] of thread.events) {
     if (event.type !== 'MessageReceived' && event.type !== 'TriggerStarted') continue;
-    const value = event[field];
+    const value = read(event);
     if (typeof value !== 'string' || value === '') continue;
     if (seq > bestSeq) {
       bestSeq = seq;
@@ -94,11 +97,11 @@ function lastThreadMessageField(
 }
 
 export function lastThreadModel(threadId: string | null | undefined): string | undefined {
-  return lastThreadMessageField(threadId, 'model');
+  return newestStarterValue(threadId, (event) => event.model);
 }
 
 export function lastThreadReasoningEffort(threadId: string | null | undefined): string | undefined {
-  return lastThreadMessageField(threadId, 'reasoning_effort');
+  return newestStarterValue(threadId, (event) => event.reasoning_effort);
 }
 
 /** The backend this thread last pinned for `model`. Mirrors the backend's
@@ -108,20 +111,7 @@ export function lastThreadProvider(
   threadId: string | null | undefined,
   model: string,
 ): string | undefined {
-  if (!threadId) return undefined;
-  const thread = threadMap.value.get(threadId);
-  if (!thread) return undefined;
-  let bestSeq = -Infinity;
-  let bestValue: string | undefined;
-  for (const [seq, event] of thread.events) {
-    if (event.type !== 'MessageReceived' && event.type !== 'TriggerStarted') continue;
-    if (event.model !== model || typeof event.provider !== 'string' || event.provider === '') continue;
-    if (seq > bestSeq) {
-      bestSeq = seq;
-      bestValue = event.provider;
-    }
-  }
-  return bestValue;
+  return newestStarterValue(threadId, (event) => (event.model === model ? event.provider : undefined));
 }
 
 // --- Resolvers: pending pick ?? thread's last message ?? account default ---

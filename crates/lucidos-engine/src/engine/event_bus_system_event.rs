@@ -1174,10 +1174,22 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A standing apply ended by firing: its thread settled and the engine
+    /// started applying `change_id`. `ChangeApplied` or `ChangeApplyFailed`
+    /// reports how the apply went. Every surface drawing the armed face clears
+    /// on this, exactly as on a drop.
+    StandingApplyFired {
+        thread_id: Uuid,
+        change_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A standing apply ended without applying, and this is its report. A
-    /// thread that parks or fails never settles by itself, so the arm is
-    /// dropped rather than left waiting. Also covers the owner disarming it
-    /// and the armed change disappearing.
+    /// thread parked on a question, or whose turn failed, never settles by
+    /// itself, so the arm is dropped rather than left waiting. Also covers the
+    /// owner disarming it and the armed change disappearing.
     StandingApplyDropped {
         thread_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1466,6 +1478,7 @@ impl SystemEvent {
         "ApplyAllBatchStarted",
         "ApplyAllBatchCompleted",
         "StandingApplyArmed",
+        "StandingApplyFired",
         "StandingApplyDropped",
         "EngineSupervisorRespawned",
         "EmailSent",
@@ -1609,6 +1622,7 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { .. } => "ApplyAllBatchStarted",
             Self::ApplyAllBatchCompleted { .. } => "ApplyAllBatchCompleted",
             Self::StandingApplyArmed { .. } => "StandingApplyArmed",
+            Self::StandingApplyFired { .. } => "StandingApplyFired",
             Self::StandingApplyDropped { .. } => "StandingApplyDropped",
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
@@ -1749,6 +1763,7 @@ impl SystemEvent {
         "ApplyAllBatchStarted",
         "ApplyAllBatchCompleted",
         "StandingApplyArmed",
+        "StandingApplyFired",
         "StandingApplyDropped",
         "EngineSupervisorRespawned",
         "EmailSent",
@@ -1873,7 +1888,9 @@ impl SystemEvent {
             // a reader follows. The sweep that armed it is a field, not the
             // aggregate: cancelling a sweep drops many arms, each of which
             // reports on its own thread.
-            Self::StandingApplyArmed { .. } | Self::StandingApplyDropped { .. } => "standing_apply",
+            Self::StandingApplyArmed { .. }
+            | Self::StandingApplyFired { .. }
+            | Self::StandingApplyDropped { .. } => "standing_apply",
             Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
@@ -1999,6 +2016,7 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { batch_id, .. }
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
             Self::StandingApplyArmed { thread_id, .. }
+            | Self::StandingApplyFired { thread_id, .. }
             | Self::StandingApplyDropped { thread_id, .. } => thread_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
             // The preview is engine-level, but WHICH thread's worktree it shows

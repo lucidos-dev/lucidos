@@ -136,9 +136,14 @@ fn full_real_turn_maps_to_canonical_events() {
         other => panic!("expected ToolResult third, got {:?}", other),
     }
     match &events[3] {
-        AgentEvent::Message { role, text } => {
+        AgentEvent::Message {
+            role,
+            text,
+            opens_block,
+        } => {
             assert_eq!(role, "assistant");
             assert_eq!(text, "5 files");
+            assert!(opens_block, "an exec agent_message is always whole");
         }
         other => panic!("expected Message fourth, got {:?}", other),
     }

@@ -1335,6 +1335,10 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
 
     let handle = app.clone();
     std::thread::spawn(move || {
+        // First, before the service plist is written: from a disk image or a
+        // translocated copy it would pin launchd to a path that vanishes.
+        #[cfg(target_os = "macos")]
+        refuse_unstable_bundle_location(&handle);
         let app_data = match app_data_dir_from_env() {
             Ok(p) => p,
             Err(e) => {
@@ -1441,6 +1445,36 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     });
 }
 
+/// Quit with a native dialog when the bundle runs from a disk image or an App
+/// Translocation copy. Returns only for a stable location. ADR 0271.
+///
+/// Runs on the launch thread, so the dialog may block. The exit is a hard one,
+/// like the uninstall's: `app.exit` would meet the `ExitRequested` guard that
+/// keeps the client resident, and there is no service or state to wind down.
+#[cfg(target_os = "macos")]
+fn refuse_unstable_bundle_location(app: &AppHandle) {
+    use crate::bundle_location;
+
+    let Ok(bundle) = bundle_location::bundle_path() else {
+        return;
+    };
+    let Some(body) = bundle_location::launch_refusal(&bundle_location::current(&bundle)) else {
+        return;
+    };
+    eprintln!(
+        "[desktop] refusing to run from {}: {body}",
+        bundle.display()
+    );
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    app.dialog()
+        .message(body)
+        .title("Move Lucidos to Applications")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCustom("Quit".to_string()))
+        .blocking_show();
+    std::process::exit(0);
+}
+
 /// What an uninstall from this app will leave on the machine.
 ///
 /// The app's uninstall reaches its own bundle, its two launch agents and its
@@ -1500,7 +1534,7 @@ pub(crate) struct PlannedWindow {
     /// The URL to load, composed here from a validated slug.
     pub url: String,
     /// The frame the workspace was last left at, when one is remembered.
-    pub frame: Option<crate::window_restore::Rect>,
+    pub frame: Option<crate::window_restore::RememberedFrame>,
 }
 
 /// Where `main` goes, and what other windows this launch opens.
@@ -1530,17 +1564,17 @@ pub(crate) struct LaunchPlan {
 /// exactly on top of `main`.
 pub(crate) fn launch_plan(
     tap: Option<String>,
-    restore: &[(String, Option<crate::window_restore::Rect>)],
+    restore: &[(String, Option<crate::window_restore::RememberedFrame>)],
     origin: &str,
 ) -> LaunchPlan {
     let tapped = tap
         .as_deref()
         .and_then(crate::window_target::window_workspace)
         .map(str::to_string);
-    let mut wanted: Vec<(&String, Option<crate::window_restore::Rect>)> = restore
+    let mut wanted: Vec<(&String, Option<crate::window_restore::RememberedFrame>)> = restore
         .iter()
         .filter(|(id, _)| Some(id) != tapped.as_ref())
-        .map(|(id, frame)| (id, *frame))
+        .map(|(id, frame)| (id, frame.clone()))
         .collect();
 
     let main = match tap {
@@ -1664,7 +1698,7 @@ pub(crate) fn reopen_plan(
     // in the menu bar while the service starts, and the user clicks it.
     let booting = main.is_some_and(|w| !crate::window_target::window_is_navigated(&w.url));
 
-    let mut owed: Vec<(&str, Option<crate::window_restore::Rect>)> = Vec::new();
+    let mut owed: Vec<(&str, Option<crate::window_restore::RememberedFrame>)> = Vec::new();
     if !booting {
         // Every workspace this process is already serving, visible or parked.
         let served: Vec<&str> = live
@@ -1675,7 +1709,7 @@ pub(crate) fn reopen_plan(
             let id = id.as_str();
             let known = served.contains(&id) || owed.iter().any(|(seen, _)| *seen == id);
             if crate::window_target::is_workspace_slug(id) && !known {
-                owed.push((id, session.geometry.get(id).copied()));
+                owed.push((id, session.geometry.get(id).cloned()));
             }
         }
     }
@@ -1962,11 +1996,9 @@ fn install_stop_handlers() {}
 /// loaded and running. Installs the login agent alongside it, so the client
 /// itself also comes back at the next login.
 ///
-/// The plist captures `current_exe()`. A signed and notarized app in
-/// `/Applications` has a stable path. An unsigned local test build run from
-/// Downloads can be Gatekeeper app-translocated to a random read-only mount,
-/// so the captured path later vanishes. Move the `.app` into `/Applications`,
-/// or sign it, before relying on the service across reboots.
+/// The plist captures `current_exe()`, so it must never run from a disk image
+/// or a translocated copy, whose paths vanish. The launch thread's
+/// `refuse_unstable_bundle_location` guarantees that before calling here.
 fn ensure_service_installed_and_running(app_data: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
 
@@ -3242,19 +3274,25 @@ mod tests {
 
     // ── What a launch reopens ────────────────────────────────────────────────
 
-    fn rect(x: i64, y: i64, width: i64, height: i64) -> crate::window_restore::Rect {
-        crate::window_restore::Rect {
+    /// A frame as an older record holds it: no display anchor.
+    fn remembered(
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+    ) -> crate::window_restore::RememberedFrame {
+        crate::window_restore::RememberedFrame::unanchored(crate::window_restore::Rect {
             x,
             y,
             width,
             height,
-        }
+        })
     }
 
     const ORIGIN: &str = "http://localhost:3210";
 
     /// A `PlannedWindow`, so each expectation reads as one line.
-    fn planned(url: &str, frame: Option<crate::window_restore::Rect>) -> PlannedWindow {
+    fn planned(url: &str, frame: Option<crate::window_restore::RememberedFrame>) -> PlannedWindow {
         PlannedWindow {
             url: url.to_string(),
             frame,
@@ -3277,8 +3315,8 @@ mod tests {
         let plan = launch_plan(
             None,
             &[
-                ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
-                ("dev".to_string(), Some(rect(10, 20, 900, 700))),
+                ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
+                ("dev".to_string(), Some(remembered(10, 20, 900, 700))),
             ],
             ORIGIN,
         );
@@ -3287,7 +3325,7 @@ mod tests {
             plan.extra,
             vec![planned(
                 "http://localhost:3210/dev/",
-                Some(rect(10, 20, 900, 700))
+                Some(remembered(10, 20, 900, 700))
             )]
         );
     }
@@ -3363,7 +3401,7 @@ mod tests {
     #[test]
     fn a_late_tap_returns_the_workspace_it_displaced_to_the_extras() {
         let restore = [
-            ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
+            ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
             ("dev".to_string(), None),
         ];
         let first = launch_plan(None, &restore, ORIGIN);
@@ -3410,8 +3448,8 @@ mod tests {
     #[test]
     fn a_tap_on_the_first_restored_workspace_costs_no_other_window_its_size() {
         let restore = [
-            ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
-            ("dev".to_string(), Some(rect(50, 60, 900, 700))),
+            ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
+            ("dev".to_string(), Some(remembered(50, 60, 900, 700))),
         ];
         let plan = launch_plan(
             Some("http://localhost:3210/myws/".to_string()),
@@ -3423,7 +3461,7 @@ mod tests {
             plan.extra,
             vec![planned(
                 "http://localhost:3210/dev/",
-                Some(rect(50, 60, 900, 700))
+                Some(remembered(50, 60, 900, 700))
             )]
         );
     }
@@ -3457,13 +3495,13 @@ mod tests {
     /// A record naming `open`, with a frame for each entry `geometry` lists.
     fn session(
         open: &[&str],
-        geometry: &[(&str, crate::window_restore::Rect)],
+        geometry: &[(&str, crate::window_restore::RememberedFrame)],
     ) -> crate::window_session::WindowSession {
         crate::window_session::WindowSession {
             open: open.iter().map(|id| id.to_string()).collect(),
             geometry: geometry
                 .iter()
-                .map(|(id, frame)| (id.to_string(), *frame))
+                .map(|(id, frame)| (id.to_string(), frame.clone()))
                 .collect(),
             units: crate::window_session::FrameUnits::LogicalPoints,
         }
@@ -3530,8 +3568,8 @@ mod tests {
             &session(
                 &["myws", "dev"],
                 &[
-                    ("myws", rect(0, 0, 1200, 800)),
-                    ("dev", rect(9, 9, 900, 700)),
+                    ("myws", remembered(0, 0, 1200, 800)),
+                    ("dev", remembered(9, 9, 900, 700)),
                 ],
             ),
             ORIGIN,
@@ -3544,14 +3582,14 @@ mod tests {
             plan.navigate_main,
             Some(planned(
                 "http://localhost:3210/myws/",
-                Some(rect(0, 0, 1200, 800))
+                Some(remembered(0, 0, 1200, 800))
             ))
         );
         assert_eq!(
             plan.build,
             vec![planned(
                 "http://localhost:3210/dev/",
-                Some(rect(9, 9, 900, 700))
+                Some(remembered(9, 9, 900, 700))
             )]
         );
         assert_eq!(plan.show, vec!["main"]);

@@ -5,10 +5,11 @@ import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
-import { handleNotificationSSE } from './notifications';
+import { handleNotificationSSE, loadUnreadNotifications } from './notifications';
 import { dropDeletedThreads } from './threads-delete';
 import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
@@ -41,13 +42,10 @@ import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
-import { loadArtifacts, invalidateFilePreview } from './artifacts';
+import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
 import { clearWipIfMatches } from './wipPreview';
-import { openCredentialRequest } from './credentials';
-import { openPluginInstallRequest } from './plugin-install';
-import { openPluginUninstallRequest } from './plugin-uninstall';
-import { openEmailConfirmRequest } from './email-confirm';
+import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } from './form-requests';
 import { setDevicePushEnabled } from './push';
 import { getDeviceId } from './devices';
 import { focusThread } from './threads';
@@ -67,7 +65,7 @@ import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 import { errorDetail } from '../../utils/errorDetail';
-import { handleNavigationRequest, describeNavTarget } from './navigation-request';
+import { routeThreadNavigation, type NavigationActor } from './navigation-request';
 import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
 import type { EmbeddingModelStatus } from '../../api/types';
@@ -79,11 +77,6 @@ const BACKUP_FAILED_TOAST_KEY = 'backup-failed';
 /** Keyed for the same reason: the engine re-announces its refused `apis.json`
  *  entries on every boot, and a reconnecting client must not stack them. */
 const PROXY_CONFIG_REJECTED_TOAST_KEY = 'proxy-config-rejected';
-
-/** The nil UUID the engine stamps on a thread-less `NavigationRequested`. The
- *  SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs) emits it, being
- *  user-initiated and bound to no thread. */
-const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
@@ -314,6 +307,16 @@ export function connectThreadEvents(): void {
       if (gen !== sseGeneration) return;
       markEventStreamStatus('connected');
       fanOutEventStreamStatus('open');
+      // On EVERY open, the first one included, and after the open: a form
+      // request emitted while no stream was up reaches this page only here.
+      // It owns its own failure reporting.
+      void syncPendingFormRequests();
+      // The Files list and the unread notifications too, for the same reason.
+      // The page's first reads can finish before this open, and a change in
+      // between was announced to nobody. Neither read can land stale: an open
+      // during a listing asks for one more, and the newest unread read wins.
+      refreshArtifacts();
+      void loadUnreadNotifications();
       // Only resync after a reconnect. On the initial connect, useStartup.ts
       // already loads thread state. Without the flag we'd double-fetch on every
       // page load.
@@ -886,6 +889,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   }
 }
 
+/** Un-arm a thread's flag once its standing apply has ended, however it ended. */
+function forgetStandingApply(threadId: string | undefined): void {
+  if (!threadId || !standingApplyThreadIds.value.has(threadId)) return;
+  const next = new Set(standingApplyThreadIds.value);
+  next.delete(threadId);
+  standingApplyThreadIds.value = next;
+}
+
 export function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
   switch (type) {
     case 'NotificationCreated':
@@ -972,8 +983,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // reloaded `preferences` signal through `wasSwUpdateDismissed`: it must
       // run after loadPreferences resolves, or it reads the stale value.
       // Idempotent and self-correcting. The engine-switch toast needs no
-      // equivalent, its version-status poll hiding it once `wasSwitchDismissed`
-      // reads true. loadPreferences sets `preferences` to `failed` on error.
+      // equivalent, its version-status poll hiding it once
+      // `wasEngineVersionDismissed` reads true. loadPreferences sets `preferences` to `failed` on error.
       void loadPreferences().then(() => syncClientUpdateFromBuild()).catch(() => { /* best-effort re-derive */ });
       // The Backup page does NOT read its three values out of the preferences
       // cache: they arrive from `/backup/schedule`, `/backup/providers` and
@@ -1150,16 +1161,19 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
+    case 'StandingApplyFired': {
+      // The arm ended by firing. ChangeApplied or ChangeApplyFailed reports how
+      // the apply went, so this owes no toast of its own.
+      forgetStandingApply(data.thread_id as string | undefined);
+      break;
+    }
+
     case 'StandingApplyDropped': {
-      // The arm ended. It fired, the owner took it back, or the thread parked
-      // or failed. The last case is the one that owes a report, and `reason` is
-      // written for the owner to read.
+      // The arm ended without applying: the owner took it back, or the thread
+      // parked or failed. The last two owe a report, and `reason` is written
+      // for the owner to read.
       const threadId = data.thread_id as string | undefined;
-      if (threadId && standingApplyThreadIds.value.has(threadId)) {
-        const next = new Set(standingApplyThreadIds.value);
-        next.delete(threadId);
-        standingApplyThreadIds.value = next;
-      }
+      forgetStandingApply(threadId);
       const reason = typeof data.reason === 'string' ? data.reason : '';
       // A cancel is the owner's own click, and the control already changed
       // face. Only a drop the engine decided is news.
@@ -1290,6 +1304,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // on transient wake noise), so `void` just acknowledges that we don't
       // need the promise back.
       void resyncLoadedThreads();
+      // A dropped frame may have been a form request, which the thread resync
+      // does not reopen. It reports its own failures.
+      void syncPendingFormRequests();
       break;
     }
 
@@ -1437,7 +1454,8 @@ function consumePendingFileToolWrite(threadId: string, toolCalledEventId?: strin
   invalidateFilePreview(pending.path);
 }
 
-/** Handle transient ThreadEvent types that trigger side effects (modals, refreshes).
+/** Run the side effects a LIVE frame triggers: opening a form request's form,
+ *  refreshes, navigation. A history replay never comes here.
  *
  *  `sourceThreadId` is the thread the event was emitted on. It scopes
  *  `NavigationRequested`, so a navigate from a sibling thread cannot hijack
@@ -1450,41 +1468,15 @@ function handleTransientSideEffects(
   sourceThreadId: string,
   eventId?: string,
 ): void {
+  // A form request: open its form now. One this page misses is found by
+  // `syncPendingFormRequests` on the next stream open.
+  if (isFormRequest(event)) {
+    openFormRequest(sourceThreadId, event);
+    return;
+  }
   switch (event.type) {
-    case 'CredentialPromptRequested':
-      try {
-        openCredentialRequest(JSON.parse((event as { payload: string }).payload));
-      } catch (e) {
-        console.error('Failed to parse credential request:', e);
-        showToast('Failed to handle credential request from engine', 'error');
-      }
-      break;
-
-    case 'PluginInstallRequested':
-      try {
-        openPluginInstallRequest(JSON.parse((event as { payload: string }).payload));
-      } catch (e) {
-        console.error('Failed to parse plugin install request:', e);
-        showToast('Failed to handle plugin install request from engine', 'error');
-      }
-      break;
-
-    case 'PluginUninstallRequested':
-      try {
-        openPluginUninstallRequest(JSON.parse((event as { payload: string }).payload));
-      } catch (e) {
-        console.error('Failed to parse plugin uninstall request:', e);
-        showToast('Failed to handle plugin uninstall request from engine', 'error');
-      }
-      break;
-
-    case 'EmailConfirmRequested':
-      try {
-        openEmailConfirmRequest(JSON.parse((event as { payload: string }).payload));
-      } catch (e) {
-        console.error('Failed to parse email confirm request:', e);
-        showToast('Failed to handle email confirm request from engine', 'error');
-      }
+    case 'FormRequestResolved':
+      closeResolvedFormRequest(event.request_id, event.outcome, event.actor);
       break;
 
     case 'PushNotificationRequested':
@@ -1570,47 +1562,7 @@ function handleTransientSideEffects(
         showToast('Failed to handle navigation request from engine', 'error');
         break;
       }
-      // Device scope: an agent navigate (navigate_ui) carries the originating
-      // device — the device that sent the prompt that triggered the turn (engine
-      // stamps it in execute_navigate_ui). Such a navigate must act ONLY on that
-      // device, not every device viewing the thread. So if the event names a
-      // device that isn't this one, drop it entirely — no navigate, no offer.
-      // Navigations with no device actor (trigger/background turns; the SDK
-      // app-iframe nil-thread path) fall through to the thread/app scoping below.
-      const navActor = (event as { actor?: { kind?: string; device_id?: string } }).actor;
-      if (navActor?.kind === 'device' && navActor.device_id !== getDeviceId()) break;
-      // Scope. A navigate acts on this page directly only when it originates
-      // from the thread the user is viewing, or from an app iframe. The SDK
-      // `lucidos.ui.navigate` path emits on the nil thread (api/sdk.rs), being
-      // user-initiated and bound to no thread, so it always applies.
-      const focused = focusedThreadId.value;
-      const fromApp = sourceThreadId === NIL_THREAD_ID;
-      if (fromApp || sourceThreadId === focused) {
-        // Source label for any "couldn't open" toast downstream: which thread
-        // asked, or the app iframe — so the error says where it came from
-        // instead of swallowing it.
-        const source = fromApp ? 'an app' : formatThreadLabel(sourceThreadId);
-        handleNavigationRequest(nav, { source });
-        break;
-      }
-      // Off-focus: a navigate from a thread the user isn't viewing must NOT
-      // hijack the page. Offer to jump instead of silently dropping it — this
-      // preserves "open X when you're done" from a background/sibling/trigger
-      // thread. Tapping Open lands on BOTH the source thread (the context that
-      // asked) and the navigate target. Keyed per source thread so repeated
-      // navigates refresh one offer instead of stacking.
-      const label = formatThreadLabel(sourceThreadId);
-      showToast(`${label} wants to open ${describeNavTarget(nav)}`, 'info', {
-        key: `nav-offer-${sourceThreadId}`,
-        action: {
-          label: 'Open',
-          onClick: () => {
-            dismissToast(`nav-offer-${sourceThreadId}`);
-            focusThread(sourceThreadId);
-            handleNavigationRequest(nav, { source: label });
-          },
-        },
-      });
+      routeThreadNavigation(nav, (event as { actor?: NavigationActor }).actor, sourceThreadId);
       break;
     }
 

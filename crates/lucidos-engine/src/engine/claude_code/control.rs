@@ -1,6 +1,76 @@
 use super::*;
 use crate::engine::CcCommandsResult;
 
+/// Record on the session the model or effort a control request switches to.
+/// The session is the only place that learns of it: the request goes straight
+/// to the runtime, past the run loop.
+pub(crate) fn record_control_request(
+    session: &mut crate::engine::AgentSession,
+    request: &crate::runtime::ControlRequest,
+) {
+    match request {
+        crate::runtime::ControlRequest::SetModel { model } => {
+            session.current_model = Some(model.clone());
+        }
+        crate::runtime::ControlRequest::SetReasoningEffort { effort } => {
+            session.current_reasoning_effort = Some(effort.clone());
+        }
+        _ => {}
+    }
+}
+
+/// The thread-less half of `stop_agent`: stop every session in the map that
+/// `stop_refusal` lets go. A request that stopped nothing reports the refusal.
+pub(crate) fn stop_every_session(
+    sessions: &mut HashMap<Uuid, crate::engine::AgentSession>,
+    reason: StopReason,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if sessions.is_empty() {
+        return Err("No Claude Code process is running".into());
+    }
+    let mut refusal = None;
+    let mut stopped_any = false;
+    for session in sessions.values_mut() {
+        if let Some(why) = stop_refusal(session) {
+            refusal = Some(why);
+            continue;
+        }
+        session.pending_stop = Some(reason);
+        session.stop.notify_one();
+        stopped_any = true;
+    }
+    match refusal {
+        Some(why) if !stopped_any => Err(why.into()),
+        _ => Ok(()),
+    }
+}
+
+/// What `interrupt_agent` does with the entry it found for a thread.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InterruptRoute {
+    /// A turn is in flight and a loop is listening: fire the interrupt.
+    Interrupt,
+    /// The turn already reached its boundary: nothing to interrupt.
+    AlreadyWaiting,
+    /// No loop is listening: the session is exiting, or a phantom. Take the
+    /// no-session fallback.
+    NoLoop,
+}
+
+/// `is_waiting` alone cannot tell a live turn from an entry whose loop is gone,
+/// so the interrupt asks `is_in_flight`. A turn that reached its boundary stays
+/// "already waiting" whether or not its loop is still there: an interrupt
+/// would stop nothing either way.
+pub(crate) fn interrupt_route(session: &crate::engine::AgentSession) -> InterruptRoute {
+    if session.is_in_flight() {
+        InterruptRoute::Interrupt
+    } else if session.is_waiting {
+        InterruptRoute::AlreadyWaiting
+    } else {
+        InterruptRoute::NoLoop
+    }
+}
+
 impl LucidosEngine {
     /// Check if any Claude Code session is running for a specific thread.
     pub async fn is_agent_running_for(&self, thread_id: Uuid) -> bool {
@@ -9,6 +79,12 @@ impl LucidosEngine {
             .await
             .get(&thread_id)
             .is_some_and(|s| s.is_live())
+    }
+
+    /// Whether any coding-agent spawn owns the thread: a live session, or a
+    /// spawn still starting up that has not registered one yet.
+    pub(crate) async fn coding_agent_owns_thread(&self, thread_id: Uuid) -> bool {
+        self.spawns_in_flight.contains(thread_id) || self.is_agent_running_for(thread_id).await
     }
 
     /// Stop a running Claude Code session via the generic stop signal.
@@ -20,7 +96,7 @@ impl LucidosEngine {
     /// resulting `ChangeApplied` / `ChangeApplyFailed` events stamped via
     /// the stale-session fallback. Engine-internal shutdowns pass `None`.
     ///
-    /// `thread_id = None` stops every session (engine shutdown timeout path).
+    /// `thread_id = None` stops every session no change claim holds.
     ///
     /// No-live-session fallback mirrors `interrupt_agent`: cancel the
     /// in-process token, try `end_stale_waiting_session`, then settle any
@@ -39,7 +115,25 @@ impl LucidosEngine {
         thread_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Before the session lookup, because the engine owns the tasks: they
+        // A refused stop must leave everything as it found it, background
+        // tasks included. So the stop is decided and reserved in one lock,
+        // before anything is abandoned. Once `pending_stop` is set, no apply
+        // can claim the session either.
+        let reserved = match thread_id {
+            Some(tid) => match self.agent_sessions.lock().await.get_mut(&tid) {
+                Some(session) => {
+                    if let Some(refusal) = stop_refusal(session) {
+                        return Err(refusal.into());
+                    }
+                    session.pending_stop = Some(reason);
+                    Some(session.stop.clone())
+                }
+                None => None,
+            },
+            None => None,
+        };
+
+        // Before the loop is told, because the engine owns the tasks: they
         // outlive the agent's process and are running whether or not a
         // session is still registered.
         if let Some(tid) = thread_id.filter(|_| reason.abandons_background_tasks()) {
@@ -47,15 +141,11 @@ impl LucidosEngine {
                 .await;
         }
 
-        let mut guard = self.agent_sessions.lock().await;
-
         if let Some(tid) = thread_id {
-            if let Some(session) = guard.get_mut(&tid) {
-                session.pending_stop = Some(reason);
-                session.stop.notify_one();
+            if let Some(stop) = reserved {
+                stop.notify_one();
                 Ok(())
             } else {
-                drop(guard);
                 if self.cancel_thread(tid, actor.clone()) {
                     return Ok(());
                 }
@@ -78,15 +168,22 @@ impl LucidosEngine {
                 }
             }
         } else {
-            if guard.is_empty() {
-                return Err("No Claude Code process is running".into());
-            }
-            for session in guard.values_mut() {
-                session.pending_stop = Some(reason);
-                session.stop.notify_one();
-            }
-            Ok(())
+            stop_every_session(&mut *self.agent_sessions.lock().await, reason)
         }
+    }
+
+    /// Which operation holds this thread's change claim right now, if any. A
+    /// Stop, Discard or Archive would be refused while one does, so a caller can
+    /// refuse before it changes anything.
+    pub(crate) async fn change_claim_holder(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<crate::engine::types::ChangeClaim> {
+        self.agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .and_then(|s| s.change_claim)
     }
 
     /// Snapshot a session's `pending_stop` reason. Encapsulates the lock
@@ -171,8 +268,12 @@ impl LucidosEngine {
         let mut guard = self.agent_sessions.lock().await;
 
         if let Some(tid) = thread_id {
-            if let Some(session) = guard.get_mut(&tid) {
-                if session.is_waiting {
+            // An entry no loop listens to is no session at all.
+            if let Some(session) = guard
+                .get_mut(&tid)
+                .filter(|s| interrupt_route(s) != InterruptRoute::NoLoop)
+            {
+                if interrupt_route(session) == InterruptRoute::AlreadyWaiting {
                     return Err(SESSION_ALREADY_WAITING.into());
                 }
                 // Record who clicked Cancel BEFORE the notify so the run_session
@@ -194,7 +295,7 @@ impl LucidosEngine {
             }
             let mut any = false;
             for session in guard.values() {
-                if !session.is_waiting {
+                if interrupt_route(session) == InterruptRoute::Interrupt {
                     session.interrupt.notify_one();
                     any = true;
                 }
@@ -219,12 +320,7 @@ impl LucidosEngine {
             let session = guard
                 .get_mut(&thread_id)
                 .ok_or("No Claude Code session found for this thread")?;
-            if let crate::runtime::ControlRequest::SetModel { ref model } = request {
-                session.current_model = Some(model.clone());
-            }
-            if let crate::runtime::ControlRequest::SetReasoningEffort { ref effort } = request {
-                session.current_reasoning_effort = Some(effort.clone());
-            }
+            record_control_request(session, &request);
             session
                 .control_tx
                 .send(request)

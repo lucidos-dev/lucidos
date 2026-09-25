@@ -119,6 +119,7 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'checkpoint':
     case 'event_wait':
     case 'held_message':
+    case 'form_request':
     case 'spoken_reply':
     case 'empty':
       return true;

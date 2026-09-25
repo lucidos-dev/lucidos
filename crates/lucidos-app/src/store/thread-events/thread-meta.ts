@@ -27,11 +27,13 @@ export type ThreadAggregate = {
   section: ThreadSection;
   status: ThreadStatus;
   activeChildrenCount: number;
+  /** See `ThreadMeta.waitingChildrenCount`. */
+  waitingChildrenCount?: number;
   totalChildrenCount: number;
   /** Count of descendants (transitive) currently blocking this thread's
    *  archive. Maintained by EventBus on
    *  `thread_summaries.blocking_descendant_count`. Consumed by
-   *  `resolveActions` via `count > 0`. */
+   *  `resolveThreadActions` via `count > 0`. */
   blockingDescendantCount: number;
   /** Count of descendants (transitive) currently in a state that needs user
    *  attention (WaitingForUserAnswer, or an in-workspace CC thread with
@@ -123,6 +125,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.section !== agg.section) { meta.section = agg.section; changed = true; }
   if (meta.status !== agg.status) { meta.status = agg.status; changed = true; }
   if (meta.activeChildrenCount !== agg.activeChildrenCount) { meta.activeChildrenCount = agg.activeChildrenCount; changed = true; }
+  if ((meta.waitingChildrenCount ?? 0) !== (agg.waitingChildrenCount ?? 0)) { meta.waitingChildrenCount = agg.waitingChildrenCount ?? 0; changed = true; }
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
@@ -204,10 +207,16 @@ export type ThreadMeta = {
   section: ThreadSection;
   /** Number of active child threads (non-zero means parent is "in progress"). */
   activeChildrenCount: number;
+  /** Direct children idle on their own live event wait, from
+   *  `thread_summaries.waiting_children_count`. Such a child has not finished
+   *  (ADR 0254), so the parent waits on it as on an active one. Disjoint from
+   *  `activeChildrenCount`, so the two add up. Absent reads as zero, which is
+   *  what a meta built before the field existed means. */
+  waitingChildrenCount?: number;
   /** Total number of child threads (active + finished). */
   totalChildrenCount: number;
   /** Count of descendants (transitive) currently blocking this thread's
-   *  archive. Consumed by `resolveActions` via `count > 0`. */
+   *  archive. Consumed by `resolveThreadActions` via `count > 0`. */
   blockingDescendantCount: number;
   /** Count of descendants (transitive) currently in a state that needs user
    *  attention (WaitingForUserAnswer, or an in-workspace CC thread with
@@ -343,7 +352,7 @@ export type ThreadState = {
    *  the server pages by. Null before the first load, and on a thread served
    *  whole, which is every thread shorter than a page.
    *
-   *  All three are OPTIONAL. A thread built without them reads as served
+   *  Both are OPTIONAL. A thread built without them reads as served
    *  whole, which is the truth for a fixture and for any pre-paging state. */
   historyFloor?: { created: string; sequence: number } | null;
   /** True while the server says older events remain behind `historyFloor`.
@@ -352,8 +361,9 @@ export type ThreadState = {
   hasOlderEvents?: boolean;
   /** Optimistic user messages shown before real SSE events arrive.
    *  Each entry is removed when its corresponding MessageReceived event arrives
-   *  from SSE, matched by the client-generated event_id UUID. */
-  /** `unconfirmed` marks a row the safety refetch gave up on: the send was
+   *  from SSE, matched by the client-generated event_id UUID.
+   *
+   *  `unconfirmed` marks a row the safety refetch gave up on: the send was
    *  never confirmed and the row is kept so the text stays visible, but it no
    *  longer counts as a turn in flight (see `effectiveThreadStatus`). */
   pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[]; unconfirmed?: boolean }>;

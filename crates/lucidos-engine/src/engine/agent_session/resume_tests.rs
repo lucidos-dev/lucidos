@@ -456,7 +456,7 @@ async fn lookup_finds_config_dir_from_init_settings() {
     emit_settings_with_config_dir(&bus, thread_id, Some("sess-cfg"), Some("/home/u/.claude")).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
         Some("/home/u/.claude".to_string()),
         "the config dir stamped at Init must be resolvable for a later resume"
     );
@@ -479,7 +479,7 @@ async fn lookup_config_dir_is_none_for_legacy_thread() {
     emit_settings_with_sid(&bus, thread_id, Some("sess-legacy")).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
         None,
         "a thread with no recorded config dir must resolve None, not a phantom value"
     );
@@ -510,7 +510,7 @@ async fn lookup_pinned_config_dir_prefers_first() {
     emit_settings_with_config_dir(&bus, thread_id, None, None).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
         Some("/home/u/.claude-personal".to_string()),
         "a settings-only emit with no config dir must not shadow the pinned dir"
     );
@@ -519,7 +519,7 @@ async fn lookup_pinned_config_dir_prefers_first() {
     // the account of its first session.
     emit_settings_with_config_dir(&bus, thread_id, Some("sess-2"), Some("/home/u/.claude")).await;
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await,
+        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
         Some("/home/u/.claude-personal".to_string()),
         "the FIRST recorded config dir is the permanent pin; a later account must not override it"
     );
@@ -670,7 +670,7 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
     emit_idled(&bus, thread_id, Some("sess-B"), None).await;
 
     // The pin is the FIRST account.
-    let pinned = lookup_pinned_cc_config_dir(&pool, thread_id).await;
+    let pinned = lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap();
     assert_eq!(pinned.as_deref(), Some("/home/u/.claude-personal"));
 
     // Auto-detect resume (no caller sid), scoped to the pin: resumes session A, not B.

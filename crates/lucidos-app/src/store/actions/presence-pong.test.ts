@@ -25,7 +25,7 @@ vi.mock('../store', () => ({
   appPseudoFullscreen: pseudoFullscreenSignal,
 }));
 vi.mock('../appFullscreenHost', () => ({ appFullscreenHost: fullscreenHostSignal }));
-vi.mock('./devices', () => ({ getDeviceId: getDeviceIdMock, pendingDeviceRegistration: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId: getDeviceIdMock }));
 vi.mock('./event-stream', () => ({ submitPong: submitPongMock }));
 vi.mock('./in-app-notification-toast', () => ({
   showInAppNotificationToast: showInAppNotificationToastMock,

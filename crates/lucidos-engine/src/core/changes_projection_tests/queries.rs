@@ -1,5 +1,6 @@
 use super::cp_helpers::*;
 use super::*;
+use crate::core::changes::ChangeStatus;
 
 #[tokio::test]
 async fn pending_for_thread_filters_by_thread() {
@@ -119,34 +120,11 @@ async fn a_proposal_after_an_apply_on_the_same_branch_is_a_new_change() {
 
     let applied = proj.get_by_id(first).await.unwrap().expect("applied row");
     assert_eq!(
-        applied.status, "applied",
+        applied.status(),
+        ChangeStatus::Applied,
         "the applied change stays applied"
     );
     assert_eq!(applied.commits, vec!["feat: first round".to_string()]);
-
-    teardown_test_db(&db).await;
-}
-
-#[tokio::test]
-async fn has_pending_for_branch_reflects_pending_state() {
-    let (pool, db) = setup_test_db().await;
-    let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let thread = Uuid::new_v4();
-    let id = Uuid::new_v4();
-    start_cc_thread(&bus, thread).await;
-
-    let proj = ChangesProjection::new(pool.clone());
-    assert!(!proj.has_pending_for_branch("branch-a").await.unwrap());
-
-    emit(&bus, thread, aggregate_proposed(id, "branch-a", "/repo")).await;
-    assert!(proj.has_pending_for_branch("branch-a").await.unwrap());
-    assert!(!proj.has_pending_for_branch("branch-b").await.unwrap());
-
-    emit(&bus, thread, applied_event(id, &["feat: x"], false)).await;
-    assert!(
-        !proj.has_pending_for_branch("branch-a").await.unwrap(),
-        "applied → no longer pending"
-    );
 
     teardown_test_db(&db).await;
 }
@@ -249,7 +227,7 @@ async fn list_recently_applied_includes_reverted() {
     let proj = ChangesProjection::new(pool);
     let recent = proj.list_recently_applied(10, None).await.unwrap();
     assert_eq!(recent.len(), 1);
-    assert_eq!(recent[0].status, "reverted");
+    assert_eq!(recent[0].status(), ChangeStatus::Reverted);
 
     teardown_test_db(&db).await;
 }
@@ -687,24 +665,27 @@ async fn enrich_marks_only_changes_whose_conflict_pairing_is_open() {
     )
     .await;
 
-    let mut pending = proj.list_pending().await.unwrap();
-    crate::core::changes::enrich_pending_state(&pool, &mut pending)
-        .await
-        .unwrap();
+    let pending = crate::core::changes::list_pending_for_readers(
+        &pool,
+        &proj,
+        crate::core::changes::PendingScope::All,
+    )
+    .await
+    .unwrap();
     for (thread, change) in [resolving, untouched, cleared] {
         let row = pending
             .iter()
             .find(|c| c.id == change)
             .expect("pending row");
         assert_eq!(
-            row.resolving_conflict,
+            row.thread_state().unwrap().resolving_conflict(),
             proj.conflict_pairing_open(thread, change).await.unwrap(),
             "the served flag and the merge guard read one definition"
         );
     }
     let flagged: Vec<Uuid> = pending
         .iter()
-        .filter(|c| c.resolving_conflict)
+        .filter(|c| c.thread_state().unwrap().resolving_conflict())
         .map(|c| c.id)
         .collect();
     assert_eq!(
@@ -898,7 +879,266 @@ async fn with_merge_worktree_returns_only_pending_with_active_merge() {
     let active = proj.with_merge_worktree().await.unwrap();
     assert_eq!(active.len(), 1, "only one with active merge: {:?}", active);
     assert_eq!(active[0].id, with_merge);
-    assert_eq!(active[0].merge_worktree_path.as_deref(), Some("/tmp/wt-1"));
+    assert_eq!(
+        active[0].merge_worktree().map(|m| m.path.as_str()),
+        Some("/tmp/wt-1")
+    );
+
+    teardown_test_db(&db).await;
+}
+
+fn idled() -> ThreadEvent {
+    ThreadEvent::CodingAgentIdled {
+        has_changes: true,
+        is_external_repo: false,
+        requires_restart: false,
+        cc_session_id: None,
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        reason: None,
+        worktree_path: None,
+        worktree_head_sha: None,
+        bg_bash_pending: false,
+    }
+}
+
+/// The flags a reader sees for one change, next to the status `threads list`
+/// shows for its thread.
+async fn read_one(pool: &PgPool, proj: &ChangesProjection, thread: Uuid) -> (String, bool, bool) {
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let pending = crate::core::changes::list_pending_for_readers(
+        pool,
+        proj,
+        crate::core::changes::PendingScope::All,
+    )
+    .await
+    .unwrap();
+    let change = pending
+        .iter()
+        .find(|c| c.thread_id == Some(thread))
+        .expect("the change is pending");
+    let thread = change.thread_state().unwrap();
+    (status, thread.unsettled(), thread.settling())
+}
+
+/// A session proposed, then an event delivery started a new turn and it kept
+/// working. The `changes` tool read that change as settled, and an
+/// orchestrator told the user the session was done. Driven by real events, so
+/// the flag has to follow the status every step of the way.
+#[tokio::test]
+async fn a_change_reads_unsettled_whenever_its_thread_works_again() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let proj = ChangesProjection::new(pool.clone());
+    let thread = Uuid::new_v4();
+    start_cc_thread(&bus, thread).await;
+    emit(&bus, thread, idled()).await;
+    emit(
+        &bus,
+        thread,
+        aggregate_proposed(Uuid::new_v4(), "b-resume", "/r"),
+    )
+    .await;
+
+    assert_eq!(
+        read_one(&pool, &proj, thread).await,
+        ("idle".to_string(), false, false),
+        "an idle thread with no wait has finished with its change"
+    );
+
+    emit(
+        &bus,
+        thread,
+        ThreadEvent::UserPromptInjected {
+            text: "the background task finished".into(),
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            origin: None,
+            injected_message_id: None,
+            delivered_event_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        read_one(&pool, &proj, thread).await,
+        ("running".to_string(), true, true),
+        "a thread that resumes after proposing is still working on the change"
+    );
+
+    emit(&bus, thread, idled()).await;
+    assert_eq!(
+        read_one(&pool, &proj, thread).await,
+        ("idle".to_string(), false, false),
+        "once it goes idle again, the change reads settled"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The list and the Apply gate read the same state. At 21:14 an Apply All hit
+/// a conflict and the thread went back to work resolving it. The `changes`
+/// tool then listed the change with every flag false, while `apply` on the same
+/// change was refused because the thread had not finished.
+#[tokio::test]
+async fn the_list_and_the_apply_gate_agree_on_every_thread_state() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let proj = ChangesProjection::new(pool.clone());
+
+    let states = [
+        ("mid-turn", "running", 0, false),
+        ("on a question card", "waiting_for_user_answer", 0, false),
+        ("watching an event", "idle", 1, false),
+        ("resolving a conflict", "running", 0, true),
+        ("settled", "idle", 0, false),
+    ];
+    let mut rows = Vec::new();
+    for (i, (label, status, waits, conflict)) in states.into_iter().enumerate() {
+        let (thread, change) = (Uuid::new_v4(), Uuid::new_v4());
+        start_cc_thread(&bus, thread).await;
+        emit(&bus, thread, idled()).await;
+        emit(
+            &bus,
+            thread,
+            aggregate_proposed(change, &format!("agree-{i}"), "/r"),
+        )
+        .await;
+        if conflict {
+            emit(
+                &bus,
+                thread,
+                ThreadEvent::MergeConflictDetected {
+                    change_id: change.to_string(),
+                    files: vec!["a.rs".to_string()],
+                    origin: None,
+                },
+            )
+            .await;
+        }
+        sqlx::query(
+            "UPDATE thread_summaries SET status = $2, live_event_wait_count = $3 \
+             WHERE thread_id = $1",
+        )
+        .bind(thread)
+        .bind(status)
+        .bind(waits)
+        .execute(&pool)
+        .await
+        .unwrap();
+        rows.push((label, change, conflict));
+    }
+
+    let listed = crate::core::changes::list_pending_for_readers(
+        &pool,
+        &proj,
+        crate::core::changes::PendingScope::All,
+    )
+    .await
+    .unwrap();
+    for (label, change, conflict) in rows {
+        let row = listed.iter().find(|c| c.id == change).expect("listed");
+        let refused = crate::api::changes::change_action_refusal(
+            &pool,
+            change,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            row.thread_state().unwrap().unsettled(),
+            refused.is_some(),
+            "{label}: the list says unsettled={}, the gate says {refused:?}",
+            row.thread_state().unwrap().unsettled()
+        );
+        assert_eq!(
+            row.thread_state().unwrap().resolving_conflict(),
+            conflict,
+            "{label}: resolving flag"
+        );
+    }
+
+    teardown_test_db(&db).await;
+}
+
+/// The threads-list count and the `changes` filter read one definition of
+/// "sub-thread", so over the same tree they agree. The root's own change is in
+/// neither: a completion card keeps it apart too.
+#[tokio::test]
+async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
+    use crate::core::changes::{list_pending_for_readers, PendingScope};
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let proj = ChangesProjection::new(pool.clone());
+
+    // root holds its own change; child and grandchild hold one each; the
+    // quiet sibling holds none.
+    let [root, child, grandchild, quiet] = [(); 4].map(|_| Uuid::new_v4());
+    for (i, thread) in [root, child, grandchild, quiet].into_iter().enumerate() {
+        start_cc_thread(&bus, thread).await;
+        if thread != quiet {
+            emit(
+                &bus,
+                thread,
+                aggregate_proposed(Uuid::new_v4(), &format!("tree-{i}"), "/r"),
+            )
+            .await;
+        }
+    }
+    for (thread, parent) in [(child, root), (grandchild, child), (quiet, root)] {
+        sqlx::query("UPDATE thread_summaries SET parent_thread_id = $2 WHERE thread_id = $1")
+            .bind(thread)
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let below_root = list_pending_for_readers(&pool, &proj, PendingScope::SubThreadsOf(root))
+        .await
+        .unwrap();
+    let mut owners: Vec<_> = below_root.iter().filter_map(|c| c.thread_id).collect();
+    owners.sort();
+    let mut expected = vec![child, grandchild];
+    expected.sort();
+    assert_eq!(
+        owners, expected,
+        "the filter reaches the grandchild, not the root"
+    );
+
+    let counts =
+        crate::core::changes::pending_sub_thread_change_counts(&pool, &[root, child, quiet])
+            .await
+            .unwrap();
+    assert_eq!(counts.get(&root).copied(), Some(below_root.len() as i64));
+    assert_eq!(counts.get(&child).copied(), Some(1));
+    assert_eq!(counts.get(&quiet), None, "nothing below the quiet sibling");
+
+    // The list an agent reads carries the count on every row, zero included.
+    let store = crate::core::store::EventStore::new(pool.clone());
+    let rows = store
+        .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
+            status: crate::core::store::StatusFilter::Any,
+            sources: None,
+            parent: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    let count_of = |id: Uuid| {
+        rows.iter()
+            .find(|r| r.thread_id == id.to_string())
+            .expect("listed")
+            .pending_sub_thread_change_count
+    };
+    assert_eq!(count_of(root), Some(2));
+    assert_eq!(count_of(grandchild), Some(0));
+
+    // Every other read path omits it rather than claiming zero.
+    let by_id = store.get_threads_by_ids(&[root.to_string()]).await.unwrap();
+    assert_eq!(by_id[0].pending_sub_thread_change_count, None);
 
     teardown_test_db(&db).await;
 }

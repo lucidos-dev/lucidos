@@ -75,7 +75,7 @@ describe('backgroundActivities', () => {
     };
     const [activity] = backgroundActivities(true, null, null, detail, 0);
     expect(activity.note).toBe(
-      '3 commits since your running version\n\n' +
+      '3 commits come with the new version\n\n' +
         'New\n• memory: one cache per user\n\n' +
         'Fixed\n• splash: the brand leaves first\n• todo: a canceled subscription settles',
     );
@@ -91,7 +91,7 @@ describe('backgroundActivities', () => {
       },
     };
     const [activity] = backgroundActivities(true, null, null, detail, 0);
-    expect(activity.note).toContain('9 commits since your running version');
+    expect(activity.note).toContain('9 commits come with the new version');
     expect(activity.note).toContain('• and 4 more');
   });
 
@@ -111,7 +111,7 @@ describe('backgroundActivities', () => {
       },
     };
     expect(backgroundActivities(true, null, null, detail, 0)[0].note).toBe(
-      '43 commits since your running version\n\n' +
+      '43 commits come with the new version\n\n' +
         'New\n• memory: one cache per user\n\n' +
         '• 42 housekeeping commits (docs, tests, chores)',
     );
@@ -127,7 +127,7 @@ describe('backgroundActivities', () => {
       },
     };
     expect(backgroundActivities(true, null, null, detail, 0)[0].note).toBe(
-      '1 commit since your running version\n\nFixed\n• the only one',
+      '1 commit comes with the new version\n\nFixed\n• the only one',
     );
   });
 
@@ -233,7 +233,7 @@ describe('activityToastContent', () => {
     // its own section, so a group heading can never render as a bullet of the
     // group above it.
     expect(parsed.sections).toHaveLength(3);
-    expect(parsed.sections[0].title).toBe('3 commits since your running version');
+    expect(parsed.sections[0].title).toBe('3 commits come with the new version');
     expect(parsed.sections[1].title).toBe('Fixed');
     expect(parsed.sections[1].bullets).toEqual(['one']);
     expect(parsed.sections[2].title).toBeUndefined();
@@ -259,7 +259,7 @@ describe('activityToastContent', () => {
     // there were fewer, because the caveat was absorbed as one more bullet of
     // the commit list.
     expect(parsed.sections).toHaveLength(4);
-    expect(parsed.sections[1].title).toBe('2 commits since your running version');
+    expect(parsed.sections[1].title).toBe('2 commits come with the new version');
     expect(parsed.sections[2].title).toBe('Fixed');
     expect(parsed.sections[2].bullets).toEqual(['one', 'two']);
     expect(parsed.sections[3].title).toBe(MEMORY_NOT_INDEXED_NOTE);

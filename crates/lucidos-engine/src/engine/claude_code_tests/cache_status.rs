@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::changes::ChangeStatus;
 
 fn cache_with(entries: &[(&str, &[&str])]) -> HashMap<String, CcCommandsInfo> {
     entries
@@ -57,17 +58,21 @@ fn hardening_succeeded_requires_marker_and_no_cancel() {
 }
 
 /// Race regression: when another device clicks Apply while CC is running
-/// `/harden`, the change row flips to `"applied"` and the marker file is
+/// `/harden`, the change row flips to applied and the marker file is
 /// consumed. `spawn_hardening_session`'s post-CC `branch_is_hardened` check
 /// then returns false and would emit a spurious `ChangeApplyFailed` ~15s
 /// after the user already saw `ChangeApplied` — surfacing as a "hindsight
-/// failure" in the UI. The predicate gates the bail-out: only `"applied"`
+/// failure" in the UI. The predicate gates the bail-out: only `Applied`
 /// triggers the skip; missing rows and any other status preserve the
 /// existing failure path.
 #[test]
 fn change_applied_concurrently_only_true_for_applied_status() {
-    assert!(change_applied_concurrently(Some("applied")));
-    assert!(!change_applied_concurrently(Some("pending")));
-    assert!(!change_applied_concurrently(Some("discarded")));
+    for status in ChangeStatus::ALL {
+        assert_eq!(
+            change_applied_concurrently(Some(status)),
+            status == ChangeStatus::Applied,
+            "{status}"
+        );
+    }
     assert!(!change_applied_concurrently(None));
 }

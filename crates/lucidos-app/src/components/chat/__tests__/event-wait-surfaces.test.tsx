@@ -25,6 +25,7 @@ import { dirname, resolve } from 'node:path';
 import type { ComponentChildren, VNode } from 'preact';
 import { eventDeliveryBody, eventWaitRowBody, triggerFiredBody } from '../chat-exchange-parts';
 import { formatDeliveredPayload } from '../CreateThreadView';
+import { EventConditionModal } from '../EventConditionModal';
 import { waitingIndicatorBody } from '../WaitingPanel';
 import * as promptInputHelpers from '../prompt-input-helpers';
 import {
@@ -36,6 +37,7 @@ import { eventConditionModal } from '../../../store/store';
 import { isExchangeStartEvent } from '../../../store/thread-events';
 import type { EventWaitSummary, Exchange } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
+import { formatMessageTimestamp } from '../../../utils/formatTime';
 
 type TriggerStarted = Extract<Exchange['userEvent'], { type: 'TriggerStarted' }>;
 
@@ -85,6 +87,7 @@ const wait_ = (over: Partial<Wait> = {}): Wait => ({
   wait_id: 'w1',
   subscriptions: [{ event_type: 'ChangeProposed' }],
   reason: 'the release build to finish',
+  created: '2026-08-06T11:00:00Z',
   expires_at: '2026-08-06T12:00:00Z',
   state: 'waiting',
   ...over,
@@ -112,8 +115,8 @@ describe('EventWaitRow', () => {
     const el = findByRole(tree, 'event-wait-row');
     expect(el?.props['data-state']).toBe('waiting');
     expect(el?.props['data-kind']).toBe('wait');
-    expect(vnodeText(tree)).toContain('Set up an event wait: the release build to finish');
-    expect(vnodeText(tree)).toContain('ChangeProposed');
+    expect(vnodeText(tree)).toContain('Waiting for the release build to finish');
+    expect(vnodeText(tree)).toContain('change proposed');
     // A card, but never the affordance card's own class.
     expect(String(el?.props.class)).toContain('event-row');
     expect(String(el?.props.class)).not.toContain('step-note-card');
@@ -142,19 +145,70 @@ describe('EventWaitRow', () => {
     },
   );
 
-  /** Every state reads as a WORD, so the tint only groups it and a colourblind
+  /** Every state reads as WORDS, so the tint only groups it and a colourblind
    *  reader gets the same fact. Timeout and stop are told apart by their words
-   *  rather than by red: nothing failed either time. */
+   *  rather than by red: nothing failed either time.
+   *
+   *  **The pill says the outcome once.** The headline already says "Waiting",
+   *  so a live pill carries the deadline instead of repeating the verb. */
   it.each([
-    ['waiting', 'waiting', 'live'],
-    ['matched', 'matched', 'arrived'],
-    ['timed_out', 'timed out', 'lapsed'],
-    ['canceled', 'stopped', 'halted'],
-  ] as const)('reports the %s state as the word "%s"', (state, word, tone) => {
+    ['waiting', /^until /, 'live'],
+    ['matched', /^✓$/, 'arrived'],
+    ['timed_out', /^gave up at /, 'lapsed'],
+    ['canceled', /^stopped$/, 'halted'],
+  ] as const)('reports the %s state as %s', (state, words, tone) => {
     const tree = step(wait_({ state }));
     const pill = findByClass(tree, 'event-row-state');
-    expect(vnodeText(pill)).toBe(word);
+    expect(vnodeText(pill)).toMatch(words);
     expect(pill?.props['data-tone']).toBe(tone);
+  });
+
+  /** Without a deadline the pill falls back to the bare word, never to an
+   *  "until" with nothing after it. */
+  it.each([
+    ['waiting', 'waiting'],
+    ['timed_out', 'gave up'],
+  ] as const)('falls back to "%s" words with no deadline', (state, word) => {
+    const pill = findByClass(step(wait_({ state, expires_at: '' })), 'event-row-state');
+    expect(vnodeText(pill)).toBe(word);
+  });
+
+  /** A delivered wait's pill says when it was done, behind a check, in the
+   *  same format the live pill used for its deadline. */
+  it('stamps a delivered wait with when it was done', () => {
+    vi.useFakeTimers();
+    try {
+      const now = new Date('2026-08-10T12:00:00.000Z');
+      vi.setSystemTime(now);
+      const at = (ms: number) => new Date(now.getTime() + ms).toISOString();
+      const stamp = (e: string) =>
+        vnodeText(findByClass(step(wait_({ state: 'matched', matched_at: e })), 'event-row-state'));
+
+      expect(stamp(at(-60 * 1000))).toMatch(/^✓ \d{2}:\d{2}$/);
+      expect(stamp(at(-36 * 60 * 60 * 1000))).toMatch(/^✓ \w{3} \d{1,2} \d{2}:\d{2}$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** The header says when the wait started, in the message-header format. The
+   *  response header above shows when the turn ENDED, so nothing else does. */
+  it('stamps the header with when the wait started', () => {
+    const time = findByClass(step(wait_()), 'event-row-time');
+    expect(time?.props.dateTime).toBe('2026-08-06T11:00:00Z');
+    expect(vnodeText(time)).toBe(formatMessageTimestamp('2026-08-06T11:00:00Z'));
+  });
+
+  /** An unparseable time draws nothing, never an "Invalid Date". */
+  it('omits the start time when it cannot be read', () => {
+    expect(findByClass(step(wait_({ created: '' })), 'event-row-time')).toBeNull();
+  });
+
+  /** **The deadline appears once**, on the pill, never again on the facts line. */
+  it('states the deadline in the pill and nowhere else', () => {
+    const tree = step(wait_());
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toMatch(/^until /);
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).not.toContain('until');
   });
 
   /** A wait that resolved on its own keeps the same subject line, so the eye
@@ -166,31 +220,55 @@ describe('EventWaitRow', () => {
    *  thread, and the row cannot tell whether this one had been asleep, so it
    *  states the thing that is true of the subscription in both lanes. */
   it.each([
-    ['matched', 'ChangeProposed'],
-    ['timed_out', 'timed out'],
-  ] as const)('keeps the arming subject in the %s state', (state, note) => {
+    ['matched', 'change proposed'],
+    ['timed_out', 'gave up'],
+  ] as const)('keeps the subject, in the past tense, in the %s state', (state, note) => {
     const tree = step(
       wait_({ state, matched_event_type: state === 'matched' ? 'ChangeProposed' : undefined }),
     );
     expect(findByRole(tree, 'event-wait-row')?.props['data-state']).toBe(state);
-    expect(vnodeText(tree)).toContain('Set up an event wait:');
+    expect(vnodeText(tree)).toContain('Waited for the release build to finish');
     expect(vnodeText(tree)).toContain(note);
   });
 
-  /** Each watched type gets its own chip, joined by the word the subscription
-   *  language itself uses. Two chips and one glue is ONE fact, so the row's
-   *  middot separator steps over the "or" rather than fencing it. */
+  /** **The words the user asked to lose.** "Event wait" is the internal name
+   *  (`system-knowhow/glossary.md` § Event wait), and "subscription" is its
+   *  glossary synonym. Neither belongs on a row a person reads. */
+  it.each(['waiting', 'matched', 'timed_out', 'canceled'] as const)(
+    'says neither "event wait" nor "subscription" in the %s state',
+    (state) => {
+      const text = vnodeText(step(wait_({ state, cause: 'user_stop', matched_event_type: 'ChangeProposed' })));
+      expect(text).not.toMatch(/event wait|subscription/i);
+    },
+  );
+
+  /** A model reason that opens with a gerund keeps a colon, so the row never
+   *  reads "Waiting for watching". */
+  it('keeps a colon before a gerund reason', () => {
+    const text = vnodeText(step(wait_({ reason: 'watching the deploy' })));
+    expect(text).toContain('Waiting: watching the deploy');
+  });
+
+  /** Each watched type gets its own chip, after "watching for" and joined by the
+   *  word the subscription language itself uses. The glue words and the chips
+   *  are ONE fact, so the row's middot separator steps over them. */
   it('chips every watched event type', () => {
     const tree = step(
       wait_({ subscriptions: [{ event_type: 'ChangeProposed' }, { event_type: 'ChangeApplied' }] }),
     );
-    expect(vnodeText(tree)).toContain('ChangeProposed');
-    expect(vnodeText(tree)).toContain('ChangeApplied');
-    expect(vnodeText(tree)).toContain('or');
-    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('ChangeProposed');
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).toBe('watching forchange proposedorchange applied');
+    expect(findByClass(tree, 'event-row-sep')).toBeNull();
   });
 
-  /** **"(filtered)" says a filter exists and nothing about what it says**, and
+  /** **The chip shows plain words and keeps the raw type on its tooltip.** A
+   *  reader who needs the exact event to subscribe to can still find it. */
+  it('shows the plain name with the raw type on the tooltip', () => {
+    const chip = findByClass(step(wait_()), 'event-name');
+    expect(vnodeText(chip)).toBe('change proposed');
+    expect(chip?.props['data-tooltip']).toBe('ChangeProposed');
+  });
+
+  /** **"matching only" says a filter exists and nothing about what it says**, and
    *  the raw operator JSON is far too wide for a facts line. So the chip is the
    *  door to it: pressing one opens the condition in a modal. Before that, the
    *  row could report that a watch was narrowed and no surface could say how. */
@@ -198,15 +276,45 @@ describe('EventWaitRow', () => {
     const condition = { 'workflow_run.event': 'completed' };
     const tree = step(wait_({ subscriptions: [{ event_type: 'GithubWorkflowRunStateChanged', condition }] }));
     const chip = findByClass(tree, 'event-name-link');
-    expect(vnodeText(chip)).toBe('GithubWorkflowRunStateChanged (filtered)');
-    // The visible text is a bare event type. The accessible name is what says
-    // pressing it opens the filter rather than jumping to an event.
-    expect(chip?.props['aria-label']).toBe('Show the condition filtering GithubWorkflowRunStateChanged');
+    expect(vnodeText(chip)).toBe('github workflow run state changed matching only');
+    expect(vnodeText(findByClass(chip, 'event-name-note'))).toBe('matching only');
+    // The accessible name carries the raw type and says pressing it opens the
+    // condition rather than jumping to an event.
+    expect(chip?.props['aria-label']).toBe('GithubWorkflowRunStateChanged · show the condition');
     (chip?.props.onClick as () => void)();
     expect(eventConditionModal.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
-      condition,
+      conditions: [condition],
     });
+  });
+
+  /** **The card this was rebuilt for.** One `CodingAgentIdled` per session
+   *  printed the same name six times, joined by five "or"s, over three lines.
+   *  One type is one chip, and its door opens every condition behind it. */
+  it('folds repeats of one event type into a single chip', () => {
+    const conditions = [1, 2, 3, 4, 5, 6].map((n) => ({ thread_id: `t${n}` }));
+    const tree = step(wait_({
+      subscriptions: conditions.map((condition) => ({ event_type: 'CodingAgentIdled', condition })),
+    }));
+    const chip = findByClass(tree, 'event-name-link');
+    expect(vnodeText(chip)).toBe('coding agent stopped working 6 conditions');
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).toBe('watching forcoding agent stopped working 6 conditions');
+    expect(chip?.props['aria-label']).toBe('CodingAgentIdled · show the 6 conditions');
+    (chip?.props.onClick as () => void)();
+    expect(eventConditionModal.value).toEqual({ eventType: 'CodingAgentIdled', conditions });
+  });
+
+  /** The modal is for developers, so it shows the raw event type and the
+   *  payload match, not a sentence about them. */
+  it('shows the condition as a type and payload block', () => {
+    eventConditionModal.value = { eventType: 'CodingAgentIdled', conditions: [{ thread_id: 't1' }] };
+    const modal = EventConditionModal();
+    const subject = findByRole(modal, 'event-condition-type');
+    expect(vnodeText(subject)).toBe('CodingAgentIdled');
+    expect(subject?.props['data-tooltip']).toBe('coding agent stopped working');
+    expect(vnodeText(findByRole(modal, 'event-condition-json'))).toBe(
+      'type: CodingAgentIdled\npayload: {\n  "thread_id": "t1"\n}',
+    );
   });
 
   /** A chip with no condition promises nothing, so it must offer no door: a
@@ -242,10 +350,8 @@ describe('EventWaitRow', () => {
       const now = new Date('2026-08-10T12:00:00.000Z');
       vi.setSystemTime(now);
       const at = (ms: number) => new Date(now.getTime() + ms).toISOString();
-      const stamp = (e: string) => {
-        const text = vnodeText(step(wait_({ expires_at: e })));
-        return text.slice(text.indexOf('until '));
-      };
+      const stamp = (e: string) =>
+        vnodeText(findByClass(step(wait_({ expires_at: e })), 'event-row-state'));
 
       expect(stamp(at(60 * 1000))).toMatch(/^until \d{2}:\d{2}$/);
       expect(stamp(at(36 * 60 * 60 * 1000))).toMatch(/^until \w{3} \d{1,2} \d{2}:\d{2}$/);
@@ -265,8 +371,8 @@ describe('EventWaitRow', () => {
 
   /** A STOP is a different action at a different moment, so it says so. When
    *  the subscription was armed in an earlier turn, this row IS the stop and
-   *  sits where the stop happened; "Set up an event wait" there would name the
-   *  wrong event entirely.
+   *  sits where the stop happened; "Waiting for" there would name the wrong
+   *  moment entirely.
    *
    *  The word is "stopped", never "discarded": *discarded* already means
    *  throwing a thing away in Lucidos, and one of the causes literally IS a
@@ -275,46 +381,53 @@ describe('EventWaitRow', () => {
     const tree = step(wait_({ state: 'canceled', cause: 'user_stop' }));
     const el = findByRole(tree, 'event-wait-row');
     expect(el?.props['data-state']).toBe('canceled');
-    expect(vnodeText(tree)).toContain('Stopped waiting: the release build to finish');
-    expect(vnodeText(tree)).not.toContain('Set up an event wait');
+    expect(vnodeText(tree)).toContain('Stopped waiting for the release build to finish');
+    expect(vnodeText(tree)).not.toContain('Waiting for');
     expect(vnodeText(tree)).not.toContain('discard');
-    // The subscription is over, so the row names how it ended instead of what
-    // it was watching. Naming both would read as a live watch.
-    expect(vnodeText(tree)).not.toContain('ChangeProposed');
+    // The wait is over, so the row names how it ended instead of what it was
+    // watching. Naming both would read as a live watch.
+    expect(vnodeText(tree)).not.toContain('change proposed');
   });
 
   /** **A label never says "waiting" twice.** Both subjects here carry the verb,
    *  and `reason` is the model's free text, which reaches for a gerund as often
    *  as a noun phrase. An arm-then-stand-down then printed the same sentence on
-   *  two cards, each opening `wait: waiting for`.
+   *  two cards, each saying "waiting" twice.
    *
    *  Fixed at the label rather than by trusting the guidance, so it holds for
    *  every reason already on disk. `awaitedSubject` carries the rule and its
    *  edges; these two cases pin that both subjects route through it. */
   it.each([
-    ['waiting', 'Set up an event wait: the e2e lock to free up'],
-    ['canceled', 'Stopped waiting: the e2e lock to free up'],
+    ['waiting', 'Waiting for the e2e lock to free up'],
+    ['canceled', 'Stopped waiting for the e2e lock to free up'],
   ] as const)('drops the duplicated verb on a %s row', (state, subject) => {
     const tree = step(wait_({ state, reason: 'waiting for the e2e lock to free up' }));
     expect(vnodeText(tree)).toContain(subject);
-    expect(vnodeText(tree)).not.toContain('waiting for the e2e lock');
+    expect(vnodeText(tree)).not.toMatch(/waiting for waiting/i);
   });
 
   /** Every cause reads as what the person actually did, so a stand-down the
    *  agent performed is not reported as the user pressing a button. */
   it.each([
-    ['user_stop', 'stopped from the panel'],
-    ['agent_stand_down', 'stood down'],
-    ['thread_archived', 'stopped by archiving'],
-    ['thread_discarded', 'stopped by discarding the thread'],
-    ['thread_canceled', 'stopped by a thread Stop'],
+    ['user_stop', 'you stopped it'],
+    ['agent_stand_down', 'the agent stopped it'],
+    ['thread_archived', 'stopped when the thread was archived'],
+    ['thread_discarded', 'stopped when the thread was discarded'],
+    ['thread_canceled', 'stopped by Stop'],
   ] as const)('names %s as "%s"', (cause, note) => {
     expect(vnodeText(step(wait_({ state: 'canceled', cause })))).toContain(note);
   });
 
+  /** An unknown cause adds no note: the pill already says it stopped, and a
+   *  second "stopped" under it would say nothing new. */
+  it('adds no note for an unknown cause', () => {
+    const tree = step(wait_({ state: 'canceled', cause: 'unknown' }));
+    expect(findByClass(tree, 'event-row-meta')).toBeNull();
+  });
+
   /** A pre-2026-08-07 `EventWaitCanceled` carries neither a cause nor what it
    *  stopped. It still has to render, and it says the one thing it knows rather
-   *  than an empty "Set up an event wait: ". */
+   *  than trailing an empty subject. */
   it('renders a legacy stop that knows neither cause nor subscription', () => {
     const tree = step(wait_({
       state: 'canceled', reason: '', subscriptions: [], expires_at: '', cause: undefined,
@@ -343,7 +456,7 @@ describe('EventWaitRow', () => {
     expect(findByClass(matched, 'event-name-link')).toBeNull();
     expect(vnodeText(matched)).not.toContain('Go to event');
     // The matched type is still named.
-    expect(vnodeText(findByClass(matched, 'event-name'))).toBe('ChangeProposed');
+    expect(vnodeText(findByClass(matched, 'event-name'))).toBe('change proposed');
   });
 
   /** The park never splits the transcript, and neither does a resolution that
@@ -411,18 +524,18 @@ describe('eventDeliveryBody', () => {
 
   it('leads with the event name and keeps the payload folded', () => {
     const tree = delivery({ payloadJson: '{\n  "has_changes": true\n}' });
-    expect(vnodeText(tree)).toContain('CodingAgentIdled');
+    expect(vnodeText(tree)).toContain('Coding agent stopped working');
     // A <details> with no `open` prop: the payload is there, not shown.
     const disclosure = findByClass(tree, 'event-row-fold');
     expect(disclosure).not.toBeNull();
     expect(disclosure?.props.open).toBeUndefined();
-    expect(vnodeText(tree)).toContain('Payload');
+    expect(vnodeText(tree)).toContain('Details');
     expect(vnodeText(tree)).toContain('has_changes');
   });
 
   it('drops the disclosure when there is nothing to expand', () => {
     const tree = delivery({ eventType: 'ReleaseTagged' });
-    expect(vnodeText(tree)).toContain('ReleaseTagged');
+    expect(vnodeText(tree)).toContain('Release tagged');
     expect(findByClass(tree, 'event-row-fold')).toBeNull();
   });
 
@@ -435,8 +548,9 @@ describe('eventDeliveryBody', () => {
     const el = findByRole(tree, 'event-delivery');
     expect(String(el?.props.class)).toContain('event-row');
     expect(el?.props['data-kind']).toBe('delivery');
-    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('ChangeProposed');
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('delivered');
+    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('Change proposed');
+    expect(findByClass(tree, 'event-name')?.props['data-tooltip']).toBe('ChangeProposed');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('arrived');
   });
 
   /** The arming reason lives on the `EventWaitStarted`, which is routinely
@@ -444,7 +558,7 @@ describe('eventDeliveryBody', () => {
    *  fact its own event carries, so the card names the event and stops. */
   it('claims no arming reason it cannot see', () => {
     const tree = delivery({ eventType: 'ChangeProposed' });
-    expect(vnodeText(tree)).not.toContain('Set up an event wait');
+    expect(vnodeText(tree)).not.toContain('Waiting for');
     expect(vnodeText(tree)).not.toContain('waiting');
   });
 
@@ -463,20 +577,21 @@ describe('eventDeliveryBody', () => {
    *  quietly reintroduce it. See
    *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`. */
   it('says the event arrived, never that the thread woke', () => {
-    expect(vnodeText(delivery({ eventType: 'ChangeProposed' })))
-      .toContain('Event arrived: ChangeProposed');
+    expect(vnodeText(delivery({ eventType: 'ChangeProposed' }))).toBe('↓Change proposedarrived');
     const surfaces = [
       delivery(),
       linked(),
       ...(['waiting', 'matched', 'timed_out', 'canceled'] as const)
         .map((state) => step(wait_({ state, matched_event_type: 'ChangeProposed' }))),
     ];
-    for (const tree of surfaces) expect(vnodeText(tree)).not.toMatch(/\bwok|\bwake/i);
+    // No leading word boundary: `vnodeText` joins text nodes with no spaces,
+    // so "14:00wakes on" would slip past a `\bwake`.
+    for (const tree of surfaces) expect(vnodeText(tree)).not.toMatch(/wok|wake/i);
   });
 
   /** **This card owns the jump**, moved here from the arming card on
    *  2026-08-10: this one IS the arrival, so a link out of it goes to the thing
-   *  that arrived, where a link out of "Set up an event wait" pointed at
+   *  that arrived, where a link out of the arming card pointed at
    *  something that happened hours after the moment that card records.
    *
    *  **And the event's NAME is that jump.** It was a separate "Go to event"
@@ -488,7 +603,7 @@ describe('eventDeliveryBody', () => {
     const jump = findByRole(tree, 'event-delivery-jump');
 
     expect(jump?.type).toBe('button');
-    expect(vnodeText(jump)).toBe('ChangeProposed');
+    expect(vnodeText(jump)).toBe('Change proposed');
     expect(String(jump?.props.class)).toContain('event-name');
     // Nothing else on the card claims to be the way there.
     expect(vnodeText(tree)).not.toContain('Go to event');
@@ -507,7 +622,7 @@ describe('eventDeliveryBody', () => {
 
     // Still named: the NAME is the answer to "why did this thread start
     // talking again", whether or not it can be opened.
-    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('BackgroundBashCompleted');
+    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('Background job finished');
     expect(findByRole(tree, 'event-delivery-jump')).toBeNull();
     expect(findByClass(tree, 'event-name-link')).toBeNull();
     expect(vnodeText(tree)).not.toContain('Go to event');
@@ -515,13 +630,13 @@ describe('eventDeliveryBody', () => {
 
   /** A real `<button>`, not a `<code>` carrying an onClick, so it is reachable
    *  by keyboard and announces itself. Its accessible name says where it goes:
-   *  the visible text is a bare event type, which says only what the event is. */
+   *  the visible text says only what the event is. */
   it('is a keyboard-reachable control that says where it goes', () => {
     const jump = findByRole(linked({ eventType: 'ChangeProposed' }), 'event-delivery-jump');
 
     expect(jump?.type).toBe('button');
     expect(jump?.props.type).toBe('button');
-    expect(jump?.props['aria-label']).toBe('Go to the ChangeProposed event');
+    expect(jump?.props['aria-label']).toBe('ChangeProposed · go to the event');
   });
 
   /** Resolving the matched event's owning thread is a network round-trip in
@@ -541,7 +656,7 @@ describe('eventDeliveryBody', () => {
     const pending = findByRole(linked({ opening: true }), 'event-delivery-jump');
     expect(pending?.props.disabled).toBe(true);
     expect(pending?.props['aria-busy']).toBe('true');
-    expect(vnodeText(pending)).toBe('CodingAgentIdled');
+    expect(vnodeText(pending)).toBe('Coding agent stopped working');
   });
 
   /** A marker event carries `{}`, and a disclosure that opens onto an empty
@@ -620,12 +735,12 @@ describe('triggerFiredBody', () => {
 
   it('chips the matched event type whether or not it can be opened', () => {
     const plain = fired({ invocation: eventFire });
-    expect(vnodeText(findByClass(plain, 'event-name'))).toBe('ChangeApplied');
+    expect(vnodeText(findByClass(plain, 'event-name'))).toBe('change applied');
     expect(findByRole(plain, 'trigger-event-jump')).toBeNull();
     expect(findByClass(plain, 'event-name-link')).toBeNull();
 
     const linkable = firedLinked({ invocation: eventFire });
-    expect(vnodeText(findByClass(linkable, 'event-name'))).toBe('ChangeApplied');
+    expect(vnodeText(findByClass(linkable, 'event-name'))).toBe('change applied');
     expect(findByRole(linkable, 'trigger-event-jump')).not.toBeNull();
   });
 
@@ -636,15 +751,15 @@ describe('triggerFiredBody', () => {
     const jump = findByRole(tree, 'trigger-event-jump');
 
     expect(jump?.type).toBe('button');
-    expect(vnodeText(jump)).toBe('ChangeApplied');
-    expect(jump?.props['aria-label']).toBe('Go to the ChangeApplied event');
+    expect(vnodeText(jump)).toBe('change applied');
+    expect(jump?.props['aria-label']).toBe('ChangeApplied · go to the event');
     expect(vnodeText(tree)).not.toContain('Go to event');
   });
 
   it('reports the jump as pending and refuses a second tap', () => {
     const pending = findByRole(firedLinked({ invocation: eventFire }, true), 'trigger-event-jump');
     expect(pending?.props.disabled).toBe(true);
-    expect(vnodeText(pending)).toBe('ChangeApplied');
+    expect(vnodeText(pending)).toBe('change applied');
   });
 
   /** A legacy row carries neither a name nor a prompt. It still renders, saying
@@ -694,7 +809,7 @@ describe('the waiting indicator, on a subscription', () => {
     );
 
     const many = body([wait(), wait({ wait_id: 'w2' })]);
-    expect(findByRole(many, 'waiting-indicator')?.props['data-tooltip']).toBe('2 subscriptions');
+    expect(findByRole(many, 'waiting-indicator')?.props['data-tooltip']).toBe('2 events');
   });
 });
 

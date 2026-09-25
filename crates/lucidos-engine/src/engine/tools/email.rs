@@ -490,7 +490,17 @@ impl LucidosEngine {
                     }
                     dest.to_string()
                 } else {
-                    format!("imported/email/{}", safe_filename)
+                    // The default path never overwrites, the same rule
+                    // `import_file` follows, so two attachments named
+                    // `invoice.pdf` both survive. A named destination is the
+                    // caller's choice and is written as given.
+                    match self
+                        .artifact_manager
+                        .resolve_collision_free_path(&format!("imported/email/{}", safe_filename))
+                    {
+                        Ok(d) => d,
+                        Err(e) => return Ok(format!("Error: {}", e)),
+                    }
                 };
 
                 let commit_sha = match self
@@ -542,7 +552,7 @@ impl LucidosEngine {
 
                 Ok(result)
             }
-            _ => Ok(format!("Unknown email tool: {}", name)),
+            _ => Err(format!("Unknown email tool: {}", name).into()),
         }
     }
 }

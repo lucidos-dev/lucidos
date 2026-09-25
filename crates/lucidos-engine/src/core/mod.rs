@@ -37,6 +37,7 @@ pub mod shell;
 pub mod slug;
 pub mod store;
 pub mod system_knowhow;
+pub mod technical_literacy;
 pub mod user_dir;
 pub mod user_path;
 pub mod webhook_deliveries;
@@ -279,10 +280,9 @@ pub fn is_tmp_path(data_path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-pub use apps::{App, AppManager, AppManifest};
+pub use apps::{App, AppManager};
 pub use artifacts::{
-    is_vendored_path, list_searchable_data_files, ArtifactChange, ArtifactManager,
-    WriteAnnouncement,
+    is_vendored_path, list_searchable_data_files, ArtifactManager, WriteAnnouncement,
 };
 pub use credentials::{
     credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
@@ -473,22 +473,21 @@ pub use preferences::{
     DEFAULT_VERTEX_REGION, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
     PREF_CODING_AGENT_CLAUDE_PATH, PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
     PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_JUDGMENT_COMMAND_GUARD,
-    PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL, PREF_MAX_TOOL_CALLS,
-    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION,
-    PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
+    PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL, PREF_MODEL_COMMAND_JUDGE,
+    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
+    PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
     PREF_MODEL_VOICE_TRANSCRIBER, PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC,
     PREF_PROVIDER_ENABLED_LOCAL, PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
     PREF_PROVIDER_ENABLED_TYPESAFE, PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI,
-    PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
+    PREF_PROXY_TIMEOUT_SECS, PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
     PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_QUERY_CLASSIFICATION,
     PREF_REASONING_TITLE, PREF_RESPONSE_STYLE, PREF_RESPONSE_STYLES,
-    PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS, PREF_SELF_CURATED_CONTEXT_MODE,
-    PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS, PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS,
-    PREF_VOICE_TALKER_VOICE,
+    PREF_SELF_CURATED_CONTEXT_MODE, PREF_TECHNICAL_LITERACY, PREF_VERTEX_REGION,
+    PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE,
 };
 pub use store::{
-    ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
-    ThreadEventRow, ThreadSummary,
+    ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
+    ThreadSummary,
 };
 pub use webhook_deliveries::{Claim, DeliveryLedger};
 pub use webhooks::{Webhook, WebhookStore};
@@ -1359,7 +1358,7 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
 }
 
 /// Human-friendly description of a tool call, used for progress steps in both
-/// live streaming (engine.rs) and session replay (store.rs).
+/// live streaming (`engine/chat/process`) and session replay (`core/store`).
 ///
 /// The `Executing <name>...` fallback exists only for genuinely unknowable
 /// names: a third-party MCP tool with no `mcp__` prefix, or a historical event
@@ -1753,6 +1752,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "list_threads" => "Listing threads...".to_string(),
         "count_threads" => "Counting threads...".to_string(),
         "search_threads" => search_label("Searching past conversations", args),
+        "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
         "apply_change" => "Applying change...".to_string(),
         "apply_when_settled" => "Arming a standing apply...".to_string(),
@@ -1907,6 +1907,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "threads" => match args["action"].as_str() {
             Some("count") => "Counting threads...".to_string(),
             Some("search") => search_label("Searching past conversations", args),
+            Some("detach_child") => "Moving a child thread to top level...".to_string(),
             _ => "Listing threads...".to_string(),
         },
         "mcp" => match args["action"].as_str() {

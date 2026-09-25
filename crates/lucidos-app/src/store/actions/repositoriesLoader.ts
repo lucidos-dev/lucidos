@@ -31,6 +31,13 @@ export function loadRepositories(): Promise<void> {
   return repositoriesLoadInFlight;
 }
 
+/** Load the list with a request sent after this call. A load already in flight
+ *  may predate what the caller just saw, so wait it out and send another. */
+export async function refreshRepositories(): Promise<void> {
+  if (repositoriesLoadInFlight) await repositoriesLoadInFlight;
+  return loadRepositories();
+}
+
 async function loadRepositoriesInner(): Promise<void> {
   setLoadingIfFresh(repositories);
   try {

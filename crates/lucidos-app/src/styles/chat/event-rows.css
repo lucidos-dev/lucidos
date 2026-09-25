@@ -24,12 +24,12 @@
     --event-row-mark-width: 0.75rem;
     display: flex;
     flex-direction: column;
-    gap: 0.1875rem;
-    margin: 0.375rem 0;
-    padding: var(--space-sm) 0.625rem;
+    gap: 0.375rem;
+    margin: var(--space-sm) 0;
+    padding: 0.625rem var(--space-md);
     background: var(--bg-secondary);
-    border: 1px solid color-mix(in srgb, var(--border-color) 45%, transparent);
-    border-radius: 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
+    border-radius: 0.625rem;
     font-size: var(--font-size-md);
     /* Pinned rather than inherited, for the same reason `.inline-step` pins
        its own: these render inside `.response-content`, whose 1.6 is prose
@@ -47,11 +47,30 @@
 
 /* Mark, subject and state on ONE line. The state is pushed to the far edge and
    pinned to the first line (`align-self: flex-start`), so a subject that wraps
-   to three lines still reports its verdict where the reading starts. */
+   to three lines still reports its verdict where the reading starts.
+
+   On a pane too narrow for the subject's basis beside the time and the pill
+   (a phone), the aside wraps onto a line of its own instead. Without the wrap
+   the subject, which may break between any two letters, shrank to one letter
+   per line. */
 .event-row-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--space-sm);
+    gap: var(--space-xs) var(--space-sm);
+}
+
+/* The time and the state as one group, so they wrap together and neither is
+   left alone on a line. Pushed to the far edge on either line. It wraps
+   internally only when even a line of its own is too narrow for both. */
+.event-row-aside {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: flex-start;
+    align-self: flex-start;
+    gap: var(--space-xs) var(--space-sm);
+    margin-left: auto;
 }
 
 /* One mark column, shared by all four kinds, so a column of these is scannable.
@@ -72,15 +91,35 @@
        it wraps. Pin it to the top instead, and nudge it back onto the first
        line's optical centre. */
     align-self: flex-start;
-    margin-top: 0.0625rem;
+    margin-top: 0.03125rem;
+}
+
+/* The same muted stamp a message header carries. Pinned like the pill, with
+   the pill's vertical padding, so the two texts share one baseline. */
+.event-row-time {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    margin-top: 0.03125rem;
+    padding-block: 0.0625rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    white-space: nowrap;
 }
 
 /* The facts and the fold hang under the subject rather than under the mark, so
    the card has one text column instead of a ragged two. Clears exactly the mark
    plus the head's gap, both taken from their own declarations. */
 .event-row-meta,
-.event-row-fold {
+.event-row-fold,
+.event-row-actions {
     padding-left: calc(var(--event-row-mark-width) + var(--space-sm));
+}
+
+/* An open form request's Open, on the subject's column. */
+.event-row-actions {
+    display: flex;
+    gap: var(--space-sm);
+    margin-top: var(--space-xs);
 }
 
 /* WRAPS, and this is load-bearing rather than a preference. The subject is a
@@ -91,8 +130,9 @@
 .event-row-subject {
     /* The only child that gives: the mark and the state pill are fixed-size, so
        a long subject shrinks itself and wraps rather than pushing the pill off
-       the card's right edge. */
-    flex: 1 1 auto;
+       the card's right edge. The basis is the floor it shrinks to before the
+       head wraps the aside below it instead. */
+    flex: 1 1 12rem;
     min-width: 0;
     color: var(--text-primary);
     overflow-wrap: anywhere;
@@ -104,17 +144,25 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 0.375rem;
-    font-size: var(--font-size-sm);
+    gap: 0.3125rem var(--space-sm);
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
+/* A separator and the fact it introduces, kept on one line together. */
+.event-row-fact {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
 .event-row-sep {
-    color: var(--border-color);
+    color: color-mix(in srgb, var(--text-muted) 45%, transparent);
 }
 
 .event-row-glue {
     color: var(--text-muted);
+    font-size: var(--font-size-2xs);
 }
 
 /* The state as a WORD. The tint only groups it: every state stays legible as
@@ -125,10 +173,11 @@
 .event-row-state {
     display: inline-flex;
     align-items: center;
-    padding: 0.0625rem 0.375rem;
-    border-radius: 0.25rem;
+    padding: 0.0625rem var(--space-sm);
+    border-radius: 999rem;
     font-size: var(--font-size-xs);
-    font-weight: 600;
+    font-weight: 500;
+    letter-spacing: 0.02em;
     background: var(--bg-tertiary);
     color: var(--text-secondary);
 }
@@ -181,42 +230,49 @@
 
 /* The event-type atom. THE one way an event type is spelled in the transcript,
    used by an event wait's subscription list, a delivery's matched event and an
-   event-fired trigger alike. It was `.event-delivery-name` while the delivery
-   card was its only user. */
+   event-fired trigger alike. Neutral when inert, so the accent is left to mean
+   one thing: this chip does something when pressed. */
 .event-name {
+    display: inline-flex;
+    align-items: baseline;
+    /* A flex box drops the space text node between name and note, so the gap
+       stands in for it. */
+    gap: 0.4em;
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.25rem;
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
+    /* Transparent, so the link variant's outline costs no layout shift. */
+    border: 1px solid transparent;
+    border-radius: 0.3125rem;
+    background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+    color: var(--text-secondary);
     font-family: var(--font-mono);
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
 }
 
-/* The chip AS the jump. There is no separate "Go to event" link any more: it sat
-   beside a chip that already named the destination, so the card asked to be read
-   twice for one place to go.
+/* "filtered" / "6 filters": a qualifier, so it recedes behind the name in
+   whichever colour the chip wears. */
+.event-name-note {
+    color: color-mix(in srgb, currentColor 60%, transparent);
+}
 
-   It is a `<button>`, so it has to shed the UA button box and take the chip's
-   own back. Everything visual comes from `.event-name` above; this adds only
-   what makes it read as something you can press. The underline is the affordance
-   (a tinted background alone is what the inert chip already has, so colour
-   cannot carry it), and it is drawn in the accent at the same 40% strength
-   `.accent-link` uses, so a jump reads the same wherever it appears. */
+/* The chip AS the jump, or the door to a subscription's conditions. It is a
+   `<button>`, so it sheds the UA button box and takes the chip's own back.
+   The outline is the affordance, since colour alone fails a colourblind
+   reader. The accent tint and the hover back it up. */
 .event-name-link {
-    border: none;
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
     margin: 0;
     font-weight: inherit;
     line-height: inherit;
     cursor: pointer;
-    text-decoration: underline;
-    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
-    text-underline-offset: 0.125rem;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
 
 @media (hover: hover) {
     .event-name-link:hover {
-        background: color-mix(in srgb, var(--accent) 20%, transparent);
-        text-decoration-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 22%, transparent);
+        border-color: color-mix(in srgb, var(--accent) 60%, transparent);
     }
 }
 
@@ -228,7 +284,6 @@
 .event-name-link:disabled {
     cursor: default;
     opacity: 0.55;
-    text-decoration-color: transparent;
 }
 
 /* One disclosure, labelled by what it holds (Payload / Summary / Prompt), and

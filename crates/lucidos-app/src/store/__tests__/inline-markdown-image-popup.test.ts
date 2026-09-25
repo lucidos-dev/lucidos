@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
 import { inlineMarkdownImage, openImagePopupFromGroup, popupImage } from '../imagePopup';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -54,6 +54,20 @@ describe('inlineMarkdownImage', () => {
     const [img] = mount('markdown-content', renderMarkdown(`[![Diagram](${DIAGRAM})](https://example.test/page)`));
     expect(img).toBeTruthy();
     expect(inlineMarkdownImage(img)).toBeNull();
+  });
+
+  it('claims an image on a question card, in the question and in an option', () => {
+    // A card showed an agent's mockups, and tapping one did nothing.
+    document.body.innerHTML = `
+      <div class="question-body">
+        <div class="question-text">${renderMarkdownInlineWithLinks(`Which? ![All](${DIAGRAM})`)}</div>
+        <button class="question-option">
+          <span class="question-option-preview">${renderMarkdownInline(`![One](${CHART})`)}</span>
+        </button>
+      </div>`;
+    const imgs = [...document.querySelectorAll<HTMLImageElement>('img')];
+    expect(imgs).toHaveLength(2);
+    for (const img of imgs) expect(inlineMarkdownImage(img)).toBe(img);
   });
 
   it('ignores an image outside a markdown surface', () => {
@@ -91,6 +105,22 @@ describe('inline images join the popup nav group', () => {
 
     openImagePopupFromGroup(imgs[0].src, imgs[0]);
     expect(popupImage.value).toEqual({ images: [DIAGRAM, CHART], index: 0 });
+  });
+
+  it('pages from a reply image to the question card pictures below it', () => {
+    document.body.innerHTML = `
+      <div class="thread-content">
+        <div class="response-content markdown-content">${renderMarkdown(`![Diagram](${DIAGRAM})`)}</div>
+        <div class="question-body">
+          <button class="question-option">
+            <span class="question-option-preview">${renderMarkdownInline(`![Chart](${CHART})`)}</span>
+          </button>
+        </div>
+      </div>`;
+    const card = document.querySelector<HTMLImageElement>('.question-body img')!;
+
+    openImagePopupFromGroup(card.src, card);
+    expect(popupImage.value).toEqual({ images: [DIAGRAM, CHART], index: 1 });
   });
 
   it('mixes an inline image with the thumbnails already in the thread', () => {

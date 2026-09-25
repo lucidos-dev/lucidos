@@ -22,6 +22,7 @@
 import { API } from '../../api/client';
 import { getDeviceId } from './devices';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
+import { registrationToAwait } from '../../utils/deviceRegistration';
 import { isPageActive } from '../../utils/pageActive';
 import { startNativeWindowActiveTracking } from '../../utils/nativeWindow';
 
@@ -32,7 +33,9 @@ let lastReported: boolean | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let cleanupFns: Array<() => void> = [];
 
-function postDevicePresence(visible: boolean): void {
+async function postDevicePresence(visible: boolean): Promise<void> {
+  const registration = registrationToAwait(ENDPOINT, 'POST');
+  if (registration) await registration;
   fetch(ENDPOINT, {
     method: 'POST',
     // The header as well as the body id. This emits `DeviceVisible`, so it is
@@ -64,7 +67,7 @@ function syncDevicePresence(opts: { forceRefresh?: boolean } = {}): void {
   // foreground PWA (notifications.md §2 row 4 misfire). Callers that own
   // a known iOS-suspend signal (visibilitychange) pass forceRefresh.
   if (!opts.forceRefresh && lastReported === visible) return;
-  postDevicePresence(visible);
+  void postDevicePresence(visible);
   lastReported = visible;
   if (visible) {
     startHeartbeat();
@@ -77,7 +80,7 @@ function startHeartbeat(): void {
   if (heartbeatTimer !== null) return;
   heartbeatTimer = setInterval(() => {
     if (!isPageActive()) return;
-    postDevicePresence(true);
+    void postDevicePresence(true);
     lastReported = true;
   }, HEARTBEAT_INTERVAL_MS);
 }

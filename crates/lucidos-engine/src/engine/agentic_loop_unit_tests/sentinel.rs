@@ -17,11 +17,19 @@ mod sentinel_redaction_tests {
     fn install_sentinel_extracts_payload_and_redacts() {
         let raw = format!(
             "{PLUGIN_INSTALL_REQUEST_PREFIX}{}",
-            r#"{"install_id":"abc","files":["apps/x/index.html"]}"#
+            r#"{"install_id":"4b8f1a2e-0c1d-4e5f-9a6b-7c8d9e0f1a2b","files":["apps/x/index.html"]}"#
         );
         let m = match_sentinel(&raw).expect("install sentinel must match");
         match m.event {
-            ThreadEvent::PluginInstallRequested { payload } => {
+            ThreadEvent::PluginInstallRequested {
+                request_id,
+                payload,
+            } => {
+                assert_eq!(
+                    request_id.to_string(),
+                    "4b8f1a2e-0c1d-4e5f-9a6b-7c8d9e0f1a2b",
+                    "the request reuses the install id the confirm route takes"
+                );
                 assert!(payload.starts_with('{'), "payload must be the JSON object");
                 assert!(payload.contains("install_id"));
                 assert!(payload.contains("apps/x/index.html"));
@@ -54,11 +62,18 @@ mod sentinel_redaction_tests {
     fn uninstall_sentinel_extracts_payload_and_redacts() {
         let raw = format!(
             "{PLUGIN_UNINSTALL_REQUEST_PREFIX}{}",
-            r#"{"uninstall_id":"xyz","plugin_id":"foo","files":["apps/foo/index.html"]}"#
+            r#"{"uninstall_id":"5c9a2b3f-1d2e-4f60-8b7c-8d9eaf102b3c","plugin_id":"foo","files":["apps/foo/index.html"]}"#
         );
         let m = match_sentinel(&raw).expect("uninstall sentinel must match");
         match m.event {
-            ThreadEvent::PluginUninstallRequested { payload } => {
+            ThreadEvent::PluginUninstallRequested {
+                request_id,
+                payload,
+            } => {
+                assert_eq!(
+                    request_id.to_string(),
+                    "5c9a2b3f-1d2e-4f60-8b7c-8d9eaf102b3c"
+                );
                 assert!(payload.contains("uninstall_id"));
                 assert!(payload.contains("foo"));
             }
@@ -77,10 +92,10 @@ mod sentinel_redaction_tests {
         );
         let m = match_sentinel(&raw).expect("credential sentinel must match");
         match m.event {
-            ThreadEvent::CredentialPromptRequested { payload } => {
+            ThreadEvent::CredentialRequested { payload, .. } => {
                 assert!(payload.contains("openai"));
             }
-            other => panic!("expected CredentialPromptRequested, got {:?}", other),
+            other => panic!("expected CredentialRequested, got {:?}", other),
         }
         let redacted = m.redacted_text.expect("credential must redact for the LLM");
         assert!(!redacted.contains('{'));
@@ -129,7 +144,7 @@ mod sentinel_redaction_tests {
         let raw = "[EMAIL_CONFIRM]{\"to\":[\"a@b\"],\"subject\":\"hi\"}".to_string();
         let m = match_sentinel(&raw).expect("email confirm sentinel must match");
         match m.event {
-            ThreadEvent::EmailConfirmRequested { payload } => {
+            ThreadEvent::EmailConfirmRequested { payload, .. } => {
                 assert!(payload.contains("a@b"));
             }
             other => panic!("expected EmailConfirmRequested, got {:?}", other),
@@ -138,6 +153,76 @@ mod sentinel_redaction_tests {
             m.redacted_text.is_none(),
             "email-confirm must pass through unredacted (its tool description already explains the modal)"
         );
+    }
+
+    /// The engine knows it recorded a request, not that a screen drew it. A
+    /// lost stream frame once left the user seeing nothing, while the old
+    /// wording told the agent the form was up.
+    #[test]
+    fn the_agent_is_told_a_form_was_sent_never_that_it_was_shown() {
+        let payloads = [
+            format!(
+                "{CREDENTIAL_REQUEST_PREFIX}{}",
+                r#"{"service":"openai","prompt":"p","auth_type":"api_key"}"#
+            ),
+            format!(
+                "{PLUGIN_INSTALL_REQUEST_PREFIX}{}",
+                r#"{"install_id":"4b8f1a2e-0c1d-4e5f-9a6b-7c8d9e0f1a2b"}"#
+            ),
+            format!(
+                "{PLUGIN_UNINSTALL_REQUEST_PREFIX}{}",
+                r#"{"uninstall_id":"5c9a2b3f-1d2e-4f60-8b7c-8d9eaf102b3c"}"#
+            ),
+        ];
+        for raw in payloads {
+            let redacted = match_sentinel(&raw)
+                .and_then(|m| m.redacted_text)
+                .expect("every redacting sentinel matches");
+            let lower = redacted.to_lowercase();
+            assert!(!lower.contains("shown"), "{redacted}");
+            assert!(lower.contains("sent to the user"), "{redacted}");
+            assert!(lower.contains("stays open"), "{redacted}");
+        }
+    }
+
+    /// Two requests are two questions, so each gets its own id to be answered by.
+    #[test]
+    fn every_credential_request_gets_a_fresh_id() {
+        let raw = format!(
+            "{CREDENTIAL_REQUEST_PREFIX}{}",
+            r#"{"service":"openai","prompt":"p","auth_type":"api_key"}"#
+        );
+        let id = |m: super::super::SentinelMatch| match m.event {
+            ThreadEvent::CredentialRequested { request_id, .. } => request_id,
+            other => panic!("expected CredentialRequested, got {other:?}"),
+        };
+        assert_ne!(
+            id(match_sentinel(&raw).unwrap()),
+            id(match_sentinel(&raw).unwrap())
+        );
+    }
+
+    /// The main loop and the intent sub-loop share the handler. A second
+    /// caller that forgot the form request would bring back a form that
+    /// never opens, with its raw JSON handed to the model.
+    #[test]
+    fn both_agentic_loops_route_sentinels_through_the_form_request_emitter() {
+        for (name, source) in [
+            ("run.rs", include_str!("../agentic_loop/run.rs")),
+            (
+                "agentic_loop_special_tool.rs",
+                include_str!("../agentic_loop_special_tool.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("match_sentinel("),
+                "{name} must match sentinels"
+            );
+            assert!(
+                source.contains("form_requests::emit_request("),
+                "{name} must emit through the form-request emitter"
+            );
+        }
     }
 
     #[test]

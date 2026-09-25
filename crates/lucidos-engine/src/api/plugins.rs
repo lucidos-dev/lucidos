@@ -28,6 +28,7 @@ use crate::core::plugin_marketplaces::{
     PluginMarketplace,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
+use crate::engine::thread_events::FormRequestOutcome;
 use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
 use crate::engine::tools::plugins::{
     cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
@@ -317,13 +318,9 @@ pub(super) async fn catalog(
 /// Returns as soon as the scan is queued. A scan already running absorbs the
 /// request through the same single-flight guard the scheduler uses, so leaning
 /// on the button cannot stack clone passes.
-pub(super) async fn rescan_catalog(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
-    let _actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+pub(super) async fn rescan_catalog(State(state): State<AppState>) -> Json<JsonValue> {
     spawn_rescan(&state);
-    Ok(Json(serde_json::json!({ "queued": true })))
+    Json(serde_json::json!({ "queued": true }))
 }
 
 /// Kick off a marketplace scan without waiting for it.
@@ -631,6 +628,35 @@ fn pending_status(err_msg: &str) -> StatusCode {
     }
 }
 
+/// Close the *form request* a chat turn opened for the staged plugin `id`.
+///
+/// A missing entry means the staging is gone (the TTL, a restart, another
+/// device got there first), so the request can no longer be answered. Any
+/// other failure leaves it open, so the user can press the button again.
+async fn settle_plugin_request<T>(
+    state: &AppState,
+    id: &str,
+    result: &Result<T, String>,
+    done: FormRequestOutcome,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    let outcome = match result {
+        Ok(_) => done,
+        Err(e) if pending_status(e) == StatusCode::NOT_FOUND => FormRequestOutcome::Expired,
+        Err(_) => return,
+    };
+    // A staged id is always a uuid; one that is not names no form request.
+    let Ok(request_id) = id.parse() else { return };
+    crate::engine::form_requests::resolve_or_log(
+        &state.pool,
+        &state.engine.event_bus,
+        request_id,
+        outcome,
+        actor,
+    )
+    .await;
+}
+
 /// `POST /api/v1/plugins/install/:install_id/confirm` — user accepted the
 /// staged install in the install panel. Pops the entry, writes files into
 /// `data/`, emits `PluginInstalled` (stamped with the device that clicked
@@ -647,8 +673,22 @@ pub(super) async fn confirm_install(
 ) -> Result<Json<ConfirmInstallResponse>, (StatusCode, Json<JsonValue>)> {
     prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match confirm_pending_install(&state.engine, &install_id, query.keep_local_changes, actor).await
-    {
+    let result = confirm_pending_install(
+        &state.engine,
+        &install_id,
+        query.keep_local_changes,
+        actor.clone(),
+    )
+    .await;
+    settle_plugin_request(
+        &state,
+        &install_id,
+        &result,
+        FormRequestOutcome::Completed,
+        actor,
+    )
+    .await;
+    match result {
         Ok(outcome) => Ok(Json(ConfirmInstallResponse {
             summary: outcome.summary,
             installed_files: outcome.installed_files,
@@ -672,7 +712,16 @@ pub(super) async fn cancel_install(
 ) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
     prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match cancel_pending_install(&state.engine, &install_id, actor).await {
+    let result = cancel_pending_install(&state.engine, &install_id, actor.clone()).await;
+    settle_plugin_request(
+        &state,
+        &install_id,
+        &result,
+        FormRequestOutcome::Canceled,
+        actor,
+    )
+    .await;
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"canceled": true}))),
         Err(e) => Err(err(pending_status(&e), &e)),
     }
@@ -696,7 +745,16 @@ pub(super) async fn confirm_uninstall(
     Path(uninstall_id): Path<String>,
 ) -> Result<Json<ConfirmUninstallResponse>, (StatusCode, Json<JsonValue>)> {
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match confirm_pending_uninstall(&state.engine, &uninstall_id, actor).await {
+    let result = confirm_pending_uninstall(&state.engine, &uninstall_id, actor.clone()).await;
+    settle_plugin_request(
+        &state,
+        &uninstall_id,
+        &result,
+        FormRequestOutcome::Completed,
+        actor,
+    )
+    .await;
+    match result {
         Ok(outcome) => Ok(Json(ConfirmUninstallResponse {
             summary: outcome.summary,
             files_deleted: outcome.files_deleted,
@@ -715,7 +773,16 @@ pub(super) async fn cancel_uninstall(
     Path(uninstall_id): Path<String>,
 ) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match cancel_pending_uninstall(&state.engine, &uninstall_id, actor).await {
+    let result = cancel_pending_uninstall(&state.engine, &uninstall_id, actor.clone()).await;
+    settle_plugin_request(
+        &state,
+        &uninstall_id,
+        &result,
+        FormRequestOutcome::Canceled,
+        actor,
+    )
+    .await;
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"canceled": true}))),
         Err(e) => Err(err(pending_status(&e), &e)),
     }

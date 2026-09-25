@@ -197,15 +197,30 @@ impl LucidosEngine {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        // Resolve persistence targets up-front so the request loop can pre-check
-        // Content-Length against the bulk threshold without buffering a huge body.
+        // Resolve and validate persistence targets before the request goes out.
+        // A POST sent first and refused on the write side invites a retry, and
+        // the server then acts on it twice. Resolving early also lets the
+        // request loop pre-check Content-Length against the bulk threshold.
         let output_path = args["output_path"].as_str();
         let temp_path = args["temp_path"].as_str();
+        if temp_path.is_some_and(crate::api::is_path_traversal) {
+            return Ok("Error: temp_path must be relative with no '..' components".to_string());
+        }
+        // `(data_path, artifact_path)`: the normalized data-relative path, and
+        // the same path relative to `artifacts/`, which the store writes under.
         let resolved_output = if let Some(raw_path) = output_path {
-            match self.resolve_data_path(raw_path) {
-                Ok((data_path, _)) => Some(data_path),
+            let data_path = match self.resolve_data_path(raw_path) {
+                Ok((data_path, _)) => data_path,
                 Err(e) => return Ok(format!("Error: {}", e)),
-            }
+            };
+            let Some(artifact_path) = data_path.strip_prefix("artifacts/").map(str::to_string)
+            else {
+                return Ok(format!(
+                    "Error: output_path must be under artifacts/, got: {}",
+                    data_path
+                ));
+            };
+            Some((data_path, artifact_path))
         } else {
             None
         };
@@ -253,7 +268,7 @@ impl LucidosEngine {
                     // honest server tells us the size and the LLM asked us to
                     // persist it under data/artifacts/.
                     if (200..300).contains(&status) {
-                        if let (Some(data_path), Some(len)) =
+                        if let (Some((data_path, _)), Some(len)) =
                             (resolved_output.as_ref(), response.content_length())
                         {
                             if len > MAX_BULK_BYTES {
@@ -346,11 +361,6 @@ impl LucidosEngine {
         // Handle temp_path - save to .lucidos/tmp/ (not git-tracked)
         let saved_temp = if let Some(path) = temp_path {
             if (200..300).contains(&status) {
-                if crate::api::is_path_traversal(path) {
-                    return Ok(
-                        "Error: temp_path must be relative with no '..' components".to_string()
-                    );
-                }
                 let tmp_dir = self.workspace_path.join(crate::core::TMP_DIR);
                 if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
                     return Ok(format!(
@@ -389,17 +399,8 @@ impl LucidosEngine {
         // Handle output_path - save to artifacts/ (git-tracked). Pre-checked
         // Content-Length above; this re-checks actual body size as a safety net
         // for servers that lie or omit the header.
-        if let Some(ref data_path) = resolved_output {
+        if let Some((data_path, artifact_path)) = &resolved_output {
             if (200..300).contains(&status) {
-                let artifact_path = match data_path.strip_prefix("artifacts/") {
-                    Some(p) => p,
-                    None => {
-                        return Ok(format!(
-                            "Error: output_path must be under artifacts/, got: {}",
-                            data_path
-                        ))
-                    }
-                };
                 let downloaded = body_bytes.len() as u64;
                 if downloaded > MAX_BULK_BYTES {
                     return Ok(bulk_threshold_error(
@@ -440,7 +441,7 @@ impl LucidosEngine {
         if (200..300).contains(&status) {
             if let Some(path) = saved_temp {
                 Ok(format!("[SAVED] {} ({} bytes)", path, body_bytes.len()))
-            } else if let Some(ref data_path) = resolved_output {
+            } else if let Some((data_path, _)) = &resolved_output {
                 Ok(format!(
                     "[SAVED] {} ({} bytes)",
                     data_path,

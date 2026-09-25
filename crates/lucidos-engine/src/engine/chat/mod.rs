@@ -1,5 +1,7 @@
+pub(crate) mod child_detach;
 pub(crate) mod child_follow_up;
 mod events;
+pub(crate) mod follow_up_order;
 mod held_messages;
 mod images;
 pub(in crate::engine) mod process;
@@ -12,6 +14,7 @@ pub(crate) mod rerun;
 mod spawn;
 mod title;
 
+pub(crate) use events::images_to_hashes;
 pub(crate) use events::make_message_received;
 pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;
 pub(crate) use held_messages::answer_releases_held_messages;

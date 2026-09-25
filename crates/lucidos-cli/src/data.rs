@@ -38,9 +38,45 @@ pub(crate) fn resolve_data_path(ws: &Workspace, relative: &str) -> Result<PathBu
 /// the frontend's path linkifier rewrites it into a file-preview link. An
 /// invented `artifact:` / `file:` scheme dead-ends — no handler claims it — so
 /// the link MUST stay scheme-less. Label defaults to the file's basename.
+///
+/// An image gets markdown IMAGE syntax, which renders inline. Agents paste this
+/// line verbatim, and a plain link to a picture only opens a preview on tap.
+/// Markdown ends a bare destination at a space, so an image path holding one
+/// is angle-bracketed.
 fn chat_link(normalized: &str) -> String {
     let label = normalized.rsplit('/').next().unwrap_or(normalized);
-    format!("[{}]({})", label, normalized)
+    if !is_image(label) {
+        return format!("[{}]({})", label, normalized);
+    }
+    if normalized.contains(char::is_whitespace) {
+        format!("![{}](<{}>)", label, normalized)
+    } else {
+        format!("![{}]({})", label, normalized)
+    }
+}
+
+/// Printed after saving a picture. An agent saved one, told the user "I've
+/// drawn out the options", and pasted no image line, so the user saw nothing.
+/// It names no order because stdout and stderr may interleave either way.
+///
+/// The card comes first because a reply written just before a tool call
+/// reaches the user only as a short summary, which drops the picture.
+/// `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md` has the
+/// transcripts.
+const IMAGE_NOT_SHOWN_YET: &str = "The user cannot see this picture yet. If a question card \
+     comes next, put the `![...]` line ON the card: in its question, or in an option's \
+     `preview`. For a choice, give each option its own picture of only that option. \
+     Your words before any tool call reach the user only as a short summary, which drops \
+     the picture. Otherwise paste the line in the reply that ends your turn.";
+
+/// Mirrors `IMAGE_EXTENSIONS` in the frontend's `utils/fileIcons.tsx`.
+fn is_image(file_name: &str) -> bool {
+    const IMAGE_EXTENSIONS: &[&str] = &["gif", "jpeg", "jpg", "png", "svg", "webp"];
+    file_name.rsplit_once('.').is_some_and(|(_, ext)| {
+        IMAGE_EXTENSIONS
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+    })
 }
 
 fn normalize(path: &str) -> String {
@@ -141,14 +177,20 @@ pub(crate) fn cmd_write(
     send_expect_success("PUT", &url, req)?;
 
     // Echo the resolved absolute path on stderr so callers see exactly what was
-    // written, keeping stdout clean for the clickable link below.
-    writeln!(io::stderr(), "{}", abs.display())
+    // written, keeping stdout clean for the clickable link below. The path
+    // stays stderr's LAST line, so a picture's reminder goes before it.
+    let mut stderr = io::stderr();
+    if is_image(&normalized) {
+        writeln!(stderr, "{IMAGE_NOT_SHOWN_YET}")
+            .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
+    }
+    writeln!(stderr, "{}", abs.display())
         .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
 
-    // Print a ready-to-paste clickable Lucidos chat link on stdout, mirroring
-    // `lucidos spawn-thread`. This gives the agent a canonical, working link to
-    // hand the user instead of inventing an `artifact:`/`file:` scheme that the
-    // frontend has no handler for and that dead-ends on click.
+    // Print a ready-to-paste Lucidos chat link (an inline image for a picture)
+    // on stdout, mirroring `lucidos spawn-thread`. This gives the agent a
+    // canonical, working link to hand the user instead of inventing an
+    // `artifact:`/`file:` scheme that the frontend has no handler for.
     println!("{}", chat_link(&normalized));
     Ok(())
 }
@@ -277,6 +319,58 @@ mod tests {
         assert_eq!(
             chat_link("artifacts/report.html"),
             "[report.html](artifacts/report.html)"
+        );
+    }
+
+    #[test]
+    fn chat_link_for_an_image_is_markdown_image_syntax() {
+        // An agent pastes this line verbatim. A plain link to a picture only
+        // opens a preview on tap, so the user never sees the picture it meant
+        // to show.
+        assert_eq!(
+            chat_link("artifacts/design/options.png"),
+            "![options.png](artifacts/design/options.png)"
+        );
+    }
+
+    #[test]
+    fn chat_link_matches_image_extensions_case_insensitively() {
+        for path in ["artifacts/a.JPG", "artifacts/a.jpeg", "artifacts/a.webp"] {
+            assert!(chat_link(path).starts_with("!["), "{path}");
+        }
+    }
+
+    #[test]
+    fn chat_link_for_an_image_with_a_space_brackets_the_target() {
+        // Markdown ends a bare destination at the first space, so the image
+        // would render as literal text. An angle-bracketed one may hold spaces.
+        assert_eq!(
+            chat_link("artifacts/quarterly chart.png"),
+            "![quarterly chart.png](<artifacts/quarterly chart.png>)"
+        );
+    }
+
+    #[test]
+    fn the_picture_reminder_sends_a_picture_before_a_card_onto_the_card() {
+        // A reply written just before a card arrives as a short summary. So
+        // "the same message" as the card is where a picture gets lost.
+        let card = IMAGE_NOT_SHOWN_YET
+            .find("ON the card")
+            .expect("names the card");
+        let reply = IMAGE_NOT_SHOWN_YET
+            .find("reply that ends your turn")
+            .expect("names the turn-ending reply");
+        assert!(card < reply, "the card comes first: {IMAGE_NOT_SHOWN_YET}");
+        assert!(IMAGE_NOT_SHOWN_YET.contains("`preview`"));
+        assert!(IMAGE_NOT_SHOWN_YET.contains("short summary"));
+        assert!(!IMAGE_NOT_SHOWN_YET.contains("same message"));
+    }
+
+    #[test]
+    fn chat_link_for_a_non_image_with_an_image_like_name_stays_a_link() {
+        assert_eq!(
+            chat_link("artifacts/png-notes.md"),
+            "[png-notes.md](artifacts/png-notes.md)"
         );
     }
 }

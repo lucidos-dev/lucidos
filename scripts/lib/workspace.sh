@@ -2433,10 +2433,13 @@ PY
 # answers an unrouted slug with a 404 or a 503 rather than by hanging up. So
 # without it this loop printed "ready!" on its first tick whether or not the
 # workspace could be reached, which is the whole thing it is here to find out.
+#
+# `gateway_curl`, because the gateway gates every workspace path, health
+# included. A bare curl gets 401 on a healthy engine and waits out all 90 ticks.
 wait_for_workspace_health() {
     echo -n "Waiting for workspace '$GATEWAY_WS_ID' engine"
     for _ in $(seq 1 90); do
-        if curl -fsk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
+        if gateway_curl -fsk "$PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"; return 0
         fi
         echo -n "."; sleep 1

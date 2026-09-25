@@ -41,10 +41,10 @@ What each piece does — include only what you need:
 | Tag | Provides | Skip if |
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
-| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
 
@@ -152,6 +152,28 @@ Three rules hold:
 
 `sdk.js` reads the switch from `sdk-prefs.js` when you include it, otherwise
 it starts on. One preference read at load then corrects it.
+
+**`sdk.js` also refuses key codes typed as text.** In the desktop app, an arrow
+key with nowhere to move the caret would otherwise type a square into your
+field. The SDK cancels any insertion made entirely of control codes (tab and
+line breaks excepted) or macOS function-key codes. Typing, pasting and emoji
+are untouched, and you write nothing.
+
+### Reduced motion
+
+**Key your animations on `data-motion`, never on the media query.** Every app
+frame gets `data-motion="reduce"` or `data-motion="full"` on `<html>`.
+`sdk-prefs.js` sets it before first paint, and `sdk.js` sets it again from the
+device's `motion` preference (§ lucidos.preferences). It already folds in the OS
+switch: under `system` it follows the OS, and `reduce` or `full` override it.
+
+```css
+:root[data-motion="reduce"] .card { animation: none; transition: none; }
+```
+
+`@media (prefers-reduced-motion: reduce)` reads only the OS, so it ignores a
+user who picked Reduce or Full in Lucidos. A change reaches a running app
+through `watchPreferences()`.
 
 ### Theme variables
 
@@ -307,6 +329,7 @@ file). The class names are the contract:
 | `.image-scroll-wrapper` | Wrap an `<img>` inside `.markdown-content` in this. Unlike a table an image cannot reflow, so this one is the normal path rather than a safety net: the wrapper stays within your container width and pans an oversized image sideways inside itself, at every viewport width, instead of widening the body. The image keeps its natural width (no `max-width` cap, which would shrink a wide screenshot to a thumbnail) and is capped at `24rem` tall with the aspect ratio preserved. An image smaller than the container renders unchanged, with no scrollbar. A bare `<img>` with no wrapper around it is untouched by these rules. |
 | `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
+| `<input type="checkbox">` (element, no class) | A plain checkbox already renders as the Lucidos checkbox: a soft accent-tinted box with a tick that draws on, sized in `em` to its row's text, identical in every browser. The `indeterminate` DOM property shows a dash. Put it in a `<label>` with its text and set no width or height on it. |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
 | `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. You write the attribute and nothing else: `sdk.js` builds, positions and paints the box. Full contract in § Tooltips, under lucidos.ui. |
 
@@ -596,7 +619,9 @@ interface ProxyClient {
 
 `fetch` returns the raw `Response` so the caller picks how to read the body (`.json()`, `.text()`, `.blob()`, …). The auth header is added server-side; do not set `Authorization` from the iframe.
 
-**A response is buffered when the call travels the bridge, so it does not stream.** From an app frame the host makes the upstream call and hands the whole body back at the end. A token stream therefore arrives complete rather than arriving as it is generated, and a stream that never ends fails at the 120s deadline. Render the finished answer from a frame, or open the app in its own tab, where the response streams as usual.
+**A response is buffered, so it does not stream.** The engine reads the whole upstream body before it answers, from a frame and from a standalone tab alike. A token stream therefore arrives complete rather than as it is generated. Render the finished answer.
+
+**The engine waits 30 seconds on the upstream by default, then answers 504.** A streamed reply counts in full. Raise the wait for every route with the `proxy_timeout_secs` preference, or for one entry with `timeout_secs` in `apis.json`; both accept 1 to 600. See `system-knowhow/lucidos-cli.md` § Timeouts. One proxied call never runs past 600 seconds in total, and the bridge waits 660, so it never gives up before the engine does.
 
 ### Configure the backend (one-time)
 
@@ -1135,6 +1160,7 @@ type Preferences = Record<string, string>;
 | `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures, on code and `pre` blocks only, via `--font-features-text` / `--font-features-code`) |
 | `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
 | `autocorrect` | `true`, `false` | Whether text fields autocorrect on this device. Unset, on everywhere. `sdk.js` applies it to your fields (§ Text fields and autocorrect, under Setup) |
+| `motion` | `system`, `reduce`, `full` | Whether this device reduces motion. `system` (the default) follows the OS. Read it as `data-motion` on `<html>` (§ Reduced motion, under Setup) |
 
 ## lucidos.notifications — Notification Center
 
@@ -1381,6 +1407,10 @@ interface ThreadSummary {
    *  descendants needing *user attention* (WaitingForUserAnswer, or pending
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
+  /** Pending changes held by this thread's sub-threads, at any depth, not
+   *  counting its own. Present on `lucidos.threads.list` rows only; absent on
+   *  every other read, so an absent field never means zero. */
+  pending_sub_thread_change_count?: number;
   /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'waiting_for_user_answer'.
    *  The same values the `status` filter above accepts, so you can filter on
    *  what you read. `running` is the workspace working; `waiting_for_user_answer`

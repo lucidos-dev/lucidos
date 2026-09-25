@@ -258,7 +258,7 @@ async fn the_settled_completion_resolves_the_wait_armed_on_that_task() {
             event_type: "BackgroundBashCompleted".into(),
             condition: Some(serde_json::json!({ "task_id": "task-watched" })),
         }],
-        reason: "Watching background work started in this thread".into(),
+        reason: "the background command \"sleep 300\" to finish".into(),
         armed_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
         watermark,
@@ -320,7 +320,7 @@ async fn a_settled_completion_does_not_resolve_another_tasks_wait() {
             event_type: "BackgroundBashCompleted".into(),
             condition: Some(serde_json::json!({ "task_id": "the-other-one" })),
         }],
-        reason: "Watching background work started in this thread".into(),
+        reason: "the background command \"sleep 300\" to finish".into(),
         armed_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
         watermark,
@@ -360,7 +360,14 @@ async fn a_settled_completion_does_not_resolve_another_tasks_wait() {
 async fn a_task_this_process_is_running_is_not_settleable() {
     let reg = crate::engine::tools::bash_background::BackgroundBashRegistry::new();
     let (live, _rx) = reg
-        .spawn("sleep 300", 600, std::path::Path::new("/tmp"), &[], None)
+        .spawn(
+            "sleep 300",
+            600,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+            None,
+        )
         .await
         .expect("spawn");
 
@@ -392,7 +399,14 @@ async fn a_task_this_process_is_running_is_not_settleable() {
 async fn a_finished_task_in_the_registry_is_still_settleable() {
     let reg = crate::engine::tools::bash_background::BackgroundBashRegistry::new();
     let (done, _rx) = reg
-        .spawn("echo done", 5, std::path::Path::new("/tmp"), &[], None)
+        .spawn(
+            "echo done",
+            5,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+            None,
+        )
         .await
         .expect("spawn");
     assert!(

@@ -16,17 +16,18 @@ import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { loadedOr } from '../../store/types';
-import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
+import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { useSkeleton, SkText } from '../shared/Skeleton';
 import { resolveLinkedApp } from './resolveLinkedApp';
+import { notificationPosition } from './notificationPosition';
 import { navigateTapLabel } from './notificationTapLabel';
 import { notificationActions, notificationTriggerId } from './notificationActions';
 
 /** The notification detail rendered directly in the content pane (replacing the
  *  former modal). The content-pane header owns the title and the back/forward
  *  nav; this body renders the date, the markdown body, the action buttons, and
- *  the floating prev/next chevrons that walk the inbox list (side-centered,
- *  styled like the thread-view scroll chevrons).
+ *  the newer/older chevrons that walk the inbox list (styled like the
+ *  thread-view scroll chevrons).
  *
  *  Source-level contract: this component must not write store signals directly.
  *  Every mutation routes through actions/notifications.ts (prev/next),
@@ -43,15 +44,11 @@ export function NotificationDetailInline() {
   if (sk) return <NotificationDetailSkeleton />;
   if (!detail) return null;
 
-  const items = loadedOr(notifications.value, []);
-  const currentIndex = items.findIndex((n) => n.id === detail.id);
-  const hasPrev = currentIndex > 0;
-  // The "next" (older) chevron stays visible at the last loaded item when the
-  // server has more pages — the tap loads the next page before stepping, so
-  // navigation walks the whole inbox, not just the first loaded page.
-  const hasNext =
-    currentIndex >= 0 &&
-    (currentIndex < items.length - 1 || notificationsHasMore.value);
+  const position = notificationPosition(
+    loadedOr(notifications.value, []),
+    detail.id,
+    notificationsHasMore.value,
+  );
 
   const linked = resolveLinkedApp(detail.app_id, appsList.value);
   const apps = loadedOr(appsList.value, []);
@@ -135,30 +132,28 @@ export function NotificationDetailInline() {
 
   return (
     <div class="notification-detail">
-      {/* Nav row above the title: prev/next chevrons bracketing the date. Both
-       *  chevrons are always rendered, sitting `disabled` (greyed, no pointer
-       *  events) at the first / last notification rather than vanishing — the
-       *  prev/next affordance stays visible even when not currently available,
-       *  and the fixed slot keeps the date centered between them. */}
+      {/* Up/down, never left/right: the header's left/right chevrons are
+       *  history, and the inbox list runs top to bottom, newest first. Both
+       *  buttons stay rendered, `disabled` at either end of the list. */}
       <div class="notification-detail-header">
-        <button
-          class="notification-detail-nav prev"
-          onClick={() => void navigateAdjacentNotification(detail.id, -1)}
-          disabled={!hasPrev}
-          aria-label="Previous notification"
-          data-tooltip="Previous notification"
-        >
-          <ChevronLeftIcon />
-        </button>
         <span class="notification-detail-date">{dateStr}</span>
         <button
-          class="notification-detail-nav next"
-          onClick={() => void navigateAdjacentNotification(detail.id, 1)}
-          disabled={!hasNext}
-          aria-label="Next notification"
-          data-tooltip="Next notification"
+          class="notification-detail-nav newer"
+          onClick={() => void navigateAdjacentNotification(detail.id, -1)}
+          disabled={!position.hasNewer}
+          aria-label="Newer notification"
+          data-tooltip="Newer notification"
         >
-          <ChevronRightIcon />
+          <ChevronUpIcon />
+        </button>
+        <button
+          class="notification-detail-nav older"
+          onClick={() => void navigateAdjacentNotification(detail.id, 1)}
+          disabled={!position.hasOlder}
+          aria-label="Older notification"
+          data-tooltip="Older notification"
+        >
+          <ChevronDownIcon />
         </button>
       </div>
       <h2 class="notification-detail-title">{detail.title || 'Notification'}</h2>

@@ -477,10 +477,6 @@ function workspaceDataImageSrc(src: string): string | null {
  *  which `src` attributes exist at all, deleting `javascript:` and `data:`
  *  ones outright. So only an attribute that already passed that gate is ever
  *  rewritten, and the sanitizer is never handed a value to re-judge. */
-function rewriteImageSources(html: string): string {
-  return inDom(html, ['<img'], rewriteImageSourcesIn);
-}
-
 function rewriteImageSourcesIn(body: HTMLElement): void {
   for (const img of Array.from(body.querySelectorAll('img'))) {
     const src = img.getAttribute('src');
@@ -490,16 +486,14 @@ function rewriteImageSourcesIn(body: HTMLElement): void {
   }
 }
 
-/** Point every image at its real source AND wrap it, in one parse.
- *
- *  The block path wants both, so they share a visit. `renderMarkdownInline`
- *  wants only the first: the wrapper is a block box, invalid in the phrasing
- *  content those helpers exist to emit. */
+/** Point every image at its real source AND wrap it, in one parse. */
 function prepareImages(html: string): string {
-  return inDom(html, ['<img'], (body) => {
-    rewriteImageSourcesIn(body);
-    wrapImagesIn(body);
-  });
+  return inDom(html, ['<img'], prepareImagesIn);
+}
+
+function prepareImagesIn(body: HTMLElement): void {
+  rewriteImageSourcesIn(body);
+  wrapImagesIn(body);
 }
 
 /** Wrap every image in the scroll container that lets an oversized screenshot
@@ -585,17 +579,29 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
  *  `breaks: true` is passed locally so a future edit to markedConfig.ts's
  *  global options cannot silently turn newlines back into spaces.
  *
- *  `parseInline` DOES emit `<img>`, so a workspace-relative source is
- *  rewritten here too. The `.image-scroll-wrapper` is NOT applied: it is a
- *  block box, invalid inside the phrasing content these helpers exist to
- *  emit. */
+ *  `parseInline` DOES emit `<img>`, so an image gets the same source rewrite
+ *  and scroll wrapper as a reply image. The wrapper is a `<span>`, so the
+ *  output stays phrasing content.
+ *
+ *  Raw HTML never meets the link renderer, so interactive elements it carries
+ *  are unwrapped to their contents here. */
 export function renderMarkdownInline(md: string): string {
-  return rewriteImageSources(sanitizeHtmlFragments(marked.parseInline(md, {
+  const html = sanitizeHtmlFragments(marked.parseInline(md, {
     async: false,
     breaks: true,
     renderer: inlineLinkStripRenderer,
-  }) as string));
+  }) as string);
+  return inDom(html, ['<'], (body) => {
+    for (const el of Array.from(body.querySelectorAll(INTERACTIVE_ELEMENTS))) {
+      el.replaceWith(...Array.from(el.childNodes));
+    }
+    prepareImagesIn(body);
+  });
 }
+
+/** What the HTML spec calls interactive content, less what the sanitizer
+ *  already drops. Any one of them inside an option `<button>` takes its tap. */
+const INTERACTIVE_ELEMENTS = 'a, button, input, select, textarea, label, details, audio, video';
 
 /** Like renderMarkdownInline, but KEEPS http(s) links as clickable
  *  `<a target="_blank" rel="noopener">`. Used for the AskUserQuestion question
@@ -604,7 +610,7 @@ export function renderMarkdownInline(md: string): string {
  *  Safe ONLY in non-interactive containers: an `<a>` inside a `<button>` is
  *  invalid, so option buttons must keep `renderMarkdownInline`. */
 export function renderMarkdownInlineWithLinks(md: string): string {
-  return rewriteImageSources(sanitizeHtmlFragments(marked.parseInline(md, {
+  return prepareImages(sanitizeHtmlFragments(marked.parseInline(md, {
     async: false,
     breaks: true,
     gfm: true,

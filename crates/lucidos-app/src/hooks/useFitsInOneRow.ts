@@ -34,10 +34,3 @@ export function contentWidthOf(el: HTMLElement): number {
   const padding = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
   return Math.max(0, el.clientWidth - padding);
 }
-
-export interface FitsInOneRowOptions {
-  /** Gap between adjacent items inside a gapped cluster, in rem. */
-  gapRem?: number;
-  /** Selector for the container's gapped cluster(s). See `countGappedPairs`. */
-  gappedCluster?: string;
-}

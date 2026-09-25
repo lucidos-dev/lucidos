@@ -3,7 +3,7 @@ import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { isFormRequest, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -382,8 +382,19 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
 
   if (canAppendTrailing) {
     const exchanges = [...base];
+    // A message still on its way queues as the fold will once it lands. It
+    // must not flash up as the running turn first.
+    let turn = cache.fold.current;
+    let othersWait = cache.fold.unreadMessages.length > 0;
     for (const { seq, event } of synthetic) {
-      exchanges.push({ userEvent: event, userSeq: seq, steps: [] });
+      const pending: Exchange = { userEvent: event, userSeq: seq, steps: [] };
+      if (turn && waitsForTheAgent(cache.fold, event, turn, othersWait)) {
+        pending.awaitingRead = true;
+        othersWait = true;
+      } else {
+        turn = pending;
+      }
+      exchanges.push(pending);
     }
     return filterRemovedQueuedExchanges(exchanges, thread.events);
   }
@@ -445,12 +456,12 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'CodingAgentPermissionRequest',
   'CommandPermissionRequested',
   'McpPermissionRequested',
-  'CredentialRequested',
   'McpConsentRequested',
   'ChildThreadCompleted',
-  // A user Stop paused a child (ADR 0252). A note that holds no turn: see
-  // `isTurnlessBoundary`.
+  // A user Stop paused a child (ADR 0252), or a child moved to top level
+  // (ADR 0278). Notes that hold no turn: see `isTurnlessBoundary`.
   'ChildThreadStopped',
+  'ChildThreadDetached',
   // A caller's utterance the talker answered alone. A reader sorts a
   // transcript by who is talking. Which turn was running underneath comes
   // second, so the caller opens a boundary either way.
@@ -516,9 +527,8 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['UserQuestionAsked', 'takes'],
   ['CommandPermissionRequested', 'takes'],
   ['McpPermissionRequested', 'takes'],
-  // No producer emits either one today. Decided with their siblings above, so
-  // the family behaves alike the day one does.
-  ['CredentialRequested', 'takes'],
+  // No producer emits it today. Decided with its siblings above, so the family
+  // behaves alike the day one does.
   ['McpConsentRequested', 'takes'],
   // Coding-agent events fold by the clock rather than by request id, so the
   // continuation already lands below these. A handoff would move nothing.
@@ -533,6 +543,7 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['SpokenMessageReceived', 'own-arm'],
   ['EventWaitCanceled', 'own-arm'],
   ['ChildThreadStopped', 'own-arm'],
+  ['ChildThreadDetached', 'own-arm'],
 ]);
 
 /** Does this boundary take the running turn? `previous` held it.
@@ -558,9 +569,9 @@ function boundaryTakesTheTurn(type: string, previous: Exchange): boolean {
  *  turn is an ordinary in-flight response again, and a child completion must
  *  advance the redirect like any other.
  *
- *  `CredentialRequested` / `McpConsentRequested` have no resolution event in the
- *  ThreadEvent union, so they can never be observed as resolved and stay parked.
- *  Add the resolution arm here if one is ever introduced. */
+ *  `McpConsentRequested` has no resolution event in the ThreadEvent union, so it
+ *  can never be observed as resolved and stays parked. Add the resolution arm
+ *  here if one is ever introduced. */
 function dividerStillAwaitsUser(exchange: Exchange): boolean {
   const userEvent = exchange.userEvent;
   switch (userEvent.type) {
@@ -578,12 +589,20 @@ function dividerStillAwaitsUser(exchange: Exchange): boolean {
       return !exchange.steps.some(s =>
         s.event.type === 'McpPermissionResolved'
         && s.event.request_id === userEvent.request_id);
-    case 'CredentialRequested':
     case 'McpConsentRequested':
       return true;
     default:
       return false;
   }
+}
+
+/** The exchange holding the form request `requestId` names, newest first. */
+function formRequestOwner(exchanges: Exchange[], requestId: string): Exchange | undefined {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    if (ex.steps.some(s => isFormRequest(s.event) && s.event.request_id === requestId)) return ex;
+  }
+  return undefined;
 }
 
 /** Pure bookkeeping metadata events that belong to no exchange. Without this
@@ -979,6 +998,54 @@ function stillRunning(exchange: Exchange): boolean {
   return !exchange.steps.some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
 }
 
+/** Does this event belong to a coding-agent session? `EventMeta` stamps the
+ *  channel on every payload, though not every TS type declares it. */
+function onCodingAgentChannel(event: { type: string }): boolean {
+  return (event as { channel?: string }).channel === 'claude_code';
+}
+
+/** Is `event` a message the coding agent has yet to read, sent while `turn`
+ *  is still running or while others wait? Such a message waits in the queue
+ *  (`Exchange.awaitingRead`). `othersWait` defaults to the fold's own queue. */
+function waitsForTheAgent(
+  state: GroupFoldState,
+  event: StoredEvent,
+  turn: Exchange,
+  othersWait = state.unreadMessages.length > 0,
+): boolean {
+  if (event.type !== 'MessageReceived' || !onCodingAgentChannel(event)) return false;
+  if (!state.readsReported) return false;
+  if (othersWait) return true;
+  const agentTurn = onCodingAgentChannel(turn.userEvent)
+    || turn.steps.some(({ event: step }) => step.type.startsWith('CodingAgent'));
+  return agentTurn && stillRunning(turn);
+}
+
+/** The running chat turn, when `current` is a follow-up still queued behind it.
+ *
+ *  Some rows a chat turn writes carry no request id, such as its to-do list or
+ *  a retry note, so they land on `current`. A queued follow-up is `current`
+ *  while the turn runs. A row there would read as the loop having taken it:
+ *  the message would lose its Queued tag and its bin, and read "Read".
+ *
+ *  Rows that never count as taking a message stay on `current`, as before. */
+function chatTurnQueuedBehind(state: GroupFoldState, current: Exchange | null, event: StoredEvent): Exchange | null {
+  if (VOICE_ONLY_STEP_TYPES.has(event.type) || UNANCHORABLE_ASYNC_EVENTS.has(event.type)) return null;
+  if (!current || !isUningestedMessage(current)) return null;
+  const turn = chatTurnOwner(state, null);
+  return turn && turn !== current && stillRunning(turn) ? turn : null;
+}
+
+/** Hand the turn to a message leaving the queue.
+ *
+ *  It moves below whatever opened while it waited, the way an injected chat
+ *  message does. `reanchorAboveSpeechAndQueue` keeps it above anything a
+ *  caller said and above the messages still waiting behind it. */
+function takeTurnFromQueue(state: GroupFoldState, message: Exchange): Exchange {
+  reanchorAboveSpeechAndQueue(state.exchanges, message);
+  return message;
+}
+
 /** Move a running turn's continuation from one exchange to a later one.
  *
  *  Called when a boundary opens under a turn that keeps going. Everything the
@@ -1131,6 +1198,14 @@ interface GroupFoldState {
    *  caller speaking moves it on (see `handOverTheTurn`). Remembering the
    *  divider keeps the suppression attached to the card that tells. */
   turnDividers: Map<string, Exchange>;
+  /** Coding-agent messages the agent has not read yet, oldest first. See
+   *  `Exchange.awaitingRead`. */
+  unreadMessages: Exchange[];
+  /** Does the loaded history hold a `CodingAgentInputRead` anywhere? History
+   *  from before read events has none, and there a message takes the turn when
+   *  sent, since nothing would ever say the agent read it. Read across the
+   *  whole window, because a page can start after the running turn's read. */
+  readsReported: boolean;
   /** request_id to the tool call a permission card is holding: the exchange
    *  owning the call step, plus that step's `seq`. Written when the request is
    *  folded, read when its resolution is, so both ends mark the same row. It is
@@ -1138,6 +1213,10 @@ interface GroupFoldState {
    *  a chat lane the call is found positionally and that position is long gone
    *  by then. See `Exchange.blockedStepSeqs`. */
   gatedCalls: Map<string, { exchange: Exchange; seq: number }>;
+  /** The latest held message released and not yet seen delivered. The engine
+   *  delivers one at a time, recording each copy right after its release, so
+   *  one slot is enough. See `pairHeldDelivery`. */
+  pendingRelease: { holder: Exchange; held: Extract<StoredEvent, { type: 'MessageHeld' }> } | null;
   // request_event_id to redirect target exchange. Set when a UPI is absorbed
   // mid-flight. The loop emits the UPI when it ingests the queued follow-up, so
   // every event after that answers the absorbed prompt rather than the original
@@ -1186,7 +1265,10 @@ function newFoldState(paged: boolean): GroupFoldState {
     permissionDividerOwners: new Map(),
     lastDelegationHost: null,
     turnDividers: new Map(),
+    unreadMessages: [],
+    readsReported: false,
     gatedCalls: new Map(),
+    pendingRelease: null,
     reqIdRedirect: new Map(),
     resolvedReqIds: new Set(),
     abortReqIds: new Set(),
@@ -1325,8 +1407,8 @@ export function isWaitingTypedMessage(exchange: Exchange): boolean {
  *
  *  Two kinds are stepped over, both because a row filed there is a row nobody
  *  can read. A message still WAITING has had nothing happen in it, and a step
- *  there takes it out of the queue, beyond Stop's reach. A user's Stop-waiting
- *  panel draws no body at all.
+ *  there takes it out of the queue, beyond Stop's reach. A turnless boundary
+ *  (`isTurnlessBoundary`) draws no body at all.
  *
  *  Null means nowhere can hold the row. A reply then opens a boundary of its
  *  own, the greeting arm in `foldEvent`, and a session mark is dropped.
@@ -1480,6 +1562,11 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boole
       // event): its sorted position is in the middle, not the end.
       return rebuildIncrementalCache(events, paged);
     }
+    if (event.type === 'CodingAgentInputRead' && !cache.fold.readsReported) {
+      // The first read proves the agent reports them, which changes how the
+      // messages already folded should have queued (`readsReported`).
+      return rebuildIncrementalCache(events, paged);
+    }
     const reqId = requestEventIdOf(event);
     if (event.type === 'ResponseAborted' && reqId) {
       batchAbortReqIds.add(reqId);
@@ -1543,6 +1630,7 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
   }
 
   const state = newFoldState(paged);
+  state.readsReported = sorted.some(({ event }) => event.type === 'CodingAgentInputRead');
   for (const { seq, event } of sorted) {
     foldEvent(state, seq, event, legacySupersededAbortSeqs.has(seq), null);
   }
@@ -1552,7 +1640,11 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
 
 /** Re-anchor `exchange` to the position it should occupy now that the agent has
  *  engaged with it: as far down as it can go WITHOUT crossing something the
- *  caller said.
+ *  caller said, or a message still waiting in the queue.
+ *
+ *  The queue is the tail of the timeline, so nothing moves below it. A card
+ *  canceled while a typed reply waited would otherwise land under the reply,
+ *  leaving the reply above a tall card and out of view.
  *
  *  The end of the timeline when nothing was said after it, which is the common
  *  case for both callers. Otherwise just above the first utterance that
@@ -1570,12 +1662,12 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
  *  position-derived props need no `touched` bump. The render pass recomputes
  *  `isLast` / `hasPriorActive` / `priorModel` / `priorEffort` per exchange and
  *  `chatExchangePropsEqual` compares each, so a reorder re-renders on its own. */
-function reanchorBelowSpeech(exchanges: Exchange[], exchange: Exchange): void {
+function reanchorAboveSpeechAndQueue(exchanges: Exchange[], exchange: Exchange): void {
   const from = exchanges.indexOf(exchange);
   if (from === -1) return;
   let wall = exchanges.length;
   for (let i = from + 1; i < exchanges.length; i++) {
-    if (isCallerUtterance(exchanges[i].userEvent)) {
+    if (isCallerUtterance(exchanges[i].userEvent) || exchanges[i].awaitingRead) {
       wall = i;
       break;
     }
@@ -1601,56 +1693,60 @@ function callerSpokeAfter(exchanges: Exchange[], exchange: Exchange): boolean {
   return false;
 }
 
-/** A divider just received its resolution (answer / permission grant). A
- *  boundary exchange appended while the card sat on screen leaves the divider
- *  no longer last, yet still OWNING the turn's continuation via
- *  `reqIdRedirect`. The usual shape is a spawned sub-thread emitting
- *  `ChildThreadCompleted`. Left in place, every post-answer step renders ABOVE
- *  that intervening card. Live work then reads mid-timeline while the bottom of
- *  the thread is a stepless card frozen on 'Requesting', as if stuck.
+/** A divider just received its resolution (answer / permission grant), so it
+ *  moves to its RESOLUTION point and becomes `current` (ADR 0284). While it
+ *  waited, the render pinned it to the bottom. So a boundary that landed
+ *  meanwhile, usually a sub-thread's `ChildThreadCompleted`, already reads
+ *  above it, and the answered card stays where the reader answered it.
  *
- *  So re-anchor the divider to its RESOLUTION point: move it to the end and
- *  make it `current`. Same move as the mid-flight `UserPromptInjected` absorb
- *  above, for a different reason: that one follows the message the loop just
- *  picked up, this one follows the card the reader just answered.
+ *  Every lane. A chat divider's continuation finds it by request id, and a
+ *  coding agent's follows `current`, which is why the divider takes `current`.
+ *  Left behind, post-answer work renders mid-timeline above the boundary.
  *
- *  Gated on the divider being a `reqIdRedirect` target, which is exactly the
- *  in-process chat dividers whose continuation routes back here by request id.
- *  A CC `CodingAgentPermissionRequest` is never a redirect target, CC events
- *  not being request-id routed. Its continuation flows through `current` to the
- *  intervening boundary, so moving the card would strand it. No-op with no
- *  boundary between, the divider being already last and already `current`.
+ *  **A caller's utterance stops the move outright**, both halves of it. What
+ *  the card holds is speech too, and every spoken line must read back in the
+ *  order it was said. The card then keeps its place and gives up `current`,
+ *  which the utterance never took: the boundary branch hands it back. A chat
+ *  continuation still finds the card by request id.
  *
- *  **A caller's utterance stops the move outright**, both halves of it. The
- *  intervening boundary this was written for is a sub-thread finishing, which
- *  nobody said out loud. An utterance is speech, and so is what the card holds:
- *  every spoken line must read back in the order it was said. Moving the card
- *  below a later utterance reorders its own spoken rows. Handing it `current`
- *  sends the NEXT reply there too, rows early. The continuation still finds the
- *  card, routing by request id rather than by position, so what is given up is
- *  where it renders.
- *
- *  The hold costs the card nothing else, because an utterance never took
- *  `current` in the first place: the boundary branch hands it back. So the
- *  card keeps the continuation that routes chronologically too. */
+ *  **A stale coding-agent card stays put.** The engine's cleanup sweeps resolve
+ *  cards the agent moved past, after a restart or at idle. Moving one would hand
+ *  it the live turn's `current`. The agent working after the card is the tell. */
 function reanchorResolvedDivider(
   state: GroupFoldState,
   divider: Exchange,
   current: Exchange | null,
 ): Exchange | null {
-  let ownsContinuation = false;
-  for (const target of state.reqIdRedirect.values()) {
-    if (target === divider) {
-      ownsContinuation = true;
-      break;
-    }
+  if (
+    !ownsRequestContinuation(state, divider)
+    && agentWorkedSince(state.exchanges, state.exchanges.indexOf(divider))
+  ) {
+    return current;
   }
-  if (!ownsContinuation) return current;
-  reanchorBelowSpeech(state.exchanges, divider);
+  reanchorAboveSpeechAndQueue(state.exchanges, divider);
   if (callerSpokeAfter(state.exchanges, divider)) return current;
   // The resolved divider is the live turn again (see `Exchange.continuationMoved`).
   divider.continuationMoved = false;
   return divider;
+}
+
+/** Does a chat turn's continuation route to `divider` by request id? */
+function ownsRequestContinuation(state: GroupFoldState, divider: Exchange): boolean {
+  for (const target of state.reqIdRedirect.values()) {
+    if (target === divider) return true;
+  }
+  return false;
+}
+
+/** Did the agent make progress in the card at `from`, or anywhere after it? A
+ *  live card blocks its turn, so any progress means the card was left behind.
+ *  The fold and the bottom pin both ask it (ADR 0284). */
+export function agentWorkedSince(exchanges: Exchange[], from: number): boolean {
+  if (from === -1) return false;
+  for (let i = from; i < exchanges.length; i++) {
+    if (exchanges[i].steps.some(s => QUESTION_OVERTAKEN_STEP_TYPES.has(s.event.type))) return true;
+  }
+  return false;
 }
 
 /** The exchange holding the chat turn a permission request interrupted.
@@ -1753,17 +1849,50 @@ function foldEvent(
   // The walk body runs as a closure so its many early exits all funnel
   // through the single `state.current = current` sync below.
   const step = (): void => {
+    // A read marks the message it names and never becomes a step. The message
+    // may sit outside the loaded window, and then there is nothing to mark.
+    if (event.type === 'CodingAgentInputRead') {
+      const read = exchanges.find(ex => ex.userEvent._eventId === event.input_event_id);
+      if (read && !read.inputRead) {
+        read.inputRead = true;
+        touched?.add(read);
+      }
+      // A waiting message takes the turn from here: the agent's later steps
+      // answer it. The agent reads in order, so any older waiting ones are
+      // read too.
+      const at = read ? state.unreadMessages.indexOf(read) : -1;
+      if (read && at !== -1) {
+        for (const message of state.unreadMessages.splice(0, at + 1)) {
+          message.awaitingRead = undefined;
+          touched?.add(message);
+        }
+        current = takeTurnFromQueue(state, read);
+      }
+      return;
+    }
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
+    // The prompt handing a waiting message to a running agent is no step of
+    // the running turn, though it carries that turn's anchor. Filed there, it
+    // opens a Thinking row that nothing closes. The read's own turn draws one.
+    // It carries the message's text, which tells it from the turn's own
+    // prompts, such as a resume after a question.
+    if (event.type === 'CodingAgentPromptSent' && current && stillRunning(current)
+      && state.unreadMessages.some(({ userEvent }) =>
+        userEvent.type === 'MessageReceived' && userEvent.text === event.text)) {
+      return;
+    }
 
     // A release marks its held row delivered, so it joins the exchange that
     // holds the row, wherever the transcript has moved on to since.
     if (event.type === 'HeldMessageReleased') {
-      const holder = exchanges.find(ex => ex.steps.some(s =>
-        s.event.type === 'MessageHeld' && s.event._eventId === event.held_message_id));
-      if (holder) {
+      for (const holder of exchanges) {
+        const held = holder.steps.find(s =>
+          s.event.type === 'MessageHeld' && s.event._eventId === event.held_message_id);
+        if (held?.event.type !== 'MessageHeld') continue;
         holder.steps.push({ seq, event });
         touched?.add(holder);
+        state.pendingRelease = { holder, held: held.event };
         return;
       }
     }
@@ -1898,6 +2027,18 @@ function foldEvent(
         return;
       }
     }
+    // A form request resolves whenever the user answers, often turns later.
+    // Route the resolution to the exchange holding its request, so the row
+    // there shows the outcome. One whose request is off the page belongs to no
+    // exchange on screen, and a stray step would disturb the current one.
+    if (event.type === 'FormRequestResolved') {
+      const owner = formRequestOwner(exchanges, event.request_id);
+      if (owner) {
+        owner.steps.push({ seq, event });
+        touched?.add(owner);
+      }
+      return;
+    }
     // **The talker asked for the doer, which STARTS a turn** (ADR 0201). The
     // row is a step rather than a boundary: the caller's words already opened
     // the card, and a second one would split one utterance from its answer.
@@ -1941,7 +2082,7 @@ function foldEvent(
       // Only the MOVE is held. The exchange still takes `current`, so the
       // turn's own bookkeeping keeps landing on it. What the call leaves
       // behind never reaches `current`, going to the bottom by name instead.
-      reanchorBelowSpeech(exchanges, absorbTarget);
+      reanchorAboveSpeechAndQueue(exchanges, absorbTarget);
       absorbTarget.steps.push({ seq, event });
       touched?.add(absorbTarget);
       // It owns the turn again, so a handoff recorded while it sat in the queue
@@ -2012,9 +2153,28 @@ function foldEvent(
       // `own-arm` in `BOUNDARY_CONTINUATION_HANDOFF`. It continues nothing, so
       // there is no continuation to redirect and no handoff to record.
       //
-      // A `ChildThreadStopped` is handled the same way: it wakes nothing, so a
-      // turn the parent is running keeps writing where it was.
+      // A `ChildThreadStopped` or `ChildThreadDetached` is handled the same
+      // way: it wakes nothing, so a turn the parent is running keeps writing
+      // where it was.
       if (isTurnlessBoundary(event)) {
+        current = previousCurrent;
+        return;
+      }
+      // A message sent to an agent that went idle finds it has taken in
+      // everything sent before, as the engine's own settle says. So a message
+      // still waiting there is stale, as in history from before read events.
+      if (event.type === 'MessageReceived' && previousCurrent && !stillRunning(previousCurrent)) {
+        for (const stale of state.unreadMessages.splice(0)) {
+          stale.awaitingRead = undefined;
+          touched?.add(stale);
+        }
+      }
+      // A message sent behind a running coding-agent turn waits in the queue.
+      // The agent reads it at its next step, and until then everything it
+      // emits belongs to the turn that is running.
+      if (previousCurrent && waitsForTheAgent(state, event, previousCurrent)) {
+        current.awaitingRead = true;
+        state.unreadMessages.push(current);
         current = previousCurrent;
         return;
       }
@@ -2186,25 +2346,75 @@ function foldEvent(
         chatToolCallOwners.set(event._eventId, owner);
       }
     } else {
+      // The turn ended with a message still unread, as when the agent died
+      // before reading it. The next step is the message's own. The turn's
+      // trailing terminals, such as the `CodingAgentIdled` after its
+      // `ResponseGenerated`, still close it.
+      const next = state.unreadMessages[0];
+      if (next && current && !stillRunning(current) && !TERMINAL_EVENT_TYPES.has(event.type)) {
+        state.unreadMessages.shift();
+        next.awaitingRead = undefined;
+        touched?.add(next);
+        current = takeTurnFromQueue(state, next);
+      }
+      const runningTurn = chatTurnQueuedBehind(state, current, event);
       // Nowhere to put the step, which on a PAGED thread means the boundary
       // that opens this turn is older than the page. Hold it in a fragment
       // rather than dropping it. See `Exchange.continuationFragment`.
-      const target = current ?? openContinuationFragment(state, seq, event, touched);
+      const target = runningTurn ?? current ?? openContinuationFragment(state, seq, event, touched);
       if (!target) return;
-      current = target;
-      appendStep(current, seq, event);
-      touched?.add(current);
+      if (!runningTurn) current = target;
+      appendStep(target, seq, event);
+      touched?.add(target);
       if (event.type === 'CodingAgentToolCalled') {
         const id = toolUseIdOf(event);
-        if (id) toolCallOwners.set(id, current);
+        if (id) toolCallOwners.set(id, target);
       }
       if (event.type === 'ToolCalled' && event._eventId) {
-        chatToolCallOwners.set(event._eventId, current);
+        chatToolCallOwners.set(event._eventId, target);
       }
     }
   };
   step();
   state.current = current;
+  if (event.type === 'MessageReceived' && event.mode === 'agent') pairHeldDelivery(state, event, touched);
+}
+
+/** Make a released message's delivered copy its one card (ADR 0256).
+ *
+ *  The copy is the next agent message after the release, with the same text
+ *  and sender. Any other agent message ends the wait, so a lost delivery is
+ *  never paired with a later lookalike. Nothing hides until the copy exists:
+ *  a crash between release and delivery must leave the held row on screen. */
+function pairHeldDelivery(
+  state: GroupFoldState,
+  event: Extract<StoredEvent, { type: 'MessageReceived' }>,
+  touched: Set<Exchange> | null,
+): void {
+  const release = state.pendingRelease;
+  if (!release) return;
+  state.pendingRelease = null;
+  const held = release.held;
+  if (held.text !== event.text || senderKey(held.origin) !== senderKey(event.origin)) return;
+  let delivered: Exchange | undefined;
+  for (let i = state.exchanges.length - 1; i >= 0 && !delivered; i--) {
+    if (state.exchanges[i].userEvent === event) delivered = state.exchanges[i];
+  }
+  if (!delivered || !held._eventId) return;
+  (release.holder.deliveredHeldIds ??= new Set()).add(held._eventId);
+  delivered.releasedFromHold = true;
+  touched?.add(release.holder);
+  touched?.add(delivered);
+}
+
+/** Who sent a message, as an identity rather than a display name: two threads
+ *  may share a title. */
+function senderKey(origin: MessageOrigin | undefined): string {
+  switch (origin?.kind) {
+    case 'thread_link': return `thread:${origin.thread_id}`;
+    case 'workspace': return `workspace:${origin.workspace}`;
+    default: return origin?.kind ?? '';
+  }
 }
 
 /** Open a continuation fragment to hold a step whose turn starts off the page.

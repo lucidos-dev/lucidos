@@ -179,7 +179,7 @@ impl LucidosEngine {
                 Ok(result) => Ok(result),
                 Err(e) => Ok(format!("Error: {}", e)),
             },
-            _ => Ok(format!("Unknown browser tool: {}", name)),
+            _ => Err(format!("Unknown browser tool: {}", name).into()),
         }
     }
 }

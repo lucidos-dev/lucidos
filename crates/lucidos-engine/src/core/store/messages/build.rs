@@ -198,6 +198,7 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
     } else {
         pending_change_ids.join(", ")
     };
+    let sub_thread_section = sub_thread_pending_section(event);
     let title_line = if title.is_empty() {
         String::new()
     } else {
@@ -214,14 +215,60 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
     // original reader and is retired (ADR 0109); the `events` tool's
     // `event_id` argument takes the same form.
     format!(
-        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}\n\
+        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}{}\n\
          Note: phrases like \"session can finish\" or \"## Session Summary\" in \
          the summary describe the child subprocess only — if you were following \
          a multi-step procedure, continue with the next step. Otherwise use \
          run_thread to refine.",
-        child_thread_id, status, event.id, title_line, pending_section, summary_section
+        child_thread_id,
+        status,
+        event.id,
+        title_line,
+        pending_section,
+        sub_thread_section,
+        summary_section
     )
 }
+
+/// The block's lines for pending changes held below the child, or nothing when
+/// there are none. The `Pending changes:` line above names the child's own
+/// branch only, so without this an orchestrator whose children hold every
+/// change reads "none".
+fn sub_thread_pending_section(event: &EventRow) -> String {
+    use crate::engine::thread_events::SubThreadPendingChange;
+
+    let entries: Vec<SubThreadPendingChange> = event
+        .payload
+        .get("sub_thread_pending_changes")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let state = if entry.thread_unsettled {
+                "still working"
+            } else {
+                "settled"
+            };
+            let title = entry.thread_title.as_deref().unwrap_or(UNTITLED_SUB_THREAD);
+            format!(
+                "\n- {} from sub-thread \"{}\" ({}): {}",
+                entry.change_id, title, entry.thread_id, state
+            )
+        })
+        .collect();
+    format!(
+        "\nPending changes in its sub-threads (state when this card was sent):{}",
+        lines.concat()
+    )
+}
+
+/// How the block names a sub-thread whose title is not generated yet.
+const UNTITLED_SUB_THREAD: &str = "untitled";
 
 /// Format a persisted `ChildThreadStopped` event row as the `[CHILD THREAD
 /// STOPPED]` user-channel block the parent LLM sees in its history.
@@ -249,6 +296,35 @@ pub fn format_child_thread_stopped_block(event: &EventRow) -> String {
          will get a [CHILD THREAD COMPLETED] block when it next finishes, or one \
          with status canceled if the user archives or discards it. Until then, \
          do not roll back its work, respawn it, or send it a follow-up.",
+        event.id
+    )
+}
+
+/// Format a persisted `ChildThreadDetached` event row as the `[CHILD THREAD
+/// MOVED OUT]` user-channel block the parent LLM sees in its history.
+///
+/// The move wakes nothing, so this block is how the parent learns it. Without
+/// it the parent reads a spawn that never reports back, and respawns it
+/// (ADR 0278).
+pub fn format_child_thread_detached_block(event: &EventRow) -> String {
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title_line = match event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+    {
+        Some(title) if !title.is_empty() => format!("\nTitle: {title}"),
+        _ => String::new(),
+    };
+    format!(
+        "[CHILD THREAD MOVED OUT] {child_thread_id}\nevent_id: {}{title_line}\n\
+         This child was moved to top level. It keeps running on its own, but it is \
+         no longer your child: you will not get its result, and you cannot follow up \
+         on it. Do not wait for it or respawn it.",
         event.id
     )
 }
@@ -979,12 +1055,18 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     agent: None,
                 });
             }
-            "ChildThreadStopped" => {
+            "ChildThreadStopped" | "ChildThreadDetached" => {
                 // Same user-channel shape as the completion block above, so
-                // the parent's next turn knows the child is alive.
+                // the parent's next turn knows the child is alive, or no
+                // longer its own.
+                let content = if event.event_type == "ChildThreadStopped" {
+                    format_child_thread_stopped_block(event)
+                } else {
+                    format_child_thread_detached_block(event)
+                };
                 messages.push(SessionMessage {
                     role: "user".to_string(),
-                    content: format_child_thread_stopped_block(event),
+                    content,
                     created_at: event.created,
                     channel: None,
                     steps: vec![],

@@ -220,6 +220,7 @@ impl LlmProvider for MockProvider {
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
+                content_is_progress_notes: false,
             });
         }
 
@@ -241,6 +242,7 @@ impl LlmProvider for MockProvider {
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
+                content_is_progress_notes: false,
             });
         }
 
@@ -266,6 +268,7 @@ impl LlmProvider for MockProvider {
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
+                content_is_progress_notes: false,
             });
         }
 
@@ -300,6 +303,7 @@ impl LlmProvider for MockProvider {
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
+            content_is_progress_notes: false,
         })
     }
 

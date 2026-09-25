@@ -5,8 +5,8 @@ use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
 impl LucidosEngine {
-    pub(crate) fn clear_cc_debounce(&self, thread_id: Uuid) {
-        if let Ok(mut spawns) = self.last_cc_spawn.lock() {
+    pub(crate) fn clear_spawn_debounce(&self, thread_id: Uuid) {
+        if let Ok(mut spawns) = self.last_spawn.lock() {
             spawns.remove(&thread_id);
         }
     }
@@ -220,8 +220,6 @@ impl LucidosEngine {
         claude_text_buf: &mut CodingAgentTextBuffer,
         meta: &crate::engine::thread_events::EventMeta,
         external_terminal_emitted: &std::sync::atomic::AtomicBool,
-        normalized_model: &Option<String>,
-        cc_reasoning_effort: &Option<String>,
         coding_agent: crate::runtime::CodingAgent,
     ) {
         // Resolve "is this session shutting down" ONCE, and use that one value
@@ -287,11 +285,14 @@ impl LucidosEngine {
         {
             return;
         }
+        let (model, reasoning_effort) = self
+            .terminal_model_settings(thread_id, external_terminal_emitted)
+            .await;
         let terminal_event = Self::make_terminal_event(
             kind,
             claude_text_buf.as_str().to_string(),
-            normalized_model.clone(),
-            cc_reasoning_effort.clone(),
+            model,
+            reasoning_effort,
         );
         // `is_aborted` here means exactly `Aborted(EngineShutdown)`:
         // `stop_terminal_kind` yields an abort only when `is_shutdown`. So the
@@ -405,7 +406,12 @@ impl LucidosEngine {
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: format!("Internal error: {}", panic_msg),
                                 },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
+                                // The channel lets a reader of the latest
+                                // coding-agent terminal see this one.
+                                meta: crate::engine::thread_events::EventMeta {
+                                    channel: Some(EventChannel::ClaudeCode),
+                                    ..crate::engine::thread_events::EventMeta::NONE
+                                },
                             },
                             "[AgentSession] ResponseFailed after panic",
                         )
@@ -423,10 +429,24 @@ impl LucidosEngine {
                             "[AgentSession] SessionEnded after panic",
                         )
                         .await;
-                    engine.agent_sessions.lock().await.remove(&thread_id);
+                    reap_dead_session_entry(&mut *engine.agent_sessions.lock().await, thread_id);
                 }
             }
         })
+    }
+}
+
+/// Remove `thread_id`'s entry only when it reads dead.
+///
+/// The panic cleanup has no identity token for the run that panicked. That run's
+/// future is gone, so its entry reads dead. A replacement registered meanwhile
+/// is live, and removing it hides its subprocess from every watchdog and Stop.
+fn reap_dead_session_entry(
+    sessions: &mut std::collections::HashMap<Uuid, crate::engine::AgentSession>,
+    thread_id: Uuid,
+) {
+    if sessions.get(&thread_id).is_some_and(|s| !s.is_live()) {
+        sessions.remove(&thread_id);
     }
 }
 
@@ -513,6 +533,32 @@ pub(super) async fn external_terminal_already_emitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panicked run dropped its receiver, so its entry reads dead and goes.
+    #[test]
+    fn the_panic_cleanup_reaps_the_panicked_runs_entry() {
+        let thread_id = Uuid::new_v4();
+        let (session, rx) = crate::engine::AgentSession::for_test();
+        drop(rx);
+        let mut sessions = std::collections::HashMap::from([(thread_id, session)]);
+
+        reap_dead_session_entry(&mut sessions, thread_id);
+        assert!(sessions.is_empty());
+    }
+
+    /// A replacement registered before the panic surfaced is live and stays.
+    #[test]
+    fn the_panic_cleanup_leaves_a_live_replacement_alone() {
+        let thread_id = Uuid::new_v4();
+        let (replacement, _rx) = crate::engine::AgentSession::for_test();
+        let mut sessions = std::collections::HashMap::from([(thread_id, replacement)]);
+
+        reap_dead_session_entry(&mut sessions, thread_id);
+        assert!(
+            sessions.contains_key(&thread_id),
+            "removing a live replacement hides its subprocess from every watchdog and Stop"
+        );
+    }
 
     /// `stamp_host_actor_if_aborted` stamps the actor its caller supplies (NOT
     /// `Engine{OrphanRecovery}`) on aborted terminals. The safety-net caller
@@ -645,6 +691,64 @@ mod tests {
              (`session_is_shutting_down`), not the raw per-session flag. A bare \
              read here classifies an engine restart as a user Stop for any \
              session that registered after the teardown snapshot:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// Source-scan tripwire: **a terminal event reports the model the session
+    /// runs on now.** A mid-session model change goes through
+    /// `send_agent_control_request`, which updates the session entry and never
+    /// reaches the run loop. So the loop's spawn-time `normalized_model` and
+    /// `cc_reasoning_effort` go stale, and no terminal may be built from them.
+    #[test]
+    fn terminal_events_never_take_the_spawn_time_model() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("engine")
+            .join("agent_session");
+        let files = [
+            dir.join("runtime_helpers.rs"),
+            dir.join("run_session").join("run.rs"),
+            dir.join("run_session").join("completion.rs"),
+        ];
+        let builders = [
+            "make_terminal_event(",
+            "emit_stop_terminal(",
+            "emit_response_aborted(",
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let content = std::fs::read_to_string(path).expect("read source");
+            let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
+            for builder in builders {
+                for (at, _) in production.match_indices(builder) {
+                    if production[..at].ends_with("fn ") {
+                        continue;
+                    }
+                    // The call runs to the end of its statement.
+                    let call = &production[at..];
+                    let call = &call[..call.find(';').unwrap_or(call.len())];
+                    checked += 1;
+                    if call.contains("normalized_model") || call.contains("cc_reasoning_effort") {
+                        violations.push(format!(
+                            "{}: {}",
+                            path.file_name().unwrap().to_string_lossy(),
+                            call.lines().next().unwrap_or_default().trim()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 5,
+            "the scan found only {checked} terminal builder calls, so it has \
+             stopped matching the source it is supposed to guard"
+        );
+        assert!(
+            violations.is_empty(),
+            "a terminal event must report the session's current model, not the \
+             spawn-time locals:\n{}",
             violations.join("\n")
         );
     }

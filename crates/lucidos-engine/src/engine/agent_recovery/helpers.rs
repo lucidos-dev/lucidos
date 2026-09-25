@@ -4,7 +4,7 @@
 
 use super::super::agent_session::CodingAgentKind;
 use super::super::event_bus::{BusEvent, EventBus};
-use super::super::git_ops::git_cmd;
+use super::super::git_ops::{git_answer, git_cmd, GitAnswer};
 use super::super::thread_events::{
     EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
@@ -163,6 +163,9 @@ pub enum ContinueRecovery {
     /// Errored with no retry left. Settle the projection so the thread cannot
     /// sit at `running` with no live subprocess.
     Settle,
+    /// Lost the spawn debounce to a winner that may still be starting, or may
+    /// have died. Settle only if no coding-agent spawn owns the thread.
+    SettleUnlessOwned,
 }
 
 /// Decide the spawn consumer's next move for a continuation, from the error the
@@ -191,24 +194,28 @@ pub enum ContinueRecovery {
 ///   `is_stale_resume_signal` requires one — but crash-safety here is a floor,
 ///   not an inference.)
 ///
-/// The ONE error that must NOT settle is `AGENT_ALREADY_RUNNING_ERROR`: the
-/// spawn guard rejected us because a **live** session already owns the thread,
-/// so this continuation owns nothing and the `running` projection is TRUE — it
-/// belongs to the turn that won the race. Settling there would emit a terminal
-/// against a working session and make the projection lie in the opposite
-/// direction, which is strictly worse than the wedge this backstop exists to
-/// prevent. Reachable whenever a continuation races a user message: the
-/// consumer dispatches off an event subscriber with no lock on the thread.
+/// A lost race must NOT settle blindly. The spawn guard rejected us because
+/// another spawn owns the thread, so the `running` projection is TRUE. Settling
+/// would emit a terminal against a working session. Two guards report the loss:
+///
+/// - `AGENT_ALREADY_RUNNING_ERROR`: the winner's session is live, so the winner
+///   emits its own terminal. A continuation races a user message this way,
+///   because the consumer holds no thread lock.
+/// - `DUPLICATE_SPAWN_ERROR`: the winner started seconds ago. After a switch,
+///   the event-wait delivery and the boot auto-resume race this way. The
+///   winner may still be starting, or may have already failed, and then our
+///   own `ContinuationStarted` holds the row at `running`. So the consumer
+///   asks `coding_agent_owns_thread`, which counts spawns still starting up.
 ///
 /// Every other error settles: the failure modes that skip their own terminal are
 /// exactly the ones we cannot enumerate, and settling is idempotent
 /// (`settle_stuck_running_thread` re-checks `running` first).
 pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery {
+    use crate::engine::claude_code::{AGENT_ALREADY_RUNNING_ERROR, DUPLICATE_SPAWN_ERROR};
     match error {
         None => ContinueRecovery::Nothing,
-        Some(e) if e == crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR => {
-            ContinueRecovery::Nothing
-        }
+        Some(e) if e == AGENT_ALREADY_RUNNING_ERROR => ContinueRecovery::Nothing,
+        Some(e) if e == DUPLICATE_SPAWN_ERROR => ContinueRecovery::SettleUnlessOwned,
         Some(e) if !retried && e == crate::engine::claude_code::STALE_RESUME_ERROR => {
             ContinueRecovery::RetryFresh
         }
@@ -219,20 +226,14 @@ pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery
 /// User message the spawn consumer hands to `run_direct_agent` when actuating
 /// a `SpawnRequest::Continue`. **Must be non-empty.**
 ///
-/// `claude --print --resume` reads stdin in stream-json mode and waits
-/// indefinitely for at least one input line before emitting its `system/init`
-/// event. The engine keeps the input channel open across the session lifetime,
-/// so EOF never arrives on its own — without an explicit input, CC parks
-/// forever, `events_rx.recv()` never resolves, and the thread sits "Running"
-/// until the next engine restart tears the subprocess down.
+/// `claude --print --resume` waits on stdin for its first input before it emits
+/// `system/init`. It continues on its own only when Claude Code's internal
+/// `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` is set, which the engine does not do.
+/// So recovery sends this text as an ordinary user turn, and `run_direct_agent`
+/// refuses an empty one (ADR 0272). It resumes any transcript state: a cut tool
+/// call, a cut stream, or a completed API-error turn.
 ///
-/// The string mirrors the placeholder CC itself injects on `--resume` of an
-/// unfinished tool_use (see `agent_session/run_session.rs` and
-/// `agent_session/reconstruct.rs`), so CC ingests it as a plain user turn and
-/// proceeds against the resumed conversation state. The richer recovery
-/// payload (system-prompt override, pending-merge context, etc.) will replace
-/// this call site later; until then this constant guarantees the non-empty
-/// stdin precondition.
+/// The wording matches Claude Code's own continuation prompt.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
 
 /// Opens the [`ANSWERED_AFTER_IDLE_REASON`] resume message. Its whole job is to
@@ -450,6 +451,42 @@ pub(crate) fn recovery_repo_roots(
     }
 
     roots
+}
+
+/// How many git subprocesses one boot-time recovery sweep runs at once. Each
+/// sweep fans out per repo or per thread, and a serial fan-out made boot time
+/// grow with every registered repo. The cap keeps a large workspace from
+/// launching a burst big enough to push probes past `GIT_TIMEOUT`.
+pub(crate) const RECOVERY_GIT_CONCURRENCY: usize = 8;
+
+/// The first root, in `roots` order, whose refs hold `refs/heads/<branch>`.
+/// Every root is asked at once, but the pick is the one a serial scan would
+/// make. That keeps the load-bearing order of [`recovery_repo_roots`].
+pub(crate) async fn first_root_holding_branch<'a>(
+    roots: &'a [(PathBuf, Option<String>)],
+    branch: &str,
+) -> Option<&'a (PathBuf, Option<String>)> {
+    use futures::StreamExt;
+    let refname = format!("refs/heads/{branch}");
+    let answers: Vec<GitAnswer> = futures::stream::iter(roots.iter().map(|(root, _)| {
+        let refname = refname.as_str();
+        async move { git_answer(&["rev-parse", "--verify", refname], root).await }
+    }))
+    .buffered(RECOVERY_GIT_CONCURRENCY)
+    .collect()
+    .await;
+    first_confirmed(roots, &answers)
+}
+
+/// The first item whose answer is `Yes`. An `Unknown` never picks: an unanswered
+/// probe must not claim the branch lives in this repo, or recovery builds a
+/// worktree against the wrong root (`.claude/rules/rust.md`).
+fn first_confirmed<'a, T>(items: &'a [T], answers: &[GitAnswer]) -> Option<&'a T> {
+    items
+        .iter()
+        .zip(answers)
+        .find(|(_, answer)| answer.or_unknown(false))
+        .map(|(item, _)| item)
 }
 
 /// The app id an `App`-kind coding-agent thread edits, read from its newest
@@ -960,6 +997,57 @@ mod tests {
         assert!(
             roots[2].1.is_some(),
             "a registered repo carries the id its worktree marker records"
+        );
+    }
+
+    #[test]
+    fn first_confirmed_takes_the_earliest_yes_in_scan_order() {
+        let roots = ["lucidos", "workspace", "external"];
+        let answers = [GitAnswer::No, GitAnswer::Yes, GitAnswer::Yes];
+        assert_eq!(first_confirmed(&roots, &answers), Some(&"workspace"));
+    }
+
+    #[test]
+    fn first_confirmed_never_picks_an_unanswered_root() {
+        let roots = ["lucidos", "workspace"];
+        let answers = [GitAnswer::Unknown, GitAnswer::Yes];
+        assert_eq!(first_confirmed(&roots, &answers), Some(&"workspace"));
+        let answers = [GitAnswer::Unknown, GitAnswer::No];
+        assert_eq!(first_confirmed(&roots, &answers), None);
+    }
+
+    /// Asked concurrently against real repos, the pick is still the one a
+    /// serial scan makes: the first root holding the branch, never a later one.
+    #[tokio::test]
+    async fn first_root_holding_branch_matches_a_serial_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let without = tmp.path().join("without");
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        for repo in [&without, &first, &second] {
+            std::fs::create_dir_all(repo).unwrap();
+            init_repo(repo).await;
+        }
+        let branch = "lucidos-claude-code-repo-example-12345678";
+        for repo in [&first, &second] {
+            git_cmd(&["branch", branch], repo).await.unwrap();
+        }
+        let roots = vec![
+            (tmp.path().join("missing"), None),
+            (without, None),
+            (first.clone(), Some("first-id".to_string())),
+            (second, Some("second-id".to_string())),
+        ];
+
+        let found = first_root_holding_branch(&roots, branch).await;
+        assert_eq!(
+            found,
+            Some(&(first, Some("first-id".to_string()))),
+            "the earliest root holding the branch wins"
+        );
+        assert_eq!(
+            first_root_holding_branch(&roots, "no-such-branch").await,
+            None
         );
     }
 

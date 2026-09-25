@@ -59,8 +59,9 @@ const SDK_PREFS_JS: &str =
 /// `text-size` and `font-size` are the pre-grid aliases for `ui-scale`, carried
 /// so this script and the live `ui.applyPreferences` pick the same scale.
 /// `autocorrect` is read by the SDK's field stamp, which must answer before a
-/// field's first focus (ADR 0262).
-const SEED_KEYS: [&str; 7] = [
+/// field's first focus (ADR 0262). `motion` resolves `data-motion` before the
+/// first frame can animate.
+const SEED_KEYS: [&str; 8] = [
     "theme",
     "font-family",
     "ui-scale",
@@ -68,6 +69,7 @@ const SEED_KEYS: [&str; 7] = [
     "font-size",
     "style_overrides",
     "autocorrect",
+    "motion",
 ];
 
 /// The global the seed lands on, read by `boot/appearanceBoot.ts` and the SDK's
@@ -331,6 +333,16 @@ mod tests {
         assert_eq!(
             seed_line(&prefs(&[("autocorrect", "true")])),
             "window.__lucidosPrefs={\"autocorrect\":\"true\"};\n"
+        );
+    }
+
+    #[test]
+    fn the_seed_line_carries_motion() {
+        // Without it an isolated frame paints its first frame from the OS
+        // switch alone, and a device that chose Reduce sees motion.
+        assert_eq!(
+            seed_line(&prefs(&[("motion", "reduce")])),
+            "window.__lucidosPrefs={\"motion\":\"reduce\"};\n"
         );
     }
 

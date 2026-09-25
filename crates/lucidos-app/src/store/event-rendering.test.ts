@@ -112,6 +112,7 @@ describe('drawsResponseRow', () => {
         wait_id: 'w1',
         subscriptions: [{ event_type: 'ChangeApplied' }],
         reason: 'waiting for the apply',
+        created: '2026-08-10T11:00:00Z',
         expires_at: '2026-08-10T12:00:00Z',
         state: 'waiting',
       },

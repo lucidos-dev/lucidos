@@ -1,5 +1,47 @@
 import { describe, it, expect } from 'vitest';
-import { resolveVisualStatus, statusTooltip, ThreadStatusIcon, type VisualStatus } from './ThreadStatusIcon';
+import { resolveVisualStatus, statusTooltip, ThreadStatusIcon, visualStatusFor, type VisualStatus } from './ThreadStatusIcon';
+import type { ThreadMeta } from '../../store/thread-events';
+
+describe('visualStatusFor', () => {
+  const idle = {
+    activeChildrenCount: 0,
+    waitingChildrenCount: 0,
+    codingAgentProposed: false,
+    liveEventWaitCount: 0,
+  } as ThreadMeta;
+
+  // The reported shape: every child idle on its own event wait. Each is
+  // unfinished (ADR 0254), so the parent must not read as finished.
+  it('reads a parent whose child waits as waiting', () => {
+    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 3 })).toBe('waiting');
+  });
+
+  it('reads a waiting child exactly as a running one', () => {
+    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1 }))
+      .toBe(visualStatusFor('idle', { ...idle, activeChildrenCount: 1 }));
+  });
+
+  // The child writes its own worktree, so the parent's change stays
+  // applicable (ADR 0249), exactly as with a running child.
+  it('lets the parent\'s own change outrank a waiting child', () => {
+    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1, codingAgentProposed: true }))
+      .toBe('changes');
+  });
+
+  it('reads an absent count as zero', () => {
+    const beforeTheField = {
+      activeChildrenCount: 0,
+      codingAgentProposed: false,
+      liveEventWaitCount: 0,
+    } as ThreadMeta;
+    expect(visualStatusFor('idle', beforeTheField)).toBe('idle');
+  });
+
+  it('resolves on the status alone for a thread it cannot see', () => {
+    expect(visualStatusFor('running', undefined)).toBe('running');
+    expect(visualStatusFor('idle', undefined)).toBe('idle');
+  });
+});
 
 describe('statusTooltip', () => {
   it('titles the tooltip with the status label and explains it in the body', () => {

@@ -2,59 +2,57 @@
  * The menu drawer must not depend on an animation that may not run.
  *
  * `closeDrawer()` normally only sets `drawerClosing`, and the panel's
- * `onAnimationEnd` handler is what clears `drawerOpen`. Under
- * `prefers-reduced-motion: reduce` the CSS drops the animation on
- * `.drawer.closing` (mobile.css), and an element with no animation fires no
- * `animationend`. So the drawer stayed open, and `<Overlay open>` held
- * `data-overlay-open` on `<html>`, which inerts the whole shell behind it.
+ * `onAnimationEnd` handler is what clears `drawerOpen`. Under reduced motion
+ * the CSS drops the animation on `.drawer.closing` (mobile.css), and an element
+ * with no animation fires no `animationend`. So the drawer stayed open, and
+ * `<Overlay open>` held `data-overlay-open` on `<html>`, which inerts the whole
+ * shell behind it.
  *
- * That media query is not scoped to a breakpoint, so desktop had no recovery
- * short of a reload. These tests dispatch no `animationend` at all and assert
- * synchronously: no event and no timer may stand between the call and the
- * closed state.
+ * The in-app Motion setting makes that path common, and it can disagree with
+ * the OS in both directions. So these cases drive the resolved value from both
+ * inputs. They dispatch no `animationend` at all and assert synchronously: no
+ * event and no timer may stand between the call and the closed state.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   closeDrawer, drawerClosing, drawerOpen, forceCloseDrawer, openDrawer,
 } from '../Drawer';
+import { motionPreference, osReducesMotion } from '../../../utils/motion';
+import type { MotionPref } from '@lucidos/appearance';
 
-/** Answer `prefers-reduced-motion` the way the OS setting would, and hand back
- *  the restore. Same stub shape as `chat/__tests__/scroll-to-top.test.ts`. */
-function stubReducedMotion(reduce: boolean): () => void {
-  const real = window.matchMedia;
-  (window as any).matchMedia = (query: string) => ({
-    matches: reduce && query.includes('prefers-reduced-motion'),
-    addEventListener: () => {}, removeEventListener: () => {},
-    addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
-  });
-  return () => { (window as any).matchMedia = real; };
+function setMotion(pref: MotionPref, osReduces: boolean): void {
+  motionPreference.value = pref;
+  osReducesMotion.value = osReduces;
 }
-
-let restoreMatchMedia: (() => void) | null = null;
 
 beforeEach(() => {
   forceCloseDrawer();
 });
 
 afterEach(() => {
-  restoreMatchMedia?.();
-  restoreMatchMedia = null;
+  setMotion('system', false);
   forceCloseDrawer();
 });
 
+/** Every input pair that resolves to reduced motion. The middle one is the case
+ *  a media-query read would miss: calm chosen in the app, OS switch off. */
+const REDUCED: Array<[MotionPref, boolean]> = [['system', true], ['reduce', false], ['reduce', true]];
+
 describe('closing the menu drawer under reduced motion', () => {
-  it('reaches the closed state with no animationend', () => {
-    restoreMatchMedia = stubReducedMotion(true);
-    openDrawer();
+  for (const [pref, os] of REDUCED) {
+    it(`reaches the closed state with no animationend (${pref}, OS ${os ? 'on' : 'off'})`, () => {
+      setMotion(pref, os);
+      openDrawer();
 
-    expect(closeDrawer()).toBe(true);
+      expect(closeDrawer()).toBe(true);
 
-    expect(drawerOpen.value).toBe(false);
-    expect(drawerClosing.value).toBe(false);
-  });
+      expect(drawerOpen.value).toBe(false);
+      expect(drawerClosing.value).toBe(false);
+    });
+  }
 
   it('leaves no stuck overlay for the rest of the session', () => {
-    restoreMatchMedia = stubReducedMotion(true);
+    setMotion('reduce', false);
     openDrawer();
     closeDrawer();
 
@@ -70,7 +68,7 @@ describe('closing the menu drawer under reduced motion', () => {
   it('still reports the already-closed case as a no-op', () => {
     // The load-bearing `false`: the dismiss hook leaves the paired click
     // un-swallowed, so a tap on a neighbor button still reaches its handler.
-    restoreMatchMedia = stubReducedMotion(true);
+    setMotion('reduce', false);
 
     expect(closeDrawer()).toBe(false);
     expect(drawerOpen.value).toBe(false);
@@ -79,7 +77,7 @@ describe('closing the menu drawer under reduced motion', () => {
 
 describe('closing the menu drawer with motion on', () => {
   it('waits for the slide-out rather than closing straight through', () => {
-    restoreMatchMedia = stubReducedMotion(false);
+    setMotion('system', false);
     openDrawer();
 
     expect(closeDrawer()).toBe(true);
@@ -88,8 +86,53 @@ describe('closing the menu drawer with motion on', () => {
     expect(drawerOpen.value).toBe(true);
   });
 
+  it('waits for it under Full even when the OS asks to reduce', () => {
+    // `full` keeps the slide-out, so the animation runs and its end event fires.
+    setMotion('full', true);
+    openDrawer();
+
+    expect(closeDrawer()).toBe(true);
+    expect(drawerClosing.value).toBe(true);
+  });
+
+  it('closes on its fallback timer if the slide-out end never arrives', () => {
+    // Motion turning reduced mid-slide drops the running animation, so its
+    // `animationend` never fires. The timer is what keeps the shell usable.
+    vi.useFakeTimers();
+    try {
+      setMotion('system', false);
+      openDrawer();
+      closeDrawer();
+      osReducesMotion.value = true;
+
+      vi.advanceTimersByTime(300);
+
+      expect(drawerOpen.value).toBe(false);
+      expect(drawerClosing.value).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let a stale fallback cut a later close short', () => {
+    vi.useFakeTimers();
+    try {
+      setMotion('system', false);
+      openDrawer();
+      closeDrawer();
+      vi.advanceTimersByTime(250);
+      openDrawer();
+      closeDrawer();
+      // The first close's timer fires here; the second close is still sliding.
+      vi.advanceTimersByTime(60);
+      expect(drawerClosing.value).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports a second call mid-slide-out as a no-op', () => {
-    restoreMatchMedia = stubReducedMotion(false);
+    setMotion('system', false);
     openDrawer();
     closeDrawer();
 

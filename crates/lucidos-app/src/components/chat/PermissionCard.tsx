@@ -374,7 +374,7 @@ type ButtonSpec = {
 export const DEFAULT_PERMISSION_CHOICE: PermissionChoice = 'allow';
 
 /** Render one permission button with answered/terminated state styling. Shared
- *  by both the coding-agent and command-guard cards. */
+ *  by all three cards: coding-agent, command-guard and MCP. */
 function renderPermissionButton(
   spec: ButtonSpec,
   state: { selected: PermissionChoice | null; answered: boolean; terminated: boolean },
@@ -404,8 +404,8 @@ function renderPermissionButton(
 }
 
 /** The shared card chrome: a question line + a primary row + one row per
- *  secondary button. Both permission cards (coding-agent, command-guard) build
- *  their own `buttons` and feed them here. */
+ *  secondary button. Each permission card (coding-agent, command-guard, MCP)
+ *  builds its own `buttons` and feeds them here. */
 function PermissionBodyShell({
   requestId,
   question,

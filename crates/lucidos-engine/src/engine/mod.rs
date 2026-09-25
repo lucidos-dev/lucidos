@@ -30,6 +30,7 @@ pub mod engine_version;
 pub(crate) mod eval_capture;
 pub mod event_bus;
 pub mod event_wait;
+pub mod form_requests;
 pub mod frontend_preview;
 mod frontend_refresh;
 pub(crate) mod git_ops;
@@ -72,6 +73,8 @@ pub(crate) use agentic_loop::{
     emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
 pub(crate) use aux_capture::AuxCapture;
+#[cfg(test)]
+pub(crate) use change_ops::bind_in_place_conflict_resolution;
 pub(crate) use change_ops::now_epoch_millis;
 // Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
 // into an HTTP status by identity against this const (a 404 there means "no
@@ -82,9 +85,11 @@ pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 // refusal taxonomy: the delivery half stays reachable solely as
 // `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
 // second delivery path out of its parts.
+pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpUrgency,
 };
+pub(crate) use chat::follow_up_order::{FollowUpOrder, FollowUpTurn};
 pub(crate) use chat::PreEmittedOrigin;
 pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
@@ -465,8 +470,9 @@ pub struct LucidosEngine {
     /// ~4s version-status poll. Dev-only. See
     /// `engine_version::disk_binary_is_upgrade`.
     disk_direction_cache: std::sync::Mutex<engine_version::DiskDirectionCache>,
-    /// Throttled cache of the commits between the running engine's commit and
-    /// HEAD, which the status toast lists while a rebuild runs. Same reason as
+    /// Throttled cache of the commits a switch would bring (see
+    /// `engine_version::PendingCommits`), which the status toast lists while a
+    /// rebuild runs. Same reason as
     /// `source_behind_cache`: version-status is polled every ~4s per client and
     /// this forks `git log`. Only read when a build is in flight or the source is
     /// behind HEAD, so an idle workspace never populates it. Dev-only. See
@@ -502,6 +508,12 @@ pub struct LucidosEngine {
     /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
     /// snapshots are taken from. Set alongside `served_frontend`.
     served_frontend_source: std::sync::OnceLock<PathBuf>,
+    /// The trunk HEAD the served snapshot was taken at, or `None` when unknown
+    /// or when an engine change sits between it and the running commit. `None`
+    /// at boot, and written on each successful swap. `engine_version::pending_commits_since` reads
+    /// it to leave out what that client already carries. In memory like the
+    /// snapshot itself: a restart re-pins and records again.
+    served_frontend_commit: std::sync::Mutex<Option<String>>,
     /// Monotonic generation for served-frontend re-snapshots: coalesces rapid
     /// frontend-only Applies (only the latest generation swaps) AND names the
     /// snapshot subdir. Boot pins generation 0; the first refresh is generation 1.
@@ -657,9 +669,12 @@ pub struct LucidosEngine {
     /// Registered coding-agent backends (Claude Code, Codex, …).
     /// Engine code spawns agents via this registry instead of naming a concrete runtime.
     pub(crate) agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
-    /// Per-thread timestamps of the last Claude Code session spawn — used to debounce duplicate requests.
+    /// Per-thread time of the last coding-agent spawn, for the spawn debounce.
     /// Keyed by thread_id so concurrent starts on different threads are not blocked.
-    last_cc_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    last_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    /// Spawns past the spawn debounce that have not returned yet. Together with
+    /// `agent_sessions` this answers whether anybody owns a thread.
+    spawns_in_flight: agent_session::SpawnsInFlight,
     /// Pre-spawn map of `cc_thread_id` → `app_id` for app coding-agent
     /// threads. `spawn_agent_thread` stashes the app id here before
     /// `process_message_with_steps` runs; `run_direct_agent` pops it in to
@@ -667,6 +682,9 @@ pub struct LucidosEngine {
     /// `SessionStarted` event lands (the value is then persisted on the
     /// event payload and in `thread_summaries.coding_agent_kind`).
     pub(crate) pending_app_spawn: std::sync::Mutex<HashMap<Uuid, String>>,
+    /// Keeps a thread's coding-agent follow-ups in the order they were sent.
+    /// See `chat::follow_up_order`.
+    pub(crate) follow_up_order: FollowUpOrder,
     /// Per-thread spawn-coalescer. Phase 2 made every Claude Code subprocess exit on
     /// idle, so two rapid follow-ups (within ~250ms) used to either race two
     /// subprocesses or drop the second message with a "duplicate request"

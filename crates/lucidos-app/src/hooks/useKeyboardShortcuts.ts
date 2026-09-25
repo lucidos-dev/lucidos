@@ -21,6 +21,7 @@ import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadF
 import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
 import { stepThreadTurn, parseNavigatedTurn } from '../components/chat/scrollState';
+import { stepViewedNotification } from '../store/actions/notifications';
 import { navFocusElement, applyNavFocus } from '../components/shared/focusMarker';
 
 function startNewThread() {
@@ -79,10 +80,11 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   toggleSubthreads: toggleFocusedThreadFamily,
   historyBack: () => historyBack(),
   historyForward: () => historyForward(),
-  // Step the transcript one turn (a .chat-exchange) up/down and land focus in the
-  // scrollable transcript so continuous Arrow/Page scrolling follows.
-  prevThreadTurn: () => stepThreadTurn(-1),
-  nextThreadTurn: () => stepThreadTurn(1),
+  // Step the open notification newer/older when the content pane holds one.
+  // Otherwise step the transcript one turn (a .chat-exchange) up/down and land
+  // focus in it, so continuous Arrow/Page scrolling follows.
+  prevTurnOrNotification: () => { if (!stepViewedNotification(-1)) stepThreadTurn(-1); },
+  nextTurnOrNotification: () => { if (!stepViewedNotification(1)) stepThreadTurn(1); },
   toggleThreadDrawer: () => { if (focusOrToggleThreadDrawer()) seedDrawerHighlight(); },
   toggleThreadPane,
   toggleContentPane,

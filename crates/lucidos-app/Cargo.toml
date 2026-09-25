@@ -10,6 +10,8 @@ edition = "2021"
 [features]
 window-probe = [
     "dep:objc2-web-kit",
+    "objc2-app-kit/NSAppearance",
+    "objc2-app-kit/NSColor",
     "objc2-app-kit/NSEvent",
     "objc2-app-kit/NSGraphics",
     "objc2-app-kit/NSScreen",

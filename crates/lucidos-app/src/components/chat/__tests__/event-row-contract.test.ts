@@ -143,6 +143,19 @@ describe('event row contract', () => {
     expect(block('.event-row-subject')).toContain('min-width: 0');
   });
 
+  /** **The phone half.** The subject may break anywhere, so its min-content is
+   *  one letter. With the time and the pill fixed beside it, a phone-width pane
+   *  squeezed it to one letter per line. The head wraps instead, and the subject
+   *  keeps a basis, so the time and the pill drop to a line of their own. They
+   *  travel as one group, so neither is stranded alone. */
+  it('wraps the time and state below a subject that has no room', () => {
+    const head = block('.event-row-head');
+    expect(head).toContain('flex-wrap: wrap');
+    expect(block('.event-row-subject')).toMatch(/flex:\s*1 1 \d+(\.\d+)?rem/);
+    expect(block('.event-row-aside')).toContain('margin-left: auto');
+    expect(code(row)).toMatch(/class="event-row-aside"[\s\S]*event-row-time[\s\S]*event-row-state/);
+  });
+
   /** A fold on the card's own fill would open onto an invisible panel. */
   it('lifts the fold body off the card fill', () => {
     const fold = block('.event-row-fold > pre,\n.event-row-fold > .event-row-fold-body');

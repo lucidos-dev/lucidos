@@ -155,6 +155,59 @@ fn write_from_worktree_targets_the_parent_workspace_engine() {
         !stderr.contains("worktrees"),
         "stderr must not name the worktree, got: {stderr}"
     );
+    assert!(
+        !stderr.contains("cannot see"),
+        "only a picture carries the not-shown reminder, got: {stderr}"
+    );
+}
+
+/// An agent saved a picture, told the user "I've drawn out the options", and
+/// pasted no image line. Saving a picture must say it is not shown yet, while
+/// stdout stays the paste-ready line and the path stays stderr's last line.
+#[test]
+fn write_of_a_picture_says_the_user_cannot_see_it_yet() {
+    let (port, _requests) = spawn_stub_engine(StatusCode::OK);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_ports(&workspace, port);
+
+    let src = tmp.path().join("options.png");
+    fs::write(&src, b"not really a png").unwrap();
+
+    let out = Command::new(LUCIDOS)
+        .args(["data", "write", "artifacts/design/options.png", "--from"])
+        .arg(&src)
+        .current_dir(&workspace)
+        .env_remove("LUCIDOS_WORKSPACE")
+        .env_remove("LUCIDOS_API_BASE_URL")
+        .output()
+        .expect("lucidos binary should run");
+    assert!(
+        out.status.success(),
+        "lucidos data write failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "![options.png](artifacts/design/options.png)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("The user cannot see this picture yet"),
+        "a saved picture must say it is not shown yet, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("give each option its own picture of only that option"),
+        "a choice between pictures must put each on its own option, got: {stderr}"
+    );
+    assert!(
+        stderr
+            .trim()
+            .ends_with("ws/data/artifacts/design/options.png"),
+        "the path must stay stderr's last line, got: {stderr}"
+    );
 }
 
 #[test]

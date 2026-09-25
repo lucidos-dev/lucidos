@@ -1,8 +1,9 @@
 import { signal } from '@preact/signals';
 import { showToast, workspaceName } from '../store';
 import { fetchWorkspaces } from '../../api/client';
-import { listWorkspaces, locateWorkspace, slugifyWorkspaceName } from '../../api/client/control';
+import { listWorkspaces, locateWorkspace } from '../../api/client/control';
 import { GATEWAY_PORT, WORKSPACE_ID } from '../../utils/basePath';
+import { slugifyWorkspaceName } from '../../utils/slug';
 import { isTauri } from '../../utils/platform';
 import { openUrl } from './artifacts';
 import { focusThreadOrBootstrap } from './threads';

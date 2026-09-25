@@ -2305,8 +2305,9 @@ async fn emit(
 pub async fn opening_for(engine: &LucidosEngine, thread_id: Uuid) -> SessionOpening {
     let pool = engine.pool();
     let language = language::for_workspace(pool).await;
+    let literacy = crate::core::technical_literacy::read(pool).await;
     SessionOpening {
-        instructions: super::instructions_for(language.as_ref()),
+        instructions: super::instructions_for(language.as_ref(), literacy),
         resident_block: resident::build_block(engine, thread_id).await,
         // Both resolve their catalog default, so neither is guarded here. The
         // voice was a const while nothing could hear it: a setting nobody can

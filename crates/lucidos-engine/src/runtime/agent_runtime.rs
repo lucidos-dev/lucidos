@@ -58,8 +58,14 @@ pub enum AgentEvent {
         slash_commands: Vec<String>,
         skills: Vec<String>,
     },
-    /// Streamed assistant text fragment.
-    Message { role: String, text: String },
+    /// Streamed assistant text fragment. `opens_block` is true when this text
+    /// starts a new content block rather than continuing the open one. The
+    /// consumer starts a new paragraph there, so two blocks never run together.
+    Message {
+        role: String,
+        text: String,
+        opens_block: bool,
+    },
     /// Streamed reasoning/thinking fragment — human-readable extended-thinking
     /// text the agent emitted before (or between) its visible output. CC sends it
     /// as a `stream_event` → `content_block_delta` with `delta.type:
@@ -99,6 +105,14 @@ pub enum AgentEvent {
         status: String,
         id: String,
     },
+    /// The agent took the oldest forwarded inputs it had not taken yet.
+    ///
+    /// Claude Code reports it by replaying the input (`--replay-user-messages`).
+    /// The replay comes mid-turn when it folds the input in at a tool result,
+    /// and at the next turn's start otherwise. Inputs queued behind a busy turn
+    /// share one replay, which carries what they said. Codex reports one input
+    /// when the driver starts the turn that carries it, and carries `None`.
+    InputRead(Option<ReplayedInput>),
     /// Turn-complete marker. The agent is now idle.
     /// `error` is `Some` when the agent reported the turn ended in failure
     /// (CC's `subtype: "error_during_execution"` etc., `is_error: true`) —
@@ -136,6 +150,17 @@ pub enum AgentEvent {
     Exited { killed_by_signal: bool },
 }
 
+/// What one Claude Code replay carried, which may be several inputs.
+///
+/// Claude Code joins queued plain-text inputs into one text with newlines. Once
+/// an image is among them it keeps every input's blocks apart instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedInput {
+    /// The text blocks, in order.
+    pub texts: Vec<String>,
+    pub images: usize,
+}
+
 /// User input sent to a running agent.
 #[derive(Debug, Clone)]
 pub struct AgentInput {
@@ -159,6 +184,9 @@ pub enum ControlRequest {
 #[derive(Clone)]
 pub struct SpawnArgs<'a> {
     pub worktree_path: &'a Path,
+    /// Which repo the session edits. Decides who owns the lucidos-cli skill
+    /// file (see `lucidos_cli::place_lucidos_cli_skill`). Codex ignores it.
+    pub coding_agent_kind: crate::engine::agent_session::CodingAgentKind,
     /// Forwarded as `LUCIDOS_WORKSPACE` so subprocess tooling (e.g. the
     /// `lucidos` CLI) can resolve back to the right engine.
     pub workspace_path: &'a Path,
@@ -196,16 +224,6 @@ pub struct SpawnArgs<'a> {
     /// AskUserQuestion redirect (which would hang an unattended session
     /// waiting for an answer that's not coming).
     pub interactive: bool,
-    /// True when the engine resumes a mid-turn-interrupted session with NO
-    /// new user input (the `ContinuationRequested` recovery path) and expects
-    /// the agent to pick up where it left off on its own.
-    ///
-    /// Claude Code ignores this: `claude --print --resume` auto-injects
-    /// "Continue from where you left off." before reading stdin. Runtimes
-    /// whose CLI only acts on an explicit prompt (Codex) use it to start the
-    /// first turn with an equivalent continuation prompt instead of waiting
-    /// for an input that will never arrive.
-    pub continuation: bool,
     /// User-managed non-secret environment variables (`(NAME, value)` pairs from
     /// `EnvironmentVariableStore::env_pairs`). Applied FIRST in
     /// `runtime::spawn_env::apply_lucidos_env`, before every engine-owned var, so

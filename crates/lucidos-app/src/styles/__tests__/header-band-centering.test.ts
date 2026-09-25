@@ -54,20 +54,17 @@ describe('the desktop header centers on the whole bar, not on the header alone',
     ['.threads-header'],
     ['.app-header .pane-header-brand'],
     ['.app-header .content-header-elements'],
-    // The drawer toggle, in the header's LEFT-MOST slot. It TRAVELS
-    // horizontally between the two drawer states
-    // (header-drawer-toggle-travel.test.ts), so the lift is the only vertical
-    // term it may carry: a second one would make the icon rise or dip as it
-    // slid.
+    // The drawer toggle, in the header's LEFT-MOST slot in both drawer states
+    // (header-drawer-toggle-pinned.test.ts). The lift is the only vertical term
+    // it may carry: a second one would sit it off the line the bar shares.
     ['.thread-toggle-slot'],
   ])('%s takes the lift', selector => {
     expect(desktopRule(selector).props.get('transform')).toBe(CENTER_ON_BAND);
   });
 
   it('the Filter button rides its row, with no vertical term of its own', () => {
-    // The drawer-open half of the same slot, and a plain flex child of the
-    // lifted `.threads-header`. Any vertical term here moves it off the line
-    // the rest of the bar sits on.
+    // A plain flex child of the lifted `.threads-header`, beside Search. Any
+    // vertical term here moves it off the line the rest of the bar sits on.
     const slotRules = shellRules.filter(
       r => r.selector.includes('.view-selector-slot') && r.atRules === DESKTOP,
     );
@@ -142,9 +139,10 @@ describe('on the overlay build the leading control only steps sideways', () => {
   });
 
   it('the derived reserve still comes out at the 80px every reader was sized for', () => {
-    // Five call sites are laid out against this number: three leading
-    // controls, the centred threads title's clamp, and paneMinimums.ts's
-    // drawer floor. So the sum is pinned, not just the shape. 10 (our x) + 60
+    // Three readers are laid out against this number: the header's lead inset
+    // (which places the drawer toggle and leads the drawer row), the Canvas
+    // row's floor, and paneMinimums.ts's floors. So the sum is pinned, not just
+    // the shape. 10 (our x) + 60
     // (the cluster: three 14pt button frames at a 23pt pitch, measured) + 10
     // (what is left over).
     const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
@@ -230,16 +228,15 @@ describe('on the overlay build the leading control only steps sideways', () => {
   });
 
   it('the drawer toggle clears the lights, and moves in no other direction', () => {
-    // It moves the RESTING PLACE, not `left`: only the drawer-shut position
-    // differs between the builds. Overriding `left` here would restate the
-    // drawer-open rule, and be free to drift from it.
+    // It moves the RESTING PLACE, not `left`. The toggle rests there in both
+    // drawer states, so the one override covers both.
     //
-    // The resting place is --brand-lead-inset on :root, and it has to be there
-    // rather than on the slot: --brand-side-reserve reads the same value, so
-    // the centred brand cluster knows where this control actually is. A private
-    // copy on the slot is how the two came apart, which is the overlap the two
-    // cases below now rule out.
-    expect(desktopRule(':root[data-titlebar-overlay]').props.get('--brand-lead-inset'))
+    // The resting place is --header-lead-inset on :root, and it has to be there
+    // rather than on the slot: --brand-side-reserve and the drawer row's lead
+    // read the same value, so they know where this control actually is. A
+    // private copy on the slot is how such readers came apart, which is the
+    // overlap the cases below now rule out.
+    expect(desktopRule(':root[data-titlebar-overlay]').props.get('--header-lead-inset'))
       .toBe('var(--titlebar-lights-reserve)');
     // No rule of its own for the slot on this build: the override is the value.
     expect(shellRules.filter(
@@ -247,7 +244,7 @@ describe('on the overlay build the leading control only steps sideways', () => {
     ), 'the resting place has two declarations again').toEqual([]);
     // And the base rule is what consumes it, so the override cannot be inert.
     expect(desktopRule('.thread-toggle-slot').props.get('left'))
-      .toBe('var(--brand-lead-inset)');
+      .toBe('var(--header-lead-inset)');
     expect(shellCss, '--thread-toggle-home is retired; one name for one place')
       .not.toContain('--thread-toggle-home');
   });
@@ -264,7 +261,7 @@ describe('on the overlay build the leading control only steps sideways', () => {
       .toBe(true);
     // The leading term names the inset the toggle is actually placed with,
     // rather than restating 0.5rem or 80px.
-    expect(reserve).toContain('calc(var(--brand-lead-inset) + var(--header-icon-box))');
+    expect(reserve).toContain('calc(var(--header-lead-inset) + var(--header-icon-box))');
     // …and the trailing one is still the actions at their widest.
     expect(reserve).toContain('3 * var(--header-icon-box)');
   });
@@ -300,24 +297,30 @@ describe('on the overlay build the leading control only steps sideways', () => {
     expect([...rule.props.keys()], 'horizontal-only here too').toEqual(['left']);
   });
 
-  it('the drawer-open row starts after the lights, carrying the button with it', () => {
-    // Moving the ROW rather than the button keeps the two drawer states on one
-    // height for free: the button stays an ordinary flex child and inherits
-    // the row's bar centring.
-    const rule = desktopRule(':root[data-titlebar-overlay] .threads-header');
-    expect(rule.props.get('padding-left')).toBe('var(--titlebar-lights-reserve)');
+  it('the drawer row leads with the toggle\'s room, which carries the lights reserve', () => {
+    // The toggle rests over the row's leading end, and the row keeps that end
+    // for it. On the overlay build the toggle's inset IS the lights reserve. So
+    // the row clears the lights through the token that places the toggle, with
+    // no rule of its own. The lead's full arithmetic is pinned in
+    // header-drawer-toggle-pinned.test.ts.
+    expect(desktopRule('.threads-header').props.get('--threads-row-lead'))
+      .toContain('var(--header-lead-inset)');
+    expect(shellRules.filter(
+      r => r.selector === ':root[data-titlebar-overlay] .threads-header',
+    ), 'the row has an overlay-only lead again').toEqual([]);
   });
 
-  it('the reserve survives the search field taking over the row', () => {
+  it('the lead survives the search field taking over the row', () => {
     // The ROW is centred on the bar, so whatever leads it reaches into the
-    // band. Hand the reserve back under `.search-active` and the lights sit
-    // over the search field's magnifier, eating any click that lands there.
-    const searchRules = shellRules.filter(
-      r => r.selector.includes('.threads-header') && r.selector.includes('.search-active')
-        && r.selector.includes('[data-titlebar-overlay]'),
+    // band. Hand the lead back under `.search-active` and the field runs under
+    // the toggle, and under the lights on the overlay build too. The row's
+    // search rules live in drawer.css, so both sheets are read.
+    const searchRules = [...shellRules, ...cssRules(drawerCss)].filter(
+      r => r.selector.includes('.threads-header') && r.selector.includes('.search-active'),
     );
+    expect(searchRules.length, 'the row has no search-active rule to guard').toBeGreaterThan(0);
     for (const rule of searchRules) {
-      for (const prop of ['padding', 'padding-left']) {
+      for (const prop of ['padding', 'padding-left', 'clip-path']) {
         expect(rule.props.get(prop), `${rule.selector} { ${prop} }`).toBeUndefined();
       }
     }
@@ -334,8 +337,8 @@ describe('on the overlay build the leading control only steps sideways', () => {
     );
     expect(
       movers.length,
-      'expected the three leading-control rules, plus the centred title\'s clamp',
-    ).toBe(4);
+      'expected the toggle\'s inset and the Canvas row\'s floor',
+    ).toBe(2);
     for (const rule of movers) {
       expect(rule.selector, rule.selector).toContain('[data-titlebar-overlay]');
     }
@@ -344,10 +347,8 @@ describe('on the overlay build the leading control only steps sideways', () => {
 
 describe('the Threads title is centred on the pane, not between the icons', () => {
   it('is out of the flex row and pinned to the pane\'s own middle', () => {
-    // `flex: 1` centres the title on the GAP between the Filter and Search
-    // buttons. Off this build the gap's middle and the pane's coincide. Here
-    // the row starts after the lights reserve, which puts the title
-    // (reserve - 0.5rem) / 2 right of the pane's middle.
+    // `flex: 1` centres the title on the GAP between the row's two ends, and
+    // those differ in width: the toggle's room leads, Filter and Search trail.
     const title = desktopRule('.threads-header-title');
     expect(title.props.get('position')).toBe('absolute');
     expect(title.props.get('left')).toBe('50%');
@@ -358,61 +359,64 @@ describe('the Threads title is centred on the pane, not between the icons', () =
     expect(title.props.get('top')).toBe('50%');
   });
 
-  it('leaves the Search button pinned to the row\'s trailing edge', () => {
-    // With the title out of flow the row has two in-flow children left, and
-    // this is what holds them apart.
-    expect(desktopRule('.threads-header').props.get('justify-content')).toBe('space-between');
+  it('packs Filter and Search at the row\'s trailing edge', () => {
+    // With the title out of flow they are the row's only in-flow children,
+    // and the leading end belongs to the toggle.
+    expect(desktopRule('.threads-header').props.get('justify-content')).toBe('flex-end');
   });
 
-  it('clears the WIDER of the row\'s two ends on BOTH sides, per build', () => {
+  it('clears the WIDER of the row\'s two ends on BOTH sides, on both builds', () => {
     // A box centred on the pane overlaps a button as soon as it is wider than
     // twice the distance from the pane's middle to that button's inner edge.
-    // The clamp is therefore the structural non-overlap guarantee.
-    expect(desktopRule('.threads-header-title').props.get('max-width'))
-      .toBe('calc(100% - 2 * (var(--threads-title-lead) + var(--header-icon-box) + var(--pane-header-gap)))');
-    // The lead is the ONLY thing the overlay build touches, so the doubling
-    // lives in one shared clamp and cannot drift between the builds.
-    expect([...desktopRule(':root[data-titlebar-overlay] .threads-header-title').props.keys()])
-      .toEqual(['--threads-title-lead']);
+    // The clamp is therefore the structural non-overlap guarantee. One clamp
+    // for both builds: the overlay build moves only --header-lead-inset.
+    expect(desktopRule('.threads-header-title').props.get('max-width')).toBe(
+      'calc(100% - 2 * max(var(--threads-row-lead), '
+        + '0.5rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))))',
+    );
+    expect(shellRules.filter(
+      r => r.selector === ':root[data-titlebar-overlay] .threads-header-title',
+    ), 'the title has an overlay-only clamp again').toEqual([]);
   });
 
-  it('takes its lead from the row\'s own padding, on each build', () => {
-    // The clamp is symmetric about the pane's middle only if the lead it
-    // counts twice is what the row keeps clear at its leading end. CSS cannot
-    // hand that back as a resolved length, so this is the drift check on the
-    // web build's two literals.
-    const rowPadding = desktopRule('.threads-header').props.get('padding');
-    expect(rowPadding).toBe('0 0.5rem');
-    expect(desktopRule('.threads-header-title').props.get('--threads-title-lead'))
-      .toBe(rowPadding!.split(' ')[1]);
-
-    const overlayLead = desktopRule(':root[data-titlebar-overlay] .threads-header-title')
-      .props.get('--threads-title-lead');
-    expect(overlayLead)
-      .toBe(desktopRule(':root[data-titlebar-overlay] .threads-header').props.get('padding-left'));
+  it('counts the same two ends the row actually keeps clear', () => {
+    // The clamp is symmetric about the pane's middle only if its two terms are
+    // what the row keeps at each end. CSS cannot hand that back as a resolved
+    // length, so this is the drift check. The leading term is the property the
+    // row pads with, and the trailing term starts with the row's own padding.
+    const clamp = desktopRule('.threads-header-title').props.get('max-width')!;
+    const [, lead, trailPad] = /max\((var\([\w-]+\)), ([\d.]+rem) \+/.exec(clamp) ?? [];
+    expect(desktopRule('.threads-header').props.get('padding'))
+      .toBe(`0 ${trailPad} 0 ${lead}`);
   });
 
-  it('declares the lead on the title, where --pane-header-gap actually resolves', () => {
+  it('declares the lead on the row, where --pane-header-gap actually resolves', () => {
     // A custom property is substituted on the element that DECLARES it. A
     // `:root` copy would resolve --pane-header-gap against a rule that has
-    // never heard of it. That makes the clamp invalid at computed-value time,
-    // silently dropping the max-width.
-    for (const rule of shellRules) {
-      if (rule.props.get('--threads-title-lead') === undefined) continue;
-      expect(rule.selector, `${rule.selector} { --threads-title-lead }`)
-        .toContain('.threads-header-title');
-    }
+    // never heard of it. That makes the lead invalid at computed-value time,
+    // silently dropping the row's padding, its clip and the title's clamp.
+    const declaring = shellRules.filter(r => r.props.has('--threads-row-lead'));
+    expect(declaring.map(r => r.selector)).toEqual(['.threads-header']);
+    expect(shellCss, '--threads-title-lead is retired; the row owns the lead')
+      .not.toContain('--threads-title-lead');
   });
 });
 
 describe('the threads header clips sideways only, on both builds', () => {
-  it('every edge is flush, now that nothing leaves the row vertically', () => {
-    expect(desktopRule('.threads-header').props.get('clip-path')).toBe('inset(0)');
-  });
-
-  it('the overlay build adds no clip of its own', () => {
-    expect(desktopRule(':root[data-titlebar-overlay] .threads-header').props.get('clip-path'))
-      .toBeUndefined();
+  it('its top and bottom let out the focus ring, and its right edge is flush', () => {
+    // The row is exactly one button tall, so a flush top and bottom cut the
+    // focus ring on Filter and Search. The right edge is flush because the
+    // row's own padding already holds the ring there. The left inset is the
+    // toggle's room, pinned in header-drawer-toggle-pinned.test.ts.
+    const clip = desktopRule('.threads-header').props.get('clip-path') ?? '';
+    const [, top, right, bottom] = /^inset\((-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) /
+      .exec(clip) ?? [];
+    const ring = shellRules.find(r => r.selector === '.app-header .icon-btn:focus-visible');
+    const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(ring?.props.get('--focus-ring') ?? '')?.[1] ?? 'NaN');
+    for (const edge of [top, bottom]) {
+      expect(-parseFloat(edge), `clip ${clip} cuts the ${band}rem focus ring`).toBeGreaterThanOrEqual(band);
+    }
+    expect(right).toBe('0');
   });
 
   it('carries no clip release for the popout that no longer exists', () => {

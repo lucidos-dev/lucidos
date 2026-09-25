@@ -41,13 +41,19 @@ impl LucidosEngine {
             ));
         }
 
-        // Check fan-out: how many children does this parent already have?
-        let child_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM thread_summaries WHERE parent_thread_id = $1")
-                .bind(parent_thread_id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| format!("Failed to query child thread count: {}", e))?;
+        // Fan-out counts every child this parent spawned, including the ones
+        // moved to top level. Otherwise a move would buy back a slot, over and
+        // over (ADR 0278).
+        let child_count: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM thread_summaries WHERE parent_thread_id = $1) \
+                  + (SELECT COUNT(*) FROM events \
+                     WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+                       AND event_type = 'ChildThreadDetached')",
+        )
+        .bind(parent_thread_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Failed to query child thread count: {}", e))?;
 
         if child_count >= MAX_CHILDREN_PER_THREAD {
             return Err(format!(

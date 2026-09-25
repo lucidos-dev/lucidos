@@ -55,6 +55,30 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
     )
 }
 
+/// What a member that changed state after the lock dropped is told. The raw
+/// lifecycle error names engine internals, so it goes to the log instead.
+const LEFT_OPEN_MESSAGE: &str = "It changed state after the archive began, so it was left open";
+
+/// The `skipped` entry for a member the cascade left unarchived: the change-claim
+/// slug and the engine's words when a claim refused its stop, or
+/// `not_archivable` with [`LEFT_OPEN_MESSAGE`].
+fn skipped_member(thread_id: uuid::Uuid, reason: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({ "thread_id": thread_id, "reason": reason, "message": message })
+}
+
+/// The `409` for a target thread whose session a change claim holds.
+fn claimed_target_rejection(
+    holder: crate::engine::types::ChangeClaim,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(serde_json::json!({
+            "reason": crate::engine::claude_code::claim_refusal_slug(holder),
+            "message": crate::engine::claude_code::claim_refusal_message(holder),
+        })),
+    )
+}
+
 /// POST /api/v1/threads/archive — cascading archive of a thread + every descendant.
 ///
 /// Inside one transaction the recursive CTE locks parent + all descendants
@@ -104,8 +128,13 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 /// Then, when the root still owed its parent a card, the parent gets the
 /// canceled card (ADR 0252, ADR 0254).
 ///
+/// A change claim holding the TARGET's session refuses the whole call first,
+/// before anything is locked or emitted. The claim is an apply or an in-session
+/// Discard, and the `409` names which. A member whose stop a claim refuses later,
+/// or one that parked after the lock dropped, stays unarchived and is reported.
+///
 /// Already-archived rows are skipped, so nothing is emitted twice. Response:
-/// `{"archived": [<uuid>, ...]}`, the members this call archived.
+/// `{"archived": [<uuid>, ...], "skipped": [{thread_id, reason, message}, ...]}`.
 pub(in crate::api) async fn archive_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -127,6 +156,11 @@ pub(in crate::api) async fn archive_thread(
     )
     .await
     .map_err(reach_rejection)?;
+    // Before the transaction too, so a refused target changes nothing. A
+    // single-thread archive is exactly this case, and must not answer 200.
+    if let Some(holder) = state.engine.change_claim_holder(thread_uuid).await {
+        return Err(claimed_target_rejection(holder));
+    }
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     let mut tx = state.engine.pool().begin().await.map_err(internal_json)?;
@@ -211,6 +245,7 @@ pub(in crate::api) async fn archive_thread(
     }
 
     let mut archived = Vec::with_capacity(to_archive.len());
+    let mut skipped = Vec::new();
     for tid in &to_archive {
         // Cancel-stamp the orphaned QuestionCard, if any, so its answer
         // buttons render disabled instead of dangling clickable on the
@@ -274,6 +309,15 @@ pub(in crate::api) async fn archive_thread(
                 )
                 .await
             {
+                // An apply or discard holding the session refuses the stop.
+                // Archiving anyway would leave it and its live session running
+                // on an archived thread, so the member stays unarchived.
+                let message = e.to_string();
+                if let Some(reason) = crate::engine::claude_code::claim_refusal_reason(&message) {
+                    log!("[API] archive_thread: {} not archived: {}", tid, message);
+                    skipped.push(skipped_member(*tid, reason, &message));
+                    continue;
+                }
                 log!("[API] Failed to end Claude Code session on archive: {}", e);
             }
         }
@@ -292,6 +336,7 @@ pub(in crate::api) async fn archive_thread(
             // The bus refused: the member parked after the lock dropped.
             Err(e) if e.downcast_ref::<LifecycleViolation>().is_some() => {
                 log!("[API] archive_thread: {} not archived: {}", tid, e);
+                skipped.push(skipped_member(*tid, "not_archivable", LEFT_OPEN_MESSAGE));
             }
             Err(e) => return Err(internal_json(e)),
         }
@@ -309,5 +354,74 @@ pub(in crate::api) async fn archive_thread(
             .await;
     }
 
-    Ok(axum::Json(serde_json::json!({ "archived": archived })))
+    Ok(axum::Json(
+        serde_json::json!({ "archived": archived, "skipped": skipped }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::claude_code::{APPLY_IN_PROGRESS_MESSAGE, DISCARD_IN_PROGRESS_MESSAGE};
+    use crate::engine::types::ChangeClaim;
+
+    /// A member a change claim kept from being archived is reported with the
+    /// holder's reason and words, so the caller can say which and why.
+    #[test]
+    fn a_skipped_member_carries_its_reason_and_message() {
+        let tid = uuid::Uuid::new_v4();
+        assert_eq!(
+            skipped_member(tid, "discard_in_progress", DISCARD_IN_PROGRESS_MESSAGE),
+            serde_json::json!({
+                "thread_id": tid,
+                "reason": "discard_in_progress",
+                "message": DISCARD_IN_PROGRESS_MESSAGE,
+            })
+        );
+        assert!(
+            !LEFT_OPEN_MESSAGE.to_lowercase().contains("lifecycle"),
+            "a member left open is told in plain words, not engine internals"
+        );
+    }
+
+    /// A refused target fails the call as a 409 naming the holder, so a
+    /// single-thread archive never answers 200 with nothing archived.
+    #[test]
+    fn a_claimed_target_is_a_conflict_that_names_the_holder() {
+        for (holder, slug, message) in [
+            (
+                ChangeClaim::Apply,
+                "apply_in_progress",
+                APPLY_IN_PROGRESS_MESSAGE,
+            ),
+            (
+                ChangeClaim::Discard,
+                "discard_in_progress",
+                DISCARD_IN_PROGRESS_MESSAGE,
+            ),
+        ] {
+            let (status, body) = claimed_target_rejection(holder);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                body.0,
+                serde_json::json!({ "reason": slug, "message": message })
+            );
+        }
+    }
+
+    /// The target's claim is checked before the family transaction opens, so a
+    /// refused target changes nothing: no lock, no cleared change, no emit.
+    #[test]
+    fn a_claimed_target_is_refused_before_anything_is_touched() {
+        let src = crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("api/threads/archive.rs"),
+        );
+        let body = &src[src.find("async fn archive_thread(").expect("handler")..];
+        let check = body.find("change_claim_holder(").expect("the pre-check");
+        let begin = body.find(".begin()").expect("the family transaction");
+        assert!(
+            check < begin,
+            "the claim check must run before the transaction"
+        );
+    }
 }

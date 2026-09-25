@@ -11,6 +11,12 @@
 
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
+import { scaledDurationMs } from '../../utils/motion';
+
+/** The textarea's height ease on a compose-draft switch, at 1x. It rides the
+ *  Animation speed slider, and so does the safety net that outlives it. */
+const HEIGHT_EASE_MS = 300;
+const HEIGHT_EASE_SLACK_MS = 100;
 
 const cache = new WeakMap<HTMLTextAreaElement, { height: number; len: number }>();
 
@@ -40,7 +46,7 @@ function boxWidth(el: HTMLTextAreaElement): number {
  *
  *  Measured on a clone rather than by borrowing the real element's `value`,
  *  which would fire the editing pipeline and, on iOS, leave the keyboard's
- *  shift state stale (see `.claude/rules/frontend.md` on programmatic clears). */
+ *  shift state stale (see `.claude/rules/frontend-css.md` on programmatic clears). */
 function placeholderHeight(el: HTMLTextAreaElement): number {
   const parent = el.parentElement;
   if (!el.placeholder || el.value.length > 0 || !parent || !el.cloneNode) return 0;
@@ -223,7 +229,7 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
     raf2 = requestAnimationFrame(() => {
       started = true;
       el.addEventListener('transitionend', finish);
-      el.style.transition = 'height 0.3s ease';
+      el.style.transition = `height ${scaledDurationMs(HEIGHT_EASE_MS)}ms ease`;
       el.style.height = target;
       // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
       //
@@ -237,7 +243,7 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
       //
       // The window before this frame is covered by `onHidden`, which is the
       // only case that can keep the frame from arriving at all.
-      timer = setTimeout(finish, 400);
+      timer = setTimeout(finish, scaledDurationMs(HEIGHT_EASE_MS) + HEIGHT_EASE_SLACK_MS);
     });
   });
 }

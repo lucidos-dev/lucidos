@@ -272,6 +272,12 @@ enum Command {
     /// engine's proxy (engine injects the configured auth header). Body to
     /// stdout; exit 0 by default even on 4xx/5xx. Use `--fail` to mirror
     /// `curl --fail`, `--include` to mirror `curl -i`.
+    ///
+    /// The engine waits 30 s on the upstream by default, then answers 504. A
+    /// streamed reply counts in full. Raise the wait for every route with the
+    /// `proxy_timeout_secs` preference (`lucidos preferences set --key
+    /// proxy_timeout_secs --value 300`), or for one entry with `timeout_secs`
+    /// in `apis.json`. Both accept 1 to 600.
     Proxy(ProxyCliArgs),
     /// Approve an auth handshake script, or list which ones may run.
     ///
@@ -475,7 +481,21 @@ enum ChangesCmd {
     /// canonical way to find a pending change's id before `apply` — read
     /// `.pending[].id` from the output. Exit non-zero on transport / HTTP
     /// error.
-    List,
+    ///
+    /// Each pending change carries `thread_unsettled`. `true` means its thread
+    /// is still working: mid-turn, on a question, resolving a conflict, or
+    /// watching an event. `apply` refuses such a change.
+    List {
+        /// Only changes held by this thread's sub-threads, at any depth. The
+        /// thread's own changes are left out.
+        #[arg(long)]
+        sub_threads_of: Option<String>,
+        /// Only changes held by THIS thread's sub-threads. Shorthand for
+        /// `--sub-threads-of` with the calling thread's own id, so it only
+        /// works from inside a Lucidos thread.
+        #[arg(long, conflicts_with = "sub_threads_of")]
+        my_sub_threads: bool,
+    },
     /// Apply a pending change by id. Echoes the engine's typed
     /// `ApplyChangeResult` JSON to stdout (see `docs/apply-change-api.md`).
     /// Exit non-zero on transport / HTTP error; the engine's error body is
@@ -576,6 +596,23 @@ enum ThreadsCmd {
         #[arg(long)]
         urgent: bool,
     },
+    /// Move a child thread to top level, so its parent stops waiting for it.
+    ///
+    /// The child keeps running and finishes on its own. It is not stopped,
+    /// and no work is lost. Its former parent gets no result from it, cannot
+    /// follow up on it, and does not get the child slot back. The move cannot
+    /// be undone.
+    ///
+    /// From inside a Lucidos thread you can only move your own DIRECT
+    /// children: the engine reads the calling thread from the origin token
+    /// this subprocess was spawned with. Outside a thread, it moves any
+    /// thread that has a parent, as the thread menu's "Move to top level"
+    /// does.
+    Detach {
+        /// The child's uuid. Find it with `threads list --my-children`.
+        #[arg(long)]
+        thread: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -589,6 +626,11 @@ enum BackgroundTaskCmd {
     /// The exit status is the command's own. Do not end it with
     /// `; echo $? > file`, which always exits 0; end with `exit $rc` instead.
     Run {
+        /// What the task is, as a short noun phrase in the user's language
+        /// ("the nightly e2e sweep"). The thread's waiting row shows it as
+        /// "<description> to finish". Without it the row shows the command.
+        #[arg(long)]
+        description: Option<String>,
         /// Kill the task if it is still running after this many seconds
         /// (default and maximum 3600).
         #[arg(long = "timeout-secs")]
@@ -666,9 +708,9 @@ pub(crate) struct AwaitEventArgs {
     /// matches, so pick a real upper bound and add margin.
     #[arg(long = "timeout-secs")]
     pub(crate) timeout_secs: i64,
-    /// One short line, in the user's language, saying what you are waiting for
-    /// and why. The user reads it in the waiting indicator, and it is how
-    /// they tell a sleeping thread from a stalled one.
+    /// What you are waiting for, as a short noun phrase in the user's language
+    /// ("the release build to finish"). The user reads it after "Waiting for",
+    /// and it is how they tell a sleeping thread from a stalled one.
     #[arg(long)]
     pub(crate) reason: String,
 }
@@ -1063,7 +1105,7 @@ enum DataCmd {
     },
     /// Write content to the resolved absolute path. Creates parent dirs.
     /// Prints a clickable chat link (bare store path, no scheme) on stdout and
-    /// the absolute path on stderr.
+    /// the absolute path on stderr. A picture's link is an inline image.
     Write(WriteArgs),
 }
 
@@ -1377,9 +1419,10 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             let ws = resolve_from_env()?;
             match action {
                 BackgroundTaskCmd::Run {
+                    description,
                     timeout_secs,
                     command,
-                } => background_task::cmd_run(&ws, &command, timeout_secs)?,
+                } => background_task::cmd_run(&ws, &command, description.as_deref(), timeout_secs)?,
                 BackgroundTaskCmd::Output { task_id } => {
                     background_task::cmd_output(&ws, &task_id)?
                 }
@@ -1474,13 +1517,25 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     event_id.or_else(threads::event_id_from_env).as_deref(),
                     urgent,
                 )?,
+                ThreadsCmd::Detach { thread } => threads::cmd_detach(&ws, &thread)?,
             }
             Ok(0)
         }
         Command::Changes { action } => {
             let ws = resolve_from_env()?;
             match action {
-                ChangesCmd::List => changes::cmd_list(&ws)?,
+                ChangesCmd::List {
+                    sub_threads_of,
+                    my_sub_threads,
+                } => changes::cmd_list(
+                    &ws,
+                    changes::resolve_sub_threads_of(
+                        sub_threads_of,
+                        my_sub_threads,
+                        threads::source_thread_id_from_env(),
+                    )?
+                    .as_deref(),
+                )?,
                 ChangesCmd::Apply { change_id } => changes::cmd_apply(&ws, &change_id)?,
             }
             Ok(0)
@@ -1596,6 +1651,20 @@ mod tests {
             assert!(
                 !flags.iter().any(|f| f == forbidden),
                 "{forbidden} must not exist on follow-up: the caller is authenticated, not stated"
+            );
+        }
+    }
+
+    /// `threads detach` states no caller either: the origin token decides
+    /// whether it may move only this thread's own children.
+    #[test]
+    fn detach_exposes_no_caller_identity_flag() {
+        let flags = subcommand_flags(&["threads", "detach"]);
+        assert!(flags.contains(&"--thread".to_string()), "{flags:?}");
+        for forbidden in ["--from", "--caller", "--caller-thread", "--parent"] {
+            assert!(
+                !flags.iter().any(|f| f == forbidden),
+                "{forbidden} must not exist on detach: the caller is authenticated, not stated"
             );
         }
     }

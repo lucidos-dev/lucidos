@@ -102,7 +102,7 @@ The lock's refusal is correct, and how a loser *waits* was not. On 2026-08-09 th
 
 So **the lock announces itself**. Every hold emits `E2ELockAcquired` when it starts and `E2ELockReleased` when it ends, as domain events through `lucidos events emit`. A refused run subscribes with `lucidos await-event --on E2ELockReleased` and **ends its turn**. The engine re-opens the thread when the event lands.
 
-`.claude/skills/e2e-lock-wait/SKILL.md` carries the agent-facing rules: one-shot subscription, forward-only watch, the cap of 10 subscriptions an hour, the attempt cap, and timeout handling. The refusal message teaches the same path in four lines, so an agent that never loaded the skill still does the right thing.
+`.claude/skills/e2e-lock-wait/SKILL.md` carries the agent-facing rules: one-shot subscription, forward-only watch, the cap of 20 counted subscriptions an hour, the attempt cap, and timeout handling. The refusal message teaches the same path in four lines, so an agent that never loaded the skill still does the right thing.
 
 | Event | When | Payload |
 |---|---|---|

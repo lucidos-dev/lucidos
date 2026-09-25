@@ -1,15 +1,9 @@
 /**
- * Tests for the sub-thread disclosure control on family parent rows — a single
- * toggle anchored at the parent row's bottom-center that swaps contents by
- * collapse state:
- *
- *   - EXPANDED  → the ▴ chevron alone (the affordance to collapse back).
- *   - COLLAPSED → the sub-thread count badge alone (no chevron); the badge
- *                 itself signals there are hidden sub-threads, and clicking it
- *                 re-expands.
+ * Tests for the sub-thread toggle on family parent rows: a "Show / Hide N
+ * sub-threads" link under the date. Both states name the count.
  *
  * The control only renders in the nested ThreadList (collapsible context);
- * search / drafts render flat lists, so they show neither chevron nor badge.
+ * search / drafts render flat lists, so they show no toggle.
  *
  * The waiting status icon (pulsing dot) must show on the parent row when
  * activeChildrenCount > 0.
@@ -20,7 +14,8 @@ import { threadMap, threadsLoaded } from '../../store/store';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
-import { resolveVisualStatus } from '../shared/ThreadStatusIcon';
+import { resolveVisualStatus, visualStatusFor } from '../shared/ThreadStatusIcon';
+import { familyDisclosureLabel } from './ThreadDrawer';
 
 function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadState {
   return {
@@ -59,34 +54,19 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
   };
 }
 
-/**
- * Replicate ThreadRowContentImpl's family-disclosure decisions. Mirrors the
- * logic in ThreadDrawer.tsx — the disclosure control renders when `collapsible
- * && totalChildrenCount > 0`, and swaps contents by collapse state: the ▴
- * chevron ONLY while expanded, the count badge (totalChildrenCount) ONLY while
- * collapsed (the two are mutually exclusive). Also surfaces the visual-status
- * resolution still performed on every parent row (ThreadRow / SearchResultRow).
- */
+/** ThreadRowContentImpl renders the toggle when `collapsible &&
+ *  totalChildrenCount > 0`. Also surfaces the visual-status resolution still
+ *  performed on every parent row (ThreadRow / SearchResultRow). */
 function familyRenderState(
   meta: ThreadMeta,
   status: ThreadStatus,
   opts: { collapsible: boolean; isCollapsed: boolean } = { collapsible: true, isCollapsed: false },
 ) {
-  const hasFamily = opts.collapsible && meta.totalChildrenCount > 0;
-  const hasActiveChildren = meta.activeChildrenCount > 0;
-  const a11yCount = `${meta.totalChildrenCount} sub-thread${meta.totalChildrenCount === 1 ? '' : 's'}`;
+  const hasDisclosure = opts.collapsible && meta.totalChildrenCount > 0;
   return {
-    // The toggle button itself renders whenever the family is collapsible.
-    hasDisclosure: hasFamily,
-    // Chevron only when EXPANDED; badge only when COLLAPSED — never both.
-    showChevron: hasFamily && !opts.isCollapsed,
-    showCount: hasFamily && opts.isCollapsed,
-    countText: hasFamily && opts.isCollapsed ? String(meta.totalChildrenCount) : null,
-    a11yCount,
-    // The control's own tooltip + aria-label, so hovering the badge/chevron
-    // never falls through to the row's general thread tooltip.
-    disclosureLabel: opts.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads',
-    visualStatus: resolveVisualStatus(status, hasActiveChildren, meta.codingAgentProposed, meta.liveEventWaitCount > 0),
+    hasDisclosure,
+    label: hasDisclosure ? familyDisclosureLabel(meta.totalChildrenCount, opts.isCollapsed) : null,
+    visualStatus: visualStatusFor(status, meta),
   };
 }
 
@@ -96,7 +76,7 @@ beforeEach(() => {
 });
 
 describe('family disclosure visibility', () => {
-  it('shows the chevron (no badge) when an EXPANDED collapsible thread has children (any section)', () => {
+  it('shows the toggle when a collapsible thread has children (any section)', () => {
     const sections: Array<{ section: ArchiveState; status: ThreadStatus; saved: boolean; activeChildren: number }> = [
       // Waiting: idle + active children
       { section: 'archived', status: 'idle', saved: false, activeChildren: 2 },
@@ -118,85 +98,34 @@ describe('family disclosure visibility', () => {
       });
 
       const display = displaySection(section, status, saved, activeChildren > 0, false, false);
-      // Default opts = expanded: chevron shown, count badge absent.
-      const render = familyRenderState(thread.meta, status);
-
-      expect(render.hasDisclosure).toBe(true);
-      expect(render.showChevron).toBe(true);
-      expect(render.showCount).toBe(false);
-      // Verify this is a valid display section
+      expect(familyRenderState(thread.meta, status).hasDisclosure).toBe(true);
       expect(['current', 'saved', 'archive']).toContain(display);
     }
   });
 
-  it('does not show the disclosure control when the thread has no children', () => {
+  it('does not show the toggle when the thread has no children', () => {
     const thread = makeThread('t1', { totalChildrenCount: 0, activeChildrenCount: 0 });
-    const render = familyRenderState(thread.meta, 'idle');
-
-    expect(render.hasDisclosure).toBe(false);
-    expect(render.showChevron).toBe(false);
-    expect(render.showCount).toBe(false);
+    expect(familyRenderState(thread.meta, 'idle').hasDisclosure).toBe(false);
   });
 
-  it('does not show the disclosure control in a non-collapsible context (search / drafts)', () => {
+  it('does not show the toggle in a non-collapsible context (search / drafts)', () => {
     const thread = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 1 });
     const render = familyRenderState(thread.meta, 'idle', { collapsible: false, isCollapsed: false });
-
     expect(render.hasDisclosure).toBe(false);
-    expect(render.showChevron).toBe(false);
-    expect(render.showCount).toBe(false);
   });
 
-  it('collapsed = badge only (no chevron); expanded = chevron only (no badge)', () => {
-    const thread = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 1 });
-    const expanded = familyRenderState(thread.meta, 'idle', { collapsible: true, isCollapsed: false });
-    const collapsed = familyRenderState(thread.meta, 'idle', { collapsible: true, isCollapsed: true });
-
-    // The toggle button is present in both states — only its contents swap.
-    expect(expanded.hasDisclosure).toBe(true);
-    expect(collapsed.hasDisclosure).toBe(true);
-
-    // Expanded: chevron, no badge.
-    expect(expanded.showChevron).toBe(true);
-    expect(expanded.showCount).toBe(false);
-    expect(expanded.countText).toBeNull();
-
-    // Collapsed: badge, no chevron.
-    expect(collapsed.showChevron).toBe(false);
-    expect(collapsed.showCount).toBe(true);
-    expect(collapsed.countText).toBe('3');
-  });
-
-  it('badge shows the total sub-thread count regardless of how many are done', () => {
-    const opts = { collapsible: true, isCollapsed: true };
-    const allActive = makeThread('t1', { totalChildrenCount: 3, activeChildrenCount: 3 });
+  it('names the total count in both states, whatever is done', () => {
+    expect(familyDisclosureLabel(3, true)).toBe('Show 3 sub-threads');
+    expect(familyDisclosureLabel(3, false)).toBe('Hide 3 sub-threads');
     const allDone = makeThread('t2', { totalChildrenCount: 3, activeChildrenCount: 0 });
-    const one = makeThread('t3', { totalChildrenCount: 1, activeChildrenCount: 0 });
-
-    expect(familyRenderState(allActive.meta, 'idle', opts).countText).toBe('3');
-    expect(familyRenderState(allDone.meta, 'idle', opts).countText).toBe('3');
-    expect(familyRenderState(one.meta, 'idle', opts).countText).toBe('1');
+    expect(familyRenderState(allDone.meta, 'idle', { collapsible: true, isCollapsed: true }).label)
+      .toBe('Show 3 sub-threads');
   });
 
-  it('keeps the aria label smart-plural (1 sub-thread, N sub-threads)', () => {
-    const one = makeThread('t1', { totalChildrenCount: 1, activeChildrenCount: 0 });
-    const many = makeThread('t2', { totalChildrenCount: 3, activeChildrenCount: 0 });
-
-    expect(familyRenderState(one.meta, 'idle').a11yCount).toBe('1 sub-thread');
-    expect(familyRenderState(many.meta, 'idle').a11yCount).toBe('3 sub-threads');
-  });
-
-  it('disclosure label is "Show N sub-threads" collapsed, "Hide sub-threads" expanded', () => {
-    const one = makeThread('t1', { totalChildrenCount: 1, activeChildrenCount: 0 });
-    const many = makeThread('t2', { totalChildrenCount: 3, activeChildrenCount: 0 });
-    const collapsed = { collapsible: true, isCollapsed: true };
-    const expanded = { collapsible: true, isCollapsed: false };
-
-    // Collapsed names the hidden count (smart-plural).
-    expect(familyRenderState(one.meta, 'idle', collapsed).disclosureLabel).toBe('Show 1 sub-thread');
-    expect(familyRenderState(many.meta, 'idle', collapsed).disclosureLabel).toBe('Show 3 sub-threads');
-    // Expanded drops the count — children are listed inline.
-    expect(familyRenderState(many.meta, 'idle', expanded).disclosureLabel).toBe('Hide sub-threads');
+  it('is smart-plural (1 sub-thread, N sub-threads)', () => {
+    expect(familyDisclosureLabel(1, true)).toBe('Show 1 sub-thread');
+    expect(familyDisclosureLabel(1, false)).toBe('Hide 1 sub-thread');
+    expect(familyDisclosureLabel(12, true)).toBe('Show 12 sub-threads');
   });
 });
 
@@ -332,12 +261,9 @@ describe('family disclosure consistency across row types', () => {
 
     expect(threadRow.visualStatus).toBe('waiting');
     expect(searchRow.visualStatus).toBe(threadRow.visualStatus);
-    // Expanded nested row: control present, showing the chevron.
+    // Nested row: toggle present. Flat search row: no toggle at all.
     expect(threadRow.hasDisclosure).toBe(true);
-    expect(threadRow.showChevron).toBe(true);
-    // Flat search row: no control at all.
     expect(searchRow.hasDisclosure).toBe(false);
-    expect(searchRow.showChevron).toBe(false);
   });
 
   it('a parent with no children shows no disclosure control in either context', () => {

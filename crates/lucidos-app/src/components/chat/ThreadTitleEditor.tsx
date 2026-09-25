@@ -103,7 +103,12 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
 
     suggestTitle(threadId, controller.signal)
       .then(s => { if (!controller.signal.aborted) setSuggestion(s); })
-      .catch(() => { /* silently fail — user can still type their own */ })
+      // The suggestion is an optional hint beside a field the user is already
+      // typing in, so a toast would interrupt for nothing. The next edit asks
+      // again. An abort is this editor closing, and is no failure at all.
+      .catch((e: unknown) => {
+        if (!controller.signal.aborted) console.warn('Title suggestion failed:', e);
+      })
       .finally(() => { if (!controller.signal.aborted) setSuggesting(false); });
   }, [editing, threadId, title]);
 

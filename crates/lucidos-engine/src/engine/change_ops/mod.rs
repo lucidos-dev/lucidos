@@ -5,6 +5,7 @@ use super::git_ops::{
 };
 use super::thread_events::MessageOrigin;
 use super::LucidosEngine;
+use crate::core::changes::{ChangeState, ChangeStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -224,7 +225,7 @@ pub(crate) enum MergeOwnership {
 /// resolver's own live session, fast-forwarded `main` at step 2 of the
 /// resolver's 5-step prompt, and then reset the resolver's worktree under it.
 /// The only re-entrancy guard at the time was the in-memory
-/// `apply_now_in_progress` flag, which the detached Tier-2 and Tier-3 merge
+/// `change_claim` flag, which the detached Tier-2 and Tier-3 merge
 /// spawns never set.
 ///
 /// `resolver_present` is the second half, and it is deliberately about THE
@@ -232,8 +233,8 @@ pub(crate) enum MergeOwnership {
 /// the thread is not evidence that anyone is resolving: a pairing stranded by a
 /// crash plus a later, unrelated turn on the same thread would otherwise refuse
 /// every Apply for the length of that turn, over and over. So the term is
-/// `AgentSession::conflict_change_id == Some(change_id)`, set where each tier
-/// binds its resolution to a session.
+/// the change id of `AgentSession::conflict`, set where each tier binds its
+/// resolution to a session.
 ///
 /// It is also what keeps this from wedging Apply outright. An engine restart
 /// empties `agent_sessions`, so a stranded pairing names no resolver and does
@@ -325,7 +326,8 @@ impl super::LucidosEngine {
         guard
             .get(&thread_id)
             .filter(|s| s.is_live())
-            .and_then(|s| s.conflict_change_id)
+            .and_then(|s| s.conflict)
+            .map(crate::engine::types::ConflictBinding::change_id)
     }
 
     /// Record that this thread's live session is carrying `change_id`'s
@@ -339,10 +341,22 @@ impl super::LucidosEngine {
         thread_id: Uuid,
         change_id: Uuid,
     ) {
-        let mut guard = self.agent_sessions.lock().await;
-        if let Some(s) = guard.get_mut(&thread_id) {
-            s.conflict_change_id = Some(change_id);
-        }
+        bind_in_place_conflict_resolution(
+            &mut *self.agent_sessions.lock().await,
+            thread_id,
+            change_id,
+        );
+    }
+}
+
+/// The map half of [`LucidosEngine::bind_session_to_conflict_resolution`].
+pub(crate) fn bind_in_place_conflict_resolution(
+    sessions: &mut std::collections::HashMap<Uuid, crate::engine::AgentSession>,
+    thread_id: Uuid,
+    change_id: Uuid,
+) {
+    if let Some(s) = sessions.get_mut(&thread_id) {
+        s.conflict = Some(crate::engine::types::ConflictBinding::InPlace { change_id });
     }
 }
 
@@ -422,45 +436,7 @@ pub(crate) async fn reset_worktree_to_main_after_apply(
         .into());
     }
 
-    let reset = git_cmd(&["reset", "--hard", "main"], worktree_path)
-        .await
-        .map_err(|e| {
-            format!(
-                "git reset --hard main failed in worktree {}: {}",
-                worktree_path.display(),
-                e
-            )
-        })?;
-    if !reset.status.success() {
-        return Err(format!(
-            "git reset --hard main failed in worktree {}: {}",
-            worktree_path.display(),
-            String::from_utf8_lossy(&reset.stderr).trim()
-        )
-        .into());
-    }
-
-    // `git clean -fd` removes untracked files (e.g. half-written merge
-    // artifacts). Untracked-but-gitignored build outputs (target/, node_modules/)
-    // are preserved — only `clean -fdx` would touch them, which we don't want.
-    let clean = git_cmd(&["clean", "-fd"], worktree_path)
-        .await
-        .map_err(|e| {
-            format!(
-                "git clean -fd failed in worktree {}: {}",
-                worktree_path.display(),
-                e
-            )
-        })?;
-    if !clean.status.success() {
-        return Err(format!(
-            "git clean -fd failed in worktree {}: {}",
-            worktree_path.display(),
-            String::from_utf8_lossy(&clean.stderr).trim()
-        )
-        .into());
-    }
-    Ok(())
+    reset_hard_to_main_and_clean(worktree_path).await
 }
 
 /// Phase 6.3: Reset a thread's worktree to main HEAD after a Discard, leaving
@@ -480,6 +456,15 @@ pub(crate) async fn reset_worktree_to_main_after_apply(
 /// would leave the branch advanced past main and the next CC spawn would see
 /// a "phantom" pending state for a change the user already discarded.
 pub(crate) async fn reset_worktree_to_main_after_discard(
+    worktree_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    reset_hard_to_main_and_clean(worktree_path).await
+}
+
+/// `git reset --hard main` then `git clean -fd` in `worktree_path`. The shared
+/// tail of the Apply and Discard resets; each caller decides whether a dirty
+/// tree may be wiped first.
+async fn reset_hard_to_main_and_clean(
     worktree_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reset = git_cmd(&["reset", "--hard", "main"], worktree_path)

@@ -76,7 +76,7 @@ describe('a folded waiting indicator says what it is waiting for', () => {
   it('counts each kind once there is more than one reason', () => {
     const waits = [{ reason: 'one' }, { reason: 'two' }] as never[];
     expect(waitingIndicatorSummary(waits, { threads: [], unresolved: 1 })?.menuLabel)
-      .toBe('Waiting for 2 subscriptions, 1 sub-thread');
+      .toBe('Waiting for 2 events, 1 sub-thread');
   });
 
   it('says the same thing to a screen reader as to the menu', () => {

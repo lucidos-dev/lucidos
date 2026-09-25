@@ -13,7 +13,7 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - spawn a new *thread* with `lucidos spawn-thread`: a chat thread, or a *coding-agent thread* on a repo or an app folder. `--coding-agent claude-code|codex` picks the backend, `--folder data/apps/<id>` targets an app worktree
 - subscribe the calling thread to an event instead of polling for it, and finish, letting the engine re-open the thread when the event lands: `lucidos await-event`
 - read what this thread is currently subscribed to, and stop watching: `lucidos event-waits list` / `lucidos event-waits cancel`
-- run work that has to outlive a coding agent's turn, and be re-opened when it finishes: `lucidos background-task run -- <command>`
+- run work that has to outlive a coding agent's turn, and be re-opened when it finishes: `lucidos background-task run --description "<what it is>" -- <command>`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
@@ -153,7 +153,7 @@ $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
 
 Two outputs:
 
-- **stderr** — the resolved absolute filesystem path, so it can be captured separately (`… 2>/tmp/path`).
+- **stderr**: the resolved absolute filesystem path, so it can be captured separately (`… 2>/tmp/path`). The path is always the last line.
 - **stdout** — a ready-to-paste clickable Lucidos chat link, mirroring `lucidos spawn-thread`:
 
 ```bash
@@ -161,6 +161,24 @@ $ echo '# notes' | lucidos data write artifacts/ticket-workflow/node-types-and-a
 [node-types-and-attributes.md](artifacts/ticket-workflow/node-types-and-attributes.md)   # stdout
 /Users/.../workspaces/myws/data/artifacts/ticket-workflow/node-types-and-attributes.md   # stderr
 ```
+
+A picture (`gif`, `jpeg`, `jpg`, `png`, `svg`, `webp`) prints as a markdown
+**image**, which shows the picture inline in the thread. A plain link to a
+picture only opens a preview on tap. So paste the line as printed to show the
+user what you drew:
+
+```bash
+$ lucidos data write artifacts/design/options.png --from /tmp/options.png
+![options.png](artifacts/design/options.png)   # stdout
+The user cannot see this picture yet. ...      # stderr, before the path
+```
+
+Saving a picture shows the user nothing. It appears only where you paste that
+line. If a question card comes next, put the line on the card: in its question,
+or in an option's `preview`. For a choice, give each option its own picture
+of only that option, never one sheet of them all in the question. Your
+words before any tool call reach the user only as a short summary, which drops
+the picture. Otherwise paste it in the reply that ends your turn.
 
 **Linking an artifact in chat — use the bare store path, never a scheme.** The clickable form is the `data/`-rooted path with no URL scheme (e.g. `artifacts/ticket-workflow/node-types-and-attributes.md`, or with the leading `data/`); the frontend's path linkifier rewrites it into a file-preview link. There is **no `artifact:` or `file:` scheme** — inventing one (by analogy to `thread:`/`app:`) produces a dead link the browser can't resolve. Paste the stdout link verbatim, or keep its target and swap the label for something friendlier: `[OST node types & attributes](artifacts/ticket-workflow/node-types-and-attributes.md)`.
 
@@ -306,7 +324,12 @@ $ lucidos threads list --my-children --status running | jq -r '.[] | "\(.status)
 
 # Which of them are stuck waiting on me?
 $ lucidos threads list --my-children --status waiting_for_user_answer | jq -r '.[].title'
+
+# Which of them have changes waiting below them?
+$ lucidos threads list --my-children | jq -r '.[] | select(.pending_sub_thread_change_count > 0) | .title'
 ```
+
+Every row this command returns carries `pending_sub_thread_change_count`: the pending changes held by that thread's sub-threads at any depth, not counting its own. An orchestrating child that ran children of its own holds no change itself, so this is where the work below it shows. `lucidos changes list --sub-threads-of <uuid>` lists those changes.
 
 Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
 
@@ -358,6 +381,22 @@ Five things worth knowing:
 `--event-id` defaults from `$LUCIDOS_EVENT_ID` and stamps the child's message-route panel so the follow-up links back to the originating event.
 
 **A cancellation is not done when the ack returns.** The ack says the message is on the child's timeline, nothing more: even with `--urgent` the child still has to pick it up, read it, and do the work of stopping. If you told a child to kill a running job, verify the job is actually gone (no processes, no lock file) before you report the cancellation as complete. Reporting off the ack is how a nightly pipeline once announced a clean host while its e2e suite ran on for another seven minutes.
+
+### `lucidos threads detach --thread <child-uuid>`
+
+Move a child thread to **top level**, so its parent stops waiting for it. Wraps `POST /api/v1/threads/<child>/detach`, the same move the thread menu's **Move to top level** makes.
+
+```bash
+$ lucidos threads detach --thread 9c1f2b40-...
+{"child_thread_id":"9c1f2b40-...","child_title":"Import the sales figures",
+ "former_parent_thread_id":"4b7e0c11-..."}
+```
+
+- **From inside a thread you can move only your own DIRECT children.** The engine reads the calling thread off the origin token, exactly as for `follow-up`. Anything else is a 403. Outside a thread, with no origin token, it moves any thread that has a parent.
+- **Nothing is stopped.** The child keeps running, finishes on its own and proposes any change. Its result goes to its own timeline only.
+- **The former parent gets nothing more.** No completion card, no follow-up, and it leaves `--my-children`. A card the child earned before the move still arrives.
+- **It frees no child slot**, and it cannot be undone.
+- A thread already at top level is a 409, and an unknown id a 404.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
@@ -434,7 +473,7 @@ poll for those.
 **And never subscribe to your own child's completion.** A thread spawned with
 `lucidos spawn-thread --relation child` already re-opens this one: when it finishes, the
 engine emits `ChildThreadCompleted` here and re-opens this thread with the
-child's status, summary and `pending_change_ids`, which is everything a
+child's status, summary, `pending_change_ids` and `sub_thread_pending_changes`, which is everything a
 subscription would have handed you. So a wait on it buys nothing, and it costs
 two things: one of the subscriptions the loop cap below allows, and
 a second clock, since
@@ -483,19 +522,20 @@ yourself a few minutes ago.
 - `--timeout-secs` is required and capped at 86400 (24 h). There is no unbounded
   subscription. Giving up early costs one turn; giving up too late costs the
   user the whole wait.
-- `--reason` is one short line in the user's language, naming **what** you await
-  rather than the fact that you await it. They read it in the subscription
+- `--reason` is a short noun phrase in the user's language, naming **what** you
+  await rather than the fact that you await it. They read it in the waiting
   indicator, and it is how they tell a sleeping thread from a stalled one.
   Write `"the e2e lock to free up"`, not `"waiting for the e2e lock"`: the
-  transcript labels it `Set up an event wait: <reason>`, so a reason opening
-  with a waiting word says it twice.
+  transcript labels it `Waiting for <reason>`, so a reason opening with a
+  waiting word says it twice.
 
 Refusals arrive as a `400` carrying the reason, and are worth reading rather
 than retrying: a per-token streaming event (`TextStreamed` and friends) or an
 `EventWait*` type is refused outright, a thread may hold at most 25 live
 subscriptions, the same `--on` list twice on one thread is refused (it would
-deliver one event to you twice), and 10 subscriptions within an hour with no
-message from the user is the loop cap.
+deliver one event to you twice), and 20 counted subscriptions within an hour
+with no message or answer from the user is the loop cap. A subscription another
+thread's event ended does not count.
 
 ```bash
 # Wait for a domain event the workspace's own scripts emit, then stop. The
@@ -508,7 +548,7 @@ $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}
     --timeout-secs 1800 --reason "the refactor to propose its change"
 ```
 
-### `lucidos background-task run [--timeout-secs <N>] -- <command>` / `output <task_id>` / `stop <task_id>`
+### `lucidos background-task run [--description <T>] [--timeout-secs <N>] -- <command>` / `output <task_id>` / `stop <task_id>`
 
 Run work that has to outlive your turn, then **end your turn**. The engine runs
 the command as a *background task* in this thread's worktree. It arms an event
@@ -525,6 +565,11 @@ the maximum.
 
 - **One argument after `--` runs as written**, so quote a pipeline or a
   redirect as a single string. Several arguments run as exactly those words.
+- **Always pass `--description`**: what the task is, as a short noun phrase
+  in the user's language (`"the nightly e2e sweep"`). The thread's waiting row
+  reads `Waiting for <description> to finish`, and that row is how
+  the user tells what the thread is waiting on. Without it the row shows the
+  command line instead.
 - `--timeout-secs` kills a task still running after that long. Default and
   maximum: 3600.
 - `run` prints a `status`. `watched` means end your turn now. `unwatched` means
@@ -553,7 +598,8 @@ agent's `run_bash_background` behaves the same way.
 
 ```bash
 # The normal shape: start the suite, then end your turn.
-$ lucidos background-task run -- 'lucidos build-slot -- cargo test > .lucidos/test.log 2>&1'
+$ lucidos background-task run --description "the engine test suite" \
+    -- 'lucidos build-slot -- cargo test > .lucidos/test.log 2>&1'
 
 # Look in on it, or give up on it.
 $ lucidos background-task output 5f0c2e1a-…
@@ -1115,7 +1161,7 @@ Switching individual tools off is `PUT /api/v1/mcp/servers/<id>/disabled-tools`
 with `{"disabled_tools": ["<wire name>", ...]}`, a full replacement rather than a
 delta. No CLI flag for it: the set is a selection, not a scalar.
 
-### `lucidos changes list`
+### `lucidos changes list [--sub-threads-of <uuid> | --my-sub-threads]`
 
 List pending and recently-applied *changes*. Wraps `GET /api/v1/changes` and echoes the engine's payload verbatim to stdout. This is the canonical way for a script to find a pending change's id before `apply` — read `.pending[].id`. Don't scan `ChangeProposed` events for the id when this one command gives it directly.
 
@@ -1128,9 +1174,22 @@ $ CID=$(lucidos changes list | jq -r '.pending[0].id')
 $ lucidos changes apply "$CID"
 ```
 
-The response carries `pending` (array of pending changes, each with `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id`), `applied` (recently applied), `total_pending`, and `restart_required`. Exit non-zero on transport / HTTP error.
+The response carries `pending`, `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title` / `thread_unsettled` / `thread_settling` / `resolving_conflict`. Exit non-zero on transport / HTTP error.
 
-> **In-thread agent:** the chat Lucidos Agent has the equivalent `list_changes` LLM tool, which returns the same `{pending, applied, total_pending}` shape **in-process** (no HTTP round-trip). Use `list_changes` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess.
+**`thread_unsettled: true` means the proposing thread is still working on the change**: mid-turn, on a question card, resolving a merge conflict, or watching an event. `apply` refuses it for exactly that reason, so never report such a change as finished. `thread_settling` is the part of that a *standing apply* can wait out. `resolving_conflict` means an apply of it is merging now.
+
+Narrow `pending` to one subtree:
+
+```bash
+# Changes held by any sub-thread of one thread, at any depth (not its own):
+$ lucidos changes list --sub-threads-of 6fa459ea-ee8a-3ca4-894e-db77e160355e
+# The same, for the thread this subprocess runs in:
+$ lucidos changes list --my-sub-threads
+```
+
+`--my-sub-threads` reads `LUCIDOS_THREAD_ID`, like `threads list --my-children`, so it works only from inside a Lucidos thread. `total_pending` counts the narrowed list.
+
+> **In-thread agent:** the chat Lucidos Agent has the equivalent `changes` tool. Its `list` action returns the same `{pending, applied, total_pending}` shape **in-process** (no HTTP round-trip), with the same flags filled. Its `sub_threads_of` argument takes a thread id, or `current` for its own thread. Use it from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess.
 
 ### `lucidos changes apply <change-id>`
 
@@ -1143,9 +1202,11 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 > **In-thread agent:** the chat Lucidos Agent has the equivalent `apply_change` LLM tool. It calls the same engine apply pipeline **in-process** and stamps the apply as the agent (linked back to the applying thread), so the route popover never mislabels it as "You". Use `apply_change` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess (which can't call the in-process tool and would otherwise have to forward the subprocess-origin headers by hand).
 
-> **Both refusals below reach the LLM tool too.** `apply_change` asks the same gate this CLI's route asks (ADR 0233). A thread that is still working, or a change with no files left, is refused there as well. The tool error names the way forward. It offers `apply_when_settled` only for a *working* thread, because a *standing apply* drops at once on a parked one.
+> **Both refusals below reach the LLM tool too.** `apply_change` asks the same gate this CLI's route asks (ADR 0233). A thread that has not settled, or a change with no files left, is refused there as well. The tool error names the way forward. It offers `apply_when_settled` only for a *settling* thread, because `apply_when_settled` refuses one parked on a question.
 
-> **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every thread still working as each one lands. Both arm the same instruction the Apply control arms from the UI. Both drop with a report if a thread parks or fails. LLM-only, with no CLI form.
+> **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every *settling* thread as each one lands. Both arm the same instruction the Apply control arms from the UI. Both wait through an event wait, and drop with a report if a thread stops on a question or fails. LLM-only, with no CLI form.
+
+> **Nothing to wait for, nothing armed.** `apply_when_settled` refuses a thread that has already settled with nothing pending, parked on a question, or failed. So never re-arm a thread whose change just landed.
 
 > **Neither reaches a repo Lucidos does not apply into.** An *external-repo coding-agent thread* proposes no *change* at all, so `apply_when_settled` refuses one and the `apply_as_they_settle` sweep passes it over. That work is reviewed and pushed from the repo itself.
 
@@ -1161,7 +1222,7 @@ The response carries:
 | `applied_commit` | 40-char SHA on `main` AFTER the merge (present on `applied` and idempotent `noop`) |
 | `previous_commit` | 40-char SHA on `main` BEFORE the merge |
 | `commits_applied` | Number of commits added to `main` (0 for `noop`) |
-| `restart_required` | `true` when the changed files trigger an engine restart on apply |
+| `restart_required` | `true` when the change needs a new engine version. Apply never restarts Lucidos: it builds the new version in the background, and the user taps "Switch to new version" to restart onto it. Never tell them an apply restarts Lucidos. |
 | `conflict_thread_id` / `review_thread_id` | Thread to focus when `status` is `conflict` / `hardening` |
 
 The CLI prints the JSON verbatim on stdout. Exit non-zero on transport / 4xx with the engine's error body on stderr — match `--fail` semantics from `lucidos proxy`.
@@ -1299,11 +1360,18 @@ lucidos frontend-preview stop
 
 **One slot per workspace.** `start` on another thread moves the preview rather than adding a second one.
 
-`start` refuses, by name, when the thread has no worktree, when the worktree is not a Lucidos-source one (an app or external-repo thread has no frontend to preview), or when its dependencies were never provisioned. It answers only once Vite is actually serving, so the printed URL is live when you paste it into a reply.
+`start` refuses, by name, in four cases:
+
+- the thread has no worktree;
+- the worktree is not a Lucidos-source one (an app or external-repo thread has no frontend to preview);
+- its dependencies were never provisioned;
+- no workspace gateway launched the engine. It answers only once Vite is actually serving, so the printed URL is live when you paste it into a reply.
 
 **The printed URL uses the host the CLI reached the engine on**, which from inside the worktree is `localhost`. That is right for the host machine and wrong for a phone: the engine builds the URL from the caller's `Host`, and the in-app control (the coding-agent control menu's *Frontend preview* section) builds it from the page's own location instead, so a user on a tailnet gets a link that resolves. Prefer pointing the user at that control over pasting a `localhost` URL. It also carries the device id, which the CLI has no way to know, and without it the preview renders with none of that device's scoped preferences.
 
-The preview registers **no service worker** and cannot do push: a dev server emits unhashed module URLs a worker would cache past a hot update. See ADR 0055 for the whole design.
+The preview registers **no service worker** and cannot do push: a dev server emits unhashed module URLs a worker would cache past a hot update.
+
+**The preview needs a paired device.** It reaches the engine through the workspace gateway, and it serves its own files only to a browser holding the gateway's device cookie. So it opens in a browser that already has Lucidos open, and answers 401 to anything else, a `curl` included. See ADR 0055 and ADR 0267 for the whole design.
 
 ### `lucidos knowhow list`
 
@@ -1394,6 +1462,26 @@ lucidos proxy sonos /zones --fail
 ```
 
 Output is the response body on **stdout**. With `--include`, the status line and headers are prepended to stdout (curl convention — single stream). With `--fail`, the body is suppressed and a one-line `lucidos proxy: HTTP <code>` summary is written to stderr instead. Transport errors (DNS failure, connection refused, …) print to stderr (`lucidos: ...`) and exit non-zero. Exit codes mirror curl: `0` on success (including 4xx/5xx by default), `22` when `--fail` and the response is 4xx/5xx, `1` on transport failure.
+
+#### Timeouts
+
+The engine waits **30 seconds** on the upstream by default, then answers `504 upstream timeout`. The wait covers the whole reply: the proxy reads a streamed body in full before it answers, so a long streamed model call is cut at the same point. Two settings raise it, and both accept 1 to 600 seconds:
+
+| Setting | Where | Applies to |
+|---|---|---|
+| `proxy_timeout_secs` | a workspace preference | every proxied call, including the builtin model routes (`vertex`, `openai`, …) that have no `apis.json` entry |
+| `timeout_secs` | a field on one `apis.json` entry | that entry only, and it wins over `proxy_timeout_secs` |
+
+```bash
+# Let every proxied call wait up to five minutes
+lucidos preferences set --key proxy_timeout_secs --value 300
+```
+
+```json
+{ "slow-model": { "base_url": "https://llm.example", "timeout_secs": 300 } }
+```
+
+A value outside 1 to 600 is refused. For the preference, the write fails and names the key and the range. For an entry, the engine rejects that entry by name at boot, and every call to it answers 502 with the reason. Each upstream request gets the whole wait, so a redirect hop or the one retry after a 401 starts its own. One proxied call is capped at 600 seconds in total, and past that it answers 504. `lucidos proxy` itself waits 660 seconds, so it never gives up before the engine does.
 
 `script_handshake`-typed proxies look identical to the caller — `lucidos proxy comfort-cloud /devices/list` — because the engine runs the configured login script transparently and attaches the resulting headers. See `system-knowhow/building-an-auth-handshake.md` for authoring the script.
 

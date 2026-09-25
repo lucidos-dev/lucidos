@@ -193,6 +193,7 @@ impl LucidosEngine {
             None,
             external_cancel,
             crate::engine::FollowUpUrgency::Normal,
+            None,
         )
         .await
     }
@@ -239,6 +240,9 @@ impl LucidosEngine {
         // behind it. Named rather than a bare `bool` so the call sites stay
         // readable in a column of `None`s.
         urgency: crate::engine::FollowUpUrgency,
+        // This follow-up's place in its thread's order. Only a typed follow-up
+        // to a coding-agent thread holds one, joined by the chat handler.
+        follow_up_turn: Option<crate::engine::FollowUpTurn>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         self.process_message_with_steps_internal(
             user_message,
@@ -267,6 +271,7 @@ impl LucidosEngine {
             voice_session_id,
             None,
             urgency,
+            follow_up_turn,
         )
         .await
     }

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
+import { motionPreference } from '../../utils/motion';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -1676,6 +1677,59 @@ describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
     expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(true);
   });
 });
+describe('motion: the device-scoped calm switch', () => {
+  const KEY = 'lucidos-motion';
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+    motionPreference.value = 'system';
+    _resetPendingPreferenceWritesForTesting();
+  });
+
+  afterEach(() => {
+    motionPreference.value = 'system';
+    vi.restoreAllMocks();
+  });
+
+  it('follows the OS when nothing is stored', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(currentMotion()).toBe('system');
+  });
+
+  it('answers from the mirror while preferences are still loading', () => {
+    localStorage.setItem(KEY, 'reduce');
+    preferences.value = { status: 'loading' };
+    expect(currentMotion()).toBe('reduce');
+  });
+
+  it('applies the served value to the signal and to the mirror', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { motion: 'full' } });
+    await loadPreferences();
+    expect(motionPreference.value).toBe('full');
+    expect(localStorage.getItem(KEY)).toBe('full');
+  });
+
+  it('clears the mirror and follows the OS when the engine serves no value', async () => {
+    // A stale mirror would otherwise keep calming a device after a reset.
+    localStorage.setItem(KEY, 'reduce');
+    motionPreference.value = 'reduce';
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBeNull();
+    expect(motionPreference.value).toBe('system');
+  });
+
+  it('writes this device only, and applies before the round trip', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    const saved = setMotion('reduce');
+    expect(motionPreference.value).toBe('reduce');
+    expect(localStorage.getItem(KEY)).toBe('reduce');
+    await saved;
+    expect(spy).toHaveBeenCalledWith('motion', 'reduce', expect.any(String));
+  });
+});
+
 describe('the resident-block sections a call opens with', () => {
   const KEY = 'voice_resident_sections';
 

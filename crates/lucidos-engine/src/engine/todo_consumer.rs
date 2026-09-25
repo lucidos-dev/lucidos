@@ -2,7 +2,7 @@
 //!
 //! On every persisted chat-thread terminator (`ResponseGenerated` /
 //! `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`, the full
-//! `TERMINATOR_EVENT_TYPES` set in `thread_events.rs`), calls
+//! `TERMINATOR_EVENT_TYPES` set in `thread_events/event_impl.rs`), calls
 //! [`crate::engine::tools::todo::settle_open_todos`] to enforce the agent's
 //! contract: either keep working the list until every item is `completed`, or
 //! call `todo_write` with `[]` to drop it. If the agent left open items behind,

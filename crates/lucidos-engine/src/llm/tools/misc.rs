@@ -135,6 +135,10 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                 "prompt": {
                     "type": "string",
                     "description": "Draft text for the compose box. 'new-chat' only."
+                },
+                "device": {
+                    "type": "string",
+                    "description": "A Known devices id. Omit for the user's last used device."
                 }
             },
             "required": ["target"]
@@ -409,10 +413,9 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-/// One clause here is a **temporary measure**: "Saying you will re-arm is not
-/// re-arming; a turn that ends with no new call leaves nothing watching for it"
-/// carries no system fact and exists only to pre-empt a recurring model mistake
-/// on this terminal tool. Registered in `docs/temporary-measures.md` § "\"Narrating it
+/// One clause here is a **temporary measure**: "Saying you will re-subscribe is
+/// not re-subscribing" carries no system fact and exists only to pre-empt a
+/// recurring model mistake on this tool. Registered in `docs/temporary-measures.md` § "\"Narrating it
 /// does not do it\" on an event-wait re-arm", alongside its twin in
 /// `engine::event_wait::WAIT_SPENT_NOTICE`. Everything else in the description
 /// states real properties of the tool.
@@ -420,7 +423,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a backup finishing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in {} minutes without a user message the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_RECENT_SUBSCRIPTIONS, crate::engine::event_wait::RECENT_SUBSCRIPTION_WINDOW_SECS / 60),
+            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a backup finishing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in {} minutes without a user reply the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_RECENT_SUBSCRIPTIONS, crate::engine::event_wait::RECENT_SUBSCRIPTION_WINDOW_SECS / 60),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -451,7 +454,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                     },
                     "reason": {
                         "type": "string",
-                        "description": "REQUIRED. One short line in the user's language saying what you await; it shows in the waiting indicator."
+                        "description": "REQUIRED. What you await, as a short noun phrase in the user's language; shown after 'Waiting for'."
                     }
                 },
                 "required": ["on", "timeout_secs", "reason"]

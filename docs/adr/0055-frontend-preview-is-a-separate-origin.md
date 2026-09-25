@@ -56,9 +56,10 @@ stamping: five surfaces, each of which the whole product boots through. On its
 own port the bundle takes the `BASE_PATH === ''` branch, which is the
 already-supported legacy direct-engine mode, and needs none of them.
 
-**Vite proxies the engine-owned prefixes back to the engine**, so the preview
-page is same-origin with its own API and no CORS is needed. That block is gated
-on the env var the engine sets, so a manual `npm run dev` is unchanged.
+**Vite proxies the engine-owned prefixes**, so the preview page is same-origin
+with its own API and no CORS is needed. That block is gated on the env vars the
+engine sets, so a manual `npm run dev` is unchanged. ADR 0267 moved the target
+from the engine to the gateway, after the engine went behind it on loopback.
 
 ## Consequences
 
@@ -72,7 +73,7 @@ on the env var the engine sets, so a manual `npm run dev` is unchanged.
   `sw.js` Vite serves carries an unstamped `__LUCIDOS_BUILD_ID__`. Registration
   is gated on `isDevServerBundle()`, and push therefore cannot be enabled there.
 - **A second self-signed cert prompt** on a device that has not accepted one for
-  that port. The preview reuses the engine's own `LUCIDOS_TLS_CERT` / `_KEY`.
+  that port. The preview serves with the gateway's cert (ADR 0267).
 - **A node process outlives the agent turn, by design.** It stops on an explicit
   stop, on its worktree disappearing, and on engine restart. Deliberately no
   lifetime timer: one that fires while the user is looking at the preview is

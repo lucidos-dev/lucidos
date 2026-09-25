@@ -55,7 +55,7 @@ done
     )
 }
 
-fn stub_driver(turn_body: &str, resume: Option<&str>, continuation: bool) -> StubSession {
+fn stub_driver(turn_body: &str, resume: Option<&str>) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let requests_log = tmp.path().join("requests.log");
     let script = tmp.path().join("codex-stub.sh");
@@ -87,7 +87,6 @@ fn stub_driver(turn_body: &str, resume: Option<&str>, continuation: bool) -> Stu
     tokio::spawn(app_server_driver_task(
         config,
         resume.map(str::to_string),
-        continuation,
         events_tx,
         input_rx,
         control_rx,
@@ -132,7 +131,7 @@ const HAPPY_TURN_BODY: &str = r#"printf '{"method":"item/agentMessage/delta","pa
 
 #[tokio::test]
 async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
-    let mut s = stub_driver(HAPPY_TURN_BODY, None, false);
+    let mut s = stub_driver(HAPPY_TURN_BODY, None);
     s.input_tx
         .send(AgentInput {
             text: "ping".into(),
@@ -144,6 +143,10 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
         next_event(&mut s.events_rx).await,
         AgentEvent::Init { session_id, model: Some(m), .. }
             if session_id == "t-1" && m == "gpt-5.5"
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
     ));
     // Real streaming: the deltas arrive as separate Message events.
     assert!(matches!(
@@ -211,7 +214,7 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
 
 #[tokio::test]
 async fn resume_uses_thread_resume_with_stored_id() {
-    let mut s = stub_driver(HAPPY_TURN_BODY, Some("sid-9"), false);
+    let mut s = stub_driver(HAPPY_TURN_BODY, Some("sid-9"));
     s.input_tx
         .send(AgentInput {
             text: "follow up".into(),
@@ -238,35 +241,11 @@ async fn resume_uses_thread_resume_with_stored_id() {
 }
 
 #[tokio::test]
-async fn continuation_starts_turn_without_any_input() {
-    let mut s = stub_driver(HAPPY_TURN_BODY, Some("sid-9"), true);
-    // No input sent — the continuation prompt must drive a full turn.
-    let mut saw_result = false;
-    for _ in 0..5 {
-        if matches!(
-            next_event(&mut s.events_rx).await,
-            AgentEvent::Result { .. }
-        ) {
-            saw_result = true;
-            break;
-        }
-    }
-    assert!(saw_result, "continuation turn must complete without input");
-    let requests = logged_requests(&s.requests_log);
-    let turn_req = requests
-        .iter()
-        .find(|r| r.contains(r#""method":"turn/start""#))
-        .expect("turn/start sent");
-    assert!(turn_req.contains("Continue from where you left off."));
-    s.cancel.cancel();
-}
-
-#[tokio::test]
 async fn approval_round_trip_accept_reaches_the_child() {
     // turn/start raises a command approval and HOLDS the turn until the
     // decision arrives (the `"decision":` case arm completes it).
     let turn_body = r#"printf '{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"t-1","turnId":"turn-1","itemId":"i7","command":"sudo ls","cwd":"/wt","startedAtMs":1}}\n'"#;
-    let mut s = stub_driver(turn_body, None, false);
+    let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
             text: "go".into(),
@@ -277,6 +256,10 @@ async fn approval_round_trip_accept_reaches_the_child() {
     assert!(matches!(
         next_event(&mut s.events_rx).await,
         AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
     ));
 
     // The bridge must surface the approval on permission_rx with the
@@ -311,7 +294,7 @@ async fn approval_round_trip_accept_reaches_the_child() {
 async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
     let turn_body = r#"printf '{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"t-1","turnId":"turn-1","itemId":"i7","command":"sudo ls","cwd":"/wt","startedAtMs":1}}\n'
       printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","startedAtMs":2,"item":{"id":"i7","type":"commandExecution","command":"sudo ls","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'"#;
-    let mut s = stub_driver(turn_body, None, false);
+    let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
             text: "go".into(),
@@ -322,6 +305,10 @@ async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
     assert!(matches!(
         next_event(&mut s.events_rx).await,
         AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
     ));
     let req = tokio::time::timeout(std::time::Duration::from_secs(30), s.permission_rx.recv())
         .await
@@ -354,7 +341,7 @@ async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
 #[tokio::test]
 async fn approval_deny_sends_decline() {
     let turn_body = r#"printf '{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"t-1","turnId":"turn-1","itemId":"i8","command":"rm -rf /","cwd":"/wt","startedAtMs":1}}\n'"#;
-    let mut s = stub_driver(turn_body, None, false);
+    let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
             text: "go".into(),
@@ -362,6 +349,10 @@ async fn approval_deny_sends_decline() {
         })
         .unwrap();
     let _ = next_event(&mut s.events_rx).await; // Init
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
+    ));
     let req = tokio::time::timeout(std::time::Duration::from_secs(30), s.permission_rx.recv())
         .await
         .expect("permission request within 30s")
@@ -383,7 +374,7 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
     // A turn that never completes on its own — only the interrupt path (the
     // stub's turn/interrupt arm) ends it.
     let turn_body = r#"printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"i9","type":"commandExecution","command":"sleep 99","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'"#;
-    let mut s = stub_driver(turn_body, None, false);
+    let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
             text: "go".into(),
@@ -393,6 +384,10 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
     assert!(matches!(
         next_event(&mut s.events_rx).await,
         AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -427,7 +422,7 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
     // the driver must synthesize the failure.
     let turn_body = r#"printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"i10","type":"commandExecution","command":"x","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'
       exit 7"#;
-    let mut s = stub_driver(turn_body, None, false);
+    let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
             text: "go".into(),
@@ -437,6 +432,10 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
     assert!(matches!(
         next_event(&mut s.events_rx).await,
         AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead(None)
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -460,7 +459,7 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
 
 #[tokio::test]
 async fn cancellation_kills_session_and_emits_exited() {
-    let mut s = stub_driver(HAPPY_TURN_BODY, None, false);
+    let mut s = stub_driver(HAPPY_TURN_BODY, None);
     s.cancel.cancel();
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -533,7 +532,6 @@ done
     tokio::spawn(app_server_driver_task(
         config,
         Some("sid-dead".to_string()),
-        false,
         events_tx,
         input_rx,
         control_rx,
@@ -552,6 +550,10 @@ done
     assert!(matches!(
         next_event(&mut events_rx).await,
         AgentEvent::Init { session_id, .. } if session_id == "t-fresh"
+    ));
+    assert!(matches!(
+        next_event(&mut events_rx).await,
+        AgentEvent::InputRead(None)
     ));
     assert!(matches!(
         next_event(&mut events_rx).await,

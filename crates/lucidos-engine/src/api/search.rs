@@ -1,5 +1,6 @@
 use super::*;
 use crate::core::ArtifactManager;
+use crate::engine::thread_search::recency_boost;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -28,18 +29,6 @@ pub struct SearchResponse {
     pub results: HashMap<String, Vec<SearchResultItem>>,
 }
 
-/// Apply a recency boost: `score * (0.5 + 0.5 * exp(-age_days / 14.0))`.
-/// Items with no timestamp get score 1.0.
-fn recency_boost(score: f64, last_activity: Option<chrono::DateTime<chrono::Utc>>) -> f64 {
-    match last_activity {
-        Some(ts) => {
-            let age_days = (chrono::Utc::now() - ts).num_seconds() as f64 / 86400.0;
-            score * (0.5 + 0.5 * (-age_days / 14.0).exp())
-        }
-        None => score,
-    }
-}
-
 /// GET /api/v1/search?q=<query>&category=all|threads|files|apps|triggers|settings|changes
 pub(super) async fn search(
     State(state): State<AppState>,
@@ -65,7 +54,7 @@ pub(super) async fn search(
             );
             results.insert(
                 "threads".into(),
-                apply_recency_boosts(threads.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?),
+                threads.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
             );
             results.insert(
                 "files".into(),
@@ -88,7 +77,7 @@ pub(super) async fn search(
             let items = search_threads_internal(&state, &q, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            results.insert("threads".into(), apply_recency_boosts(items));
+            results.insert("threads".into(), items);
         }
         "files" => {
             let items = search_files_internal(&state, &q, limit)
@@ -128,7 +117,8 @@ pub(super) async fn search(
     Ok(Json(SearchResponse { results }))
 }
 
-/// Apply recency boosts to all items (for the "all" tab).
+/// Apply recency boosts to a category's items and sort them. Threads skip it:
+/// `combined_thread_search` already ranks and boosts them.
 fn apply_recency_boosts(items: Vec<SearchResultItem>) -> Vec<SearchResultItem> {
     let mut boosted: Vec<SearchResultItem> = items
         .into_iter()
@@ -192,10 +182,8 @@ async fn search_threads_internal(
     // `limit` bounds each ARM inside the merge, not the merge, so two arms that
     // agree on nothing yield up to twice it and this category would out-fill
     // every sibling in the palette. Truncated here, like `files` / `apps` /
-    // `triggers` / `changes` each do in their own `*_internal`, so the
-    // `apply_recency_boosts` the caller runs next sees the same shape for every
-    // category. Threads relied on the shared merge truncating for it, which
-    // made the promise an accident of that function rather than this one's.
+    // `triggers` / `changes` each do in their own `*_internal`. The merge has
+    // already ranked, so the cut keeps the best hits.
     Ok(results
         .into_iter()
         .map(|r| thread_summary_to_item(&r.info, r.score))
@@ -318,7 +306,7 @@ async fn search_changes_internal(
         .map(|c| SearchResultItem {
             id: c.id.to_string(),
             title: c.description.clone(),
-            subtitle: format!("{} - {}", c.branch_name, c.status),
+            subtitle: format!("{} - {}", c.branch_name, c.status()),
             category: "changes".into(),
             score: 1.0,
             last_activity: Some(c.created_at.to_rfc3339()),
@@ -329,32 +317,4 @@ async fn search_changes_internal(
 /// Route for the global `/search` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new().route("/search", get(search))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recency_boost_no_timestamp() {
-        let boosted = recency_boost(0.8, None);
-        assert!((boosted - 0.8).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn recency_boost_recent_item() {
-        let now = chrono::Utc::now();
-        let boosted = recency_boost(1.0, Some(now));
-        // Very recent: boost should be close to 1.0
-        assert!(boosted > 0.95);
-    }
-
-    #[test]
-    fn recency_boost_old_item() {
-        let old = chrono::Utc::now() - chrono::Duration::days(60);
-        let boosted = recency_boost(1.0, Some(old));
-        // 60 days old: exp(-60/14) ~ 0.014, so boost ~ 0.5 + 0.5*0.014 ~ 0.507
-        assert!(boosted < 0.55);
-        assert!(boosted > 0.49);
-    }
 }

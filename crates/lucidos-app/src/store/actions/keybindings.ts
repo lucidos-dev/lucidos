@@ -30,10 +30,13 @@ export const KEYBINDINGS_PREF_KEY = 'keybindings';
  *  silently drops a user's custom binding; the next `setBinding` rewrites the map
  *  with the current id (legacy keys aren't re-emitted), so the old key fades out
  *  naturally. `previousThread`/`nextThread` became `historyBack`/`historyForward`
- *  when the shortcut went from thread-only to focused-pane-aware. */
+ *  when the shortcut went from thread-only to focused-pane-aware.
+ *  `prevThreadTurn`/`nextThreadTurn` gained the notification detail the same way. */
 const LEGACY_SHORTCUT_IDS: Partial<Record<ShortcutId, string>> = {
   historyBack: 'previousThread',
   historyForward: 'nextThread',
+  prevTurnOrNotification: 'prevThreadTurn',
+  nextTurnOrNotification: 'nextThreadTurn',
 };
 
 type EventLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>;

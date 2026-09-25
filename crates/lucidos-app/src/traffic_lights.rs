@@ -16,8 +16,8 @@
 //! So the cluster is 60pt wide, its centre 16pt below the window's top edge.
 //! The buttons' `origin.y` is AppKit's to set, which is why
 //! [`container_height`] is the arithmetic rather than a y offset. And AppKit
-//! reverts the placement on **every window resize** and **every new title**, so
-//! [`watch_resizes`] and [`retitle`] own re-applying it.
+//! reverts the placement on **every window resize**, **every new title** and
+//! **an appearance change**. [`watch`] and [`retitle`] own re-applying it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -171,9 +171,7 @@ pub(crate) fn measure_cluster(ns_window: &objc2_app_kit::NSWindow) -> Option<Clu
     use objc2_app_kit::NSWindowButton;
 
     let close = ns_window.standardWindowButton(NSWindowButton::CloseButton)?;
-    // SAFETY: as in `inset_lights`. `superview` is unbounded in what it can
-    // return, we only read a frame off it, and we are on the main thread.
-    let container = unsafe { close.superview().and_then(|view| view.superview()) }?;
+    let container = titlebar_container(&close)?;
     let frame = close.frame();
     let centre_in_window = container.frame().origin.y + frame.origin.y + frame.size.height / 2.0;
     Some(ClusterGeometry {
@@ -209,10 +207,9 @@ pub(crate) fn load_persisted(app: &tauri::AppHandle) {
 
 /// Place the lights on one window at ITS bar height.
 ///
-/// The re-apply path. It runs on every `Resized`, a revert AppKit is measured
-/// to perform. It runs on every `Moved` too, as the net for a revert the probe
-/// has not found (ADR 0074). A retitle is the other measured revert, and
-/// [`retitle`] handles it.
+/// The late re-apply path. It runs on every `Resized` and every `Moved`, as
+/// the net behind [`watch`] (ADR 0074). A retitle is the other measured revert,
+/// and [`retitle`] handles it.
 pub(crate) fn place(window: &tauri::Window) {
     place_at(window, bar_height_for(window.label()));
 }
@@ -275,7 +272,7 @@ fn place_at(_window: &tauri::Window, _bar_height_px: f64) {}
 fn place_at(window: &tauri::Window, bar_height_px: f64) {
     let label = window.label().to_string();
     let placed = on_ns_window(window, move |ns_window| {
-        watch_resizes(&label, ns_window);
+        watch(&label, ns_window);
         inset_lights(ns_window, LIGHTS_X_PX, bar_height_px);
     });
     if let Err(e) = placed {
@@ -349,13 +346,26 @@ fn on_ns_window(
 /// The opaque token `addObserverForName:object:queue:usingBlock:` hands back,
 /// which is the only handle that can remove that registration again.
 #[cfg(target_os = "macos")]
-type ResizeObserver =
+pub(crate) type Observer =
     objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>;
+
+/// What keeps one window's cluster placed. Both observers re-apply, at two
+/// different moments.
+#[cfg(target_os = "macos")]
+struct Watch {
+    /// Inside a live resize, before AppKit displays it. See [`observe_resizes`].
+    resize: Observer,
+    /// After AppKit shrinks the container back. See [`observe_relayouts`].
+    relayout: Observer,
+    /// The container `relayout` is scoped to. Retained, so its address cannot
+    /// be reused by another view while [`watch`] compares against it.
+    container: objc2::rc::Retained<objc2_app_kit::NSView>,
+}
 
 #[cfg(target_os = "macos")]
 thread_local! {
-    /// The observers [`watch_resizes`] installs, keyed by Tauri window label, so
-    /// a window is watched exactly once and can be unwatched when it goes away.
+    /// What [`watch`] installs, keyed by Tauri window label, so a window is
+    /// watched exactly once and can be unwatched when it goes away.
     ///
     /// A `thread_local!` rather than a `static` because a `Retained` is `!Send`
     /// and every path that touches this map is on the main thread already.
@@ -363,80 +373,208 @@ thread_local! {
     /// first forming a `&NSWindow`. Removal runs from the `Destroyed` arm of
     /// `on_window_event`, and AppKit posts the notification on the main thread.
     /// So there is exactly one map, owned by the thread that owns AppKit.
-    static RESIZE_OBSERVERS: std::cell::RefCell<std::collections::HashMap<String, ResizeObserver>> =
+    static WATCHES: std::cell::RefCell<std::collections::HashMap<String, Watch>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Keep one window's cluster placed through a live resize, by re-applying from
-/// AppKit's own `NSWindowDidResizeNotification`. Idempotent per window: the
-/// first placement installs the observer and every later one finds it there, so
-/// [`place_at`] can call this unconditionally.
+/// Keep one window's cluster placed through a resize and a relayout. Idempotent
+/// per window: the first placement installs both observers and every later one
+/// finds them there, so [`place_at`] can call this unconditionally.
+///
+/// A container AppKit has replaced gets a fresh watch, since the relayout
+/// observer is scoped to the old one and would hear nothing.
+///
+/// Called with a `&NSWindow` in hand, which is itself the evidence that we are
+/// on the main thread.
+#[cfg(target_os = "macos")]
+fn watch(label: &str, ns_window: &objc2_app_kit::NSWindow) {
+    use objc2_app_kit::NSWindowButton;
+
+    // Only app windows, so the map holds exactly the labels [`unwatch`] is
+    // called for. A `url-preview-*` panel webview is not one, and its
+    // `ns_window()` is the APP window hosting it. Watching under its label
+    // would register a second pair of observers on a window that has one.
+    if !crate::app_window::is_app_window(label) {
+        return;
+    }
+    let Some(container) = ns_window
+        .standardWindowButton(NSWindowButton::CloseButton)
+        .and_then(|close| titlebar_container(&close))
+    else {
+        return;
+    };
+    let watched = WATCHES.with_borrow(|watches| {
+        watches.get(label).is_some_and(|watch| {
+            objc2::rc::Retained::as_ptr(&watch.container) == objc2::rc::Retained::as_ptr(&container)
+        })
+    });
+    if watched {
+        return;
+    }
+    remove_watch(label);
+
+    let owner = label.to_string();
+    let resize = observe_resizes(ns_window, move |window| {
+        inset_lights(window, LIGHTS_X_PX, bar_height_for(&owner));
+    });
+    let owner = label.to_string();
+    let relayout = observe_relayouts(ns_window, &container, move |window| {
+        inset_lights(window, LIGHTS_X_PX, bar_height_for(&owner));
+    });
+    let watch = Watch {
+        resize,
+        relayout,
+        container,
+    };
+    WATCHES.with_borrow_mut(|watches| watches.insert(label.to_string(), watch));
+}
+
+/// Re-apply from AppKit's own `NSWindowDidResizeNotification`, synchronously,
+/// so a live resize never displays the cluster at AppKit's position.
 ///
 /// ADR 0074 records why this hooks AppKit's notification rather than Tauri's
-/// `Resized` event, and which two tidier-looking hooks were probed and failed.
-///
-/// The notification is both late enough and early enough, which had to be
-/// measured rather than reasoned about. By the time it fires AppKit has already
-/// reverted BOTH numbers, so there is something to correct. No later layout
-/// pass reverts them again, so what we write gets committed.
+/// `Resized` event. The notification is both late enough and early enough,
+/// which had to be measured. By the time it fires AppKit has already reverted
+/// BOTH numbers. No later layout pass reverts them again, so what we write gets
+/// committed.
 ///
 /// `on_window_event`'s `Resized` arm stays, because it covers one moment this
 /// does not: tao emits a second, synthetic resize from
 /// `windowDidExitFullscreen:`. That one is late by construction, and late is
 /// right for it.
-///
-/// Called with a `&NSWindow` in hand, which is itself the evidence that we are
-/// on the main thread.
 #[cfg(target_os = "macos")]
-fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
+pub(crate) fn observe_resizes(
+    ns_window: &objc2_app_kit::NSWindow,
+    place: impl Fn(&objc2_app_kit::NSWindow) + 'static,
+) -> Observer {
+    let object: &objc2::runtime::AnyObject = ns_window;
+    // SAFETY: AppKit's own notification name constant, never written.
+    let name = unsafe { objc2_app_kit::NSWindowDidResizeNotification };
+    // The block runs synchronously on the posting thread, which is the whole
+    // point: a queued Tauri event lands a run-loop turn too late.
+    observe(name, object, move |object| {
+        // SAFETY: the observer is scoped to this one window through
+        // `object:`, and it is alive because it is the one posting.
+        let ns_window: &objc2_app_kit::NSWindow =
+            unsafe { &*(object as *const objc2::runtime::AnyObject).cast() };
+        place(ns_window);
+    })
+}
+
+/// Re-apply after AppKit shrinks the titlebar container back to its own height.
+///
+/// An appearance change reverts the placement this way, and nothing else would
+/// re-apply. The window-lifecycle probe measured it. macOS makes that change by
+/// itself, for instance when "Auto" appearance follows the time of day.
+///
+/// It does NOT cover the resize or the retitle. The probe measured both
+/// reverting the buttons' own frames after this notification's block has run.
+/// [`observe_resizes`] and [`retitle`] keep owning those two.
+///
+/// Deferred to the main operation queue, never run inside the notification. It
+/// arrives inside AppKit's own `setFrame:` on the container, and a write nested
+/// there set off AppKit recursion in full screen that overflowed the stack. A
+/// notification centre queue does not defer: it runs the block inline when the
+/// poster is already on that queue. `addOperationWithBlock:` always enqueues.
+///
+/// Several notifications in one layout pass queue one placement between them.
+/// Our own write posts once more, and [`inset_lights`] then writes nothing.
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_relayouts(
+    ns_window: &objc2_app_kit::NSWindow,
+    container: &objc2_app_kit::NSView,
+    place: impl Fn(&objc2_app_kit::NSWindow) + 'static,
+) -> Observer {
+    // The window we were registered for, never `container.window()`. In full
+    // screen AppKit hosts the titlebar in a separate toolbar window, and a
+    // placement against that one would compute from the wrong frame.
+    let owner = objc2::rc::Weak::from(ns_window);
+    let queued = std::rc::Rc::new(std::cell::Cell::new(false));
+    let deferred = block2::RcBlock::new({
+        let queued = queued.clone();
+        move || {
+            queued.set(false);
+            // A queued placement can outlive its window.
+            let Some(ns_window) = owner.load() else {
+                return;
+            };
+            // Full screen lays the titlebar out continuously. The `Resized`
+            // arm re-places once the window is back.
+            if ns_window
+                .styleMask()
+                .contains(objc2_app_kit::NSWindowStyleMask::FullScreen)
+            {
+                return;
+            }
+            place(&ns_window);
+        }
+    });
+    let object: &objc2::runtime::AnyObject = container;
+    // SAFETY: AppKit's own notification name constant, never written.
+    let name = unsafe { objc2_app_kit::NSViewFrameDidChangeNotification };
+    observe(name, object, move |_container| {
+        if queued.replace(true) {
+            return;
+        }
+        // SAFETY: the binding asks for a sendable block because a queue may
+        // run it on any thread. The main queue runs it on the main thread,
+        // which is where this block was made and where its captures belong.
+        unsafe { objc2_foundation::NSOperationQueue::mainQueue().addOperationWithBlock(&deferred) };
+    })
+}
+
+/// Register `handle` for `name` from `object` alone. The block runs
+/// synchronously on the posting thread, which must be the main one, and hands
+/// `handle` the posting object.
+#[cfg(target_os = "macos")]
+fn observe(
+    name: &objc2_foundation::NSNotificationName,
+    object: &objc2::runtime::AnyObject,
+    handle: impl Fn(&objc2::runtime::AnyObject) + 'static,
+) -> Observer {
     use objc2_foundation::{NSNotification, NSNotificationCenter};
 
-    // Only app windows, so the map holds exactly the labels [`unwatch`] is
-    // called for. A `url-preview-*` panel webview is not one, and its
-    // `ns_window()` is the APP window hosting it. Watching under its label
-    // would register a second observer on a window that already has one.
-    if !crate::app_window::is_app_window(label) {
-        return;
-    }
-    if RESIZE_OBSERVERS.with_borrow(|observers| observers.contains_key(label)) {
-        return;
-    }
-
-    let owner = label.to_string();
     let block = block2::RcBlock::new(move |notification: std::ptr::NonNull<NSNotification>| {
-        // AppKit posts this on the main thread and we registered with a nil
-        // queue, so the block runs there. Checked rather than assumed: reaching
+        // AppKit posts both notifications on the main thread, and a nil queue
+        // runs the block on the posting thread. Checked rather than assumed: reaching
         // into AppKit off the main thread would be unsound, and skipping costs
         // only the one placement.
         if objc2::MainThreadMarker::new().is_none() {
             return;
         }
         // SAFETY: the notification is alive for the duration of the call.
-        let Some(object) = (unsafe { notification.as_ref() }).object() else {
-            return;
-        };
-        // SAFETY: the observer below is scoped to a single window through the
-        // `object:` argument. The only sender that can reach this block is that
-        // `NSWindow`, and it is alive because it is the one posting.
-        let ns_window: &objc2_app_kit::NSWindow =
-            unsafe { &*objc2::rc::Retained::as_ptr(&object).cast() };
-        inset_lights(ns_window, LIGHTS_X_PX, bar_height_for(&owner));
+        if let Some(object) = (unsafe { notification.as_ref() }).object() {
+            handle(&object);
+        }
     });
-
-    let object: &objc2::runtime::AnyObject = ns_window;
-    // SAFETY: the name is AppKit's own notification constant, and the object is
-    // the window we want scoped notifications for. A nil queue asks for the
-    // block to run synchronously on the posting thread, which is the whole
-    // point: a queued block would land where the Tauri event already is.
-    let observer = unsafe {
+    // SAFETY: the name is AppKit's own notification constant, and scoping to
+    // `object` means only that sender can reach the block.
+    unsafe {
         NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-            Some(objc2_app_kit::NSWindowDidResizeNotification),
+            Some(name),
             Some(object),
             None,
             &block,
         )
-    };
-    RESIZE_OBSERVERS.with_borrow_mut(|observers| observers.insert(label.to_string(), observer));
+    }
+}
+
+/// Stop the notification centre delivering to `observer`.
+#[cfg(target_os = "macos")]
+pub(crate) fn stop_observing(observer: &Observer) {
+    let observer: &objc2::runtime::AnyObject = observer.as_ref();
+    // SAFETY: the token is what `addObserverForName:object:queue:usingBlock:`
+    // handed back, on the same centre.
+    unsafe { objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(observer) };
+}
+
+/// Drop `label`'s watch, if it has one. Main thread only, like [`WATCHES`].
+#[cfg(target_os = "macos")]
+fn remove_watch(label: &str) {
+    if let Some(watch) = WATCHES.with_borrow_mut(|watches| watches.remove(label)) {
+        stop_observing(&watch.resize);
+        stop_observing(&watch.relayout);
+    }
 }
 
 /// Off macOS no window was ever watched.
@@ -445,7 +583,7 @@ pub(crate) fn unwatch(label: &str) {
     BAR_HEIGHTS.lock().unwrap().remove(label);
 }
 
-/// Drop a closed window's resize observer. Called from the `Destroyed` arm of
+/// Drop a closed window's observers. Called from the `Destroyed` arm of
 /// `on_window_event`, and the only thing that stops the notification centre
 /// holding a registration keyed on a dead window's address. Another `NSWindow`
 /// can reuse that address, and the block would then place lights on somebody
@@ -456,21 +594,29 @@ pub(crate) fn unwatch(label: &str) {
     // reported height left behind would be handed to the next window to take
     // this label.
     BAR_HEIGHTS.lock().unwrap().remove(label);
-    // The observer map is the main thread's (see [`RESIZE_OBSERVERS`]) and
+    // The watch map is the main thread's (see [`WATCHES`]) and
     // `on_window_event` runs there. This checks the invariant rather than
     // taking a branch we expect.
     if objc2::MainThreadMarker::new().is_none() {
-        eprintln!("[Tauri] Traffic-light resize observer for {label} left registered: not on the main thread");
+        eprintln!(
+            "[Tauri] Traffic-light observers for {label} left registered: not on the main thread"
+        );
         return;
     }
-    let Some(observer) = RESIZE_OBSERVERS.with_borrow_mut(|observers| observers.remove(label))
-    else {
-        return;
-    };
-    let observer: &objc2::runtime::AnyObject = observer.as_ref();
-    // SAFETY: the token is what `addObserverForName:object:queue:usingBlock:`
-    // handed back for this window, on the same centre.
-    unsafe { objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(observer) };
+    remove_watch(label);
+}
+
+/// close -> NSTitlebarView -> NSTitlebarContainerView. The container carries
+/// the cluster's vertical position: it is pinned to the window's top edge, so
+/// growing it is how the buttons move DOWN.
+#[cfg(target_os = "macos")]
+pub(crate) fn titlebar_container(
+    close: &objc2_app_kit::NSButton,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSView>> {
+    // SAFETY: `superview` is unsafe in the generated bindings because it is
+    // unbounded in what it can return. We only read and write frames on the
+    // result, and holding a button is evidence we are on the main thread.
+    unsafe { close.superview().and_then(|view| view.superview()) }
 }
 
 /// Move the three window buttons to `x` and centre them on a bar
@@ -480,7 +626,8 @@ pub(crate) fn unwatch(label: &str) {
 ///
 /// Idempotent, which is what makes the re-apply safe to run on every event. A
 /// previous run leaves the buttons' `origin.y` and their pitch unchanged, so a
-/// second call reads the same inputs and writes the same frames.
+/// second call reads the same inputs. It then writes nothing, which is what
+/// stops [`observe_relayouts`] hearing its own write forever.
 #[cfg(target_os = "macos")]
 pub(crate) fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64) {
     use objc2_app_kit::NSWindowButton;
@@ -495,14 +642,7 @@ pub(crate) fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_heig
     // The zoom button is absent on a non-resizable window. The other two carry
     // the pitch between them, so its absence costs nothing.
     let zoom = ns_window.standardWindowButton(NSWindowButton::ZoomButton);
-
-    // close -> NSTitlebarView -> NSTitlebarContainerView. The container is what
-    // carries the cluster's vertical position: it is pinned to the window's top
-    // edge, so growing it is how the buttons move DOWN.
-    // SAFETY: `superview` is unsafe in the generated bindings because it is
-    // unbounded in what it can return. We only read frames off the result, and
-    // we are on the main thread.
-    let Some(container) = (unsafe { close.superview().and_then(|view| view.superview()) }) else {
+    let Some(container) = titlebar_container(&close) else {
         return;
     };
 
@@ -511,7 +651,9 @@ pub(crate) fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_heig
     let mut container_frame = container.frame();
     container_frame.size.height = height;
     container_frame.origin.y = ns_window.frame().size.height - height;
-    container.setFrame(container_frame);
+    if container.frame() != container_frame {
+        container.setFrame(container_frame);
+    }
 
     // AppKit's own spacing, read rather than assumed, so the cluster keeps the
     // system's rhythm and only its origin is ours.
@@ -521,7 +663,9 @@ pub(crate) fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_heig
     for (index, button) in buttons.into_iter().enumerate() {
         let mut origin = button.frame().origin;
         origin.x = x + index as f64 * pitch;
-        button.setFrameOrigin(origin);
+        if button.frame().origin != origin {
+            button.setFrameOrigin(origin);
+        }
     }
 }
 

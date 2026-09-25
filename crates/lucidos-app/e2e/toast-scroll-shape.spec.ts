@@ -21,7 +21,7 @@ import { assertHealthy, gotoWithRetry } from './helpers';
 
 /** The parsed shape of a build toast: a count line, a group title, and enough
  *  bullets to overflow the 14rem cap. */
-const HEADING = '12 commits since your running version';
+const HEADING = '12 commits come with the new version';
 const BULLETS = [
   'header: the unread total rides the brand and the menu says where it lives',
   'gateway: the pairing screen is not the picker, and owns its own boot',

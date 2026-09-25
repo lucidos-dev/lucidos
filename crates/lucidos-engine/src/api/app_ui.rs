@@ -37,7 +37,7 @@ const BRAND_FAVICON_LINKS: &str = concat!(
 /// Tell `/api/v1/sdk-prefs.js` which device is asking, by stamping `?device=`
 /// onto the app's own reference to it.
 ///
-/// That script resolves this device's theme, font and UI scale, and it is
+/// That script resolves this device's theme, font, UI scale and motion, and it is
 /// parser-blocking, so nothing async can feed it. It used to read them out of
 /// `localStorage`, which an app frame could see only because its sandbox said
 /// `allow-same-origin`. Isolating the frame takes that away.

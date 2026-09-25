@@ -13,7 +13,7 @@ impl EventStore {
     ///
     /// This function COALESCEs both shapes and writes the *first* TriggerStarted
     /// event's id/name per thread — same "first write wins" semantics as the
-    /// runtime projection in `event_bus::apply_thread_event`. Runs before
+    /// runtime projection in `EventBus::update_thread_projection`. Runs before
     /// `backfill_trigger_id_v5_to_config_id` so the v5→config_id rewrite picks
     /// up the freshly recovered rows. Once-only — guarded by a marker.
     pub async fn backfill_trigger_id_from_events(

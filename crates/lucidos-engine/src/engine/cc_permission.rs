@@ -115,6 +115,31 @@ pub const UNATTENDED_DENY_UNCLASSIFIED_REASON: &str =
      the workspace. To read a file outside the workspace use cat, head or grep, which stay on \
      the safe fast path.";
 
+/// What a pending card's waiters receive when it ends. Shared by all three
+/// permission lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionAnswer {
+    /// A human allowed it.
+    Allowed,
+    /// A human denied it.
+    Denied,
+    /// The engine withdrew the card before anyone answered, for the reason
+    /// stamped on its resolution. Nobody decided, so no waiter may report it as
+    /// a user denial.
+    Withdrawn(&'static str),
+}
+
+impl PermissionAnswer {
+    /// The answer a human's Allow or Deny carries.
+    pub fn from_decision(allowed: bool) -> Self {
+        if allowed {
+            Self::Allowed
+        } else {
+            Self::Denied
+        }
+    }
+}
+
 /// Grouping key for collapsing identical concurrent permission requests. The
 /// canonical input is the serialized `input`, which suffices because the agent
 /// re-serializes the same struct each time and produces the same bytes.
@@ -130,7 +155,7 @@ pub struct PermissionEntry {
     pub request_id: String,
     pub tool_name: String,
     pub input: serde_json::Value,
-    pub tx: tokio::sync::broadcast::Sender<bool>,
+    pub tx: tokio::sync::broadcast::Sender<PermissionAnswer>,
 }
 
 /// Two-way index: lookup by `DedupKey` when a new request arrives, lookup by
@@ -198,7 +223,11 @@ impl PermissionState {
         thread_id: Uuid,
         tool_name: String,
         input: serde_json::Value,
-    ) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
+    ) -> (
+        String,
+        tokio::sync::broadcast::Receiver<PermissionAnswer>,
+        bool,
+    ) {
         // Opportunistic sweep: each new prompt evicts orphans whose waiters
         // were canceled and would otherwise leak until an engine restart.
         self.gc_dead_entries();
@@ -503,6 +532,28 @@ async fn fetch_thread_origin_and_linkage(
     }
 }
 
+/// Whether a `ChildThreadDetached` names `thread_id`. An unreadable answer
+/// counts as moved, so a database error asks a human rather than lending a
+/// trigger's grant.
+async fn was_moved_to_top_level(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events \
+         WHERE aggregate = 'thread' AND event_type = 'ChildThreadDetached' \
+           AND payload->>'child_thread_id' = $1::text)",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| {
+        crate::log!(
+            "[CCPermission] Could not read whether {} was moved to top level: {}",
+            thread_id,
+            e
+        );
+        true
+    })
+}
+
 /// Decide whether this coding-agent session is interactive or unattended, and
 /// what side-effect grant an unattended one inherits. Walks the spawn tree from
 /// `thread_id` up to its root through the persisted `MessageOrigin` chain:
@@ -534,6 +585,12 @@ pub async fn resolve_attend_mode(
     for _ in 0..MAX_ANCESTRY_HOPS {
         if !seen.insert(current) {
             break; // cycle guard, which a real tree never trips
+        }
+        // A thread moved to top level left its old tree (ADR 0278). Its spawn
+        // event still names the old parent, and events are never rewritten,
+        // so the walk stops here and a human answers.
+        if was_moved_to_top_level(pool, current).await {
+            return AttendMode::Interactive;
         }
         let Some((origin, callback_linkage)) = fetch_thread_origin_and_linkage(pool, current).await
         else {
@@ -1221,7 +1278,7 @@ pub async fn lookup_session_worktree(
 }
 
 /// One blocking permission round-trip: the shared core both raise paths drive,
-/// CC's MCP HTTP path and the Codex app-server bridge. The flow is five gates,
+/// CC's MCP HTTP path and the Codex app-server bridge. The flow is six gates,
 /// in order:
 ///
 ///   1. **In-worktree write fast path.** A file write inside the session's own
@@ -1472,26 +1529,32 @@ async fn record_unattended_denial(
 }
 
 /// Map the broadcast `recv` result for a pending permission into the outcome
-/// relayed to the agent. The three outcomes are distinct:
-///   * `Ok(true)` is an explicit Allow fanned over the broadcast.
-///   * `Ok(false)` is an explicit Deny, supersession included.
+/// relayed to the agent. Only a human's Deny reads as `DENIAL_REASON`:
+///   * `Withdrawn` names the engine's reason and says nobody decided.
 ///   * `Err(_)` means the channel CLOSED, which can only be the engine tearing
 ///     down. Every live resolution path sends before dropping the sender, and
 ///     `gc_dead_entries` never reaps an entry whose receiver is still awaiting.
-///     A restart is NOT a user denial, so it carries the neutral
-///     `RESTART_INTERRUPT_REASON`. Otherwise a resumed session reads "User
-///     denied" and treats the restart as a rejection of its approach.
+///     It carries the neutral `RESTART_INTERRUPT_REASON`.
+///
+/// Otherwise the agent reads a rejection of an approach nobody rejected.
 fn outcome_from_permission_recv(
-    recv: Result<bool, tokio::sync::broadcast::error::RecvError>,
+    recv: Result<PermissionAnswer, tokio::sync::broadcast::error::RecvError>,
 ) -> PermissionPromptOutcome {
     match recv {
-        Ok(true) => PermissionPromptOutcome {
+        Ok(PermissionAnswer::Allowed) => PermissionPromptOutcome {
             allowed: true,
             reason: None,
         },
-        Ok(false) => PermissionPromptOutcome {
+        Ok(PermissionAnswer::Denied) => PermissionPromptOutcome {
             allowed: false,
             reason: Some(DENIAL_REASON.to_string()),
+        },
+        Ok(PermissionAnswer::Withdrawn(reason)) => PermissionPromptOutcome {
+            allowed: false,
+            reason: Some(format!(
+                "{reason}, not a user decision. Nobody denied this request, so do not read it \
+                 as a rejection of your approach."
+            )),
         },
         Err(_) => PermissionPromptOutcome {
             allowed: false,
@@ -1544,8 +1607,8 @@ pub fn record_coding_agent_allow_grant(
 
 /// Emit a `CodingAgentPermissionResolved` via the bus. Sibling of
 /// `command_permission::emit_command_permission_resolved`, and the one place
-/// this lane builds the variant: the answer path, the unattended deny, and both
-/// dangling-card sweeps all come through here.
+/// this lane builds the variant: the answer path, the unattended deny, and every
+/// dangling-card sweep all come through here.
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_coding_agent_permission_resolved(
     event_bus: &EventBus,
@@ -1596,7 +1659,7 @@ pub async fn resolve_coding_agent_permission(
         return false;
     };
     // Wake the blocked handler, and every deduped waiter on the same broadcast.
-    let _ = entry.tx.send(allowed);
+    let _ = entry.tx.send(PermissionAnswer::from_decision(allowed));
 
     let reason = if allowed {
         None
@@ -1705,8 +1768,8 @@ pub(crate) async fn has_pending_permission_card(
 /// and the session-ended path. Mirrors `recover_orphan_cc_permission_requests`
 /// but scoped to one thread. Two effects per unresolved request:
 ///
-///   1. Fan a deny out to any still-blocked handler through the in-memory
-///      broadcast entry. The subprocess's pending call then returns
+///   1. Fan a `Withdrawn` out to any still-blocked handler through the
+///      in-memory broadcast entry. The subprocess's pending call then returns
 ///      immediately, rather than dangling until the next sweep.
 ///   2. Emit a denied `CodingAgentPermissionResolved`, so the card's buttons
 ///      stop dangling. Without it the card sits clickable forever and the
@@ -1722,7 +1785,7 @@ async fn resolve_pending_permissions_with_reason(
     pending: &Mutex<PermissionState>,
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
-    reason: &str,
+    reason: &'static str,
     log_label: &str,
 ) {
     let rows: Vec<(Option<String>,)> = match sqlx::query_as(UNRESOLVED_PERMISSION_REQUESTS_SQL)
@@ -1750,7 +1813,7 @@ async fn resolve_pending_permissions_with_reason(
         {
             let mut state = pending.lock().unwrap();
             if let Some(entry) = state.take(&request_id) {
-                let _ = entry.tx.send(false);
+                let _ = entry.tx.send(PermissionAnswer::Withdrawn(reason));
             }
         }
         emit_coding_agent_permission_resolved(
@@ -1875,18 +1938,25 @@ mod tests {
 
     #[test]
     fn outcome_allow_has_no_reason() {
-        let o = outcome_from_permission_recv(Ok(true));
+        let o = outcome_from_permission_recv(Ok(PermissionAnswer::Allowed));
         assert!(o.allowed);
         assert_eq!(o.reason, None);
     }
 
     #[test]
     fn outcome_explicit_deny_is_user_denied() {
-        // A `false` fanned over the broadcast (explicit Deny click or
-        // supersession) keeps the "User denied" reason.
-        let o = outcome_from_permission_recv(Ok(false));
+        let o = outcome_from_permission_recv(Ok(PermissionAnswer::Denied));
         assert!(!o.allowed);
         assert_eq!(o.reason.as_deref(), Some(DENIAL_REASON));
+    }
+
+    #[test]
+    fn outcome_withdrawn_names_the_reason_and_is_not_user_denied() {
+        let o = outcome_from_permission_recv(Ok(PermissionAnswer::Withdrawn(SUPERSEDED_REASON)));
+        assert!(!o.allowed);
+        let reason = o.reason.unwrap();
+        assert!(reason.starts_with(SUPERSEDED_REASON), "{reason}");
+        assert!(reason.contains("not a user decision"), "{reason}");
     }
 
     #[test]
@@ -1904,7 +1974,11 @@ mod tests {
     fn register(
         state: &mut PermissionState,
         key: DedupKey,
-    ) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
+    ) -> (
+        String,
+        tokio::sync::broadcast::Receiver<PermissionAnswer>,
+        bool,
+    ) {
         let tool_name = key.1.clone();
         state.register_or_attach(key, Uuid::nil(), tool_name, serde_json::json!({}))
     }
@@ -1957,10 +2031,10 @@ mod tests {
 
         // Resolve via the same path the consent endpoint uses.
         let entry = state.take(&id).expect("entry must be present");
-        let _ = entry.tx.send(true);
+        let _ = entry.tx.send(PermissionAnswer::Allowed);
 
-        assert!(rx1.recv().await.unwrap());
-        assert!(rx2.recv().await.unwrap());
+        assert_eq!(rx1.recv().await.unwrap(), PermissionAnswer::Allowed);
+        assert_eq!(rx2.recv().await.unwrap(), PermissionAnswer::Allowed);
     }
 
     fn entry(req_id: &str) -> PermissionEntry {
@@ -3235,6 +3309,51 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// A child moved to top level keeps its spawn event, which still names the
+    /// trigger thread as parent. The walk must stop at the move anyway, or the
+    /// thread the user cut loose keeps auto-approving side effects (ADR 0278).
+    #[tokio::test]
+    async fn resolve_attend_mode_moved_child_does_not_inherit_trigger_grant() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-moved";
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let grandchild = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_child_spawn_event(&pool, child, root).await;
+        insert_child_spawn_event(&pool, grandchild, child).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        assert!(
+            matches!(
+                resolve_attend_mode(&pool, &cfgs, grandchild).await,
+                AttendMode::Unattended { .. }
+            ),
+            "before the move the whole subtree inherits the trigger's grant"
+        );
+
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, 'ChildThreadDetached', $3, NOW(), $2::uuid)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(root.to_string())
+        .bind(serde_json::json!({ "child_thread_id": child }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for thread in [child, grandchild] {
+            assert_eq!(
+                resolve_attend_mode(&pool, &cfgs, thread).await,
+                AttendMode::Interactive,
+                "a moved subtree asks a human"
+            );
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// A `relation: "top"` spawn stamps a `ThreadLink` origin naming its
     /// spawning thread (so the route popover can link back) but carries NO
     /// `parent_thread_id`. Attribution must not lend it the spawning thread's trigger
@@ -3808,7 +3927,7 @@ mod tests {
             state.take(&request_id).expect("canonical entry present")
         };
         assert_eq!(entry.tool_name, "command_execution");
-        let _ = entry.tx.send(true);
+        let _ = entry.tx.send(PermissionAnswer::Allowed);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
             .await
@@ -4104,7 +4223,7 @@ mod tests {
             .unwrap()
             .take(&request_id)
             .expect("canonical entry present");
-        let _ = entry.tx.send(true);
+        let _ = entry.tx.send(PermissionAnswer::Allowed);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
             .await
@@ -4119,6 +4238,81 @@ mod tests {
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    /// A card the engine withdraws is not a user decision. A new message or an
+    /// idling session used to reach the blocked agent as "User denied", so it
+    /// abandoned an approach nobody had rejected.
+    #[tokio::test]
+    async fn a_withdrawn_card_never_tells_the_agent_the_user_denied() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        for (label, sweep_reason) in [
+            ("superseded", SUPERSEDED_REASON),
+            ("session ended", SESSION_ENDED_REASON),
+        ] {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let pending = Arc::new(Mutex::new(PermissionState::default()));
+            let thread_id = Uuid::new_v4();
+            seed_cc_thread(&bus, thread_id).await;
+
+            let waiter = {
+                let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
+                let cfgs = empty_trigger_configs();
+                tokio::spawn(async move {
+                    prompt_coding_agent_permission(
+                        &pool,
+                        &bus,
+                        &pending,
+                        &cfgs,
+                        Path::new("/ws"),
+                        Some(Path::new("/ws/.lucidos/worktrees/thread-abc")),
+                        None,
+                        CodingAgentPermissionInput {
+                            thread_id,
+                            tool_use_id: "i-withdrawn".into(),
+                            tool_name: "Write".into(),
+                            input: serde_json::json!({ "file_path": "/home/u/notes.md" }),
+                        },
+                    )
+                    .await
+                })
+            };
+            await_canonical_request(&pending).await;
+            // The request event lands after registration, so wait for it
+            // before sweeping, as a real follow-up would.
+            while card_count(&pool, thread_id).await == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            if sweep_reason == SUPERSEDED_REASON {
+                resolve_pending_permissions_as_superseded(&pool, &bus, &pending, thread_id, None)
+                    .await;
+            } else {
+                resolve_pending_permissions_as_session_ended(
+                    &pool, &bus, &pending, thread_id, None,
+                )
+                .await;
+            }
+
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+                .await
+                .expect("resolves within 10s")
+                .expect("task ok");
+            assert!(!outcome.allowed, "{label}: a withdrawn card allows nothing");
+            let reason = outcome.reason.unwrap_or_default();
+            assert_ne!(
+                reason, DENIAL_REASON,
+                "{label}: nobody clicked Deny, so the agent must not read a user denial"
+            );
+            assert!(
+                reason.starts_with(sweep_reason) && reason.contains("not a user decision"),
+                "{label}: the agent reads why the card ended: {reason:?}"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
     }
 
     /// Spin until the canonical entry lands, then hand back its request_id.
@@ -4305,7 +4499,7 @@ mod tests {
             .unwrap()
             .take(&request_id)
             .expect("a card must be rendered");
-        let _ = entry.tx.send(true);
+        let _ = entry.tx.send(PermissionAnswer::Allowed);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
             .await

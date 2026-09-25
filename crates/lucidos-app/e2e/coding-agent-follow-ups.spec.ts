@@ -3,7 +3,7 @@ import {
   navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
   assertHealthy, pickComposeDestination, newThread, countExchanges,
   waitForActionPanel, waitForCCToFinish, waitForExchangeCount,
-  waitForCCToStart, assertUserMessagesVisible,
+  waitForCCToStart, assertUserMessagesVisible, assertUserMessagesInOrder,
 } from './helpers';
 
 test.describe('Claude Code follow-ups during and after working', () => {
@@ -56,7 +56,10 @@ test.describe('Claude Code follow-ups during and after working', () => {
     await waitForExchangeCount(page, 3, 180_000);
     await waitForCCToFinish(page, 180_000);
 
-    await assertUserMessagesVisible(page, [msg1, msg2, msg3]);
+    // Both follow-ups usually land while the session is still starting. The
+    // engine must record and deliver them in sent order, and the agent may
+    // answer both in one turn.
+    await assertUserMessagesInOrder(page, [msg1, msg2, msg3]);
   });
 
   test('send follow-up after CC finishes and goes idle', async ({ page }) => {

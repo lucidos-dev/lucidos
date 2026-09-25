@@ -820,6 +820,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
                 id: "opt-0".into(),
                 label: "A".into(),
                 description: None,
+                preview: None,
             }],
             worktree_path: None,
             multi_select: false,

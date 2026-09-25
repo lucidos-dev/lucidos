@@ -17,12 +17,15 @@
     font-size: var(--font-size-3xs);
     font-weight: bold;
     border-radius: 0.5625rem;
-    min-width: 0.875rem;
-    min-height: 0.875rem;
+    /* The design height. styles/badges.css rounds it to whole pixels, which
+       is what keeps the glyph centred, and the width follows that box. */
+    --badge-height: 0.875rem;
+    min-width: var(--badge-box, var(--badge-height));
+    min-height: var(--badge-height);
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 0 0.1875rem;
-    line-height: 0.875rem;
+    line-height: var(--badge-height);
     box-sizing: border-box;
 }

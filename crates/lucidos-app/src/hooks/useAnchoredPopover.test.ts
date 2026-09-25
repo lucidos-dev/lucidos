@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers, installPairedSwallow } from './useAnchoredPopover';
+import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers, installPairedSwallow, pointAnchor } from './useAnchoredPopover';
 import { notePressOutcome, takePressOutcome } from '../utils/tapGesture';
 
 function fakeAnchor(rect: { top: number; bottom: number; left: number; right: number }): HTMLElement {
@@ -245,6 +245,29 @@ describe('computeAnchorPosition', () => {
     );
     // desiredLeft = 350 - 380 = -30; clamp pins to the left margin.
     expect(pos.left).toBe(8);
+  });
+});
+
+describe('pointAnchor', () => {
+  it('opens a panel just below and right of the pointer', () => {
+    setViewport(1280, 800);
+    const pos = computeAnchorPosition(pointAnchor({ x: 200, y: 300 }), 200, 240);
+    expect(pos.placement).toBe('bottom-start');
+    expect(pos.left).toBe(200);
+    expect(pos.top).toBe(304);
+  });
+
+  it('flips above the pointer near the bottom edge', () => {
+    setViewport(1280, 800);
+    const pos = computeAnchorPosition(pointAnchor({ x: 200, y: 700 }), 200, 240);
+    expect(pos.placement).toBe('top-start');
+    expect(pos.top).toBe(496); // 700 - 200 - 4
+  });
+
+  it('clamps inside the viewport near the right edge', () => {
+    setViewport(1280, 800);
+    const pos = computeAnchorPosition(pointAnchor({ x: 1270, y: 300 }), 200, 240);
+    expect(pos.left).toBe(1032); // 1280 - 240 - 8
   });
 });
 

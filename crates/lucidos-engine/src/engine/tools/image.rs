@@ -209,6 +209,17 @@ impl LucidosEngine {
             .unwrap_or(ImageSize::Auto);
 
         let save_as_artifact = args.get("save_as_artifact").and_then(|v| v.as_str());
+        // Refused before the provider call, which the user pays for. Refused
+        // after it, the image is generated, billed and then thrown away.
+        if let Some(artifact_path) = save_as_artifact {
+            if crate::api::is_path_traversal(artifact_path) {
+                return Err(format!(
+                    "Invalid save_as_artifact path (must not contain '..' or start with '/' or '\\'): {}",
+                    artifact_path
+                )
+                .into());
+            }
+        }
 
         // Resolve input images
         let input_refs: Vec<String> = args
@@ -282,13 +293,6 @@ impl LucidosEngine {
 
         // Save as artifact if requested
         if let Some(artifact_path) = save_as_artifact {
-            if crate::api::is_path_traversal(artifact_path) {
-                return Err(format!(
-                    "Invalid save_as_artifact path (must not contain '..' or start with '/' or '\\'): {}",
-                    artifact_path
-                )
-                .into());
-            }
             let raw_bytes = base64::engine::general_purpose::STANDARD.decode(&compressed.base64)?;
             // The store announces the write. This tool used to call the raw
             // writer and emit nothing at all, so a generated image appeared in no

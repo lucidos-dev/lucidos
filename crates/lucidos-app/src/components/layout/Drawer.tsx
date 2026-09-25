@@ -9,7 +9,7 @@ import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isMobile } from '../../utils/viewport';
-import { prefersReducedMotion } from '../../utils/platform';
+import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
@@ -66,19 +66,29 @@ export function openDrawer(anchor?: HTMLElement) {
  *
  *  Reduced motion has no slide-out to wait for. The CSS drops the animation on
  *  `.drawer.closing`, and an element with no animation fires no `animationend`.
- *  The panel's `onAnimationEnd` handler is the only place that clears
- *  `drawerOpen`. So the close reads the same preference the CSS reads, rather
- *  than racing it with a timer. A real close still returns `true` and the tap
- *  is still swallowed. */
+ *  So the close reads `isReducedMotion()`, the value the CSS keys on through
+ *  `data-motion`, and closes at once. A scaled fallback timer covers the rest:
+ *  motion turning reduced mid-slide, or a frame that never paints. A real close
+ *  still returns `true` and the tap is still swallowed. */
 export function closeDrawer(): boolean {
   if (!drawerOpen.value || drawerClosing.value) return false;
-  if (prefersReducedMotion()) {
+  if (isReducedMotion()) {
     forceCloseDrawer();
     return true;
   }
   drawerClosing.value = true;
+  const close = ++closeGeneration;
+  setTimeout(() => {
+    if (close === closeGeneration && drawerClosing.value) forceCloseDrawer();
+  }, scaledDurationMs(DRAWER_SLIDE_OUT_MS) + DRAWER_SLIDE_OUT_SLACK_MS);
   return true;
 }
+
+/** The `.drawer.closing` slide-out at 1x (`--duration-normal`, mobile.css). */
+const DRAWER_SLIDE_OUT_MS = 200;
+const DRAWER_SLIDE_OUT_SLACK_MS = 100;
+/** Bumped per close, so a stale fallback cannot cut a later close short. */
+let closeGeneration = 0;
 
 /** Immediately close the drawer without animation (e.g. pane switching). */
 export function forceCloseDrawer() {

@@ -7,7 +7,8 @@
 //! - `POST /api/v1/frontend-preview/stop`
 //!
 //! Every response carries `url` when a preview is running, built from the
-//! `Host` header of THIS request. The engine has no other way to know it: the
+//! `Host` header of THIS request and the gateway's scheme, which the preview
+//! shares (ADR 0267). The engine has no other way to know it: the
 //! same workspace is `localhost` from the laptop and a Tailscale name from the
 //! phone, and handing a phone a `localhost` link is handing it nothing.
 //!
@@ -27,7 +28,9 @@ use uuid::Uuid;
 
 use super::error::ApiError;
 use super::AppState;
-use crate::engine::frontend_preview::{preview_url_for_host, FrontendPreviewStatus};
+use crate::engine::frontend_preview::{
+    preview_upstream_from_env, preview_url_for_host, FrontendPreviewStatus,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -51,23 +54,30 @@ struct PreviewResponse {
 }
 
 impl PreviewResponse {
-    fn build(status: FrontendPreviewStatus, headers: &HeaderMap) -> Self {
-        let url = status.port.and_then(|port| {
+    /// `scheme` is the preview's, `None` when no gateway launched this engine
+    /// (and then no preview can be running either).
+    fn build(status: FrontendPreviewStatus, headers: &HeaderMap, scheme: Option<&str>) -> Self {
+        let url = status.port.zip(scheme).and_then(|(port, scheme)| {
             preview_url_for_host(
                 headers
                     .get(axum::http::header::HOST)
                     .and_then(|v| v.to_str().ok()),
-                crate::net_config::tls_scheme(),
+                scheme,
                 port,
             )
         });
         Self { status, url }
     }
+
+    fn for_request(status: FrontendPreviewStatus, headers: &HeaderMap) -> Self {
+        let upstream = preview_upstream_from_env().ok();
+        Self::build(status, headers, upstream.as_ref().map(|u| u.scheme()))
+    }
 }
 
 async fn get_status(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let status = state.engine.frontend_preview_status().await;
-    Json(json_of(PreviewResponse::build(status, &headers)))
+    Json(json_of(PreviewResponse::for_request(status, &headers)))
 }
 
 async fn start(
@@ -84,12 +94,14 @@ async fn start(
         .start_frontend_preview(req.thread_id)
         .await
         .map_err(ApiError::bad_request)?;
-    Ok(Json(json_of(PreviewResponse::build(status, &headers))))
+    Ok(Json(json_of(PreviewResponse::for_request(
+        status, &headers,
+    ))))
 }
 
 async fn stop(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let status = state.engine.stop_frontend_preview().await;
-    Json(json_of(PreviewResponse::build(status, &headers)))
+    Json(json_of(PreviewResponse::for_request(status, &headers)))
 }
 
 /// `PreviewResponse` is a `#[serde(flatten)]` wrapper, which `Json` can only
@@ -125,14 +137,11 @@ mod tests {
         let json = json_of(PreviewResponse::build(
             status,
             &headers_with_host("phone.tailnet.ts.net:5173"),
+            Some("https"),
         ));
         assert_eq!(json["running"], true);
         assert_eq!(json["port"], 6173);
-        assert!(json["url"].as_str().unwrap().starts_with("http")); // scheme follows the engine's own TLS config
-        assert!(json["url"]
-            .as_str()
-            .unwrap()
-            .contains("phone.tailnet.ts.net:6173"));
+        assert_eq!(json["url"], "https://phone.tailnet.ts.net:6173/");
     }
 
     #[test]
@@ -140,6 +149,7 @@ mod tests {
         let json = json_of(PreviewResponse::build(
             FrontendPreviewStatus::stopped(),
             &headers_with_host("localhost:5173"),
+            Some("https"),
         ));
         assert_eq!(json, serde_json::json!({ "running": false }));
     }
@@ -155,7 +165,11 @@ mod tests {
             started_at: None,
             worktree: None,
         };
-        let json = json_of(PreviewResponse::build(status, &HeaderMap::new()));
+        let json = json_of(PreviewResponse::build(
+            status,
+            &HeaderMap::new(),
+            Some("https"),
+        ));
         assert_eq!(json["port"], 6173);
         assert!(json.get("url").is_none());
     }

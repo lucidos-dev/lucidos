@@ -41,6 +41,7 @@ layer.
   "<provider-name>": {
     "base_url": "https://api.example.com",
     "insecure_transport": false,   // optional, default false (see below)
+    "timeout_secs": 300,           // optional, 1-600 (see below)
     "auth": {
       "pipeline": [
         // one or more layer entries, in execution order
@@ -74,6 +75,15 @@ has no secret to leak, so it is fine as it stands.
 Without the flag, an affected call answers 502 naming what to change. With it,
 the engine logs the provider at startup and posts one notification listing every
 entry it will not vouch for.
+
+### `timeout_secs`: how long this entry waits
+
+How long the engine waits on one upstream request for this entry, in seconds,
+from 1 to 600. It wins over the workspace's `proxy_timeout_secs` preference,
+which in turn defaults to 30. Set it on a slow backend, so one long call can
+finish without raising the limit for every other entry. A value outside the
+range rejects the entry by name, and its calls answer 502 with the reason. See
+`system-knowhow/lucidos-cli.md` § Timeouts.
 
 Layer shapes (all live in `proxy_pipeline_config::LayerConfig`):
 

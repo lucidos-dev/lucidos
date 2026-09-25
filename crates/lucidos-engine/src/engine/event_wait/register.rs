@@ -9,10 +9,11 @@
 //! # Four refusals, three of them caps
 //!
 //! * **The subscribability gate** (S3), via `validate_subscribable_event_type`.
-//! * **The recent-subscription cap** (S8): 10 registrations inside one hour
-//!   with no human message in between. Catches a thread awaiting an event kind
-//!   its own re-entry emits, two threads ping-ponging, and a model simply stuck.
-//!   All three re-arm fast, and a serial workflow of long waits does not.
+//! * **The recent-subscription cap** (S8): 20 registrations inside one hour
+//!   with no human action in between, counting only waits no other thread
+//!   ended. Catches a thread awaiting an event kind its own re-entry emits, and
+//!   a model stuck re-arming for something that never comes. Waiting on other
+//!   threads' work is progress and never counts (ADR 0280).
 //! * **The live-wait cap** (S6b): 25 simultaneous waits per thread. It bounds
 //!   how many separate re-entries one burst of events can start on one thread,
 //!   not what a sleeping subscription costs, which is nothing.
@@ -34,11 +35,16 @@ use crate::engine::LucidosEngine;
 /// every reason anyone had for it is indistinguishable from a stalled thread.
 pub(crate) const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 
-/// How many times a thread may subscribe inside
-/// [`RECENT_SUBSCRIPTION_WINDOW_SECS`] with no human `MessageReceived` in
-/// between (S8). Mirrors `max_event_trigger_depth` in intent: the events still
-/// persist, the fan-out just stops.
-pub(crate) const MAX_RECENT_SUBSCRIPTIONS: i64 = 10;
+/// How many counted waits a thread may start inside
+/// [`RECENT_SUBSCRIPTION_WINDOW_SECS`] with no human action in between (S8).
+/// [`recent_subscriptions`] says which waits count. Mirrors
+/// `max_event_trigger_depth` in intent: the events still persist, the fan-out
+/// just stops.
+///
+/// Twenty, not ten: a thread's own background tasks still count, and a thread
+/// working through short ones reached ten in an hour. A hot loop re-arms in
+/// seconds, so it reaches twenty within a minute or two anyway (ADR 0280).
+pub(crate) const MAX_RECENT_SUBSCRIPTIONS: i64 = 20;
 
 /// The rolling window [`MAX_RECENT_SUBSCRIPTIONS`] counts over. The cap bounds a
 /// loop, and every loop it names re-arms within seconds. A serial workflow of
@@ -154,10 +160,10 @@ impl LucidosEngine {
             .unwrap_or_default();
         if reason.is_empty() {
             return AwaitEventOutcome::Refused(
-                "Error: `reason` is required. One short line saying what you are waiting \
-                 for and why, in the user's language. The user reads it in the \
-                 waiting indicator, and it is how they tell a sleeping thread from \
-                 a stalled one."
+                "Error: `reason` is required. Name what you await as a short noun \
+                 phrase in the user's language (\"the release build to finish\"). \
+                 The user reads it after \"Waiting for\", and it is how they tell a \
+                 sleeping thread from a stalled one."
                     .to_string(),
             );
         }
@@ -350,10 +356,10 @@ impl LucidosEngine {
         }
         match recent_subscriptions(&self.pool, thread_id).await {
             Ok(n) if n >= MAX_RECENT_SUBSCRIPTIONS => Some(format!(
-                "Error: this thread has subscribed {n} times in the last {} minutes with \
-                 no message from the user, which is the limit. Either this thread keeps \
-                 re-opening itself, or what you are waiting for is not coming. Report \
-                 where things stand and let the user decide.",
+                "Error: this thread has started {n} waits in the last {} minutes that no \
+                 other thread ended, with no message or answer from the user, which is the \
+                 limit. Either this thread keeps re-opening itself, or what you are waiting \
+                 for is not coming. Report where things stand and let the user decide.",
                 RECENT_SUBSCRIPTION_WINDOW_SECS / 60,
             )),
             Ok(_) => None,
@@ -592,15 +598,21 @@ pub(crate) async fn delivered_event_ids(
         .collect())
 }
 
-/// `EventWaitStarted` events since the last **human** message on this thread,
-/// inside [`RECENT_SUBSCRIPTION_WINDOW_SECS`]. The S8 counter, derived from
-/// events, with no new state. The window is resolved on the database clock,
-/// which stamps `created` (ADR 0053).
+/// The S8 counter: `EventWaitStarted` events on this thread since its last
+/// **human action**, inside [`RECENT_SUBSCRIPTION_WINDOW_SECS`], that no OTHER
+/// thread ended (ADR 0280). Derived from events, with no new state. The window
+/// is resolved on the database clock, which stamps `created` (ADR 0053).
 ///
-/// Human specifically: an agent- or engine-authored `MessageReceived` (a child
-/// callback, a trigger fire, an event delivery) is exactly the kind of traffic a
-/// ping-pong loop generates, so counting it would reset the very counter it
-/// should be tripping.
+/// A human action is a human `MessageReceived`, or a question card a human
+/// answered. Agent- and engine-authored traffic (a child callback, a trigger
+/// fire, an event delivery) never resets it. A ping-pong loop is made of
+/// exactly that traffic.
+///
+/// A wait is exempt only when its delivered event is positively attributed to
+/// another thread. Waiting for seven sessions one by one is progress, however
+/// fast it re-arms. Anything unattributed counts, because the `emit_event` tool
+/// writes domain events with no actor. Reading "unknown" as "someone else" would
+/// let a thread waiting on its own domain event loop unchecked.
 ///
 /// A free function on the pool rather than a method, so the SQL that carries
 /// the whole cap can be tested against a real database without standing up an
@@ -609,19 +621,43 @@ pub(crate) async fn recent_subscriptions(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    // The `CASE` guarding the uuid cast keeps one malformed delivery row from
+    // failing the read, which would refuse every wait on this thread forever.
+    // A `ChildThreadCompleted` lands on the waiting parent, so its source is
+    // the child it names, not the row's own thread.
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events e \
-         WHERE e.aggregate = 'thread' \
-           AND e.aggregate_id = $1 \
-           AND e.event_type = 'EventWaitStarted' \
-           AND e.created >= now() - make_interval(secs => $2) \
-           AND e.sequence > COALESCE(( \
-               SELECT MAX(m.sequence) FROM events m \
-               WHERE m.aggregate = 'thread' \
-                 AND m.aggregate_id = $1 \
-                 AND m.event_type = 'MessageReceived' \
-                 AND m.payload->>'mode' = 'human' \
-           ), 0)",
+        "SELECT COUNT(*) FROM events s \
+         WHERE s.aggregate = 'thread' \
+           AND s.aggregate_id = $1 \
+           AND s.event_type = 'EventWaitStarted' \
+           AND s.created >= now() - make_interval(secs => $2) \
+           AND s.sequence > COALESCE(( \
+               SELECT MAX(h.sequence) FROM events h \
+               WHERE h.aggregate = 'thread' \
+                 AND h.aggregate_id = $1 \
+                 AND ((h.event_type = 'MessageReceived' \
+                       AND h.payload->>'mode' = 'human') \
+                   OR (h.event_type = 'UserQuestionAnswered' \
+                       AND (h.payload->'actor'->>'kind' = 'device' \
+                         OR h.payload->'actor'->>'mode' = 'human'))) \
+           ), 0) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM events d \
+               JOIN events src ON src.id = CASE \
+                   WHEN d.payload->>'event_id' ~* \
+                       '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                   THEN (d.payload->>'event_id')::uuid END \
+               WHERE d.aggregate = 'thread' \
+                 AND d.aggregate_id = $1 \
+                 AND d.event_type = 'EventWaitDelivered' \
+                 AND d.payload->>'wait_id' = s.payload->>'wait_id' \
+                 AND (CASE \
+                     WHEN src.event_type = 'ChildThreadCompleted' \
+                         THEN src.payload->>'child_thread_id' \
+                     WHEN src.aggregate = 'thread' THEN src.aggregate_id \
+                     ELSE src.payload->'actor'->>'source_thread_id' \
+                 END) <> $1 \
+           )",
     )
     .bind(thread_id.to_string())
     .bind(RECENT_SUBSCRIPTION_WINDOW_SECS)

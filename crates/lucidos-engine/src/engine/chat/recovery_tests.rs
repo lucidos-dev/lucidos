@@ -36,6 +36,7 @@ async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: 
                 id: "opt-0".into(),
                 label: "A".into(),
                 description: None,
+                preview: None,
             }],
             worktree_path: None,
             multi_select: false,

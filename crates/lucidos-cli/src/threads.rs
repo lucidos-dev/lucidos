@@ -6,7 +6,7 @@ use crate::workspace::{BoxError, Workspace};
 /// public read. It is NOT how the engine learns who the caller is: that comes
 /// from the thread-bound origin token the HTTP client forwards, which is why
 /// `follow-up` has no `--from` flag to get wrong.
-const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
+pub(crate) const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 
 /// Env var carrying the event that spawned this subprocess. Defaults
 /// `follow-up --event-id`, matching how `spawn-thread` defaults
@@ -144,6 +144,24 @@ pub(crate) fn cmd_follow_up(
         body["urgent"] = serde_json::Value::Bool(true);
     }
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
+}
+
+/// `lucidos threads detach`: move a child thread to top level (ADR 0278).
+///
+/// Like `follow-up`, the caller is never stated. The origin token decides
+/// whether this may move only the calling thread's own children, or, with no
+/// token, any nested thread.
+pub(crate) fn cmd_detach(ws: &Workspace, child_thread_id: &str) -> Result<(), BoxError> {
+    let child = child_thread_id.trim();
+    if uuid::Uuid::parse_str(child).is_err() {
+        return Err(format!(
+            "--thread takes a child thread's uuid, and '{child}' is not one. \
+             Run `lucidos threads list --my-children` to find the id."
+        )
+        .into());
+    }
+    let url = format!("{}/api/v1/threads/{child}/detach", ws.base_url());
+    send_and_print("POST", &url, http_client()?.post(&url))
 }
 
 /// Default `--event-id` from the spawning event, the way `spawn-thread`

@@ -30,7 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
-import { awayFromBottom, followPosition, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
+import { awayFromBottom, followSurvivesScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -159,10 +159,10 @@ describe('focusThread', () => {
       withTranscript((el) => {
         focusThread('t1');
         setFollowLiveEdge(true); // the reader arms it here
-        expect(followPosition(el)).toBe('live-edge');
+        expect(followSurvivesScroll(el)).toBe(true);
 
         focusThread('t2');
-        expect(followPosition(el)).toBeNull();
+        expect(followSurvivesScroll(el)).toBe(false);
       });
     });
 
@@ -175,7 +175,7 @@ describe('focusThread', () => {
         setFollowLiveEdge(true);
 
         focusThread('t1');
-        expect(followPosition(el)).toBe('live-edge');
+        expect(followSurvivesScroll(el)).toBe(true);
       });
     });
 
@@ -187,7 +187,7 @@ describe('focusThread', () => {
         setFollowLiveEdge(true);
 
         unfocusThread();
-        expect(followPosition(el)).toBeNull();
+        expect(followSurvivesScroll(el)).toBe(false);
       });
     });
   });
@@ -537,7 +537,7 @@ describe('loadAllThreads', () => {
     });
   }
 
-  it('stores the backend archive_count for the collapsed Archive badge', async () => {
+  it('stores the backend archive_count for the Archive badge', async () => {
     archiveThreadCount.value = 0;
     (fetchThreads as any).mockResolvedValue({
       saved: [], active_threads: [], composing: [], family_threads: [], active: [],

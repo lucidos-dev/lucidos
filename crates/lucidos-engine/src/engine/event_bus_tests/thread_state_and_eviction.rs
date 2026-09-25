@@ -492,6 +492,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
             status: crate::engine::thread_events::ChildCompletionStatus::Success,
             summary: "child finished".into(),
             pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
         },
         meta: EventMeta {
             event_id: Some(ctc_id),

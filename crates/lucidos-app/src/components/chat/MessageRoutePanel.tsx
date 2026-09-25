@@ -1,5 +1,6 @@
 import { useRef } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
+import type { CodingAgent } from '../../api/types';
 import { AppsIcon } from '../shared/icons';
 import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
@@ -12,6 +13,8 @@ import {
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { loadRepositories } from '../../store/actions/chat';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { formatMessageTimestamp } from '../../utils/formatTime';
+import { formatThreadChannelLabel } from '../../utils/formatChannel';
 import { Overlay } from '../shared/Overlay';
 import { loadedOr } from '../../store/types';
 import {
@@ -91,9 +94,9 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   if (userEvent.type === 'McpPermissionRequested') {
     return findMcpPermissionResolution(exchange, userEvent.request_id)?.actor;
   }
-  // CredentialRequested / McpConsentRequested have no user-side answer event
-  // today — the initiator row carries the disclosure on its own.
-  if (userEvent.type === 'CredentialRequested' || userEvent.type === 'McpConsentRequested') {
+  // McpConsentRequested has no user-side answer event today. The initiator row
+  // carries the disclosure on its own.
+  if (userEvent.type === 'McpConsentRequested') {
     return undefined;
   }
   // Engine-emitted events (ContinuationStarted, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
@@ -216,7 +219,7 @@ export function MessageRoutePanel() {
   const pos = useAnchoredPosition(state?.anchor ?? null, ref, '.thread-pane');
 
   if (!state) return null;
-  const { exchange, threadId, section, priorModel, priorEffort } = state;
+  const { exchange, threadId, section, priorModel, priorEffort, pausedBy } = state;
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
 
@@ -233,7 +236,7 @@ export function MessageRoutePanel() {
       panelRef={ref}
     >
       {section === 'origin'
-        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle)
+        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, thread.meta.codingAgent)
         : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
     </Overlay>
   );
@@ -251,6 +254,8 @@ export function renderOriginSection(
   exchange: Exchange,
   parentTitle: string | undefined,
   getLiveTitle: (threadId: string) => string | undefined,
+  pausedBy?: StoredEvent,
+  codingAgent: CodingAgent = 'claude-code',
 ) {
   const userEvent = exchange.userEvent;
   // TriggerStarted keeps its richer renderer (invocation kind + event link).
@@ -263,7 +268,7 @@ export function renderOriginSection(
     );
   }
 
-  const initiatorRow = renderInitiatorRow(userEvent);
+  const initiatorRow = renderInitiatorRow(userEvent, codingAgent);
   const origin = resolveOrigin(exchange);
   const channel = origin ? renderChannelSection(origin, parentTitle, getLiveTitle) : null;
   const audit = origin ? renderAuditSection(origin) : null;
@@ -284,6 +289,7 @@ export function renderOriginSection(
     : null;
   const explainer = continuationWhy
     ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason) : null);
+  const paused = pausedBy ? renderFoldedPause(pausedBy) : null;
 
   // System-driven `ResponseAborted` (safety_net, engine_shutdown, …): the
   // device/api/v1/workspace/engine renderers above all return null for
@@ -320,7 +326,7 @@ export function renderOriginSection(
     );
   }
 
-  if (!initiatorRow && !issuer && !channel && !audit && !explainer) {
+  if (!initiatorRow && !issuer && !channel && !audit && !explainer && !paused) {
     return (
       <section class="route-section">
         <h4>Origin</h4>
@@ -337,7 +343,33 @@ export function renderOriginSection(
       {channel}
       {audit}
       {explainer}
+      {paused}
     </section>
+  );
+}
+
+/** The restart pause a resume absorbed (`restartPauseFoldsInto`): when and why
+ *  the turn stopped, and which device asked for the restart. The pause draws no
+ *  panel of its own, so this is the only place that still says so. */
+function renderFoldedPause(pause: StoredEvent): preact.JSX.Element {
+  const { cause, actor } = pause.type === 'ResponseAborted' ? pause : { cause: undefined, actor: undefined };
+  const pausedAt = pause.created || pause._displayCreated;
+  return (
+    <>
+      {pausedAt && (
+        <div class="route-row">
+          <strong>Paused</strong>
+          <span>{formatMessageTimestamp(pausedAt)}</span>
+        </div>
+      )}
+      {renderExplainer('Why it paused', describeAbortCause(cause))}
+      {actor?.kind === 'device' && (
+        <div class="route-row">
+          <strong>Restarted from</strong>
+          <span>{actor.label}</span>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -370,12 +402,15 @@ function renderExplainer(heading: string, body: string | null): preact.JSX.Eleme
 }
 
 /** Initiator row for divider-starter ActionRequired events. The chip reads the
- *  asking agent (Lucidos Agent / Claude Code); this row mirrors who *asked* —
- *  Claude Code or Lucidos Agent for questions (by thread kind), Claude Code for
- *  permission gates, Lucidos for credential and MCP-consent requests. Returns
+ *  asking agent; this row mirrors who *asked*. A coding-agent question or
+ *  permission gate names the thread's backend (Claude Code or Codex), a chat
+ *  question the Lucidos Agent, and an MCP-consent request Lucidos. Returns
  *  null for non-divider events (their initiator is implied by channel/audit). */
-export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element | null {
-  const text = initiatorRowText(userEvent);
+export function renderInitiatorRow(
+  userEvent: StoredEvent,
+  codingAgent: CodingAgent = 'claude-code',
+): preact.JSX.Element | null {
+  const text = initiatorRowText(userEvent, formatThreadChannelLabel('claude_code', codingAgent));
   if (!text) return null;
   return (
     <div class="route-row">
@@ -385,13 +420,12 @@ export function renderInitiatorRow(userEvent: StoredEvent): preact.JSX.Element |
   );
 }
 
-function initiatorRowText(userEvent: StoredEvent): string | null {
+function initiatorRowText(userEvent: StoredEvent, backend: string): string | null {
   switch (userEvent.type) {
-    case 'UserQuestionAsked':            return userEvent.cc_session_id ? 'Claude Code' : 'Lucidos Agent';
-    case 'CodingAgentPermissionRequest': return 'Claude Code (permission gate)';
+    case 'UserQuestionAsked':            return userEvent.cc_session_id ? backend : 'Lucidos Agent';
+    case 'CodingAgentPermissionRequest': return `${backend} (permission gate)`;
     case 'CommandPermissionRequested':   return 'Lucidos Agent (command gate)';
     case 'McpPermissionRequested':       return 'Lucidos Agent (MCP gate)';
-    case 'CredentialRequested':          return 'Lucidos (credential request)';
     case 'McpConsentRequested':          return 'Lucidos (tool consent)';
     default:                             return null;
   }

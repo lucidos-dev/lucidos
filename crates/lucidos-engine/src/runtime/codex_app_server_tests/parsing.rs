@@ -101,6 +101,59 @@ fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
     );
 }
 
+/// Only the first delta of an item opens a block, so the engine breaks the
+/// paragraph between two messages and never inside one.
+#[test]
+fn only_the_first_delta_of_an_agent_message_opens_a_block() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    let mut delta = |item: &str, text: &str| {
+        note(
+            &mut t,
+            "item/agentMessage/delta",
+            serde_json::json!({"itemId": item, "delta": text, "threadId": "t", "turnId": "u"}),
+        )
+    };
+    let opens: Vec<bool> = [("i1", "Hel"), ("i1", "lo."), ("i2", "Next"), ("i2", " one")]
+        .into_iter()
+        .flat_map(|(item, text)| delta(item, text))
+        .map(|ev| match ev {
+            AgentEvent::Message { opens_block, .. } => opens_block,
+            other => panic!("expected Message, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(opens, [true, false, true, false]);
+}
+
+#[test]
+fn a_completed_remainder_continues_its_block_but_an_unstreamed_message_opens_one() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    note(
+        &mut t,
+        "item/agentMessage/delta",
+        serde_json::json!({"itemId": "i1", "delta": "Hel", "threadId": "t", "turnId": "u"}),
+    );
+    let remainder = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {"id": "i1", "type": "agentMessage", "text": "Hello"}}),
+    );
+    assert!(
+        matches!(&remainder[..], [AgentEvent::Message { text, opens_block: false, .. }] if text == "lo"),
+        "got {remainder:?}"
+    );
+    let whole = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {"id": "i2", "type": "agentMessage", "text": "whole"}}),
+    );
+    assert!(
+        matches!(&whole[..], [AgentEvent::Message { text, opens_block: true, .. }] if text == "whole"),
+        "got {whole:?}"
+    );
+}
+
 // The plan tool (codex's TodoWrite analog) arrives as `turn/plan/updated`
 // with `{plan: [{step, status}]}` — verified live against codex-cli 0.142.5.
 // It maps to the exec protocol's `todo_list` shape (`{items: [{text,

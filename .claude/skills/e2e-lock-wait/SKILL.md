@@ -38,8 +38,8 @@ lucidos await-event --on E2ELockReleased --timeout-secs 21600 \
 ```
 
 **Name what you await, not the fact that you await it.** The transcript labels
-the reason `Set up an event wait: <reason>` and `Stopped waiting: <reason>`, so
-a reason opening "waiting for" reads as `wait: waiting for`.
+the reason `Waiting for <reason>` and `Stopped waiting for <reason>`, so a
+reason should be a noun phrase. A reason opening "waiting for" says it twice.
 
 **3. END THE TURN.** Say what you subscribed to and stop. This is the whole
 point, not a side effect: the command returns immediately and blocks nothing, so
@@ -114,10 +114,12 @@ confirmation. Read it. If the lock was released while you were composing the
 call, the subscription will never fire for it: go retry the script now instead of
 waiting.
 
-### There is a cap of 10 subscriptions an hour
+### There is a cap of 20 counted subscriptions an hour
 
-Ten registrations inside one hour with no message from the user, and the next
-is refused outright. So do not spend the budget on short waits and do not treat
+Twenty counted registrations inside one hour with no message or answer from the
+user, and the next is refused outright. A wait that `E2ELockReleased` ended
+does not count, because the releasing script names its own thread. A timeout
+does count. So do not spend the budget on short waits and do not treat
 re-subscription as free:
 
 - **Pick the timeout from the run you are waiting on, generously.** A full

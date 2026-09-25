@@ -17,7 +17,7 @@
  * `360` they replace at a 16px root.
  *
  * The cost of deriving them is that the three no longer fit every window: they
- * sum to 1010px at 100% ui-scale, 1182 at 125%, 1355 at 150% and 1527 at 175%,
+ * sum to 1010px at 100% ui-scale, 1182 at 125%, 1355 at 150% and 1535 at 175%,
  * so from 150% on a 1280px screen `clampSplitRatio`'s empty-range branch is what
  * the user actually meets (137.5%, the step below, still fits at 1269). That
  * branch is load-bearing, not a corner. Those sums hold on every desktop client,
@@ -30,17 +30,15 @@
  */
 import { getRemPx } from '../utils/dom';
 
-/** One END of the threads header's row, in rem, excluding whatever pads it: a
- *  button (Filter leading, Search trailing) and its gap. Mirrors
- *  `.threads-header` in styles/panels/shell.css (`--header-icon-box` and
- *  `--pane-header-gap`). */
-const DRAWER_ROW_SIDE_REM = 2.25 + 0.25;
+/** One control at an end of the threads header's row, in rem: a button and its
+ *  gap. The leading end holds one, the drawer toggle resting over the row; the
+ *  trailing end holds two, Filter and Search. Mirrors `.threads-header` in
+ *  styles/panels/shell.css (`--header-icon-box` and `--pane-header-gap`). */
+const DRAWER_ROW_BUTTON_REM = 2.25 + 0.25;
 /** The title's own room, in rem: wide enough to stay a title rather than an
  *  ellipsis. */
 const DRAWER_ROW_TITLE_REM = 4.5;
-/** The row's own padding, in rem, per end. Half of `.threads-header`'s
- *  `0 0.5rem`. It is the floor UNDER the floor: whatever lead the row is sized
- *  around, an end can never be narrower than the padding every build has. */
+/** The row's own trailing padding, in rem: `.threads-header`'s `0.5rem`. */
 const DRAWER_ROW_PAD_REM = 0.5;
 /** Fallback for the traffic-lights reserve if the property cannot be read (it
  *  is declared inside the desktop media query, so a sub-769px viewport reports
@@ -57,10 +55,9 @@ const TITLEBAR_LIGHTS_RESERVE_PX = 80;
  *  it: the drawer toggle's box. Mirrors `.thread-toggle-slot` in
  *  styles/panels/shell.css (`--header-icon-box`). */
 const THREAD_ROW_SIDE_REM = 2.25;
-/** The row's own leading padding, in rem. `--brand-lead-inset`'s web value, and
- *  the floor UNDER the floor for the same reason the drawer's is: whatever lead
- *  the row is sized around, an end is never narrower than the padding every
- *  build has. */
+/** The row's own leading padding, in rem. `--header-lead-inset`'s web value, and
+ *  the floor UNDER the floor: whatever lead the row is sized around, an end is
+ *  never narrower than the padding every build has. */
 const THREAD_ROW_PAD_REM = 0.5;
 /** The centred brand cluster at its natural width, in rem: two chevrons and the
  *  mark's tap target, touching. Mirrors `--desktop-nav-min-span`
@@ -79,10 +76,10 @@ const MIN_CONTENT_PANE_REM = 22.5;
  *  layout engine; the DOM read lives in `minDrawerWidth` below.
  *
  *  The row is sized around a title centred on the PANE (`.threads-header-title`
- *  in styles/panels/shell.css), not on the gap between the two buttons flanking
+ *  in styles/panels/shell.css), not on the gap between the controls flanking
  *  it, so the title clears the WIDER of the row's two ends on BOTH sides and the
- *  floor is symmetric: `2 * side + title`. That is why the lead is counted twice
- *  rather than once.
+ *  floor is symmetric: `2 * side + title`. The leading end is the lead plus the
+ *  drawer toggle; the trailing end is the padding plus Filter and Search.
  *
  *  ONE floor for every desktop client: its only caller passes the traffic-lights
  *  reserve as the lead, on the web build that has no lights too (ADR 0058). That
@@ -92,16 +89,18 @@ const MIN_CONTENT_PANE_REM = 22.5;
  *  into the reclaimed title-bar band, so it starts after the fixed reserve that
  *  clears the lights, where the web row starts after its own 0.5rem). Taking the
  *  wider one is what makes the floor a floor on both. The web row still LAYS OUT
- *  at 0.5rem, so what it gains is 144px of title room it is not obliged to use;
- *  nothing there paints against a light that is not there.
+ *  at 0.5rem, so what it gains is title room it is not obliged to use; nothing
+ *  there paints against a light that is not there.
  *
- *  The `max` against the row's own padding keeps the floor honest at the other
- *  end of the scale: the reserve is PX (the lights are OS chrome and do not
- *  scale with our root font size) while the padding is rem, so at a large enough
- *  root the padding is the wider end and has to win. */
+ *  The reserve is PX (the lights are OS chrome and do not scale with our root
+ *  font size) while everything else here is rem. So above about 166% ui-scale
+ *  the all-rem trailing end is the wider one, and it sets the floor. It also
+ *  covers the web row's leading end at every root: 0.5rem plus a button is
+ *  always narrower than the padding plus two. */
 export function computeMinDrawerWidth(remPx: number, leadPx: number): number {
-  const sidePx = Math.max(leadPx, DRAWER_ROW_PAD_REM * remPx) + DRAWER_ROW_SIDE_REM * remPx;
-  return Math.ceil(2 * sidePx + DRAWER_ROW_TITLE_REM * remPx);
+  const leadEndPx = leadPx + DRAWER_ROW_BUTTON_REM * remPx;
+  const trailEndPx = (DRAWER_ROW_PAD_REM + 2 * DRAWER_ROW_BUTTON_REM) * remPx;
+  return Math.ceil(2 * Math.max(leadEndPx, trailEndPx) + DRAWER_ROW_TITLE_REM * remPx);
 }
 
 /** The lead both derived floors are sized around, read from CSS rather than

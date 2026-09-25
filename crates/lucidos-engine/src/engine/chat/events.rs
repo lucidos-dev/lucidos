@@ -7,7 +7,7 @@ use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 /// Bad-base64 / unsupported-mime entries are dropped + logged; the event
 /// still emits with the surviving hashes, matching the migration's
 /// partial-failure policy.
-pub(super) fn images_to_hashes(
+pub(crate) fn images_to_hashes(
     workspace: &Path,
     images: Option<&[crate::api::ChatImage]>,
 ) -> Vec<String> {
@@ -19,7 +19,7 @@ pub(super) fn images_to_hashes(
         .filter_map(|img| match write_blob_from_base64(workspace, &img.base64) {
             Ok(blob) => Some(blob.hash),
             Err(e) => {
-                crate::log!("[Image] make_message_received: blob write failed: {}", e);
+                crate::log!("[Image] blob write failed, image dropped: {}", e);
                 None
             }
         })

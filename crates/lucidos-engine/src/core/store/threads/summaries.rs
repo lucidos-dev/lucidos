@@ -431,7 +431,24 @@ impl EventStore {
             .bind(filters.parent)
             .fetch_all(&self.pool)
             .await?;
-        Self::rows_to_thread_summaries(rows)
+        let mut summaries = Self::rows_to_thread_summaries(rows)?;
+        // A parent reads its children here, so each row says what waits below
+        // it. Without this an orchestrator's row shows nothing pending while
+        // its children hold every change.
+        let ids: Vec<uuid::Uuid> = summaries
+            .iter()
+            .filter_map(|s| uuid::Uuid::parse_str(&s.thread_id).ok())
+            .collect();
+        let counts =
+            crate::core::changes::pending_sub_thread_change_counts(&self.pool, &ids).await?;
+        for summary in &mut summaries {
+            let count = uuid::Uuid::parse_str(&summary.thread_id)
+                .ok()
+                .and_then(|id| counts.get(&id).copied())
+                .unwrap_or(0);
+            summary.pending_sub_thread_change_count = Some(count);
+        }
+        Ok(summaries)
     }
 
     /// Same filters as [`Self::list_thread_summaries`], but returns the

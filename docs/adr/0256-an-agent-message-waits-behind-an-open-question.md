@@ -34,8 +34,12 @@ an Allow or Deny on the card. So do the user's next message and Continue. A
 Cancel keeps them held.
 
 Each release emits `HeldMessageReleased` and then the ordinary `MessageReceived`,
-which the agent reads. A unique index allows one release per held message. The
-rule is `message_is_held` in `engine/chat/held_messages.rs`.
+and forwards the message to the agent. A unique index allows one release per
+held message. The rule is `message_is_held` in `engine/chat/held_messages.rs`.
+
+The release is guaranteed to reach the agent. The session keeps its subprocess
+until the agent reports the message read, per ADR 0268. The transcript shows
+the delivered message as "Sent", then "Read".
 
 ## Rationale
 
@@ -57,7 +61,11 @@ message twice, which is silent.
 
 **Codex waits for the turn to end.** A Codex agent interrupts a running turn for
 any new input. So a release waits for the turn the answer resumed to finish.
-Claude Code queues input mid-turn on its own and needs no wait.
+Claude Code needs no wait. It reads a mid-turn input at its next tool result, or
+as its next turn when none follows. The session stays up for that turn because
+the input is owed until Claude Code replays it (ADR 0268). Before ADR 0268 the
+session exited at the answered turn's `Result`, and the released message was
+lost.
 
 ## Consequences
 

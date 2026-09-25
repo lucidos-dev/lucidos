@@ -2,6 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-30
+- **Amended by**: [0266: A standing apply waits through an event wait](0266-a-standing-apply-waits-through-an-event-wait.md).
+  A thread on a live event wait keeps its standing apply. A question card still
+  drops it.
+- **Amended by**: [0282: A resumed turn keeps the owner's instruction](0282-a-resumed-turn-keeps-the-owners-instruction.md).
+  An engine resume carries the standing instruction of the turn it resumes.
 
 ## Context
 

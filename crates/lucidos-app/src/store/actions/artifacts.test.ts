@@ -279,3 +279,102 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(store.filePreviewRevision.value).toBeNull();
   });
 });
+
+// A write announced while the list is loading must still reach the list. The
+// e2e flake that found this: a file PUT during the page's first load never
+// appeared, because the announcement was dropped while the status was
+// `loading`.
+describe('loadArtifacts keeps the newest answer', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    mockListArtifacts.mockReset();
+  });
+
+  /** A listing the test answers by hand, in whatever order it likes. */
+  function deferredListing() {
+    let answer!: (paths: string[]) => void;
+    const promise = new Promise<{ artifacts: string[] }>(resolve => {
+      answer = paths => resolve({ artifacts: paths });
+    });
+    return { promise, answer };
+  }
+
+  it('lists a file announced during the first load', async () => {
+    const first = deferredListing();
+    const second = deferredListing();
+    mockListArtifacts.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { artifacts } = await import('../store');
+    const { loadArtifacts, refreshArtifacts } = await import('./artifacts');
+
+    const startup = loadArtifacts();
+    refreshArtifacts();
+    first.answer(['artifacts/old.md']);
+    await vi.waitFor(() => expect(mockListArtifacts).toHaveBeenCalledTimes(2));
+    second.answer(['artifacts/old.md', 'artifacts/new.png']);
+    await startup;
+
+    expect(artifacts.value).toEqual({
+      status: 'loaded',
+      data: ['artifacts/old.md', 'artifacts/new.png'],
+    });
+  });
+
+  it('never lets a listing that started earlier overwrite a later one', async () => {
+    const early = deferredListing();
+    const late = deferredListing();
+    mockListArtifacts.mockReturnValueOnce(early.promise).mockReturnValueOnce(late.promise);
+    const { artifacts } = await import('../store');
+    const { loadArtifacts } = await import('./artifacts');
+
+    const first = loadArtifacts();
+    const second = loadArtifacts();
+    expect(mockListArtifacts, 'one listing at a time').toHaveBeenCalledTimes(1);
+    early.answer(['artifacts/a.md']);
+    await vi.waitFor(() => expect(mockListArtifacts).toHaveBeenCalledTimes(2));
+    late.answer(['artifacts/a.md', 'artifacts/b.md']);
+    await Promise.all([first, second]);
+
+    expect(artifacts.value).toEqual({
+      status: 'loaded',
+      data: ['artifacts/a.md', 'artifacts/b.md'],
+    });
+  });
+
+  it('folds a burst of requests during one listing into one more', async () => {
+    const first = deferredListing();
+    mockListArtifacts
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValue({ artifacts: ['artifacts/a.md'] });
+    const { loadArtifacts } = await import('./artifacts');
+
+    const done = loadArtifacts();
+    void loadArtifacts();
+    void loadArtifacts();
+    void loadArtifacts();
+    first.answer([]);
+    await done;
+
+    expect(mockListArtifacts).toHaveBeenCalledTimes(2);
+  });
+
+  // `loadArtifacts` writes `toFailed` on error, which discards the loaded
+  // list. A refresh that skipped `failed` would latch: one timed-out fetch and
+  // no later announcement could bring the list back, short of a reload.
+  it('retries a list whose last load failed', async () => {
+    mockListArtifacts.mockResolvedValue({ artifacts: ['artifacts/a.md'] });
+    const { artifacts } = await import('../store');
+    const { refreshArtifacts, loadArtifacts } = await import('./artifacts');
+    artifacts.value = { status: 'failed', error: 'Request timed out after 10000ms' };
+    refreshArtifacts();
+    await loadArtifacts();
+    expect(artifacts.value).toEqual({ status: 'loaded', data: ['artifacts/a.md'] });
+  });
+
+  it('leaves a list nobody asked for unfetched', async () => {
+    mockListArtifacts.mockResolvedValue({ artifacts: [] });
+    const { refreshArtifacts } = await import('./artifacts');
+    refreshArtifacts();
+    expect(mockListArtifacts).not.toHaveBeenCalled();
+  });
+});

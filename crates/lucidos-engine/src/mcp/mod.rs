@@ -391,7 +391,7 @@ impl McpManager {
 
     /// Register a new MCP server (saves to DB and connects).
     /// `tools_live` says whether the CALLER's tool array picks the new surface
-    /// up this turn. See [`McpStartOutcome::describe_in`].
+    /// up this turn. See [`McpStartOutcome::describe`].
     pub async fn setup_server(
         &self,
         id: &str,

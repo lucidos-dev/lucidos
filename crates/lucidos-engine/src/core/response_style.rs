@@ -1,12 +1,18 @@
-//! The **response style**: how much comes back in a chat or trigger answer.
+//! The **response style**: how a chat or trigger answer comes back. It has two
+//! independent parts, rendered into one prompt section:
 //!
-//! Lucidos ships three styles and the user may edit two of them, reset either,
+//! - the **style**, the shape of an answer: how much comes back and what it is
+//!   for, from the library below;
+//! - the **technical literacy**, how technical the words are
+//!   (`core::technical_literacy`).
+//!
+//! Lucidos ships four styles and the user may edit three of them, reset any,
 //! and add as many of their own as they like. One is selected at a time, by the
 //! `response_style` preference. The rest of the library is one JSON document in
 //! `response_styles`.
 //!
 //! **Standard adds nothing, and nothing can make it add something.** It is the
-//! off switch rather than a style. A workspace that never opens this setting
+//! off switch rather than a style. A workspace on Standard with no literacy set
 //! gets the prompt it always got, byte for byte. Every degraded state resolves
 //! there too: a selected id nobody defines, a blank instruction, a document
 //! that will not parse, a failed read.
@@ -15,11 +21,13 @@
 //! instruction between them is editable. A user can ask for one-line answers.
 //! They cannot ask for an answer that drops the warning they needed.
 //!
-//! See `docs/plans/2026-09-18-response-style-control.md`.
+//! See `docs/plans/2026-09-18-response-style-control.md` and
+//! `docs/plans/2026-09-24-technical-literacy.md`.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::core::technical_literacy::{self, TechnicalLiteracy};
 use crate::core::{PreferenceStore, PREF_RESPONSE_STYLE, PREF_RESPONSE_STYLES};
 
 /// The off switch's id. Selected when `response_style` is unset.
@@ -48,7 +56,7 @@ const STYLE_FLOOR: &str = "- Style never overrides substance. Keep every warning
 
 /// A style Lucidos ships.
 ///
-/// The two non-empty ones are seeds. An entry in the user's document with the
+/// The non-empty ones are seeds. An entry in the user's document with the
 /// same id replaces the label and the instruction, and deleting that entry
 /// brings this text back.
 struct ShippedStyle {
@@ -81,11 +89,20 @@ const SHIPPED: &[ShippedStyle] = &[
     ShippedStyle {
         id: "minimal",
         label: "Minimal",
-        description: "The short answer only, and no follow-up question.",
+        description: "The outcome, not the process, and no follow-up question.",
         instruction:
-            "- Answer and stop. One or two sentences, or a short list when the answer is a list.\n\
-             - No preamble, no recap, no narration of what you did, no offer of next steps.\n\
+            "- Give the outcome, not the process: what you found, what changed, or what is done. Leave out how you got there.\n\
+             - One or two sentences, or a short list when the answer is a list. No preamble, no recap, no offer of next steps.\n\
              - Do not ask the follow-up in CONVERSATION STYLE unless you cannot answer without it.",
+    },
+    ShippedStyle {
+        id: "learning",
+        label: "Learning",
+        description: "Explains the why as it goes, so you learn how things work.",
+        instruction:
+            "- Explain the why as you go: what you are doing, why this way, and the idea behind it.\n\
+             - Introduce one new idea at a time, and connect it to something the user already knows.\n\
+             - End with the one thing worth remembering from this answer.",
     },
 ];
 
@@ -223,8 +240,8 @@ fn read_document(raw: Option<&str>) -> Vec<StyleEntry> {
 /// Merge the shipped styles with the user's document.
 ///
 /// A stored entry whose id is shipped replaces that row's label and
-/// instruction; one with a fresh id is appended. Standard is skipped whatever
-/// the document says.
+/// instruction, and keeps its description; one with a fresh id is appended.
+/// Standard is skipped whatever the document says.
 pub fn merge(entries: &[StyleEntry]) -> Vec<Style> {
     let mut library: Vec<Style> = SHIPPED
         .iter()
@@ -234,7 +251,7 @@ pub fn merge(entries: &[StyleEntry]) -> Vec<Style> {
                 Some(e) => Style {
                     id: s.id.to_string(),
                     label: e.label.trim().to_string(),
-                    description: derive_description(&e.instruction),
+                    description: s.description.to_string(),
                     instruction: e.instruction.trim().to_string(),
                     source: StyleSource::Overridden,
                     editable: true,
@@ -289,34 +306,47 @@ fn derive_description(instruction: &str) -> String {
     format!("{}…", kept.trim_end())
 }
 
-/// Wrap an instruction into the prompt section, floor included.
+/// Wrap both parts into the prompt section, floor included once, at the end.
 ///
 /// It LEADS with a blank line rather than being followed by one. That is what
 /// lets an empty section leave the surrounding prompt byte-identical to a build
 /// carrying no style at all.
-fn render(instruction: &str) -> String {
+fn render(instruction: &str, literacy: Option<TechnicalLiteracy>) -> String {
+    let mut parts: Vec<String> = Vec::new();
     let instruction = instruction.trim();
-    if instruction.is_empty() {
+    if !instruction.is_empty() {
+        parts.push(instruction.to_string());
+    }
+    if let Some(level) = literacy {
+        parts.push(level.chat_rules());
+    }
+    if parts.is_empty() {
         return String::new();
     }
-    format!("\n\nRESPONSE STYLE:\n{}\n{}", instruction, STYLE_FLOOR)
+    format!("\n\nRESPONSE STYLE:\n{}\n{}", parts.join("\n"), STYLE_FLOOR)
 }
 
-/// The prompt section for `selected`, given a merged library.
+/// The prompt section for `selected` and `literacy`, given a merged library.
 ///
-/// An id the library does not hold resolves to nothing, which is Standard. That
-/// is the state left behind by deleting the style you had selected.
-pub fn section_for(library: &[Style], selected: &str) -> String {
-    match library.iter().find(|s| s.id == selected) {
-        Some(style) => render(&style.instruction),
+/// An id the library does not hold resolves to Standard, which contributes
+/// nothing. That is the state left behind by deleting the style you had
+/// selected. The literacy part renders either way.
+pub fn section_for(
+    library: &[Style],
+    selected: &str,
+    literacy: Option<TechnicalLiteracy>,
+) -> String {
+    let instruction = match library.iter().find(|s| s.id == selected) {
+        Some(style) => style.instruction.as_str(),
         None => {
             log!(
                 "[ResponseStyle] selected style '{}' is not in the library. Using Standard",
                 selected
             );
-            String::new()
+            ""
         }
-    }
+    };
+    render(instruction, literacy)
 }
 
 /// Read one preference, treating a DB error as unset.
@@ -345,42 +375,49 @@ pub async fn library(pool: &PgPool) -> Vec<Style> {
 }
 
 /// The response-style section for this turn's system prompt, or an empty string
-/// when the workspace is on Standard.
+/// when the workspace is on Standard with no technical literacy set.
 ///
-/// Read once per turn, at prompt assembly. Both keys are workspace-global, so
-/// the result is the same for every thread and the cached system tier stays
+/// Read once per turn, at prompt assembly. All three keys are workspace-global,
+/// so the result is the same for every thread and the cached system tier stays
 /// shared (ADR 0084).
 pub async fn resolve(pool: &PgPool) -> String {
+    let literacy = technical_literacy::read(pool).await;
     let selected = read_preference(pool, PREF_RESPONSE_STYLE)
         .await
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| STANDARD_ID.to_string());
     if selected == STANDARD_ID {
-        return String::new();
+        return render("", literacy);
     }
-    section_for(&library(pool).await, &selected)
+    section_for(&library(pool).await, &selected, literacy)
 }
 
 /// The widest section the ENGINE authors, for the always-loaded budget meter.
 ///
 /// A user's own instruction is workspace content, like `user_profile.md`, so it
-/// is not on that meter. What is billed is the shipped text plus the wrapper
-/// and the floor.
+/// is not on that meter. What is billed is the widest shipped style plus the
+/// widest literacy level, the wrapper and the floor.
 ///
 /// Test-only, because the meter is: production reads a real selection.
 #[cfg(test)]
 pub fn widest_shipped_section() -> String {
-    SHIPPED
+    let widest_style = SHIPPED
         .iter()
-        .map(|s| render(s.instruction))
-        .max_by_key(String::len)
-        .unwrap_or_default()
+        .map(|s| s.instruction)
+        .max_by_key(|i| i.len())
+        .unwrap_or_default();
+    let widest_level = TechnicalLiteracy::ALL
+        .into_iter()
+        .max_by_key(|l| l.chat_rules().len())
+        .expect("there are literacy levels");
+    render(widest_style, Some(widest_level))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::PREF_TECHNICAL_LITERACY;
 
     fn entry(id: &str, label: &str, instruction: &str) -> StyleEntry {
         StyleEntry {
@@ -402,7 +439,7 @@ mod tests {
     #[test]
     fn standard_renders_nothing() {
         let library = merge(&[]);
-        assert_eq!(section_for(&library, STANDARD_ID), "");
+        assert_eq!(section_for(&library, STANDARD_ID, None), "");
         assert_eq!(find(&library, STANDARD_ID).instruction, "");
     }
 
@@ -429,13 +466,13 @@ mod tests {
         assert_eq!(standard.instruction, "");
         assert_eq!(standard.label, "Standard");
         assert_eq!(standard.source, StyleSource::Builtin);
-        assert_eq!(section_for(&library, STANDARD_ID), "");
+        assert_eq!(section_for(&library, STANDARD_ID, None), "");
     }
 
     #[test]
-    fn the_shipped_styles_are_standard_concise_and_minimal() {
+    fn the_shipped_styles_are_standard_concise_minimal_and_learning() {
         let ids: Vec<String> = merge(&[]).into_iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec![STANDARD_ID, "concise", "minimal"]);
+        assert_eq!(ids, vec![STANDARD_ID, "concise", "minimal", "learning"]);
     }
 
     /// Every style the prompt can carry ends with the rail, however it was
@@ -448,7 +485,7 @@ mod tests {
         ]);
 
         for style in &library {
-            let section = section_for(&library, &style.id);
+            let section = section_for(&library, &style.id, None);
             if style.id == STANDARD_ID {
                 assert_eq!(section, "", "Standard must stay silent");
                 continue;
@@ -462,8 +499,9 @@ mod tests {
         }
     }
 
-    /// A shipped style keeps its own description. An edited or user-written one
-    /// derives a line from its instruction, having no description field.
+    /// A shipped style keeps its own description, edited or not. The picker
+    /// marks the edit from `source`; a line lifted from the instruction read
+    /// as unrelated text.
     #[test]
     fn editing_a_shipped_style_overrides_it_and_leaves_the_rest_alone() {
         let library = merge(&[entry("minimal", "Terse", "- One sentence. Nothing else.")]);
@@ -472,7 +510,8 @@ mod tests {
         assert_eq!(minimal.label, "Terse");
         assert_eq!(minimal.source, StyleSource::Overridden);
         assert!(minimal.editable);
-        assert_eq!(minimal.description, "One sentence. Nothing else.");
+        let shipped = SHIPPED.iter().find(|s| s.id == "minimal").unwrap();
+        assert_eq!(minimal.description, shipped.description);
 
         let concise = find(&library, "concise");
         assert_eq!(concise.source, StyleSource::Builtin);
@@ -498,17 +537,55 @@ mod tests {
     fn a_user_style_is_appended_after_the_shipped_ones() {
         let library = merge(&[entry("board-report", "Board report", "- Three bullets.")]);
 
-        assert_eq!(library.len(), 4);
+        assert_eq!(library.len(), SHIPPED.len() + 1);
         let mine = find(&library, "board-report");
         assert_eq!(mine.source, StyleSource::User);
         assert!(mine.editable);
-        assert!(section_for(&library, "board-report").contains("Three bullets."));
+        assert!(section_for(&library, "board-report", None).contains("Three bullets."));
     }
 
     /// The state left behind by deleting the style you had selected.
     #[test]
     fn a_selected_id_nobody_defines_resolves_to_standard() {
-        assert_eq!(section_for(&merge(&[]), "deleted-last-week"), "");
+        assert_eq!(section_for(&merge(&[]), "deleted-last-week", None), "");
+    }
+
+    /// Every combination of the two parts renders one heading, each chosen
+    /// part once, and the floor exactly once at the very end.
+    #[test]
+    fn style_and_literacy_render_independently_under_one_heading() {
+        let library = merge(&[]);
+        let levels = std::iter::once(None).chain(TechnicalLiteracy::ALL.into_iter().map(Some));
+        for literacy in levels {
+            for style in &library {
+                let section = section_for(&library, &style.id, literacy);
+                if style.instruction.is_empty() && literacy.is_none() {
+                    assert_eq!(section, "", "Standard with no level must stay silent");
+                    continue;
+                }
+                assert_eq!(section.matches("RESPONSE STYLE:").count(), 1);
+                assert_eq!(section.matches(STYLE_FLOOR).count(), 1);
+                assert!(section.ends_with(STYLE_FLOOR));
+                assert!(section.contains(&style.instruction));
+                if let Some(level) = literacy {
+                    assert!(
+                        section.contains(&level.chat_rules()),
+                        "{level:?} is missing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The literacy part still renders when the selected style is gone.
+    #[test]
+    fn a_missing_style_keeps_the_literacy_part() {
+        let section = section_for(
+            &merge(&[]),
+            "deleted-last-week",
+            Some(TechnicalLiteracy::Developer),
+        );
+        assert!(section.contains(&TechnicalLiteracy::Developer.chat_rules()));
     }
 
     #[test]
@@ -626,7 +703,7 @@ mod tests {
         assert!(widest.starts_with("\n\nRESPONSE STYLE:\n"));
         assert!(widest.ends_with(STYLE_FLOOR));
         for shipped in SHIPPED {
-            assert!(render(shipped.instruction).len() <= widest.len());
+            assert!(render(shipped.instruction, None).len() <= widest.len());
         }
     }
 
@@ -651,7 +728,7 @@ mod tests {
         // A shipped style, selected. The section is the shipped text.
         seed(PREF_RESPONSE_STYLE, "minimal".to_string()).await;
         let minimal = resolve(&pool).await;
-        assert!(minimal.contains("Answer and stop."));
+        assert!(minimal.contains("Give the outcome, not the process"));
         assert!(minimal.ends_with(STYLE_FLOOR));
 
         // Overridden, so the user's words replace the shipped ones.
@@ -664,7 +741,7 @@ mod tests {
         seed(PREF_RESPONSE_STYLES, document).await;
         let overridden = resolve(&pool).await;
         assert!(overridden.contains("One sentence, and only one."));
-        assert!(!overridden.contains("Answer and stop."));
+        assert!(!overridden.contains("Give the outcome, not the process"));
         assert!(overridden.ends_with(STYLE_FLOOR));
 
         // A style of their own, selected by its id.
@@ -696,6 +773,26 @@ mod tests {
         // A blank selection reads as unset rather than as a missing style.
         seed(PREF_RESPONSE_STYLE, "   ".to_string()).await;
         assert_eq!(resolve(&pool).await, "");
+
+        // Technical literacy speaks on Standard too: the two parts are
+        // independent.
+        seed(PREF_TECHNICAL_LITERACY, "non-technical".to_string()).await;
+        let literacy_only = resolve(&pool).await;
+        assert!(literacy_only.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
+        assert!(literacy_only.ends_with(STYLE_FLOOR));
+
+        // And beside a style, under the one heading.
+        seed(PREF_RESPONSE_STYLE, "minimal".to_string()).await;
+        let both = resolve(&pool).await;
+        assert!(both.contains("Give the outcome, not the process"));
+        assert!(both.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
+        assert_eq!(both.matches("RESPONSE STYLE:").count(), 1);
+
+        // An unknown level costs the level, never the turn or the style.
+        seed(PREF_TECHNICAL_LITERACY, "wizard".to_string()).await;
+        let unknown = resolve(&pool).await;
+        assert!(unknown.contains("Give the outcome, not the process"));
+        assert!(!unknown.contains("The user is"));
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db_name).await;

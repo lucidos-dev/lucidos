@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { Overlay } from './Overlay';
-import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { useAnchoredPosition, pointAnchor, type AnchorAlign, type AnchorBox, type ViewportPoint } from '../../hooks/useAnchoredPopover';
 import { MoreIcon, InfoIcon } from './icons';
 import type { TooltipRow } from '../drawer/threadRowInfo';
 
@@ -27,18 +27,31 @@ export function nextMenuIndex(current: number, count: number, key: string): numb
  *  `openedViaKeyboard` lets an item show only on keyboard-open (see the Pin
  *  item in ThreadOverflowMenu). */
 export interface OverflowMenuContext {
-  open: boolean;
   openedViaKeyboard: boolean;
   run: (fn: () => void) => (e: MouseEvent) => void;
-  /** What the menu is anchored to: the ⋯ trigger, or the host's element in
-   *  host-opened mode. An item that OPENS a popover of its own needs it, since
+  /** What the menu is anchored to: the ⋯ trigger, or the host's element when
+   *  the host opened it. An item that OPENS a popover of its own needs it, since
    *  the row it was clicked on unmounts as the menu closes. */
   anchor: HTMLElement | null;
 }
 
-/** How a host opens a menu that renders no ⋯ trigger. The element passed is what
- *  the popovers position against. */
-export type OverflowMenuOpener = (anchor: HTMLElement) => void;
+/** How a host opens the menu from its own gesture. `anchor` is the element the
+ *  menu belongs to. `at` opens it at the pointer instead of below `anchor`. */
+export type OverflowMenuOpener = (anchor: HTMLElement, at?: ViewportPoint) => void;
+
+/** Hands opening to a host. `trigger` says whether the ⋯ is drawn as well. */
+export interface HostOpener {
+  ref: { current: OverflowMenuOpener | null };
+  trigger: boolean;
+}
+
+/** An open popover: the element it belongs to, and the box it is placed
+ *  against. The two differ only for a menu opened at the pointer. */
+interface Placement {
+  anchor: HTMLElement;
+  box: AnchorBox;
+  align: AnchorAlign;
+}
 
 /** Generic ⋯ overflow menu: a trigger button, an anchored menu popover, and an
  *  optional secondary Info popover — the whole dismiss/Escape/inert contract via
@@ -47,12 +60,12 @@ export type OverflowMenuOpener = (anchor: HTMLElement) => void;
  *  shared shell behind ThreadOverflowMenu (started threads) and DraftOverflowMenu
  *  (compose drafts); each supplies its own `items` and `infoRows`.
  *
- *  **`openRef` hands opening to the host, and the mobile drawer row is why.**
- *  There the ⋯ is not drawn and a long press on the row opens the menu instead:
- *  a 31x27px trigger against the pane's right edge is the hardest place on a
- *  phone to hit. One prop rather than a hide-the-trigger flag beside it. A menu
- *  with neither a trigger nor a host opener would be unopenable, and that state
- *  is now unrepresentable.
+ *  **`hostOpener` lets the host open the same menu from a gesture.** A desktop
+ *  drawer row's right-click opens it at the pointer, beside a drawn ⋯ (ADR
+ *  0285). A mobile row draws no ⋯ and a long press opens it instead: a 31x27px
+ *  trigger against the pane's right edge is the hardest place on a phone to
+ *  hit. The ⋯ can only be hidden through `hostOpener`, so a menu nothing can
+ *  open is unrepresentable.
  *
  *  **Open mode (keyboard vs pointer) shapes the menu.** A real pointer click
  *  reports `e.detail >= 1`; a keyboard activation (Enter/Space) and a synthetic
@@ -71,13 +84,13 @@ export type OverflowMenuOpener = (anchor: HTMLElement) => void;
  *  (the drawer row's focus-thread `onClick`) — toggling the menu or running an
  *  item must not also fire it.
  */
-export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, openRef, items, infoRows }: {
+export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, hostOpener, items, infoRows }: {
   ariaLabel: string;
   stopPropagation?: boolean;
   extraClass?: string;
   /** Extra attributes for the ⋯ trigger. A host whose row is MEASURED marks its
-   *  members with one, and the trigger is a member like any other. Ignored in
-   *  host-opened mode, which draws no trigger. */
+   *  members with one, and the trigger is a member like any other. Ignored
+   *  when no trigger is drawn. */
   triggerAttrs?: Record<string, string>;
   /** Run as the menu opens, before anything else.
    *
@@ -89,12 +102,11 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   /** `-1` removes the ⋯ trigger from the Tab order (the drawer row's mouse-only
    *  use — the drawer is a single tab stop, and the menu is opened via the
    *  "Open thread actions" shortcut). Default undefined → natively tabbable
-   *  (the thread-title headers). Ignored in host-opened mode: there is no
-   *  trigger to order. */
+   *  (the thread-title headers). Ignored when no trigger is drawn. */
   tabIndex?: number;
-  /** Set it and the host owns opening: no ⋯ is rendered, and this menu writes
-   *  its opener here for the host's gesture to call. See the class comment. */
-  openRef?: { current: OverflowMenuOpener | null };
+  /** Set it and this menu writes its opener into `ref` for the host's gesture
+   *  to call. See the class comment. */
+  hostOpener?: HostOpener;
   /** Custom items, rendered above the auto-appended Info row. Invoked only while
    *  the menu is open. */
   items: (ctx: OverflowMenuContext) => ComponentChildren;
@@ -106,15 +118,12 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const infoRef = useRef<HTMLDivElement>(null);
-  // The element the host last opened against, so the Info popover lands on the
-  // same one the menu did. Null whenever a ⋯ trigger is doing the opening.
-  const hostAnchorRef = useRef<HTMLElement | null>(null);
-  // Anchor element when open, null when closed — `useAnchoredPosition` reacts to
-  // anchor changes via its effect deps, so no separate `open` flag is needed.
-  // The menu and the Info popover each carry their own anchor; they're mutually
-  // exclusive (opening one closes the other).
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const [infoAnchor, setInfoAnchor] = useState<HTMLElement | null>(null);
+  const drawsTrigger = hostOpener?.trigger ?? true;
+  // Null when closed. `useAnchoredPosition` reacts to `box` changes via its
+  // effect deps, so no separate `open` flag is needed. The menu and the Info
+  // popover are mutually exclusive: opening one closes the other.
+  const [menu, setMenu] = useState<Placement | null>(null);
+  const [info, setInfo] = useState<Placement | null>(null);
   // Whether the LAST open was keyboard-driven (Enter/Space on the trigger or the
   // shortcut's synthetic `trigger.click()`, both `e.detail === 0`). Drives the
   // focus-into-menu on open and the focus-restore on close.
@@ -122,23 +131,23 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // Element focused at keyboard-open time (the drawer tree container, or the
   // header trigger), restored on close so list-nav resumes.
   const lastFocusedRef = useRef<HTMLElement | null>(null);
-  const open = anchor !== null;
-  const infoOpen = infoAnchor !== null;
-  // Right-align both popovers to the ⋯ trigger: the trigger sits at the far right
-  // of a drawer row / thread-title header, so left-start placement would push the
-  // wide panel off-screen and the viewport clamp would strand it near the left
-  // edge (the "all the way to the left" report on narrow mobile viewports).
+  const open = menu !== null;
+  const infoOpen = info !== null;
+  const pos = useAnchoredPosition(menu?.box ?? null, menuRef, undefined, menu?.align);
+  const infoPos = useAnchoredPosition(info?.box ?? null, infoRef, undefined, info?.align);
+
+  // Right-align to the ⋯ trigger. It sits at the far right of its row. A
+  // left-start panel would run off-screen, and the clamp would then strand it
+  // near the left edge.
   //
-  // Host-opened mode inverts that, because the anchor does too: a whole drawer
-  // row, not a button at its end. Right-aligning to it puts the panel back in
-  // the corner the long press exists to leave. So it aligns to the row's
-  // leading edge instead.
-  const align = openRef ? 'start' : 'end';
-  const pos = useAnchoredPosition(anchor, menuRef, undefined, align);
-  const infoPos = useAnchoredPosition(infoAnchor, infoRef, undefined, align);
+  // A host's anchor is a whole row, not a button at its end. Right-aligning to
+  // it puts the panel back in the corner the long press exists to leave, so it
+  // aligns to the row's leading edge instead.
+  const placeAt = (anchor: HTMLElement): Placement =>
+    ({ anchor, box: anchor, align: anchor === triggerRef.current ? 'end' : 'start' });
 
   const close = () => {
-    setAnchor(null);
+    setMenu(null);
     // A keyboard-opened menu owns DOM focus (an item inside the portal); hand it
     // back to the opener so the drawer's ↑/↓/Enter list-nav (or the header) is
     // live again after an action instead of focus falling to <body>. A
@@ -148,17 +157,19 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
       if (prev && document.body.contains(prev)) prev.focus();
     }
   };
-  const closeInfo = () => setInfoAnchor(null);
+  const closeInfo = () => setInfo(null);
   const toggle = (e: MouseEvent) => {
     if (stopPropagation) e.stopPropagation();
     closeInfo();
     if (open) { close(); return; }
+    const trigger = triggerRef.current;
+    if (!trigger) return;
     onOpen?.();
     // detail === 0 ⇒ keyboard activation or the shortcut's synthetic click.
     const keyboard = e.detail === 0;
     setOpenedViaKeyboard(keyboard);
     lastFocusedRef.current = keyboard ? (document.activeElement as HTMLElement | null) : null;
-    setAnchor(triggerRef.current);
+    setMenu(placeAt(trigger));
   };
   const run = (fn: () => void) => (e: MouseEvent) => {
     if (stopPropagation) e.stopPropagation();
@@ -166,25 +177,25 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
     fn();
   };
 
-  // Host-opened mode's entry point, published for the host's own gesture. It
-  // only ever OPENS: the host cannot call it while the menu is up, because an
-  // open overlay makes the shell behind it inert and the gesture never starts.
-  // Always a pointer-open, since a gesture is what invokes it.
+  // The host's entry point, published for its own gesture. It only ever OPENS:
+  // the host cannot call it while the menu is up, because an open overlay makes
+  // the shell behind it inert and the gesture never starts. Always a
+  // pointer-open, since a gesture is what invokes it.
   //
   // Assigned during render rather than in an effect, so it is live from the
   // first frame. Cleared on unmount, so a row scrolled out of the list cannot
   // be opened through a stale handle.
-  if (openRef) {
-    openRef.current = (el: HTMLElement) => {
+  const hostRef = hostOpener?.ref;
+  if (hostRef) {
+    hostRef.current = (el: HTMLElement, at?: ViewportPoint) => {
       closeInfo();
       onOpen?.();
-      hostAnchorRef.current = el;
       setOpenedViaKeyboard(false);
       lastFocusedRef.current = null;
-      setAnchor(el);
+      setMenu(at ? { anchor: el, box: pointAnchor(at), align: 'start' } : placeAt(el));
     };
   }
-  useEffect(() => () => { if (openRef) openRef.current = null; }, [openRef]);
+  useEffect(() => () => { if (hostRef) hostRef.current = null; }, [hostRef]);
 
   // ↑/↓/Home/End rove focus across the menu items (the Overlay owns Escape;
   // Enter/Space activate the focused <button> natively → its onClick).
@@ -220,15 +231,15 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
 
   // The Overlay's anchor is the element that re-activates the overlay through
   // its OWN handler, exempt from the outside-pointerdown dismiss. That is the ⋯
-  // trigger, and host-opened mode has none. The row is not a toggle: its click
-  // focuses the thread, so exempting it would let one tap both dismiss the menu
-  // and navigate. The re-open race the exemption normally guards cannot happen
-  // here, because a short tap never opens this menu.
-  const overlayAnchor = openRef ? null : triggerRef.current;
+  // trigger, whichever way the menu opened, so pressing it closes the menu. A
+  // host's row is never the anchor: its click focuses the thread, so exempting
+  // it would let one tap both dismiss the menu and navigate. The re-open race
+  // the exemption guards cannot happen there, because a tap never opens it.
+  const overlayAnchor = drawsTrigger ? triggerRef.current : null;
 
   return (
     <>
-      {!openRef && (
+      {drawsTrigger && (
         <button
           ref={triggerRef}
           type="button"
@@ -260,11 +271,12 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
           ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }
           : { visibility: 'hidden' }}
       >
-        {open && items({ open, openedViaKeyboard, run, anchor })}
+        {menu && items({ openedViaKeyboard, run, anchor: menu.anchor })}
         {rows && (
           <>
             <div class="thread-overflow-divider" role="separator" />
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => setInfoAnchor(triggerRef.current ?? hostAnchorRef.current))}>
+            {/* Info takes the menu's place, wherever the menu opened. */}
+            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => setInfo(menu))}>
               <InfoIcon />
               Info
             </button>

@@ -16,6 +16,7 @@ use crate::postgres::{self, PgBackend, PgHandle, ProvisionError, ProvisionErrorK
 use crate::proxy;
 use crate::registry::{self, Registry, Workspace, REGISTRY_VERSION, SIGIL};
 use crate::release_check;
+use crate::slowness;
 use crate::stack::{self, EngineKeeper, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
 use crate::BoxError;
 use axum::body::Body;
@@ -269,6 +270,14 @@ struct GatewayInner {
     /// A different question from `binary_check`, which asks whether a newer
     /// gateway binary sits on disk in a dev checkout.
     release_check: release_check::ReleaseCheck,
+    /// The machine's one slowness watch (ADRs 0274, 0283).
+    slowness: slowness::Slowness,
+}
+
+/// Where a running engine's pid comes from, for the slowness attribution.
+enum RunningEngine {
+    Child(u32),
+    Adopted(PathBuf),
 }
 
 /// Memoized "is a newer gateway binary on disk?" verdict, keyed by the binary's
@@ -359,6 +368,7 @@ impl GatewayState {
                     default_prefix: None,
                     config_path: None,
                 }),
+                slowness: slowness::Slowness::default(),
             }),
         }
     }
@@ -987,6 +997,54 @@ impl GatewayState {
     /// backstop timer.
     pub fn release_check(&self) -> &release_check::ReleaseCheck {
         &self.inner.release_check
+    }
+
+    /// The machine's slowness watch (ADRs 0274, 0283), for the control plane,
+    /// the supervisor and the sampler loop.
+    pub fn slowness(&self) -> &slowness::Slowness {
+        &self.inner.slowness
+    }
+
+    /// How to find each RUNNING engine's pid, for [`Self::lucidos_roots`]: the
+    /// child this gateway spawned, or the directory of one it adopted.
+    ///
+    /// Only live stacks, never the registry. A stopped workspace keeps its
+    /// pidfile, and once the OS reuses that pid it names somebody else's app.
+    async fn running_engines(&self) -> Vec<RunningEngine> {
+        let stacks: Vec<_> = self.inner.stacks.lock().await.values().cloned().collect();
+        let mut engines = Vec::with_capacity(stacks.len());
+        for stack in stacks {
+            let s = stack.lock().await;
+            engines.push(match &s.engine {
+                Some(child) => RunningEngine::Child(child.id()),
+                None => RunningEngine::Adopted(s.resolved_dir.clone()),
+            });
+        }
+        engines
+    }
+
+    /// The process trees whose memory counts as Lucidos: this gateway, every
+    /// running engine, and the embedded postmaster.
+    ///
+    /// An engine adopted after a gateway restart is not this process's child:
+    /// it was reparented when the gateway that spawned it exited. Its pidfile
+    /// names it instead. Blocking: it reads files.
+    fn lucidos_roots(&self, engines: Vec<RunningEngine>) -> Vec<i32> {
+        let engines = engines.into_iter().filter_map(|engine| match engine {
+            RunningEngine::Child(pid) => Some(pid),
+            RunningEngine::Adopted(dir) => stack::read_pidfile(&dir),
+        });
+        let postmaster = match self.inner.pg_backend {
+            PgBackend::Embedded { .. } => {
+                postgres::read_postmaster_pid(&postgres::embedded_data_dir(self.app_data()))
+            }
+            PgBackend::Docker => None,
+        };
+        std::iter::once(std::process::id())
+            .chain(engines)
+            .map(|pid| pid as i32)
+            .chain(postmaster)
+            .collect()
     }
 
     /// Every Lucidos install on this machine, scanned fresh.
@@ -2295,21 +2353,22 @@ impl GatewayState {
         // second costs the pass nothing.
         let outcomes: Vec<EngineReadings> =
             futures::future::join_all(candidates.iter().map(|t| async move {
-                let outcome = stack::probe_health(client, scheme, t.port).await;
-                if outcome != ProbeOutcome::Healthy {
-                    return (outcome, None, None);
+                let probe = stack::probe_engine(client, scheme, t.port).await;
+                if probe.outcome != ProbeOutcome::Healthy {
+                    return (probe, None, None);
                 }
                 let (unread, backup) = futures::future::join(
                     stack::fetch_unread_count(client, scheme, t.port),
                     stack::fetch_last_successful_backup(client, scheme, t.port),
                 )
                 .await;
-                (outcome, unread, backup)
+                (probe, unread, backup)
             }))
             .await;
 
         // Apply phase: re-acquire each stack briefly to write the result back.
-        for (t, (outcome, unread, backup)) in candidates.into_iter().zip(outcomes) {
+        for (t, (probe, unread, backup)) in candidates.into_iter().zip(outcomes) {
+            let outcome = probe.outcome;
             let mut s = t.stack.lock().await;
             // The lock was dropped across the probe, so the stack may have
             // changed under us (see `probe_result_is_stale`). `contains_key` is
@@ -2320,6 +2379,10 @@ impl GatewayState {
                 continue;
             }
             if outcome == ProbeOutcome::Healthy {
+                // An engine that answered is alive and past its boot.
+                if slowness::probe_is_slow(outcome, true, true, probe.database_reachable) {
+                    self.slowness().record_slow(&t.id);
+                }
                 s.health = Health::Healthy;
                 s.restart_attempts = 0;
                 s.health_misses = 0;
@@ -2342,6 +2405,9 @@ impl GatewayState {
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
+            if slowness::probe_is_slow(outcome, alive, since_spawn >= BOOT_GRACE, true) {
+                self.slowness().record_slow(&t.id);
+            }
             // Count this miss; a healthy probe resets it. Only a DEAD process
             // is ever culled, so a load spike cannot cull a working engine.
             s.health_misses = s.health_misses.saturating_add(1);
@@ -2452,7 +2518,7 @@ struct ProbeTarget {
 /// the backup line). Both are `None` for an engine that did not answer healthy,
 /// and `None` again when the engine answered health but not that read.
 type EngineReadings = (
-    ProbeOutcome,
+    stack::EngineProbe,
     Option<u64>,
     Option<stack::LastSuccessfulBackup>,
 );
@@ -2971,6 +3037,7 @@ pub async fn run() -> Result<(), BoxError> {
                 release_check: release_check::ReleaseCheck::new(
                     &release_check::Deployment::from_env(packaged, exe_path, release_app_data),
                 ),
+                slowness: slowness::Slowness::default(),
             }),
         };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
@@ -3011,6 +3078,23 @@ pub async fn run() -> Result<(), BoxError> {
             loop {
                 checker.release_check().refresh(false).await;
                 tokio::time::sleep(release_check::POLL_INTERVAL).await;
+            }
+        });
+    }
+
+    // Slowness sampler (ADRs 0274, 0283). Each sample makes syscalls and, during an
+    // episode, reads every process, so it runs on a blocking thread.
+    {
+        let watcher = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let sampler = watcher.clone();
+                let engines = sampler.running_engines().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    sampler.slowness().sample(|| sampler.lucidos_roots(engines))
+                })
+                .await;
+                tokio::time::sleep(slowness::SAMPLE_INTERVAL).await;
             }
         });
     }
@@ -4441,6 +4525,36 @@ mod tests {
             database_url: None,
             autostart,
         }
+    }
+
+    // An engine adopted after a gateway restart is not this process's child.
+    // Only its pidfile can name it as Lucidos for the slowness banner.
+    #[test]
+    fn lucidos_roots_name_spawned_and_adopted_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lucidos")).unwrap();
+        std::fs::write(dir.path().join(".lucidos/engine.pid"), "4242\n").unwrap();
+        let state = GatewayState::for_tests();
+
+        let roots = state.lucidos_roots(vec![
+            RunningEngine::Child(77),
+            RunningEngine::Adopted(dir.path().to_path_buf()),
+        ]);
+        assert_eq!(roots, [std::process::id() as i32, 77, 4242]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_workspace_contributes_no_engine_root() {
+        // Registered, with a pidfile left behind, but no live stack.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lucidos")).unwrap();
+        std::fs::write(dir.path().join(".lucidos/engine.pid"), "4242\n").unwrap();
+        let state = GatewayState::for_tests();
+        let mut ws = workspace("myws", false);
+        ws.dir = dir.path().to_string_lossy().into_owned();
+        state.inner.registry.lock().unwrap().workspaces.push(ws);
+
+        assert!(state.running_engines().await.is_empty());
     }
 
     // A packaged Restart stops every engine, so nothing is healthy and

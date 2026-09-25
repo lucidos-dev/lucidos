@@ -8,7 +8,7 @@ vi.mock('../../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { ChildStoppedRow } from '../ChildCompletionRow';
+import { ChildMovedOutRow, ChildStoppedRow } from '../ChildCompletionRow';
 import { STOPPED_CHILD_CONTINUE, STOPPED_CHILD_SETTLE, StoppedChildNotice } from '../StoppedChildNotice';
 import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 import type { ThreadMeta } from '../../../store/thread-events';
@@ -61,6 +61,23 @@ describe('ChildStoppedRow', () => {
     expect(vnodeText(row)).toContain('Child thread stopped:');
     expect(vnodeText(row)).toContain('Fix the ticket');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('waiting for you');
+
+    const link = findByClass(tree, 'accent-link')!;
+    (link.props as unknown as { onClick: () => void }).onClick();
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('child-uuid');
+  });
+});
+
+describe('ChildMovedOutRow', () => {
+  /** The former parent's row for a child moved to top level (ADR 0278): it
+   *  names the child, links to it, and says nothing more is coming. */
+  it('says the child moved out and the parent no longer waits, with a link to it', () => {
+    const tree = ChildMovedOutRow({ childThreadId: 'child-uuid', childThreadTitle: 'Write the notes' });
+    const row = findByClass(tree, 'event-row');
+    expect(row!.props['data-state']).toBe('moved-out');
+    expect(vnodeText(row)).toContain('Child thread moved to top level:');
+    expect(vnodeText(row)).toContain('Write the notes');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('no longer waiting');
 
     const link = findByClass(tree, 'accent-link')!;
     (link.props as unknown as { onClick: () => void }).onClick();

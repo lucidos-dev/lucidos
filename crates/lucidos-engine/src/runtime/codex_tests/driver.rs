@@ -11,7 +11,7 @@ struct StubSession {
     cancel: CancellationToken,
 }
 
-fn stub_driver(jsonl_body: &str, resume: Option<&str>, continuation: bool) -> StubSession {
+fn stub_driver(jsonl_body: &str, resume: Option<&str>) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let args_log = tmp.path().join("args.log");
     let script = tmp.path().join("codex-stub.sh");
@@ -46,7 +46,6 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>, continuation: bool) -> St
     tokio::spawn(driver_task(
         config,
         resume.map(str::to_string),
-        continuation,
         events_tx,
         input_rx,
         control_rx,
@@ -97,7 +96,7 @@ const HAPPY_TURN: &str = r#"{"type":"thread.started","thread_id":"t-1"}
 
 #[tokio::test]
 async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
-    let mut s = stub_driver(HAPPY_TURN, None, false);
+    let mut s = stub_driver(HAPPY_TURN, None);
     s.agent
         .input_tx
         .send(AgentInput {
@@ -106,6 +105,10 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
         })
         .expect("send input");
 
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
     assert!(matches!(
         next_event(&mut s.agent).await,
         AgentEvent::Init { session_id, .. } if session_id == "t-1"
@@ -160,7 +163,7 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
 
 #[tokio::test]
 async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
-    let mut s = stub_driver(HAPPY_TURN, None, false);
+    let mut s = stub_driver(HAPPY_TURN, None);
     s.agent
         .input_tx
         .send(AgentInput {
@@ -168,8 +171,8 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
             images: vec![],
         })
         .unwrap();
-    // Drain turn 1: Init, Message, Usage, Result.
-    for _ in 0..4 {
+    // Drain turn 1: InputRead, Init, Message, Usage, Result.
+    for _ in 0..5 {
         let _ = next_event(&mut s.agent).await;
     }
     s.agent
@@ -180,6 +183,10 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
         })
         .unwrap();
     // Turn 2: duplicate thread.started is suppressed → Message, Usage, Result.
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
     assert!(matches!(
         next_event(&mut s.agent).await,
         AgentEvent::Message { .. }
@@ -205,13 +212,25 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
     s.cancel.cancel();
 }
 
+/// Recovery resumes a session with the continuation as an ordinary input. The
+/// turn runs against the resumed session and reports that input read, so the
+/// engine's ledger settles it (ADR 0268).
 #[tokio::test]
-async fn continuation_spawns_turn_without_any_input() {
-    // ContinuationRequested recovery: the engine sends NO input and expects
-    // the agent to pick up on its own. The driver must start the turn with
-    // the synthetic continuation prompt against the resumed session.
-    let mut s = stub_driver(HAPPY_TURN, Some("sid-9"), true);
-    // No input sent — events must still arrive.
+async fn a_resumed_session_runs_the_engine_continuation_as_an_input() {
+    let continuation = "Continue from where you left off.";
+    let mut s = stub_driver(HAPPY_TURN, Some("sid-9"));
+    s.agent
+        .input_tx
+        .send(AgentInput {
+            text: continuation.into(),
+            images: vec![],
+        })
+        .expect("send input");
+
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
     let mut saw_result = false;
     for _ in 0..4 {
         if matches!(next_event(&mut s.agent).await, AgentEvent::Result { .. }) {
@@ -219,12 +238,12 @@ async fn continuation_spawns_turn_without_any_input() {
             break;
         }
     }
-    assert!(saw_result, "continuation turn must complete without input");
+    assert!(saw_result, "the continuation turn must complete");
 
     let invocations = logged_invocations(&s.args_log);
     assert_eq!(invocations.len(), 1);
     assert!(invocations[0].contains("resume sid-9"));
-    assert!(invocations[0].contains(CONTINUATION_PROMPT));
+    assert!(invocations[0].contains(continuation));
 
     s.cancel.cancel();
 }
@@ -236,7 +255,7 @@ async fn child_death_without_terminal_synthesizes_failed_result() {
     // synthesize a failed one instead of leaving the thread wedged.
     let body = r#"{"type":"thread.started","thread_id":"t-1"}
 {"type":"error","message":"401 Unauthorized"}"#;
-    let mut s = stub_driver(body, None, false);
+    let mut s = stub_driver(body, None);
     s.agent
         .input_tx
         .send(AgentInput {
@@ -245,6 +264,10 @@ async fn child_death_without_terminal_synthesizes_failed_result() {
         })
         .unwrap();
 
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
     assert!(matches!(
         next_event(&mut s.agent).await,
         AgentEvent::Init { .. }
@@ -269,7 +292,7 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
     // hang watchdog.
     let body = r#"{"type":"thread.started","thread_id":"t-1"}
 {"type":"item.started","item":{"id":"i0","type":"command_execution","command":"sleep 99","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#;
-    let mut s = stub_driver(body, None, false);
+    let mut s = stub_driver(body, None);
     s.agent
         .input_tx
         .send(AgentInput {
@@ -278,6 +301,10 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
         })
         .unwrap();
 
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
     assert!(matches!(
         next_event(&mut s.agent).await,
         AgentEvent::Init { .. }
@@ -303,7 +330,7 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
 
 #[tokio::test]
 async fn cancellation_kills_session_and_emits_exited() {
-    let mut s = stub_driver(HAPPY_TURN, None, false);
+    let mut s = stub_driver(HAPPY_TURN, None);
     // Cancel while idle (no turn running).
     s.cancel.cancel();
     assert!(matches!(
@@ -349,7 +376,6 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     tokio::spawn(driver_task(
         config,
         None,
-        false,
         events_tx,
         input_rx,
         control_rx,
@@ -370,6 +396,10 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     }
     assert!(matches!(
         recv(&mut events_rx).await,
+        AgentEvent::InputRead(None)
+    ));
+    assert!(matches!(
+        recv(&mut events_rx).await,
         AgentEvent::Init { .. }
     ));
     assert!(matches!(
@@ -377,11 +407,9 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         AgentEvent::ToolUse { .. }
     ));
 
-    // Queue a follow-up BEFORE interrupting. The engine counted it in
-    // `AgentSession::inputs_awaiting_result` and, because Codex settles that
-    // count by one per Result, expects a Result for it. The driver must run it
-    // as a fresh turn after the interrupt (CC's stdin queue behaves the same way
-    // after Esc, though CC answers the whole queue with one Result).
+    // Queue a follow-up BEFORE interrupting. The engine owes it until its turn
+    // starts (ADR 0268), so the driver must run it as a fresh turn after the
+    // interrupt. CC's stdin queue behaves the same way after Esc.
     input_tx
         .send(AgentInput {
             text: "queued".into(),
@@ -400,8 +428,12 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         recv(&mut events_rx).await,
         AgentEvent::Result { error: None, .. }
     ));
-    // The queued follow-up starts the next turn (the stub blocks again, so
-    // its ToolUse is the signal the turn is running).
+    // The queued follow-up starts the next turn, which reports it read. The
+    // stub blocks again, so its ToolUse is the signal the turn is running.
+    assert!(matches!(
+        recv(&mut events_rx).await,
+        AgentEvent::InputRead(None)
+    ));
     assert!(matches!(
         recv(&mut events_rx).await,
         AgentEvent::ToolUse { .. }

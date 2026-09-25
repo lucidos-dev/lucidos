@@ -14,11 +14,9 @@
 //! Caveats:
 //!
 //! - We do NOT try to reconstruct a stream-json conversation (CC's
-//!   tool_use / tool_result pairs). The Phase 3 spike showed CC injects its
-//!   own "Continue from where you left off" header on `--resume` and rejects
-//!   half-formed stream-json. A FRESH session sees the recap as plain user
-//!   text and that's good enough — CC has rough knowledge, not a perfect
-//!   replay.
+//!   tool_use / tool_result pairs): CC rejects half-formed stream-json. A
+//!   FRESH session sees the recap as plain user text, and that is good
+//!   enough. CC gets rough knowledge, not a perfect replay.
 //! - The output is bounded by `max_chars` so we never blow CC's context. A
 //!   typical 50K cap holds ~50 turns of moderate conversation.
 

@@ -237,6 +237,7 @@ impl TurnStarter for ThreadTurn {
                     // nothing here for a voice session id to mark.
                     None,
                     crate::engine::FollowUpUrgency::Normal,
+                    None,
                 )
                 .await;
             match result {

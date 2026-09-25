@@ -52,6 +52,11 @@
     animation: progress-blink-red 0.6s ease-in-out infinite;
 }
 
+/* Reduced motion: a steady red dot. The word beside it carries the state. */
+:root[data-motion="reduce"] .system-status-row .status-dot.disconnected {
+    animation: none;
+}
+
 /* What the state means for the app, under the state itself. The row above says
    which state it is and has said it in one word for as long as this page has
    existed; a word is not a message, and this is the same sentence the Lucidos

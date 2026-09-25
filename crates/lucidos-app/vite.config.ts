@@ -4,22 +4,23 @@ import preact from '@preact/preset-vite';
 import { resolve } from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { frontendPreviewProxy, PREVIEW_API_ORIGIN_ENV } from './vite/frontendPreviewProxy';
+import { previewAuthGate, previewGatewayFromEnv, previewProxy } from './vite/frontendPreviewGateway';
+import { askGatewaySession } from './vite/gatewaySession';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
 // The frontend preview (engine/frontend_preview.rs) runs THIS dev server from a
-// coding-agent worktree on its own port, and forwards the engine-owned prefixes
-// back to the engine so the page is same-origin with its own API. `undefined`
-// for every other invocation, including a manual `npm run dev`.
-const previewProxy = frontendPreviewProxy(process.env[PREVIEW_API_ORIGIN_ENV]);
+// coding-agent worktree on its own port, behind the workspace's gateway (ADR
+// 0267). `undefined` for every other invocation, including a manual `npm run dev`.
+const previewGateway = previewGatewayFromEnv(process.env);
 
 // Resolve TLS cert/key: local .certs/ first, then LUCIDOS_TLS_CERT/KEY env
 // vars, which a worktree needs because .certs/ is gitignored there. Mirrors
-// detect_tls() in workspace.sh.
+// detect_tls() in workspace.sh. The preview skips .certs/: the engine hands it
+// the gateway's pair, or none, so its scheme is always the gateway's.
 function resolveTlsFile(localName: string, envVar: string | undefined): string | undefined {
   const localPath = resolve(__dirname, '../../.certs', localName);
-  if (fs.existsSync(localPath)) return localPath;
+  if (!previewGateway && fs.existsSync(localPath)) return localPath;
   if (envVar && fs.existsSync(envVar)) return envVar;
   return undefined;
 }
@@ -293,7 +294,13 @@ export default defineConfig({
   // root with no `<base>` they resolve to `/assets/...`. In `vite serve` a
   // relative base falls back to `/`, so the dev server is unaffected.
   base: './',
-  plugins: [buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
+  plugins: [
+    ...(previewGateway
+      ? [previewAuthGate(previewGateway, (cookie) => askGatewaySession(previewGateway, cookie))]
+      : []),
+    buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
+    stampServiceWorker(), preact(), atomicDistPublish(),
+  ],
   build: {
     // The eager entry chunk is the first-paint-critical app core: shell, store,
     // event handling, signals, layout. Views are lazy-loaded and the heavy libs
@@ -385,7 +392,13 @@ export default defineConfig({
         key: fs.readFileSync(keyFile!),
       },
     }),
-    ...(previewProxy && { proxy: previewProxy }),
+    ...(previewGateway && {
+      proxy: previewProxy(previewGateway),
+      // A phone opens the preview by its tailnet name, which Vite's DNS
+      // rebinding guard refuses. The auth gate covers that threat here: the
+      // device cookie is host-only, so a rebound name never carries it.
+      allowedHosts: true,
+    }),
     // The `server` block serves a manual `vite serve` and the frontend preview
     // (engine/frontend_preview.rs). It is NOT part of the dev harness (ADR
     // 0014): web-dev, tauri-dev and e2e all build dist/ and let the engine

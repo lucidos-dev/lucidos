@@ -32,6 +32,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, join } from 'node:path';
+import { DEFAULT_FONT_FAMILY } from '@lucidos/appearance';
 import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS } from '../../../store/store';
 import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIndex';
 
@@ -181,6 +182,30 @@ describe('Settings nav structure', () => {
       expect(iface).toContain(`data-search-anchor="${anchor}"`);
       expect(iface, `${anchor} must render unconditionally`).not.toMatch(guarded);
     }
+  });
+});
+
+describe('the Motion row', () => {
+  it('sits beside Theme in Appearance, on every client, and writes the preference', () => {
+    const iface = functionBody(SETTINGS_VIEW, 'function appearanceSection()');
+    // Unconditional: reduced motion matters on every client, not one platform.
+    expect(iface).toMatch(/<div class="settings-row" data-search-anchor="appearance:motion">/);
+    expect(iface).not.toMatch(/&&\s*\(\s*<div class="settings-row" data-search-anchor="appearance:motion"/);
+    // After the theme row, inside the Theme section, before Typography.
+    const motionAt = iface.indexOf('appearance:motion');
+    expect(motionAt).toBeGreaterThan(iface.indexOf('appearance:mode'));
+    expect(motionAt).toBeLessThan(iface.indexOf('appearance:typography'));
+    // Each option writes through setMotion, and the active one reads the signal.
+    expect(iface).toContain('{MOTION_PREFS.map((m) => (');
+    expect(iface).toContain('onClick={() => void setMotion(m)}');
+    expect(iface).toContain('const motion = motionPreference.value;');
+  });
+});
+
+describe('the Font dropdown', () => {
+  it('lists the default font first, as Theme and Motion list theirs', () => {
+    const options = SETTINGS_VIEW.slice(SETTINGS_VIEW.indexOf('const FONT_OPTIONS'));
+    expect(options.match(/value: '([^']+)'/)?.[1]).toBe(DEFAULT_FONT_FAMILY);
   });
 });
 

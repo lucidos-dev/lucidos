@@ -1,6 +1,6 @@
-import { signal, type ReadonlySignal } from '@preact/signals';
+import { computed, signal, type ReadonlySignal } from '@preact/signals';
 import { transcriptScrolls } from './threadWindow';
-import { prefersReducedMotion } from '../../utils/platform';
+import { isReducedMotion } from '../../utils/motion';
 // The LEAF breadcrumb module, not `utils/liveness`, which re-exports it behind
 // a `store` import this module deliberately avoids (see `parseNavigatedTurn`).
 import { postClientLog } from '../../utils/clientLog';
@@ -241,10 +241,9 @@ export function markNavigationScroll(el: HTMLElement, top: number) {
 }
 
 /** Write `top` and record it as the app HOLDING the reader on the content they
- *  were already reading, while the layout changed under them. Two writers, and
- *  they are the same act either side of the DOM/layout line:
- *  `withScrollAnchor`'s reveal correction and `restoreAfterReflow`'s pane-resize
- *  correction.
+ *  were already reading, while the layout changed under them. Every caller does
+ *  that one act, from `withScrollAnchor`'s reveal correction to
+ *  `restoreAfterReflow`'s pane-resize correction.
  *
  *  It marks a navigation, like every other write here. That is what stops the
  *  render-window expansion reading a correction landing near the top as a
@@ -291,7 +290,8 @@ export function onAnchorScroll(listener: (el: HTMLElement) => void): () => void 
  *
  *  The counterpart of `markNavigationScroll` for a navigation that does not
  *  write `scrollTop` itself: it calls `scrollIntoView` and lets the platform
- *  pick the offset. `choiceCardNav`'s arrow-key step is the one today. Both
+ *  pick the offset: `choiceCardNav`'s arrow-key step, and a key or a focus
+ *  landing on a control inside the transcript. Both
  *  signals that would otherwise catch it are blind here. Nothing stamps a
  *  position, and the keydown lands on the choice BUTTON rather than on the
  *  transcript, so no gesture is recorded either.
@@ -349,9 +349,9 @@ export function isWhereWeLastScrolledIt(el: HTMLElement): boolean {
     && Math.abs(el.scrollTop - _navScrollTop) <= 1;
 }
 
-/** RETIRE the stamp the moment the container leaves it. Called by `onScroll`,
- *  beside `forgetHeldLiveEdge` and for the same reason: a number the reader came
- *  BACK to reads exactly like one they never left. Clears the offset alone, so
+/** RETIRE the stamp the moment the container leaves it. Called by `onScroll`:
+ *  a number the reader came BACK to reads exactly like one they never left.
+ *  Clears the offset alone, so
  *  `isNavigationScroll`'s window keeps its element. */
 function forgetNavigationStamp(el: HTMLElement): void {
   if (_navScrollEl === el && !isWhereWeLastScrolledIt(el)) _navScrollTop = null;
@@ -361,16 +361,16 @@ function forgetNavigationStamp(el: HTMLElement): void {
  *  reader somewhere on purpose, rather than the ride holding them where they
  *  already were?
  *
- *  The narrow half of `isNavigationScroll`, and the one the platform-scroll
- *  correction asks. It has to be the narrow one, because held writes mark a
- *  navigation as well, and a settling transcript takes one every growth round.
- *  The wide predicate is therefore true almost continuously on exactly the
- *  threads the correction exists for.
+ *  The narrow half of `isNavigationScroll`, and the one the follow's disarm
+ *  asks: a placement off the edge retires the ride, where anything else is the
+ *  platform and is written back. It has to be the narrow one, because held
+ *  writes mark a navigation as well, and a settling transcript takes one every
+ *  growth round. Read through the wide predicate, the ride's own writes would
+ *  retire it.
  *
  *  A held write's OWN event lands on the stamp, and `isWhereWeHeldIt` excludes
  *  it a term earlier. So a scroll that is NOT on the stamp cannot be that
- *  write's event, and the clock has nothing to add. Only a placement leaves the
- *  reader somewhere the correction must not undo. */
+ *  write's event, and the clock has nothing to add. */
 function isPlacementScroll(el: HTMLElement): boolean {
   return _navScrollKind !== 'held' && isNavigationScroll(el);
 }
@@ -400,29 +400,77 @@ export function isOtherNavigationScroll(el: HTMLElement): boolean {
 }
 
 /* ── The standing request to ride the live edge ──────────────────────────────
- *  The flag below is the ARMED half of the follow. ADR 0064 (docs/adr/) is the
- *  policy: what may arm it, what retires it, and every arming rule tried and
- *  rejected. Read it before changing either list.
+ *  ADR 0064 (docs/adr/) is the policy: what may arm the follow, what retires
+ *  it, and every arming rule tried and rejected. Read it before changing either
+ *  list.
  *
- *  ARMED and CARRYING are two states, and the flag is only the first. The
- *  request persists across an idle spell untouched. A reader who scrolls away on
- *  a quiet thread keeps the lit toggle and the recorded live-edge reading
- *  position. What stops for them while idle is the WRITING. See
- *  `followIsCarrying`.
+ *  THREE STATES, and the toggle is lit for two of them:
+ *  - `off`: nothing follows.
+ *  - `riding`: the reader is ON the live edge, or a ride glide is taking them
+ *    there. A scroll they did not make is written back.
+ *  - `parked`: the reader scrolled off the edge while the thread was waiting.
+ *    Nothing moves them. The thread going live again rides them back to the
+ *    edge (`setTranscriptLive`), and so does scrolling back down themselves.
+ *
+ *  So a lit toggle is never off the edge while the thread is live. Which of
+ *  `off` and `parked` a reader's scroll leads to is `leaveTheRideByScroll`'s
+ *  call, and it is the user's explicit instruction. Read it there.
  *
  *  TWO functions arm it and no others, both through `armFollowOn`:
  *  `setFollowLiveEdge` (the toggle) and `resumeFollowingBottom` (which replays a
  *  toggle request recorded in this thread). Being AT the bottom arms nothing.
  *
- *  A SIGNAL rather than a plain boolean, because the toggle renders it. It has
+ *  A SIGNAL rather than a plain value, because the toggle renders it. It has
  *  to go off by itself when a scroll retires the follow underneath it. Exported
- *  as a `ReadonlySignal<boolean>`, which the compiler refuses to let a component
- *  assign, so reading the state cannot become a way of setting it. */
-const _followingBottom = signal(false);
+ *  only as a derived `ReadonlySignal<boolean>`, so reading the state cannot
+ *  become a way of setting it. */
+type FollowState = 'off' | 'riding' | 'parked';
+const _follow = signal<FollowState>('off');
 
-/** Is the standing follow armed? Read by the follow toggle, which RENDERS it.
- *  `ReadonlySignal` on the way out on purpose: see the block above. */
-export const followingLiveEdge: ReadonlySignal<boolean> = _followingBottom;
+/** Is the standing follow armed, riding or parked? Read by the follow toggle,
+ *  which RENDERS it. `ReadonlySignal` on the way out on purpose: see above. */
+export const followingLiveEdge: ReadonlySignal<boolean> = computed(() => _follow.value !== 'off');
+
+/** Is the thread on screen live streaming? Pushed in from the thread
+ *  projection by `watchTranscriptLiveness` (`store/transcriptLiveness.ts`), its
+ *  one writer. A copy, because this module imports no store. */
+let _transcriptLive = false;
+
+/** Tell the follow whether the thread on screen is live streaming. When a
+ *  quiet thread goes live, a PARKED reader rides again and glides to the edge.
+ *  So no lit toggle sits off the edge while rows arrive. */
+export function setTranscriptLive(live: boolean): void {
+  const waking = live && !_transcriptLive;
+  _transcriptLive = live;
+  if (!waking) return;
+  const el = resolveTarget();
+  if (el) wakeParkedRide(el);
+}
+
+/** A parked follow on a LIVE thread rides again, glided to the edge. Asked on
+ *  the wake, and again by every growth round: a wake that found no visible
+ *  transcript is caught up by the first row that arrives once it shows.
+ *
+ *  It stands down for a deep link still resolving, whose landing decides the
+ *  ride, exactly as `keepTheLiveEdge` does. */
+function wakeParkedRide(el: HTMLElement): boolean {
+  if (_follow.value !== 'parked' || !_transcriptLive) return false;
+  if (hasPendingEventScroll()) return false;
+  unparkTheRide(el);
+  rideToLiveEdge(el);
+  return true;
+}
+
+/** A PARKED follow rides again, stamped at `el`'s position. Not an ARM: the
+ *  reader armed it already, so `armFollowOn`'s two callers stay the only ones.
+ *  The listeners still hear it, because a parked reader recorded a place. */
+function unparkTheRide(el: HTMLElement): void {
+  if (_follow.value !== 'parked') return;
+  _follow.value = 'riding';
+  holdPosition(el);
+  _rideShortReported = false;
+  for (const listener of _followRideListeners) listener();
+}
 
 /* ── The follow SEED ─────────────────────────────────────────────────────────
  *  The reader's last PRESS of the toggle, remembered across threads and
@@ -520,178 +568,10 @@ export function applyFollowSeed(el: HTMLElement, from: FollowResumeFrom = 'live-
   return true;
 }
 
-/* ── THE LIVE SOURCES: is anything producing rows on the thread on screen? ────
- *  TWO of them, and `threadIsLive` is the one predicate that reads both. What
- *  either one means is the same: content is arriving that an armed reader asked
- *  to be carried toward. What they decide is described at `threadIsLive`.
- *
- *  Two slots rather than one flag, because each source clears its own. They
- *  overlap constantly during a call: every utterance is an exchange, so the
- *  `isLast` role moves on and the outgoing exchange writes `false`. One shared
- *  flag would end a live call's ride on that write.
- *
- *  Each is a plain mutable variable read imperatively, like
- *  `_activeScrollElement`. Both are TOLD to this module rather than derived
- *  here, because `scrollState` must not import `store` (see
- *  `parseNavigatedTurn`). */
-
-/** Is the AGENT running a turn on the thread being shown? Told by
- *  `ChatExchange` for its `isLast` turn, derived by `exchangeMarksAgentLive`
- *  from BOTH the turn's status and the thread projection's own quiescence. */
-let _agentLive = false;
-
-/** Is a voice CALL up on the thread being shown? Told by the call store's own
- *  installer, which is the seam between a call and the transcript.
- *
- *  It is a second source rather than part of the one above because a call runs
- *  NO TURN. Every event a call writes is `Metadata` (ADR 0165), so the thread
- *  projection stays quiescent for the whole conversation and
- *  `exchangeMarksAgentLive` reads idle throughout.
- *
- *  Without it the follow treated a call as a quiet thread. A reader parked off
- *  the live edge was carried by nothing while the caller spoke, and the toggle
- *  stayed lit over a transcript following nothing. */
-let _callLive = false;
-
-/** When the SUBMIT's own claim that the thread is live runs out. A submit says
- *  so before any status can (see `followSubmit`), and that claim must EXPIRE
- *  rather than stand until something contradicts it. What would contradict it
- *  may never come. A Continue whose POST fails leaves the last turn's status
- *  exactly as it was, and so does an unanswered permission decision. So
- *  `ChatExchange`'s effect never re-runs and never writes `false`. Left
- *  standing, the claim would cost the reader their follow the next time they
- *  browsed an idle thread. */
-let _submitLiveUntil = -Infinity;
-
-/** How long a submit's claim outlives the submit. It has to cover the POST round
- *  trip AND the whole gap before the thread projection says `running`, which is
- *  the longer of the two. `meta.status` only advances when a per-event aggregate
- *  carrying `running` arrives. `store.ts`'s `isRenderedThreadIdle` documents
- *  that gap running to about eight seconds on a resume.
- *
- *  Being wrong LONG costs a few more seconds in which a scroll retires the
- *  follow, on a thread the reader just submitted to. That is the least likely
- *  moment for them to be idly browsing. Being wrong SHORT re-opens the gap the
- *  claim exists for. */
-const SUBMIT_LIVE_CLAIM_MS = 20_000;
-
-/** Tell this module whether the thread on screen has a turn in flight. Called by
- *  `ChatExchange` for its last exchange, and cleared when that exchange
- *  unmounts, so a thread switch cannot leave the previous thread's answer
- *  standing.
- *
- *  A `true` retires a submit's claim, because what the claim was guessing at has
- *  arrived. A `false` DOES NOT, and that asymmetry is the whole point: `false`
- *  is exactly what a lagging source says inside the window the claim covers.
- *  `exchangeMarksAgentLive` needs the thread projection to agree, and the
- *  projection is the slow half. The render right after a send therefore writes
- *  `false` while the agent is on its way. Clearing the claim there would destroy
- *  it in the one window it exists for. Nothing is lost by ignoring `false`,
- *  since the claim expires on its own.
- *
- *  A `true` that WAKES the thread also does the growth round the observer
- *  missed, because this call arrives too late to be seen by it. See
- *  `honourWake`. */
-export function setAgentLive(live: boolean): void {
-  const waking = live && !threadIsLive();
-  _agentLive = live;
-  if (live) _submitLiveUntil = -Infinity;
-  if (waking) honourWake();
-}
-
-/** Tell this module whether a voice CALL is up on the thread on screen. The
- *  call's half of the pair above, and the same shape: one writer, and the
- *  false-to-true edge replays the round the observer missed.
- *
- *  The EDGE is read against both sources, not against this flag alone. A call
- *  placed on a thread already running a turn describes no new content, and the
- *  reader is being carried by that turn already. Replaying there would put a
- *  reader who had scrolled away back at the live edge for nothing.
- *
- *  It does NOT retire a submit's claim, unlike `setAgentLive`'s `true`. The
- *  claim is waiting for the agent to answer a submit, and a call says nothing
- *  about that. It expires on its own. */
-export function setCallLive(live: boolean): void {
-  const waking = live && !threadIsLive();
-  _callLive = live;
-  if (waking) honourWake();
-}
-
-/** The ride resumes on the WAKE itself, not on the next growth round.
- *
- *  The follow does its work from the transcript's ResizeObserver
- *  (`honourGrowth`), and this module learns the thread is live from a Preact
- *  `useEffect` in `ChatExchange`. Those two arrive in the wrong order. The new
- *  turn's row mounting fires the observer inside the same frame, while Preact
- *  defers its effects to a task after it. So the WAKING resize is handed to
- *  `honourGrowth` while this module still believes the thread is idle.
- *
- *  Usually invisible, because a streaming reply resizes again a moment later. It
- *  is visible for a turn that mounts its row and then produces nothing: a
- *  coding-agent turn RESUMING sits on `SessionStarted` for fifteen to twenty
- *  seconds, stranding an armed reader short of the edge with the toggle lit.
- *
- *  So the transition replays the missed round through `honourGrowth` itself,
- *  guards and all, rather than growing a second copy of the follow's rule.
- *
- *  Only on the false to true EDGE, and that edge belongs to `threadIsLive` as a
- *  whole rather than to one source. A `true` on a thread another source already
- *  holds live describes no new content. Acting on one would put a reader back
- *  at the live edge after they had scrolled away. It replays the LIVE arm
- *  alone, needing no edge reading. */
-function honourWake(): void {
-  const el = resolveTarget();
-  if (el) honourGrowth(el);
-}
-
-/** Is ANYTHING producing rows on the thread on screen? The agent running a
- *  turn, a voice call being up, or a submit's unexpired claim.
- *
- *  It decides what happens to a reader who is somewhere OTHER than the live
- *  edge. On a quiet thread their scroll does not end the ride, and neither does
- *  the up chevron or turn stepping. Growth does not carry them back down either,
- *  since growth there is the transcript finishing its own rendering.
- *
- *  A reader still ON the live edge asks it nothing. The app's own rendering must
- *  not move a rider off an edge they never left. See `keepTheLiveEdge`.
- *
- *  Two things deliberately DO NOT ask it, and both are the reader asking
- *  directly: pressing the toggle (`setFollowLiveEdge`), and resuming a request
- *  recorded in this thread (`resumeFollowingBottom`). Pressing the toggle on a
- *  finished thread must still take the reader to the bottom. */
-function threadIsLive(): boolean {
-  return _agentLive || _callLive || nowMs() < _submitLiveUntil;
-}
-
-/** Is the standing follow CARRYING the reader right now, as opposed to merely
- *  being armed? Armed AND live. See `_followingBottom` for why those are two
- *  states, and ADR 0064 for the policy.
- *
- *  For GROWTH it answers for a reader somewhere OTHER than the live edge. Its
- *  liveness term decides nothing for a reader ON the edge, whom
- *  `keepTheLiveEdge` keeps there whatever the thread is doing.
- *
- *  For a turn control's PRESS it is the whole answer, edge or no edge. The
- *  press names one thing to hold still, so only a ride already carrying the
- *  reader outranks it (ADR 0147).
- *
- *  Three callers ask it: the growth branch (`honourGrowth`), the reveal snap
- *  (`honourAnchoredMutation`), and `withScrollAnchor`'s decision to skip the
- *  anchor correction. The last two are ONE act split across the DOM/layout
- *  line, so they must answer the same, and asking one predicate is what makes
- *  that so.
- *
- *  Deliberately NOT asked by the reader's own explicit requests, which write the
- *  live edge directly: pressing the toggle, resuming a recorded request on
- *  re-entry, and the seed. Nor by `keepTheLiveEdge`, whose events are the app
- *  moving a rider who never left, rather than carrying one who did. */
-export function followIsCarrying(): boolean {
-  return _followingBottom.value && threadIsLive();
-}
-
-/** Subscribers notified when the follow is ARMED, and never when it is retired.
- *  One consumer today: `attachScrollMemory`, which records the request as this
- *  thread's reading position.
+/** Subscribers notified when the follow STARTS RIDING: armed, or a parked follow
+ *  riding again. Never when it is retired or parked. One consumer today:
+ *  `attachScrollMemory`, which records the request as this thread's reading
+ *  position.
  *
  *  The asymmetry is the design. A retirement has two causes that must be
  *  recorded differently, and this side cannot tell them apart. The reader
@@ -703,14 +583,15 @@ export function followIsCarrying(): boolean {
  *  A plain callback set rather than a signal. An exported writable signal would
  *  be an arming point no source scan could stop, and it would broadcast the
  *  retirement this deliberately does not. */
-const _followArmedListeners = new Set<() => void>();
+const _followRideListeners = new Set<() => void>();
 
-/** Subscribe to the arm. Returns the unsubscribe; fires on the unarmed to armed
- *  transition only, so re-arming an already-armed follow notifies nobody (there
- *  is nothing new to record). */
-export function onFollowArmed(listener: () => void): () => void {
-  _followArmedListeners.add(listener);
-  return () => { _followArmedListeners.delete(listener); };
+/** Subscribe to a ride starting. Returns the unsubscribe. Fires on the unarmed
+ *  to armed transition, and when a parked follow rides again (`unparkTheRide`),
+ *  since a parked reader recorded their place. Re-arming a rider notifies
+ *  nobody. */
+export function onFollowRideStarted(listener: () => void): () => void {
+  _followRideListeners.add(listener);
+  return () => { _followRideListeners.delete(listener); };
 }
 
 /** The turn a submit was made on, and THE HOLD'S BASELINE: what the agent had
@@ -885,15 +766,6 @@ function isScrollable(el: HTMLElement): boolean {
  *  resolving a card, granting a permission or expanding a turn. */
 let _heldEl: HTMLElement | null = null;
 let _heldTop = -1;
-/** Was the container ON the live edge when we took that stamp? MEASURED at the
- *  stamp, which is the only moment the answer is knowable: growth moves the
- *  edge away afterwards while leaving `scrollTop` exactly where it was.
- *
- *  It is what lets a placement the app has JUST made answer "the reader is on
- *  the edge" (see `heldOnTheLiveEdge`). `keepTheLiveEdge`'s own reading is taken
- *  at the END of a round, so it is absent for the round that needs it most: the
- *  growth that follows a thread opening onto a recorded ride. */
-let _heldAtLiveEdge = false;
 
 /** Record where the reader is WITHOUT writing anything, so a landing that has
  *  not moved them yet can still tell their next gesture from our own writes. A
@@ -901,12 +773,11 @@ let _heldAtLiveEdge = false;
  *  is waiting for renders there is no write to stamp, and the reader's flick in
  *  that window must still cancel it.
  *
- *  THE ONE WRITER of all three fields, so a stamp carrying a stale reading of
- *  the edge is not expressible. `null` forgets the stamp entirely. */
+ *  THE ONE WRITER of both fields, so a half-taken stamp is not expressible.
+ *  `null` forgets the stamp entirely. */
 function holdPosition(el: HTMLElement | null) {
   _heldEl = el;
   _heldTop = el ? el.scrollTop : -1;
-  _heldAtLiveEdge = !!el && isAtLiveEdge(el);
 }
 
 /** Write `top` and record it as OURS, so the scroll event it fires a frame later
@@ -924,7 +795,7 @@ function markHeldScroll(el: HTMLElement, top: number) {
   // EVERY held write asks whether it landed, because every one of them is the
   // app aiming a reader at the live edge. Asking here rather than at the five
   // call sites is what keeps a new one from forgetting. `settleTheRide` holds
-  // the terms, and answers nothing for a write that was not a carrying ride's.
+  // the terms, and answers nothing for a write that was not the ride's.
   rideSettlesOnTheEdge();
 }
 
@@ -942,8 +813,8 @@ function markHeldScroll(el: HTMLElement, top: number) {
  *  ordinary: a reader already at the live edge gets no write, and an idle thread
  *  then grows nothing, so no scroll carries the request anywhere. */
 function armFollowOn(el: HTMLElement | null) {
-  const wasArmed = _followingBottom.value;
-  _followingBottom.value = true;
+  const wasArmed = _follow.value !== 'off';
+  _follow.value = 'riding';
   holdPosition(el);
   // A fresh ride has said nothing yet. See `_rideShortReported`.
   _rideShortReported = false;
@@ -953,7 +824,7 @@ function armFollowOn(el: HTMLElement | null) {
   // chevron, which supersedes it. Everything downstream (the growth branch, the
   // cancel in `onScroll`) may therefore assume at most one of the two.
   _pendingLanding = null;
-  if (!wasArmed) for (const listener of _followArmedListeners) listener();
+  if (!wasArmed) for (const listener of _followRideListeners) listener();
 }
 
 /** Where a resumed standing follow starts from, i.e. whether resuming it also
@@ -974,13 +845,9 @@ function armFollowOn(el: HTMLElement | null) {
  *  is the one case where `in-place` writes. Asked for by
  *  `standDownForDeepLink` and by `onPageWake`'s claim-held branch.
  *
- *  `parked` replays a request the reader made while sitting somewhere OTHER
- *  than the live edge, and writes nothing at all. ARMED and CARRYING are two
- *  states (ADR 0064): the ride moves such a reader only while the thread is
- *  running, and the growth branch is what does it (`followIsCarrying`). So
- *  resuming one is the arm and nothing else. Asked for by the three sites in
- *  `attachScrollMemory` that read an armed-and-parked reading position. */
-export type FollowResumeFrom = 'live-edge' | 'in-place' | 'parked';
+ *  There is no third form for a request parked away from the edge, because the
+ *  follow has no such state. */
+export type FollowResumeFrom = 'live-edge' | 'in-place';
 
 /** Resume a standing follow the reader armed in this thread BEFORE they left it:
  *  arm, then write the live edge, so the growth branch carries them from there.
@@ -995,21 +862,13 @@ export type FollowResumeFrom = 'live-edge' | 'in-place' | 'parked';
  *  The live edge is wherever the content currently ends, so the write lands on
  *  today's bottom and the armed follow rides every later arrival. */
 export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): void {
-  if (from === 'parked') {
-    // NO STAMP, which is the whole of this branch. A stamp is the app saying
-    // where it put the reader, and this put them nowhere. Handing one over lets
-    // `heldOnTheLiveEdge` claim an edge for a reader parked in history, and the
-    // next growth round then hauls them to the bottom.
-    armFollowOn(null);
-    return;
-  }
   if (from === 'in-place') {
     // Two guards, and both are about what resuming may NOT undo.
     //
     // ALREADY ARMED means the reader never lost the request. Arming again would
-    // clear the held stamp `followPosition` reads, which silently switches
+    // clear the held stamp `followSurvivesScroll` reads, which silently switches
     // what this landing records from the live edge to a place.
-    if (_followingBottom.value) return;
+    if (_follow.value !== 'off') return;
     // LANDED OFF THE LIVE EDGE means the link has ended the ride ON PURPOSE
     // (`scrollToSelectorAndPulse`), because a link is a request to be at ONE
     // place. Resuming afterwards would undo that decision, so the resume is
@@ -1045,11 +904,10 @@ export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 
       return;
     }
     // Still in flight, so the link owns a position nobody knows yet and this
-    // writes nothing. The stamp follows the POSITION, the reader being wherever
-    // the open left them. OFF the edge that is an ordinary offset, which the
-    // follow never wrote and must not record as the live edge (see
-    // `currentPosition` in `hooks/useScrollMemory.ts`). ON the edge it is
-    // exactly what the follow writes, so stamping is honest there.
+    // writes nothing. It is the one moment the flag may stand off the edge: the
+    // link's claim stands the edge write down, and its landing then either
+    // retires the ride or takes the reader to the edge. The stamp is taken only
+    // ON the edge, where it is exactly what the follow writes.
     armFollowOn(isAtLiveEdge(el) ? el : null);
     return;
   }
@@ -1058,10 +916,9 @@ export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 
 }
 
 /** Has the standing follow SURVIVED the scroll being handled? Armed, and this
- *  is not the scroll that retires it.
- *
- *  Only the reader may end a ride, so a scroll that ends none leaves the
- *  request standing whatever it did to `scrollTop`.
+ *  is not the scroll that retires it. A surviving follow holds the reader on
+ *  the live edge, so this is also whether their *reading position* IS the live
+ *  edge. `currentPosition` in `hooks/useScrollMemory.ts` records it so.
  *
  *  ORDER-INDEPENDENT, which is the term that makes it safe to ask off the
  *  scroll path at all. `.thread-content` carries two scroll listeners, the
@@ -1072,68 +929,38 @@ export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 
  *
  *  A container still ON our stamp skips the rule entirely. That scroll is the
  *  follow's own write, which cannot be the reader taking over. */
-function followSurvivesScroll(el: HTMLElement): boolean {
-  if (!_followingBottom.value) return false;
+export function followSurvivesScroll(el: HTMLElement): boolean {
+  if (_follow.value !== 'riding') return false;
   const tookOver = !isWhereWeHeldIt(el);
   if (!tookOver) return true;
-  return !scrollRetiresTheRide(isAtLiveEdge(el), tookOver, readerGestureActive(el));
+  return !scrollLeavesTheRide(isAtLiveEdge(el), tookOver, readerGestureActive(el), isPlacementScroll(el));
 }
 
-/** Is the reader AT the live edge, or on their way to it under the ride's own
- *  motion? Three sources, because no one of them covers the whole of a ride.
+/** Does the scroll being handled take a riding reader OFF the ride? One rule,
+ *  so the disarm and the recorder cannot drift. What it leads to, off or
+ *  parked, is `leaveTheRideByScroll`'s call.
  *
- *  MEASURED is the ordinary answer. The app's own PLACEMENT covers the frame
- *  after a held write, where growth has already moved the edge on: the same
- *  pair `keepTheLiveEdge` reads, for the same reason.
+ *  The reader's own act moving them off the edge leaves it: their GESTURE, or
+ *  a PLACEMENT the app made for them (a reveal, a chord, a navigation). A
+ *  scroll that is neither is the platform's, and `keepTheLiveEdge` writes it
+ *  back instead. The ride's own held writes are not placements.
  *
- *  A RIDE'S GLIDE covers the press itself. The toggle arms from wherever the
- *  reader was and glides, so for up to `SCROLL_MAX_MS` they are neither at the
- *  edge nor placed on it. Their reading position is the edge all the same, and
- *  a thread left mid-glide must not be remembered as parked. Only a ride's:
- *  a landing's glide belongs to a submit, which arms nothing. */
-function followHoldsTheEdge(el: HTMLElement): boolean {
-  return heldOnTheLiveEdge(el) || isAtLiveEdge(el) || rideGlideInFlight();
+ *  Its booleans are read by the caller, because `onScroll` must read them ONCE
+ *  for the scroll it is handling rather than once per question. */
+function scrollLeavesTheRide(atEdge: boolean, tookOver: boolean, gesture: boolean, placement: boolean): boolean {
+  return !atEdge && tookOver && (gesture || placement);
 }
 
-/** Is the tween in flight the RIDE's own glide? The counterpart of
- *  `landingGlideInFlight`, for the other owner. */
-function rideGlideInFlight(): boolean {
-  return _heldAnim && _heldAnimTarget === 'ride';
-}
-
-export type FollowPosition = 'live-edge' | 'parked' | null;
-
-/** What the standing follow makes of this container's *reading position* right
- *  now, in the three states it can be in:
+/** THE USER'S EXPLICIT INSTRUCTION: a scroll turns the follow off
+ *  automatically ONLY while the thread is live streaming. On a waiting or idle
+ *  thread the follow stays armed, PARKED where the reader scrolled to.
  *
- *  - `live-edge`: the request survived this scroll and the reader is on the
- *    edge, so the position IS the edge.
- *  - `parked`: the request survived and the reader is elsewhere, so it rides
- *    in front of the place they are at.
- *  - `null`: NO REQUEST SURVIVES this scroll, so the place speaks alone. Not
- *    the same as "unarmed": the scroll that retires a ride answers null while
- *    the flag is still up, which is the order-independence below.
- *
- *  ONE call rather than two predicates, and that is not tidiness. Both answers
- *  read the gesture window, which is wall-clock. A second read can land the
- *  other side of its edge and describe a different scroll, which is why
- *  `onScroll` reads its own terms once.
- *
- *  The recording side is the one caller (`currentPosition` in
- *  `hooks/useScrollMemory.ts`), which must keep the reader's request on disk
- *  for as long as they hold it. */
-export function followPosition(el: HTMLElement): FollowPosition {
-  if (!followSurvivesScroll(el)) return null;
-  return followHoldsTheEdge(el) ? 'live-edge' : 'parked';
-}
-
-/** Does the scroll being handled RETIRE the standing follow? ADR 0064's four
- *  terms, in one place, so the disarm and the recorder cannot drift.
- *
- *  Its three booleans are read by the caller, because `onScroll` must read them
- *  ONCE for the scroll it is handling rather than once per question. */
-function scrollRetiresTheRide(atEdge: boolean, tookOver: boolean, gesture: boolean): boolean {
-  return threadIsLive() && !atEdge && tookOver && gesture;
+ *  Do not change this without the user explicitly asking for it. One earlier
+ *  change read a report as the opposite and made every scroll disarm. The user
+ *  had to report it again. ADR 0064 records the rule. */
+function leaveTheRideByScroll(): void {
+  if (_transcriptLive) stopFollowingBottom();
+  else parkTheRide();
 }
 
 /** Retire the standing follow, and with it anything we were doing to serve it or
@@ -1150,10 +977,21 @@ function scrollRetiresTheRide(atEdge: boolean, tookOver: boolean, gesture: boole
  *  thread's newest turn. The landing therefore leaves the reader AT the live
  *  edge, where the disarm's first condition is false.
  *
- *  It is deliberately NOT gated on the thread being live, unlike every other
- *  retirement here. See `scrollToSelectorAndPulse`, which owns that call, and
- *  ADR 0064. */
+ *  It is deliberately NOT gated on the thread being live, unlike a reader's
+ *  scroll (`leaveTheRideByScroll`). See `scrollToSelectorAndPulse`, which owns
+ *  that call, and ADR 0064. */
 export function stopFollowingBottom() {
+  leaveTheRide('off');
+}
+
+/** Keep the follow armed but move the reader nowhere, until the thread goes
+ *  live or they scroll back to the edge. See `leaveTheRideByScroll`. */
+function parkTheRide() {
+  leaveTheRide('parked');
+}
+
+/** Stop everything we were doing to hold the reader, and settle on `next`. */
+function leaveTheRide(next: 'off' | 'parked') {
   // The settle check serves the ride and nothing else, so it goes with it.
   cancelRideSettle();
   // Both of the things that hold a reader are OUR motion, so both stop here.
@@ -1162,7 +1000,7 @@ export function stopFollowingBottom() {
   // thread's turn as the target. Only a HELD tween: a deep-link or up-chevron
   // glide belongs to a navigation this has no business cancelling.
   if (_heldAnim) cancelScrollAnim();
-  _followingBottom.value = false;
+  _follow.value = next;
   holdPosition(null);
   _pendingLanding = null;
 }
@@ -1213,51 +1051,41 @@ function landingInFlight(): boolean {
 /** Carry the held stamp onto a scroll THE APP just wrote to hold the reader on
  *  the same content while the layout moved under them. Two writers, and they are
  *  the same act on either side of the DOM/layout line: `restoreAfterReflow` for
- *  a pane resize, `withScrollAnchor` for a toggle. Neither is the reader taking
- *  over, so neither may retire a standing follow or cancel a pending landing.
- *  Without the stamp, the scroll event each fires arrives at a position we do
- *  not recognise and does both.
+ *  a pane resize, `withScrollAnchor` for a toggle. Neither is the reader
+ *  scrolling, so the scroll event each fires must not cancel a pending landing.
+ *  Whether the follow survives is decided by position instead, in
+ *  `honourAnchoredMutation`.
  *
  *  It CARRIES a hold rather than taking one, hence the guard. With no hold on
  *  this element there is nothing to protect, and stamping would claim a position
- *  nobody asked for.
- *
- *  Re-taking the whole stamp is what keeps the edge reading honest. The
- *  correction holds the reader on their CONTENT, which for a reader parked up in
- *  history is nowhere near the bottom. A stamp that kept an older `true` would
- *  hand `heldOnTheLiveEdge` a position the reader left. */
+ *  nobody asked for. */
 function carryHeldScroll(el: HTMLElement): void {
   if (_heldEl === el) holdPosition(el);
 }
 
 /** What the transcript owes the reader after the APP mutated it and corrected
- *  the scroll to hold them still. `withScrollAnchor`'s side of `honourGrowth`,
- *  and the two say the same thing in the two worlds. Every reveal in the
- *  transcript goes through it: the collapse fold, the per-turn unfold, and the
- *  two transcript-wide turn controls.
+ *  the scroll to hold them still. `withScrollAnchor`'s side of `honourGrowth`.
+ *  Every reveal in the transcript goes through it: the collapse fold, the
+ *  per-turn unfold, and the two transcript-wide turn controls.
  *
- *  ONLY A SCROLL MAY RETIRE THE FOLLOW, so the first line is not optional. A
- *  toggle is a click on a control, not a gesture. The correction moves the
- *  container all the same, and without the stamp that write reads as the reader
- *  taking over. The transcript-wide reveals grow every turn, including those
- *  BELOW the anchored root, so the correction leaves the reader short.
+ *  A press asks for one named thing to change, so the thing pressed is what
+ *  must not move (ADR 0147). The correction has held it. If that left an armed
+ *  reader off the live edge, their own press took them there. So it retires
+ *  the ride exactly as a gesture would. A flag left up would be a lit toggle
+ *  over a reader it no longer holds. Nothing moves either way.
  *
- *  Then, for a reader the ride is CARRYING, one held write puts them on the
- *  live edge, in the frame the caller unfreezes: `snapToLiveEdge`. That is not
- *  a position the reader ever occupied.
- *
- *  CARRYING, rather than merely armed and sitting on the edge. A press asks for
- *  one named thing to change, so the thing they pressed is what must not move
- *  (ADR 0147). On a live thread the next growth round would undo that hold, so
- *  one press would cost two motions and the ride wins. On a quiet thread
- *  nothing is arriving to carry them toward.
- *
- *  Nothing at all for anyone else. A tween here was tried and rejected, see
- *  ADR 0064. */
+ *  Except mid-glide: a ride still gliding is short of the edge because it has
+ *  not landed, not because of the press. Its frames re-aim at the edge, so it
+ *  goes on. */
 export function honourAnchoredMutation(el: HTMLElement): void {
   carryHeldScroll(el);
-  if (!followIsCarrying() || isAtLiveEdge(el)) return;
-  snapToLiveEdge(el);
+  if (_follow.value === 'riding' && !isAtLiveEdge(el) && !rideGlideInFlight()) stopFollowingBottom();
+}
+
+/** Is the tween in flight the RIDE's own glide? The counterpart of
+ *  `landingGlideInFlight`, for the other owner. */
+function rideGlideInFlight(): boolean {
+  return _heldAnim && _heldAnimTarget === 'ride';
 }
 
 /** Is the container still exactly where our last held write left it? The exact
@@ -1266,37 +1094,6 @@ export function honourAnchoredMutation(el: HTMLElement): void {
  *  ratio) and the iOS repaint nudge's deliberate ±1. */
 function isWhereWeHeldIt(el: HTMLElement): boolean {
   return _heldEl === el && Math.abs(el.scrollTop - _heldTop) <= 1;
-}
-
-/** Did WE put the reader on the live edge, and are they still there? The app's
- *  own knowledge of where it left them, for the moment before anything has
- *  measured one.
- *
- *  Both terms, and the second is what keeps it from outliving its truth. Growth
- *  moves the edge and never `scrollTop`, so a stamp taken at the edge still
- *  describes a reader who was on it. Anything else that moves the container
- *  fails `isWhereWeHeldIt`, and a correction that moves it deliberately re-takes
- *  the stamp (`carryHeldScroll`). */
-function heldOnTheLiveEdge(el: HTMLElement): boolean {
-  return _heldAtLiveEdge && isWhereWeHeldIt(el);
-}
-
-/** RETIRE the edge claim the moment the container leaves the stamp that made
- *  it. Called by `onScroll`, which is where the module watches it move.
- *
- *  Position equality alone cannot carry the claim, because a number the reader
- *  came BACK to reads exactly like one they never left. An armed reader
- *  browsing an idle thread keeps both their ride and their stamp. The offset
- *  they parked on stays matchable while the transcript grows past it. Wandering
- *  back onto it would then claim an edge a screenful below them.
- *
- *  Only the claim. `_heldEl` and `_heldTop` outlive it, because a scroll that
- *  is not the reader taking over must still read as ours
- *  (`followSurvivesScroll`).
- *  Anything that puts the reader back on the edge re-stamps through
- *  `holdPosition`, so nothing has to be restored by hand. */
-function forgetHeldLiveEdge(el: HTMLElement): void {
-  if (_heldEl === el && !isWhereWeHeldIt(el)) _heldAtLiveEdge = false;
 }
 
 /* ── Was this scroll the reader's own GESTURE? ───────────────────────────────
@@ -1309,15 +1106,13 @@ function forgetHeldLiveEdge(el: HTMLElement): void {
  *    WebKit adjusts the offset ASYNCHRONOUSLY through the animation, well after
  *    any write of ours to stamp it against.
  *  - An app backgrounded and resumed. The PWA restores an offset nobody wrote.
- *  - Anything else the platform scrolls on its own, such as a focus ring
- *    brought into view or a restored session.
+ *  - Anything else the platform scrolls on its own, such as a restored session.
  *
  *  So the question is asked of the INPUT instead: a scroll may retire the follow
- *  only while a reader gesture is in flight. The gesture term is ADDED to the
- *  position one, so both must hold. A NAVIGATION is not a gesture and says so
- *  itself, which is what the up chevron, turn stepping and the deep link do.
+ *  only while a reader gesture is in flight, or when the app placed the reader
+ *  for them (`isPlacementScroll`). Either term is ADDED to the position one.
  *  Answering the question is not ACTING on it: `keepTheLiveEdge` is the other
- *  half, and undoes a scroll that was nobody's gesture. */
+ *  half, and undoes a scroll that was nobody's. */
 
 /** How long after the reader lifts off their scroll events still count as
  *  theirs. `utils/scrollActivity.ts` already defines `USER_SCROLL_WINDOW_MS` as
@@ -1522,9 +1317,9 @@ function attachReaderGestures(el: HTMLElement): () => void {
     // scrolls the nearest scrollable ancestor for any key the focused control
     // does not consume. That is the reader scrolling by keyboard, and it is the
     // ordinary case: the choice-card seeding parks focus on a button inside the
-    // transcript. So it is marked as a REVEAL rather than stamped as a gesture,
-    // which is the narrow half of the two. The correction stands down, and the
-    // disarm's four terms are left as they were.
+    // transcript. So it is marked as a REVEAL rather than stamped as a gesture.
+    // The correction stands down for it, and a reveal off the edge retires the
+    // ride like any other placement.
     //
     // Marked generously, for any unconsumed scroll key wherever it lands. A key
     // the control DOES consume moves nothing and fires no scroll event.
@@ -1536,10 +1331,9 @@ function attachReaderGestures(el: HTMLElement): () => void {
    *  focused control, as it does for Tab, Shift+Tab, a screen reader moving the
    *  cursor, and any `focus()` without `preventScroll`.
    *
-   *  It is a NAVIGATION rather than a gesture, which is why it is stamped here
-   *  rather than through `stampGesture`. A gesture retires the ride. Tabbing to
-   *  a control is the reader going somewhere specific, so they keep the lit
-   *  toggle AND the place the browser took them to.
+   *  It is a PLACEMENT rather than a gesture: the reader going somewhere
+   *  specific. Where it takes them off the live edge it retires the ride, and
+   *  they keep the place the browser took them to.
    *
    *  Without it the platform-scroll correction writes the reader back to the
    *  live edge, leaving the control they just tabbed to off screen. Tab then
@@ -1772,7 +1566,7 @@ function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false): voi
     if (freeze) freezeLandingGlide(el);
     return;
   }
-  if (prefersReducedMotion()) {
+  if (isReducedMotion()) {
     snapToLiveEdge(el);
     return;
   }
@@ -1830,10 +1624,13 @@ function freezeLandingGlide(el: HTMLElement): void {
  *  earlier still reads as at-the-edge. It survives, and carries the reader to
  *  the top with the link's marker left on a turn at the bottom.
  *
- *  THREE callers, and each has armed the follow on the line above. They are the
- *  toggle's own press, a deep link whose landing IS the live edge, and the
- *  resume over such a landing. Arming stays the caller's act, so this never
- *  turns a navigation into a ride. */
+ *  FOUR callers, and each has armed or unparked the follow on the line above:
+ *  - the toggle's own press,
+ *  - a deep link whose landing IS the live edge,
+ *  - the resume over such a landing,
+ *  - a parked follow waking.
+ *
+ *  Arming stays the caller's act, so this never turns a navigation into a ride. */
 function rideToLiveEdge(el: HTMLElement): void {
   if (!isAtLiveEdge(el)) { glideToLiveEdge(el, 'ride'); return; }
   cancelScrollAnim();
@@ -1861,23 +1658,12 @@ function rideToLiveEdge(el: HTMLElement): void {
  *  which makes the composer's two calls for one send one submit. See the guard
  *  itself for why the rule stops there. */
 function followSubmit(resolveTurn: TurnResolver, holds = true): void {
-  // A submit CLAIMS the thread is live, whatever the last turn's status says
-  // yet. That is what a submit IS: an act the agent is expected to respond to.
-  // The status cannot say so for a while, and the gap is not small. Answering a
-  // card leaves the turn on `awaiting-answer`, which is not an ACTIVE status,
-  // until the engine's resumed status arrives over SSE. A reader who scrolls
-  // away inside that window means "stop dragging me" as much as one who scrolls
-  // away mid-reply. A CLAIM rather than a fact, so it expires on its own when
-  // the response never comes: see `_submitLiveUntil`. `ChatExchange` supersedes
-  // it the instant the real status is known.
-  // Gated on HOLDS, because the claim's premise is that the agent will respond.
-  // A cancel denies that premise: it asks the agent to finish. Claimed anyway,
-  // an ARMED reader who pressed Stop would be carried by every growth round.
-  // That runs for the claim's whole length, on a thread they had just quieted.
-  if (holds) _submitLiveUntil = nowMs() + SUBMIT_LIVE_CLAIM_MS;
   const el = resolveTarget();
   if (!el) return;
-  if (_followingBottom.value) {
+  if (_follow.value !== 'off') {
+    // A parked reader who submits rides again: the reply is what they parked
+    // to wait for.
+    unparkTheRide(el);
     // A rider already ON the live edge needs no write, and gets no redundant
     // tween, which on iOS would cancel a momentum scroll. The armed follow
     // carries them through the turn rendering underneath. The LANDING cannot
@@ -2134,11 +1920,40 @@ function honourLanding(el: HTMLElement): void {
   if (ending) _pendingLanding = null;
 }
 
+/** THE FOLLOW'S PROMISE: one write and one rule, reaching the reader through
+ *  THREE events. GROWTH is one (`honourGrowth`). The other two move the reader
+ *  without the transcript growing: the transcript's own BOX changing, and the
+ *  PLATFORM scrolling the container with no reader behind it. Each caller adds
+ *  its own event terms and reads the return.
+ *
+ *  ONE TERM of its own, RIDING. A riding reader is on the live edge by
+ *  construction (see the block at `_follow`), so this writes the edge wherever
+ *  the event left it. A parked reader chose their place and is left on it. No
+ *  liveness term: the platform and the app's own layout move a rider whether
+ *  or not the agent is running.
+ *
+ *  It stands down for a TWEEN, already going somewhere the reader asked for
+ *  more recently, and for a deep-link CLAIM that has not landed. Under a
+ *  claim, `restoreAfterReflow` is the right answer instead. It cannot loop,
+ *  because `markHeldScroll` stamps the position read back AFTER the write, so
+ *  a browser clamp is recorded as ours.
+ *
+ *  AND FOR AN ANCHOR WRITE, which is the app deciding a beat ago that this
+ *  reader stays on their own content across a mutation. Where that left them
+ *  off the edge, `honourAnchoredMutation` has retired the ride already. */
+function keepTheLiveEdge(el: HTMLElement): boolean {
+  if (_follow.value !== 'riding') return false;
+  if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
+  if (isAnchorScroll(el)) return false;
+  markHeldScroll(el, liveEdgeTop(el));
+  return true;
+}
+
 /** What one growth round owes the reader, which is at most ONE of two things. A
- *  submit's landing is in hand, so give it its round. Or the follow is CARRYING
- *  them to the live edge, so write it. Never both,
- *  because a submit arms nothing and arming drops a pending landing
- *  (`armFollowOn`). Nothing at all for a reader who asked for neither.
+ *  submit's landing is in hand, so give it its round. Or the follow is armed,
+ *  so keep them on the live edge. Never both, because a submit arms nothing and
+ *  arming drops a pending landing (`armFollowOn`). Nothing at all for a reader
+ *  who asked for neither.
  *
  *  Stands down while a tween owns the scroll. A tween re-reads its own target
  *  every frame, so a write beside it would fight the easing rather than help it.
@@ -2157,30 +1972,15 @@ function honourLanding(el: HTMLElement): void {
  *  Narrow by construction rather than by care: a pending landing and an armed
  *  follow are mutually exclusive (`armFollowOn`), so no RIDE glide can ever be
  *  in flight on the branch below. Every other tween still stands the round down,
- *  a deep link's and a chevron's included.
- *
- *  TWO ARMS, and which one answers depends only on where the reader is. A reader
- *  who has SCROLLED AWAY is carried only while a live source is producing rows
- *  (`followIsCarrying`). A reader ON the live edge is kept there either way, and
- *  that arm is not this function's to state: growth is the third event reaching
- *  `keepTheLiveEdge`, beside a box change and a platform scroll, so the caller
- *  hands it in.
- *
- *  `keepEdge` is omitted by a caller with no pre-round reading of where the
- *  reader was, which is `honourWake`. A wake has just declared the thread live,
- *  so the arm above answers for a rider too. */
-function honourGrowth(el: HTMLElement, keepEdge?: () => boolean): void {
+ *  a deep link's and a chevron's included. */
+function honourGrowth(el: HTMLElement): void {
   if (_pendingLanding) {
     if (_scrollAnimRaf !== null && !landingGlideInFlight()) return;
     honourLanding(el);
     return;
   }
-  if (_scrollAnimRaf !== null) return;
-  if (followIsCarrying()) {
-    markHeldScroll(el, liveEdgeTop(el));
-    return;
-  }
-  keepEdge?.();
+  if (wakeParkedRide(el)) return;
+  keepTheLiveEdge(el);
 }
 
 /** The frame a carrying ride has pending, or null. One at a time: a second
@@ -2210,10 +2010,8 @@ function cancelRideSettle(): void {
  *  (ADR 0222, docs/adr/).
  *
  *  It hangs off `markHeldScroll` rather than off the growth round alone,
- *  because two of the five write sites have nothing after them. A turn
- *  control's press takes `honourAnchoredMutation`, whose own re-assert stands
- *  down for a carried reader by design (`withScrollAnchor`). A ride's glide
- *  ends on its last frame.
+ *  because some write sites have nothing after them. A ride's glide ends on its
+ *  last frame, and a resume writes once.
  *
  *  Not a poll and not a loop. The check's own write cancels the frame it would
  *  otherwise schedule. The guard covers the DOM-free unit environment this
@@ -2235,12 +2033,12 @@ function rideSettlesOnTheEdge(): void {
  *
  *  It asks the four owners too. Each is going somewhere on purpose and none of
  *  them is the ride: a tween, a submit's landing, a deep-link claim, and the
- *  ride no longer carrying anybody. */
+ *  ride no longer armed. */
 function settleTheRide(): void {
   _rideSettleRaf = null;
   const el = resolveTarget();
   if (!el || isAtLiveEdge(el)) return;
-  if (!followIsCarrying()) return;
+  if (_follow.value !== 'riding') return;
   if (_scrollAnimRaf !== null || _pendingLanding || hasPendingEventScroll()) return;
   if (!isWhereWeHeldIt(el)) return;
   const edge = liveEdgeTop(el);
@@ -2359,7 +2157,7 @@ function landingTargetOf(el: HTMLElement): (c: HTMLElement) => number {
  *  jumps instantly. */
 function smoothScrollToElement(el: HTMLElement): void {
   const targetOf = landingTargetOf(el);
-  if (prefersReducedMotion()) {
+  if (isReducedMotion()) {
     cancelScrollAnim();
     const c = resolveTarget();
     if (c) markNavigationScroll(c, Math.max(0, targetOf(c)));
@@ -2386,20 +2184,15 @@ export function scrollToTop() {
   const el = resolveTarget();
   if (!el) return;
 
-  // Going to the top ends the ride, and the press has to say so ITSELF. A
-  // scroll only speaks for the reader when a gesture is behind it. A chevron
-  // tap lands on the button rather than on the transcript. See "Was this
-  // scroll the reader's own GESTURE?".
-  //
-  // Only while a live source is producing rows, matching the scroll disarm.
-  // Going back to re-read a quiet thread is browsing, and the lit toggle says
-  // on screen that the ride survived.
+  // Going to the top ends the ride, on any thread, and the press says so
+  // ITSELF rather than leaving it to the glide's scroll events. A lit toggle
+  // over a reader on their way to the top would be following nothing.
   //
   // After the target resolves, so a press with no transcript to move retires
   // nothing.
-  if (threadIsLive()) stopFollowingBottom();
+  stopFollowingBottom();
 
-  if (prefersReducedMotion()) {
+  if (isReducedMotion()) {
     cancelScrollAnim();
     markNavigationScroll(el, 0);
     _scrollAnimRaf = requestAnimationFrame(() => {
@@ -2425,7 +2218,7 @@ export function scrollToTop() {
 export function scrollToBottomAnimated() {
   clearPendingEventScroll();
   const el = resolveTarget();
-  if (!el || prefersReducedMotion()) { scrollToBottom(); return; }
+  if (!el || isReducedMotion()) { scrollToBottom(); return; }
   // `liveEdgeTop` (the MAX scroll position), not `scrollHeight`, so the ease
   // lands exactly at the bottom instead of clamping flat for the last screenful.
   animateScroll(
@@ -2540,8 +2333,9 @@ export function hasPendingEventScroll(): boolean {
 }
 
 /** Subscribers notified when a deep link TAKES the claim, and never when it
- *  releases one. Same shape and same asymmetry as `onFollowArmed`: the claim is
- *  the request, and a release is not a second request anyone needs to hear.
+ *  releases one. Same shape and same asymmetry as `onFollowRideStarted`: the
+ *  claim is the request, and a release is not a second request anyone needs to
+ *  hear.
  *
  *  One consumer: `attachScrollMemory`, which retires a saved-position restore
  *  already armed when the claim arrived. Asking `hasPendingEventScroll` once at
@@ -2911,7 +2705,9 @@ function scrollToSelectorAndPulse(
       // actually ends up.
       toTop: container ? clampToScrollRange(container, landingTop) : 0,
     });
-    if (container && landsOnTheEdge && _followingBottom.value) {
+    if (container && landsOnTheEdge && _follow.value !== 'off') {
+      // A parked reader rides again: the link took them to the edge.
+      unparkTheRide(container);
       // The link and the ride ask for the same place, so there is nothing to
       // retire. The reader tapped a notification pointing at the newest turn,
       // and the ride was already holding them there.
@@ -2919,7 +2715,7 @@ function scrollToSelectorAndPulse(
       // Served by the RIDE's own motion rather than by the element tween. Both
       // rest in the same place, the browser clamping the element's target back
       // to the edge. Only this one marks its frames as HELD, which is what keeps
-      // `followPosition` answering `live-edge` rather than a place.
+      // `followSurvivesScroll` recording the live edge rather than a place.
       // It also re-reads a growing bottom per frame, where the element's own top
       // stops being the edge the moment the reply resumes.
       rideToLiveEdge(container);
@@ -2935,11 +2731,9 @@ function scrollToSelectorAndPulse(
       // scroll and the pulse are all ungated. Gating this way would leave a
       // reader who was just moved still following.
       //
-      // Not gated on LIVE either, unlike the scroll disarm, the up chevron and
-      // turn stepping. Those three are browsing when the thread is quiet, so
-      // keeping the ride costs the reader nothing. A LINK names one event, and
-      // that ask is durable rather than a moment's position, so it must survive
-      // the thread waking. See ADR 0064 for the gate this replaced.
+      // Not gated on LIVE either, unlike the scroll disarm. A LINK names one
+      // event, and that ask is durable rather than a moment's position. A parked
+      // ride would carry the reader off it the moment the thread woke.
       stopFollowingBottom();
       smoothScrollToElement(target);
     }
@@ -3073,6 +2867,14 @@ function scrollToSelectorAndPulse(
       // not in this thread. One with no box says it is, and something is
       // covering or collapsing it.
       reportOutcome('unresolved', document.querySelectorAll<HTMLElement>(selector));
+      // A follow armed IN PLACE for this link stood off the edge only while the
+      // link owned the position. Moving nobody, it ends there, so no lit toggle
+      // outlives the link. `useScrollMemory`'s rescue re-arms it where it can.
+      // A PARKED follow the link's claim held back from waking wakes now, if
+      // the thread went live meanwhile.
+      const c = resolveTarget();
+      if (c && _follow.value === 'riding' && !isAtLiveEdge(c)) stopFollowingBottom();
+      else if (c) wakeParkedRide(c);
       opts?.onUnresolved?.();
     }, EVENT_RESOLVE_DEADLINE_MS);
   };
@@ -3319,16 +3121,13 @@ export function stepThreadTurn(direction: 1 | -1): void {
   // threshold is `isLiveEdgeTop`, the same one a deep link's landing asks.
   awayFromBottom.value = !isLiveEdgeTop(el, targetOf(el));
 
-  // A deliberate jump AWAY from the live edge ends the ride, and it has to say
-  // so itself. A scroll only speaks for the reader when a gesture is behind it,
-  // and a keyboard chord is not one. See "Was this scroll the reader's own
-  // GESTURE?".
+  // A deliberate jump AWAY from the live edge ends the ride, on any thread. It
+  // says so itself rather than leaving it to the glide's scroll events.
   //
   // It reuses the line above rather than asking again, so the chevron's state
   // and the ride's cannot disagree. A step onto the LAST turn lands at the
-  // clamped live edge, which is where the ride was taking them anyway. And only
-  // while a live source is producing rows, matching the scroll disarm.
-  if (awayFromBottom.value && threadIsLive()) stopFollowingBottom();
+  // clamped live edge, which is where the ride was taking them anyway.
+  if (awayFromBottom.value) stopFollowingBottom();
 
   // Mark the landed turn with the navigation focus marker. Any prior marker was
   // already cleared by `clearPendingEventScroll` above, so this is a clean
@@ -3337,7 +3136,7 @@ export function stepThreadTurn(direction: 1 | -1): void {
   // scroll should.
   applyNavFocus(turn);
 
-  if (prefersReducedMotion()) {
+  if (isReducedMotion()) {
     cancelScrollAnim();
     markNavigationScroll(el, Math.max(0, targetOf(el)));
     return;
@@ -3468,39 +3267,36 @@ export function makeScrollObservers(el: HTMLElement) {
    *  `scrollTop`. A correction derived from a delta would read that clamp as the
    *  reader having scrolled.
    *
-   *  A reader measured ON THE LIVE EDGE is anchored to the edge instead of to a
-   *  child, and `anchorAtLiveEdge` is that half of the snapshot. */
+   *  An ARMED reader is anchored to the live edge instead of to a child. See
+   *  `keepTheLiveEdge`, which runs in front of this correction. */
   let lastWidth = el.clientWidth;
   let lastHeight = el.clientHeight;
   let anchorChild: HTMLElement | null = null;
   let anchorRelTop = 0;
-  /** Was the reader at the live edge when the anchor was last taken? Starts
-   *  false rather than measured: a container with no box answers `isAtLiveEdge`
-   *  true (0 + 0 >= 0 - 2), and the first round must not act on that. */
-  let anchorAtLiveEdge = false;
 
   function viewportTop() {
     return el.getBoundingClientRect().top;
   }
 
-  /** Snapshot where the reader is parked, in the two forms the correction can
-   *  use. Whether they are ON THE LIVE EDGE, and which child they are parked on:
-   *  the last one whose top is at or above the viewport top, with the offset it
-   *  sat at. Scanned from the END, since the reader is normally near the newest
-   *  turn, so the loop usually stops on its first step. Children with no box are
-   *  skipped, because on desktop the mobile title row reports an all-zero rect
-   *  that would otherwise read as "far above".
+  /** Snapshot which child the reader is parked on: the last one whose top is at
+   *  or above the viewport top, with the offset it sat at. Scanned from the END,
+   *  since the reader is normally near the newest turn, so the loop usually
+   *  stops on its first step. Children with no box are skipped, because on
+   *  desktop the mobile title row reports an all-zero rect that would otherwise
+   *  read as "far above".
    *
-   *  Both are taken together and read together. The ResizeObserver only sees the
-   *  geometry AFTER the change, and both questions are about before it.
+   *  The ResizeObserver only sees the geometry AFTER the change, and the
+   *  question is about before it.
    *
    *  Cheap on the scroll path despite the rect reads. Both callers run
    *  `isElementVisible(el)` first, which already forces any pending layout
    *  flush, so these reads hit a clean tree rather than triggering one. */
   function recordAnchor() {
-    anchorAtLiveEdge = isAtLiveEdge(el);
     anchorChild = null;
-    const kids = el.children;
+    // The turns sit inside `.thread-feed`, exactly as `scrollAnchor.ts` reads
+    // them. Anchored on the feed box, a re-wrap above the reader shifts nothing.
+    const feed = typeof el.querySelector === 'function' ? el.querySelector('.thread-feed') : null;
+    const kids = (feed ?? el).children;
     if (!kids || typeof el.getBoundingClientRect !== 'function') return;
     const top = viewportTop();
     for (let i = kids.length - 1; i >= 0; i--) {
@@ -3546,81 +3342,21 @@ export function makeScrollObservers(el: HTMLElement) {
     carryHeldScroll(el);
   }
 
-  /** THE FOLLOW'S PROMISE: one write and one rule, reaching the reader through
-   *  THREE events. Two of them move the reader without the transcript growing.
-   *  Those are the transcript's own BOX changing, and the PLATFORM scrolling the
-   *  container with no gesture behind it. GROWTH is the third, and arrives here
-   *  as `honourGrowth`'s `keepEdge`. Each caller adds its own event terms and
-   *  reads the return.
-   *
-   *  TWO terms here. ARMED, because a position is not a request. And AT THE LIVE
-   *  EDGE before the event, which has THREE sources and needs any one.
-   *
-   *  A ride that is CARRYING is the first, and it needs no position at all. It
-   *  owns where the reader is, parked in history or resting on the end alike,
-   *  which is how `honourGrowth`'s own carrying arm already reads it. The other
-   *  two describe where the reader WAS, and one round that declined a
-   *  correction clears both together: the disarm's `forgetHeldLiveEdge` takes
-   *  the claim and `recordAnchor` re-takes the measurement off the edge. The
-   *  ride could then never write again, which is the reported strand (ADR 0222,
-   *  docs/adr/). It answers for nobody else: an armed reader on a QUIET thread
-   *  keeps both readings, since nothing is arriving for them to be carried
-   *  toward.
-   *
-   *  `anchorAtLiveEdge` is the MEASUREMENT, taken by `recordAnchor` at the end
-   *  of every round. `heldOnTheLiveEdge` is the app's own PLACEMENT, and it is
-   *  the only one that can answer for the first round after an open. A resume
-   *  writes the live edge before any round has run. On a thread that finished
-   *  while the reader was away there is no liveness to carry them either. So the
-   *  measurement alone left them where the write fell, with the toggle lit,
-   *  watching the transcript grow past them.
-   *
-   *  No LIVENESS term. The platform and the app's own layout move the reader
-   *  whether or not the agent is running. Liveness belongs to GROWTH, where it
-   *  means there is nothing to be carried toward.
-   *
-   *  It stands down for a TWEEN, already going somewhere the reader asked for
-   *  more recently, and for a deep-link CLAIM that has not landed. Under a
-   *  claim, `restoreAfterReflow` is the right answer instead. It cannot loop,
-   *  because `markHeldScroll` stamps the position read back AFTER the write, so
-   *  a browser clamp is recorded as ours.
-   *
-   *  AND FOR AN ANCHOR WRITE, which is the app deciding a beat ago that this
-   *  reader stays on their own content across a mutation. Both readings above
-   *  describe where they were BEFORE it, so acting on either undoes the
-   *  correction. That is the reported bug. Unfolding a turn from the bottom
-   *  wrote nothing here, so this round hauled the reader to the new end. The
-   *  pressed icon went with them.
-   *
-   *  It belongs INSIDE this predicate, unlike the placement term `onScroll`
-   *  adds. That one also covers a HELD write. The growth branch takes one every
-   *  round, so asking it here would stand the branch down for its own writes.
-   *  An anchor write is a kind of its own, and this branch never makes one. The
-   *  narrow question is safe where the wide one is not. */
-  function keepTheLiveEdge(): boolean {
-    if (!_followingBottom.value) return false;
-    if (!followIsCarrying() && !anchorAtLiveEdge && !heldOnTheLiveEdge(el)) return false;
-    if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
-    if (isAnchorScroll(el)) return false;
-    markHeldScroll(el, liveEdgeTop(el));
-    return true;
-  }
-
   // Scroll events. Whoever moved the container, the answer is the same:
   // reconcile the three position signals against where it now sits, and re-take
-  // the reflow anchor. Nothing infers intent from a scroll.
+  // the reflow anchor.
   //
-  // Two questions ARE asked of it, and this is the only place a scroll retires a
-  // follow or cancels a landing. Has the reader taken the container away from
-  // where our last held write put it, and was a reader GESTURE behind it. Those
-  // two have THREE answers between them, and the third is `keepTheLiveEdge`: a
-  // scroll that moved an armed reader off the edge with no gesture is neither
-  // theirs to keep nor ours to ignore.
+  // This is the only place a scroll retires a follow or cancels a landing. A
+  // RIDING reader moved off the edge gets one of two answers. If the reader
+  // moved themselves, by a gesture or a placement made for them, they leave the
+  // ride (`scrollLeavesTheRide`): off while live, parked while waiting. That
+  // split is `leaveTheRideByScroll`, and it is the user's instruction.
+  // Otherwise it was the platform, and `keepTheLiveEdge` writes them back. A
+  // PARKED reader who scrolls back onto the edge rides again.
   //
-  // The FOLLOW takes FOUR terms, and ADR 0064 has the reasoning. Off the live
-  // edge alone is not enough: a shrink clamps the reader down, and the anchor
-  // correction moves them while holding them on the same content. Moved alone is
-  // not enough either, because a tween mid-glide is our own.
+  // Moved alone is not the test, because a held write is our own: it lands on
+  // the stamp, so `tookOver` is false for it. Off the edge alone is not it
+  // either, because a shrink clamps the reader down while they stay on it.
   //
   // The LANDING takes only the moved term, deliberately. A reader who flicks
   // down to the live edge mid-glide has gone where the landing is not taking
@@ -3628,42 +3364,22 @@ export function makeScrollObservers(el: HTMLElement) {
   // got going yet says nothing about whether the reader wants it.
   function onScroll() {
     if (!isElementVisible(el)) return;
-    // All three are questions about the scroll being HANDLED, so all three are
-    // read before anything below can write over the answer. The gesture once,
-    // not once per arm. The two arms are opposite answers to ONE question, and a
-    // second call could land the other side of the window's edge.
+    // All four are questions about the scroll being HANDLED, so all four are
+    // read before anything below can write over the answer, and each once. The
+    // gesture and placement windows are wall-clock, and a second read could
+    // land the other side of an edge.
     const atEdge = isAtLiveEdge(el);
     const tookOver = !isWhereWeHeldIt(el);
     const gesture = readerGestureActive(el);
-    // The container has moved off our stamp, so the stamp stops speaking for
-    // where the reader is. Ahead of every branch below, and of the reads it
-    // cannot change: they took their answers on the line above, and each branch
-    // that puts the reader back on the edge re-stamps as it writes.
-    forgetHeldLiveEdge(el);
+    const placement = isPlacementScroll(el);
     forgetNavigationStamp(el);
-    if (_followingBottom.value) {
-      if (scrollRetiresTheRide(atEdge, tookOver, gesture)) stopFollowingBottom();
-      // NOT A GESTURE IS NOT THE SAME AS THE PLATFORM, which is the fourth term.
-      // The app's own NAVIGATIONS are the third thing that moves the container:
-      // the up chevron, turn stepping, and `useScrollMemory` positioning a
-      // thread on open. Each writes through `markNavigationScroll` rather than
-      // `markHeldScroll`, so none is where we held the reader, and a chord is
-      // deliberately not a gesture either. On an IDLE thread those three KEEP
-      // the ride. Without this term the correction writes the reader back to the
-      // bottom on the navigation's own trailing scroll event.
-      //
-      // `isPlacementScroll` is the module's answer to exactly this question,
-      // window and all. It is asked HERE rather than inside `keepTheLiveEdge`,
-      // because only a scroll event can be attributed to a write. The box-change
-      // caller has none, and re-marks itself every growth round, so asking there
-      // would stand the branch down for our own writes.
-      //
-      // A PLACEMENT and not any navigation, which is the narrower of the two.
-      // The ride's own held writes mark a navigation too, for the mobile
-      // header's sake. So the wide predicate is true for most of a settling
-      // transcript. Read through it, one unattributed scroll clears both
-      // readings `keepTheLiveEdge` has and the ride can never write again.
-      else if (!atEdge && tookOver && !gesture && !isPlacementScroll(el)) keepTheLiveEdge();
+    if (_follow.value === 'riding') {
+      if (scrollLeavesTheRide(atEdge, tookOver, gesture, placement)) leaveTheRideByScroll();
+      else if (!atEdge && tookOver) keepTheLiveEdge(el);
+    } else if (_follow.value === 'parked') {
+      // Back on the edge by their OWN scroll: ride again from here. A clamp
+      // after a shrink puts them there too, and that is not them asking.
+      if (atEdge && (gesture || placement)) unparkTheRide(el);
     } else if (tookOver && landingInFlight()) {
       cancelLanding();
     }
@@ -3676,26 +3392,18 @@ export function makeScrollObservers(el: HTMLElement) {
     // The reader has moved, so the reflow anchor has to follow them.
     recordAnchor();
   }
-  // Resize events. A resize moves the reader for exactly three reasons, and all
-  // three are things they asked for:
+  // Resize events. A resize moves the reader for exactly two reasons, and both
+  // are things they asked for:
   //
-  //  - they ASKED to ride the live edge and are still ON it, so the app must not
-  //    slide the edge out from under them. `keepTheLiveEdge`, whether the BOX
-  //    changed or the CONTENT grew;
-  //  - they asked to ride, have not taken it back, and there is something live
-  //    to ride, from wherever they now are (`followIsCarrying`);
+  //  - they ASKED to ride the live edge, so the app must not slide the edge out
+  //    from under them. `keepTheLiveEdge`, whether the BOX changed or the
+  //    CONTENT grew;
   //  - they just SUBMITTED and the turn their landing waits for has rendered.
   //
   // For everyone else it moves nobody, whatever grew and however far off the
   // bottom it leaves them. A streaming reply, a decoded image, an expanded step
   // and a growing composer all leave the transcript where it is. The handler's
   // remaining job is to reconcile the signals against the new geometry.
-  //
-  // "Everyone else" includes an ARMED reader who has SCROLLED AWAY on an idle
-  // thread, for CONTENT GROWTH. The line is drawn at the reader's POSITION, not
-  // at the kind of resize. See `followIsCarrying`, and ADR 0064 for the pin this
-  // replaced. The branch below infers nothing: it reads what the reader's own
-  // chevron tap or submit recorded.
   function onResize() {
     if (!isElementVisible(el)) return;
     // The transcript's OWN BOX changing is a different event from its content
@@ -3714,9 +3422,9 @@ export function makeScrollObservers(el: HTMLElement) {
     // Both corrections run before anything below reads the new geometry, and
     // they are ALTERNATIVES rather than a sequence.
     //
-    // A reader who ASKED to be kept at the bottom and WAS there keeps the live
-    // edge across the change. For them the edge REPLACES the child anchor rather
-    // than following it. The two say the same thing before the change and
+    // A reader who ASKED to be kept at the bottom keeps the live edge across
+    // the change. For them the edge REPLACES the child anchor rather than
+    // following it. The two say the same thing before the change and
     // different things after it. Correcting first would be one write to the
     // wrong place and a second to the right one.
     //
@@ -3728,18 +3436,14 @@ export function makeScrollObservers(el: HTMLElement) {
     //
     // This caller's own term is the BOX. Content growth changes no dimension, so
     // a streaming reply reaches the edge write through the growth branch.
-    if (!(boxChanged && keepTheLiveEdge()) && reflowed) {
+    if (!(boxChanged && keepTheLiveEdge(el)) && reflowed) {
       restoreAfterReflow();
     }
     // The growth branch. It runs after whichever correction above ran, so it
     // writes from the corrected position. It runs before the signals reconcile
-    // below, so the chevron describes where it left the reader.
-    //
-    // It is handed `keepTheLiveEdge` for its on-the-edge arm, so growth is that
-    // rule's third caller rather than a second copy of it. Growth adds no term
-    // of its own: the event IS the term. Where the branch above already wrote
-    // the live edge, this repeats that exact target.
-    honourGrowth(el, keepTheLiveEdge);
+    // below, so the chevron describes where it left the reader. Where the branch
+    // above already wrote the live edge, this repeats that exact target.
+    honourGrowth(el);
     syncNotAtTop();
     syncScrolledFromTop();
     // One unconditional reconcile, both directions. Growth below the fold raises

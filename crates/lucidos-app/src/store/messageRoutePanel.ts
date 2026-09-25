@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import type { Exchange } from './thread-events';
+import type { Exchange, StoredEvent } from './thread-events';
 
 // --- Message route panel (anchored popover for the route badge) ---
 type MessageRoutePanelSection = 'origin' | 'executor';
@@ -12,6 +12,8 @@ export interface MessageRoutePanelState {
    *  before the current exchange's ResponseGenerated event arrives. */
   priorModel?: string;
   priorEffort?: string;
+  /** The restart pause folded into this resume (`restartPauseFoldsInto`). */
+  pausedBy?: StoredEvent;
 }
 export const messageRoutePanel = signal<MessageRoutePanelState | null>(null);
 /** Click semantics for the route badge: opens the panel for the given exchange +

@@ -22,8 +22,8 @@
  * 2. The COPIES. CSS cannot hand a rule's own declaration back, so the gap
  *    inside the reserve is a copy of the row's own `gap`, and the two span
  *    tokens are shared with the thread pane's clamp. Same shape as the drift
- *    checks in header-band-centering.test.ts, which holds --threads-title-lead
- *    to the threads row's padding and --header-icon-box to the button.
+ *    checks in header-band-centering.test.ts, which holds the threads title's
+ *    clamp to the row's padding and --header-icon-box to the button.
  *
  * The vertical half is NOT here: the row's bar centring, and its packaged-macOS
  * `left` floor, belong to header-band-centering.test.ts and are untouched by
@@ -77,8 +77,8 @@ describe('the content title is centred on the row, not between the icons', () =>
 
   it('leaves the hamburger and the actions pinned to the row\'s two ends', () => {
     // The title's `flex: 1` used to push the actions to the trailing edge. With
-    // it out of flow the row has two in-flow children left, and this is what
-    // holds them apart, exactly as `.threads-header` holds its own pair.
+    // it out of flow the row has two in-flow children left, one at each end,
+    // and this is what holds them apart.
     expect(desktopRule(ROW).props.get('justify-content')).toBe('space-between');
     const ends = desktopRule(
       '.app-header .content-header-elements > .hamburger-panel, .app-header .content-header-actions',

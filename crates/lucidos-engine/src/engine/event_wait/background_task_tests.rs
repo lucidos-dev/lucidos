@@ -30,6 +30,8 @@ fn owner() -> Uuid {
 fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
     RunningTaskHandle {
         task_id: task_id.to_string(),
+        description: None,
+        command: "cargo build".to_string(),
         watchdog_deadline: deadline,
     }
 }
@@ -157,6 +159,79 @@ fn the_ordinary_ceiling_still_applies() {
         timeout_for(&refs, now),
         super::super::register::MAX_TIMEOUT_SECS
     );
+}
+
+// ── the reason the user reads ────────────────────────────────────────
+
+fn named(description: Option<&str>, command: &str) -> RunningTaskHandle {
+    RunningTaskHandle {
+        description: description.map(String::from),
+        command: command.to_string(),
+        ..task("t")
+    }
+}
+
+/// The row reads `Waiting for <reason>`, so the agent's own name for
+/// the work is the whole answer to "what is it waiting for".
+#[test]
+fn one_described_task_is_named_in_the_agents_words() {
+    let t = named(Some("the five-project e2e sweep"), "./scripts/sweep.sh");
+    assert_eq!(armed_reason(&[&t]), "the five-project e2e sweep to finish");
+}
+
+/// No description still names the work, by its command. A generic sentence
+/// about "background work" is what this replaced.
+#[test]
+fn an_undescribed_task_is_named_by_its_command() {
+    let t = named(None, "cargo test --lib");
+    assert_eq!(
+        armed_reason(&[&t]),
+        "the background command \"cargo test --lib\" to finish"
+    );
+}
+
+/// The wait fires on the first completion, so the reason says so, and names
+/// every task up to the cap.
+#[test]
+fn several_tasks_are_all_named_and_the_first_to_finish_is_what_counts() {
+    let a = named(Some("the build"), "make");
+    let b = named(None, "npm test");
+    assert_eq!(
+        armed_reason(&[&a, &b]),
+        "the first of 2 background jobs to finish: the build; \
+         the background command \"npm test\""
+    );
+}
+
+/// Past the cap the rest are counted, not listed, so a thread with many tasks
+/// still gets one readable line.
+#[test]
+fn tasks_past_the_cap_are_counted() {
+    let tasks: Vec<RunningTaskHandle> = (0..5)
+        .map(|i| named(Some(&format!("job {i}")), "x"))
+        .collect();
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+    assert_eq!(
+        armed_reason(&refs),
+        "the first of 5 background jobs to finish: job 0; job 1; job 2; 2 more"
+    );
+}
+
+/// The transcript row is one line. A multi-line, oversized command must not
+/// break it or flood it.
+#[test]
+fn a_long_multi_line_command_becomes_one_bounded_line() {
+    let command = format!("set -e\ncd /tmp\n{}", "echo lots; ".repeat(50));
+    let t = named(None, &command);
+    let reason = armed_reason(&[&t]);
+
+    assert!(!reason.contains('\n'), "{reason}");
+    assert!(reason.contains("\"set -e cd /tmp echo lots;"), "{reason}");
+    assert!(
+        reason.contains('…'),
+        "a cut label says it was cut: {reason}"
+    );
+    assert!(one_short_line(&command).chars().count() <= LABEL_MAX_CHARS);
 }
 
 // ── the synthetic id ─────────────────────────────────────────────────

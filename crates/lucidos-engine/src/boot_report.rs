@@ -15,7 +15,46 @@
 //! direct-engine harness). It must never affect startup correctness or timing,
 //! so it never blocks the caller: the POST runs on a detached task.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Wall-clock time per named boot stage, logged as one line when the engine
+/// binds. A slow boot then names its slow stage instead of leaving a gap
+/// between unrelated log lines.
+pub struct BootStageTimer {
+    started: Instant,
+    last_lap: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl BootStageTimer {
+    pub fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_lap: now,
+            stages: Vec::new(),
+        }
+    }
+
+    /// Close the stage that ran since the previous lap, under `name`.
+    pub fn lap(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.stages.push((name, now - self.last_lap));
+        self.last_lap = now;
+    }
+
+    pub fn summary(&self) -> String {
+        format_stage_summary(self.started.elapsed(), &self.stages)
+    }
+}
+
+fn format_stage_summary(total: Duration, stages: &[(&'static str, Duration)]) -> String {
+    let stages: Vec<String> = stages
+        .iter()
+        .map(|(name, d)| format!("{name} {}ms", d.as_millis()))
+        .collect();
+    format!("{}ms total: {}", total.as_millis(), stages.join(", "))
+}
 
 /// Kebab-case phase wire values understood by the gateway
 /// (`BootPhase::from_wire`). Engine-reported phases only — the gateway sets the
@@ -72,4 +111,35 @@ pub fn report(phase: &str) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_summary_lists_every_stage_in_order_after_the_total() {
+        let summary = format_stage_summary(
+            Duration::from_millis(1500),
+            &[
+                ("startup lease", Duration::from_millis(3)),
+                ("worktree recovery", Duration::from_millis(1200)),
+            ],
+        );
+        assert_eq!(
+            summary,
+            "1500ms total: startup lease 3ms, worktree recovery 1200ms"
+        );
+    }
+
+    #[test]
+    fn a_lap_records_the_time_since_the_previous_lap() {
+        let mut timer = BootStageTimer::start();
+        timer.lap("first");
+        std::thread::sleep(Duration::from_millis(5));
+        timer.lap("second");
+        let names: Vec<&str> = timer.stages.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert!(timer.stages[1].1 >= Duration::from_millis(5));
+    }
 }

@@ -5,8 +5,8 @@ use crate::core::oauth_registry;
 use crate::core::AuthType;
 use crate::core::CredentialStore;
 
-/// Sentinel prefix on a tool result that the agentic loop strips off and
-/// re-emits as a `CredentialPromptRequested` SSE event for the frontend modal.
+/// Sentinel prefix on a tool result that the agentic loop strips off and emits
+/// as the *form request* `CredentialRequested`, which drives the credential form.
 pub(crate) const CREDENTIAL_REQUEST_PREFIX: &str = "[CREDENTIAL_REQUEST]";
 
 /// Wrap a pre-built credential-request JSON value in the sentinel prefix.
@@ -439,9 +439,9 @@ fn connect_result_message(
 
 impl LucidosEngine {
     /// `thread_id` + `device_id` are here for `connect_oauth_account`: the
-    /// authorization page is opened by the user's own client (see
-    /// [`Self::request_navigation`]), so the flow needs to know which thread to
-    /// emit on and which device is actually in front of the user.
+    /// authorization page is opened by the user's own client, through an
+    /// `OAuthAuthorizationRequested` form request. So the flow needs to know
+    /// which thread to emit on and which device is in front of the user.
     pub(crate) async fn execute_credential_tool(
         &self,
         name: &str,
@@ -579,7 +579,6 @@ impl LucidosEngine {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string)
                     };
-                    //
                     // Anything the agent did NOT pass falls back to the *OAuth
                     // provider registry* row, which is the same data it would
                     // have read out of the knowhow. Passing wins, so a derived
@@ -587,10 +586,8 @@ impl LucidosEngine {
                     // before; the fallback only rescues the case where the agent
                     // skipped the lookup, which used to drop the user into a
                     // blank endpoint form.
-                    let row = oauth_registry::find_provider(
-                        self.system_knowhow_dir(),
-                        &oauth::client_provider_name(&provider),
-                    );
+                    let row =
+                        oauth_registry::find_provider(self.system_knowhow_dir(), &cred_service);
                     let from_row = row
                         .as_ref()
                         .map(oauth::OAuthClientOverrides::from_registry)
@@ -618,29 +615,43 @@ impl LucidosEngine {
                 // browser panel again once the flow lands, instead of leaving
                 // the user on a dead callback page inside the app. See
                 // `oauthAuthFlow` in store/actions/oauth.ts.
-                let open_auth_url = async |auth_url: &str| {
-                    self.request_navigation(
-                        &serde_json::json!({
-                            "target": "url",
-                            "url": auth_url,
-                            "purpose": "oauth",
-                        }),
-                        thread_id,
-                        device_id,
-                    )
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("could not open the authorization page: {e}").into()
-                    })
+                // The page goes to the last used device, the screen the user is
+                // on now. That device comes back to the front when the flow lands.
+                //
+                // It is a persisted *form request*, not a transient navigation:
+                // a client that missed the frame still finds it on its next
+                // stream open, for as long as the flow is listening.
+                let actor = match self.last_used_device(thread_id, device_id).await {
+                    Some(id) => Some(super::navigate::device_actor(&self.pool, &id).await),
+                    None => None,
+                };
+                let open_auth_url = async |auth_url: &str, request_id: uuid::Uuid| {
+                    let payload = serde_json::json!({
+                        "target": "url",
+                        "url": auth_url,
+                        "purpose": "oauth",
+                    });
+                    self.event_bus
+                        .emit(crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::OAuthAuthorizationRequested {
+                                request_id,
+                                payload: payload.to_string(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::with_actor(actor.clone()),
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("could not open the authorization page: {e}").into()
+                        })
                 };
                 let outcome = oauth::run_oauth_flow(
                     &self.pool,
                     &self.event_bus,
                     &provider,
                     scopes,
-                    // Same device the authorization page was handed to: it is the
-                    // one to bring back to the front when the flow lands.
-                    self.turn_device_actor(device_id).await,
+                    actor.clone(),
                     open_auth_url,
                 )
                 .await?;
@@ -649,13 +660,10 @@ impl LucidosEngine {
                 // message (which console to open, what has to be enabled there).
                 // Looked up the same way the no-credentials branch above does,
                 // and absent registry rows are a supported state.
-                let row = oauth_registry::find_provider(
-                    self.system_knowhow_dir(),
-                    &oauth::client_provider_name(&provider),
-                );
+                let row = oauth_registry::find_provider(self.system_knowhow_dir(), &cred_service);
                 Ok(connect_result_message(&provider, &outcome, row.as_ref()))
             }
-            _ => Ok(format!("Unknown credential tool: {}", name)),
+            _ => Err(format!("Unknown credential tool: {}", name).into()),
         }
     }
 }
@@ -1062,6 +1070,17 @@ mod tests {
                 "{field} comes off the resolved row, never the request: {parsed}"
             );
         }
+    }
+
+    /// The request payload is persisted now, in the events table and every
+    /// trigger payload. A widening reopens a row that holds a secret, and none
+    /// of it may ride along.
+    #[test]
+    fn a_widening_payload_never_carries_the_stored_secret() {
+        let existing = stored(&["https://api.github.com"]);
+        let payload = widen_scope_request(&existing, &scope(&["https://github.com"]));
+        assert!(!payload.contains(&existing.auth_value), "{payload}");
+        assert!(parse_payload(&payload).get("auth_value").is_none());
     }
 
     #[test]

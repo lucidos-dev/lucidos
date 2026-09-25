@@ -75,18 +75,15 @@
 //!
 //! ## What we *do not* touch
 //!
-//! - Active worktrees. Activity is detected by querying the events table:
-//!   any thread event newer than [`TIER_2_IDLE`] keeps the worktree out of
-//!   Tier 2. The cleanup worker therefore needs no in-memory `agent_sessions`
-//!   handle — events are the source of truth and the in-memory map is just a
-//!   cache of currently-running spawns. A spawn always emits at least
-//!   `SessionStarted` / `MessageReceived` / `CodingAgentTextStreamed` shortly
-//!   after start, well within the 30-day idle window.
+//! - Active worktrees. A live agent session skips every tier, checked through
+//!   [`ActiveThreads`], because a session parked on a question emits no
+//!   events. Past that, activity comes from the events table: a thread event
+//!   newer than a tier's idle window keeps the worktree out of that tier.
 //! - Legacy random-suffix worktrees (anything in `.lucidos/worktrees/` whose
 //!   directory name doesn't match `thread-<8-hex>`). We can't safely map them
 //!   back to a thread, so we leave them for manual pruning.
 //! - Anything outside the workspace's `.lucidos/worktrees/` directory.
-//!   `prune_path` validates the path before any `remove_dir_all`.
+//!   `is_safe_subpath` validates the path before any `remove_dir_all`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -151,9 +148,9 @@ pub const TIER_1_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 pub const TIER_2_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Soft free-disk threshold. When the volume hosting the workspace falls
-/// below this, the worker emits a `NotificationCreated` once per cycle so the
-/// user knows worktrees are competing for space. No automatic cleanup beyond
-/// the normal Tier 1 / Tier 2 idle sweeps.
+/// below this, the worker emits one `NotificationCreated` per pressure episode
+/// so the user knows worktrees are competing for space. It also opens the
+/// retention gate for non-archived threads.
 pub const FREE_DISK_SOFT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// Hard free-disk threshold. When free space drops below this, the worker
@@ -757,7 +754,7 @@ impl WorktreeCleanup {
 
         // Primary liveness gate: the change row's status.
         match self.changes.get_by_id(change_id).await {
-            Ok(Some(change)) if change.status == "pending" => return None,
+            Ok(Some(change)) if change.is_pending() => return None,
             Ok(_) => {}
             Err(e) => {
                 log!(
@@ -910,8 +907,8 @@ impl WorktreeCleanup {
     ///       parent will resume when it finishes, so it needs its worktree. A
     ///       *stopped child* counts the same way: the parent is still owed its
     ///       card and will resume when it lands (ADR 0252).
-    ///   (b) the thread's latest persisted event, `ChildThreadStopped` notes
-    ///       aside, is a `ChildThreadCompleted`:
+    ///   (b) the thread's latest persisted event, `ChildThreadStopped` and
+    ///       `ChildThreadDetached` notes aside, is a `ChildThreadCompleted`:
     ///       a child has completed but the parent hasn't processed it yet (the
     ///       exact incident window); this is the same predicate B1's boot sweep
     ///       (`refire_unprocessed_child_completions`) selects on.
@@ -950,12 +947,12 @@ impl WorktreeCleanup {
         }
         // (b) a completed-but-unprocessed child completion is the thread's last
         // persisted word (no resume emitted a later event). A sibling's
-        // `ChildThreadStopped` note wakes nothing, so it cannot have processed
-        // the card, and it must not hide it.
+        // `ChildThreadStopped` or `ChildThreadDetached` note wakes nothing, so
+        // it cannot have processed the card, and it must not hide it.
         match sqlx::query_scalar::<_, String>(
             "SELECT event_type FROM events \
              WHERE aggregate = 'thread' AND aggregate_id = $1::text \
-               AND event_type <> 'ChildThreadStopped' \
+               AND event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
              ORDER BY sequence DESC LIMIT 1",
         )
         .bind(thread_id)

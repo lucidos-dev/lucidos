@@ -21,6 +21,7 @@ Ask each question via the `AskUserQuestion` tool, not as plain text.
 
 - Phrase the question clearly and end with a question mark.
 - Provide 2–4 plausible options. Make the recommended option first and append " (Recommended)" to its label.
+- Recommend the thorough, long-term option over a quick patch. The maintainer always prefers it.
 - Each option needs a short `description` explaining the trade-off or implication.
 - Keep `header` to a short chip-style label (max 12 chars).
 - Use `multiSelect: true` only when choices genuinely aren't mutually exclusive.

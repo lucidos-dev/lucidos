@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use crate::core::changes::ChangeStatus;
 
 /// Locks in the boolean-cluster split: `CodingAgentIdled` no longer sets
 /// `coding_agent_proposed`, even when its `has_changes` payload is true.
@@ -572,13 +573,14 @@ async fn change_applied_emits_once_on_sequential_reapply() {
          re-apply must not produce a second 'Change applied' timeline entry"
     );
 
-    let status: String = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
+    let status: ChangeStatus = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
         .bind(change_id)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(
-        status, "applied",
+        status,
+        ChangeStatus::Applied,
         "the change row is applied after the first emit"
     );
 
@@ -818,13 +820,14 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
     assert_eq!(pending[0].1, "claude-code/new-B");
 
     // The orphan is discarded (not lingering as pending).
-    let a_status: String = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
+    let a_status: ChangeStatus = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
         .bind(change_a)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(
-        a_status, "discarded",
+        a_status,
+        ChangeStatus::Discarded,
         "the stale branch-A change must be discarded"
     );
 

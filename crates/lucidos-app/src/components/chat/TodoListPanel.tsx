@@ -21,6 +21,10 @@ export function closeTodoPanel(): void {
   todoPanelAnchor.value = null;
 }
 
+/** The two values `data-state` can take. A union rather than `string`, so a
+ *  third one cannot be stamped without a stylesheet rule to paint it. */
+type TodoIndicatorState = 'in-progress' | 'idle';
+
 /** Everything the indicator says about a list, in one place.
  *
  *  `null` when there is nothing to report, which is what hides the control.
@@ -45,10 +49,6 @@ export function closeTodoPanel(): void {
  *  The WORDS keep the fuller picture, and there waiting outranks abandoned
  *  because it is the live fact: a list carrying both has parked items that are
  *  still going somewhere. */
-/** The two values `data-state` can take. A union rather than `string`, so a
- *  third one cannot be stamped without a stylesheet rule to paint it. */
-type TodoIndicatorState = 'in-progress' | 'idle';
-
 export function todoIndicatorSummary(
   items: TodoItem[] | null,
   notes?: string | null,

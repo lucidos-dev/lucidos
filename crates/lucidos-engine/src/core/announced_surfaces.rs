@@ -147,7 +147,11 @@ pub const TABLES: &[TableRule] = &[
         table: "standing_applies",
         owners: &["api/threads/delete.rs", "engine/standing_apply.rs"],
         announcement: Announcement::Announced {
-            events: &["StandingApplyArmed", "StandingApplyDropped"],
+            events: &[
+                "StandingApplyArmed",
+                "StandingApplyFired",
+                "StandingApplyDropped",
+            ],
             exempt: &[ExemptWriter {
                 function: "delete_family_rows",
                 why: "The thread-delete cascade, which ThreadsDeleted covers as \
@@ -207,7 +211,16 @@ pub const TABLES: &[TableRule] = &[
                 "DeviceDeleted",
                 "DeviceHandedOver",
             ],
-            exempt: &[],
+            exempt: &[ExemptWriter {
+                function: "mark_seen",
+                why: "Stamps last_seen_at when a device hides Lucidos, from the \
+                      DeviceHidden projection. It records an observation, and \
+                      it runs downstream of the DeviceHidden event, which SSE \
+                      already carries. Every Device* event would misdescribe \
+                      it: nothing was registered, renamed or deleted. The \
+                      page-load refresh inside register is silent for the \
+                      same reason.",
+            }],
         },
     },
     TableRule {

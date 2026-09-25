@@ -27,6 +27,10 @@ use uuid::Uuid;
 /// **A turn the owner opened.** Their words in that turn are the press, and
 /// the thread's newest turn-start event carries a `Device` actor.
 ///
+/// **A resume the engine made is the same turn carrying on.** After a switch,
+/// an API error or a hang, it inherits the turn it resumes, per ADR 0168
+/// clause 6. It never promotes one: a resumed agent turn stays the agent's.
+///
 /// **A trigger firing the owner authorized.** The same decision, made in
 /// advance. A fire reaches the engine two ways, so the shape has two records.
 /// An intent trigger runs on a thread whose turn starts with `TriggerStarted`.
@@ -83,12 +87,19 @@ async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> 
     //
     // `task_id` is `TriggerStarted`'s legacy spelling of `trigger_id`, aliased
     // on the enum and therefore still live in old rows.
+    //
+    // The query skips a resume the owner did not click, so it reads the turn
+    // start that resume continues. The owner's own Continue carries a device
+    // origin and counts as a turn they opened.
     let sql = format!(
         "SELECT event_type, \
                 COALESCE(payload->'origin', payload->'actor')->>'kind' = 'device', \
                 COALESCE(payload->>'trigger_id', payload->>'task_id') \
          FROM events \
          WHERE aggregate_id = $1 AND event_type IN ({starts}) \
+           AND NOT (event_type IN ('ContinuationStarted', 'OrphanRecoveryStarted') \
+                AND COALESCE(payload->'origin', payload->'actor')->>'kind' \
+                    IS DISTINCT FROM 'device') \
          ORDER BY sequence DESC LIMIT 1",
         starts = crate::engine::agent_recovery::THREAD_START_EVENTS_SQL,
     );

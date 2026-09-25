@@ -379,7 +379,7 @@ pub enum CommitGroupKind {
 
 impl CommitGroupKind {
     /// How many kinds there are, and the width of the tallies
-    /// [`parse_pending_commits`] counts into.
+    /// [`group_commit_subjects`] counts into.
     const COUNT: usize = 5;
 
     /// This kind's index in those tallies, and in [`COMMIT_GROUP_ORDER`].
@@ -415,23 +415,24 @@ pub struct CommitGroup {
     pub descriptions: Vec<String>,
 }
 
-/// The commits a *Switch to new version* would bring: every non-merge commit
-/// between the running engine's commit and HEAD, grouped by what it is.
+/// The commits a *Switch to new version* would bring, grouped by what they are.
 /// Surfaced on `version_status`, and read by two client surfaces: the status
 /// toast behind the spinning brand badge, which says what is being BUILT, and
 /// the new-version confirm, which says what the switch would BRING.
 ///
-/// **Merges are excluded** ([`LucidosEngine::read_pending_commits`] passes
-/// `--no-merges`). An Apply lands as a merge whose subject is the branch name,
-/// which describes no work, and everything it merged is already in this range
-/// under its own subject.
+/// **Only what the switch adds** ([`pending_commits_since`]): the list leaves
+/// out whatever the served client already carries.
+///
+/// **Merges are excluded** ([`pending_commits_since`] passes `--no-merges`). An
+/// Apply lands as a merge named after its branch, which describes no work. What
+/// it merged is already in this range under its own subjects.
 ///
 /// "commits", not "changes". A *change* is the coding-agent change the user
 /// Applies (see `system-knowhow/glossary.md`), and not every commit here is one
 /// (a hand commit, a revert).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PendingCommits {
-    /// Every non-merge commit in the range. Computed from `groups` by
+    /// Every commit the switch brings. Computed from `groups` by
     /// [`Self::from_groups`], the only constructor, so the count the toast
     /// headlines can never drift from the list under it.
     pub total: usize,
@@ -551,8 +552,8 @@ pub struct VersionStatus {
     /// number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_elapsed_ms: Option<u64>,
-    /// The commits between the running engine's commit and HEAD, or absent when
-    /// git could not say (see [`PendingCommits`]). Read only when a surface
+    /// The commits the switch would bring, or absent when git could not say
+    /// (see [`PendingCommits`]). Read only when a surface
     /// will show it, so an idle workspace forks no git: see
     /// [`wants_pending_commits`] for the four reasons.
     ///
@@ -1012,8 +1013,8 @@ impl LucidosEngine {
         }
     }
 
-    /// The non-merge commits between the running engine's commit and HEAD,
-    /// grouped by what they are, or `None` when git could not answer. TTL-cached
+    /// The [`PendingCommits`] a switch would bring, or `None` when git could
+    /// not answer. TTL-cached
     /// ([`PENDING_COMMITS_TTL`]) so the `git log` runs at most once per interval
     /// across every polling client.
     async fn pending_commits(&self) -> Option<PendingCommits> {
@@ -1052,14 +1053,7 @@ impl LucidosEngine {
         }
         let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
         let root = crate::paths::repo_root().ok()?;
-        let range = format!("{running}..HEAD");
-        // `--no-merges`: an Apply lands as a merge whose subject is the branch
-        // name, and everything it merged is in this same range under its own
-        // subject. See [`PendingCommits`].
-        classify_pending_commits(
-            crate::engine::git_ops::git_cmd(&["log", "--no-merges", "--format=%s", &range], &root)
-                .await,
-        )
+        pending_commits_since(running, self.served_frontend_commit().as_deref(), &root).await
     }
 
     /// One periodic self-heal tick (dev only). Retriggers a background rebuild
@@ -1450,7 +1444,7 @@ fn lock_held_at(path: &std::path::Path) -> bool {
 /// when engine source is dirty, falling back to `src-<hash>` with no git. Only
 /// the commit is comparable across two binaries, so split at the first `-` and
 /// reject the no-git and unstamped forms.
-fn build_id_commit(id: &str) -> Option<&str> {
+pub(crate) fn build_id_commit(id: &str) -> Option<&str> {
     if id.is_empty() || id.starts_with("src") {
         return None;
     }
@@ -1482,9 +1476,74 @@ fn wants_pending_commits(
     build_running || shared_building || source_behind || update_available
 }
 
-/// Classify a `git log --no-merges --format=%s <range>` run into the grouped
-/// commit list the status toast shows, keeping "git could not answer" apart
-/// from "git answered none".
+/// The [`PendingCommits`] a switch from the `running` commit would bring, or
+/// `None` when git could not answer.
+///
+/// Every commit since `running` that the `served` client lacks: the trunk HEAD
+/// its snapshot was taken at (`LucidosEngine::served_frontend_commit`).
+/// Excluding both keeps the list inside `running..HEAD` even when `served` is
+/// older. With no `served` commit known, it lists everything since `running`.
+///
+/// `--no-merges`: an Apply lands as a merge whose subject is the branch name,
+/// and everything it merged is in this same range under its own subject.
+async fn pending_commits_since(
+    running: &str,
+    served: Option<&str>,
+    root: &std::path::Path,
+) -> Option<PendingCommits> {
+    let mut args = vec![
+        "log".to_string(),
+        "--no-merges".to_string(),
+        "--format=%s".to_string(),
+        "HEAD".to_string(),
+        format!("^{running}"),
+    ];
+    args.extend(served.map(|commit| format!("^{commit}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    classify_pending_commits(crate::engine::git_ops::git_cmd(&args, root).await)
+}
+
+/// `candidate` when a client built from it runs on the `running` engine, else
+/// `None`. That is INV-A's git test: no file `files_require_restart` flags
+/// differs between the two commits.
+///
+/// Recording a served commit only through this check means an engine change
+/// can never be recorded as served. `None` lists everything since `running`.
+pub(crate) async fn compatible_served_commit(
+    running: &str,
+    candidate: &str,
+    root: &std::path::Path,
+) -> Option<String> {
+    (no_restart_between(running, candidate, root).await == Some(true))
+        .then(|| candidate.to_string())
+}
+
+/// Whether no file `files_require_restart` flags differs between `from` and
+/// `to`. `None` when git could not answer: a failed spawn, the timeout, or a
+/// commit this checkout does not know.
+pub(crate) async fn no_restart_between(
+    from: &str,
+    to: &str,
+    root: &std::path::Path,
+) -> Option<bool> {
+    let out = crate::engine::git_ops::git_cmd(&["diff", "--name-only", from, to], root)
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(!crate::engine::git_ops::files_require_restart(&files))
+}
+
+/// Classify a [`pending_commits_since`] run into the grouped commit list the
+/// status toast shows, keeping "git could not answer" apart from "git answered
+/// none".
 ///
 /// `Err` is a spawn failure or the [`GIT_TIMEOUT`](crate::engine::git_ops)
 /// ceiling, and a non-zero exit means git refused the range. Neither says
@@ -1496,9 +1555,9 @@ fn classify_pending_commits(
     result: Result<std::process::Output, String>,
 ) -> Option<PendingCommits> {
     match result {
-        Ok(out) if out.status.success() => {
-            Some(parse_pending_commits(&String::from_utf8_lossy(&out.stdout)))
-        }
+        Ok(out) if out.status.success() => Some(group_commit_subjects(
+            String::from_utf8_lossy(&out.stdout).lines(),
+        )),
         Ok(_) | Err(_) => None,
     }
 }
@@ -1557,18 +1616,21 @@ fn classify_commit_subject(subject: &str) -> (CommitGroupKind, String) {
     (group, line)
 }
 
-/// Parse `git log --no-merges --format=%s` stdout (newest first, one subject
-/// per line) into the grouped list the status toast shows. Pure so the
-/// taxonomy, the per-group cap, the counts and the ordering are testable
-/// without a repository.
+/// Group commit subjects (newest first) into the list the status toast shows.
+/// Pure so the taxonomy, the per-group cap, the counts and the ordering are
+/// testable without a repository.
 ///
-/// Blank lines are dropped: an empty subject would render as an empty bullet,
-/// and it would inflate the count of what the user is waiting for. Empty groups
-/// are omitted, so no heading is ever rendered over nothing.
-fn parse_pending_commits(stdout: &str) -> PendingCommits {
+/// Blank subjects are dropped: they would render as an empty bullet, and they
+/// would inflate the count of what the user is waiting for. Empty groups are
+/// omitted, so no heading is ever rendered over nothing.
+fn group_commit_subjects<'a>(subjects: impl IntoIterator<Item = &'a str>) -> PendingCommits {
     let mut totals = [0usize; CommitGroupKind::COUNT];
     let mut descriptions: [Vec<String>; CommitGroupKind::COUNT] = Default::default();
-    for subject in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for subject in subjects
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
         let (kind, line) = classify_commit_subject(subject);
         let slot = kind.slot();
         totals[slot] += 1;
@@ -1653,12 +1715,12 @@ async fn commit_is_strict_ancestor(
     if ancestor.starts_with(descendant) || descendant.starts_with(ancestor) {
         return Some(false); // same commit, possibly abbreviated, so not OLDER
     }
-    let out = tokio::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .current_dir(root)
-        .output()
-        .await
-        .ok()?;
+    let out = crate::engine::git_ops::git_cmd(
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        root,
+    )
+    .await
+    .ok()?;
     match out.status.code() {
         Some(0) => Some(true),  // is an ancestor
         Some(1) => Some(false), // is not an ancestor
@@ -1672,17 +1734,7 @@ async fn commit_is_strict_ancestor(
 /// per-HEAD and retries once new work lands.
 async fn current_head_sha() -> Option<String> {
     let root = crate::paths::repo_root().ok()?;
-    let out = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&root)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
+    crate::engine::git_ops::current_head_sha(&root).await
 }
 
 /// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
@@ -1915,11 +1967,12 @@ mod tests {
     use super::{
         acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
-        disk_upgrade_verdict, engine_build_lock_path, lock_held_at, open_teardown,
-        parse_pending_commits, rebuild_is_wedged, run_capturing_output, self_heal_is_wedged,
-        stash_first_restart_actor, try_lock_file, unrecognized_build_failure,
-        wants_pending_commits, BuildFailure, BuildOutput, BuildProcessGroupGuard, BuildState,
-        CommitGroupKind, BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
+        compatible_served_commit, disk_upgrade_verdict, engine_build_lock_path,
+        group_commit_subjects, lock_held_at, open_teardown, pending_commits_since,
+        rebuild_is_wedged, run_capturing_output, self_heal_is_wedged, stash_first_restart_actor,
+        try_lock_file, unrecognized_build_failure, wants_pending_commits, BuildFailure,
+        BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind,
+        BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
         COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
     };
     use crate::engine::thread_events::MessageOrigin;
@@ -2908,7 +2961,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// empty subject would both render as an empty bullet and inflate what the
     /// user is waiting for.
     #[test]
-    fn parse_pending_commits_groups_and_caps_each_list_but_not_the_counts() {
+    fn group_commit_subjects_groups_and_caps_each_list_but_not_the_counts() {
         let mut log = String::new();
         for i in 1..=8 {
             log.push_str(&format!("fix: bug {i}\n"));
@@ -2917,7 +2970,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         for i in 1..=4 {
             log.push_str(&format!("docs: page {i}\n"));
         }
-        let parsed = parse_pending_commits(&log);
+        let parsed = group_commit_subjects(log.lines());
 
         assert_eq!(parsed.total, 13, "every commit counts toward the total");
         assert_eq!(
@@ -2955,13 +3008,13 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             "housekeeping is counted, never listed"
         );
 
-        // Blank and whitespace-only lines are not commits.
-        let ragged = parse_pending_commits("fix: one\n\n   \nfix: two\n");
+        // Blank and whitespace-only subjects are not commits.
+        let ragged = group_commit_subjects(["fix: one", "", "   ", "fix: two"]);
         assert_eq!(ragged.total, 2);
         assert_eq!(ragged.groups[0].descriptions, vec!["one", "two"]);
 
         // A genuinely empty range is a real answer: zero, with nothing to list.
-        let none = parse_pending_commits("");
+        let none = group_commit_subjects([]);
         assert_eq!(none.total, 0);
         assert!(none.groups.is_empty());
     }
@@ -3017,13 +3070,13 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         );
     }
 
-    /// The real range against a throwaway repo: `<running>..HEAD` lists what a
-    /// switch would bring, newest first, with the running commit itself
-    /// excluded and every MERGE dropped (its subject is a branch name, and what
-    /// it merged is already in the range). And a range git cannot resolve
-    /// classifies as UNKNOWN rather than as empty.
+    /// The real range against a throwaway repo, landed the way Apply lands: the
+    /// branch merges the trunk in, then the trunk fast-forwards. The served
+    /// client's commit decides: what it carries is left out, everything else
+    /// since the running commit is listed. No MERGE subject is listed, and an
+    /// unresolvable range is UNKNOWN.
     #[tokio::test]
-    async fn pending_commits_reads_the_range_between_the_running_commit_and_head() {
+    async fn pending_commits_leave_out_what_the_served_client_carries() {
         let dir = std::env::temp_dir().join(format!(
             "lucidos-pending-commits-{}-{:?}",
             std::process::id(),
@@ -3038,50 +3091,72 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                 .output()
                 .expect("git runs in the test environment")
         };
+        let stdout = |args: &[&str]| {
+            String::from_utf8(git(args).stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "Test"]);
         std::fs::write(dir.join("a.txt"), "one").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "running: the version in use"]);
-        let running = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-        for subject in ["fix: the older one", "feat: the newer one"] {
-            std::fs::write(dir.join("a.txt"), subject).unwrap();
-            git(&["add", "."]);
-            git(&["commit", "-qm", subject]);
-        }
-        // A side branch merged back in, exactly as an Apply lands: the merge
-        // subject names the branch and must not reach the toast, while the work
-        // it brought must.
-        git(&["checkout", "-q", "-b", "side", &running]);
-        std::fs::write(dir.join("b.txt"), "side work").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "fix(side): work done on a branch"]);
-        // `-` rather than a branch NAME: `init.defaultBranch` is the user's
-        // config, so this repo's trunk is `master` on one machine and `main` on
-        // the next.
-        git(&["checkout", "-q", "-"]);
-        git(&[
-            "merge",
-            "-q",
-            "--no-ff",
-            "-m",
-            "Merge branch 'side'",
-            "side",
-        ]);
-
-        let range = format!("{running}..HEAD");
-        let commits = classify_pending_commits(
-            crate::engine::git_ops::git_cmd(&["log", "--no-merges", "--format=%s", &range], &dir)
-                .await,
-        )
-        .expect("a resolvable range is a real answer");
+        let running = stdout(&["rev-parse", "HEAD"]);
+        // `init.defaultBranch` is the user's config, so read the trunk's name.
+        let trunk = stdout(&["symbolic-ref", "--short", "HEAD"]);
+        let apply = |branch: &str, base: &str, commits: &[(&str, &str)]| {
+            git(&["checkout", "-q", "-b", branch, base]);
+            for (subject, file) in commits {
+                let path = dir.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, subject).unwrap();
+                git(&["add", "."]);
+                git(&["commit", "-qm", subject]);
+            }
+            git(&["merge", "-q", "--no-edit", &trunk]);
+            git(&["checkout", "-q", &trunk]);
+            git(&["merge", "-q", "--ff-only", branch]);
+        };
+        apply(
+            "a",
+            &running,
+            &[("feat(ui): live, landed before any engine change", "app.tsx")],
+        );
+        // INV-A lets the served client advance to here, and no further.
+        let served = stdout(&["rev-parse", "HEAD"]);
         assert_eq!(
-            commits.total, 3,
-            "the merge is not a commit the user is waiting for; its content is"
+            compatible_served_commit(&running, &served, &dir).await,
+            Some(served.clone()),
+            "a frontend-only landing can be recorded as served"
+        );
+        apply(
+            "b",
+            &running,
+            &[("fix(engine): the engine change", "src/lib.rs")],
+        );
+        apply(
+            "c",
+            &running,
+            &[("feat(ui): held behind the engine change", "app2.tsx")],
+        );
+        apply(
+            "d",
+            &trunk,
+            &[
+                ("feat(ui): a frontend step", "app3.tsx"),
+                ("feat: the newer one", "src/new.rs"),
+            ],
+        );
+
+        let commits = pending_commits_since(&running, Some(&served), &dir)
+            .await
+            .expect("a resolvable range is a real answer");
+        assert_eq!(
+            commits.total, 4,
+            "the engine change and every landing after it wait for the switch; \
+             the served frontend commit and the merges do not"
         );
         let group = |kind| {
             commits
@@ -3090,19 +3165,22 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                 .find(|g| g.kind == kind)
                 .unwrap_or_else(|| panic!("{kind:?} group is present"))
         };
+        // Sorted: commits made within one second share a date, so `git log`
+        // order between them is not fixed.
+        let mut new = group(CommitGroupKind::New).descriptions.clone();
+        new.sort();
         assert_eq!(
-            group(CommitGroupKind::New).descriptions,
-            vec!["the newer one"],
-            "the running commit is not part of what is coming"
+            new,
+            vec![
+                "the newer one",
+                "ui: a frontend step",
+                "ui: held behind the engine change"
+            ],
+            "a frontend commit landed after the engine change waits for the switch"
         );
-        // Not order-asserted across the two: `git log` sorts by commit date, and
-        // the branch commit is younger than the trunk commits it merges beside.
-        let mut fixed = group(CommitGroupKind::Fixed).descriptions.clone();
-        fixed.sort();
         assert_eq!(
-            fixed,
-            vec!["side: work done on a branch", "the older one"],
-            "the branch's own work is listed, under its own subject"
+            group(CommitGroupKind::Fixed).descriptions,
+            vec!["engine: the engine change"]
         );
         assert!(
             !commits
@@ -3113,20 +3191,26 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             "no merge subject reaches the toast"
         );
 
+        // The served client never advanced (a failed rebuild, or no served
+        // commit known): the frontend commit is listed too.
+        for served in [Some(running.as_str()), None] {
+            let all = pending_commits_since(&running, served, &dir).await;
+            assert_eq!(all.map(|c| c.total), Some(5), "served {served:?}");
+        }
+
+        // Running at HEAD: a real, empty answer.
+        let head = stdout(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            compatible_served_commit(&running, &head, &dir).await,
+            None,
+            "a commit past an engine change is never recorded as served"
+        );
+        let level = pending_commits_since(&head, Some(&head), &dir).await;
+        assert_eq!(level.map(|c| c.total), Some(0), "nothing to bring");
+
         // A range git refuses (unknown object) exits non-zero: unknown, not empty.
         assert_eq!(
-            classify_pending_commits(
-                crate::engine::git_ops::git_cmd(
-                    &[
-                        "log",
-                        "--no-merges",
-                        "--format=%s",
-                        "0000000000000000000000000000000000000000..HEAD",
-                    ],
-                    &dir,
-                )
-                .await
-            ),
+            pending_commits_since("0000000000000000000000000000000000000000", None, &dir).await,
             None,
             "a range git cannot resolve says nothing about what is pending"
         );

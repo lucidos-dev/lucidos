@@ -728,7 +728,8 @@ impl ArtifactManager {
 
         let head = match repo.head() {
             Ok(h) => h.peel_to_commit()?,
-            Err(_) => return Ok(Vec::new()), // No commits yet
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
 
         let mut revwalk = repo.revwalk()?;
@@ -736,7 +737,14 @@ impl ArtifactManager {
         revwalk.set_sorting(git2::Sort::TIME | git2::Sort::REVERSE)?; // oldest first
 
         // Collect OIDs first to avoid borrow conflict with repo
-        let oids: Vec<git2::Oid> = revwalk.filter_map(|r| r.ok()).collect();
+        // One unreadable commit is skipped, not fatal: the caller rebuilds
+        // memory from this list, and an error here would drop every artifact.
+        let oids: Vec<git2::Oid> = revwalk
+            .filter_map(|r| {
+                r.map_err(|e| log!("[Artifacts] Skipping unreadable commit in history: {}", e))
+                    .ok()
+            })
+            .collect();
 
         let artifacts_prefix = format!("{}/", super::ARTIFACTS_DIR);
         let mut changes = Vec::new();

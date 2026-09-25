@@ -334,6 +334,28 @@ describe('incremental grouping ≡ full grouping', () => {
     expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
   });
 
+  it('a held message\'s delivered copy repaints the turn that held it', () => {
+    const origin = { kind: 'thread_link', thread_id: 'parent-1', title: 'Parent' } as const;
+    const thread = replay([
+      { seq: 1, event: { type: 'MessageReceived', text: 'start' } as ThreadEvent },
+      { seq: 2, event: { type: 'UserQuestionAsked', tool_use_id: 'tu1', cc_session_id: 's', question: 'Go?', options: [] } as ThreadEvent },
+      { seq: 3, event: { type: 'MessageHeld', text: 'stop now', origin } as ThreadEvent },
+      { seq: 4, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
+      { seq: 5, event: { type: 'HeldMessageReleased', held_message_id: 'evt-3' } as ThreadEvent },
+    ], 'claude_code');
+    const holder = computeExchanges(thread)[1];
+    const beforeRevision = holder.revision ?? 0;
+
+    const map = new Map([['thread-1', thread]]);
+    handleEvent(map, 'thread-1', 6, { type: 'MessageReceived', text: 'stop now', mode: 'agent', origin } as ThreadEvent, at(99), 'evt-6');
+    expectMatchesFull(thread);
+
+    const after = computeExchanges(thread)[1];
+    expect(after).toBe(holder);
+    expect(after.deliveredHeldIds?.has('evt-3')).toBe(true);
+    expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
+  });
+
   // A call is the sequence with the most fold state per event: a boundary that
   // hands `current` back, rows routed to the bottom rather than to `current`,
   // and a re-anchor held by an utterance. Each of those reads state the resumed

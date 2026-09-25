@@ -60,6 +60,12 @@ sha2 = "0.10"
 # so this adds exactly one crate and nothing under it.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
+# macOS reports a process's processor time in Mach ticks, and converting them
+# needs `mach_timebase_info`. `libc` deprecates its copy in favour of this crate,
+# which is already in the lockfile, so it adds nothing to download.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 # A self-signed cert for the https stand-in gateway in `peers_tests.rs`. Minted

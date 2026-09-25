@@ -8,6 +8,7 @@ import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { IngressBanner } from './components/layout/IngressBanner';
 import { WebhookRefusalBanner } from './components/layout/WebhookRefusalBanner';
+import { SlownessBanner } from './components/layout/SlownessBanner';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
@@ -113,11 +114,13 @@ export function App() {
             The mobile copies are mounted inside the fixed header instead (see
             AppHeader), and each renders only under its own viewport.
             Ordered by reach, widest first. The connection bar says this whole
-            workspace is unreachable; the ingress bar narrows that to the public
-            path a sender takes; the refusal bar narrows it again to one hook
-            that is throwing away what does arrive; the reminder below all three
-            is about a risk that will still be there later. */}
+            workspace is unreachable; the slowness bar says it is reachable
+            but slow; the ingress bar narrows reach to the public path a sender
+            takes; the refusal bar narrows it again to one hook that is throwing
+            away what does arrive; the reminder below them all is about a risk
+            that will still be there later. */}
         <ConnectionBanner layout="desktop" />
+        <SlownessBanner layout="desktop" />
         <IngressBanner layout="desktop" />
         <WebhookRefusalBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />

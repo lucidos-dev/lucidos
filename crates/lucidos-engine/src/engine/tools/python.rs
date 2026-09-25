@@ -1,8 +1,6 @@
 use super::super::LucidosEngine;
 use super::ToolOutcome;
-use crate::core::redact_postgres_secrets;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::llm::tools::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS};
 
 impl LucidosEngine {
@@ -137,7 +135,7 @@ impl LucidosEngine {
         Ok(crate::core::redact_secret_values(&response, &secrets))
     }
 
-    /// `run_python_background(code, packages?, timeout_secs?)` — install
+    /// `run_python_background(code, description, packages?, timeout_secs?)`: install
     /// packages into the per-workspace venv, write the script to
     /// `.lucidos/exhaust/<run_id>/script.py`, then hand a venv-rooted
     /// `python <script>` invocation off to `BackgroundBashRegistry::spawn`.
@@ -220,23 +218,17 @@ impl LucidosEngine {
         let env_vars = self.build_tool_env_vars(thread_id).await;
         let command =
             build_python_background_command(self.python_runtime.python_bin(), &script_path);
-        // The constructed command embeds absolute paths only — no user
-        // secrets — but stay consistent with bash.rs and redact through
-        // the same helper before logging.
-        let safe_command = redact_postgres_secrets(&command);
-        log!(
-            "[PythonBg] Spawning: {}",
-            &safe_command[..safe_command.floor_char_boundary(200)]
-        );
 
-        let (task_id, finish_rx) = match self
-            .bash_background
-            .spawn(
+        // The bash path end to end: same registry, same `BackgroundBash*`
+        // events, and so the same event wait re-opens the thread.
+        let (task_id, started_at) = match self
+            .start_background_task(
+                thread_id,
                 &command,
+                args.get("description").and_then(|v| v.as_str()),
                 timeout_secs,
                 self.workspace_path(),
                 &env_vars,
-                Some(thread_id),
             )
             .await
         {
@@ -253,32 +245,9 @@ impl LucidosEngine {
                 // startup sweep wipes `.lucidos/staging` but preserves
                 // exhaust for audit.
                 std::fs::remove_dir_all(&script_dir).ok();
-                return Err(format!("Error: failed to spawn background python: {}", e));
+                return Err(e);
             }
         };
-
-        let started_at = chrono::Utc::now();
-
-        if let Err(e) = self
-            .event_bus
-            .emit(BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::BackgroundBashStarted {
-                    task_id: task_id.clone(),
-                    command: safe_command.clone(),
-                    timeout_secs,
-                    started_at,
-                },
-                meta: EventMeta::NONE,
-            })
-            .await
-        {
-            log!("[PythonBg] failed to emit BackgroundBashStarted: {}", e);
-        }
-
-        // Reuse the bash watcher: same registry, same completion event,
-        // and so the same event wait re-opens the thread.
-        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), finish_rx);
 
         Ok(serde_json::json!({
             "task_id": task_id,
@@ -734,7 +703,7 @@ mod tests {
         let reg = BackgroundBashRegistry::new();
         let command = build_python_background_command(runtime.python_bin(), &script_path);
         let (task_id, _finish_rx) = reg
-            .spawn(&command, 10, dir.path(), &[], None)
+            .spawn(&command, 10, dir.path(), &[], None, None)
             .await
             .expect("spawn");
 
@@ -805,7 +774,7 @@ mod tests {
         let reg = BackgroundBashRegistry::new();
         let command = build_python_background_command(runtime.python_bin(), &script_path);
         let (task_id, _finish_rx) = reg
-            .spawn(&command, 10, dir.path(), &env, None)
+            .spawn(&command, 10, dir.path(), &env, None, None)
             .await
             .expect("spawn");
 

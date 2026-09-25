@@ -339,14 +339,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     }
   });
 
-  // Global "/" shortcut to open dropdown when not typing in an input
+  // Global "/" shortcut to open dropdown when not typing in an input. The
+  // listener mounts once, so it reads `openMenu` through a ref. The menu
+  // outlives a thread switch, and without the ref the first render's closure
+  // would fetch the commands of the thread that was open then.
+  const openMenuRef = useRef(openMenu);
+  openMenuRef.current = openMenu;
   useEffect(() => {
     function handleSlash(e: KeyboardEvent) {
       if (open.value) return;
       if (isTextInput(e.target)) return;
       if (e.key === '/') {
         e.preventDefault();
-        openMenu();
+        openMenuRef.current();
       }
     }
     document.addEventListener('keydown', handleSlash);

@@ -61,6 +61,43 @@ keeps recording it. CARRYING is whether the app acts on it this instant, which
 on a quiet thread it does not. A reader who scrolls away from a finished reply
 keeps the lit toggle and is picked back up when the thread runs again.
 
+> **Amended: ARMED and CARRYING are ONE state again.** This supersedes the
+> paragraph above, the one below, and the amendments that follow it. While the flag is up, the reader
+> is on the live edge or a ride glide is taking them there. Every scroll the
+> reader makes off the edge retires the ride, on any thread.
+
+> So do the up chevron, turn stepping away from the edge, and a turn-control
+> press whose hold leaves them off it. A scroll nobody made is written back.
+> The follow asks nothing about liveness, so `setAgentLive`, `setCallLive` and
+> the submit's live claim are gone.
+
+> The split let a reader scroll a question-parked thread with the toggle lit.
+> Nothing carried them to the new card, reported as the toggle "out of sync".
+> The split's only gain was keeping the ride across a browse of an idle thread,
+> and one press of the toggle restores that. It also fed on a copy of thread
+> liveness taken from the last turn's rendered status. See
+> `docs/plans/2026-09-25-a-lit-follow-toggle-always-holds-the-live-edge.md`.
+
+> **Amended again, and this one is the user's explicit instruction: a scroll
+> turns the follow off automatically ONLY while the thread is live
+> streaming.** It supersedes the amendment above on this point. That amendment
+> read the user's report as "every scroll disarms", which was wrong, and the
+> user had to report it again. Do not change this rule without the user
+> explicitly asking for it.
+
+> On a waiting thread a reader's scroll PARKS the follow instead. The toggle
+> stays lit and nothing moves the reader. Three things make it ride again: the
+> thread going live, a submit, and the reader scrolling back to the edge. So a
+> lit toggle never sits off the edge while rows arrive, which is what the
+> amendment above fixed.
+
+> Liveness comes from the thread projection (`isThreadStreaming`: running, or
+> an answer resuming), never from a rendered turn. A voice call up on the thread
+> counts as live too, since a call writes no turn. Only the reader's scroll parks.
+> The up chevron, turn stepping, a turn-control press and a deep link still turn
+> the follow off. The rule lives in `leaveTheRideByScroll`. See
+> `docs/plans/2026-09-25-a-waiting-thread-parks-the-ride.md`.
+
 **Where the reader is decides which half answers.** A reader ON the live edge is
 kept there, running thread or quiet one. The app's own rendering must not slide
 the edge out from under someone who never left it. A reader SCROLLED AWAY is

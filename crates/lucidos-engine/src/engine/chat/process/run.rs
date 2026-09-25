@@ -231,7 +231,14 @@ impl LucidosEngine {
         voice_session_id: Option<Uuid>, // set when this message was spoken on a call
         external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
         urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
+        follow_up_turn: Option<crate::engine::FollowUpTurn>, // released once this message is recorded and routed
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Everything up to the release runs after every earlier follow-up to
+        // this thread has been recorded and routed. Every return releases it.
+        let mut follow_up_turn = follow_up_turn;
+        if let Some(turn) = follow_up_turn.as_mut() {
+            turn.wait_for_predecessor().await;
+        }
         let urgent = urgency.is_urgent();
         let chat_start = std::time::Instant::now();
         // Track whether a pending change was proposed during this request
@@ -571,6 +578,18 @@ impl LucidosEngine {
                 origin.clone(),
             )
             .await;
+            // And for an open form: the user answered in words instead. Only a
+            // person does, so a child's completion or a wait delivery re-entering
+            // the thread leaves the form open.
+            if mode == ActorMode::Human {
+                crate::engine::form_requests::supersede_on_user_message(
+                    self.pool(),
+                    &self.event_bus,
+                    thread_id,
+                    origin.clone(),
+                )
+                .await;
+            }
         }
 
         // Fast-path for CC follow-ups: route via msg_tx BEFORE register_thread_queued
@@ -761,9 +780,9 @@ impl LucidosEngine {
                             // Nothing to pre-count and nothing to roll back: the
                             // message is visible to the session's idle decision the
                             // moment it is in the channel (that decision reads
-                            // `msg_rx` under this same lock), and the run loop counts
-                            // it against `inputs_awaiting_result` when it forwards it
-                            // to the driver. A send that fails put nothing anywhere.
+                            // `msg_rx` under this same lock), and the run loop records
+                            // it as owed when it forwards it to the driver. A send
+                            // that fails put nothing anywhere.
                             session
                                 .msg_tx
                                 .send(AgentUserInput {
@@ -1071,6 +1090,9 @@ impl LucidosEngine {
                 .expect("persisted event must return EmitResult");
             emit_result.event_id
         };
+        // Recorded, and the thread is registered, so a later follow-up now
+        // queues behind this turn rather than racing it. Release it.
+        drop(follow_up_turn.take());
 
         // Publish this turn's anchor on the handle. Everything below stamps
         // `request_event_id: Some(origin_id)` on its events and on its own
@@ -1456,6 +1478,8 @@ impl LucidosEngine {
             self.build_chat_context_sections(super::context_sections::ChatContextInputs {
                 classification: &classification,
                 user_profile: &user_profile,
+                thread_id,
+                turn_anchor: origin_id,
                 device_id,
                 event_device: device_name.as_deref(),
                 app_context: app_context.as_ref(),
@@ -1701,7 +1725,7 @@ impl LucidosEngine {
         if !mcp_stopped_context.is_empty() {
             user_message_parts.push(&mcp_stopped_context);
         }
-        let setup_reminder = if !is_trigger && !missing_pref_keys.is_empty() {
+        let setup_reminder = if !missing_pref_keys.is_empty() {
             let missing_list = missing_pref_keys.join(", ");
             format!("CRITICAL: The following preferences are not set: {}. Do NOT proceed with the user's request. Ask the user to configure these first.", missing_list)
         } else {

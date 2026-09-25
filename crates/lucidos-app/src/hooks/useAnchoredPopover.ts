@@ -42,6 +42,22 @@ const CLAMP_MARGIN = 8;
  *    edge, detached from the trigger. */
 export type AnchorAlign = 'start' | 'end';
 
+/** What a popover is positioned against: an element, or a bare box. */
+export type AnchorBox = Pick<HTMLElement, 'getBoundingClientRect'>;
+
+/** A point in viewport coordinates, such as where a right-click landed. */
+export interface ViewportPoint {
+  x: number;
+  y: number;
+}
+
+/** A zero-size box at `point`, so a context menu opens at the pointer and
+ *  still flips and clamps like any anchored popover. */
+export function pointAnchor({ x, y }: ViewportPoint): AnchorBox {
+  const rect = { x, y, left: x, right: x, top: y, bottom: y, width: 0, height: 0 };
+  return { getBoundingClientRect: () => ({ ...rect, toJSON: () => rect }) };
+}
+
 /** Compute a fixed-positioned popover offset relative to an anchor element.
  *  Defaults to placing the popover *below* the anchor; flips to *above* when
  *  there isn't enough vertical room. Horizontally aligns per `align` (see
@@ -62,7 +78,7 @@ export type AnchorAlign = 'start' | 'end';
  *  unreachable. Surfaces should still cap their own `max-height` against the
  *  viewport so that overlap stays rare (see `.prompt-bar-popover`). */
 export function computeAnchorPosition(
-  anchor: HTMLElement,
+  anchor: AnchorBox,
   panelHeight: number,
   panelWidth: number,
   container?: HTMLElement | null,
@@ -128,7 +144,7 @@ function isInToastLayer(target: Node): boolean {
  *  scroll container move together). Passive scroll listener so we don't block
  *  the chat's auto-scroll. */
 export function useAnchoredPosition(
-  anchor: HTMLElement | null,
+  anchor: AnchorBox | null,
   panelRef: { current: HTMLElement | null },
   containerSelector?: string,
   align: AnchorAlign = 'start',
@@ -139,7 +155,10 @@ export function useAnchoredPosition(
       setPos(null);
       return;
     }
-    const container = containerSelector ? anchor.closest<HTMLElement>(containerSelector) : null;
+    // Only an element sits inside a container; a bare box clamps to the viewport.
+    const container = containerSelector && 'closest' in anchor
+      ? (anchor as HTMLElement).closest<HTMLElement>(containerSelector)
+      : null;
     let rafId: number | null = null;
     const recompute = () => {
       rafId = null;
@@ -400,7 +419,7 @@ export function makeDismissHandlers(
   let awaitingPairedClick = false;
   // The click that pairs with the press that OPENED this overlay has not
   // arrived yet. A GESTURE-opened overlay has no anchor to exempt (see
-  // `OverflowMenu`'s `openRef`), and its opening `pointerdown` fired before
+  // `OverflowMenu`'s `hostOpener`), and its opening `pointerdown` fired before
   // these listeners existed. So its trailing click reaches the fallback below
   // looking exactly like a synthetic one, and the lift that opened the menu
   // dismissed it again.
@@ -529,8 +548,8 @@ export function makeDismissHandlers(
       // tests and keyboard-shortcut handlers). The replaced hand-rolled
       // handlers used document click-capture and dismissed + swallowed those
       // too; without this branch the canonical hook silently dropped that
-      // contract and any caller relying on synthetic clicks (the thread-filter
-      // dropdown e2e tests are the canary) wedged its dismiss flow.
+      // contract and any caller relying on synthetic clicks wedged its dismiss
+      // flow. `e2e/overlay-dismiss-swallow.spec.ts` is the canary.
       const dismissed = onDismiss();
       if (dismissed !== false) {
         e.stopPropagation();

@@ -1,6 +1,6 @@
 ---
 name: Orchestrating Sub-Threads
-description: How a parent thread runs several children at once, and what a spawn costs. The one rule: siblings observe each other but never direct each other. Covers which edge carries an instruction and which a fact, and reaching a finished child. Load before a spawn, when weighing one against inline work, when children disagree or duplicate work, or for "can a sub-thread message another sub-thread".
+description: How a parent thread runs several children at once, and what a spawn costs. The one rule: siblings observe each other but never direct each other. Covers which edge carries an instruction, reaching a finished child, and moving one to top level. Load before a spawn, when weighing one against inline work, when children disagree or duplicate work, or for "can a sub-thread message another sub-thread".
 ---
 
 # Orchestrating Sub-Threads
@@ -26,6 +26,7 @@ yours to decide, case by case.
 | Parent to its own direct child | `follow_up_child_thread` | An instruction. The only instruction-bearing edge. |
 | Child to parent | `ChildThreadCompleted`, at every terminal turn | A report. Re-opens the parent. |
 | Child to parent | `ChildThreadStopped`, when a user Stop pauses the child | A note. Re-opens nothing. |
+| Parent and child | `ChildThreadDetached`, when the child moves to top level | The edge is cut. Re-opens nothing. |
 | Any thread to any thread's events | `await_event`, the `events` query | Facts. Never an instruction. |
 | Sibling to sibling | Nothing exists | There is no tool and no route. |
 
@@ -46,6 +47,8 @@ consequences worth knowing before you plan around them:
   permanently.
 - **Reviving a child is free.** A follow-up consumes no child slot. Prefer
   reviving over spawning when you still have work for a child that already ran.
+- **Moving a child to top level frees no slot.** A moved child still counts
+  toward the ten.
 
 ## When to spawn, and what it costs
 
@@ -160,6 +163,18 @@ you saw and carry on with your own work.
 5. **A child that will not comply is a supervision problem.** Say so plainly in
    your report, and let the user decide. You can ask a child to stop. You have
    no tool that forces it.
+6. **Count the changes below a child, not only its own.** A card's
+   `Pending changes:` line names the child's own branch. A second section,
+   `Pending changes in its sub-threads`, lists what its own children hold.
+   Each one is marked settled or still working. The `threads` list shows the
+   same count as `pending_sub_thread_change_count`, and `changes` `list` with
+   `sub_threads_of` lists them.
+7. **Never report a session done while its change reads unsettled.** In the
+   `changes` list, `thread_unsettled: true` means the thread is still working
+   on that change: mid-turn, on a question card, resolving a merge conflict,
+   or watching an event. Apply refuses it for the same reason. The card's
+   settled state dates from when the card was sent. So read the list again
+   before you tell the user a change is ready.
 
 ## Reaching a child that already finished
 
@@ -178,6 +193,25 @@ the child reported done. Four things to expect:
   cards as superseded.
 - A follow-up into an **archived** coding-agent child resurfaces it in the
   user's Inbox at its next idle.
+
+## Moving a child to top level
+
+When you no longer need a child's result, stop waiting for it: the `threads`
+tool's `detach_child` action (or `lucidos threads detach --thread <id>`) moves
+it to top level. The user does the same from the thread menu's **Move to top
+level**, and they can move any nested thread. You can move only your own direct
+children.
+
+- **Nothing is stopped.** A turn in flight finishes, keeps its work and proposes
+  its change. There is still no tool that stops a child.
+- **You get nothing more from it.** No completion card, no follow-up, and it
+  leaves your `my_children` list. A card it earned before the move still
+  arrives.
+- **You read a `[CHILD THREAD MOVED OUT]` note** (or a turn-gap line) when the
+  user moved it. Do not respawn it or wait for it.
+- **It cannot be undone.** There is no way to take a moved thread back.
+- **An `await_event` you armed on its `ChildThreadCompleted` is not
+  cancelled.** Stand it down yourself, or it runs to its timeout.
 
 ## Asking, disagreeing, and being overruled
 

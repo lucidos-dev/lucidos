@@ -126,7 +126,7 @@ function AgentRow({
             row whose gap IS the separator, so no glue character between them
             (an explicit one would be double-spaced). */}
         <div
-          class={`list-row-details${broken || missing ? ' error' : ''}`}
+          class={`list-row-details${broken || missing ? ' error-text' : ''}`}
           data-role="agent-binary-status"
         >
           {version && <span data-role="agent-binary-version">{version}</span>}

@@ -3,7 +3,7 @@ import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsC
 import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
-import { prefersReducedMotion } from '../../utils/platform';
+import { isReducedMotion } from '../../utils/motion';
 import { isMobile } from '../../utils/viewport';
 
 /** The compose-to-thread prompt slide, at 1x. Both inline transitions and the
@@ -59,7 +59,7 @@ export function ThreadPane() {
       return;
     }
 
-    if (prefersReducedMotion() || isMobile()) {
+    if (isReducedMotion() || isMobile()) {
       // Skip the slide — CSS transforms on the prompt area prevent iOS Safari
       // from opening the keyboard on programmatic focus — but still honor the
       // deferred collapse so the textarea doesn't stay tall.

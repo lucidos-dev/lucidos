@@ -104,6 +104,8 @@ function settleMatchedCallStep(step: StepLike): void {
  *  - A coding-agent turn, because only one of those has the gap. Wider than
  *    `hasCCContent` by `SessionStarted`, which covers the resumed-session
  *    start window and is the same event `exchangeStatus` reads as "Working".
+ *    Wider again by `inputRead`: a message read mid-turn has no prompt step
+ *    of its own, and the agent holds it from the read on.
  *  - `isLast`, the ACTIVE exchange. Coding-agent events fold chronologically
  *    rather than by request id, so the live turn IS the last one.
  *  - Not an *engine-down* boundary (`abortTookEngineDown`), which is closed by
@@ -125,7 +127,9 @@ function needsLiveThinkingRow(opts: {
   if (abortTookEngineDown(exchange.userEvent)) return false;
   // The `SessionStarted` scan runs only in the start window, where
   // `hasCCContent` is false and everything cheaper has already passed.
-  return hasCCContent || exchange.steps.some(({ event }) => event.type === 'SessionStarted');
+  return hasCCContent
+    || exchange.inputRead === true
+    || exchange.steps.some(({ event }) => event.type === 'SessionStarted');
 }
 
 /** A step row that has not named itself yet: the model is thinking and has not
@@ -619,6 +623,19 @@ function failureEchoPredicate(exchange: Exchange): (text: string | undefined) =>
   return text => (text ?? '').trim() === failure;
 }
 
+/** Who sent an agent message, as the transcript names them. `undefined` when
+ *  the origin names no sender. */
+export function agentMessageSender(origin: MessageOrigin | undefined): string | undefined {
+  switch (origin?.kind) {
+    case 'thread_link':
+      return origin.title ? `"${origin.title}"` : 'another thread';
+    case 'workspace':
+      return `workspace "${origin.workspace}"`;
+    default:
+      return undefined;
+  }
+}
+
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
  *  @param isLast the ACTIVE exchange, as in `exchangeSteps`. It does not drive
  *  spinner resolution (see `threadIdle`), only the derived live row.
@@ -627,19 +644,6 @@ function failureEchoPredicate(exchange: Exchange): (text: string | undefined) =>
  *  flag to finalize pending steps. A non-last exchange can still be the one
  *  the engine is processing (chat mid-flight injection), so resolution must
  *  not trigger purely on `!isLast`. */
-/** Who sent a held message, as the row names them. A held message is always
- *  agent-sent, so an origin the engine did not record reads as "an agent". */
-export function heldMessageSender(origin: MessageOrigin | undefined): string {
-  switch (origin?.kind) {
-    case 'thread_link':
-      return origin.title ? `"${origin.title}"` : 'another thread';
-    case 'workspace':
-      return `workspace "${origin.workspace}"`;
-    default:
-      return 'an agent';
-  }
-}
-
 export function exchangeResponseEvents(exchange: Exchange, isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
@@ -950,11 +954,13 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         break;
       }
       case 'MessageHeld': {
+        if (event._eventId && exchange.deliveredHeldIds?.has(event._eventId)) break;
         events.push({
           type: 'held_message',
           held_id: event._eventId ?? '',
           text: event.text,
-          sender: heldMessageSender(event.origin),
+          // Always agent-sent, so an unrecorded origin is still an agent.
+          sender: agentMessageSender(event.origin) ?? 'an agent',
           released: false,
         });
         break;
@@ -967,6 +973,22 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         }
         break;
       }
+      case 'CredentialRequested':
+      case 'PluginInstallRequested':
+      case 'PluginUninstallRequested':
+      case 'EmailConfirmRequested':
+      case 'OAuthAuthorizationRequested':
+        // A form request, below the tool step that asked for it. The grouping
+        // routes its resolution into this same exchange, however much later.
+        events.push({ type: 'form_request', request: event });
+        break;
+      case 'FormRequestResolved':
+        for (const row of events) {
+          if (row.type === 'form_request' && row.request.request_id === event.request_id) {
+            row.resolution = event.outcome;
+          }
+        }
+        break;
       case 'EventWaitStarted': {
         // The park, as the transcript's ONE record of it. A step-level row,
         // not a divider: the attached delivery resumes THIS exchange, and its
@@ -991,6 +1013,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           wait_id: e.wait_id,
           subscriptions: e.on,
           reason: e.reason,
+          created,
           expires_at: e.expires_at,
           state: 'waiting',
         };
@@ -1026,6 +1049,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
             if (state === 'matched') {
               prior.matched_event_type = e.event_type;
               prior.matched_event_id = e.event_id;
+              prior.matched_at = created;
             }
             break;
           }
@@ -1033,8 +1057,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         break;
       }
       case 'EventWaitCanceled': {
-        // **A stop never rewrites the arming row.** "Set up an event wait: X"
-        // is a true statement about a moment, and a stop is a different action
+        // **A stop never rewrites the arming row.** "Waiting for X" is a true
+        // statement about a moment, and a stop is a different action
         // at a different moment, routinely hours later. Rewriting the row in
         // place leaves nothing anywhere saying when the watch ended.
         //
@@ -1057,6 +1081,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           // rather than inventing one.
           subscriptions: e.on ?? [],
           reason: e.reason ?? '',
+          created,
           // The deadline died with the subscription, so there is nothing to
           // count down to. The row renders its note, not a countdown.
           expires_at: '',
@@ -1210,27 +1235,20 @@ export function dividerBodyIsSuppressed(exchange: Exchange, events: ResponseEven
 }
 
 /** User-facing presentation of a `StepOutcome`. The outcome IS the CSS class,
- *  which drives the icon and the row's treatment, and this adds the label.
+ *  which drives the row's treatment, and this adds the label. The mark itself
+ *  is `StepOutcomeIcon` (components/shared/icons.tsx).
  *
  *  'Did not finish' is deliberately not 'Failed': a step killed mid-execution
  *  never reported anything, while 'Failed' asserts it ran and returned an
  *  error. */
-export function stepStatus(outcome: StepOutcome): { label: string; icon: string; className: StepOutcome } {
+export function stepStatus(outcome: StepOutcome): { label: string; className: StepOutcome } {
   switch (outcome) {
-    // In-progress rows show no leading mark: the shimmering description is the
-    // "live" affordance. The empty icon still gets its fixed-width slot
-    // (`.inline-step .step-icon`, steps.css). The running row's text then sits
-    // on the same column as the finished rows above it.
-    case 'pending': return { label: 'In progress', icon: '', className: 'pending' };
-    case 'success': return { label: 'Completed', icon: '✓', className: 'success' };
-    case 'error': return { label: 'Failed', icon: '⚠', className: 'error' };
-    case 'unfinished': return { label: 'Did not finish', icon: '⊘', className: 'unfinished' };
-    // A pause bar, because held-not-running is exactly what was being misread.
-    // Text rather than an emoji, for the reason `EVENT_ROW_MARK` gives: these
-    // are marks in a column of prose, coloured by the type around them.
-    case 'blocked': return { label: 'Needs approval', icon: '‖', className: 'blocked' };
-    // The pair of the success check, so the two read as one answered question.
-    case 'denied': return { label: 'Denied', icon: '✗', className: 'denied' };
+    case 'pending': return { label: 'In progress', className: 'pending' };
+    case 'success': return { label: 'Completed', className: 'success' };
+    case 'error': return { label: 'Failed', className: 'error' };
+    case 'unfinished': return { label: 'Did not finish', className: 'unfinished' };
+    case 'blocked': return { label: 'Needs approval', className: 'blocked' };
+    case 'denied': return { label: 'Denied', className: 'denied' };
   }
 }
 
@@ -1561,6 +1579,22 @@ export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
   return ev.type === 'ResponseAborted' && isSwitchTeardownAbort(ev.actor, ev.cause);
 }
 
+/** Does this "Paused by restart" boundary fold into the resume right after it?
+ *
+ *  The pause and the resume are one event to the reader, so once the resume
+ *  lands the pause draws no panel. The resume's info popover carries it instead.
+ *  Until then the pause stands alone, because it is the only thing saying the
+ *  turn will come back.
+ *
+ *  Only the promised pause folds. A crash interruption stays visible, and so
+ *  does a pause holding work of its own, since hiding it would hide the work. */
+export function restartPauseFoldsInto(pause: Exchange, next: Exchange | undefined): boolean {
+  if (next?.userEvent.type !== 'ContinuationStarted') return false;
+  if (!abortPromisesAutoResume(pause.userEvent)) return false;
+  return !exchangeResponseText(pause)
+    && !hasRenderableResponseContent(exchangeResponseEvents(pause, false, true));
+}
+
 /** Index of the newest ResponseAborted exchange the user may Continue from, or
  *  `null` when the thread offers no Continue button. Only this exchange
  *  renders the button in AbortPanel, so older aborts are inert.
@@ -1728,7 +1762,6 @@ function canQueueBehind(exchange: Exchange): boolean {
     case 'CodingAgentPermissionRequest':
     case 'CommandPermissionRequested':
     case 'McpPermissionRequested':
-    case 'CredentialRequested':
     case 'McpConsentRequested':
     case 'ChildThreadCompleted':
     case 'MissingHardeningDetected':
@@ -1739,18 +1772,51 @@ function canQueueBehind(exchange: Exchange): boolean {
   }
 }
 
+/** Whether the agent has read a message sent to it yet. */
+export type ReadMarker = 'sent' | 'read';
+
+/** The read marker of every message on a thread, by exchange index. */
+export function readMarkers(exchanges: Exchange[], threadIsCC: boolean): Map<number, ReadMarker> {
+  return threadIsCC ? codingAgentReadMarkers(exchanges) : chatReadMarkers(exchanges);
+}
+
+/** The Lucidos Agent reads a message when its loop takes it, by starting the
+ *  message's turn or injecting it into a running one. What a caller says on a
+ *  call is speech, so it carries no marker. */
+function chatReadMarkers(exchanges: Exchange[]): Map<number, ReadMarker> {
+  const markers = new Map<number, ReadMarker>();
+  exchanges.forEach((exchange, i) => {
+    const { userEvent } = exchange;
+    if (userEvent.type !== 'MessageReceived' || !userEvent._eventId) return;
+    if (isLiveUtteranceRow(userEvent) || (userEvent as { voice_session_id?: string }).voice_session_id) return;
+    markers.set(i, isUningestedMessage(exchange) ? 'sent' : 'read');
+  });
+  return markers;
+}
+
+/** A coding agent reports each read as `CodingAgentInputRead`.
+ *
+ *  Markers start at the first message the agent acknowledged. Messages before
+ *  it predate read events or sit before the loaded window, and marking those
+ *  "Sent" would claim they were never read. */
+function codingAgentReadMarkers(exchanges: Exchange[]): Map<number, ReadMarker> {
+  const markers = new Map<number, ReadMarker>();
+  const first = exchanges.findIndex(ex => ex.inputRead);
+  if (first === -1) return markers;
+  for (let i = first; i < exchanges.length; i++) {
+    const { userEvent, inputRead } = exchanges[i];
+    if (userEvent.type !== 'MessageReceived' || !userEvent._eventId) continue;
+    markers.set(i, inputRead ? 'read' : 'sent');
+  }
+  return markers;
+}
+
 export interface QueuedFollowupRun {
   activeIndex: number;
   queuedOrder: number[];
   queuedIndices: Set<number>;
 }
 
-/** Locate the exchange that owns the active response plus queued follow-ups.
- *  A question or permission divider can arrive after a queued MessageReceived
- *  but before injection. Queued indices are therefore tracked independently
- *  rather than as one contiguous trailing run. Coding agents are excluded:
- *  their follow-ups go straight to subprocess stdin, and only chat uses the
- *  agentic-loop queue. */
 /** The bottom exchange that could own a turn, stepping over every live row a
  *  call is drawing, on either side.
  *
@@ -1764,6 +1830,25 @@ function lastTurnBearingIndex(exchanges: Exchange[]): number {
   return -1;
 }
 
+/** A coding-agent thread's queue: the messages the agent has yet to read
+ *  (`Exchange.awaitingRead`). The fold keeps the running turn out of it, so
+ *  the last exchange that is not waiting holds the turn. */
+function codingAgentQueue(exchanges: Exchange[]): QueuedFollowupRun {
+  const queuedOrder: number[] = [];
+  let activeIndex = -1;
+  for (let i = 0; i < exchanges.length; i++) {
+    if (exchanges[i].awaitingRead) queuedOrder.push(i);
+    else if (!isLiveCallRow(exchanges[i].userEvent)) activeIndex = i;
+  }
+  if (activeIndex === -1) activeIndex = lastTurnBearingIndex(exchanges);
+  return { activeIndex, queuedOrder, queuedIndices: new Set(queuedOrder) };
+}
+
+/** Locate the exchange that owns the active response plus queued follow-ups.
+ *  A question or permission divider can arrive after a queued MessageReceived
+ *  but before injection. Queued indices are therefore tracked independently
+ *  rather than as one contiguous trailing run. A coding-agent thread's queue
+ *  is its unread messages instead (`codingAgentQueue`). */
 export function queuedFollowupRun(
   exchanges: Exchange[],
   threadBusy: boolean,
@@ -1774,7 +1859,8 @@ export function queuedFollowupRun(
     queuedOrder: [],
     queuedIndices: new Set(),
   };
-  if (!threadBusy || threadIsCC || exchanges.length === 0) return empty;
+  if (!threadBusy || exchanges.length === 0) return empty;
+  if (threadIsCC) return codingAgentQueue(exchanges);
 
   // The QUEUE is what the reader may retract, so a delegated utterance is not
   // a candidate: it is speech, and nothing offers to unsay it.
@@ -1855,6 +1941,9 @@ export function queuedMessagesFromExchanges(
   threadBusy: boolean,
   threadIsCC = false,
 ): QueuedMessage[] {
+  // A coding agent already holds its queued messages, so nothing can take one
+  // back. Only the Lucidos Agent's queue is retractable.
+  if (threadIsCC) return [];
   const { queuedOrder } = queuedFollowupRun(exchanges, threadBusy, threadIsCC);
   const out: QueuedMessage[] = [];
   for (const idx of queuedOrder) {
@@ -1863,6 +1952,20 @@ export function queuedMessagesFromExchanges(
     out.push({ id, text: exchangeUserMessage(exchanges[idx]) });
   }
   return out;
+}
+
+/** True for a divider that reads "Needs your answer" until its resolution
+ *  lands: a question or a permission card. */
+export function opensAwaitingAnswer(exchange: Exchange): boolean {
+  switch (exchange.userEvent.type) {
+    case 'UserQuestionAsked':
+    case 'CodingAgentPermissionRequest':
+    case 'CommandPermissionRequested':
+    case 'McpPermissionRequested':
+      return true;
+    default:
+      return false;
+  }
 }
 
 /** Derive ExchangeStatus for an exchange.
@@ -1945,15 +2048,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // lands as a step. Without seeding here, the steps loop sees only the
   // resolution and never the request, so `isWaitingForAnswer` would stay false
   // for a pending divider.
-  const userEventType = exchange.userEvent.type;
-  if (
-    userEventType === 'UserQuestionAsked'
-    || userEventType === 'CodingAgentPermissionRequest'
-    || userEventType === 'CommandPermissionRequested'
-    || userEventType === 'McpPermissionRequested'
-  ) {
-    isWaitingForAnswer = true;
-  }
+  if (opensAwaitingAnswer(exchange)) isWaitingForAnswer = true;
 
   for (let i = 0; i < exchange.steps.length; i++) {
     const event = exchange.steps[i].event;
@@ -2134,12 +2229,6 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // Session ended without a proper response: no ResponseGenerated for chat, no
   // CodingAgentIdled for an agent killed mid-work.
   if (isSessionEnded && !isComplete && !isCCWaiting) return 'aborted';
-  // A prior exchange is still active and this one has no events yet, so it is
-  // queued. Checked BEFORE the `!isLast` fallthrough, which would otherwise
-  // show "No response generated". Coding-agent threads do not queue, since
-  // their messages go to stdin. Only the LAST queued exchange shows "Queued":
-  // earlier ones were superseded and the empty-non-last rule below takes them.
-  //
   // A user stop is a boundary that states its own outcome, and nothing
   // continues out of it. Terminal by construction, so it never spins
   // "Requesting" while an unrelated turn keeps the thread `running`, and never
@@ -2197,6 +2286,11 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     // written before ADR 0201, where a delegation was a `MessageReceived`.
     if (!exchange.tookTheTurn && exchange.userEvent.type !== 'MessageReceived') return 'done';
   }
+  // A prior exchange is still active and this one has no events yet, so it is
+  // queued. Checked BEFORE the `!isLast` fallthrough, which would otherwise
+  // show "No response generated". A coding-agent thread's queue comes from
+  // `queuedFollowupRun` instead. Only the LAST queued exchange shows "Queued":
+  // earlier ones were superseded and the empty-non-last rule below takes them.
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // Agent idle. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';
@@ -2226,6 +2320,12 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // single park-ending set. An overtaken divider falls through to the stale
   // detector, or to 'coding-agent-working' while the agent is still going.
   if (isWaitingForAnswer && !exchange.questionOvertaken) return 'awaiting-answer';
+  // A callback that landed under that open question: a child's report or an
+  // event-wait delivery. It waits for the answer (ADR 0255), so nothing is
+  // running for it yet, and neither "Requesting" nor "Done" is true.
+  // `threadIdle` is false once the user has answered, so the resume reads
+  // "Requesting" before the engine's `running` reaches the client.
+  if (threadAwaitingAnswer && threadIdle && isLast && !hasSteps) return 'held';
   // Non-last with steps but no terminator: the user moved past this exchange.
   // The chat fast path injects the follow-up via UPI under the parent's
   // request_event_id and redirects later events to the new exchange. A coding
@@ -2258,7 +2358,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // the redirect-advance for ChildThreadCompleted in exchange-grouping.ts).
   // Fall through to the normal machinery, so the card shows a live spinner in
   // the gap before the first post-completion step rather than "Done ✓".
-  if (userEventType === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return 'done';
+  if (exchange.userEvent.type === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return 'done';
 
   // A coding-agent exchange is 'coding-agent-working' once it has steps.
   //

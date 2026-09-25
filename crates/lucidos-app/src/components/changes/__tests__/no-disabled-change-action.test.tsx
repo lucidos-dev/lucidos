@@ -41,7 +41,7 @@ import {
   applyAllInProgress,
   standingApplyThreadIds,
   armingStandingApplyThreadIds,
-  workingThreadCount,
+  settlingThreadCount,
   threadMap,
   focusedThreadId,
 } from '../../../store/store';
@@ -117,7 +117,7 @@ let host: HTMLDivElement;
 beforeEach(() => {
   changes.value = {
     status: 'loaded',
-    data: [makeChange({ thread_unsettled: true, thread_working: true })],
+    data: [makeChange({ thread_unsettled: true, thread_settling: true })],
   };
   appliedChanges.value = { status: 'loaded', data: [] };
   applyingChangeIds.value = new Set();
@@ -125,7 +125,7 @@ beforeEach(() => {
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
   armingStandingApplyThreadIds.value = new Set();
-  workingThreadCount.value = 1;
+  settlingThreadCount.value = 1;
   disarmAll.mockClear();
   threadMap.value = new Map([[THREAD, makeThread()]]);
   focusedThreadId.value = THREAD;
@@ -173,9 +173,9 @@ describe('the Changes panel row', () => {
   it('names the unsettled thread in the row details, not in a tooltip', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_working: false })],
+      data: [makeChange({ thread_unsettled: true, thread_settling: false })],
     };
-    workingThreadCount.value = 0; // nothing to sweep, so no bulk row either
+    settlingThreadCount.value = 0; // nothing to sweep, so no bulk row either
     render(<ChangesView />, host);
     expect(actionLabels()).toEqual(['Diff']);
     expect(host.textContent).toContain('The thread has not finished');
@@ -186,7 +186,7 @@ describe('the Changes panel row', () => {
   it('shows an apply resolving merge conflicts as in flight, with no standing apply', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true })],
+      data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
     };
     render(<ChangesView />, host);
     expect(actionLabels()).not.toContain('Apply as it settles');
@@ -256,7 +256,7 @@ describe('the Changes panel bulk control', () => {
 
   it('keeps the off drawn after the last thread stops working', () => {
     changes.value = { status: 'loaded', data: [] };
-    workingThreadCount.value = 0;
+    settlingThreadCount.value = 0;
     standingApplyThreadIds.value = new Set([THREAD]);
     render(<ChangesView />, host);
     expect(bulkButton().textContent).toBe('✓ Applying as they settle');
@@ -292,7 +292,7 @@ describe("the thread's own prompt row", () => {
   it('offers nothing while the thread resolves an apply that hit merge conflicts', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_working: true, resolving_conflict: true })],
+      data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
     };
     expect(getStandingApplyControl()).toBeNull();
   });

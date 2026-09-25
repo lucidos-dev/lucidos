@@ -1,8 +1,8 @@
 /**
  * The appearance FOUC script: one program, embedded in two documents.
  *
- * It resolves the device's theme, font, ligature settings, UI scale and style
- * overrides from localStorage and writes them onto `<html>` **before any module
+ * It resolves the device's theme, font, ligature settings, UI scale, motion and
+ * style overrides from localStorage and writes them onto `<html>` **before any module
  * loads**, so the first frame is already the user's appearance instead of a
  * default that gets corrected a moment later.
  *
@@ -28,15 +28,23 @@
  * are the shell's, not the contract's.
  */
 import {
+  ANIMATION_SPEED_STORAGE_KEY,
   FONT_FAMILY_VALUES,
+  MOTION_STORAGE_KEY,
+  REDUCED_MOTION_QUERY,
   STYLE_OVERRIDES_STORAGE_KEY,
   THEMES,
   THEME_BG,
   DEFAULT_THEME,
+  durationScaleFor,
   fontFeaturesFor,
+  motionAttribute,
+  parseAnimationSpeed,
+  parseMotion,
   parseStyleOverrides,
   parseUiScale,
   resolveFontKey,
+  resolveReducedMotion,
   resolveTheme,
   styleResetRequested,
   type ResolvedTheme,
@@ -54,6 +62,12 @@ export interface BootOptions {
    * that happened to carry the parameter should not wipe the user's map.
    */
   styleReset: boolean;
+  /**
+   * Publish `--duration-scale` from the Animation speed slider and reduced
+   * motion. Shell only: an app frame's stylesheet pins the scale to 1, and an
+   * inline value here would beat it.
+   */
+  durationScale: boolean;
 }
 
 export interface BootResult {
@@ -62,6 +76,7 @@ export interface BootResult {
   theme: ThemePref;
   resolved: ResolvedTheme;
   prefersLight: boolean;
+  reducedMotion: boolean;
 }
 
 /**
@@ -147,6 +162,18 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   );
   if (scale !== null) d.style.setProperty('--user-ui-scale', `${scale}%`);
 
+  // Motion. Resolved here, before the boot splash markup parses, so a device
+  // that asked for calm never sees the splash move for a frame.
+  const reducedMotion = resolveReducedMotion(
+    parseMotion(seeded(served, 'motion', MOTION_STORAGE_KEY)),
+    matchMedia(REDUCED_MOTION_QUERY).matches,
+  );
+  d.setAttribute('data-motion', motionAttribute(reducedMotion));
+  if (opts.durationScale) {
+    const position = parseAnimationSpeed(wsLocalGet(ANIMATION_SPEED_STORAGE_KEY));
+    d.style.setProperty('--duration-scale', String(durationScaleFor(position, reducedMotion)));
+  }
+
   // The live style remote's first-paint seed. LAST on purpose: everything above
   // writes properties the remote is allowed to override, and inline properties
   // are last-write-wins.
@@ -165,5 +192,5 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
     /* a corrupt map must never break FOUC */
   }
 
-  return { raw, theme, resolved, prefersLight };
+  return { raw, theme, resolved, prefersLight, reducedMotion };
 }

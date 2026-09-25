@@ -23,6 +23,7 @@ fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
         id: id.to_string(),
         label: label.to_string(),
         description: description.map(str::to_string),
+        preview: None,
     }
 }
 

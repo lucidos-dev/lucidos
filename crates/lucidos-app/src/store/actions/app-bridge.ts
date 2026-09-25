@@ -14,6 +14,7 @@
 import { appMayCall, normalizeSuffix } from '@lucidos/sdk';
 import { API } from '../../api/client';
 import { deviceIdHeader, readDeviceId } from '../../utils/deviceIdHeader';
+import { registrationToAwait } from '../../utils/deviceRegistration';
 import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
 
 /** Mirrors `packages/lucidos-sdk/src/_bridge.ts`. Two copies, because the SDK
@@ -151,6 +152,8 @@ async function bridgedFetch(wire: WireRequest, appId: string | null): Promise<un
     throw new Error(`The app bridge does not carry ${method} ${wire.path}`);
   }
   const path = stampDeviceScope(resolved);
+  const registration = registrationToAwait(`${API}${path}`, method);
+  if (registration) await registration;
   const res = await fetch(`${API}${path}`, {
     method,
     headers: {

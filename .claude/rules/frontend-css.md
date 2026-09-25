@@ -53,7 +53,7 @@ Two consequences beyond the token block:
   `scaledDurationMs(PANE_TRANSITION_MS) + 100`. Slack is a fixed safety margin,
   not animation. An unscaled timer fires partway into the transition it exists to
   outlive: at 0.1x the drawer body blanks mid-slide and a maximizing pane snaps
-  the rest of the way. The five sites are listed in
+  the rest of the way. Every such timer is listed in
   `store/__tests__/duration-scale.test.ts`, which fails if one stops scaling.
 - **An indefinite animation does NOT scale**: a spinner, a shimmer, anything
   `infinite`. It is an activity indicator rather than a transition, so it keeps a
@@ -100,3 +100,20 @@ Two consequences beyond the token block:
 - **No `id` on dual-rendered components**: `App.tsx` mounts only the visible layout's pane tree (`SplitLayout` on desktop, `MobileSwipeContainer` on mobile; dual-mounting the panes was removed because every signal write fanned out to both subtrees). But per-layout copies still exist in the header chrome (`ControlPanel` renders in both `AppHeader` and `MobileAppHeader`), and the mounted layout swaps at runtime when the viewport crosses the breakpoint, so `id` attributes remain unsafe. Use `data-role="name"` + `querySelectorAll`. Cross-component: `getVisiblePromptInput()` in `promptFocus.ts`. **Debug hint:** if something works on desktop but fails on mobile (or vice versa), check whether you're hitting the wrong layout's copy: inspect `getBoundingClientRect()` for 0x0 dimensions.
 - **Heavy-mount children that render in both layouts must skip the inactive one**: iframes, video/audio players, big WebGL canvases, anything that fetches on mount. If a component has a copy in each layout, both copies trigger the work, doubling network and resource cost (e.g. before the pane single-mount fix, opening an app fetched `/api/v1/sdk-prefs.js` twice). Pane children mount once now; the rule still binds for chrome with per-layout copies. Pattern: the parent takes `layout: 'desktop' | 'mobile'` and forwards it to the heavy child; the child gates the render with `layout === (viewportIsMobile.value ? 'mobile' : 'desktop')`. `viewportIsMobile` is the reactive signal in `utils/viewport.ts`. Example: `AppUiInline.tsx` (gate retained from the dual-mount era; harmless now that `ContentPane` mounts once).
 - **No `getElementById()`**: Banned except `#app`. Use `querySelector`/`querySelectorAll`
+
+### Reduced motion keys on `data-motion`, never on the media query
+
+The *Motion* setting and the OS switch resolve to one value, published as
+`data-motion` on `<html>` (`docs/glossary.md` § Reduced motion (resolved)).
+
+- **Write calm rules as `:root[data-motion="reduce"] .x { … }`.** A
+  `@media (prefers-reduced-motion)` block ignores a user who picked Reduce or
+  Full in the app. Script reads `isReducedMotion()` from `utils/motion.ts`.
+- **Reduced motion collapses `--duration-scale`**, so a tokenized one-shot needs
+  no rule of its own. An indefinite or literal-duration animation does: stop it
+  with `animation: none` for its own selector.
+- **An end-event listener needs a way to finish without its event**: a scaled
+  timer, or a bypass that reads `isReducedMotion()`.
+
+`styles/__tests__/reduced-motion-guard.test.ts` and
+`__tests__/animation-end-fallbacks.test.ts` enforce all three.

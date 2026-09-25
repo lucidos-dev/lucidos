@@ -96,6 +96,21 @@ describe('ChildCompletionRow', () => {
     else expect(text).not.toContain('pending change');
   });
 
+  /** An orchestrator's children held every change, so the row showed nothing
+   *  pending while two changes waited below it. */
+  it('counts the changes pending in its sub-threads apart from its own', () => {
+    const below = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        change_id: `c${i}`,
+        thread_id: `t${i}`,
+        thread_unsettled: false,
+      }));
+    const text = vnodeText(ChildCompletionRow({ ...baseProps, subThreadPendingChanges: below(2) }));
+    expect(text).toContain('2 pending in its sub-threads');
+    expect(text).not.toContain('pending change');
+    expect(vnodeText(ChildCompletionRow(baseProps))).not.toContain('sub-threads');
+  });
+
   it('title link is an accent-link button with data-thread-id pointing at the child thread', () => {
     const tree = ChildCompletionRow(baseProps);
     const link = findByClass(tree, 'accent-link');

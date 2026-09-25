@@ -704,6 +704,44 @@ fn build_session_messages_projects_child_thread_stopped_as_alive() {
     }
 }
 
+/// ADR 0278: a child moved to top level reaches a chat parent as a
+/// `[CHILD THREAD MOVED OUT]` block, so the parent stops waiting for it rather
+/// than respawning it.
+#[test]
+fn build_session_messages_projects_child_thread_detached_as_moved_out() {
+    use chrono::Utc;
+    let child_id = Uuid::new_v4();
+    let events = vec![EventRow {
+        id: Uuid::new_v4(),
+        event_type: "ChildThreadDetached".into(),
+        payload: json!({
+            "child_thread_id": child_id.to_string(),
+            "child_thread_title": "Fix the ticket",
+        }),
+        created: Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    }];
+    let msgs = build_session_messages(&events);
+    let note = msgs
+        .iter()
+        .find(|m| m.content.contains("[CHILD THREAD MOVED OUT]"))
+        .expect("child thread moved-out message");
+    assert_eq!(note.role, "user");
+    for needle in [
+        child_id.to_string(),
+        "Fix the ticket".to_string(),
+        "no longer your child".to_string(),
+        "Do not wait for it or respawn it".to_string(),
+    ] {
+        assert!(
+            note.content.contains(&needle),
+            "missing {needle:?} in:\n{}",
+            note.content
+        );
+    }
+}
+
 /// A canceled card now comes only from Archive or Discard, so it reads as
 /// final and no longer says "user stop".
 #[test]
@@ -830,4 +868,65 @@ fn every_rebuilt_tool_result_carries_its_event_address() {
         .iter()
         .any(|c| c.contains(crate::llm::validate::ORPHAN_TOOL_RESULT_STUB)));
     assert!(bodies.iter().any(|c| c.contains("file body")));
+}
+
+/// An orchestrator's children held every change, so its own line read "none"
+/// and the parent never knew work waited below. The sub-threads' changes get
+/// their own section, apart from the child's own, each naming its owner.
+#[test]
+fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
+    use chrono::Utc;
+    let (settled_change, working_change) = (Uuid::new_v4(), Uuid::new_v4());
+    let (settled_thread, working_thread) = (Uuid::new_v4(), Uuid::new_v4());
+    let row = |payload: serde_json::Value| EventRow {
+        id: Uuid::new_v4(),
+        event_type: "ChildThreadCompleted".into(),
+        payload,
+        created: Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    };
+    let block = format_child_thread_completed_block(&row(json!({
+        "child_thread_id": Uuid::new_v4().to_string(),
+        "child_thread_title": "orchestrator",
+        "status": "success",
+        "summary": "handed over",
+        "sub_thread_pending_changes": [
+            {
+                "change_id": settled_change,
+                "thread_id": settled_thread,
+                "thread_title": "milestone 9b",
+                "thread_unsettled": false,
+            },
+            {
+                "change_id": working_change,
+                "thread_id": working_thread,
+                "thread_unsettled": true,
+            },
+        ],
+    })));
+    assert!(
+        block.contains("Pending changes: none\nPending changes in its sub-threads"),
+        "the own line stays, and the sub-thread section follows it; got:\n{block}"
+    );
+    assert!(
+        block.contains(&format!(
+            "- {settled_change} from sub-thread \"milestone 9b\" ({settled_thread}): settled"
+        )),
+        "got:\n{block}"
+    );
+    assert!(
+        block.contains(&format!(
+            "- {working_change} from sub-thread \"untitled\" ({working_thread}): still working"
+        )),
+        "got:\n{block}"
+    );
+
+    // A card with nothing below it reads exactly as before.
+    let plain = format_child_thread_completed_block(&row(json!({
+        "child_thread_id": Uuid::new_v4().to_string(),
+        "status": "success",
+        "summary": "done",
+    })));
+    assert!(!plain.contains("sub-threads"), "got:\n{plain}");
 }

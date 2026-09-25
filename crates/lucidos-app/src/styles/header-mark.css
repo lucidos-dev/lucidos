@@ -379,7 +379,10 @@
    them into a tall pill.
    Compact, because the mark is 1.6rem of glyph and the full badge box covers
    most of it. Doubled up (`.badge.brand-unread-badge`) for the specificity
-   reason the rule above documents. */
+   reason the rule above documents.
+   The size goes in as the design height and nothing else. At this weight a
+   `min-height` or `padding` would outrank styles/badges.css. That rule rounds
+   the box to whole pixels, which is what keeps the count centred. */
 .brand-mark-slot .badge.brand-unread-badge {
     position: absolute;
     top: auto;
@@ -387,10 +390,7 @@
     right: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
     /* Inside its host too, for the reason the rule above gives. */
     --header-control-veil: inherit;
-    min-width: var(--header-mark-count-size);
-    min-height: var(--header-mark-count-size);
-    line-height: var(--header-mark-count-size);
-    padding: 0 0.1875rem;
+    --badge-height: var(--header-mark-count-size);
     border-radius: 0.5rem;
     /* The tap belongs to the mark underneath, which opens the menu holding the
        matching rows. Same reason the ready badge is click-through below: this
@@ -586,20 +586,15 @@
    opacity, killing the animation would leave the connecting mark at full
    strength, i.e. indistinguishable from connected.
  *
- * The selector REPEATS the connecting rule's exactly, and that is load-bearing
- * rather than tidy. A media query contributes nothing to specificity, so the
- * obvious broad override, `.brand-mark .brand-mark-glyph { animation: none }`
- * at (0,2,0), LOSES to the state rule above at (0,3,0) (an attribute selector
- * scores as a class) and the mark keeps pulsing for a user who asked for no
- * motion. The pre-rewrite ring had this same mismatch and the same silent
- * failure. Matching the selector wins on source order instead, which is the
- * only comparison a media query can influence. Pinned by
+ * The selector REPEATS the connecting rule's exactly, behind the `data-motion`
+ * prefix, and that is load-bearing rather than tidy. A broader override such as
+ * `.brand-mark .brand-mark-glyph { animation: none }` can lose to the state rule
+ * above, since an attribute selector scores as a class, and the mark keeps
+ * pulsing for a user who asked for no motion. Pinned by
  * styles/__tests__/header-mark-geometry.test.ts. */
-@media (prefers-reduced-motion: reduce) {
-    .brand-mark[data-conn="connecting"] .brand-mark-glyph {
-        animation: none;
-        opacity: var(--header-mark-connecting-opacity-min);
-    }
+:root[data-motion="reduce"] .brand-mark[data-conn="connecting"] .brand-mark-glyph {
+    animation: none;
+    opacity: var(--header-mark-connecting-opacity-min);
 }
 
 /* ── The menu ─────────────────────────────────────────────────────────────
@@ -1041,6 +1036,9 @@ div.brand-menu-ws-row {
    same. Same for `.brand-menu-ws-name` above. */
 .brand-menu-ws-badge {
     flex: 0 0 auto;
+    /* As tall as the row's line. styles/badges.css rounds it to whole pixels,
+       which keeps the count centred. */
+    --badge-height: 1lh;
     min-width: 1.125rem;
     padding: 0 var(--space-xs);
     border-radius: 0.5625rem;

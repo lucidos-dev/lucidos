@@ -125,6 +125,37 @@ describe('the response style editor is a modal', () => {
     expect(panel()!.querySelector('.style-editor-title')?.textContent).toBe('Add a style');
   });
 
+  it('says what each field is for, and marks its sample text as an example', async () => {
+    render(<ResponseStylesSection />, host);
+    addCard().click();
+    await settled();
+
+    // A bare sample in an empty field read as text already filled in.
+    const fields = [...panel()!.querySelectorAll('.style-editor-field')];
+    expect(fields).toHaveLength(2);
+    for (const field of fields) {
+      expect(field.querySelector('.style-editor-field-hint')?.textContent).toBeTruthy();
+      const control = field.querySelector('input, textarea');
+      expect(control?.getAttribute('placeholder')).toMatch(/^For example:/);
+    }
+  });
+
+  it('marks an edited shipped style in the list, and no other row', () => {
+    responseStyles.value = {
+      status: 'loaded',
+      data: [
+        ...LIBRARY.map((s) => (s.id === 'concise' ? { ...s, source: 'overridden' as const } : s)),
+        style({ id: 'board-report', label: 'Board report', source: 'user' }),
+      ],
+    };
+    render(<ResponseStylesSection />, host);
+
+    const marked = [...host.querySelectorAll('.list-row')]
+      .filter((row) => row.querySelector('.style-row-edited'))
+      .map((row) => row.querySelector('.title')?.firstChild?.textContent);
+    expect(marked).toEqual(['Concise']);
+  });
+
   it('closes on Cancel', async () => {
     render(<ResponseStylesSection />, host);
     editRows()[0].click();

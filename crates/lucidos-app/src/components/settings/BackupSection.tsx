@@ -687,13 +687,16 @@ export function BackupSection() {
    *  still stood. Blanking is what the health card's skeleton keys off, so this
    *  flag is also the choice between "shimmer" and "leave it alone". */
   async function loadStatus({ keepPrevious = false }: { keepPrevious?: boolean } = {}) {
-    if (!selectedProvider) return;
+    const provider = selectedProvider;
+    if (!provider) return;
     if (!keepPrevious) setStatusLoadable({ status: 'loading' });
+    // A reply for a destination the user has since switched away from is
+    // dropped, or it would report that destination's health under the new name.
     try {
-      const status = await getBackupStatus(selectedProvider);
-      setStatusLoadable({ status: 'loaded', data: status });
+      const status = await getBackupStatus(provider);
+      if (live.current.provider === provider) setStatusLoadable({ status: 'loaded', data: status });
     } catch (err) {
-      setStatusLoadable(toFailed(err));
+      if (live.current.provider === provider) setStatusLoadable(toFailed(err));
     }
   }
 

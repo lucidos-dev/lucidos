@@ -5,6 +5,7 @@ import { BASE_PATH } from '../../utils/basePath';
 // client needs the same header and must not pull in the store to get it, so the
 // one copy lives in utils/.
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
+import { registrationToAwait } from '../../utils/deviceRegistration';
 import { clampText } from '../../utils/clampText';
 
 // Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
@@ -39,7 +40,7 @@ export class ApiError extends Error {
   }
 }
 
-/** The engine drops every connection while it restarts (Apply & Restart). A
+/** The engine drops every connection while it restarts (Switch to new version). A
  *  GET issued in that window hits the dead socket and surfaces as
  *  `TypeError: Load failed`, flipping whatever `Loadable` it feeds to `failed`
  *  — so the page sitting behind the "Restarting engine…" overlay paints a
@@ -77,6 +78,8 @@ function isHealthProbe(url: string): boolean {
  *  `{error}` body. JSON-response endpoints should use `json()`, which adds
  *  the header and parses for you. */
 export async function mutatingFetch(url: string, init?: RequestInit): Promise<Response> {
+  const registration = registrationToAwait(url, init?.method);
+  if (registration) await registration;
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   return fetch(url, { ...init, headers });
 }
@@ -246,6 +249,8 @@ export async function throwIfNotOk(res: Response): Promise<void> {
 async function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
   const method = (init?.method ?? 'GET').toUpperCase();
   if (method === 'GET' && !isHealthProbe(url)) await awaitEngineReady();
+  const registration = registrationToAwait(url, method);
+  if (registration) await registration;
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;

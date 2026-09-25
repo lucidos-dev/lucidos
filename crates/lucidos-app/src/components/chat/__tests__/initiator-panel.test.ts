@@ -26,7 +26,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('user');
   });
 
-  it('agent-mode MessageReceived (parent_thread origin): label is "Lucidos Agent", summary "Forwarded message", lucidos variant', () => {
+  it('agent-mode MessageReceived (parent_thread origin): label is "Lucidos Agent", summary names the sending thread, lucidos variant', () => {
     // Parent thread's LLM kicked off this child via run_thread — the Lucidos
     // agent (not the engine itself) is the initiator, so the WHO label must be
     // "Lucidos Agent" and the panel accent must be the agent's violet.
@@ -41,8 +41,28 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
     const desc = describeInitiator(ex, '<p>...</p>', [], 'tid');
     expect(desc.label).toBe(LUCIDOS_AGENT_LABEL);
-    expect(desc.summary).toBe('Forwarded message');
+    expect(desc.summary).toBe('Message from another thread');
     expect(desc.variant).toBe('lucidos');
+  });
+
+  it('agent-mode MessageReceived with no sender on record: summary "Forwarded message"', () => {
+    const ex = exchangeWith({ type: 'MessageReceived', text: 'x', mode: 'agent', channel: 'chat' });
+    expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Forwarded message');
+  });
+
+  it('a delivered held message names its sender and says it waited (ADR 0256)', () => {
+    const ex: Exchange = {
+      ...exchangeWith({
+        type: 'MessageReceived',
+        text: 'Stop now',
+        mode: 'agent',
+        channel: 'claude_code',
+        origin: { kind: 'thread_link', thread_id: 'parent-1', title: 'Loop master' },
+      }),
+      releasedFromHold: true,
+    };
+    expect(describeInitiator(ex, '<p>Stop now</p>', [], 'tid').summary)
+      .toBe('Message from "Loop master", held until you replied');
   });
 
   it('API-originated MessageReceived (human mode): chip is "API caller", summary "API message"', () => {
@@ -181,7 +201,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
-    expect(desc.label).toBe("Stopped waiting: tonight's E2E suite to pass");
+    expect(desc.label).toBe("Stopped waiting for tonight's E2E suite to pass");
     expect(desc.summary).toBeUndefined();
     // The chip stays clickable: the popover is where the device that pressed
     // the button is disclosed, off this event's own `actor`.
@@ -248,8 +268,8 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
    *  the resolved delivery is in hand, the event row in the body names the event
    *  instead.
    *
-   *  **No panel summary line**, because that row already reads "Event arrived:
-   *  <event>". Carrying one printed the same words twice, once as plain prose in
+   *  **No panel summary line**, because that row already names the event that
+   *  arrived. Carrying one printed the same words twice, once as plain prose in
    *  the header and once in the card underneath (reported 2026-08-10). Same as
    *  `TriggerStarted` and `ChildThreadCompleted` above, whose rows own their
    *  prefixes too. An injection with no resolved delivery is NOT this case and
@@ -442,12 +462,7 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
     expect(desc.details).toBeDefined();
   });
 
-  it('CredentialRequested / McpConsentRequested: iconless label = the request summary', () => {
-    const cred = describeInitiator(exchangeWith({ type: 'CredentialRequested', provider: 'github' }), '', [], 'tid');
-    expect(cred.icon).toBeNull();
-    expect(cred.label).toBe('Credentials requested: github');
-    expect(cred.variant).toBe('system');
-
+  it('McpConsentRequested: iconless label = the request summary', () => {
     const mcp = describeInitiator(exchangeWith({ type: 'McpConsentRequested', tool: 'search', args: {} }), '', [], 'tid');
     expect(mcp.icon).toBeNull();
     expect(mcp.label).toBe('Tool consent requested: search');

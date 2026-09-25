@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::ReplayedInput;
 
 /// Parse one line against a fresh stream, for the majority of tests below that
 /// judge a single frame in isolation. Anything about state that spans lines
@@ -111,9 +112,14 @@ fn parse_assistant_text() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::Message { role, text } => {
+        AgentEvent::Message {
+            role,
+            text,
+            opens_block,
+        } => {
             assert_eq!(role, "assistant");
             assert_eq!(text, "Hello world");
+            assert!(opens_block, "a Claude Code text block is always whole");
         }
         other => panic!("Expected Message, got {:?}", other),
     }
@@ -457,6 +463,64 @@ fn parse_legacy_tool_result_error() {
         }
         other => panic!("Expected ToolResult, got {:?}", other),
     }
+}
+
+/// With `--replay-user-messages`, Claude Code echoes each stdin input when it
+/// takes it in. That echo is the read report (ADR 0268). The shapes are copied
+/// from the real CLI: a text input, the output of a local `/compact`, and the
+/// interrupt notice, which carries no replay flag.
+#[test]
+fn a_replayed_input_reads_as_consumed() {
+    let text = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Also check the totals."}]},"isReplay":true}"#;
+    assert!(matches!(
+        parse_one_line(text).as_slice(),
+        [AgentEvent::InputRead(Some(_))]
+    ));
+    let compact = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"isReplay":true}"#;
+    assert!(matches!(
+        parse_one_line(compact).as_slice(),
+        [AgentEvent::InputRead(Some(_))]
+    ));
+    let interrupted = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#;
+    assert!(parse_one_line(interrupted).is_empty());
+}
+
+/// Inputs queued behind a busy turn come back in ONE replay. The shapes are
+/// copied from the real CLI: plain inputs join into one text, and an image
+/// among them keeps every input's blocks apart.
+#[test]
+fn a_replay_carries_what_every_queued_input_said() {
+    let replayed = |line: &str| match parse_one_line(line).as_slice() {
+        [AgentEvent::InputRead(Some(replay))] => replay.clone(),
+        other => panic!("expected one replay, got {other:?}"),
+    };
+    let joined = r#"{"type":"user","message":{"role":"user","content":"Say exactly: two\nSay exactly: three"},"isReplay":true}"#;
+    assert_eq!(
+        replayed(joined),
+        ReplayedInput {
+            texts: vec!["Say exactly: two\nSay exactly: three".into()],
+            images: 0,
+        }
+    );
+    let with_image = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"two"},{"type":"text","text":"three"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},{"type":"text","text":"four"}]},"isReplay":true}"#;
+    assert_eq!(
+        replayed(with_image),
+        ReplayedInput {
+            texts: vec!["two".into(), "three".into(), "four".into()],
+            images: 1,
+        }
+    );
+}
+
+/// A tool result is Claude Code's own output, so it never reports an input
+/// read, even if a future version flags it as a replay.
+#[test]
+fn a_tool_result_is_never_a_replay() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"Red","is_error":false}]},"isReplay":true}"#;
+    assert!(matches!(
+        parse_one_line(line).as_slice(),
+        [AgentEvent::ToolResult { .. }]
+    ));
 }
 
 // CC 2.1.76+ format: tool results come as "type": "user" messages

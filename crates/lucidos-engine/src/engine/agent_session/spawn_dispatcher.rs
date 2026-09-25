@@ -18,9 +18,8 @@
 //!   mid-turn-interrupted Claude Code session needs to resume without a new user
 //!   message. Production-active: the dispatcher pushes a [`SpawnRequest`]
 //!   onto an mpsc channel that a long-running task on `LucidosEngine`
-//!   consumes, calling `run_direct_agent` with empty input so CC re-enters
-//!   `--resume` against its prior session and continues from where it left
-//!   off.
+//!   consumes, calling `run_direct_agent` with `--resume` against the prior
+//!   session and the continuation text as its input (ADR 0272).
 //!
 //! Idempotency is keyed on the trigger event id: the same trigger never
 //! produces two spawns, even across engine restarts (the in-memory set is
@@ -98,9 +97,8 @@ fn continuation_superseded_events_sql() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRequest {
     /// Re-enter a Claude Code session that was interrupted mid-turn. The receiver
-    /// invokes `run_direct_agent` with empty input so CC reconnects via
-    /// `--resume` against its existing session id and continues without a
-    /// new user message.
+    /// invokes `run_direct_agent` with `--resume` against its existing session id,
+    /// sending the continuation text in place of a new user message.
     Continue {
         thread_id: Uuid,
         /// The originating `ContinuationRequested` event id — used downstream for
@@ -555,7 +553,14 @@ pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id:
     .bind(thread_id.to_string())
     .fetch_one(pool)
     .await
-    .unwrap_or(false)
+    .unwrap_or_else(|e| {
+        log!(
+            "[SpawnDispatcher] unactuated-continuation probe failed for {}: {}; emitting anyway",
+            thread_id,
+            e
+        );
+        false
+    })
 }
 
 /// Returns true when the events table contains a CC lifecycle event whose

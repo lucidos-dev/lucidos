@@ -338,12 +338,7 @@ fn call_ask_user_question(
     let options: Vec<Value> = args
         .get("options")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|label| serde_json::json!({ "label": label, "description": "" }))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(engine_option).collect())
         .unwrap_or_default();
 
     // Engine wire shape — same as CC's `tool_input.questions` (the engine's
@@ -379,6 +374,24 @@ fn call_ask_user_question(
         .map_err(|e| format!("HTTP body parse: {}", e))?;
 
     Ok(ask_tool_result(&resp, question))
+}
+
+/// One option in the engine's wire shape. The schema advertises plain labels,
+/// but a model may still send `{ label, description, preview }`. Dropping that
+/// object would leave the card with no button for it, so it passes through.
+/// Only an entry with no label at all is skipped.
+fn engine_option(option: &Value) -> Option<Value> {
+    if let Some(label) = option.as_str() {
+        return Some(serde_json::json!({ "label": label }));
+    }
+    let label = option.get("label")?.as_str()?;
+    let mut out = serde_json::json!({ "label": label });
+    for field in ["description", "preview"] {
+        if let Some(text) = option.get(field).and_then(Value::as_str) {
+            out[field] = Value::from(text);
+        }
+    }
+    Some(out)
 }
 
 /// The MCP tool result: the user's answer, or the engine's refusal as an error
@@ -565,6 +578,37 @@ mod tests {
         let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         let err = resp.error.unwrap();
         assert!(err["message"].as_str().unwrap().contains("question"));
+    }
+
+    /// Object options used to be dropped without a word, so a card could
+    /// arrive with no buttons at all.
+    #[test]
+    fn an_object_option_keeps_its_label_description_and_preview() {
+        let options: Vec<Value> = [
+            serde_json::json!("Ship it"),
+            serde_json::json!({
+                "label": "D",
+                "description": "Split by a dot",
+                "preview": "![D](artifacts/d.png)",
+                "extra": 1
+            }),
+            serde_json::json!({ "description": "no label" }),
+            serde_json::json!(7),
+        ]
+        .iter()
+        .filter_map(engine_option)
+        .collect();
+        assert_eq!(
+            options,
+            vec![
+                serde_json::json!({ "label": "Ship it" }),
+                serde_json::json!({
+                    "label": "D",
+                    "description": "Split by a dot",
+                    "preview": "![D](artifacts/d.png)"
+                }),
+            ]
+        );
     }
 
     #[test]

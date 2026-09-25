@@ -31,9 +31,10 @@ function sampleHeights(page: Page): Promise<Array<{ h: number; tr: string }>> {
  *  height wipe → nothing to assert. */
 test.describe('prompt textarea height survives the compose FLIP', () => {
   // Both the ThreadPane FLIP and the draft→draft height animation are gated on
-  // !prefersReducedMotion(). Headless Chromium can default prefers-reduced-motion
-  // to 'reduce', which would silently skip the very animations under test (and
-  // hide the regression). Force motion on so the tests actually exercise them.
+  // !isReducedMotion(), which follows the OS switch under the default `system`
+  // Motion setting. Headless Chromium can default that switch to 'reduce', which
+  // would silently skip the very animations under test (and hide the
+  // regression). Force motion on so the tests actually exercise them.
   test.use({ reducedMotion: 'no-preference' });
 
   test.beforeEach(async ({ page }) => {

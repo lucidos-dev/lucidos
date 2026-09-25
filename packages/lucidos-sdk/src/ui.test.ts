@@ -107,9 +107,11 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   let sseConnect: ReturnType<typeof vi.fn>;
   let getMock: ReturnType<typeof vi.fn>;
   let mqChangeListeners: Array<() => void>;
+  let motionChangeListeners: Array<() => void>;
   let mqQueries: string[];
   let origMatchMedia: unknown;
   let mqLight: boolean;
+  let mqReduce: boolean;
   let attrs: Record<string, string>;
   let originalGetAttribute: unknown;
   let originalSetAttribute: unknown;
@@ -134,8 +136,10 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     sseConnect = vi.fn();
     getMock = vi.fn().mockResolvedValue({ theme: 'system' });
     mqChangeListeners = [];
+    motionChangeListeners = [];
     mqQueries = [];
     mqLight = false;
+    mqReduce = false;
     setVisibility('visible');
     attrs = {};
     const el = document.documentElement as unknown as Record<string, unknown>;
@@ -150,9 +154,12 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     origMatchMedia = (globalThis as { matchMedia?: unknown }).matchMedia;
     (globalThis as { matchMedia?: unknown }).matchMedia = (q: string) => {
       mqQueries.push(q);
+      const motion = q.includes('reduced-motion');
       return {
-        get matches() { return mqLight; },
-        addEventListener: (type: string, fn: () => void) => { if (type === 'change') mqChangeListeners.push(fn); },
+        get matches() { return motion ? mqReduce : mqLight; },
+        addEventListener: (type: string, fn: () => void) => {
+          if (type === 'change') (motion ? motionChangeListeners : mqChangeListeners).push(fn);
+        },
         removeEventListener: () => {},
       };
     };
@@ -267,6 +274,28 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     expect(sseOn).toHaveBeenCalledTimes(1);
     expect(sseConnect).toHaveBeenCalledTimes(1);
     expect(mqChangeListeners).toHaveLength(1);
+    expect(motionChangeListeners).toHaveLength(1);
+  });
+
+  it('follows an OS reduce-motion flip under system, with no fetch', async () => {
+    await watchingOnSystem();
+    expect(attrs['data-motion']).toBe('full');
+
+    mqReduce = true;
+    motionChangeListeners[0]();
+
+    expect(attrs['data-motion']).toBe('reduce');
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit Full when the OS asks to reduce', async () => {
+    getMock.mockResolvedValue({ theme: 'system', motion: 'full' });
+    await watchingOnSystem();
+
+    mqReduce = true;
+    motionChangeListeners[0]();
+
+    expect(attrs['data-motion']).toBe('full');
   });
 });
 

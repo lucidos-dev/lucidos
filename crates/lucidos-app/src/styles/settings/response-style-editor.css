@@ -1,6 +1,16 @@
-/* Settings → Models → Response style: the Edit / Add modal.
+/* Settings → Models → Response style: the style list's Edited mark, and the
+   Edit / Add modal. */
 
-   The scrim spans the LAYOUT viewport, which iOS never shrinks for the
+/* Beside the name of an edited shipped style. Its description is still the
+   shipped one, so this is what says the text underneath has changed. */
+.style-row-edited {
+    margin-left: var(--space-sm);
+    font-size: var(--font-size-sm);
+    font-weight: normal;
+    color: var(--text-muted);
+}
+
+/* The scrim spans the LAYOUT viewport, which iOS never shrinks for the
    keyboard (`interactive-widget=resizes-visual` in index.html). A panel
    centred in that lands its lower half, Save included, under the keys the user
    is typing with. `--app-height` is the VISUAL viewport, published by
@@ -103,6 +113,14 @@
 .style-editor-field-label {
     font-size: var(--font-size-md);
     color: var(--text-primary);
+}
+
+/* What the field is for, under its label. The placeholder alone read as text
+   already filled in. */
+.style-editor-field-hint {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    line-height: 1.4;
 }
 
 /* `.settings-text-input` defends a 14rem floor when it shares a row with its

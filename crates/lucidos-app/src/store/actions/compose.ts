@@ -16,10 +16,13 @@
  * focused-textarea guards.
  */
 
+import { effect } from '@preact/signals';
 import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
 import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
 import {
+  composeSelections,
+  pendingComposeSelection,
   getComposeSelectionOverride,
   patchComposeSelection,
   clearComposeSelection,
@@ -43,6 +46,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { instantMicros } from '../../utils/isoInstant';
 import { sendMessage } from './chat';
+import { refreshRepositories } from './repositoriesLoader';
 // Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
 // this is a function declaration called at runtime, never at module init.
 import { forgetThreadEventsFailures } from './thread-loading';
@@ -115,6 +119,92 @@ export function applyDestination(threadId: string | null, d: ComposeDestination)
   if (threadId && getDraft(threadId).mode !== mode) {
     updateCompose(threadId, { mode });
   }
+}
+
+const DEFAULT_SCOPE: Scope = { kind: 'lucidos' };
+
+const isOnRepo = (scope: Scope | undefined, repoIds: ReadonlySet<string>): boolean =>
+  scope?.kind === 'external' && repoIds.has(scope.repoId);
+
+/** The repository ids that a compose target points at and `registered` lacks.
+ *  Only composing drafts count, since no other draft shows a picker. */
+function unregisteredTargetRepoIds(registered: ReadonlySet<string>): Set<string> {
+  const ids = new Set<string>();
+  const note = (scope: Scope | undefined): void => {
+    if (scope?.kind === 'external' && !registered.has(scope.repoId)) ids.add(scope.repoId);
+  };
+  note(selectedScope.value);
+  note(pendingComposeSelection.value.scope);
+  for (const [id, override] of composeSelections.value) {
+    if (threadMap.value.get(id)?.meta.state === 'composing') note(override.scope);
+  }
+  return ids;
+}
+
+/** Drop every compose target on one of `goneRepoIds`, so a deleted repo stops
+ *  being selected. A surface that showed it moves to the Lucidos Agent. That
+ *  destination exists on every build, and it never re-aims a coding prompt at
+ *  another codebase. */
+export function dropRepoTargets(goneRepoIds: ReadonlySet<string>): void {
+  // Each draft gets an explicit mode. A draft without one reads `inputMode`,
+  // and would follow it back to the coding agent on the Lucidos source.
+  for (const [id, override] of composeSelections.value) {
+    if (!isOnRepo(override.scope, goneRepoIds) || threadMap.value.get(id)?.meta.state !== 'composing') continue;
+    updateComposeSelection(id, { scope: DEFAULT_SCOPE });
+    if (getDraft(id).mode !== 'lucidos') updateCompose(id, { mode: 'lucidos' });
+  }
+  if (isOnRepo(resolveScope(null), goneRepoIds) && inputMode.value.type === 'coding_agent') {
+    inputMode.value = { type: 'do' };
+  }
+  if (isOnRepo(selectedScope.value, goneRepoIds)) selectedScope.value = DEFAULT_SCOPE;
+  if (isOnRepo(pendingComposeSelection.value.scope, goneRepoIds)) {
+    patchComposeSelection(null, { scope: DEFAULT_SCOPE });
+  }
+}
+
+/** Keep compose targets on registered repositories. Re-checks whenever the
+ *  repository list, a target, or a thread's state changes. A target missing
+ *  from the cached list is reconfirmed with a refetch before anything drops.
+ *  The cache can lag a repo another device just registered, and a draft reset
+ *  syncs to every device.
+ *
+ *  Checks are coalesced into a microtask, so one runs only after a thread load
+ *  has written a draft's selection, thread row and mode together. */
+export function installUnregisteredRepoTargetReset(
+  refetch: () => Promise<void> = refreshRepositories,
+): () => void {
+  let scheduled = false;
+  let confirming = false;
+  const registeredIds = (): Set<string> | null => {
+    const repos = repositories.peek();
+    return repos.status === 'loaded' ? new Set(repos.data.map(r => r.id)) : null;
+  };
+  const confirmAndDrop = async (): Promise<void> => {
+    const cached = registeredIds();
+    if (!cached || unregisteredTargetRepoIds(cached).size === 0) return;
+    confirming = true;
+    try {
+      await refetch();
+    } finally {
+      confirming = false;
+    }
+    const fresh = registeredIds();
+    const gone = fresh ? unregisteredTargetRepoIds(fresh) : new Set<string>();
+    if (gone.size > 0) dropRepoTargets(gone);
+  };
+  return effect(() => {
+    const repos = repositories.value;
+    void composeSelections.value;
+    void pendingComposeSelection.value;
+    void selectedScope.value;
+    void threadMap.value;
+    if (repos.status !== 'loaded' || scheduled || confirming) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      void confirmAndDrop();
+    });
+  });
 }
 
 interface ComposePatch {
@@ -517,9 +607,8 @@ function mutateThreadMeta(threadId: string, patch: Partial<ThreadMeta>): void {
  *
  *  Holds only the thread id, not a snapshot: the flush re-reads the CURRENT
  *  draft through `getDraft`, so last-write-wins is structural on the SEND side
- *  and no stale value can go out. Deciding what an ANSWER is allowed to conclude
- *  still needs a sequence, because overlapping PUTs can complete out of order:
- *  see `latestComposePushSeq`. */
+ *  and no stale value can go out. An ANSWER always belongs to the newest intent,
+ *  because writes for one thread never overlap: see `runComposePushes`. */
 const undeliveredComposeDrafts = new Set<string>();
 
 /** The engine REFUSED the PUT (4xx/5xx, a bad body). A verdict the user is owed

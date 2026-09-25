@@ -43,10 +43,11 @@ export interface ProxyClient {
 
 /** How long the host will wait on a proxied upstream before giving up.
  *
- *  Generous, because the upstream is somebody else's service rather than the
- *  engine. It exists so a hung backend cannot leave a pending entry for the
- *  life of the frame, which a bare `fetch` never needed. */
-const PROXY_TIMEOUT_MS = 120000;
+ *  The engine owns the real limit: `proxy_timeout_secs`, or an entry's
+ *  `timeout_secs`, with one proxied call capped at 600 s. This sits a minute
+ *  above that cap, so it never cuts first. It exists so a hung backend cannot
+ *  leave a pending entry for the life of the frame. An engine test pins it. */
+const PROXY_TIMEOUT_MS = 660000;
 
 export function proxy(name: string): ProxyClient {
   const safeName = encodeURIComponent(name);

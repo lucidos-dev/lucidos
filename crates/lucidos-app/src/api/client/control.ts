@@ -219,6 +219,45 @@ export async function getGatewayStatus(): Promise<GatewayStatus> {
   return controlJson<GatewayStatus>('/gateway/status');
 }
 
+/** What the banner may recommend about a group. Only an `app` can be quit by
+ *  name; a `process` may be a system service. Mirrors the gateway's
+ *  `UserKind`. */
+export type UserKind = 'lucidos' | 'app' | 'process';
+
+/** One group's share of this machine's memory. Mirrors the gateway's
+ *  `MemoryUser`. */
+export interface MemoryUser {
+  name: string;
+  bytes: number;
+  kind: UserKind;
+}
+
+/** One group's share of this machine's processor. `percent` is of the whole
+ *  computer, every core together. Mirrors the gateway's `ProcessorUser`. */
+export interface ProcessorUser {
+  name: string;
+  percent: number;
+  kind: UserKind;
+}
+
+/** Why an open episode says Lucidos is slow. Mirrors the gateway's
+ *  `SlownessReason`: memory shows in every workspace, unclear only in the
+ *  windows of `slow_workspaces`. */
+export type SlownessReason =
+  | { reason: 'memory'; top_users: MemoryUser[] }
+  | { reason: 'unclear'; busiest_apps: ProcessorUser[]; slow_workspaces: string[] };
+
+/** Is Lucidos slow, and why (ADRs 0274, 0283)? Mirrors the gateway's
+ *  `SlownessStatus`. */
+export type SlownessStatus =
+  | { state: 'normal' }
+  | ({ state: 'slow'; episode_id: string } & SlownessReason);
+
+/** The gateway's cached slowness answer. It never samples on request. */
+export async function getSlownessStatus(): Promise<SlownessStatus> {
+  return controlJson<SlownessStatus>('/slowness');
+}
+
 /** Ask the gateway to poll lucidos.dev if its answer is stale, and return the
  *  result. Concurrent callers coalesce inside the gateway, so N open windows
  *  still make one outbound request.
@@ -483,11 +522,6 @@ export function listPairedDevices(): Promise<PairedDevice[]> {
 export async function revokePairedDevice(id: string): Promise<void> {
   await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
-
-/** Slug a workspace name the way the gateway registry does. Re-exported from the
- *  leaf util `utils/slug` (single source of truth) so existing
- *  `from '.../api/client/control'` importers keep working. */
-export { slugifyWorkspaceName } from '../../utils/slug';
 
 /** Derive the workspace name a backup archive was produced for, from its
  *  filename (`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`). Returns null for a

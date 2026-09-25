@@ -55,7 +55,7 @@ fn user_message(text: &str) -> ThreadEvent {
 }
 
 /// Cancel = `user_hit_stop = true`, not a shutdown, with a real CC `Result`
-/// arriving (so `is_silent_resume = false`). The classifier must return
+/// arriving. The classifier must return
 /// `Canceled` AND `emit_idle = true` so the run loop emits both
 /// `ResponseCanceled` and `CodingAgentIdled` after a cancel.
 ///
@@ -64,12 +64,10 @@ fn user_message(text: &str) -> ThreadEvent {
 /// on `CodingAgentIdled` to know the turn closed.
 #[test]
 fn cancel_classifies_as_canceled_with_emit_idle_true() {
-    let is_silent_resume = false;
     let user_hit_stop = true;
     let is_shutdown = false;
 
     let (terminal, emit_idle) = classify_result(
-        is_silent_resume,
         user_hit_stop,
         false, // interrupt_is_redirect: a plain Stop, not a follow-up redirect
         is_shutdown,
@@ -79,9 +77,7 @@ fn cancel_classifies_as_canceled_with_emit_idle_true() {
 
     assert_eq!(
         terminal,
-        Some(TerminalKind::Canceled(
-            crate::engine::thread_events::CancelCause::UserStop
-        )),
+        TerminalKind::Canceled(crate::engine::thread_events::CancelCause::UserStop),
         "user-driven cancel must produce TerminalKind::Canceled"
     );
     assert!(

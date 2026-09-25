@@ -7,6 +7,10 @@
        indent from it. Everything that uses it lives inside `.thread-drawer`, so
        it needs no fallback; nothing outside the pane may claim it. */
     --drawer-row-inset: 1.25rem;
+    /* Where a thread row's content column ends. A var because the row divider
+       and a collapsed section's divider stop at the same x. The mobile block
+       below moves it: two hand-synced copies drifted the moment one did. */
+    --thread-row-pad-right: 0.5rem;
     width: var(--thread-drawer-width, 18.75rem);
     flex-shrink: 0;
     background: var(--bg-primary);
@@ -42,8 +46,9 @@
 
 /* Filter active indicator — no color override; count badge shows state */
 
-/* Filter panel: a VIEW INSIDE THIS PANE (see ThreadFilterPanel), covering the
-   thread list while it is up, on both layouts. The desktop drawer column and the
+/* Filter cover, the box the filter panel shows in: a VIEW INSIDE THIS PANE (see
+   ThreadFilterPanel and ThreadFilterCover), covering the thread list while it
+   is up, on both layouts. The desktop drawer column and the
    mobile threads pane are the same component, so `inset: 0` against
    `.thread-drawer` (position: relative above) lands it correctly on each without
    a media query. It deliberately wears the pane's OWN background and no card
@@ -54,37 +59,67 @@
    z-index must clear every POSITIONED layer inside the list, not just the list
    itself. `.thread-drawer-list` is not a stacking context (it cannot become one:
    `.flip-portal` is fixed inside it and has to escape all app chrome), so a
-   row's own z-index competes directly with the panel's. The list tops out at 2
-   (`.family-disclosure`, the sub-thread chevron + count badge; the family rail
-   and the status dot are 1), so the panel sits at 3. At 1 it lost to the
-   disclosure, and every sub-thread's chevron and badge floated over the filters,
-   which is exactly the trap of reading "the panel covers the list" as one layer
-   against one layer. A row FLYING between sections is a different thing and does
+   row's own z-index competes directly with the panel's. The list tops out at 1
+   (the family rail and the status dot), and the panel sits at 3. So "the panel
+   covers the list" is never one layer against one layer. A row FLYING between sections is a different thing and does
    cross the panel on purpose: it is cloned into `.flip-portal`,
    which is fixed at nearly the fullscreen layer on purpose so a flying thread
    clears all app chrome. Rare and sub-second, and never on the user's own facet
    toggles, since the filter is the hook's reset key. It carries neither a title
    row nor a footer: the pane header above says "Filters" while this is up, and
-   the same header's Filter button is the way out, wearing an X while the panel
+   the same header's Filter button is the way out, held down while the panel
    is open (Escape closes it too).
 
-   With nothing docked above or below it, the panel IS the pane's scroller while
-   it is up, which is what lets it take `.thread-drawer-list`'s own padding
+   With nothing docked above or below it, the cover IS the pane's scroller while
+   the panel is up, which is what lets it take `.thread-drawer-list`'s own padding
    below: the same list geometry, showing filters instead of threads. A block
    scroller, not a flex column, for the same reason the list is one: flex
    children shrink to fit rather than overflow, so a long filter list in a
    column would compress instead of scroll. */
-.thread-filter-panel {
+.thread-filter-cover {
     position: absolute;
     inset: 0;
     z-index: 3;
     background: var(--bg-primary);
-    overflow-y: auto;
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
     overscroll-behavior: contain;
-    /* Mirrors `.thread-drawer-list` exactly: breathing room above the first
-       section heading, a hair below the last row. */
-    padding-top: 0.75rem;
+    /* Mirrors `.thread-drawer-list` exactly: the same always-reserved scroll
+       gutter, breathing room above the first section heading, a hair below the
+       last row. */
+    padding-top: var(--space-md);
     padding-bottom: 0.25rem;
+    /* Shut: hidden, but only once the fade layer below has faded out. So on a
+       close the list shows exactly as the last option goes, never under it. */
+    visibility: hidden;
+    pointer-events: none;
+    transition: visibility 0s linear var(--duration-fast);
+}
+
+/* Open: the cover lands at once, opaque, and the options fade in over it. */
+.thread-filter-cover[data-open] {
+    visibility: visible;
+    pointer-events: auto;
+    transition: visibility 0s;
+}
+
+/* The fade runs on this layer, INSIDE the scroller, so the scrollbar never
+   fades with the options. It stays mounted, so a close during the fade in
+   reverses from where it is, and so does a reopen during the fade out. */
+.thread-filter-fade {
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease;
+}
+
+.thread-filter-cover[data-open] .thread-filter-fade {
+    opacity: 1;
+}
+
+/* Instant, not merely short: a scaled transition still waits for its start
+   (see .crossfade-layer in global/host-components.css). */
+:root[data-motion="reduce"] .thread-filter-cover,
+:root[data-motion="reduce"] .thread-filter-fade {
+    transition: none;
 }
 
 /* The panel's two section headings, "Status" and "By thread types". Deliberately
@@ -94,11 +129,11 @@
    was a muted --font-size-xs line, which let "View" and "Show" read as labels ON
    the rows under them rather than as a heading OVER them. Same padding as those
    headers too, so they start on the same x as a section heading in the list this
-   panel covers. */
+   panel covers. The words wear their `.drawer-section-label` as well, whose
+   cap-band trim puts the caps on the same y. */
 .thread-filter-title {
-    /* Flex so "By thread types" can carry its checkmark beside the words. On
-       the text-only "Status" heading this changes nothing: a lone text node in
-       a flex row lays out exactly as it does in a block. */
+    /* Flex so each heading's leading icon, and the checkmark on "By thread
+       types", sit on one centered row with the words. */
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -111,14 +146,32 @@
        thread type below dropped a whole one, on a toggle the user is watching.
        A LENGTH equal to the mark, not a ratio: the two tokens are what have to
        agree, and a ratio between them silently stops covering the mark the day
-       either one moves. It sizes the text-only "Status" heading identically, so
+       either one moves. It sizes the unchecked "Status" heading identically, so
        the panel's two headings also stand the same height as each other. */
     line-height: var(--icon-size-md);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-primary);
-    padding: 0.5rem 1rem 0.375rem var(--drawer-row-inset);
+    padding: var(--space-sm) 1rem calc(var(--space-md) + var(--space-sm)) var(--drawer-row-inset);
+}
+
+/* The leading icon wears the drawer section headers' `.drawer-section-icon`
+   glyph and size. Their title row spaces the icon with a 0.25rem gap plus this
+   0.25rem margin. This row's own 0.5rem gap already covers that, so the margin
+   goes. It takes the heading's bright colour rather than their grey. The rows
+   under it carry grey icons of the same size, and the heading must outrank them.
+   The active rule below still wins, being later at equal specificity. */
+.thread-filter-title .drawer-section-icon {
+    margin-right: 0;
+    color: var(--text-primary);
+}
+
+/* A ticked "By thread types" takes the accent on its icon and checkmark, the
+   same cue the active status row wears. Its words keep the heading colour. */
+.thread-filter-title-active .drawer-section-icon,
+.thread-filter-title-active .thread-filter-title-check {
+    color: var(--accent);
 }
 
 /* The mark on "By thread types" while a type is narrowing, beside the accent
@@ -135,15 +188,6 @@
 .thread-filter-title-check svg {
     width: var(--icon-size-md);
     height: var(--icon-size-md);
-}
-
-/* "By thread types" while a type is ticked, paired with the checkmark above.
-   Points the "filtered" note on the All statuses row at THIS section as its
-   cause, so the two never disagree. Still not a SELECTION: the single-select
-   set's own mark is on that row, since the types narrow it rather than competing
-   with it. */
-.thread-filter-title-active {
-    color: var(--accent);
 }
 
 /* A heading dims with the section it heads when a status view bypasses it,
@@ -197,10 +241,15 @@
     font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
 }
 
-.thread-filter-option:hover {
-    background: var(--bg-hover);
+/* Pointer hover only. A touch screen keeps `:hover` on the last row tapped, so
+   an unguarded band stayed behind on that row after the tap. */
+@media (hover: hover) {
+    .thread-filter-option:hover {
+        background: var(--bg-hover);
+    }
 }
 
 /* "Include deleted" while a status view is active. It sits inside the
@@ -234,22 +283,23 @@
 }
 
 /* Leading channel glyph on the Show-section rows (Lucidos / Coding Agent /
-   Triggers) — mirrors the per-thread source marks (ThreadTypeIcon). Fixed 1rem
-   box so the labels align, matching the View rows' icon column. The Lucidos mark
-   self-sizes via its own inline style; the monochrome line glyphs (CodeIcon, the
-   triggers CategoryIcon) size from this rule and inherit the row color. */
+   Triggers), mirroring the per-thread source marks (ThreadTypeIcon). Same box,
+   size and muted colour as the status rows' leading icon, so both halves of the
+   panel share one quiet icon column. The Lucidos mark self-sizes via its own
+   inline style; the line glyphs (CodeIcon, the triggers CategoryIcon) size here. */
 .thread-filter-channel-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
     flex-shrink: 0;
+    color: var(--text-secondary);
 }
 
 .thread-filter-channel-icon svg {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
 }
 
 /* The Lucidos mark renders in full brand color (the gradient tile) everywhere
@@ -313,17 +363,21 @@
     color: var(--text-primary);
     cursor: pointer;
     text-align: left;
+    -webkit-tap-highlight-color: transparent;
 }
 
-.drawer-view-option:hover {
-    background: var(--bg-hover);
+/* Pointer hover only, as on `.thread-filter-option` above. */
+@media (hover: hover) {
+    .drawer-view-option:hover {
+        background: var(--bg-hover);
+    }
 }
 
 /* "filtered" after the All statuses label, with its explainer icon: what is
    being shown differs from all of it. An annotation rather than part of the
    name, so it takes the `(deleted)` suffix's treatment (smaller, italic) while
-   inheriting the row's colour, which is the accent when the row is the active
-   one. No parentheses: the type alone reads as an aside.
+   inheriting the row's colour. No parentheses: the type alone reads as an
+   aside.
 
    It CARRIES the explainer icon, which is why the row it sits in is a
    `div[role="radio"]` and not the `<button>` its siblings are: a button cannot
@@ -338,7 +392,12 @@
     flex-shrink: 0;
 }
 
-.drawer-view-option-active {
+/* The active row keeps its words in the text colour. The accent marks it
+   through the leading icon and the checkmark only, since a whole line of it
+   reads louder than a "you are here" cue should. The icon selector names both
+   classes so it outranks the muted leading-icon rule further down. */
+.drawer-view-option.drawer-view-option-active > svg,
+.drawer-view-option-active .drawer-view-check {
     color: var(--accent);
 }
 
@@ -347,7 +406,7 @@
    the text) rather than riding the row's trailing edge or mirroring the Show
    section's leading toggle checkboxes. No reserved box width: it's present only
    when active, and the count is pinned right independently (margin-left below).
-   Sized like the row icons via `.drawer-view-option svg`. */
+   Sized by `.drawer-view-option svg`, a step above the leading icon. */
 .drawer-view-check {
     display: inline-flex;
     align-items: center;
@@ -358,6 +417,15 @@
     width: var(--icon-size-md);
     height: var(--icon-size-md);
     flex-shrink: 0;
+}
+
+/* The leading icon takes the "Status" heading's icon size in a muted grey, so
+   the glyphs read as quiet labels under the brighter heading mark. The active
+   row's accent (above) outranks the grey. */
+.drawer-view-option > svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    color: var(--text-secondary);
 }
 
 /* Trailing per-view count, pinned to the row's edge with `margin-left:auto`
@@ -388,24 +456,35 @@
    centered on the same column as the plain numbers. `.badge.drawer-view-count`
    outranks the base `.badge` and the plain `.drawer-view-count` regardless of
    stylesheet order; the base `.badge` supplies the blue background, radius,
-   padding, and min-height. */
+   padding, and min-height.
+   The plain cell's width above wins over the base `.badge` width, so the
+   circle restates it. styles/badges.css can round the box a pixel under the
+   cell, and half the difference goes on the trailing edge. The circle then
+   stays centred on the column the plain numbers share. */
 .badge.drawer-view-count {
     position: static;
     color: white;
     font-size: var(--font-size-3xs);
+    min-width: var(--badge-box, var(--badge-height));
+    margin-right: calc((var(--badge-height) - var(--badge-box, var(--badge-height))) / 2);
 }
 
 .thread-drawer-list {
     flex: 1;
-    overflow-y: auto;
+    /* Reserve the scrollbar's width even while the list fits. Otherwise the bar
+       comes and goes as sections and sub-threads expand or collapse, and every
+       row re-flows sideways. The same engine-covering pair as `.thread-content`
+       (chat/input-messages.css): Chromium honours the stable gutter on a
+       non-overflowing box, WebKit only reserves once `scroll` draws the bar. Both
+       are no-ops for overlay scrollbars, and the empty track is --bg-primary.
+       The bar is the app's normal one (components.css), and row backgrounds run
+       full width up to it, so a selection sits flush against it. */
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
     /* Breathing room above the first section header so it isn't flush against
        the "Threads" header chrome above the list. */
-    padding-top: 0.75rem;
+    padding-top: var(--space-md);
     padding-bottom: 0.25rem;
-    /* Use the app's normal scrollbar (the global `::-webkit-scrollbar` /
-     * `scrollbar-width` from components.css) — a visible 0.5rem classic bar. Row
-     * backgrounds run full width up to it (no right-side inset), so the selection
-     * sits flush against the scrollbar rather than leaving a `--bg-primary` gap. */
 }
 
 .thread-row {
@@ -421,10 +500,6 @@
      * hypothetical wrapper-less row on the un-indented column. */
     --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth-offset, 0px));
     padding-left: var(--thread-row-pad-left);
-    /* Where the row's content column ends. A var because the bottom-edge
-     * divider `::after` has to stop at the same x, and the mobile block below
-     * moves it: two hand-synced copies drifted the moment one of them did. */
-    --thread-row-pad-right: 0.5rem;
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: var(--thread-row-pad-right);
     /* No right MARGIN: the focused / hover / highlighted background runs full
@@ -459,8 +534,8 @@
  * below it. Drawn as a bottom-anchored `::after` (rather than `border-bottom`)
  * so both ends inset toward the row's text column: `left` is the row's
  * `padding-left` (`--thread-row-pad-left`) less a small 0.25rem nudge, so the
- * line starts just left of the thread-name text, and `right` reads the row's
- * own `--thread-row-pad-right` so it stops at the content column. Neither end
+ * line starts just left of the thread-name text, and `right` reads the
+ * drawer's `--thread-row-pad-right` so it stops at the content column. Neither end
  * runs flush to the drawer edge.
  * `--border-color` matches every other divider in the app. Scoped to
  * `.thread-drawer .thread-row` so it covers both wrapped rows (list / drafts)
@@ -571,145 +646,102 @@
     opacity: 0.45;
 }
 
-/* Sub-thread disclosure, horizontally centered on the parent row and aligned
- * to the same line as the row's copy-icon action so it reads as the parent's
- * (not the next thread's). The control swaps contents by state: while EXPANDED
- * it shows the ▴ chevron — pointing UP because the control sits above the
- * expanded sub-threads, so it reads as "pull these back up / collapse"; while
- * COLLAPSED it shows the sub-thread count badge alone — no chevron — so the badge itself
- * signals there are hidden sub-threads, and clicking it re-expands. The
- * centered anchor holds across the swap.
- *
- * Absolutely positioned so it never disturbs the title / status dot / right-
- * column flow. Vertically it rides the copy icon: that icon is the last child
- * of the (taller) right column, so its bottom edge lands on the row's content-
- * box bottom — i.e. `padding-bottom` from the row bottom. So `bottom` here =
- * that padding + half the icon-vs-badge height difference, which centers the
- * two on one line. Icon size and row padding both shift per breakpoint, so the
- * value is tuned in the media blocks below; this base covers ≤768px, where the
- * chevron/badge are bumped to 1.25rem (see the media block): row padding-bottom
- * 0.5rem + (1.5rem icon − 1.25rem control)/2 = 0.625rem. */
+/* Sub-thread toggle: a "Show / Hide N sub-threads" link on its own line under
+ * the date. It flows in the title column, so a long title can never run into
+ * it, and it sits directly above the sub-threads it opens and closes. The auto
+ * margin drops it to the row's bottom. The negative bottom margin reaches into
+ * the column's padding, centring the link on the pin and ⋯ icons opposite. The
+ * accent is mixed toward grey so the link stays quieter than the title but
+ * brighter than the date. Light mode keeps more accent, since its darker blue
+ * mixed half-and-half turns slate grey. Hover lifts it to a stronger blue, with
+ * no underline. One chevron rotates between the two states. The chevron turn
+ * is the only tap feedback, so this rule turns off iOS's grey tap flash. */
 .family-disclosure {
-    position: absolute;
-    left: 50%;
-    bottom: 0.625rem;
-    transform: translateX(-50%);
-    display: flex;
+    align-self: flex-start;
+    -webkit-tap-highlight-color: transparent;
+    display: inline-flex;
     align-items: center;
-    gap: 0.3125rem;
-    max-width: calc(100% - 1.5rem);
-    padding: 0;
+    gap: 0.1875rem;
+    margin-top: auto;
+    margin-bottom: -0.125rem;
+    padding: 0.125rem 0;
     background: none;
     border: none;
+    font-size: var(--font-size-2xs);
+    line-height: 1.2;
+    --disclosure-accent-share: 50%;
+    --disclosure-hover-color: var(--accent);
+    color: color-mix(in srgb, var(--accent) var(--disclosure-accent-share), var(--text-secondary));
     cursor: pointer;
-    color: var(--text-secondary);
-    /* Above the family rail + row divider (both z-index 1) so the corner
-     * where they meet doesn't clip the control. */
-    z-index: 2;
     transition: color var(--duration-fast) ease;
 }
 
+/* Sets only variables, so the :hover rule below still wins on colour. Hover
+ * darkens past the accent, since 80% to the full accent is too small to see. */
+html[data-theme="light"] .family-disclosure {
+    --disclosure-accent-share: 80%;
+    --disclosure-hover-color: color-mix(in srgb, var(--accent) 70%, var(--text-primary));
+}
+
+/* The chevron holds its own compositing layer in both states. WebKit drops the
+ * layer when the rotation ends, and repaints the chevron into the row at a
+ * different sub-pixel spot. In the packaged macOS app it then jumped right
+ * after landing on Hide. `will-change` keeps the layer, so the end of the turn
+ * paints exactly where the turn left it. Same fix as `.brand-mark-glyph`. */
+.family-disclosure svg {
+    width: 0.75rem;
+    height: 0.75rem;
+    flex-shrink: 0;
+    transform: rotate(0deg);
+    will-change: transform;
+    transition: transform var(--duration-normal) cubic-bezier(0.22, 0, 0, 1);
+}
+
+.family-disclosure[aria-expanded="true"] svg {
+    transform: rotate(90deg);
+}
+
 /* Keyboard focus: the shared soft accent ring (--focus-ring, see base.css /
- * .icon-btn:focus-visible) so Tab onto the sub-thread disclosure shows the same
- * custom focus border as every other control. :focus-visible (not :focus) keeps
- * a mouse click quiet, matching the icon/action buttons. The button has no base
- * border-radius (it wraps a bare ▴ glyph / pill count badge), so round the ring
- * here to match the icon buttons' soft ring rather than a boxy rectangle — this
- * has no other visual effect (no background/border to round) and no layout
- * impact (outline + box-shadow paint outside the box). The transparent outline
- * is the forced-colors fallback, where box-shadow is stripped. */
+ * .icon-btn:focus-visible). :focus-visible keeps a mouse click quiet. The
+ * transparent outline is the forced-colors fallback, where box-shadow is
+ * stripped. */
 .family-disclosure:focus-visible {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
-    border-radius: 0.375rem;
-}
-
-/* The expanded-state chevron is sized to match the collapsed-state count badge
- * (a 1rem box) so toggling a family open/closed swaps the two controls in place
- * with no jump in size or vertical position: both ride `.family-disclosure`
- * (bottom-anchored, `align-items: center`), so equal box heights land their tops
- * the same distance below the title. Was 0.75rem/line-height 1 — visibly smaller
- * than the badge and sitting a touch lower. Mobile bumps both to a 1.25rem box
- * (see the ≤768px block). */
-.family-disclosure-glyph {
-    font-size: var(--font-size-xl);
-    line-height: 1rem;
-}
-
-/* Reserve vertical room below the title / "N exchanges" meta for the bottom-
- * centered disclosure badge so a long (multi-line) title can't grow down into
- * it. The badge is absolutely positioned (horizontally centered, inside the
- * title column's width), so without this reserve the title's last line and the
- * meta slide under it — the overlap a 3-line title produced.
- *
- * The padding rides the LEFT column, not the row, so short-title family rows
- * stay compact: the badge tracks the (taller) right column's copy-icon line and
- * the reserve is absorbed as slack; only once the title column outgrows the
- * right column does the row get taller, pushing the badge clear of the title.
- *
- * Reserve = the badge's top edge above the row padding-box bottom, less the
- * row's own padding-bottom. Mobile clearance floor: bottom 0.625rem + badge
- * height 1.25rem − padding-bottom 0.5rem = 1.375rem; we use 1.875rem so the
- * title clears the control with a visible gap (≈0.625rem) instead of sitting
- * right on top of it (the old 1.5rem left only ~0.25rem). */
-.thread-row.thread-row-has-family .thread-row-left {
-    padding-bottom: 1.875rem;
-}
-
-/* Family rows reserve bottom room on the left column (rule above) for the
- * bottom-centered disclosure badge. That reserve would otherwise LIFT the
- * flow-positioned created date (its `margin-top: auto` drops it to the column's
- * content-box bottom, which now sits a full reserve-height above the row bottom)
- * clear of the bottom-pinned pin + overflow menu opposite it — the family-row
- * misalignment. Take the date out of flow and pin it to the bottom-left instead:
- * `bottom: 0.5rem` matches the row's padding-bottom, so it lands level with the
- * right column's actions (same as non-family rows), and `left` tracks the title's
- * indent. The title stays in flow, so it keeps the reserve's protection.
- *
- * `right: calc(50% + 1rem)` bounds the date to the row's left half (less 1rem),
- * so it ellipsizes before the horizontally-centered disclosure badge instead of
- * painting over it. Out of flow the date is no longer constrained by the left
- * flex column, so without this a long date on a deeply-nested row (its `left`
- * indent grows with `--thread-depth` while the badge stays centered) or a narrow
- * drawer would run under the chevron / count badge. */
-.thread-row.thread-row-has-family .thread-row-created {
-    position: absolute;
-    left: var(--thread-row-pad-left);
-    right: calc(50% + 1rem);
-    bottom: 0.5rem;
+    border-radius: 0.25rem;
 }
 
 @media (hover: hover) {
     .family-disclosure:hover {
-        color: var(--text-primary);
+        color: var(--disclosure-hover-color);
     }
 }
 
-/* Collapsed-only count badge — shared by collapsed section headers (number of
- * threads in the section) and collapsed family parents (number of hidden
- * sub-threads). Subtle accent-blue fill so the count reads as a pill, not a
- * bare number. On a focused parent row the row bg is --bg-selected (#1c3c64
- * dark), nearly identical to --bg-tertiary — so a neutral gray badge lost its
- * fill there; the blue tint stays distinct against both the normal and the
- * focused row bg. */
-.collapse-count-badge {
+/* Count badge on a section header: the number of threads the section holds.
+ * The accent-blue fill makes the count read as a pill. A drawer header draws
+ * that pill only while the section is collapsed (see below). */
+.section-count-badge {
     font-size: var(--font-size-2xs);
     font-weight: 600;
     line-height: 1rem;
-    min-width: 1rem;
+    /* The pill is as tall as its line. styles/badges.css rounds that to whole
+       pixels, which keeps the count centred. */
+    --badge-height: 1lh;
+    min-width: var(--badge-box, var(--badge-height));
     padding: 0 0.3125rem;
     text-align: center;
     border-radius: 0.625rem;
     color: var(--text-secondary);
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
+    background: var(--section-count-fill);
     font-variant-numeric: tabular-nums;
 }
 
 /* Dark mode: lift the accent share so the fill reads a touch bluer against the
  * darker row backgrounds (the 15% tint above looks washed out on dark). Light
- * mode keeps the base 15% — it stays distinct there already. */
-html[data-theme="dark"] .collapse-count-badge {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
+ * mode keeps the base 15%, which stays distinct there already. */
+html[data-theme="dark"] .section-count-badge {
+    --section-count-fill: color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 /* Focus is shown by the `bg-selected` fill alone — no leading accent bar.
@@ -771,15 +803,14 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.125rem;
+    /* The one gap between title, date and sub-thread link, so every row spaces
+     * its date the same whatever the chip column's height. */
+    gap: 0.375rem;
     /* Give wrapped titles descent room without making every row taller: this
      * only affects row height when the title column is the tallest column. */
     padding-bottom: 0.25rem;
-    /* Stretch to the row height (matching `.thread-row-right`) so the created
-     * date's `margin-top: auto` has free space to consume — it then drops to the
-     * bottom of the column, level with the bottom-pinned pin + overflow menu in
-     * the right column. Without this the column is content-height (`.list-row`'s
-     * `align-items: flex-start`), leaving no room to push the date down. */
+    /* Stretch to the row height, as `.thread-row-right` does, so the sub-thread
+     * link's `margin-top: auto` has free space to drop into. */
     align-self: stretch;
 }
 
@@ -798,11 +829,6 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 
 .thread-row-created {
     display: block;
-    /* Pin to the bottom of the (stretched) left column so the created date sits
-     * level with the bottom-pinned pin + overflow menu opposite it. Collapses to
-     * 0 when the title fills the column (multi-line), leaving the parent's
-     * 0.125rem gap as the minimum spacing below the title. */
-    margin-top: auto;
     font-size: var(--font-size-2xs);
     line-height: 1.2;
     color: var(--text-muted);
@@ -967,20 +993,6 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     .thread-row {
         padding-bottom: 0.5rem;
     }
-
-    /* Track the copy icon's line: row padding-bottom 0.5rem +
-     * (1.25rem icon − 1rem badge)/2 = 0.625rem. */
-    .family-disclosure {
-        bottom: 0.625rem;
-    }
-
-    /* Desktop badge/chevron are a 1rem box (vs mobile's 1.25rem). Clearance
-     * floor: badge bottom 0.625rem + height 1rem − row padding-bottom 0.5rem =
-     * 1.125rem; we use 1.625rem so the title clears the control with a visible
-     * gap (≈0.625rem) instead of crowding it (the old 1.25rem left only ~0.25rem). */
-    .thread-row.thread-row-has-family .thread-row-left {
-        padding-bottom: 1.625rem;
-    }
 }
 
 @media (max-width: 768px) {
@@ -994,32 +1006,16 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
      * slide into the vacated slot would leave that one control in the corner
      * this change exists to leave, so the whole right column moves in to the
      * shared --space-lg gutter. The chips above it travel with it, keeping one
-     * right edge, and the bottom divider tracks the same var. */
-    .thread-row {
+     * right edge, and both dividers track the same var. */
+    .thread-drawer {
         --thread-row-pad-right: var(--space-lg);
     }
 
-    /* Bigger sub-thread disclosure on touch — both the ▴ chevron (expanded) and
-     * the collapsed count badge are fiddly tap targets / hard to read at the base
-     * size; bump both to a 1.25rem box so the affordance is easy to hit AND the
-     * chevron stays the same size/position as the badge across the toggle (the
-     * line-height pins the glyph box to the badge's 1.25rem height — without it
-     * the base 1rem line-height would leave the chevron a hair short). The control
-     * is bottom-anchored, so it grows upward; the base `bottom` is tuned (0.625rem)
-     * to keep the 1.25rem chevron/badge centered on the copy-icon line. */
-    .family-disclosure-glyph {
-        font-size: var(--font-size-3xl);
-        line-height: 1.25rem;
-    }
-
-    /* Scoped to .family-disclosure so collapsed section-header count badges keep
-     * their compact size. */
-    .family-disclosure .collapse-count-badge {
-        font-size: var(--font-size-md);
-        line-height: 1.25rem;
-        min-width: 1.25rem;
-        padding: 0 0.4375rem;
-        border-radius: 0.75rem;
+    /* The footer link is a finger's tap target here, so it gets a larger font
+     * and more padding. */
+    .family-disclosure {
+        font-size: var(--font-size-xs);
+        padding: 0.25rem 0;
     }
 }
 
@@ -1117,16 +1113,69 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 
 /* --- Drawer sections (Running / Pinned) --- */
 
+/* Positioned so a disclosure mask (below) lays out against its own section,
+   and scrolls and clips with the list. */
 .drawer-section {
+    position: relative;
     padding: 0;
 }
 
-.drawer-section-collapsed::after {
-    content: '';
-    display: block;
-    margin: 0.5rem 1rem 0;
+/* A family or section showing or hiding its rows (useFlipAnimation): copies of
+   the rows slide inside this box, whose top edge is the parent's or header's
+   bottom edge. The overflow clip hides every copy above that edge. */
+.flip-disclosure-mask {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+/* Copies of rows that just left the list (useFlipAnimation's departures) lay
+   out against the row container, so they scroll and clip with the list. */
+.thread-drawer-rows {
+    position: relative;
+}
+
+.flip-departure-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 0;
+    pointer-events: none;
+}
+
+/* A collapsed section's divider, and the line that carries it while the rows
+   roll (useFlipAnimation's `carryHairline`). Both take the row divider's
+   insets, so the carried line lands on the divider exactly. */
+.thread-drawer .list-section-title-collapsible.collapsed::after,
+.thread-drawer .flip-disclosure-hairline {
+    position: absolute;
+    left: calc(var(--drawer-row-inset) - 0.25rem);
+    right: var(--thread-row-pad-right);
     border-bottom: 1px solid var(--border-color);
     pointer-events: none;
+}
+
+/* The divider sits on the header's bottom edge, where the rows finish
+   rolling up. It rides the header, so it slides with it when a section above
+   toggles. */
+.thread-drawer .list-section-title-collapsible.collapsed::after {
+    content: '';
+    bottom: 0;
+}
+
+/* The carried line narrows toward a nested closing row's indent by scaling,
+   and both lines end at the same right edge. */
+.thread-drawer .flip-disclosure-hairline {
+    transform-origin: right center;
+}
+
+/* While the rows roll, the carried line stands in for the divider. */
+.drawer-section:has(> .flip-disclosure-mask) > .list-section-title-collapsible.collapsed::after {
+    visibility: hidden;
 }
 
 /* Room between sections — the gap after a section's last thread, before the
@@ -1138,7 +1187,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
    inter-section separation that shrank when the header's top padding was
    trimmed, without re-bloating the top header. */
 .drawer-section + .drawer-section {
-    margin-top: 0.75rem;
+    margin-top: var(--space-md);
 }
 
 /* Flat section headers: drop the gray band that `.list-section-title` carries
@@ -1157,7 +1206,10 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
    the absolutely-positioned status-dot column to its left. */
 .thread-drawer .list-section-title {
     background: none;
-    padding: 0.5rem 1rem 0.375rem var(--drawer-row-inset);
+    /* The gap under the label equals the gap above it: the section margin (or
+       the list's padding-top) plus this top padding. Below, it runs to the first
+       row when open, and to the divider on this edge when collapsed. */
+    padding: var(--space-sm) 1rem calc(var(--space-md) + var(--space-sm)) var(--drawer-row-inset);
     /* No right inset — matches `.thread-row` (which also runs full width). The
        keyboard-highlight band painted on a focused header
        (`.list-section-title-highlighted`) runs to the drawer's right edge (or up
@@ -1183,19 +1235,15 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     cursor: pointer;
     -webkit-user-select: none;
     user-select: none;
-    /* Pin the header's line box to the collapse badge's own `line-height: 1rem`
-       (16px) so the label text and the badge share an identical cross-size.
-       Without this the badge (16px) is 1px taller than the bare 0.8125rem text
-       line box (15px): collapsing adds the badge, the flex row grows 1px, and
-       `align-items: center` re-centers the icon + label 0.5px downward. At
-       retina DPI that 0.5px crosses the device-pixel grid in some sections
-       (Pinned, Archive) but not others (Current) — the "section header jumps on
-       collapse/expand" report. Sharing the badge's line box makes the row a
-       constant height in both states, so the icon and label never move. */
+    /* Pin the header's line box to the count badge's own `line-height: 1rem`
+       (16px), so the label text and the badge share one cross-size. Otherwise
+       the badge is 1px taller than the bare 0.8125rem text line box (15px). The
+       row then grows to the badge, and `align-items: center` puts the icon and
+       label half a pixel off the grid in some sections but not others. */
     line-height: 1rem;
 }
 
-.list-section-title-collapsible > .collapse-count-badge {
+.list-section-title-collapsible > .section-count-badge {
     position: relative;
     /* A hand-tuned lift, and the block below retires it wherever it can. The
        label's caps ride above its own line box's middle, by whatever the font's
@@ -1207,6 +1255,46 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
        (0.25rem) — sets the name-to-count spacing apart from the icon-to-name
        gap so the badge doesn't crowd the label. */
     margin-left: 0.25rem;
+    /* The pill moves to `::before`, so it can animate apart from the digits.
+       `isolation` keeps the layer above the header's own background and below
+       the digits. */
+    isolation: isolate;
+    background: none;
+    /* The bare number grows to the `--font-size-sm` step (12/10). A transform,
+       not a font-size, so the row keeps its height and the size animates. It
+       scales from the box's centre, so the digits keep the pill's centre. */
+    transform: scale(1.2);
+    transition: transform var(--duration-slow) ease-out;
+}
+
+.list-section-title-collapsible.collapsed > .section-count-badge {
+    transform: none;
+    transition: transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* An open section shows its rows, so its count is a bare number. A collapsed
+ * one hides them, and the pill marks that. The pill shrinks away on open and
+ * springs back on collapse. Reduced motion collapses both to a swap. */
+.list-section-title-collapsible > .section-count-badge::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--section-count-fill);
+    opacity: 0;
+    transform: scale(0.5);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-normal) ease-in;
+}
+
+.list-section-title-collapsible.collapsed > .section-count-badge::before {
+    opacity: 1;
+    transform: scale(1);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 /* The label, its icon and its count on ONE cap band, derived instead of nudged.
@@ -1232,7 +1320,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
         text-box-edge: cap alphabetic;
     }
 
-    .list-section-title-collapsible > .collapse-count-badge {
+    .list-section-title-collapsible > .section-count-badge {
         top: 0;
     }
 }
@@ -1245,6 +1333,12 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     color: var(--text-secondary);
     flex: none;
     margin-right: 0.25rem;
+}
+
+/* The Pinned heading's pin, lowered to balance its top-heavy head against the
+   label. A transform, so the row's height and the label stay put. */
+.drawer-section-icon-pin {
+    transform: translateY(0.0625rem);
 }
 
 @media (hover: hover) {
@@ -1606,16 +1700,14 @@ textarea.thread-title-edit-input {
 }
 
 /* Reduced motion: disable decorative animations */
-@media (prefers-reduced-motion: reduce) {
-    .thread-drawer,
-    .drawer-divider,
-    .thread-title-display {
-        transition: none;
-    }
+:root[data-motion="reduce"] .thread-drawer,
+:root[data-motion="reduce"] .drawer-divider,
+:root[data-motion="reduce"] .thread-title-display {
+    transition: none;
+}
 
-    .thread-title-shimmer {
-        animation: none;
-    }
+:root[data-motion="reduce"] .thread-title-shimmer {
+    animation: none;
 }
 
 /* The row already separates its items with its own `gap`, so the explainer's

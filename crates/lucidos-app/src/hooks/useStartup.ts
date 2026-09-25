@@ -29,6 +29,7 @@ import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
 import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck } from '../store/actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from '../store/actions/engine-update';
+import { refreshSlowness, startSlownessChecks, stopSlownessChecks } from '../store/actions/slowness';
 import {
   loadEmbeddingModelStatus,
   subscribeToTailscaleServeProgress,
@@ -678,6 +679,8 @@ export function useStartup(): void {
       void loadWebhookIngress();
       // And the refusal state, whose two frames are edge-triggered too.
       void loadWebhookRefusals();
+      // And the machine's memory, whose poll skips a hidden window.
+      void refreshSlowness();
       // And the name the user gave this workspace, which they may have changed
       // in the picker on another device while this one slept. Behind the
       // gateway the in-app switcher re-adopts on every unfold, so this is
@@ -791,6 +794,9 @@ export function useStartup(): void {
     // store/actions/engine-update.ts.
     startEngineUpdateChecks();
 
+    // The gateway's slowness answer (ADRs 0274, 0283), polled while visible.
+    startSlownessChecks();
+
     return () => {
       unmounted = true;
       stopLiveness();
@@ -804,6 +810,7 @@ export function useStartup(): void {
       stopAppUpdateProgress();
       unsubscribeFromTailscaleServeProgress();
       stopEngineUpdateChecks();
+      stopSlownessChecks();
       clearTimeout(initialHealthCheck);
       window.removeEventListener('message', onAppFrameMessage);
       stopHashRouting();

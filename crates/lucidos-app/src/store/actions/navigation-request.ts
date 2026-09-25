@@ -4,14 +4,16 @@ import { openFilePreview, openUrl } from './artifacts';
 import { resolveFileTarget } from './fileTarget';
 import { openOAuthAuthorizationUrl } from './oauth';
 import { navigateToTrigger } from './triggers';
-import { focusThreadOrBootstrap, unfocusThread } from './threads';
+import { focusThread, focusThreadOrBootstrap, unfocusThread } from './threads';
+import { getDeviceId } from './devices';
+import { formatThreadLabel } from './thread-label';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
-import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
+import { showToast, dismissToast, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -377,4 +379,59 @@ export function handleNavigationRequest(nav: {
       showToast(`Unknown navigation target: ${nav.target}`, 'error');
       break;
   }
+}
+
+/** The nil UUID the engine stamps on a thread-less `NavigationRequested`. The
+ *  SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs) emits it, being
+ *  user-initiated and bound to no thread. */
+export const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
+
+/** The `actor` a navigation carries, in the shape the device test reads. */
+export interface NavigationActor {
+  kind?: string;
+  device_id?: string;
+}
+
+/** Whether a navigation scoped to `actor` is this device's to act on. An agent
+ *  navigate names one device (engine/tools/navigate.rs); one with no device
+ *  actor (a trigger turn, an app iframe) belongs to every device. */
+export function navigationIsForThisDevice(actor: NavigationActor | null | undefined): boolean {
+  return actor?.kind !== 'device' || actor.device_id === getDeviceId();
+}
+
+/** Route an engine-asked navigation from `sourceThreadId`: a `NavigationRequested`,
+ *  or the OAuth authorization page a form request carries.
+ *
+ *  It acts on this page directly only when it comes from the thread the user
+ *  is viewing, or from an app iframe. From any other thread it must not hijack
+ *  the page, so it offers the jump instead: Open lands on BOTH the source
+ *  thread and the target. The offer is keyed per source thread, so repeated
+ *  navigates refresh one offer instead of stacking. */
+export function routeThreadNavigation(
+  nav: Parameters<typeof handleNavigationRequest>[0],
+  actor: NavigationActor | null | undefined,
+  sourceThreadId: string,
+): void {
+  if (!navigationIsForThisDevice(actor)) return;
+  const fromApp = sourceThreadId === NIL_THREAD_ID;
+  if (fromApp || sourceThreadId === focusedThreadId.value) {
+    // Named in any "couldn't open" toast downstream, so the error says where
+    // it came from instead of swallowing it.
+    const source = fromApp ? 'an app' : formatThreadLabel(sourceThreadId);
+    handleNavigationRequest(nav, { source });
+    return;
+  }
+  const label = formatThreadLabel(sourceThreadId);
+  const key = `nav-offer-${sourceThreadId}`;
+  showToast(`${label} wants to open ${describeNavTarget(nav)}`, 'info', {
+    key,
+    action: {
+      label: 'Open',
+      onClick: () => {
+        dismissToast(key);
+        focusThread(sourceThreadId);
+        handleNavigationRequest(nav, { source: label });
+      },
+    },
+  });
 }

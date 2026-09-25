@@ -364,8 +364,23 @@ impl LucidosEngine {
         // (worktree_path, branch_name, repo_id, repo_root)
         let mut to_recover: Vec<(PathBuf, String, Option<String>, PathBuf)> = Vec::new();
 
-        for (repo_root, _scan_repo_id) in &repos_to_scan {
-            let wt_output = match git_cmd(&["worktree", "list", "--porcelain"], repo_root).await {
+        // Listed concurrently, parsed in root order, so `to_recover` keeps the
+        // order a serial scan produced.
+        let worktree_lists: Vec<_> = {
+            use futures::StreamExt;
+            futures::stream::iter(repos_to_scan.iter().map(|(repo_root, _)| async move {
+                (
+                    repo_root,
+                    git_cmd(&["worktree", "list", "--porcelain"], repo_root).await,
+                )
+            }))
+            .buffered(RECOVERY_GIT_CONCURRENCY)
+            .collect()
+            .await
+        };
+
+        for (repo_root, listed) in worktree_lists {
+            let wt_output = match listed {
                 Ok(o) => o,
                 Err(e) => {
                     log!(
@@ -528,9 +543,10 @@ impl LucidosEngine {
             branch_to_thread.entry(br).or_insert(tid);
         }
 
+        let t_classified = t0.elapsed();
         log!("[Recovery] Worktree scan: {}ms, DB classification: {}ms (worktrees={}, idle={}, running={})",
             t_worktree_scan.as_millis(),
-            (t0.elapsed() - t_worktree_scan).as_millis(),
+            (t_classified - t_worktree_scan).as_millis(),
             to_recover.len(),
             idle_branches.len(),
             actively_running_branches.len());
@@ -563,12 +579,15 @@ impl LucidosEngine {
                     return;
                 }
                 let coding_agent = engine.thread_coding_agent(thread_id).await;
+                // Read back, as the no-branch idle above does: this field
+                // overwrites the projection column.
+                let is_external_repo = engine.projection_says_external_repo(thread_id).await;
                 bus.emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
                             has_changes: false,
-                            is_external_repo: false,
+                            is_external_repo,
                             requires_restart: false,
                             cc_session_id: None,
                             coding_agent,
@@ -605,26 +624,12 @@ impl LucidosEngine {
                 continue;
             }
 
-            let mut found_repo: Option<(PathBuf, Option<String>)> = None;
-            for (repo_root, repo_id) in &repos_to_scan {
-                // `or_unknown(false)`: an unanswered probe must not claim the
-                // branch lives in THIS repo, or the scan below builds a worktree
-                // against the wrong root. Neither direction is free. A `false`
-                // puts a real recovery attempt in front of the destructive step,
-                // where a `true` goes straight to the wrong repo with none
-                // (`.claude/rules/rust.md`).
-                let branch_exists = crate::engine::git_ops::git_answer(
-                    &["rev-parse", "--verify", &format!("refs/heads/{}", branch)],
-                    repo_root,
-                )
+            // An unanswered probe never picks a repo. A miss puts a real
+            // recovery attempt in front of the destructive step, where a wrong
+            // pick goes straight to the wrong repo with none.
+            let found_repo = first_root_holding_branch(&repos_to_scan, branch)
                 .await
-                .or_unknown(false);
-
-                if branch_exists {
-                    found_repo = Some((repo_root.clone(), repo_id.clone()));
-                    break;
-                }
-            }
+                .cloned();
 
             match found_repo {
                 Some((repo_root, repo_id)) => {
@@ -777,6 +782,8 @@ impl LucidosEngine {
                 }
             }
         }
+
+        let t_lost_branches = t0.elapsed();
 
         let mut recovering_threads: std::collections::HashSet<uuid::Uuid> =
             std::collections::HashSet::new();
@@ -967,6 +974,13 @@ impl LucidosEngine {
             }
         }
 
+        log!(
+            "[Recovery] Lost-branch pass: {}ms, worktree pass: {}ms ({} recovering)",
+            (t_lost_branches - t_classified).as_millis(),
+            (t0.elapsed() - t_lost_branches).as_millis(),
+            recovering_threads.len()
+        );
+
         // Catch-all: settle any coding-agent thread the projection still shows
         // `running` that this pass neither resumed nor settled.
         settle_orphaned_running_coding_agent_threads(
@@ -1108,7 +1122,14 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
         .bind(thread_id.to_string())
         .fetch_one(pool)
         .await
-        .unwrap_or(false)
+        .unwrap_or_else(|e| {
+            log!(
+                "[Recovery] Could not read whether thread {} is parked on a question: {}",
+                thread_id,
+                e
+            );
+            false
+        })
 }
 
 /// True when an engine teardown must leave this thread exactly as it is because

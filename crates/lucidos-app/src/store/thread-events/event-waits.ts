@@ -85,28 +85,85 @@ export function formatRemaining(seconds: number): string {
   return `${s}s`;
 }
 
-/** One subscription as a label, using the same words the agent used in `on:`.
+/** Every entry of an `on:` list that names one event type, shown as one.
  *
- *  A condition is summarised as "filtered" rather than dumped: the raw operator
- *  JSON is developer-facing, and this is read by whoever is waiting.
+ *  An agent often watches one type several times with different filters (one
+ *  `CodingAgentIdled` per session). Listing each entry printed the same name six
+ *  times, joined by five "or"s, and said nothing the grouped form does not. */
+export interface SubscriptionGroup {
+  event_type: string;
+  /** Empty when any entry is unfiltered: that entry matches every event of the
+   *  type, so the group does too, whatever its siblings filter on. */
+  conditions: Record<string, unknown>[];
+}
+
+/** Groups in first-seen order, so the list still reads the way the agent wrote it. */
+export function groupSubscriptions(on: EventSubscription[]): SubscriptionGroup[] {
+  const groups = new Map<string, { conditions: Record<string, unknown>[]; unfiltered: boolean }>();
+  for (const s of on) {
+    const g = groups.get(s.event_type) ?? { conditions: [], unfiltered: false };
+    if (s.condition) g.conditions.push(s.condition);
+    else g.unfiltered = true;
+    groups.set(s.event_type, g);
+  }
+  return [...groups].map(([event_type, g]) => ({
+    event_type,
+    conditions: g.unfiltered ? [] : g.conditions,
+  }));
+}
+
+/** Everyday words for the event types a thread most often waits on. Any type
+ *  not listed here is split into words by `plainEventName`. */
+const PLAIN_EVENT_NAMES: Record<string, string> = {
+  BackgroundBashCompleted: 'background job finished',
+  CodingAgentIdled: 'coding agent stopped working',
+  ChangeProposed: 'change proposed',
+  ChangeApplied: 'change applied',
+  E2ELockReleased: 'test lock released',
+};
+
+/** One word of a PascalCase type: an acronym run, a capitalised word, or digits
+ *  glued to an acronym (`E2E`). */
+const TYPE_WORD = /[A-Z0-9]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z0-9]+/g;
+
+/** An event type as a reader says it: `BackgroundBashCompleted` reads
+ *  "background job finished". Event types are named in the past tense, so the
+ *  phrase fits a waiting row and an arrival card alike.
  *
- *  The summary is not the whole answer though. The two PRESSABLE surfaces open
- *  the condition itself, through `eventConditionDoor`, which is what makes
- *  "filtered how" answerable from the UI. The third consumer is the archive
- *  confirmation below, whose dialog takes plain strings and offers no door. */
-export function waitSubscriptionLabel(s: EventSubscription): string {
-  return s.condition ? `${s.event_type} (filtered)` : s.event_type;
+ *  Lower case, because it usually sits mid-sentence. An acronym keeps its
+ *  capitals. The raw type stays on the chip's tooltip (`eventNameChip`). */
+export function plainEventName(eventType: string): string {
+  const known = PLAIN_EVENT_NAMES[eventType];
+  if (known) return known;
+  const words = eventType.match(TYPE_WORD);
+  if (!words) return eventType;
+  return words.map((w) => (w.length > 1 && w === w.toUpperCase() ? w : w.toLowerCase())).join(' ');
+}
+
+/** How a group is narrowed, in words, or `undefined` when it is not.
+ *
+ *  A condition is summarised rather than dumped: the raw operator JSON is
+ *  developer-facing, and this is read by whoever is waiting. The two PRESSABLE
+ *  surfaces open the conditions themselves, through `eventConditionDoor`. */
+export function subscriptionFilterNote(g: SubscriptionGroup): string | undefined {
+  const n = g.conditions.length;
+  if (n === 0) return undefined;
+  return n === 1 ? 'matching only' : `${n} conditions`;
+}
+
+/** One group as a plain label, for a surface that holds no markup. */
+export function waitSubscriptionLabel(g: SubscriptionGroup): string {
+  const name = plainEventName(g.event_type);
+  const note = subscriptionFilterNote(g);
+  return note ? `${name} (${note})` : name;
 }
 
 /** The whole subscription as one plain string, for a surface that can hold no
  *  markup at all: the archive confirmation's detail list, which is `string[]`.
  *
- *  Neither pressable surface comes through here. Both label each entry on its
- *  own, because both make a filtered entry pressable, and a button cannot
- *  survive a joined string.
- *
- *  Takes the `on:` list rather than a whole wait, because that is all it reads.
- *  Its caller holds whole waits and hands over `w.on`. */
+ *  Neither pressable surface comes through here. Both label each group on its
+ *  own, because both make a filtered group pressable, and a button cannot
+ *  survive a joined string. */
 export function describeWaitSubscription(on: EventSubscription[]): string {
-  return on.map(waitSubscriptionLabel).join(' or ');
+  return groupSubscriptions(on).map(waitSubscriptionLabel).join(' or ');
 }

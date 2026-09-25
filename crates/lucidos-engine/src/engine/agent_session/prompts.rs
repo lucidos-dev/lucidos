@@ -76,11 +76,14 @@ const NO_MEMORY_FILES_RULE: &str = "NEVER WRITE A CODING-AGENT MEMORY FILE: Do n
 const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your commits sit \
     as a pending change on this thread. The user explicitly clicks Apply to merge your branch into \
     main — nothing happens automatically. The button label is \"Apply\" (no restart needed) or \
-    \"Apply & Restart\" (restart needed); the engine derives this from the touched files. ANY \
+    \"Apply*\" (restart needed); the engine derives this from the touched files. ANY \
     of these triggers restart: a non-test `.rs` file, `Cargo.toml`, `Cargo.lock`, a `.sql` \
     migration under `migrations/`, an SDK bundle source under `packages/lucidos-sdk/`, or an \
     engine-bundled asset (`crates/lucidos-engine/src/api/sdk_iframe.css`, `sdk_iframe_audio.js`). \
     Frontend-only edits (TypeScript/CSS outside those bundled assets) do NOT trigger restart.\n\n\
+    Apply never restarts Lucidos, even when you run `lucidos changes apply` yourself. It builds \
+    the new version in the background; the user then taps \"Switch to new version\" to restart \
+    onto it. Never tell the user an apply restarts Lucidos.\n\n\
     DO NOT comment on restart status in your session summary or anywhere else — do not write \
     \"no restart required\", \"restart required\", \"just a code rebuild\", or any equivalent. \
     The button label is the source of truth and the user already sees it. If your intuition \
@@ -169,6 +172,10 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
 /// Kept repo-generic, with no Lucidos-only tokens, so it is safe in the
 /// external-repo recovery prompt. The companion half is the neutral
 /// `RESTART_INTERRUPT_REASON` returned on the permission teardown path.
+///
+/// Only a recovery spawn carries this prompt. Every other resume, a switch
+/// auto-resume or a Continue click among them, hears of the restart through
+/// the turn-gap note's restart line (`turn_gap::last_turn_cut_off_by_restart`).
 const RESTART_NOT_REJECTION_RULE: &str = "RESTART CONTEXT — NOT A REJECTION: This session was \
     resumed after the engine restarted mid-work. If your recent history shows a permission denial \
     (e.g. \"User denied\"), a tool call that was interrupted or never completed, or a synthetic \
@@ -220,27 +227,27 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     ends (you go idle), the Lucidos engine terminates your whole process group: you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
     detached job) is therefore KILLED the instant you end the turn, and nothing re-invokes you \
-    when it would have finished. There is no blocking wait tool for background work either. \
-    Use one of two shapes. FOREGROUND, for anything that surely fits in 10 minutes: set the \
-    timeout EXPLICITLY to its maximum (Claude Code's Bash tool takes `timeout: 600000`; its \
-    120000 ms DEFAULT silently cuts a long build off at 2 minutes). Overrunning that ceiling \
-    kills the command and throws the work away, so do not gamble on the estimate. BACKGROUND \
-    TASK, for anything longer or uncertain: `lucidos background-task run -- '<cmd>'` hands the \
-    command to the engine, which runs it in your worktree and arms an event wait on its \
-    completion. When it prints `watched`, say what you are waiting for and END YOUR TURN: \
-    nothing is blocking, the thread re-opens with the exit status and the tail of the output, \
-    and waiting inside the turn would only re-read your whole context. If it prints \
-    `unwatched`, nothing will wake you: stop the task and run the command in the foreground. \
-    REDIRECT a chatty command's output to a log file (`<cmd> > /tmp/$(basename \"$PWD\").log \
-    2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE BACKGROUND \
-    WORK TOO: under Claude Code the `Agent` tool runs one in the BACKGROUND BY DEFAULT, and its \
-    report never reaches you if your turn ends first, because the subagent dies with your \
-    process group. Launch a subagent whose result you need with `run_in_background: false`, \
-    which blocks and hands you the report inline. A fan-out still costs ONE wait: put every \
-    `Agent` call in a single assistant message and they run in parallel. NEVER improvise a \
-    stall instead: a filler subagent, a sleep loop, or a fabricated question to hold the turn \
-    open. Those waste the turn, and a fabricated question also parks the thread on a card the \
-    user must clear.";
+    when it would have finished. There is no blocking wait tool for background work either. Use \
+    one of two shapes. FOREGROUND, for anything that surely fits in 10 minutes: set the timeout \
+    EXPLICITLY to its maximum (Claude Code's Bash tool takes `timeout: 600000`; its 120000 ms \
+    DEFAULT silently cuts a long build off at 2 minutes). Overrunning that ceiling kills the \
+    command and throws the work away, so do not gamble on the estimate. BACKGROUND TASK, for \
+    anything longer or uncertain: `lucidos background-task run --description \"<what it is>\" -- \
+    '<cmd>'` hands the command to the engine, which runs it in your worktree and arms an event \
+    wait on its completion. The user reads the description on the thread's waiting row, so name \
+    the work in their words (\"the full e2e suite\"). When it prints `watched`, say what you are \
+    waiting for and END YOUR TURN: nothing is blocking, the thread re-opens with the exit status \
+    and the tail of the output, and waiting inside the turn would only re-read your whole context. \
+    If it prints `unwatched`, nothing will wake you: stop the task and run the command in the \
+    foreground. REDIRECT a chatty command's output to a log file (`<cmd> > /tmp/$(basename \
+    \"$PWD\").log 2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE \
+    BACKGROUND WORK TOO: under Claude Code the `Agent` tool runs one in the BACKGROUND BY DEFAULT, \
+    and its report never reaches you if your turn ends first, because the subagent dies with your \
+    process group. Launch a subagent whose result you need with `run_in_background: false`, which \
+    blocks and hands you the report inline. A fan-out still costs ONE wait: put every `Agent` call \
+    in a single assistant message and they run in parallel. NEVER improvise a stall instead: a \
+    filler subagent, a sleep loop, or a fabricated question to hold the turn open. Those waste the \
+    turn, and a fabricated question also parks the thread on a card the user must clear.";
 
 /// Send the coding agent's DECISIONS through the structured `AskUserQuestion`
 /// tool, which the Lucidos UI renders as clickable buttons. Forbids post-work
@@ -615,33 +622,27 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     question, stop the assistant message after the `ask_user_question` tool call and do not \
     include any sibling tool calls.";
 
-/// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
-/// [`append_backend_rules`] — the shared chokepoint that rides every flavor
-/// (normal, recovery, conflict, override) for both backends. Both Claude Code
-/// and Codex run their reasoning in a channel the Lucidos UI does not render:
-/// CC's extended-thinking blocks come back `display: "omitted"` (signature only,
-/// no `thinking_delta`) by default for the current models and stay empty even
-/// when summarized display is requested in headless `stream-json` mode (an
-/// upstream CC limitation — see `runtime/claude_code_parse.rs` and the
-/// `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`), and
-/// Codex streams only a lossy reasoning *summary* (`model_reasoning_summary`
-/// — see `CODEX_REASONING_SUMMARY` in `runtime/codex.rs`), never the full
-/// reasoning. So anything the model parks in its
-/// reasoning is invisible (CC) or unreliably summarized (Codex) for the
-/// user. Without this rule the agent drafts
-/// user-facing content there and then references it as if shown — the real
-/// "Caption copy: do the six lines above work?" card whose six lines never
-/// appeared. We cannot extract the reasoning text (it is a summary at best, and
-/// unavailable through the CC CLI we drive); the fix is guidance — tell the
-/// agent its reasoning is not shown so it puts must-see content in a visible
-/// message.
+/// Backend-independent teaching appended to every coding-agent prompt by
+/// [`append_backend_rules`], the chokepoint every flavor and both backends ride.
+///
+/// Neither backend shows the user its reasoning. Claude Code returns thinking
+/// as a signature only, or on an always-thinking model as a short progress
+/// note (`runtime/vertex_relay.rs`). Codex streams a lossy summary
+/// (`CODEX_REASONING_SUMMARY` in `runtime/codex.rs`). An agent that drafts
+/// user-facing content there and then points at it points at nothing. Two
+/// real cards: "Caption copy: do the six lines above work?", and later "the
+/// card copy above". The API never returns the full text, so this is guidance,
+/// backed by `question_card_gate` refusing a card that says "above".
 const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
     YOUR REASONING IS NOT SHOWN TO THE USER: The user sees only your visible assistant messages \
     and your tool calls, never your reasoning. So anything they must see or act on (draft copy \
     to approve, the options behind a question, a snippet to review, what you found) MUST go in a \
     visible assistant message, or in a tool field the UI renders, such as a question tool's \
     `question` / `options`. Never reference content as if they saw it (\"the six lines above\") \
-    unless you put it in a visible message this turn.";
+    unless you put it in a visible message this turn. Before a tool call, your prose may reach \
+    them only as a short note of a sentence or two, however much you drafted. So content they \
+    must read in full goes on the question card itself, in the question or the option \
+    descriptions.";
 
 /// Sibling of [`REASONING_NOT_VISIBLE_RULE`], riding the same
 /// [`append_backend_rules`] chokepoint, and the same shape of mistake: the
@@ -658,6 +659,19 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
 /// rewrites a workspace-relative source onto the `/data` mount. Full trace in
 /// `docs/plans/2026-08-26-cc-tool-results-and-showing-the-user-an-image.md`.
 ///
+/// A later session knew the alternative and still stopped halfway. It saved the
+/// picture, wrote "I've drawn out the options", and never pasted the image
+/// line. So the rule names saving as showing nothing too. `lucidos data write`
+/// says the same when it saves a picture.
+///
+/// The card comes first, with its reason, because a reply written just before
+/// a card arrives as a short summary without the picture. The
+/// `question_card_gate` refuses such a card once:
+/// `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md`.
+///
+/// The visual-choice clause counters Claude Code's own tool text, which calls
+/// `preview` the place for mockups and shows it as monospace text.
+///
 /// The tell is deliberately the STEP'S SUBJECT, never the label
 /// `claude_code_parse::describe_content_block` renders. A rule naming a
 /// rendering detail goes stale the next time one moves. It then teaches the
@@ -667,15 +681,22 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
 /// `chat::process::system_prompt`, which made the same mistake for the same
 /// reason: it taught that a path becomes a link and stopped there. It is
 /// phrased differently because that agent writes `data/` directly and needs no
-/// `lucidos data write`. Change both together.
+/// `lucidos data write`. Its question-card clause names an option's
+/// description, since that agent's question tool has no `preview`
+/// (`docs/plans/2026-09-24-pictures-on-question-cards.md`). Change both together.
 const SHOWING_AN_IMAGE_RULE: &str = "\n\n\
-    READING AN IMAGE DOES NOT SHOW IT TO THE USER: `Read` on a PNG is an INPUT. It puts the \
-    picture in YOUR context and sends the user nothing: their step records that you read a \
-    file, never the picture itself. So never read a screenshot and then write \"here is the \
-    image\". To show one, put it in the workspace and use markdown IMAGE syntax: \
-    `lucidos data write artifacts/x.png --from /tmp/x.png`, then \
-    `![what it shows](artifacts/x.png)`, which renders inline. Same for any render, chart or \
-    diagram you produce.";
+    READING OR SAVING AN IMAGE DOES NOT SHOW IT TO THE USER: `Read` on a PNG is an INPUT. It \
+    puts the picture in YOUR context and sends the user nothing: their step records that you \
+    read a file, never the picture. `lucidos data write artifacts/x.png --from /tmp/x.png` \
+    only stores it, and the user still sees nothing. It appears ONLY where you paste the line \
+    it prints, `![what it shows](artifacts/x.png)`. Before a card, put it ON the question card \
+    (its text or an option's `preview` if your tool has one): words before a tool call arrive \
+    as a short summary that drops it. Else, in the reply ending your turn. Same for a render or \
+    chart. SHOW A VISUAL CHOICE AS PICTURES. For mockups or options that differ in colour, \
+    layout or type, render real ones. A headless-browser screenshot of the actual CSS works. \
+    ASCII art shows no colour. Give each option its own picture of only that option. Put it in \
+    that option's `preview` if your tool has one, else label it in the question. Never repeat \
+    one combined sheet on every option.";
 
 /// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
 /// [`append_backend_rules`], the same chokepoint [`REASONING_NOT_VISIBLE_RULE`]
@@ -1615,8 +1636,12 @@ mod tests {
         ("app_worktree", "codex", 19713),
         ("app_worktree_recovery", "claude-code", 20154),
         ("app_worktree_recovery", "codex", 18277),
-        ("conflict_resolution", "claude-code", 5811),
-        ("conflict_resolution", "codex", 7083),
+        // Both conflict_resolution rows rose by about 115 bytes when
+        // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
+        // either. The other rows had the slack to absorb it. Both rose again,
+        // by 384, for its visual-choice clause: a real picture per option.
+        ("conflict_resolution", "claude-code", 6310),
+        ("conflict_resolution", "codex", 7580),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -1879,6 +1904,7 @@ mod tests {
                     "YOUR REASONING IS NOT SHOWN TO THE USER",
                     "MUST go in a visible assistant message",
                     "the six lines above",
+                    "only as a short note of a sentence or two",
                 ] {
                     assert!(
                         full.contains(needle),
@@ -1921,11 +1947,31 @@ mod tests {
             for (label, base) in &flavors {
                 let full = append_backend_rules(base.clone(), agent);
                 for needle in [
-                    "READING AN IMAGE DOES NOT SHOW IT TO THE USER",
+                    "READING OR SAVING AN IMAGE DOES NOT SHOW IT TO THE USER",
                     // The alternative is the load-bearing half: the session
                     // that failed did not know one existed.
                     "lucidos data write artifacts/",
                     "![what it shows](artifacts/x.png)",
+                    // The tell names the step's subject, see the rule's doc.
+                    "their step records that you read a file",
+                    // A session saved the picture, wrote "I've drawn the
+                    // options", and pasted no image line, so saving must be
+                    // named as showing nothing too.
+                    "only stores it, and the user still sees nothing",
+                    // Codex's question tool takes plain string options, so an
+                    // unconditional `preview` would send it objects it drops.
+                    "`preview` if your tool has one",
+                    // Pictures pasted into the reply just before a card were
+                    // summarized away, twice. So the card comes first, with
+                    // the reason, and the reply only when it ends the turn.
+                    "Before a card, put it ON the question card",
+                    "arrive as a short summary that drops it",
+                    "in the reply ending your turn",
+                    // Colour options came as ASCII art, then as one sheet of
+                    // all four options repeated on every button.
+                    "ASCII art shows no colour",
+                    "its own picture of only that option",
+                    "Never repeat one combined sheet on every option",
                 ] {
                     assert!(
                         full.contains(needle),
@@ -1933,6 +1979,11 @@ mod tests {
                          and how to show one (`{needle}`)",
                     );
                 }
+                // "The same message" as the card is where the picture is lost.
+                assert!(
+                    !full.contains("without that line in the same message"),
+                    "{label} ({agent:?}) must not send a picture into the words before a card",
+                );
             }
         }
     }
@@ -2530,6 +2581,22 @@ mod tests {
                 prompt.contains("files_require_restart"),
                 "{label} must point at the engine function (`files_require_restart`)",
             );
+            // Apply only builds; the user switches. The retired label reads
+            // as a restart on click, so it must not come back.
+            assert!(
+                !prompt.contains("Apply & Restart"),
+                "{label} must not name the retired \"Apply & Restart\" label",
+            );
+            for needle in [
+                "\"Apply*\"",
+                "Apply never restarts Lucidos",
+                "Switch to new version",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must say {needle}: Apply builds, the user switches",
+                );
+            }
         }
     }
 

@@ -162,11 +162,9 @@
 /* Still says the same thing, and says it without moving. The bars stay at the
    height the animation would give them mid-rise, so the row reads as a mark
    rather than as a paused animation. */
-@media (prefers-reduced-motion: reduce) {
-    .live-speech-bar {
-        animation: none;
-        transform: scaleY(1.6);
-    }
+:root[data-motion="reduce"] .live-speech-bar {
+    animation: none;
+    transform: scaleY(1.6);
 }
 
 /* The caller's bubble before any words exist, holding the mark alone.

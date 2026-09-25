@@ -16,6 +16,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   isRenderedThreadIdle,
+  isThreadStreaming,
   answeringThreadIds,
   markThreadAnswering,
   clearThreadAnswering,
@@ -120,5 +121,35 @@ describe('markThreadAnswering / clearThreadAnswering', () => {
     expect(answeringThreadIds.value.has('t1')).toBe(false);
     clearThreadAnswering('t1'); // idempotent on a missing id
     expect(answeringThreadIds.value.has('t1')).toBe(false);
+  });
+});
+
+/** The transcript follow's liveness: a scroll turns the follow off only while
+ *  this is true, and parks it otherwise (ADR 0064, the user's instruction).
+ *  So every quiet status must read false, not just the two quiescent ones. */
+describe('isThreadStreaming', () => {
+  afterEach(() => {
+    answeringThreadIds.value = new Set();
+  });
+
+  it('is true only for a running thread', () => {
+    expect(isThreadStreaming(makeThread('t1', 'running'))).toBe(true);
+    for (const status of ['idle', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const) {
+      expect(isThreadStreaming(makeThread('t1', status))).toBe(false);
+    }
+  });
+
+  it('is true while an answer resumes a question-parked thread', () => {
+    markThreadAnswering('t1');
+    expect(isThreadStreaming(makeThread('t1', 'waiting_for_user_answer'))).toBe(true);
+  });
+
+  it('is true for a sent follow-up, and false for one the refetch gave up on', () => {
+    const sent = makeThread('t1', 'waiting');
+    sent.pendingUserMessages = [{ unconfirmed: false } as any];
+    expect(isThreadStreaming(sent)).toBe(true);
+    const abandoned = makeThread('t1', 'waiting');
+    abandoned.pendingUserMessages = [{ unconfirmed: true } as any];
+    expect(isThreadStreaming(abandoned)).toBe(false);
   });
 });

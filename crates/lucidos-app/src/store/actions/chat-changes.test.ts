@@ -1,9 +1,18 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Change } from '../../api/client';
-import { changes, appliedChanges, lazyChanges, applyAllInProgress } from '../store';
+import { ApiError } from '../../api/client';
+import {
+  changes,
+  appliedChanges,
+  lazyChanges,
+  applyAllInProgress,
+  standingApplyThreadIds,
+  toasts,
+} from '../store';
 
 const mockGetChangeById = vi.fn();
 const mockApplyAll = vi.fn();
+const mockDisarm = vi.fn();
 
 vi.mock(import('../../api/client'), async (importOriginal) => {
   const actual = await importOriginal();
@@ -11,10 +20,11 @@ vi.mock(import('../../api/client'), async (importOriginal) => {
     ...actual,
     getChangeById: (...args: Parameters<typeof actual.getChangeById>) => mockGetChangeById(...args),
     applyAllChanges: (...args: Parameters<typeof actual.applyAllChanges>) => mockApplyAll(...args),
+    disarmStandingApply: (...args: Parameters<typeof actual.disarmStandingApply>) => mockDisarm(...args),
   };
 });
 
-const { ensureChangeLoaded, applyAllChanges } = await import('./chat-changes');
+const { ensureChangeLoaded, applyAllChanges, disarmStandingApply } = await import('./chat-changes');
 
 function makeChange(id: string, overrides: Partial<Change> = {}): Change {
   return {
@@ -46,6 +56,33 @@ beforeEach(() => {
   appliedChanges.value = { status: 'loaded', data: [] };
   lazyChanges.value = new Map();
   applyAllInProgress.value = false;
+  standingApplyThreadIds.value = new Set();
+  toasts.value = [];
+});
+
+/** A 404 says the engine holds no arm for the thread, which is what the owner
+ *  asked for. A missed ending event is how the flag got there. */
+describe('disarmStandingApply', () => {
+  it('reads a 404 as already disarmed: the flag clears and nothing toasts', async () => {
+    standingApplyThreadIds.value = new Set(['t1', 't2']);
+    mockDisarm.mockRejectedValue(new ApiError(404, 'No standing apply on that thread'));
+
+    await disarmStandingApply('t1');
+
+    expect([...standingApplyThreadIds.value]).toEqual(['t2']);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('still reports any other failure, and keeps the flag', async () => {
+    standingApplyThreadIds.value = new Set(['t1']);
+    mockDisarm.mockRejectedValue(new ApiError(500, 'database is down'));
+
+    await disarmStandingApply('t1');
+
+    expect(standingApplyThreadIds.value.has('t1')).toBe(true);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].type).toBe('error');
+  });
 });
 
 /** "Apply as they settle" presses this and is never disabled, because it arms

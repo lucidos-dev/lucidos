@@ -135,9 +135,9 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 /// Like [`client`] but with an explicit response deadline, replacing reqwest's
 /// 30s default.
 ///
-/// For a caller whose request is incidental to its real job, where a hung
-/// engine must cost seconds rather than half a minute. `build-slot` announces
-/// contention this way while a build waits. It exists so that caller does not
+/// For a caller whose deadline is not the default: `build-slot` announces
+/// contention with a short one while a build waits, and `lucidos proxy` waits
+/// past the engine's own proxy cap. It exists so no such caller has to
 /// hand-roll a third builder and drop the three default headers with it: a call
 /// carrying no credential at all cannot say who it is (ADR 0169), and one with
 /// no workspace assertion is served by whichever engine holds the port.

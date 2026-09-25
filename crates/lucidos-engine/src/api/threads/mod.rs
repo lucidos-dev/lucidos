@@ -16,6 +16,7 @@ mod actions;
 mod archive;
 mod background_tasks;
 mod delete;
+mod detach;
 mod events_snapshot;
 mod family;
 mod follow_up;
@@ -182,6 +183,9 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/follow-up",
             post(follow_up::follow_up_child),
         )
+        // Move a child to top level. `:thread_id` is the CHILD, and who may
+        // move it depends on whether the caller carries an origin token.
+        .route("/threads/:thread_id/detach", post(detach::detach_thread))
         .route(
             "/threads/:thread_id/cc-diff",
             get(super::repositories::get_thread_cc_diff),

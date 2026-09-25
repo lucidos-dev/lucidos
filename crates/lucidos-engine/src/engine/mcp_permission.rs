@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::core::grants::{self, GrantFile};
-use crate::engine::cc_permission::{DedupKey, PermissionState};
+use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
@@ -178,13 +178,37 @@ fn canceled_refusal(tool: &str) -> String {
     format!("Error: The MCP tool '{tool}' was not run — the request was canceled before you got permission.")
 }
 
+/// The tool result fed back to the LLM when the card ended with nobody
+/// answering it. `Error:`-prefixed for the same reason as [`denial_refusal`].
+fn withdrawn_refusal(tool: &str) -> String {
+    format!(
+        "Error: The MCP tool '{tool}' was NOT run: the permission card was withdrawn before anyone \
+         answered it, usually because the user sent a new message. This is not a denial. Read the \
+         user's latest message before deciding whether to retry."
+    )
+}
+
+/// What the agentic loop feeds the model once the card ends. Only a human's
+/// Deny reads as a denial.
+fn ask_from_answer(
+    answer: Result<PermissionAnswer, tokio::sync::broadcast::error::RecvError>,
+    tool: &str,
+    server_name: &str,
+) -> McpAsk {
+    match answer {
+        Ok(PermissionAnswer::Allowed) => McpAsk::Proceed,
+        Ok(PermissionAnswer::Denied) => McpAsk::Refuse(denial_refusal(tool, server_name)),
+        Ok(PermissionAnswer::Withdrawn(_)) | Err(_) => McpAsk::Refuse(withdrawn_refusal(tool)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Superseded / orphan recovery (mirror command_permission)
 // ---------------------------------------------------------------------------
 
 /// Resolve every unresolved `McpPermissionRequested` on `thread_id` as denied,
 /// because the user typed a new message instead of clicking a button. Fans a
-/// `false` to any in-process waiter and emits `McpPermissionResolved` so the
+/// `Withdrawn` to any in-process waiter and emits `McpPermissionResolved` so the
 /// card stops dangling and the thread status flips back to `running`. Mirrors
 /// `command_permission::resolve_pending_command_permissions_as_superseded`.
 pub async fn resolve_pending_mcp_permissions_as_superseded(
@@ -229,7 +253,9 @@ pub async fn resolve_pending_mcp_permissions_as_superseded(
         {
             let mut state = pending.lock().unwrap();
             if let Some(entry) = state.take(&request_id) {
-                let _ = entry.tx.send(false);
+                let _ = entry
+                    .tx
+                    .send(PermissionAnswer::Withdrawn(SUPERSEDED_REASON));
             }
         }
         emit_mcp_permission_resolved(
@@ -319,7 +345,7 @@ pub async fn resolve_mcp_permission(
         return false;
     };
     // Wake the blocked loop, and every deduped waiter on the same broadcast.
-    let _ = entry.tx.send(allowed);
+    let _ = entry.tx.send(PermissionAnswer::from_decision(allowed));
 
     let reason = if allowed {
         None
@@ -475,7 +501,7 @@ impl LucidosEngine {
         // limiter, same as CC + the command guard) or the turn is canceled. The
         // paired `McpPermissionResolved` for an Allow/Deny click is emitted by
         // the consent endpoint; only the cancel branch resolves it here.
-        let allowed = tokio::select! {
+        let answer = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
                 if is_canonical {
@@ -499,14 +525,9 @@ impl LucidosEngine {
                 }
                 return McpAsk::Refuse(canceled_refusal(tool));
             }
-            res = rx.recv() => res.unwrap_or(false),
+            res = rx.recv() => res,
         };
-
-        if allowed {
-            McpAsk::Proceed
-        } else {
-            McpAsk::Refuse(denial_refusal(tool, server_name))
-        }
+        ask_from_answer(answer, tool, server_name)
     }
 }
 
@@ -516,6 +537,31 @@ mod tests {
 
     fn allowed_in<'a>(grants: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |p| grants.contains(&p)
+    }
+
+    /// Only a human's Deny tells the model the user refused. A superseded card
+    /// and a closed channel used to fold into the same "do not retry".
+    #[test]
+    fn only_a_human_deny_reads_as_a_denial() {
+        use tokio::sync::broadcast::error::RecvError;
+        let refusal = |answer| match ask_from_answer(answer, "channels_list", "Slack") {
+            McpAsk::Proceed => None,
+            McpAsk::Refuse(text) => Some(text),
+        };
+        assert_eq!(refusal(Ok(PermissionAnswer::Allowed)), None);
+        assert_eq!(
+            refusal(Ok(PermissionAnswer::Denied)),
+            Some(denial_refusal("channels_list", "Slack"))
+        );
+        for nobody_decided in [
+            Ok(PermissionAnswer::Withdrawn(SUPERSEDED_REASON)),
+            Err(RecvError::Closed),
+        ] {
+            assert_eq!(
+                refusal(nobody_decided),
+                Some(withdrawn_refusal("channels_list"))
+            );
+        }
     }
 
     #[test]

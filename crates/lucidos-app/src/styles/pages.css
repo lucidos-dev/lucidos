@@ -500,11 +500,6 @@
     cursor: pointer;
 }
 
-.plugin-install-keep-toggle input {
-    margin: 0;
-    flex-shrink: 0;
-}
-
 .plugin-install-empty {
     margin: 0;
     color: var(--text-muted);
@@ -928,10 +923,8 @@
     animation: shimmer 1.5s infinite;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .app-store-category-pill-skeleton {
-        animation: none;
-    }
+:root[data-motion="reduce"] .app-store-category-pill-skeleton {
+    animation: none;
 }
 
 /* A plugin row deep-link (navigate_ui target `plugins`) scrolls to the row and
@@ -974,7 +967,9 @@
     margin-bottom: 0.375rem;
 }
 
-.form-group input {
+/* A checkbox keeps the shared control look (shared-components.css), not a
+   text field's box. `:where` adds no specificity, so overrides still win. */
+.form-group input:where(:not([type="checkbox"])) {
     width: 100%;
     padding: 0.625rem 0.75rem;
     /* One step off the pane (--bg-primary) so the field reads as a crisp,
@@ -989,7 +984,7 @@
     transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
 }
 
-.form-group input:focus {
+.form-group input:where(:not([type="checkbox"])):focus {
     /* App-standard accent glow (see .action-btn:focus-visible) — the field lights
        up on focus instead of just swapping a border color. */
     border-color: var(--accent);
@@ -1022,12 +1017,6 @@
     margin-bottom: 0;
 }
 
-.form-group .form-checkbox-row input[type="checkbox"] {
-    width: auto;
-    margin: 0;
-    cursor: pointer;
-}
-
 /* Vertical stack of checkbox rows (e.g. the trigger side-effect grant). */
 .form-group .form-checkbox-list {
     display: flex;
@@ -1049,7 +1038,7 @@
     color: var(--text-muted);
 }
 
-.form-group input:disabled {
+.form-group input:where(:not([type="checkbox"])):disabled {
     opacity: 0.6;
     cursor: not-allowed;
 }

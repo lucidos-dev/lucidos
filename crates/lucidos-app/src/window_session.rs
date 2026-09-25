@@ -18,7 +18,7 @@
 //! Everything here fails soft. It sits on the client's boot path, so a bad
 //! record must mean "restore nothing", never a client that will not start.
 
-use crate::window_restore::Rect;
+use crate::window_restore::{RememberedFrame, Whereabouts};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,7 +43,7 @@ pub struct WindowSession {
     /// The last known frame of each workspace's window, in LOGICAL points, the
     /// units `window_restore` reasons in. See [`FrameUnits`].
     #[serde(default)]
-    pub geometry: BTreeMap<String, Rect>,
+    pub geometry: BTreeMap<String, RememberedFrame>,
     /// The space `geometry` is written in, so a record this build did not write
     /// cannot be read as if it had.
     #[serde(default = "FrameUnits::unmarked")]
@@ -92,7 +92,10 @@ impl FrameUnits {
 pub struct WindowSnapshot {
     pub label: String,
     pub url: String,
-    pub frame: Rect,
+    pub frame: crate::window_restore::Rect,
+    /// Where `frame` sits on the desk: the display to anchor it to, or no
+    /// screen at all. An orphaned frame is held back like a rescue (ADR 0269).
+    pub whereabouts: Whereabouts,
     /// Is `frame` a correction the CLIENT made, rather than where the user put
     /// the window?
     ///
@@ -165,13 +168,20 @@ pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSe
         };
         // A rescued window keeps whatever the record already held for its
         // workspace, because a frame the client chose is not an arrangement
-        // (ADR 0215). With nothing held there is nothing better to keep, so the
-        // corrected frame goes in and the workspace at least reopens somewhere.
-        let keep_previous = snapshot.rescued && session.geometry.contains_key(workspace);
+        // (ADR 0215). Nor is one whose title bar is on no screen, since the
+        // system put it there (ADR 0269). With nothing held there is nothing
+        // better to keep, so the frame goes in and the workspace at least
+        // reopens somewhere.
+        let (not_chosen, anchor) = match &snapshot.whereabouts {
+            Whereabouts::Orphaned => (true, None),
+            Whereabouts::OnScreen(anchor) => (snapshot.rescued, anchor.clone()),
+        };
+        let keep_previous = not_chosen && session.geometry.contains_key(workspace);
         if !keep_previous {
-            session
-                .geometry
-                .insert(workspace.to_string(), snapshot.frame);
+            session.geometry.insert(
+                workspace.to_string(),
+                RememberedFrame::new(snapshot.frame, anchor),
+            );
         }
         // Two windows on ONE workspace collapse to one entry. The record holds
         // no per-window identity, so a second restored window would land on top
@@ -259,9 +269,9 @@ pub fn write(app_data: &Path, session: &WindowSession) {
 /// `None` for a URL on no workspace (the picker, the boot splash) and for a
 /// workspace nothing is remembered about. Both mean the same thing to a caller:
 /// build the window at the declared default.
-pub fn frame_for_url(session: &WindowSession, url: &str) -> Option<Rect> {
+pub fn frame_for_url(session: &WindowSession, url: &str) -> Option<RememberedFrame> {
     let workspace = crate::window_target::window_workspace(url)?;
-    session.geometry.get(workspace).copied()
+    session.geometry.get(workspace).cloned()
 }
 
 /// The workspaces to restore, and the frame each one wants.
@@ -273,7 +283,10 @@ pub fn frame_for_url(session: &WindowSession, url: &str) -> Option<Rect> {
 ///
 /// `restore` is the launch decision. A login start comes up menu-bar-only with
 /// no window at all, so it restores nothing.
-pub fn restore_plan(session: &WindowSession, restore: bool) -> Vec<(String, Option<Rect>)> {
+pub fn restore_plan(
+    session: &WindowSession,
+    restore: bool,
+) -> Vec<(String, Option<RememberedFrame>)> {
     if !restore {
         return Vec::new();
     }
@@ -281,7 +294,7 @@ pub fn restore_plan(session: &WindowSession, restore: bool) -> Vec<(String, Opti
         .open
         .iter()
         .filter(|id| crate::window_target::is_workspace_slug(id))
-        .map(|id| (id.clone(), session.geometry.get(id).copied()))
+        .map(|id| (id.clone(), session.geometry.get(id).cloned()))
         .collect()
 }
 
@@ -318,6 +331,8 @@ mod tests {
         }
     }
 
+    use crate::window_restore::Rect;
+
     fn rect(x: i64, y: i64, width: i64, height: i64) -> Rect {
         Rect {
             x,
@@ -327,13 +342,32 @@ mod tests {
         }
     }
 
+    /// What an older build, or an unreadable desk, records for `frame`.
+    fn held(frame: Rect) -> RememberedFrame {
+        RememberedFrame::unanchored(frame)
+    }
+
+    /// The frame recorded for `workspace`, if any.
+    fn frame_of(session: &WindowSession, workspace: &str) -> Option<RememberedFrame> {
+        session.geometry.get(workspace).cloned()
+    }
+
     /// A window wearing a frame the USER chose, which is nearly every window.
     fn snapshot(label: &str, url: &str, frame: Rect) -> WindowSnapshot {
         WindowSnapshot {
             label: label.to_string(),
             url: url.to_string(),
             frame,
+            whereabouts: Whereabouts::OnScreen(None),
             rescued: false,
+        }
+    }
+
+    /// A window whose title bar is on no attached screen.
+    fn orphaned_snapshot(label: &str, url: &str, frame: Rect) -> WindowSnapshot {
+        WindowSnapshot {
+            whereabouts: Whereabouts::Orphaned,
+            ..snapshot(label, url, frame)
         }
     }
 
@@ -362,8 +396,14 @@ mod tests {
             ],
         );
         assert_eq!(session.open, vec!["myws", "dev"]);
-        assert_eq!(session.geometry.get("myws"), Some(&rect(0, 0, 1200, 800)));
-        assert_eq!(session.geometry.get("dev"), Some(&rect(100, 50, 900, 700)));
+        assert_eq!(
+            frame_of(&session, "myws"),
+            Some(held(rect(0, 0, 1200, 800)))
+        );
+        assert_eq!(
+            frame_of(&session, "dev"),
+            Some(held(rect(100, 50, 900, 700)))
+        );
     }
 
     // ── a correction is not an arrangement (ADR 0215) ────────────────────────
@@ -391,8 +431,8 @@ mod tests {
             )],
         );
         assert_eq!(
-            after.geometry.get("myws"),
-            Some(&rect(643, -191, 1728, 1084))
+            frame_of(&after, "myws"),
+            Some(held(rect(643, -191, 1728, 1084)))
         );
         // Still open, and still first. Only the frame is held back.
         assert_eq!(after.open, vec!["myws"]);
@@ -418,7 +458,10 @@ mod tests {
                 rect(200, 100, 1200, 800),
             )],
         );
-        assert_eq!(after.geometry.get("myws"), Some(&rect(200, 100, 1200, 800)));
+        assert_eq!(
+            frame_of(&after, "myws"),
+            Some(held(rect(200, 100, 1200, 800)))
+        );
     }
 
     // Nothing better to hold, so the correction goes in. Dropping the frame
@@ -434,8 +477,8 @@ mod tests {
             )],
         );
         assert_eq!(
-            session.geometry.get("myws"),
-            Some(&rect(643, 30, 1728, 1084))
+            frame_of(&session, "myws"),
+            Some(held(rect(643, 30, 1728, 1084)))
         );
     }
 
@@ -468,8 +511,77 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(after.geometry.get("myws"), Some(&rect(0, 0, 1200, 800)));
-        assert_eq!(after.geometry.get("dev"), Some(&rect(70, 70, 900, 700)));
+        assert_eq!(frame_of(&after, "myws"), Some(held(rect(0, 0, 1200, 800))));
+        assert_eq!(frame_of(&after, "dev"), Some(held(rect(70, 70, 900, 700))));
+    }
+
+    // ── an orphaned frame is not an arrangement (ADR 0269) ───────────────────
+
+    // The reported defect. An unplug left a window at 643,-191, above every
+    // screen, the flush recorded it, and every later launch rescued it onto
+    // the primary display.
+    #[test]
+    fn an_orphaned_window_keeps_the_frame_the_record_already_held() {
+        let before = capture(
+            &WindowSession::default(),
+            &[snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(1763, 1473, 1728, 1084),
+            )],
+        );
+        let after = capture(
+            &before,
+            &[orphaned_snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, -191, 1728, 1084),
+            )],
+        );
+        assert_eq!(
+            frame_of(&after, "myws"),
+            Some(held(rect(1763, 1473, 1728, 1084)))
+        );
+        assert_eq!(after.open, vec!["myws"]);
+    }
+
+    // Nothing better to hold, so the frame goes in, the same as a rescue.
+    #[test]
+    fn an_orphaned_window_with_no_remembered_frame_is_recorded() {
+        let session = capture(
+            &WindowSession::default(),
+            &[orphaned_snapshot(
+                "main",
+                "http://localhost:3210/myws/",
+                rect(643, -191, 1728, 1084),
+            )],
+        );
+        assert_eq!(
+            frame_of(&session, "myws"),
+            Some(held(rect(643, -191, 1728, 1084)))
+        );
+    }
+
+    // A record from before ADR 0269 has no `display` key, and must read as it
+    // always did: each frame unanchored, restoring exactly where it says.
+    #[test]
+    fn a_record_with_no_anchors_reads_as_before() {
+        let tmp = TempDir::new("unanchored");
+        tmp.write_raw(
+            r#"{"open":["myws","dev"],"units":"logical-points","geometry":{
+                "myws":{"x":0,"y":356,"width":1280,"height":1084},
+                "dev":{"x":1763,"y":1473,"width":1728,"height":1084}}}"#,
+        );
+        let session = read(tmp.path());
+        assert_eq!(session.open, vec!["myws", "dev"]);
+        assert_eq!(
+            frame_of(&session, "myws"),
+            Some(held(rect(0, 356, 1280, 1084)))
+        );
+        assert_eq!(
+            frame_of(&session, "dev"),
+            Some(held(rect(1763, 1473, 1728, 1084)))
+        );
     }
 
     // The picker is not a workspace, and neither is a window still on the
@@ -561,7 +673,7 @@ mod tests {
             )],
         );
         assert_eq!(after.open, vec!["myws"]);
-        assert_eq!(after.geometry.get("dev"), Some(&rect(100, 50, 900, 700)));
+        assert_eq!(frame_of(&after, "dev"), Some(held(rect(100, 50, 900, 700))));
     }
 
     // Closing the last workspace window empties the set rather than preserving
@@ -591,7 +703,7 @@ mod tests {
         );
         assert!(after.open.is_empty());
         // The sizes are still remembered for when either is opened again.
-        assert_eq!(after.geometry.get("dev"), Some(&rect(0, 0, 900, 700)));
+        assert_eq!(frame_of(&after, "dev"), Some(held(rect(0, 0, 900, 700))));
     }
 
     // Close to Menu Bar HIDES every window rather than destroying any, so the
@@ -695,8 +807,8 @@ mod tests {
                 "geometry":{"myws":{"x":100,"y":200,"width":800,"height":600}}}"#,
         );
         assert_eq!(
-            read(tmp.path()).geometry.get("myws"),
-            Some(&rect(100, 200, 800, 600))
+            frame_of(&read(tmp.path()), "myws"),
+            Some(held(rect(100, 200, 800, 600)))
         );
     }
 
@@ -748,17 +860,17 @@ mod tests {
         // asks about a workspace nothing is showing.
         assert_eq!(
             frame_for_url(&session, "http://localhost:3210/dev/"),
-            Some(rect(100, 50, 900, 700))
+            Some(held(rect(100, 50, 900, 700)))
         );
         assert_eq!(
             frame_for_url(&session, "http://localhost:3210/myws/"),
-            Some(rect(0, 0, 1200, 800))
+            Some(held(rect(0, 0, 1200, 800)))
         );
         // The landing fragment and a deep link ride the same URL, and neither is
         // part of the key.
         assert_eq!(
             frame_for_url(&session, "http://localhost:3210/dev/#notifications"),
-            Some(rect(100, 50, 900, 700))
+            Some(held(rect(100, 50, 900, 700)))
         );
     }
 
@@ -768,7 +880,7 @@ mod tests {
     fn a_url_with_no_recorded_frame_asks_for_the_default() {
         let session = WindowSession {
             open: vec!["myws".into()],
-            geometry: BTreeMap::from([("myws".to_string(), rect(1, 2, 1200, 800))]),
+            geometry: BTreeMap::from([("myws".to_string(), held(rect(1, 2, 1200, 800)))]),
             units: FrameUnits::LogicalPoints,
         };
         for url in [
@@ -792,13 +904,13 @@ mod tests {
     fn the_plan_pairs_each_workspace_with_its_frame() {
         let session = WindowSession {
             open: vec!["myws".into(), "dev".into()],
-            geometry: BTreeMap::from([("myws".to_string(), rect(1, 2, 1200, 800))]),
+            geometry: BTreeMap::from([("myws".to_string(), held(rect(1, 2, 1200, 800)))]),
             units: FrameUnits::LogicalPoints,
         };
         assert_eq!(
             restore_plan(&session, true),
             vec![
-                ("myws".to_string(), Some(rect(1, 2, 1200, 800))),
+                ("myws".to_string(), Some(held(rect(1, 2, 1200, 800)))),
                 ("dev".to_string(), None),
             ]
         );

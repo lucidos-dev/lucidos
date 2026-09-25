@@ -1,11 +1,12 @@
 import type { ComponentChildren } from 'preact';
+import { plainEventName } from '../../store/thread-events';
 
 /** **The event row**: one transcript marker for everything that arrives from
  *  outside the thread, and for what the thread is waiting on.
  *
  *  Four kinds share it, because they all answer the same question ("what
  *  happened outside this thread") and used to answer it in four dialects: an
- *  *event wait* (armed, matched, expired, stood down), an *event delivery*, a
+ *  *event wait* (waiting, done, gave up, stopped), an *event delivery*, a
  *  *child thread* callback, and a *trigger* fire. Between
  *  them they carried four glyph vocabularies, three disclosure labels, and the
  *  event type as an accent chip in one place and prose in another. See
@@ -21,7 +22,8 @@ import type { ComponentChildren } from 'preact';
  *  debris between the step list and the prose, so it is contained now. The
  *  ranking survives instead of the rule: `.step-note-card` (the checkpoint's
  *  Undo) still outweighs this, so a record never looks like something you can
- *  act on.
+ *  act on. The one exception is a record still waiting on the user: an open
+ *  *form request* carries its Open (`action`, ADR 0275), at the same weight.
  *
  *  **It is NOT a step**, and the whole point of the file is that it stops
  *  looking like one. The event wait used to render as `.inline-step` with a
@@ -33,7 +35,7 @@ import type { ComponentChildren } from 'preact';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form';
 
 /** What the mark column says. Deliberately not the kind: the mark answers "did
  *  something arrive", which is the one question all four kinds share, so a
@@ -62,7 +64,7 @@ export type EventRowTone = 'live' | 'arrived' | 'good' | 'bad' | 'lapsed' | 'hal
 
 /** One item on the facts line. `chip` is the shared event-type atom, and it is
  *  the ONLY way an event type is spelled anywhere in the transcript. `glue` is a
- *  connecting word between two chips ("or"), and is the one item the separator
+ *  connecting word around the chips ("watching for", "or"), and is the one item the separator
  *  skips on both sides.
  *
  *  There is no `link` kind. There was one, and both its users were a "Go to
@@ -77,7 +79,14 @@ export type EventRowFact =
 /** The event-type chip, optionally the row's jump. */
 export interface EventRowChip {
   kind: 'chip';
+  /** The raw event type. The chip shows it in plain words (`plainEventName`)
+   *  and keeps the raw type on its tooltip. */
   name: string;
+  /** The chip opens a sentence, so its plain name takes a capital. */
+  sentenceStart?: boolean;
+  /** A quiet qualifier after the name ("matching only", "6 conditions"). Styled
+   *  apart from the name so the event type still reads as one token. */
+  note?: string;
   /** Makes the chip ITSELF the link to the event it names. Absent whenever the
    *  event has nowhere to open, which is what keeps a dead tap unreachable
    *  rather than merely unlikely (see `eventHasTarget`). */
@@ -95,7 +104,7 @@ export interface EventRowChip {
 }
 
 export interface EventRowFold {
-  /** Named for its content: `Payload`, `Summary`, `Prompt`. */
+  /** Named for its content: `Details`, `Summary`, `Prompt`. */
   label: string;
   /** Machine data of unknown width (a JSON payload, a sha) gets a `<pre>` that
    *  scrolls rather than wraps, since a wrapped sha reads as two shas. Prose
@@ -116,11 +125,18 @@ export interface EventRowProps {
   /** The state as a word. Omitted only when the row has no state to report. */
   stateLabel?: string;
   tone?: EventRowTone;
+  /** When the row's event was recorded, already formatted, and its ISO source.
+   *  Only a row inside a response body needs one: a row in an initiator panel
+   *  sits under that panel's own timestamp. */
+  time?: { label: string; iso: string };
   /** Falsy entries are dropped, so a caller can inline a condition rather than
    *  building the array up imperatively. Nothing is invented to fill a gap: a
    *  fact the event does not carry is simply absent, and its separator with it. */
   facts?: (EventRowFact | null | undefined | false)[];
   fold?: EventRowFold;
+  /** The one thing the reader can do from the row. Only a record that is
+   *  still waiting on the user earns one: an open form request's Open. */
+  action?: { label: string; onClick: () => void };
   /** `data-role`, for the tests and for e2e selectors. */
   role?: string;
 }
@@ -137,8 +153,10 @@ export function eventRowBody({
   subject,
   stateLabel,
   tone = 'none',
+  time,
   facts,
   fold,
+  action,
   role,
 }: EventRowProps) {
   const shown = (facts ?? []).filter((f): f is EventRowFact => !!f);
@@ -151,8 +169,13 @@ export function eventRowBody({
       <div class="event-row-head">
         <span class="event-row-mark" aria-hidden="true">{EVENT_ROW_MARK[mark]}</span>
         <div class="event-row-subject">{subject}</div>
-        {stateLabel && (
-          <span class="event-row-state" data-tone={tone}>{stateLabel}</span>
+        {(time || stateLabel) && (
+          <span class="event-row-aside">
+            {time && <time class="event-row-time" dateTime={time.iso}>{time.label}</time>}
+            {stateLabel && (
+              <span class="event-row-state" data-tone={tone}>{stateLabel}</span>
+            )}
+          </span>
         )}
       </div>
       {shown.length > 0 && <div class="event-row-meta">{renderFacts(shown)}</div>}
@@ -164,6 +187,11 @@ export function eventRowBody({
             : <div class="event-row-fold-body">{fold.body}</div>}
         </details>
       )}
+      {action && (
+        <div class="event-row-actions">
+          <button type="button" class="action-btn" onClick={action.onClick}>{action.label}</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -174,16 +202,20 @@ export function eventRowBody({
  *  A middot goes between adjacent facts, and never touches a `glue`:
  *  "ChangeProposed or ChangeApplied" is one fact expressed as three items, not
  *  three facts. Nothing precedes the first fact, since the state pill left this
- *  line for the header. */
+ *  line for the header.
+ *
+ *  A middot travels with the fact after it, so a wrapped line never ends on a
+ *  stranded separator. */
 function renderFacts(facts: EventRowFact[]): ComponentChildren[] {
-  const out: ComponentChildren[] = [];
-  facts.forEach((fact, i) => {
-    if (i > 0 && fact.kind !== 'glue' && facts[i - 1].kind !== 'glue') {
-      out.push(<span key={`s${i}`} class="event-row-sep" aria-hidden="true">{'·'}</span>);
-    }
-    out.push(renderFact(fact, i));
+  return facts.map((fact, i) => {
+    if (i === 0 || fact.kind === 'glue' || facts[i - 1].kind === 'glue') return renderFact(fact, i);
+    return (
+      <span key={`f${i}`} class="event-row-fact">
+        <span class="event-row-sep" aria-hidden="true">{'·'}</span>
+        {renderFact(fact, i)}
+      </span>
+    );
   });
-  return out;
 }
 
 function renderFact(fact: EventRowFact, i: number): ComponentChildren {
@@ -199,21 +231,29 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
 
 /** The event-type atom, in both of its forms.
  *
- *  Exported because a chip is not always a FACT: the delivery card puts one in
- *  its subject ("Event arrived: `CodingAgentIdled`"), and one event type must
+ *  Exported because a chip is not always a FACT: the delivery card's subject IS
+ *  one ("Coding agent stopped working"), and one event type must
  *  not be spelled two ways depending on which line of the card it landed on.
  *
  *  A plain function rather than a component, matching `eventRowBody` and for the
  *  same reason: there is no jsdom in the test infra, so the tests walk the vnode
  *  tree these return, and a component vnode is opaque to that walk.
  *
+ *  The visible text is the plain name. The raw type leads the tooltip, so a
+ *  reader who needs the exact event to subscribe to can still find it.
+ *
  *  With `onClick` it is a real `<button>`, not a `<code>` carrying a handler, so
  *  it is reachable by keyboard and announces itself. Its accessible name says
- *  what pressing it does, because the visible text is a bare event type and says
- *  only what the event IS. */
+ *  what pressing it does, because the visible text says only what the event IS. */
 export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildren {
-  if (!chip.onClick) return <code key={key} class="event-name">{chip.name}</code>;
-  const label = chip.action ?? `Go to the ${chip.name} event`;
+  const plain = plainEventName(chip.name);
+  const text = chip.sentenceStart ? plain.charAt(0).toUpperCase() + plain.slice(1) : plain;
+  // The space is real text so a copied chip reads "coding agent stopped working 6 conditions".
+  const note = chip.note && [' ', <span key="note" class="event-name-note">{chip.note}</span>];
+  if (!chip.onClick) {
+    return <code key={key} class="event-name" data-tooltip={chip.name}>{text}{note}</code>;
+  }
+  const label = chip.action ?? `${chip.name} · go to the event`;
   return (
     <button
       key={key}
@@ -226,7 +266,8 @@ export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildr
       disabled={!!chip.pending}
       onClick={chip.onClick}
     >
-      {chip.name}
+      {text}
+      {note}
     </button>
   );
 }

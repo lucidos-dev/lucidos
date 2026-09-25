@@ -1,6 +1,6 @@
 //! What an *auxiliary model call* resolves from its [`ContextPurpose`]: the
 //! *model selection* it runs under, and the wall-clock budget it runs inside.
-//! Four purposes read no preference pair, and [`AuxModelSource`] says why.
+//! Five purposes read no preference pair, and [`AuxModelSource`] says why.
 //!
 //! **One purpose per auxiliary model preference.** The standing invariant this
 //! module exists to hold, enforced by

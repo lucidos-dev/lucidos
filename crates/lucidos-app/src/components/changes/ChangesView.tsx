@@ -1,8 +1,8 @@
 import { Fragment } from 'preact';
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, workingThreadCount } from '../../store/store';
-import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies } from '../../store/actions/chat-changes';
+import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, settlingThreadCount } from '../../store/store';
+import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
@@ -65,9 +65,10 @@ export type ChangeRowAction =
  *  button carries a tooltip nobody can read. A control that cannot act is
  *  replaced by the one that can, or drawn not at all.
  *
- *  - Thread still working: the standing apply, and nothing else. Discard would
- *    yank the worktree from a live session, so it is not offered.
- *  - Thread unsettled but PARKED: nothing. A standing apply would drop the
+ *  - Thread settling (working, or watching an event): the standing apply, and
+ *    nothing else. Discard would yank the worktree from a live session, so it
+ *    is not offered.
+ *  - Thread parked on a QUESTION: nothing. A standing apply would drop the
  *    moment it was pressed, so offering one is the same broken control in a
  *    new coat. The row's details line says the thread has not finished.
  *  - Apply resolving merge conflicts: nothing. That apply is already in
@@ -80,13 +81,13 @@ export type ChangeRowAction =
  *  expressions in the markup. */
 export function changeRowActions(change: Change, armed: boolean): ChangeRowAction[] {
   if (change.thread_unsettled) {
-    if (!change.thread_working || change.resolving_conflict) return [];
+    if (!change.thread_settling || change.resolving_conflict) return [];
     return [
       {
         kind: 'standing',
         label: armed ? '✓ Applying as it settles' : 'Apply as it settles',
         tooltip: armed
-          ? 'Armed. This change applies when its thread finishes, and drops with a report if the thread parks or fails. Click to cancel.'
+          ? 'Armed. This change applies when its thread finishes, and drops with a report if the thread stops on a question or fails. Click to cancel.'
           : `${THREAD_UNSETTLED_TIP}. Arm this and it applies the moment the thread finishes.`,
       },
     ];
@@ -97,9 +98,7 @@ export function changeRowActions(change: Change, armed: boolean): ChangeRowActio
     {
       kind: 'apply',
       label: change.requires_restart ? 'Apply*' : 'Apply',
-      tooltip: change.requires_restart
-        ? 'Engine restart required for these changes to be applied correctly. You will be prompted to restart'
-        : undefined,
+      tooltip: change.requires_restart ? APPLY_NEW_VERSION_TOOLTIP : undefined,
     },
   ];
 }
@@ -190,7 +189,7 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
 }
 
 export const SWEEP_ONLY_TIP =
-  'Nothing can be applied yet. Arm this and every thread still working applies its change the moment it finishes.';
+  'Nothing can be applied yet. Arm this and every thread still settling applies its change the moment it finishes.';
 
 export const SWEEP_ARMED_TIP =
   'Armed. Each change applies the moment its thread finishes. Click to cancel every standing apply here. Anything already applying keeps going.';
@@ -320,7 +319,7 @@ export function ChangesView() {
         {bothLoaded ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
-          const bulk = bulkApplyState(pending, workingThreadCount.value, standingApplyThreadIds.value.size);
+          const bulk = bulkApplyState(pending, settlingThreadCount.value, standingApplyThreadIds.value.size);
           const bulkRow = bulk.show ? (
             <div class="changes-bulk-actions">
               {/* Discard All skips changes whose thread is still working
@@ -329,7 +328,7 @@ export function ChangesView() {
                 <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_unsettled)} onClick={() => void discardAllChanges()}>Discard All</button>
               )}
               {/* "Keep going as the rest settle": the sweep. Everything
-                  pending, plus everything still working, as each one lands
+                  pending, plus everything still settling, as each one lands
                   (ADR 0168). Withdrawn once armed, where the toggle beside it
                   says the same thing and can also turn it off. */}
               {bulk.offerKeepGoing && (

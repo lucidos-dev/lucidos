@@ -447,6 +447,7 @@ mod tests {
     fn spawn_args_for(thread_id: uuid::Uuid, workspace: &Path) -> SpawnArgs<'_> {
         SpawnArgs {
             worktree_path: workspace,
+            coding_agent_kind: Default::default(),
             workspace_path: workspace,
             allowed_tools: None,
             system_prompt: None,
@@ -457,7 +458,6 @@ mod tests {
             spawning_event_id: None,
             repo_name: None,
             interactive: false,
-            continuation: false,
             user_env_vars: &[],
             claude_config_dir: None,
             binary_override: None,

@@ -1117,6 +1117,72 @@ describe('handleArchiveThread — 409 error toasts', () => {
     expect(toasts.value.find(t => t.type === 'error')).toBeUndefined();
   });
 
+  it('a target a Discard holds fails with the engine\'s own reason, not a quiet success', async () => {
+    const { ApiError } = await import('../../api/client');
+    seedReviewThread();
+    const reason = 'A discard is already in progress for this thread. Try again once it has finished';
+    const message = await archiveAndGetToast(new ApiError(409, reason, {
+      reason: 'discard_in_progress',
+      message: reason,
+    }));
+    expect(message).toBe(`Can't archive yet: ${reason}`);
+    expect(threadMap.value.get('parent')?.meta.section).toBe('inbox');
+  });
+
+  it('names every member the archive skipped, puts it back, and says to retry', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('parent', makeThreadState('parent', {
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('child', makeThreadState('child', {
+      meta: { id: 'child', title: 'Fix the login page', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+    }));
+    threadMap.value = map;
+    focusThread('parent');
+    const reason = 'An apply is already in progress for this thread. It finishes on its own';
+    (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      archived: ['parent'],
+      skipped: [{ thread_id: 'child', reason: 'apply_in_progress', message: reason }],
+    });
+
+    await handleArchiveThread('parent');
+
+    expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
+    expect(threadMap.value.get('child')?.meta.section).toBe('inbox');
+    const toast = toasts.value.find(t => t.type === 'warning');
+    expect(toast?.message).toContain('Fix the login page');
+    expect(toast?.message).toContain(reason);
+    expect(toast?.message).toMatch(/archive again/i);
+  });
+
+  it('gives the target its focus back when the archive skipped it', async () => {
+    const map = new Map<string, ThreadState>();
+    for (const [id, updatedAt] of [['parent', '2026-01-01T00:00:02Z'], ['other', '2026-01-01T00:00:01Z']]) {
+      map.set(id, makeThreadState(id, {
+        meta: { id, title: id, channel: 'claude_code', saved: false, createdAt: '', updatedAt, status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      }));
+    }
+    threadMap.value = map;
+    focusThread('parent');
+    (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      archived: [],
+      skipped: [{ thread_id: 'parent', reason: 'not_archivable', message: 'It changed state after the archive began, so it was left open' }],
+    });
+
+    await handleArchiveThread('parent');
+
+    expect(threadMap.value.get('parent')?.meta.section).toBe('inbox');
+    expect(focusedThreadId.value).toBe('parent');
+  });
+
+  it('an archive response from an older engine, with no skipped list, archives quietly', async () => {
+    (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ archived: ['parent'] });
+    seedReviewThread();
+    await handleArchiveThread('parent');
+    expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
+    expect(toasts.value.find(t => t.type === 'warning' || t.type === 'error')).toBeUndefined();
+  });
+
   it('formats parent_has_pending_changes with the Apply/Discard hint', async () => {
     // In-workspace CC thread with a pending change is no longer archivable —
     // the user must Apply or Discard first. Toast must say so explicitly,
@@ -1376,15 +1442,15 @@ describe('handleArchiveThread: live subscription confirm', () => {
 
     const pending = handleArchiveThread('t');
     expect(confirmState.value.visible).toBe(true);
-    expect(confirmState.value.message).toBe('Archiving stops 2 subscriptions. They will not fire.');
+    expect(confirmState.value.message).toBe('Archiving stops waiting for 2 events. They will not fire.');
     expect(confirmState.value.okLabel).toBe('Archive');
     expect(confirmState.value.cancelLabel).toBe('Cancel');
     // The agent's own reason plus the event, the same pair the subscription
     // indicator renders.
     expect(detailLines()).toEqual([
       'This thread',
-      'waiting for the release build (ChangeProposed)',
-      'waiting for the nightly import (OuraSleepImported)',
+      'waiting for the release build (change proposed)',
+      'waiting for the nightly import (oura sleep imported)',
     ]);
 
     confirmState.value.resolve?.(false); // tidy the pending promise
@@ -1463,7 +1529,7 @@ describe('handleArchiveThread: live subscription confirm', () => {
     // Attributed to the descendant by title, not merged into "this thread".
     expect(detailLines()).toEqual([
       'Grandchild',
-      'waiting for the deploy to land (ReleasePublished)',
+      'waiting for the deploy to land (release published)',
     ]);
 
     confirmState.value.resolve?.(false);
@@ -1494,10 +1560,10 @@ describe('handleArchiveThread: live subscription confirm', () => {
     focusThread('parent');
 
     const pending = handleArchiveThread('parent');
-    expect(confirmState.value.message).toBe('Archiving stops 3 subscriptions. They will not fire.');
+    expect(confirmState.value.message).toBe('Archiving stops waiting for 3 events. They will not fire.');
     expect(detailLines()).toEqual([
       'This thread',
-      'waiting for the release build (ChangeProposed)',
+      'waiting for the release build (change proposed)',
       '2 more on sub-threads',
     ]);
 
@@ -1565,7 +1631,7 @@ describe('subscriptionsStoppedByArchive', () => {
     threadMap.value = map;
 
     const stopping = subscriptionsStoppedByArchive(new Set(['t']), 't')!;
-    expect(stopping.message).toBe('Archiving stops 3 subscriptions. They will not fire.');
+    expect(stopping.message).toBe('Archiving stops waiting for 3 events. They will not fire.');
     expect(stopping.details.groups.map((g) => g.header)).toEqual([
       'This thread',
       '2 more on sub-threads',

@@ -87,6 +87,7 @@ mod reply_text_tests {
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: model_only.map(str::to_string),
+            content_is_progress_notes: false,
         }
     }
 

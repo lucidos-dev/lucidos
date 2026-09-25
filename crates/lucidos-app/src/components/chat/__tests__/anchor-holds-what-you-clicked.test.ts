@@ -17,7 +17,7 @@ if (typeof (globalThis as any).cancelAnimationFrame === 'undefined') {
 
 import { mockContainer, mockDynamicAnchor, useMockMO } from './scroll-test-helpers';
 import { withScrollAnchor } from '../CreateThreadView';
-import { resumeFollowingBottom, setActiveScrollElement, setAgentLive, stopFollowingBottom } from '../scrollState';
+import { resumeFollowingBottom, setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
 /**
  * **The anchor is the element the reader clicked.**
@@ -119,12 +119,11 @@ describe('a turn control holds the element the reader clicked', () => {
     restoreMO();
   });
 
-  /** **A reader parked on the end of a quiet thread.**
+  /** **An armed reader parked on the end of the thread.**
    *
    *  The one park that used to be exempt. An armed reader on the live edge was
    *  carried to the new edge rather than held, which moved the icon they had
-   *  just pressed. Nothing is arriving on a quiet thread, so the ride has
-   *  nothing to carry them toward and the press wins.
+   *  just pressed. The press wins now, from every park (ADR 0147).
    *
    *  Armed through `resumeFollowingBottom` rather than the toggle: it arms and
    *  writes the edge with no tween, and this file runs `requestAnimationFrame`
@@ -132,7 +131,6 @@ describe('a turn control holds the element the reader clicked', () => {
   describe('with the reader on the end of a quiet thread', () => {
     function armedAtTheEnd(container: ReturnType<typeof mockContainer>) {
       setActiveScrollElement(container as any);
-      setAgentLive(false);
       resumeFollowingBottom(container as any);
     }
 

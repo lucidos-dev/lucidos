@@ -125,7 +125,7 @@ describe('inline step layout (CSS regression)', () => {
   });
 
   // Every outcome's mark shares one column, and the running row has to sit on
-  // it while carrying no mark at all (`stepStatus` returns an empty icon for
+  // it while carrying no mark at all (`StepOutcomeIcon` returns null for
   // pending, so its slot is an empty span). A fixed slot width is the only
   // thing that holds the column in both directions; the slot used to be
   // `display: none`, which took the span out of the flex line entirely, its
@@ -137,7 +137,7 @@ describe('inline step layout (CSS regression)', () => {
     it('the slot is a fixed box, sized against the row and not the root', () => {
       const widths = iconRules.map(r => r.props.get('width')).filter(Boolean);
       expect(widths).toHaveLength(1);
-      // `em`, not `rem`: the box has to match the glyph the ROW renders, and the
+      // `em`, not `rem`: the box has to match the mark the ROW renders, and the
       // row sets its own font-size rather than inheriting the root's.
       expect(widths[0]).toMatch(/^\d*\.?\d+em$/);
       // A `min-width` would let a wide glyph push the description instead, which

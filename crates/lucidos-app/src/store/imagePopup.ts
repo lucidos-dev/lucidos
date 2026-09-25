@@ -12,12 +12,12 @@ export function openImagePopup(src: string): void {
   popupImage.value = { images: [src], index: 0 };
 }
 
-/** The block-level image `renderMarkdown` produces from `![alt](src)`, inside
- *  the scroll wrapper that sizes it. One selector reaches every markdown
- *  surface: a chat turn, a rendered `.md` preview, a notification body. It
- *  mirrors the rule that caps the image in shared-components.css, so the
- *  `zoom-in` cursor and the click land on the same set. */
-const INLINE_MARKDOWN_IMAGE = '.markdown-content .image-scroll-wrapper > img';
+/** The image the markdown renderers produce from `![alt](src)`, inside the
+ *  scroll wrapper that sizes it. One selector reaches every markdown surface:
+ *  a chat turn, a rendered `.md` preview, a notification body, and a question
+ *  card. It mirrors the rules that cap the image, so the `zoom-in` cursor and
+ *  the click land on the same set. */
+const INLINE_MARKDOWN_IMAGE = '.markdown-content .image-scroll-wrapper > img, .question-body .image-scroll-wrapper > img';
 
 /** The inline markdown image a click landed on, or null.
  *

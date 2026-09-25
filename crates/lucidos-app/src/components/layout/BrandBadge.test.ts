@@ -36,7 +36,7 @@ describe('brandBadgeState / brandBadgeTooltip', () => {
     kind: 'engine-build',
     label: 'Building new version',
     detail: '2m 14s',
-    note: '2 commits since your running version\n• fix: one\n• docs: two',
+    note: '2 commits come with the new version\n• fix: one\n• docs: two',
     progress: null,
   };
   /** The degenerate case the conditional promise exists for: a build this client

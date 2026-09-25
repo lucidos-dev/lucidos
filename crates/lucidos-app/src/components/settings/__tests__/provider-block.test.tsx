@@ -165,6 +165,30 @@ describe('ProviderBlock', () => {
     }
   });
 
+  it('keeps the fields of a provider never set up open past the fuse', async () => {
+    // A local expand writes nothing, so no answer is coming. Timing it out
+    // folded the key field away while the user was still typing the key.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const flush = async (): Promise<void> => {
+      await new Promise((resolve) => { requestAnimationFrame(() => resolve(null)); });
+      await Promise.resolve();
+    };
+    try {
+      render(block(), host);
+      toggle().checked = true;
+      toggle().dispatchEvent(new Event('change', { bubbles: true }));
+      await flush();
+      expect(configRow()).not.toBeNull();
+
+      vi.advanceTimersByTime(9000);
+      await flush();
+      expect(configRow()).not.toBeNull();
+      expect(toggle().checked).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('switches a parked provider back on', async () => {
     preferences.value = { status: 'loaded', data: { provider_enabled_openai: 'false' } };
     render(block(), host);

@@ -427,6 +427,7 @@ impl LucidosEngine {
                         Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
                         None,
                         crate::engine::FollowUpUrgency::Normal,
+                        None,
                     )
                     .await
                 {

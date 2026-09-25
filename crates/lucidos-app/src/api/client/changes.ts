@@ -3,6 +3,9 @@ import type { DiffFile, RepoDiff } from '../../store/store';
 
 // --- Changes ---
 
+/** Mirrors the engine's `ChangeStatus`, the four values `changes.status` holds. */
+export type ChangeStatus = 'pending' | 'applied' | 'discarded' | 'reverted';
+
 export interface Change {
   id: string;
   request_id: string;
@@ -15,7 +18,7 @@ export interface Change {
   files: string[];
   requires_restart: boolean;
   hardened: boolean;
-  status: string;
+  status: ChangeStatus;
   created_at: string;
   resolved_at: string | null;
   pre_merge_sha: string | null;
@@ -33,11 +36,11 @@ export interface Change {
    * NOT unsettled (ADR 0249). Defaults to false (absent on non-pending changes
    * and older payloads). */
   thread_unsettled?: boolean;
-  /** True when the originating thread is still WORKING, the half of
-   *  `thread_unsettled` a *standing apply* can act on. A thread parked on a
-   *  question or an event wait is unsettled too, and arming one drops the
-   *  moment it is pressed. Defaults to false. */
-  thread_working?: boolean;
+  /** True when the originating thread is *settling*: running, paused, or
+   *  watching an event. The half of `thread_unsettled` a *standing apply* can
+   *  wait through. A thread parked on a question is unsettled too, and arming
+   *  one drops the moment it is pressed. Defaults to false. */
+  thread_settling?: boolean;
   /** True while an apply of this change is resolving merge conflicts. The
    *  thread works only to finish that apply, and its completion lands the
    *  change, so no standing apply is offered. Defaults to false. */
@@ -69,10 +72,10 @@ export interface ChangesState {
    *  sweep arms a thread that has proposed nothing yet, and its prompt row
    *  still renders the armed state. Absent on an older payload. */
   standing_apply_thread_ids?: string[];
-  /** Coding-agent threads still working, so a sweep has something to arm. The
-   *  Changes panel offers "Apply as they settle" off this. It cannot derive it:
+  /** Coding-agent threads still settling, so a sweep has something to arm.
+   *  The Changes panel offers "Apply as they settle" off this. It cannot derive it:
    *  `threadMap` holds only the loaded window. Absent on an older payload. */
-  working_thread_count?: number;
+  settling_thread_count?: number;
 }
 
 export async function fetchChanges(params?: {
@@ -315,8 +318,8 @@ export interface EngineVersionStatus {
    *  the two disagree. The client anchors this to its own `Date.now()` at
    *  receipt and counts up locally, so skew never reaches the number. */
   build_elapsed_ms?: number;
-  /** The non-merge commits between the running engine's commit and HEAD,
-   *  grouped by what they are: what a Switch would bring. Two surfaces read it,
+  /** The commits a Switch would bring, grouped by what they are (see
+   *  `PendingCommits` for which commits count). Two surfaces read it,
    *  the status toast while a rebuild runs and the new-version confirm once one
    *  is ready.
    *
@@ -366,14 +369,17 @@ export interface CommitGroup {
   descriptions: string[];
 }
 
-/** The commits a Switch would bring. Merges are excluded engine-side: an Apply
- *  lands as a merge whose subject is a branch name, and what it merged is
- *  already in the range under its own subject.
+/** The commits a Switch would bring, since the running engine's commit. Two
+ *  kinds are excluded engine-side:
+ *  - Merges: an Apply lands as a merge whose subject is a branch name, and what
+ *    it merged is already in the range under its own subject.
+ *  - Commits the served client already carries: the engine serves those
+ *    frontend-only changes without a restart.
  *
  *  See `EngineVersionStatus.pending_commits` for why an ABSENT value and a
  *  `total: 0` one mean different things. */
 export interface PendingCommits {
-  /** Every non-merge commit in the range, including the ones no group lists.
+  /** Every commit the switch brings, including the ones no group lists.
    *  Equals the sum of the group totals (the engine derives it from them). */
   total: number;
   /** Non-empty groups, in the order the toast lists them. */

@@ -684,7 +684,17 @@ impl LucidosEngine {
             "create_trigger_group" => {
                 use crate::engine::trigger_group_writes::CreateTriggerGroupError;
                 let raw_name = args["name"].as_str().unwrap_or("");
-                let explicit_order = args.get("order").and_then(|v| v.as_i64()).map(|n| n as i32);
+                // `try_from`, never `as`: a wrapping cast would store an
+                // unrelated in-range order for an out-of-range one.
+                let explicit_order = match args
+                    .get("order")
+                    .and_then(|v| v.as_i64())
+                    .map(i32::try_from)
+                {
+                    Some(Ok(n)) => Some(n),
+                    Some(Err(_)) => return Ok("Error: order is out of range.".to_string()),
+                    None => None,
+                };
                 match self
                     .create_trigger_group_serialized(raw_name, explicit_order, None)
                     .await
@@ -745,14 +755,13 @@ impl LucidosEngine {
                         let order = entry
                             .get("order")
                             .and_then(|v| v.as_i64())
-                            .map(|n| n as i32);
-                        if id.is_empty() || order.is_none() {
+                            .and_then(|n| i32::try_from(n).ok());
+                        let Some(order) = order.filter(|_| !id.is_empty()) else {
                             return Ok(
                                 "Error: each ordering entry needs string id and integer order"
                                     .to_string(),
                             );
-                        }
-                        let order = order.unwrap();
+                        };
                         let current = match g.get(id) {
                             Some(g) => g,
                             None => {
@@ -825,7 +834,7 @@ impl LucidosEngine {
                     group_name, group_id
                 ))
             }
-            _ => Ok(format!("Unknown scheduler tool: {}", name)),
+            _ => Err(format!("Unknown scheduler tool: {}", name).into()),
         }
     }
 }

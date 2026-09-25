@@ -96,9 +96,9 @@ export function describeStyleProblem(
     return `A name is at most ${MAX_LABEL_CHARS} characters.`;
   }
   const instruction = draft.instruction.trim();
-  if (!instruction) return 'Write what this style should do to an answer.';
+  if (!instruction) return 'Write how answers should read in this style.';
   if ([...instruction].length > MAX_INSTRUCTION_CHARS) {
-    return `An instruction is at most ${MAX_INSTRUCTION_CHARS} characters.`;
+    return `Instructions are at most ${MAX_INSTRUCTION_CHARS} characters.`;
   }
   if (nextDocumentSize > MAX_STYLES) {
     return `Saving this would store ${nextDocumentSize} styles, and the limit is ${MAX_STYLES}. Delete one first.`;

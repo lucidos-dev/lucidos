@@ -215,7 +215,7 @@ pub(super) async fn create_credential(
         &request.auth_value,
         request.auth_header.as_deref(),
         env_var_name,
-        actor,
+        actor.clone(),
     )
     .await
     {
@@ -237,10 +237,32 @@ pub(super) async fn create_credential(
                     return ApiResult::err(format!("Failed to update email password: {}", e));
                 }
             }
+            complete_credential_requests(&state, request.form_request_id, &service_name, actor)
+                .await;
             ApiResult::ok()
         }
         Err(e) => ApiResult::err(format!("Failed to save credential: {}", e)),
     }
+}
+
+/// A saved credential answers the form that asked for it, and every other open
+/// request for the same service, whichever device or form saved it.
+///
+/// Runs after the save succeeded, so a failure here is logged rather than
+/// reported: the credential the user typed is stored either way.
+async fn complete_credential_requests(
+    state: &AppState,
+    form_request_id: Option<uuid::Uuid>,
+    service_name: &str,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    use crate::engine::form_requests;
+    let (pool, bus) = (&state.pool, &state.engine.event_bus);
+    if let Some(id) = form_request_id {
+        form_requests::complete_named_request(pool, bus, id, "CredentialRequested", actor.clone())
+            .await;
+    }
+    form_requests::complete_credential_requests_for(pool, bus, service_name, actor).await;
 }
 
 /// Update an existing credential's editable fields. For `email_password`
@@ -302,7 +324,7 @@ pub(super) async fn update_credential(
         request.auth_header.as_deref(),
         new_secret,
         env_var_name,
-        actor,
+        actor.clone(),
     )
     .await
     {
@@ -339,6 +361,8 @@ pub(super) async fn update_credential(
                     }
                 }
             }
+            complete_credential_requests(&state, request.form_request_id, &service_name, actor)
+                .await;
             ApiResult::ok()
         }
         Ok(None) => ApiResult::err("Credential not found".to_string()),
@@ -1791,12 +1815,27 @@ pub(super) async fn send_email_confirmed(
                             bcc: bcc.clone(),
                             subject: subject.to_string(),
                             attachment_count,
-                            actor: Some(actor),
+                            actor: Some(actor.clone()),
                         },
                     ),
                     "[Email] EmailSent",
                 )
                 .await;
+            // The confirm form that asked for this send is answered. Logged
+            // rather than reported: the email has already left.
+            if let Some(id) = body["form_request_id"]
+                .as_str()
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            {
+                crate::engine::form_requests::complete_named_request(
+                    &state.pool,
+                    &state.engine.event_bus,
+                    id,
+                    "EmailConfirmRequested",
+                    Some(actor),
+                )
+                .await;
+            }
             Json(serde_json::json!({ "success": true }))
         }
         Err(e) => {

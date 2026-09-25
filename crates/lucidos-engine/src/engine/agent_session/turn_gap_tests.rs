@@ -475,6 +475,7 @@ async fn child_completion_origin_advances_boundary() {
             status: ChildCompletionStatus::Success,
             summary: "child did the thing".into(),
             pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
         },
     )
     .await;
@@ -813,6 +814,58 @@ async fn a_stopped_child_reaches_the_resumed_parent_as_alive() {
         !note.explains_worktree_reset,
         "a child's Stop moves nothing in the parent's worktree"
     );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// ADR 0278: a child moved to top level wakes nothing either, so the resumed
+/// parent reads here that it must stop waiting for it.
+#[tokio::test]
+async fn a_moved_out_child_reaches_the_resumed_parent() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+    // The bus drops a move for a child with no row, so the child needs one.
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, parent_thread_id, depth) VALUES ($1, $2, 1)",
+    )
+    .bind(child_id)
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ChildThreadDetached {
+            child_thread_id: child_id,
+            child_thread_title: Some("Fix the ticket".into()),
+        },
+    )
+    .await;
+    let current = emit_message_received(&bus, thread_id, "what now?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .expect("a moved-out child must produce a note");
+    for needle in [
+        "CHILD MOVED OUT",
+        "Fix the ticket",
+        "no longer your child",
+        "Do not wait for it",
+    ] {
+        assert!(
+            note.note.contains(needle),
+            "missing {needle:?}: {}",
+            note.note
+        );
+    }
+    assert!(!note.explains_worktree_reset);
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
@@ -1291,5 +1344,235 @@ fn completion(
         timed_out: false,
         killed: false,
         abandoned,
+    }
+}
+
+// -------------------- A restart cut off the last turn --------------------
+//
+// The engine stops a session at teardown. Claude Code then closes the running
+// tool call as "The user doesn't want to proceed with this tool use". Without
+// a note saying who really stopped it, the resumed agent reads that as the
+// user refusing, and stops retrying the work.
+
+/// The line the note carries when a restart cut the last turn off.
+const RESTART_LINE: &str = "ENGINE RESTART";
+
+/// Emit a coding-agent `ResponseAborted` with `cause`, on `channel`.
+async fn emit_abort(
+    bus: &EventBus,
+    thread_id: Uuid,
+    cause: crate::engine::thread_events::AbortCause,
+    channel: Option<EventChannel>,
+) {
+    crate::engine::thread_events::emit_response_aborted(
+        bus,
+        thread_id,
+        cause,
+        String::new(),
+        vec![],
+        None,
+        None,
+        EventMeta {
+            channel,
+            ..EventMeta::NONE
+        },
+        "[test] ResponseAborted",
+    )
+    .await;
+}
+
+async fn emit_generated(bus: &EventBus, thread_id: Uuid) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await;
+}
+
+/// The resume the recovery sweep requests after a user switch. It is the
+/// current turn's origin, exactly as the spawn consumer passes it.
+async fn emit_switch_continuation(bus: &EventBus, thread_id: Uuid) -> Uuid {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::ContinuationRequested {
+            reason: crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into(),
+        },
+    )
+    .await
+}
+
+/// The reproduction. A restart landed mid-turn. The resume must say that the
+/// engine stopped the call, that the user refused nothing, and that the call
+/// can run again. Both restart causes: a switch, and a crash recovered at boot.
+#[tokio::test]
+async fn a_restart_that_cut_off_the_last_turn_is_named_on_resume() {
+    use crate::engine::thread_events::AbortCause;
+
+    for cause in [AbortCause::EngineShutdown, AbortCause::RecoveryAfterRestart] {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+        emit_message_received(&bus, thread_id, "run the engine tests").await;
+        emit_abort(&bus, thread_id, cause, Some(EventChannel::ClaudeCode)).await;
+        let current = emit_switch_continuation(&bus, thread_id).await;
+
+        let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+            .await
+            .unwrap_or_else(|| panic!("{cause:?}: a restart abort must produce a note"));
+        for must in [
+            RESTART_LINE,
+            "doesn't want to proceed",
+            "[Request interrupted by user for tool use]",
+            "nobody refused or interrupted anything",
+            "did not complete",
+            "safe to run it again",
+        ] {
+            assert!(
+                note.note.contains(must),
+                "{cause:?}: missing {must:?}: {}",
+                note.note
+            );
+        }
+        assert!(
+            !note.explains_worktree_reset,
+            "a restart moves no ref, so it must not excuse a HEAD move"
+        );
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+}
+
+/// A second restart during the resumed turn is still one interruption of the
+/// work in hand, so the note says it once.
+#[tokio::test]
+async fn two_restarts_in_one_gap_are_one_line() {
+    use crate::engine::thread_events::AbortCause;
+
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the engine tests").await;
+    let cc = Some(EventChannel::ClaudeCode);
+    emit_abort(&bus, thread_id, AbortCause::EngineShutdown, cc).await;
+    emit_switch_continuation(&bus, thread_id).await;
+    emit_abort(&bus, thread_id, AbortCause::EngineShutdown, cc).await;
+    let current = emit_switch_continuation(&bus, thread_id).await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .expect("a restart abort must produce a note")
+        .note;
+    assert_eq!(note.matches(RESTART_LINE).count(), 1, "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Once a resumed turn has finished, the restart is history. The user's next
+/// message must not be told the engine just restarted.
+#[tokio::test]
+async fn a_turn_that_finished_after_the_restart_carries_no_restart_line() {
+    use crate::engine::thread_events::AbortCause;
+
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the engine tests").await;
+    emit_abort(
+        &bus,
+        thread_id,
+        AbortCause::EngineShutdown,
+        Some(EventChannel::ClaudeCode),
+    )
+    .await;
+    // `ContinuationRequested` is not a turn boundary, so the resumed turn's
+    // own terminal shares a gap with the abort before it.
+    emit_switch_continuation(&bus, thread_id).await;
+    emit_generated(&bus, thread_id).await;
+    let current = emit_message_received(&bus, thread_id, "thanks, what next?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH)).await;
+    assert!(
+        note.is_none(),
+        "a finished resume leaves nothing to report: {:?}",
+        note.map(|n| n.note)
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Only a restart is a restart. A crash of the subprocess, a user Stop, and a
+/// chat-agent abort on the same thread would each make the line a lie.
+#[tokio::test]
+async fn only_a_coding_agent_restart_abort_names_a_restart() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+
+    enum Ending {
+        Aborted(AbortCause, Option<EventChannel>),
+        UserStop,
+    }
+    let cc = Some(EventChannel::ClaudeCode);
+    for ending in [
+        Ending::Aborted(AbortCause::ProcessKilled, cc),
+        Ending::Aborted(AbortCause::SafetyNet, cc),
+        Ending::Aborted(AbortCause::SessionDropped, cc),
+        Ending::Aborted(AbortCause::StaleSettle, cc),
+        Ending::Aborted(AbortCause::EngineShutdown, None),
+        Ending::UserStop,
+    ] {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, BRANCH, None).await;
+        emit_message_received(&bus, thread_id, "run the engine tests").await;
+
+        let label = match ending {
+            Ending::Aborted(cause, channel) => {
+                emit_abort(&bus, thread_id, cause, channel).await;
+                format!("{cause:?} on {channel:?}")
+            }
+            Ending::UserStop => {
+                crate::engine::thread_events::emit_response_canceled(
+                    &bus,
+                    &pool,
+                    thread_id,
+                    CancelCause::UserStop,
+                    String::new(),
+                    vec![],
+                    None,
+                    None,
+                    cc_meta(),
+                    "[test] ResponseCanceled",
+                )
+                .await;
+                "a user Stop".to_string()
+            }
+        };
+        let current = emit_message_received(&bus, thread_id, "carry on").await;
+
+        let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH)).await;
+        assert!(
+            note.is_none(),
+            "{label} must not be reported as a restart: {:?}",
+            note.map(|n| n.note)
+        );
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

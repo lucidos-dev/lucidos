@@ -258,8 +258,8 @@
            the reveal stays smooth regardless of main-thread load. */
         will-change: transform, opacity;
         transform-origin: center;
-        animation: boot-mark-reveal 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both,
-                   boot-mark-breathe 2.8s ease-in-out 1.3s infinite;
+        animation: boot-mark-reveal calc(0.6s * var(--duration-scale, 1)) cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out calc(1.3s * var(--duration-scale, 1)) infinite;
       }
       /* Picker (about to reload): hide the mark so the reveal happens ONLY in the
          workspace. Space is reserved (visibility, not display) so the status line
@@ -311,10 +311,9 @@
       [data-theme="light"] .boot-splash-quiet .boot-splash-escape { color: #1f2328; }
       /* Nothing branded to fade out, so the cover leaves faster than a launch
          splash does. Two-class specificity (0,2,0), which is what lets it beat
-         the `animation` shorthand on .boot-splash-leaving below, and is also why
-         the reduced-motion block has to restate it: a media query adds no
-         specificity, so the plain 0.15s rule in there would lose to this one. */
-      .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.2s; }
+         the `animation` shorthand on .boot-splash-leaving below. The
+         reduced-motion rule below restates it, so the 0.15s exit wins here too. */
+      .boot-splash-quiet.boot-splash-leaving { animation-duration: calc(0.2s * var(--duration-scale, 1)); }
       .boot-splash-status {
         /* Type is inherited from .boot-splash (one declaration for both
            surfaces); this rule owns only what is the status line's own. The
@@ -330,7 +329,7 @@
         overflow: hidden;
         text-overflow: ellipsis;
         opacity: 0;
-        transition: opacity 0.3s ease;
+        transition: opacity calc(0.3s * var(--duration-scale, 1)) ease;
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
       /* A FAILURE REPORT, which is several lines rather than one: what went
@@ -393,7 +392,7 @@
          src/utils/bootSplash.ts removes the node when THIS element's animation
          ends (a child's `animationend` bubbles, and acting on one would tear the
          splash out mid-veil), and its fallback timer outlives this duration. */
-      .boot-splash-leaving { animation: boot-splash-out 0.65s ease forwards; }
+      .boot-splash-leaving { animation: boot-splash-out calc(0.65s * var(--duration-scale, 1)) ease forwards; }
       /* A cover on its way out is not a target. `.boot-splash-escape` takes its
          own pointer events back and `.boot-splash-stalled` takes the whole
          container's, both for a splash that is still standing; once dismissal
@@ -405,7 +404,7 @@
          above and later in the file, which is what lets it win. */
       .boot-splash-leaving .boot-splash-status {
         opacity: 0;
-        transition: opacity 0.18s ease;
+        transition: opacity calc(0.18s * var(--duration-scale, 1)) ease;
       }
       /* Beat one, the mark. The exit is APPENDED to the animation list rather
          than replacing it, and the entries ahead of it are restated verbatim:
@@ -420,13 +419,13 @@
          lists: a formed mark (the gateway handover) never played a reveal, and
          putting one back in its list here would rebuild it mid-exit. */
       .boot-splash-leaving .boot-splash-mark {
-        animation: boot-mark-reveal 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both,
-                   boot-mark-breathe 2.8s ease-in-out 1.3s infinite,
-                   boot-mark-out 0.3s cubic-bezier(0.4, 0, 1, 1) forwards;
+        animation: boot-mark-reveal calc(0.6s * var(--duration-scale, 1)) cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out calc(1.3s * var(--duration-scale, 1)) infinite,
+                   boot-mark-out calc(0.3s * var(--duration-scale, 1)) cubic-bezier(0.4, 0, 1, 1) forwards;
       }
       .boot-splash-formed.boot-splash-leaving .boot-splash-mark {
         animation: boot-mark-breathe 2.8s ease-in-out infinite,
-                   boot-mark-out 0.3s cubic-bezier(0.4, 0, 1, 1) forwards;
+                   boot-mark-out calc(0.3s * var(--duration-scale, 1)) cubic-bezier(0.4, 0, 1, 1) forwards;
       }
       @keyframes boot-mark-reveal {
         from { opacity: 0; transform: scale(0.86); }
@@ -442,22 +441,19 @@
          has it rather than snapping to full opacity first. */
       @keyframes boot-mark-out { to { opacity: 0; transform: scale(1.06); } }
       @keyframes boot-splash-out { to { opacity: 0; visibility: hidden; } }
-      @media (prefers-reduced-motion: reduce) {
-        /* Both leaving selectors are restated for the same reason the quiet fade
-           is below: a media query adds no specificity, so the plain
-           `.boot-splash-mark` rule here would lose to the two-class (and
-           three-class) exit rules above and a reduced-motion user would get the
-           scale anyway. Same for the status, whose exit rule declares a
-           transition this one has to silence. */
-        .boot-splash-mark,
-        .boot-splash-formed .boot-splash-mark,
-        .boot-splash-leaving .boot-splash-mark,
-        .boot-splash-formed.boot-splash-leaving .boot-splash-mark { animation: none; }
-        .boot-splash-status,
-        .boot-splash-leaving .boot-splash-status { transition: none; }
-        .boot-splash-leaving,
-        .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.15s; }
-      }
+      /* Reduced motion, keyed on the `data-motion` attribute the boot script
+         sets before this markup parses. Each exit selector is restated so
+         every exit rule above meets a reduced-motion rule of its own, and a
+         reduced-motion user never gets the scale. Same for the status, whose
+         exit rule declares a transition this one has to silence. */
+      :root[data-motion="reduce"] .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-formed .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-leaving .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-formed.boot-splash-leaving .boot-splash-mark { animation: none; }
+      :root[data-motion="reduce"] .boot-splash-status,
+      :root[data-motion="reduce"] .boot-splash-leaving .boot-splash-status { transition: none; }
+      :root[data-motion="reduce"] .boot-splash-leaving,
+      :root[data-motion="reduce"] .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.15s; }
       /* lucidos-boot-splash-css-end */
     </style>
 </head>

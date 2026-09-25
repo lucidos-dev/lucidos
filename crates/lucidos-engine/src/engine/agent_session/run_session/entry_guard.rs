@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::engine::event_bus::EventBus;
-use crate::engine::thread_events::{AbortCause, EventMeta};
+use crate::engine::thread_events::{AbortCause, EventChannel, EventMeta};
 use crate::engine::types::{AgentSession, AgentUserInput};
 
 /// Drop-guard over `agent_sessions[thread_id]` for one `run_session` call.
@@ -182,7 +182,10 @@ async fn settle_dropped_session(pool: &sqlx::PgPool, event_bus: &EventBus, threa
         // from under the session, a transport event rather than a decision, so
         // the panel reads System the same way `stamp_host_actor_if_aborted`'s
         // safety-net caller makes it read.
-        EventMeta::NONE,
+        EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
         "[AgentSession] ResponseAborted (session future dropped)",
     )
     .await;
@@ -269,6 +272,59 @@ mod tests {
             still_there.msg_tx.same_channel(&replacement_tx),
             "the surviving entry must be the replacement, untouched"
         );
+    }
+
+    /// The terminal belongs to the coding agent, so it carries its channel.
+    /// Readers that pick the latest coding-agent terminal filter on it. Without
+    /// the channel, a turn resumed after a restart and then dropped hid behind
+    /// the older restart abort, so the next resume blamed a restart.
+    #[tokio::test]
+    async fn the_dropped_session_terminal_carries_the_coding_agent_channel() {
+        use crate::engine::thread_events::{ActorMode, EventChannel, ThreadEvent};
+
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        crate::test_support::start_cc_session(&bus, thread_id, "claude-code/dropped", None).await;
+        bus.emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                provider: None,
+                voice_session_id: None,
+                text: "run the build".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+
+        settle_dropped_session(&pool, &bus, thread_id).await;
+
+        let channel: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'channel' FROM events \
+             WHERE thread_id = $1 AND event_type = 'ResponseAborted'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .expect("a running thread whose session dropped gets one abort");
+        assert_eq!(channel.as_deref(), Some(EventChannel::ClaudeCode.as_str()));
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     /// A completed run removes its own entry first; the guard then finds

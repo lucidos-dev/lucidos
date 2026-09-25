@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-07-30
+- **Amended by**: [0270: /harden applies rustfmt before it checks](0270-harden-applies-rustfmt-before-it-checks.md).
+  The gate still checks; `/harden` now runs `make fmt` first.
 
 (This entry uses colons where its neighbours use dashes. `.claude/rules/no-em-dashes.md`
 bans the character outright and grants no exemption for house style.)

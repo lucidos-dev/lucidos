@@ -79,6 +79,7 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
+            content_is_progress_notes: false,
         })
     }
 

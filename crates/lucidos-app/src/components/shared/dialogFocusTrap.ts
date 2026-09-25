@@ -1,7 +1,6 @@
-/** Tab focus trap for the two centered dialogs (`ConfirmDialog`,
- *  `PromptDialog`). Both render a small `<Overlay>` panel whose whole point is
- *  that the keyboard cannot leave it until the user answers, and both hand-rolled
- *  the identical wrap logic before this was extracted.
+/** Tab focus trap for the modal panels (`ConfirmDialog`, `PromptDialog`,
+ *  `ProgressDialog`, `Explainer`, `FilePreviewModal`). Each renders an
+ *  `<Overlay>` panel the keyboard must not leave until the user is done.
  *
  *  The boundary decision itself is NOT re-derived here: it is
  *  `trapTargetIndex` from `layout/paneFocus.ts`, the same pure kernel the pane

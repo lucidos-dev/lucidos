@@ -150,7 +150,7 @@ html {
        var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
        Mobile redefines this in mobile.css: its header is fixed at the viewport
        top instead, so the anchor there is the measured header height alone. */
-    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px));
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px) + var(--app-slowness-banner-height, 0px));
     /* The breathing room a surface HUNG FROM the header leaves below that edge,
        so it reads as coming out of the row it was opened from rather than as
        welded to it. The other half of the anchor above, and it lives beside it
@@ -184,6 +184,10 @@ html {
        arrive, which is independent of the bar above: the ingress probe reads a
        401 as healthy, so a hook refusing everything passes it perfectly. */
     --app-refusal-banner-height: 0px;
+    /* The slowness bar's own height, a FIFTH property on the same terms. It
+       says a reachable workspace is slow, which is independent of every bar
+       above, so it stands alongside them. */
+    --app-slowness-banner-height: 0px;
     /* How much of a state colour an app-shell banner washes over its surface.
        Shared by every bar so they read as one family, and named so the live
        style remote can retune the wash without reaching into four rules. */
@@ -235,7 +239,8 @@ html {
        right under the up-chevron with no room. Shared here so the landing
        clearance (.chat-exchange scroll-margin-top, chat/response.css) is computed
        from the chevron's OWN size + top inset and can never drift from it. */
-    --scroll-chevron-size: 2rem;   /* button diameter (width == height) */
+    --scroll-chevron-size: 1.5rem; /* button diameter (width == height) */
+    --scroll-chevron-glyph: var(--icon-size-md);
     --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
     /* Height of the transcript's bottom dissolve: the bg-colored gradient band
        .prompt-area::before (panels/content.css) draws over the scroll area. The
@@ -351,6 +356,15 @@ html {
        fallback. Redefine --focus-ring on a context (e.g. the blue app header)
        to recolor the ring there without touching every button rule. */
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* A finger needs a bigger target than a pointer, so the floating chevrons grow
+   on touch. They stop at the mobile header's own button box, so they never read
+   larger than the header buttons above them. */
+@media (pointer: coarse) {
+    :root {
+        --scroll-chevron-size: var(--mobile-header-icon-box);
+    }
 }
 
 /* Dark theme (default) */

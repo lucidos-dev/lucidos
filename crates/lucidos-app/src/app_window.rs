@@ -239,9 +239,8 @@ struct BuildGeometry {
 /// factor. Born on the primary and moved after, it changed scale with a resize
 /// still queued, and the page came out halved (ADR 0178).
 ///
-/// No frame is File > New Window, or a workspace nothing is remembered about.
-/// That takes the declared default size and no position, which leaves macOS to
-/// centre it.
+/// No frame means the desk could not be read to choose one. That takes the
+/// declared default size and no position, which leaves macOS to centre it.
 fn build_geometry(frame: Option<window_restore::Rect>) -> BuildGeometry {
     match frame {
         Some(frame) => BuildGeometry {
@@ -347,9 +346,33 @@ pub(crate) fn set_window_title(window: tauri::Window, title: String) -> Result<(
 /// **No remembered frame, deliberately.** This is a SECOND window on the
 /// workspace you are already looking at, and the record holds one frame per
 /// workspace. Handing it that frame would drop the new window exactly on top of
-/// the one it was opened from. The declared default, centred, is the answer.
+/// the one it was opened from. It cascades from that window instead.
 pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
-    open_app_window(app, new_window_url(app), None)
+    let source =
+        source_webview(app).and_then(|webview| window_restore::cascade_source(&webview.window()));
+    open_app_window(app, new_window_url(app), Birthplace::Beside(source))
+}
+
+/// Where an extra window is born.
+enum Birthplace {
+    /// At the frame its workspace was last left at.
+    Remembered(window_restore::RememberedFrame),
+    /// Cascaded from this source frame, or sized to the screen when there is
+    /// none. See [`window_restore::new_window_frame`].
+    Beside(Option<window_restore::Rect>),
+}
+
+impl Birthplace {
+    /// The workspace's remembered frame when it has one, else beside `source`.
+    fn remembered_or_beside(
+        remembered: Option<window_restore::RememberedFrame>,
+        source: Option<window_restore::Rect>,
+    ) -> Self {
+        match remembered {
+            Some(frame) => Birthplace::Remembered(frame),
+            None => Birthplace::Beside(source),
+        }
+    }
 }
 
 /// Build a top-level app window at `url`. The one builder every extra window
@@ -358,12 +381,10 @@ pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
 ///
-/// `frame` is the geometry the window's WORKSPACE was last left at, in logical
-/// points. Such a window is BUILT at that frame and hidden, then shown, so it
-/// never appears at the default size and jumps. It is also born on the display
-/// the frame names, which is what keeps its page from rendering at half size
-/// (ADR 0178). `None` takes the declared default, centred: File > New Window,
-/// and a workspace nothing is remembered about.
+/// Every window is BUILT at the frame its [`Birthplace`] names, hidden, then
+/// shown. So it never appears at a default size and jumps. It is also born on
+/// the display the frame names, which keeps its page from rendering at half
+/// size (ADR 0178).
 ///
 /// The show is `set_visible(true)`, which is `makeKeyAndOrderFront` on macOS. So
 /// a window opened by a click still arrives key, and needs no focus call of its
@@ -371,10 +392,19 @@ pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 fn open_app_window(
     app: &tauri::AppHandle,
     url: WebviewUrl,
-    frame: Option<window_restore::Rect>,
+    birthplace: Birthplace,
 ) -> Result<(), String> {
     let counter = next_webview_label_counter();
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
+    // A remembered frame is resolved against its display before the builder
+    // sees it, so a window left on the built-in is born there (ADR 0269). The
+    // clamp below judges what the builder placed.
+    let frame = match birthplace {
+        Birthplace::Remembered(remembered) => {
+            Some(window_restore::frame_to_build(app, &label, &remembered))
+        }
+        Birthplace::Beside(source) => window_restore::new_window_frame(app, &label, source),
+    };
 
     // The `tauri.conf.json` window values apply only to the declared `main`
     // window, so a builder-made one repeats them or renders the default opaque
@@ -457,30 +487,31 @@ fn open_app_window(
     Ok(())
 }
 
-/// The URL a freshly opened app window should load. Mirrors the main window's
-/// current URL once it has navigated to the gateway, so the new window lands on
-/// the workspace the user is viewing. Falls back to the gateway on the stable
-/// packaged port, or to the bundled entry in dev.
-fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
-    // The FOCUSED window first, which is what this function's own doc promises
-    // and what macOS does. Reading `main` alone opened the second window on
-    // `main`'s workspace. So from any other window, a second window on the one
-    // you were looking at was the single thing New Window could not give you.
-    //
-    // `main` stays the fallback: a tray reopen focuses nothing.
-    //
-    // By webview, not webview window, per ADR 0140. This reads a URL, which is
-    // a page operation, and focus through `webview.window()`. Blind, it read no
-    // URL off a preview-hosting window, so New Window landed on the picker
-    // rather than the workspace you were on. That undid the 0.30.4 fix.
+/// The app window a New Window is opened FROM: the one it copies the URL of
+/// and cascades from.
+///
+/// The FOCUSED window first, which is what macOS does, so a second window opens
+/// on the workspace you are looking at. `main` is the fallback, because a tray
+/// reopen focuses nothing.
+///
+/// By webview, not webview window, per ADR 0140. The URL is a page operation,
+/// and a window hosting a URL preview answers no webview-window lookup.
+fn source_webview(app: &tauri::AppHandle) -> Option<tauri::Webview> {
     let focused = app
         .webviews()
         .into_iter()
         .filter(|(label, _)| is_app_window(label))
         .find(|(_, webview)| webview.window().is_focused().unwrap_or(false))
         .map(|(_, webview)| webview);
-    let source = focused.or_else(|| app.get_webview(MAIN_WINDOW_LABEL));
-    if let Some(url) = source.and_then(|w| w.url().ok()) {
+    focused.or_else(|| app.get_webview(MAIN_WINDOW_LABEL))
+}
+
+/// The URL a freshly opened app window should load. Mirrors the source window's
+/// current URL once it has navigated to the gateway, so the new window lands on
+/// the workspace the user is viewing. Falls back to the gateway on the stable
+/// packaged port, or to the bundled entry in dev.
+fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
+    if let Some(url) = source_webview(app).and_then(|w| w.url().ok()) {
         if url.scheme() == "http" || url.scheme() == "https" {
             return WebviewUrl::External(url);
         }
@@ -615,9 +646,17 @@ pub(crate) fn show_workspace_window(
             // whole reason the record keeps geometry after a window closes
             // (ADR 0123). Reached only when NO window is on the workspace, so
             // the remembered frame cannot land on top of the window it came
-            // from. That is also why File > New Window takes no frame.
-            let frame = window_persist::remembered_frame(&url);
-            open_app_window(&app, WebviewUrl::External(parse_window_url(&url)?), frame)
+            // from. That is also why File > New Window takes no remembered
+            // frame. A workspace with none cascades from the window that asked.
+            let birthplace = Birthplace::remembered_or_beside(
+                window_persist::remembered_frame(&url),
+                window_restore::cascade_source(&window),
+            );
+            open_app_window(
+                &app,
+                WebviewUrl::External(parse_window_url(&url)?),
+                birthplace,
+            )
         }
     }
 }
@@ -632,10 +671,13 @@ pub(crate) fn show_workspace_window(
 ///
 /// The one settler, shared by the startup show and by [`reopen_client`], so the
 /// two cannot come to different arrangements for the same window.
-pub(crate) fn settle_main_geometry(app: &tauri::AppHandle, frame: Option<window_restore::Rect>) {
+pub(crate) fn settle_main_geometry(
+    app: &tauri::AppHandle,
+    frame: Option<window_restore::RememberedFrame>,
+) {
     match frame {
-        Some(frame) => {
-            let frame = window_restore::sanitized_frame(app, MAIN_WINDOW_LABEL, frame);
+        Some(remembered) => {
+            let frame = window_restore::sanitized_frame(app, MAIN_WINDOW_LABEL, &remembered);
             window_persist::size_main_window_for_its_workspace(app, frame);
         }
         None => window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL),
@@ -666,10 +708,10 @@ static MAIN_GEOMETRY_SETTLED: std::sync::atomic::AtomicBool =
 /// after that is where the user put it. Unsettled, it takes `remembered`: see
 /// [`MAIN_GEOMETRY_SETTLED`] for the launch that leaves it so.
 fn main_frame_owed(
-    navigated: Option<Option<window_restore::Rect>>,
+    navigated: Option<Option<window_restore::RememberedFrame>>,
     settled: bool,
-    remembered: Option<window_restore::Rect>,
-) -> Option<window_restore::Rect> {
+    remembered: Option<window_restore::RememberedFrame>,
+) -> Option<window_restore::RememberedFrame> {
     match navigated {
         Some(frame) => frame,
         None if settled => None,
@@ -681,10 +723,12 @@ fn main_frame_owed(
 fn main_frame_owed_now(
     live: &[desktop::LiveWindow],
     plan: &desktop::ReopenPlan,
-) -> Option<window_restore::Rect> {
+) -> Option<window_restore::RememberedFrame> {
     let settled = MAIN_GEOMETRY_SETTLED.load(std::sync::atomic::Ordering::SeqCst);
     main_frame_owed(
-        plan.navigate_main.as_ref().map(|planned| planned.frame),
+        plan.navigate_main
+            .as_ref()
+            .map(|planned| planned.frame.clone()),
         settled,
         // Skipped when settled, so a tray click costs no file read.
         (!settled)
@@ -709,7 +753,8 @@ pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::
             eprintln!("[Tauri] Cannot restore a window on an unparseable URL: {url}");
             continue;
         };
-        if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), window.frame) {
+        let birthplace = Birthplace::remembered_or_beside(window.frame.clone(), None);
+        if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), birthplace) {
             eprintln!("[Tauri] Failed to restore a window on {url}: {e}");
         }
     }
@@ -1056,11 +1101,12 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
             // The remembered frame, for the reason the row-activation arm of
             // `show_workspace_window` takes it: a tap on a banner from a
             // workspace with no window is that workspace being reopened.
-            let frame = window_persist::remembered_frame(&url);
+            let birthplace =
+                Birthplace::remembered_or_beside(window_persist::remembered_frame(&url), None);
             match url.parse::<tauri::Url>() {
                 Ok(parsed) => {
                     activation::set_menu_bar_only(app, false);
-                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), frame) {
+                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), birthplace) {
                         eprintln!("[Tauri] Failed to open a window for {url}: {e}");
                     }
                     activation::activate_app_frontmost();
@@ -1123,8 +1169,8 @@ mod tests {
         );
     }
 
-    // File > New Window, and a workspace nothing is remembered about. No
-    // position, so macOS centres it on the primary.
+    // A desk that could not be read to choose a frame. No position, so macOS
+    // centres it on the primary.
     #[test]
     fn no_frame_takes_the_declared_default_and_no_position() {
         assert_eq!(
@@ -1251,13 +1297,13 @@ mod tests {
 
     // ── What frame a reopen owes `main` ──────────────────────────────────────
 
-    fn frame() -> window_restore::Rect {
-        window_restore::Rect {
+    fn frame() -> window_restore::RememberedFrame {
+        window_restore::RememberedFrame::unanchored(window_restore::Rect {
             x: 573,
             y: 30,
             width: 3267,
             height: 1410,
-        }
+        })
     }
 
     /// An adrift `main` is being pointed somewhere, so it takes that

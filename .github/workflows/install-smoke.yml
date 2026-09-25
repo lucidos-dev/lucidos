@@ -707,6 +707,37 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP" \
             || { echo "::error::app bundle failed codesign --verify"; exit 1; }
 
+      # ── INSTALL INTO /Applications, the way a person does ────────────────────
+      # The client refuses to run from a disk image or an App Translocation copy
+      # (ADR 0271): it shows a "Move Lucidos to Applications" dialog and quits
+      # before it writes the service plist. So launching straight off the mount
+      # can only ever time out, and the probe below would report a broken DMG
+      # that is in fact behaving as designed. Copy the bundle to /Applications
+      # and launch THAT, which is the documented install path.
+      #
+      # `ditto` keeps the signature, resource forks and extended attributes
+      # intact, and the copy is re-verified so a bad copy cannot pass as a good
+      # DMG. The quarantine flag is cleared on the copy because a Finder drag
+      # into /Applications is what exempts a quarantined app from translocation,
+      # and `ditto` is not a Finder drag. Gatekeeper's verdict on the DMG itself
+      # was already asserted above by spctl, so this weakens nothing.
+      #
+      # $APP is rewritten to the installed copy. The teardown selects processes
+      # by `/<bundle name>/Contents/MacOS/` in argv[0], so it still matches, and
+      # $MNT is untouched so the detach still runs.
+      - name: Install the app into /Applications
+        run: |
+          set -euo pipefail
+          dest="/Applications/$(basename "$APP")"
+          rm -rf "$dest" 2>/dev/null || sudo rm -rf "$dest"
+          ditto "$APP" "$dest" 2>/dev/null || sudo ditto "$APP" "$dest"
+          xattr -dr com.apple.quarantine "$dest" 2>/dev/null \
+            || sudo xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
+          codesign --verify --deep --strict --verbose=2 "$dest" \
+            || { echo "::error::the copy in /Applications failed codesign --verify"; exit 1; }
+          echo "Installed: $dest"
+          echo "APP=$dest" >> "$GITHUB_ENV"
+
       # ── READINESS, not liveness ──────────────────────────────────────────────
       # This step used to `open -g` the bundle and `pgrep -f` for it. That asks
       # only whether a PROCESS EXISTS, which it cannot fail to find: an engine

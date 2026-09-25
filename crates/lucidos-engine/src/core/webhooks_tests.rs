@@ -801,14 +801,12 @@ fn every_refusal_has_a_stable_key_and_its_own_words() {
             "duplicate words {:?}",
             refusal
         );
-        assert_eq!(DeliveryRefusal::from_key(refusal.key()), Some(refusal));
         assert!(
             !refusal.key().contains(' '),
             "a key is a wire value, not prose: {:?}",
             refusal
         );
     }
-    assert_eq!(DeliveryRefusal::from_key("from-the-future"), None);
 
     // Exactly one arm examined nothing, and that is what earns it its own
     // words in `core::webhook_refusal`.

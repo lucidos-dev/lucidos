@@ -103,10 +103,10 @@ impl LucidosEngine {
     /// Today only `SpawnRequest::Continue` flows through this channel — the
     /// chat HTTP handler still owns the spawn for `MessageReceived` (see
     /// `spawn_dispatcher` module docs). For a continue request we re-enter
-    /// `run_direct_agent` with empty input so CC reconnects via `--resume`
-    /// against the existing session id; CC then sees its prior interrupt
-    /// state and continues from there. Phase 5.3 owns enriching this with
-    /// the real recovery payload (worktree path, branch, system prompt).
+    /// `run_direct_agent` with `--resume` against the existing session id and
+    /// the continuation text from `continue_input_for_reason` as its input.
+    /// Phase 5.3 owns enriching this with the real recovery payload (worktree
+    /// path, branch, system prompt).
     pub fn start_spawn_request_consumer(
         self: &Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::spawn_dispatcher::SpawnRequest>,
@@ -275,6 +275,7 @@ impl LucidosEngine {
                                     &continue_input,
                                     None,
                                     event_id,
+                                    &[],
                                     None,
                                     &cancel_token,
                                     conflict_change_id,
@@ -324,6 +325,7 @@ impl LucidosEngine {
                                         &retry_text,
                                         None,
                                         event_id,
+                                        &[],
                                         None,
                                         &cancel_token,
                                         conflict_change_id,
@@ -341,11 +343,17 @@ impl LucidosEngine {
                             }
 
                             let final_err = err_text(&result);
-                            if crate::engine::agent_recovery::continue_recovery(
+                            let settle = match crate::engine::agent_recovery::continue_recovery(
                                 final_err.as_deref(),
                                 retried,
-                            ) == ContinueRecovery::Settle
-                            {
+                            ) {
+                                ContinueRecovery::Settle => true,
+                                ContinueRecovery::SettleUnlessOwned => {
+                                    !engine.coding_agent_owns_thread(thread_id).await
+                                }
+                                ContinueRecovery::Nothing | ContinueRecovery::RetryFresh => false,
+                            };
+                            if settle {
                                 let e = final_err.as_deref().unwrap_or_default();
                                 crate::log!(
                                     "[SpawnConsumer] Continue thread={} event={} failed: {}",
@@ -490,16 +498,16 @@ impl LucidosEngine {
         // entry with the directory left behind would hand CC a cwd whose git
         // commands resolve to the enclosing repo). A dead one falls through
         // to the branch lookup instead.
-        let recorded = match (&change.merge_worktree_path, &change.merge_temp_branch) {
-            (Some(wt), Some(tb)) => {
-                let p = PathBuf::from(wt);
+        let recorded = match change.merge_worktree() {
+            Some(merge) => {
+                let p = PathBuf::from(&merge.path);
                 if crate::engine::git_ops::is_live_worktree_at(&p).await {
-                    Some((p, tb.clone()))
+                    Some((p, merge.temp_branch.clone()))
                 } else {
                     None
                 }
             }
-            _ => None,
+            None => None,
         };
         let worktree = match recorded {
             Some(pair) => Some(pair),
@@ -579,9 +587,11 @@ impl LucidosEngine {
         // arm deletes them for the same reason). The extra merge --abort
         // inside the helper is a harmless no-op when this is the same path
         // as `merge_worktree`.
-        if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
+        if let Some(merge) = change.merge_worktree() {
             let repo = std::path::PathBuf::from(&change.repo_root);
-            if !remove_temp_merge_state(&repo, wt, tb, "[SpawnConsumer]").await {
+            if !remove_temp_merge_state(&repo, &merge.path, &merge.temp_branch, "[SpawnConsumer]")
+                .await
+            {
                 log!(
                     "[SpawnConsumer] Temp merge state for change {} needs manual cleanup: the merge columns are cleared below, so nothing points at it any more",
                     change.id
@@ -721,7 +731,13 @@ impl LucidosEngine {
         // Run sqlx migrations before any schema init calls
         crate::boot_report::report(crate::boot_report::MIGRATING);
         let migrator = sqlx::migrate!();
-        if let Err(e) = migrator.run(&pool).await {
+        let migrate_started = std::time::Instant::now();
+        let migrated = migrator.run(&pool).await;
+        log!(
+            "[Startup] Migrations checked in {}ms",
+            migrate_started.elapsed().as_millis()
+        );
+        if let Err(e) = migrated {
             // Some migration failures are TERMINAL — no respawn fixes them — and
             // the most common is an app DOWNGRADE onto a database a newer Lucidos
             // already migrated (`VersionMissing`). Translate those into something
@@ -1052,9 +1068,15 @@ impl LucidosEngine {
             }
         };
         for change in stale_merges {
-            if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
+            if let Some(merge) = change.merge_worktree() {
                 let change_repo = std::path::PathBuf::from(&change.repo_root);
-                let removed = remove_temp_merge_state(&change_repo, wt, tb, "[Startup]").await;
+                let removed = remove_temp_merge_state(
+                    &change_repo,
+                    &merge.path,
+                    &merge.temp_branch,
+                    "[Startup]",
+                )
+                .await;
                 if let Some(tid) = change.thread_id {
                     event_bus
                         .emit_or_log(
@@ -1265,6 +1287,7 @@ impl LucidosEngine {
             build_generation: std::sync::atomic::AtomicU64::new(0),
             served_frontend: std::sync::OnceLock::new(),
             served_frontend_source: std::sync::OnceLock::new(),
+            served_frontend_commit: Default::default(),
             frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
             frontend_refresh_task: std::sync::Mutex::new(None),
             frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
@@ -1346,8 +1369,10 @@ impl LucidosEngine {
                 crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().replace(rx));
                 tx
             },
-            last_cc_spawn: std::sync::Mutex::new(HashMap::new()),
+            last_spawn: std::sync::Mutex::new(HashMap::new()),
+            spawns_in_flight: agent_session::SpawnsInFlight::default(),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
+            follow_up_order: Default::default(),
             cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             workspace_repo_lock: Arc::new(tokio::sync::Mutex::new(())),

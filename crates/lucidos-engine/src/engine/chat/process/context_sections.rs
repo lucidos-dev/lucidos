@@ -33,6 +33,11 @@ pub(super) struct ChatContextSections {
 pub(super) struct ChatContextInputs<'a> {
     pub classification: &'a crate::memory::QueryClassification,
     pub user_profile: &'a str,
+    pub thread_id: Uuid,
+    /// The event that started this turn. An answer-driven resume passes the
+    /// interrupted turn's, so the answer counts toward the last used device.
+    pub turn_anchor: Uuid,
+    /// The device the turn's own event came from. `None` on a resume.
     pub device_id: Option<&'a str>,
     pub event_device: Option<&'a str>,
     pub app_context: Option<&'a AppContext>,
@@ -51,6 +56,8 @@ impl LucidosEngine {
         let ChatContextInputs {
             classification,
             user_profile,
+            thread_id,
+            turn_anchor,
             device_id,
             event_device,
             app_context,
@@ -85,8 +92,10 @@ impl LucidosEngine {
         };
 
         let device_preferences_context =
-            crate::engine::agent_context::build_user_device_preferences_context(
+            crate::engine::agent_context::build_user_device_preferences_context_for_turn(
                 &self.pool,
+                thread_id,
+                Some(turn_anchor),
                 device_id,
                 event_device,
             )
@@ -157,6 +166,18 @@ impl LucidosEngine {
             }
         };
 
+        // The id comes off the request body and is joined into a path below, so
+        // a traversal id would list another directory's docs.
+        let app_context = app_context.filter(|ctx| {
+            let traversal = crate::core::is_path_traversal(&ctx.app_id);
+            if traversal {
+                log!(
+                    "[Chat] Ignoring app context with a path-traversal app id: {}",
+                    ctx.app_id
+                );
+            }
+            !traversal
+        });
         // Active app context — tell the LLM which app UI is open so it can read files as needed
         let app_context_section = if let Some(ctx) = app_context {
             let app_name = self

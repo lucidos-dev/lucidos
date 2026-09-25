@@ -130,14 +130,7 @@ pub struct ResolvedBlob {
 
 /// Compute lowercase hex sha256 of `bytes`.
 pub fn compute_hash(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    digest.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{:02x}", b);
-        acc
-    })
+    crate::api::hex::hex_lower(&Sha256::digest(bytes))
 }
 
 /// Sniff a recognized image mime from magic bytes. Returns `None` for

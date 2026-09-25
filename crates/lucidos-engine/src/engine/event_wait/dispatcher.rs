@@ -495,6 +495,7 @@ impl LucidosEngine {
                 None,
                 None,
                 crate::engine::FollowUpUrgency::Normal,
+                None,
             )
             .await
         {

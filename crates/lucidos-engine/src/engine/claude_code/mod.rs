@@ -317,14 +317,16 @@ pub(crate) fn hardening_succeeded(cancel_token_cancelled: bool, marker_present: 
 /// emitting any `ChangeApplyFailed` — because the change was applied via a
 /// concurrent path (e.g. another device clicked Apply) while CC was running
 /// `/harden`. In that case the marker file has been consumed by the apply and
-/// the change row is no longer `"pending"`, so `branch_is_hardened` returns
+/// the change row is no longer pending, so `branch_is_hardened` returns
 /// false and we'd otherwise emit a "Hardening did not complete" failure ~15s
 /// after the user already saw `ChangeApplied` — a "hindsight failure" in the
 /// UI. `change_status` is the `status` field from the change row, or `None`
 /// when the row could not be fetched (treat as not-yet-applied so the
 /// existing failure path still runs).
-pub(crate) fn change_applied_concurrently(change_status: Option<&str>) -> bool {
-    matches!(change_status, Some("applied"))
+pub(crate) fn change_applied_concurrently(
+    change_status: Option<crate::core::changes::ChangeStatus>,
+) -> bool {
+    change_status == Some(crate::core::changes::ChangeStatus::Applied)
 }
 
 /// Sentinel error message returned when a CC resume attempt produces an empty
@@ -344,6 +346,16 @@ pub(crate) const STALE_RESUME_ERROR: &str = "CC_STALE_RESUME";
 /// `agent_recovery::continue_recovery`.
 pub(crate) const AGENT_ALREADY_RUNNING_ERROR: &str =
     "A coding agent is already running for this thread. Cancel it first or wait for it to finish.";
+
+/// Error the per-thread spawn debounce returns when another spawn started on
+/// this thread within [`SPAWN_DEBOUNCE`]. The same lost race as
+/// [`AGENT_ALREADY_RUNNING_ERROR`], possibly caught before the winner
+/// registered its session. See `agent_recovery::continue_recovery`.
+pub(crate) const DUPLICATE_SPAWN_ERROR: &str =
+    "A coding-agent session was just started, so this duplicate request was ignored.";
+
+/// How long after a spawn on a thread `run_direct_agent` refuses another one.
+pub(crate) const SPAWN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Marker file written to each CC worktree identifying the owning workspace.
 pub(crate) const WORKTREE_WORKSPACE_MARKER: &str = ".lucidos-workspace";
@@ -367,7 +379,7 @@ pub(crate) const RUNTIME_PATH_PREFIX: &str = ".lucidos/";
 /// the lucidos-cli skill entry, which lands at `<wt>/.claude/skills/...` for
 /// repo-rooted spawns but at `<wt>/data/apps/<id>/.claude/skills/...` for app
 /// coding-agent threads (CC's cwd is the deep app folder, and
-/// `install_lucidos_cli_skill` writes relative to cwd). One pattern covers
+/// `place_lucidos_cli_skill` writes relative to cwd). One pattern covers
 /// both — no separate code path per spawn kind.
 pub(crate) const WORKTREE_EXCLUDE_PATHS: &[&str] = &[
     WORKTREE_WORKSPACE_MARKER,
@@ -512,12 +524,116 @@ pub(crate) async fn emit_background_task_failure(
 /// to chase the enum into `types.rs`.
 pub use crate::engine::types::StopReason;
 
+#[cfg(test)]
+pub(crate) use control::record_control_request;
+
 /// Returned by [`LucidosEngine::interrupt_agent`] when the session is already
 /// idle/waiting — i.e. a Cancel (Stop) click that races a turn which already
 /// finished. Callers (the `/claude-code/stop` handler) treat it as a no-op
 /// (HTTP 200), not an error: there is nothing to interrupt. Lives here (not in
 /// the private `control` submodule) so the API handler can reference it.
 pub(crate) const SESSION_ALREADY_WAITING: &str = "Session is already waiting";
+
+/// Why an operation is refused while an apply holds the session's change
+/// claim (`ChangeClaim::Apply`).
+pub(crate) const APPLY_IN_PROGRESS_MESSAGE: &str =
+    "An apply is already in progress for this thread. It finishes on its own";
+
+/// Why an operation is refused while an in-session Discard holds the session's
+/// change claim (`ChangeClaim::Discard`). It never says "apply": the change is
+/// on its way out, not in.
+pub(crate) const DISCARD_IN_PROGRESS_MESSAGE: &str =
+    "A discard is already in progress for this thread. Try again once it has finished";
+
+/// The refusal a change claim gives, naming its holder.
+pub(crate) fn claim_refusal_message(holder: crate::engine::types::ChangeClaim) -> &'static str {
+    match holder {
+        crate::engine::types::ChangeClaim::Apply => APPLY_IN_PROGRESS_MESSAGE,
+        crate::engine::types::ChangeClaim::Discard => DISCARD_IN_PROGRESS_MESSAGE,
+    }
+}
+
+/// The machine-readable reason slug for a change claim's refusal.
+pub(crate) fn claim_refusal_slug(holder: crate::engine::types::ChangeClaim) -> &'static str {
+    match holder {
+        crate::engine::types::ChangeClaim::Apply => "apply_in_progress",
+        crate::engine::types::ChangeClaim::Discard => "discard_in_progress",
+    }
+}
+
+/// Why an apply or an in-session Discard is refused while a Stop, Discard or
+/// Archive is ending the session.
+pub(crate) const SESSION_STOPPING_MESSAGE: &str =
+    "The coding-agent session is stopping. Try again once it has ended";
+
+/// The machine-readable reason an HTTP handler sends beside a refusal message,
+/// matched by identity. `None` for anything that is not a claim refusal. The
+/// frontend keys on it: only `apply_in_progress` means an apply is running.
+pub(crate) fn claim_refusal_reason(message: &str) -> Option<&'static str> {
+    match message {
+        APPLY_IN_PROGRESS_MESSAGE => {
+            Some(claim_refusal_slug(crate::engine::types::ChangeClaim::Apply))
+        }
+        DISCARD_IN_PROGRESS_MESSAGE => Some(claim_refusal_slug(
+            crate::engine::types::ChangeClaim::Discard,
+        )),
+        SESSION_STOPPING_MESSAGE => Some("session_stopping"),
+        _ => None,
+    }
+}
+
+/// What an in-session Discard found for its thread.
+pub(crate) enum DiscardTarget {
+    /// No session: the stale-session teardown handles the Discard.
+    NoSession,
+    /// The session, claimed for this Discard. Release it with `claimant`.
+    Claimed {
+        worktree: PathBuf,
+        claimant: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
+    },
+}
+
+/// Claim the thread's session for an in-session Discard, in one lock.
+///
+/// The Discard resets the worktree after releasing the lock, so it holds the
+/// change claim until then. An apply cannot claim the session under it, and
+/// it cannot start under an apply or under a stop that is ending the session.
+///
+/// A missing session and a session with no worktree stay distinct: the second
+/// reports an error, and never falls through to the stale-session teardown.
+pub(crate) fn claim_for_discard(
+    sessions: &mut HashMap<Uuid, crate::engine::AgentSession>,
+    thread_id: Uuid,
+) -> Result<DiscardTarget, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(session) = sessions.get_mut(&thread_id) else {
+        return Ok(DiscardTarget::NoSession);
+    };
+    if let Some(refusal) = stop_refusal(session) {
+        return Err(refusal.into());
+    }
+    if session.pending_stop.is_some() {
+        return Err(SESSION_STOPPING_MESSAGE.into());
+    }
+    let worktree = session
+        .worktree_path
+        .clone()
+        .ok_or("No worktree for this session")?;
+    session.change_claim = Some(crate::engine::types::ChangeClaim::Discard);
+    Ok(DiscardTarget::Claimed {
+        worktree,
+        claimant: session.msg_tx.clone(),
+    })
+}
+
+/// Why a Stop, Discard or Archive is refused, or `None` when it may proceed.
+///
+/// An operation holding the session's change refuses it. Discard mid-apply
+/// wakes the apply task's idle wait with `Ok`, so the task merges a branch
+/// Discard is deleting. The holder finishes on its own, and the stop can follow.
+/// `decide_in_place_merge_claim` refuses the other direction.
+pub(crate) fn stop_refusal(session: &crate::engine::AgentSession) -> Option<&'static str> {
+    session.change_claim.map(claim_refusal_message)
+}
 
 /// Which terminal event [`settle_stuck_running_thread`] emits, i.e. what ended
 /// the turn it is settling. The caller knows. The helper must not guess: both

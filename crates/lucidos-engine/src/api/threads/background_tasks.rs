@@ -54,6 +54,8 @@ fn parse_thread_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
 #[derive(Deserialize)]
 pub(in crate::api) struct StartRequest {
     command: String,
+    /// What the task is, in the user's words. The thread's waiting row shows it.
+    description: Option<String>,
     timeout_secs: Option<u64>,
 }
 
@@ -68,7 +70,12 @@ pub(in crate::api) async fn start_background_task(
     require_own_thread_agent(&headers, thread_id)?;
     let started = state
         .engine
-        .start_background_task_for_agent(thread_id, &req.command, req.timeout_secs)
+        .start_background_task_for_agent(
+            thread_id,
+            &req.command,
+            req.description.as_deref(),
+            req.timeout_secs,
+        )
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     Ok(Json(start_response(started)))

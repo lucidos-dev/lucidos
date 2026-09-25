@@ -40,7 +40,7 @@ import { documentTitle } from '../utils/windowTitle';
 import { errorDetail } from '../utils/errorDetail';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import { clampToastMessage } from '../components/shared/toastMessage';
-import type { EventSubscription, ThreadState, ThreadStatus, Exchange } from './thread-events';
+import type { SubscriptionGroup, ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
@@ -444,7 +444,7 @@ export const lucidosReleaseDirty = signal<boolean>(false);
  *
  *  The history you HAVE. A release the updater is OFFERING postdates the binary
  *  this came out of, so its notes arrive with the update check instead
- *  (`whatsNewOfferNotes`). */
+ *  (`AppUpdateOffer.notes`). */
 export const changelogReleases = signal<Loadable<ChangelogRelease[]>>({ status: 'not-loaded' });
 /** The release whose What's New this client has opened, from localStorage, or
  *  `null` when it never has. Drives the unread dot on the Lucidos menu's version
@@ -563,14 +563,10 @@ export const currentModel = signal(DEFAULT_CHAT_MODEL);
 // --- Reasoning Effort (persisted via preferences; populated by loadPreferences) ---
 export const reasoningEffort = signal('high');
 
-// --- Animation Speed Slider (-10 to 10, 0 = normal) ---
-// Stored as slider position; speedMultiplier derives the actual multiplier
-export const animationSpeed = signal(
-  parseInt(localStorage.getItem('lucidos-animation-speed-slider') || '0', 10) || 0
-);
-
-/** Slider position (-10..10) → speed multiplier (0.1x..10x) via 10^(v/10). */
-export const speedMultiplier = computed(() => Math.pow(10, animationSpeed.value / 10));
+// --- Animation speed and reduced motion ---
+// Owned by utils/motion.ts, a lean module that timers outside the store can
+// import without loading this one. Re-exported for the store's own importers.
+export { animationSpeed, speedMultiplier, durationScale, scaledDurationMs } from '../utils/motion';
 
 // --- Toast placement (temporary: a shape comparison, see docs/temporary-measures.md) ---
 
@@ -611,37 +607,6 @@ function storedToastPlacement(): ToastPlacement {
 }
 
 export const toastPlacement = signal<ToastPlacement>(storedToastPlacement());
-
-/** What every animated duration is MULTIPLIED by: the reciprocal of the speed,
- *  so 10x speed is a 0.1 scale. It exists beside the multiplier, rather than
- *  each caller writing `1 / speed`, so one name root crosses both layers:
- *
- *    - CSS reads it as `var(--duration-scale)`, published onto :root by
- *      store/effects.ts and folded into every `--duration-*` token in
- *      styles/global/base.css. That is what lets the slider reach a plain CSS
- *      transition at all.
- *    - TS reads it through `scaledDurationMs` for a timer that must outlive
- *      one of those transitions, and directly for a Web Animations duration
- *      (useFlipAnimation).
- *
- *  1 at the slider's centre, so a user who never touches it sees today's
- *  timings exactly. */
-export const durationScale = computed(() => 1 / speedMultiplier.value);
-
-/** A base duration in ms, scaled to the current animation speed.
- *
- *  For a TS timer that MIRRORS a CSS duration, such as keeping an element
- *  mounted through its own fade. Pass the 1x duration of the CSS it mirrors.
- *  Add any safety slack OUTSIDE the call, since slack is a fixed margin rather
- *  than animation. So `scaledDurationMs(PANE_TRANSITION_MS) + 100` is the
- *  shape, never `scaledDurationMs(PANE_TRANSITION_MS + 100)`.
- *
- *  Scaling the CSS without scaling these desyncs the pair. At 0.1x the
- *  drawer's width transition runs 3s while an unscaled 350ms timer unmounts
- *  its list, so the drawer blanks and then slides shut empty. */
-export function scaledDurationMs(baseMs: number): number {
-  return baseMs * durationScale.value;
-}
 
 // --- Threads ---
 export const threadDrawerOpen = signal(
@@ -798,12 +763,11 @@ export function threadChannelToFilterSource(channel: ThreadChannel): ThreadFilte
   }
 }
 
-// Empty set = "all triggers". Non-empty = filter to those trigger_ids only.
-const SELECTED_TRIGGER_IDS_KEY = 'lucidos-selected-trigger-ids';
-
-function restoreSelectedTriggerIds(): Set<string> {
+/** A persisted id set, or an empty set when the stored value is absent or
+ *  malformed. Shared by the facet selections and the collapsed trigger groups. */
+function restoreIdSet(key: string): Set<string> {
   try {
-    const saved = localStorage.getItem(SELECTED_TRIGGER_IDS_KEY);
+    const saved = localStorage.getItem(key);
     if (!saved) return new Set();
     const parsed = JSON.parse(saved);
     if (!Array.isArray(parsed)) return new Set();
@@ -811,11 +775,18 @@ function restoreSelectedTriggerIds(): Set<string> {
   } catch { return new Set(); }
 }
 
-export const selectedTriggerIds = signal<Set<string>>(restoreSelectedTriggerIds());
+function persistIdSet(key: string, next: Set<string>): void {
+  localStorage.setItem(key, JSON.stringify([...next]));
+}
+
+// Empty set = "all triggers". Non-empty = filter to those trigger_ids only.
+const SELECTED_TRIGGER_IDS_KEY = 'lucidos-selected-trigger-ids';
+
+export const selectedTriggerIds = signal<Set<string>>(restoreIdSet(SELECTED_TRIGGER_IDS_KEY));
 
 export function setSelectedTriggerIds(next: Set<string>): void {
   selectedTriggerIds.value = next;
-  localStorage.setItem(SELECTED_TRIGGER_IDS_KEY, JSON.stringify([...next]));
+  persistIdSet(SELECTED_TRIGGER_IDS_KEY, next);
 }
 
 // Empty set = "all repos". Non-empty = filter coding-agent threads to those
@@ -823,21 +794,11 @@ export function setSelectedTriggerIds(next: Set<string>): void {
 // Coding Agent parent indeterminate when this set is non-empty.
 const SELECTED_REPO_IDS_KEY = 'lucidos-selected-repo-ids';
 
-function restoreSelectedRepoIds(): Set<string> {
-  try {
-    const saved = localStorage.getItem(SELECTED_REPO_IDS_KEY);
-    if (!saved) return new Set();
-    const parsed = JSON.parse(saved);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
-  } catch { return new Set(); }
-}
-
-export const selectedRepoIds = signal<Set<string>>(restoreSelectedRepoIds());
+export const selectedRepoIds = signal<Set<string>>(restoreIdSet(SELECTED_REPO_IDS_KEY));
 
 export function setSelectedRepoIds(next: Set<string>): void {
   selectedRepoIds.value = next;
-  localStorage.setItem(SELECTED_REPO_IDS_KEY, JSON.stringify([...next]));
+  persistIdSet(SELECTED_REPO_IDS_KEY, next);
 }
 
 // Mirrors selectedRepoIds for app coding-agent threads. Apps sit beside repos
@@ -845,21 +806,11 @@ export function setSelectedRepoIds(next: Set<string>): void {
 // set is independent so a user can pick "this repo OR this app".
 const SELECTED_APP_IDS_KEY = 'lucidos-selected-app-ids';
 
-function restoreSelectedAppIds(): Set<string> {
-  try {
-    const saved = localStorage.getItem(SELECTED_APP_IDS_KEY);
-    if (!saved) return new Set();
-    const parsed = JSON.parse(saved);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
-  } catch { return new Set(); }
-}
-
-export const selectedAppIds = signal<Set<string>>(restoreSelectedAppIds());
+export const selectedAppIds = signal<Set<string>>(restoreIdSet(SELECTED_APP_IDS_KEY));
 
 export function setSelectedAppIds(next: Set<string>): void {
   selectedAppIds.value = next;
-  localStorage.setItem(SELECTED_APP_IDS_KEY, JSON.stringify([...next]));
+  persistIdSet(SELECTED_APP_IDS_KEY, next);
 }
 
 // Whether the filter dropdown lists deleted trigger, repo and app options:
@@ -913,7 +864,7 @@ export const threadHasMore = signal(true);
 /** Whether a load-more request is currently in flight. */
 export const threadLoadingMore = signal(false);
 /** Total size of the archived pile from the backend, refreshed by every
- *  `loadAllThreads`. Drives the collapsed Archive section's count badge, so it
+ *  `loadAllThreads`. Drives the Archive section's count badge, so it
  *  shows the true total rather than the loaded window. A plain signal rather
  *  than a `Loadable`, matching the `threadMap` and `threadsLoaded` the same
  *  fetch populates. The badge falls back to the loaded count until it
@@ -980,6 +931,15 @@ export function isRenderedThreadIdle(thread: ThreadState | undefined): boolean {
   if (answeringThreadIds.value.has(thread.meta.id)) return false;
   if (thread.pendingUserMessages.length > 0) return false;
   return isThreadQuiescent(thread.meta.status);
+}
+
+/** Is the agent live streaming on this thread? RUNNING, or resuming after an
+ *  answer the aggregate has not confirmed yet. Not the opposite of
+ *  `isRenderedThreadIdle`: `waiting`, `paused` and `failed` stream nothing
+ *  either. The transcript's follow reads it (`store/transcriptLiveness.ts`). */
+export function isThreadStreaming(thread: ThreadState): boolean {
+  if (answeringThreadIds.value.has(thread.meta.id)) return true;
+  return effectiveThreadStatus(thread) === 'running';
 }
 
 export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
@@ -1541,13 +1501,13 @@ export const applyAllInProgress = signal(false);
  *
  *  Keyed by thread rather than by change, because a sweep arms a thread that has
  *  proposed nothing yet. Seeded from `GET /api/v1/changes` so a reload keeps the
- *  armed state, and kept live by the StandingApplyArmed / StandingApplyDropped
- *  SSE events. */
+ *  armed state, and kept live by the StandingApplyArmed, StandingApplyFired and
+ *  StandingApplyDropped SSE events. */
 export const standingApplyThreadIds = signal<Set<string>>(new Set());
-/** Coding-agent threads still working, so an Apply All sweep has something to
- *  arm. Served by `GET /api/v1/changes`, because the panel cannot derive it:
+/** Coding-agent threads still settling, so an Apply All sweep has something
+ *  to arm. Served by `GET /api/v1/changes`, because the panel cannot derive it:
  *  `threadMap` holds only the loaded window. */
-export const workingThreadCount = signal(0);
+export const settlingThreadCount = signal(0);
 /** Threads whose arm or disarm request is in flight, so a second tap can't fire
  *  a duplicate. */
 export const armingStandingApplyThreadIds = signal<Set<string>>(new Set());
@@ -1877,21 +1837,11 @@ export const triggerGroups = signal<Loadable<TriggerGroup[]>>({ status: 'not-loa
  *  and engine restarts on this device without syncing to any other. */
 const COLLAPSED_TRIGGER_GROUPS_KEY = 'lucidos-collapsed-trigger-groups';
 
-function restoreCollapsedTriggerGroups(): Set<string> {
-  try {
-    const saved = localStorage.getItem(COLLAPSED_TRIGGER_GROUPS_KEY);
-    if (!saved) return new Set();
-    const parsed = JSON.parse(saved);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
-  } catch { return new Set(); }
-}
-
-export const collapsedTriggerGroupIds = signal<Set<string>>(restoreCollapsedTriggerGroups());
+export const collapsedTriggerGroupIds = signal<Set<string>>(restoreIdSet(COLLAPSED_TRIGGER_GROUPS_KEY));
 
 function persistCollapsedTriggerGroups(next: Set<string>): void {
   collapsedTriggerGroupIds.value = next;
-  localStorage.setItem(COLLAPSED_TRIGGER_GROUPS_KEY, JSON.stringify([...next]));
+  persistIdSet(COLLAPSED_TRIGGER_GROUPS_KEY, next);
 }
 
 export function toggleTriggerGroupCollapsed(groupId: string): void {
@@ -1926,12 +1876,14 @@ export const pendingChatMessage = signal<string | null>(null);
 // their commands.
 export const codingAgentSessionVersion = signal(0);
 
-// Set from the compose view before a session starts, consumed on the first
-// coding-agent message.
+// The active thread's coding-agent model and effort pick, sent with its next
+// follow-up. `loadCommands` clears each once the live session adopts it. A
+// compose draft never reads these: its picks live in `composeSelections`.
 export const codingAgentPendingModel = signal<CodingAgentModelValue | null>(null);
 export const codingAgentPendingReasoningEffort = signal<CodingAgentReasoningEffort | null>(null);
 
-/** Reset the pending preferences. Called on thread switch and after sending. */
+/** Reset the pending picks. `focusThread` calls it on every focus, including
+ *  a tap on the thread that is already open. */
 export function resetCodingAgentPendingPreferences(): void {
   codingAgentPendingModel.value = null;
   codingAgentPendingReasoningEffort.value = null;
@@ -2344,12 +2296,12 @@ export interface ContextViewerState {
 export const contextViewer = signal<ContextViewerState | null>(null);
 
 // --- Event subscription condition ---
-// Set to one *event subscription* to show the `condition` filtering it; null =
-// closed. One subscription rather than the whole `on:` list, because that is
-// what the thing you pressed names.
+// Set to one event type's subscriptions to show the conditions filtering them;
+// null = closed. One type rather than the whole `on:` list, because that is
+// what the thing you pressed names. Any one condition matching resumes the thread.
 export interface EventConditionModalState {
   eventType: string;
-  condition: Record<string, unknown>;
+  conditions: Record<string, unknown>[];
 }
 export const eventConditionModal = signal<EventConditionModalState | null>(null);
 
@@ -2357,25 +2309,31 @@ export const eventConditionModal = signal<EventConditionModalState | null>(null)
  *
  *  **Both PRESSABLE surfaces go through here**: the transcript row's chip and
  *  the waiting panel's line. (The archive confirmation prints the same
- *  "(filtered)" label into a plain string and offers no door.) They must open the same thing under
- *  the same accessible name, and each must be pressable exactly when its label
- *  says filtered. Two copies of that rule is how the two drift apart.
+ *  "(matching only)" label into a plain string and offers no door.) They must
+ *  open the same thing under the same accessible name, and each must be
+ *  pressable exactly when its label carries a condition note. Two copies of
+ *  that rule is how the two drift apart.
+ *
+ *  The label leads with the raw event type: it is the tooltip over a chip that
+ *  shows the plain name, and the one place the exact type is still on screen.
  *
  *  The panel is a backdrop-less popover and the modal is a top-anchored sheet.
  *  So opening one from the other STACKS on `overlayStack` rather than replacing
  *  it: Escape or an outside click closes the modal and lands back on the panel.
  *
- *  `condition` is captured here rather than re-read at click time, which is
+ *  `conditions` is captured here rather than re-read at click time, which is
  *  what makes the returned `open` safe to hand to a handler. */
 export function eventConditionDoor(
-  s: EventSubscription,
+  g: SubscriptionGroup,
 ): { label: string; open: () => void } | null {
-  const condition = s.condition;
-  if (!condition) return null;
+  const { event_type: eventType, conditions } = g;
+  if (conditions.length === 0) return null;
   return {
-    label: `Show the condition filtering ${s.event_type}`,
+    label: conditions.length === 1
+      ? `${eventType} · show the condition`
+      : `${eventType} · show the ${conditions.length} conditions`,
     open: () => {
-      eventConditionModal.value = { eventType: s.event_type, condition };
+      eventConditionModal.value = { eventType, conditions };
     },
   };
 }

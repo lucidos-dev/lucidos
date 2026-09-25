@@ -21,7 +21,8 @@
 //! The `screens` mode walks the window through every move the client makes to
 //! one, and found that none of them reverts the placement. See
 //! [`walk_screens`], whose control step proves the walk can see a revert. It
-//! ends on [`judge_the_retitle`], because a new title does revert it.
+//! ends on [`judge_the_retitle`] and [`judge_the_appearance`], because a new
+//! title and an appearance change both do revert it.
 
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,10 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 
-use crate::traffic_lights::{inset_lights, measure_cluster, retitle_and_place, LIGHTS_X_PX};
+use crate::traffic_lights::{
+    inset_lights, measure_cluster, observe_relayouts, observe_resizes, retitle_and_place,
+    stop_observing, titlebar_container, LIGHTS_X_PX,
+};
 
 /// The page. It ticks once a second and publishes the count and WebKit's own
 /// visibility verdict through the title. A suspended WebContent cannot keep that
@@ -741,6 +745,133 @@ fn walk_screens(
     }
     faults.extend(judge_the_re_apply(app, window, options));
     faults.extend(judge_the_retitle(app, window, options));
+    faults.extend(judge_the_appearance(app, window, options));
+    faults
+}
+
+/// Flip the app between dark and light. macOS makes the same change by itself,
+/// for instance when "Auto" appearance follows the time of day.
+fn flip_appearance(app: &NSApplication, dark: bool) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    // SAFETY: AppKit's own appearance name constants, read on the main thread.
+    let name = unsafe {
+        if dark {
+            NSAppearanceNameDarkAqua
+        } else {
+            NSAppearanceNameAqua
+        }
+    };
+    app.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+}
+
+/// Whether an appearance change still reverts the placement, and whether the
+/// client's relayout observer puts it back.
+///
+/// Light to dark is the flip measured to revert. Dark to light was measured
+/// to leave the container alone, so each flip starts from light.
+///
+/// The client's two observers are installed together from the second flip on,
+/// as [`crate::traffic_lights`] installs them. So the retitle, the resize and
+/// the full-screen round trip after it prove the observers do not fight.
+fn judge_the_appearance(app: &NSApplication, window: &NSWindow, options: &Options) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    let bar = options.bar_px;
+    let to_dark = || {
+        flip_appearance(app, false);
+        pump(app, Instant::now() + STOP_SETTLE);
+        inset_lights(window, LIGHTS_X_PX, bar);
+        flip_appearance(app, true);
+        pump(app, Instant::now() + STOP_SETTLE);
+        read_stop(window)
+    };
+
+    let bare = to_dark();
+    let mut control = Vec::new();
+    judge_stop("appearance-bare", bare, bare, options, &mut control);
+    if control.is_empty() {
+        faults.push(Fault {
+            step: "appearance-bare",
+            what: "an appearance change left the placement alone, so this stop sees no revert"
+                .to_string(),
+        });
+    }
+
+    let Some(container) = window
+        .standardWindowButton(objc2_app_kit::NSWindowButton::CloseButton)
+        .and_then(|close| titlebar_container(&close))
+    else {
+        faults.push(Fault {
+            step: "appearance",
+            what: "the window has no titlebar container to observe".to_string(),
+        });
+        return faults;
+    };
+    let relayouts = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let counted = relayouts.clone();
+    let observers = [
+        observe_resizes(window, move |window| inset_lights(window, LIGHTS_X_PX, bar)),
+        observe_relayouts(window, &container, move |window| {
+            counted.set(counted.get() + 1);
+            inset_lights(window, LIGHTS_X_PX, bar)
+        }),
+    ];
+
+    let client = to_dark();
+    judge_stop("appearance", client, client, options, &mut faults);
+
+    retitle_and_place(window, "probe: retitle under both observers", bar);
+    pump(app, Instant::now() + STOP_SETTLE);
+    let retitled = read_stop(window);
+    judge_stop("both-retitle", retitled, retitled, options, &mut faults);
+
+    let mut frame = window.frame();
+    frame.size.height -= 40.0;
+    window.setFrame_display(frame, true);
+    pump(app, Instant::now() + STOP_SETTLE);
+    let resized = read_stop(window);
+    judge_stop("both-resize", resized, resized, options, &mut faults);
+
+    faults.extend(judge_full_screen(app, window, options, &relayouts));
+    for observer in &observers {
+        stop_observing(observer);
+    }
+    app.setAppearance(None);
+    faults
+}
+
+/// How long a full-screen transition gets to finish. The animation runs about
+/// a second, and a relayout echo must be over well inside this.
+const FULL_SCREEN_SETTLE: Duration = Duration::from_secs(3);
+
+/// A full-screen round trip under both observers. Once the relayout observer
+/// re-applied inside full screen, fought AppKit's own layout, and overflowed
+/// the stack. So the round trip must end, the observer must go quiet, and the
+/// lights must be back.
+fn judge_full_screen(
+    app: &NSApplication,
+    window: &NSWindow,
+    options: &Options,
+    relayouts: &std::cell::Cell<u32>,
+) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    window.toggleFullScreen(None);
+    pump(app, Instant::now() + FULL_SCREEN_SETTLE);
+    window.toggleFullScreen(None);
+    pump(app, Instant::now() + FULL_SCREEN_SETTLE);
+
+    let settled = relayouts.get();
+    pump(app, Instant::now() + STOP_SETTLE);
+    if relayouts.get() != settled {
+        faults.push(Fault {
+            step: "full-screen",
+            what: format!(
+                "the relayout observer fired {} more times on an idle window",
+                relayouts.get() - settled
+            ),
+        });
+    }
+    let back = read_stop(window);
+    judge_stop("full-screen", back, back, options, &mut faults);
     faults
 }
 
@@ -786,7 +917,7 @@ fn judge_the_retitle(app: &NSApplication, window: &NSWindow, options: &Options) 
 fn judge_the_re_apply(app: &NSApplication, window: &NSWindow, options: &Options) -> Vec<Fault> {
     let mut faults = Vec::new();
     let bar = options.bar_px;
-    let observer = observe_resizes(window, bar);
+    let observer = observe_resizes(window, move |window| inset_lights(window, LIGHTS_X_PX, bar));
 
     let mut frame = window.frame();
     frame.size.height -= 40.0;
@@ -807,43 +938,8 @@ fn judge_the_re_apply(app: &NSApplication, window: &NSWindow, options: &Options)
     let queued = read_stop(window);
     judge_stop("re-apply-late", queued, queued, options, &mut faults);
 
-    let observer: &objc2::runtime::AnyObject = observer.as_ref();
-    // SAFETY: the token `addObserverForName:object:queue:usingBlock:` handed
-    // back, on the same centre.
-    unsafe { objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(observer) };
+    stop_observing(&observer);
     faults
-}
-
-/// Re-apply the placement from AppKit's own resize notification, the shape
-/// [`crate::traffic_lights::watch_resizes`] installs. Mirrored rather than
-/// called, because the real one reads a height this process never pushed.
-fn observe_resizes(
-    window: &NSWindow,
-    bar_px: f64,
-) -> Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>> {
-    use objc2_foundation::{NSNotification, NSNotificationCenter};
-
-    let block = block2::RcBlock::new(move |notification: std::ptr::NonNull<NSNotification>| {
-        // SAFETY: the notification is alive for the duration of the call.
-        let Some(object) = (unsafe { notification.as_ref() }).object() else {
-            return;
-        };
-        // SAFETY: the observer is scoped to one window through `object:`, and
-        // that window is alive because it is the one posting.
-        let ns_window: &NSWindow = unsafe { &*objc2::rc::Retained::as_ptr(&object).cast() };
-        inset_lights(ns_window, LIGHTS_X_PX, bar_px);
-    });
-    let object: &objc2::runtime::AnyObject = window;
-    // SAFETY: AppKit's own notification name, scoped to this window. A nil queue
-    // runs the block synchronously on the posting thread, which is the point.
-    unsafe {
-        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-            Some(objc2_app_kit::NSWindowDidResizeNotification),
-            Some(object),
-            None,
-            &block,
-        )
-    }
 }
 
 /// Print rows until the operator stops the probe. Two transitions have no public

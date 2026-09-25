@@ -46,12 +46,6 @@ use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
-/// Prompt used when the engine asks for a continuation (resume with no new
-/// user input). Mirrors the text `claude --print --resume` auto-injects in
-/// the same situation, so both backends behave alike after a mid-turn
-/// engine restart. Shared with the app-server driver.
-pub(super) const CONTINUATION_PROMPT: &str = "Continue from where you left off.";
-
 #[derive(Debug, serde::Deserialize)]
 struct CodexMenuOptionsFile {
     models: Vec<CcMenuOption>,
@@ -264,7 +258,7 @@ impl AgentRuntime for CodexRuntime {
             super::spawn_env::resolve_binary_override(
                 path,
                 "Codex (`codex`)",
-                "coding_agent_codex_path",
+                crate::core::PREF_CODING_AGENT_CODEX_PATH,
             )?;
         }
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -284,7 +278,6 @@ impl AgentRuntime for CodexRuntime {
         let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlRequest>();
 
         let resume_session_id = args.resume_session_id.map(str::to_string);
-        let continuation = args.continuation;
         let protocol =
             codex_protocol_from_env(std::env::var("LUCIDOS_CODEX_PROTOCOL").ok().as_deref());
         let permission_rx = match protocol {
@@ -293,7 +286,6 @@ impl AgentRuntime for CodexRuntime {
                 tokio::spawn(super::codex_app_server::app_server_driver_task(
                     config,
                     resume_session_id,
-                    continuation,
                     events_tx,
                     input_rx,
                     control_rx,
@@ -306,7 +298,6 @@ impl AgentRuntime for CodexRuntime {
                 tokio::spawn(driver_task(
                     config,
                     resume_session_id,
-                    continuation,
                     events_tx,
                     input_rx,
                     control_rx,
@@ -778,13 +769,10 @@ pub(super) fn write_image_files(
 enum TurnOutcome {
     /// Turn ended (completed, failed, interrupted, or synthesized) — keep
     /// serving inputs. Interrupt deliberately does NOT drop queued inputs:
-    /// the engine counts every forwarded input in
-    /// `AgentSession::inputs_awaiting_result` and, for Codex specifically,
-    /// settles it by ONE per Result because this driver owes one Result per
-    /// input. A dropped input would leave that count above zero forever and
-    /// wedge the thread at idle. Matches CC, whose stdin-queued messages also
-    /// run after Esc, though CC answers them all with a single Result and so
-    /// settles to zero (see `lifecycle::settle_inputs_awaiting_result`).
+    /// the engine owes every forwarded input until its turn starts and reports
+    /// it read (ADR 0268). A dropped input would stay owed and keep the thread's
+    /// subprocess up at idle. Matches CC, whose stdin-queued messages also run
+    /// after Esc.
     Continue,
     /// Cancellation token fired or the consumer vanished — wind down.
     Shutdown,
@@ -794,7 +782,6 @@ enum TurnOutcome {
 async fn driver_task(
     config: CodexConfig,
     resume_session_id: Option<String>,
-    continuation: bool,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
@@ -804,15 +791,6 @@ async fn driver_task(
     let mut model = config.model.clone();
     let mut effort = config.reasoning_effort.clone();
     let mut queue: VecDeque<AgentInput> = VecDeque::new();
-    if continuation {
-        // Engine resumes a mid-turn-interrupted session with no new input —
-        // see `SpawnArgs::continuation`. CC auto-injects this; Codex needs it
-        // as an explicit prompt.
-        queue.push_back(AgentInput {
-            text: CONTINUATION_PROMPT.to_string(),
-            images: Vec::new(),
-        });
-    }
 
     'session: loop {
         // Idle between turns: wait for the next input or a reason to stop.
@@ -837,6 +815,7 @@ async fn driver_task(
             }
         }
         let input = queue.pop_front().expect("queue non-empty");
+        let _ = events_tx.send(AgentEvent::InputRead(None));
 
         let outcome = run_turn(
             &config,

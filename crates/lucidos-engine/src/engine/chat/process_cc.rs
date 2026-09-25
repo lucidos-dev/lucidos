@@ -109,6 +109,8 @@ impl LucidosEngine {
             Vec::new()
         };
         let coalesced_count = queued.len();
+        let coalesced_event_ids: Vec<Uuid> =
+            queued.iter().filter_map(|q| q.origin_event_id).collect();
         let (combined_text, combined_images) = crate::engine::agent_session::combine_messages(
             user_message,
             user_images.map(|imgs| imgs.to_vec()),
@@ -144,6 +146,7 @@ impl LucidosEngine {
                 &combined_text,
                 combined_images_slice,
                 origin_id,
+                &coalesced_event_ids,
                 spawning_event_id,
                 cancel_token,
                 conflict_change_id,
@@ -169,7 +172,6 @@ impl LucidosEngine {
         if let Err(ref e) = result {
             if e.to_string() == crate::engine::claude_code::STALE_RESUME_ERROR {
                 log!("[Chat] Stale CC resume — retrying with fresh session");
-                self.clear_cc_debounce(thread_id);
                 let retry_text = crate::engine::agent_session::prepend_reconstruction(
                     &self.pool,
                     thread_id,
@@ -186,6 +188,7 @@ impl LucidosEngine {
                         &retry_text,
                         combined_images_slice,
                         origin_id,
+                        &coalesced_event_ids,
                         spawning_event_id,
                         cancel_token,
                         conflict_change_id,

@@ -1,6 +1,6 @@
 import { computed } from '@preact/signals';
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { toasts, dismissToast, focusedPane, speedMultiplier, splitRatio, toastPlacement } from '../../store/store';
+import { toasts, dismissToast, focusedPane, scaledDurationMs, splitRatio, toastPlacement } from '../../store/store';
 import type { ToastItem, ToastType } from '../../store/types';
 import { CloseIcon } from './icons';
 import { parseToastMessage, type ParsedToastMessage } from './toastMessage';
@@ -10,7 +10,8 @@ import { computeToastShifts } from './toastReflow';
 import { toastColumns, toastLayout } from './toastColumns';
 import { toastStackUrgency } from './toastUrgency';
 import { focusPaneMainControl } from '../layout/paneFocus';
-import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
+import { hasHoverPointer } from '../../utils/platform';
+import { isReducedMotion } from '../../utils/motion';
 import { isTextInput } from '../../utils/dom';
 import { viewportIsMobile } from '../../utils/viewport';
 import { progressFillWidth } from './progressBar';
@@ -179,7 +180,7 @@ export function Toast() {
     const el = containerRef.current;
     const before = prevIds.current;
     prevIds.current = new Set(items.map((t) => t.id));
-    if (!el || prefersReducedMotion()) return;
+    if (!el || isReducedMotion()) return;
 
     // A rapid burst of toasts can start a new reflow before the last settled —
     // cancel the in-flight ones so a survivor doesn't fight two transforms.
@@ -196,7 +197,7 @@ export function Toast() {
       current.push({ id, top: row.getBoundingClientRect().top });
     }
 
-    const durationMs = REFLOW_DURATION_MS / speedMultiplier.value;
+    const durationMs = scaledDurationMs(REFLOW_DURATION_MS);
     for (const { id, delta } of computeToastShifts(before, oldTops, current)) {
       const row = rows.get(id);
       if (!row) continue;
@@ -230,7 +231,7 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
   // and the push-down it causes stay in lockstep at every setting — not just at
   // 1x. The CSS keeps 0.26s as the 1x default; this inline duration overrides it
   // when the slider is off-centre.
-  const entryDurationMs = REFLOW_DURATION_MS / speedMultiplier.value;
+  const entryDurationMs = scaledDurationMs(REFLOW_DURATION_MS);
 
   // One stack per VISIBLE pane, so a toast only ever pushes down the toasts of
   // its own pane (`toastColumns`). The pane split is decided here rather than

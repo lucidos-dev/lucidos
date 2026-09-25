@@ -210,7 +210,7 @@ impl LucidosEngine {
         // `emit_change_proposed`, NOT `propose_change`: the latter first
         // discards every other pending change the thread holds, which would
         // turn this correction into a resolution of a sibling change that may
-        // still hold real work.
+        // still hold real work. It broadcasts the corrected row itself.
         if let Err(e) = self
             .emit_change_proposed(ProposeChangeInput {
                 thread_id,
@@ -232,7 +232,6 @@ impl LucidosEngine {
                 e
             );
         }
-        self.broadcast_changes_updated().await;
     }
 
     /// Emit the harden boundary event then queue AUTO_HARDEN_MESSAGE on a live

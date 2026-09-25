@@ -1,4 +1,4 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, workingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, settlingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { restartConfirmCopy } from '../restartConfirmCopy';
 import { toFailed } from '../types';
@@ -20,6 +20,10 @@ import type { Change } from '../../api/client';
  *  background rebuild is actually `ready`. */
 export const RESTART_FAILURE_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
+
+/** Tooltip on every "Apply*" button. Apply only builds; the user switches. */
+export const APPLY_NEW_VERSION_TOOLTIP =
+  'Applies now (non-disruptive). A new engine version builds in the background; you’ll be prompted to switch to it when ready.';
 
 export const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
 const LEGACY_RESTART_REASONS_LS_KEY = 'lucidos-restart-reasons';
@@ -453,7 +457,7 @@ export function refreshChangesState(): void {
       // events are not replayed, so a reload would otherwise draw an armed
       // thread as unarmed and offer to arm it again.
       standingApplyThreadIds.value = new Set(state.standing_apply_thread_ids ?? []);
-      workingThreadCount.value = state.working_thread_count ?? 0;
+      settlingThreadCount.value = state.settling_thread_count ?? 0;
       // Same rehydration for the per-thread Apply Now state: its optimistic
       // spinner toast + WaitingBanner "Apply..." clear only on the live
       // ChangeApplied/ChangeApplyFailed SSE event, so a missed event (iOS PWA
@@ -597,7 +601,7 @@ export async function discardAllChanges(): Promise<void> {
 export const STANDING_APPLY_CANCELED = 'Canceled.';
 
 /** Arm a standing apply on a thread: its change applies once the thread
- *  settles, and drops with a report if the thread parks or fails.
+ *  settles, and drops with a report if the thread stops on a question or fails.
  *
  *  Pass `changeId` when the thread already has a pending change, so the arm is
  *  bound to that one and cannot reach a later proposal. */
@@ -618,13 +622,23 @@ export async function armStandingApply(threadId: string, changeId?: string): Pro
   }
 }
 
-/** Take a standing apply back. */
+/** Take a standing apply back.
+ *
+ *  A 404 means the engine holds no arm for the thread, which is the state the
+ *  owner asked for. The flag was stale, from an ending event this client
+ *  missed, so it clears quietly. */
 export async function disarmStandingApply(threadId: string): Promise<void> {
   if (armingStandingApplyThreadIds.value.has(threadId)) return;
   armingStandingApplyThreadIds.value = new Set([...armingStandingApplyThreadIds.value, threadId]);
   try {
     await apiDisarmStandingApply(threadId);
   } catch (e) {
+    if (e instanceof ApiError && e.httpCode === 404) {
+      const armed = new Set(standingApplyThreadIds.value);
+      armed.delete(threadId);
+      standingApplyThreadIds.value = armed;
+      return;
+    }
     showToast(
       changeToastMessage('Failed to cancel the standing apply', threadId, errorDetail(e)),
       'error',

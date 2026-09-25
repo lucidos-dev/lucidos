@@ -8,10 +8,16 @@
 //! - `-H` repeated for headers, `-X` for method, `-d` / stdin for body
 
 use std::io::{self, Read, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::http::{client, format_request_error};
+use crate::http::{client_with_timeout, format_request_error};
 use crate::workspace::{BoxError, Workspace};
+
+/// How long `lucidos proxy` waits on the engine: the engine's 600 s cap on one
+/// proxied call, plus a margin. The engine owns the real limit, set by
+/// `proxy_timeout_secs` or an entry's `timeout_secs`, so this must never cut
+/// first. An engine test pins the number against the engine's cap.
+const CLIENT_WAIT_SECS: u64 = 660;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyArgs {
@@ -37,7 +43,7 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
     let method = parse_method(&args.method)?;
     let headers = parse_headers(&args.headers)?;
 
-    let client = client()?;
+    let client = client_with_timeout(Duration::from_secs(CLIENT_WAIT_SECS))?;
     let method_str = method.as_str().to_string();
     let mut req = client.request(method, &url);
     for (name, value) in &headers {

@@ -24,9 +24,11 @@ export type {
   EventChannel,
   EventSubscription,
   EventWaitCancelCause,
+  FormRequestOutcome,
   MessageOrigin,
   QuestionOption,
   SessionEndReason,
+  SubThreadPendingChange,
   ThreadDirection,
   ThreadEvent,
   TodoItem,
@@ -36,6 +38,26 @@ export type {
   VoiceSessionEndReason,
 } from '../../generated/thread-event-wire';
 export { THREAD_EVENT_TYPE_NAMES } from '../../generated/thread-event-wire';
+
+/** The events that open a *form request*: something the agent asked the user
+ *  to act on. Each stays open until a `FormRequestResolved` names its
+ *  `request_id` (engine `engine/form_requests.rs`). */
+export const FORM_REQUEST_TYPES = [
+  'CredentialRequested',
+  'PluginInstallRequested',
+  'PluginUninstallRequested',
+  'EmailConfirmRequested',
+  'OAuthAuthorizationRequested',
+] as const;
+
+export type FormRequestEvent = Extract<
+  ThreadEvent,
+  { type: (typeof FORM_REQUEST_TYPES)[number] }
+>;
+
+export function isFormRequest(event: { type: string }): event is FormRequestEvent {
+  return (FORM_REQUEST_TYPES as readonly string[]).includes(event.type);
+}
 
 export type ThreadInitiator = 'user' | 'system';
 
@@ -188,24 +210,28 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  continues out of it. Grouping opens an exchange for it and hands the
  *  running turn straight back, and the panel draws its header alone.
  *
- *  Two qualify. The user's Stop waiting (`isUserStoppedWait`). And a
- *  `ChildThreadStopped` on a parent (ADR 0252): a note that a user Stop paused
- *  one of its children, which wakes nothing, so no response follows it. */
+ *  Three qualify. The user's Stop waiting (`isUserStoppedWait`). A
+ *  `ChildThreadStopped` on a parent (ADR 0252): a user Stop paused one of its
+ *  children. And a `ChildThreadDetached` on a parent (ADR 0278): one of its
+ *  children moved to top level. Neither wakes the parent, so no response
+ *  follows. */
 export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
-  return isUserStoppedWait(event) || event.type === 'ChildThreadStopped';
+  return isUserStoppedWait(event)
+    || event.type === 'ChildThreadStopped'
+    || event.type === 'ChildThreadDetached';
 }
 
 /** The wait's `reason` as a bare subject, for a label that already said "wait".
  *
- *  Both transcript labels prefix the model's own words with a template carrying
+ *  Every transcript label prefixes the model's own words with a template carrying
  *  the verb. A reason opening "waiting for the e2e lock" would otherwise render
- *  as `Stopped waiting: waiting for the e2e lock`. No template avoids that:
+ *  as `Stopped waiting for waiting for the e2e lock`. No template avoids that:
  *  every label for this concept contains a waiting word.
  *
  *  At the label rather than at the stored reason, because the text is the
- *  model's and belongs on disk as written. The *waiting indicator* calls it in
- *  the one place it supplies a verb, its aria-label. Its tooltip says the
- *  reason alone, so that one takes the text as written.
+ *  model's and belongs on disk as written. The *waiting indicator* calls it
+ *  wherever it supplies a verb: its aria-label, and each panel row under the
+ *  "Waiting for" title. Its tooltip says the reason alone, as written.
  *
  *  Three judgments sit behind the two lines below, and each is a decision
  *  rather than a gap: `to` is not one of the prepositions, only a LEADING
@@ -218,18 +244,42 @@ export function awaitedSubject(reason: string): string {
   return stripped.trim() ? stripped : reason;
 }
 
+/** A leading gerund that is really a verb. Words like "something", "morning"
+ *  and "pending" end the same way but read fine after "for". */
+const LEADING_GERUND =
+  /^\s*(?!(?:(?:some|any|every|no)?thing|morning|evening|spring|string|pending|staging|incoming|upcoming|remaining|outstanding)\b)[a-z]+ing\b/i;
+
+/** Opening words that start a sentence in the model's reason but sit
+ *  mid-sentence after "for", so they lose their capital there. */
+const LEADING_DETERMINER = /^(?:The|A|An|This|That|These|Those|All|Every|Each|Some|Any|My|Your|Its)\b/;
+
+/** `<verb> for <subject>`, the one phrasing every wait label shares:
+ *  "Waiting for the release build", "Stopped waiting for the e2e lock".
+ *
+ *  A reason that opens with a gerund takes a colon instead. The model writes
+ *  "watching the deploy" as often as a noun phrase, and "Waiting for watching"
+ *  reads as a mistake. */
+export function waitingFor(verb: string, reason: string): string {
+  const subject = awaitedSubject(reason);
+  if (LEADING_GERUND.test(subject)) return `${verb}: ${subject}`;
+  const lowered = LEADING_DETERMINER.test(subject)
+    ? subject[0].toLowerCase() + subject.slice(1)
+    : subject;
+  return `${verb} for ${lowered}`;
+}
+
 /** Header label for the turn a user's **Stop waiting** opens.
  *
  *  Says what was stopped, in the model's own words, because that is the only
  *  thing on screen that names the subscription once the clock indicator has
  *  dropped it. A pre-2026-08-07 `EventWaitCanceled` carries no reason, and the
- *  line then says the one thing it knows rather than trailing an empty colon.
+ *  line then says the one thing it knows.
  *
  *  Deliberately the same wording as the transcript's stop row, which is what a
  *  NON-user stop renders: one phrasing for one concept, whichever surface it
- *  lands on. Both therefore inherit `awaitedSubject`. */
+ *  lands on. */
 export function eventWaitStoppedSummary(reason: string | undefined): string {
-  return reason ? `Stopped waiting: ${awaitedSubject(reason)}` : 'Stopped waiting for an event';
+  return reason ? waitingFor('Stopped waiting', reason) : 'Stopped waiting for an event';
 }
 
 /** Header label / preview text for a `ResponseCanceled` turn — always a

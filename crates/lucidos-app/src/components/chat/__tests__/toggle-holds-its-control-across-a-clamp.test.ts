@@ -19,7 +19,7 @@ if (typeof (globalThis as any).MutationObserver === 'undefined') {
 }
 
 import { withScrollAnchor } from '../CreateThreadView';
-import { setActiveScrollElement, setAgentLive, stopFollowingBottom } from '../scrollState';
+import { setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
 /**
  * **One press reads only its own two measurements.**
@@ -125,7 +125,6 @@ describe('a turn control holds its control across a clamp', () => {
   beforeEach(() => {
     stopFollowingBottom();
     setActiveScrollElement(null);
-    setAgentLive(false);
     vi.useFakeTimers();
   });
   afterEach(() => {

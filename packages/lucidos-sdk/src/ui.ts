@@ -2,11 +2,11 @@ import { apiUrl, requestVoid } from './_fetch';
 import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
 import {
-  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
-  SYSTEM_THEME_SETTLE_MS, THEME_BG,
-  fontFeaturesFor, parseStyleOverrides, parseUiScale, resolveFontKey, resolveTheme,
-  resolveThemePreference,
-  type FontFamily, type ThemePref,
+  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, MOTION_STORAGE_KEY,
+  REDUCED_MOTION_QUERY, SYSTEM_THEME_SETTLE_MS, THEME_BG,
+  fontFeaturesFor, motionAttribute, parseMotion, parseStyleOverrides, parseUiScale, resolveFontKey, resolveTheme,
+  resolveReducedMotion, resolveThemePreference,
+  type FontFamily, type MotionPref, type ThemePref,
 } from './appearance';
 import { preferences as prefsModule } from './preferences';
 import { isIOSAgent } from './platform';
@@ -44,6 +44,10 @@ let lastThemePreference: ThemePref | null = null;
 let systemThemeSettleTimer: ReturnType<typeof setTimeout> | null = null;
 /** Kept alive for as long as its listener must be. See `watchPreferences`. */
 let systemThemeQuery: MediaQueryList | null = null;
+/** The motion preference at the last apply, so an OS flip can re-resolve it. */
+let lastMotionPreference: MotionPref | null = null;
+/** Held for the same WebKit reason as `systemThemeQuery`. */
+let reducedMotionQuery: MediaQueryList | null = null;
 
 /** Whether the OS is asking for light right now. */
 function osPrefersLight(): boolean {
@@ -267,6 +271,25 @@ function applyDevicePreferences(prefs: Record<string, string>, attempt: number):
   devicePreferencesLoaded = true;
   cacheExternalLinkTarget(prefs['external_link_target']);
   applyAutocorrectPreference(prefs);
+  applyMotionPreference(prefs);
+}
+
+/** Put the device's resolved motion on `<html>` as `data-motion`. It is the
+ *  attribute `sdk-prefs.js` sets at first paint, so an app keys its own
+ *  animations on one selector. */
+function applyMotionPreference(prefs: Record<string, string>): void {
+  lastMotionPreference = parseMotion(prefs['motion'] || wsLocalGet(MOTION_STORAGE_KEY));
+  resolveMotionAttribute();
+}
+
+/** Re-resolve `data-motion` from the kept preference and the live OS switch.
+ *  Needs no fetch, so an OS flip costs nothing. */
+function resolveMotionAttribute(): void {
+  if (typeof document === 'undefined' || lastMotionPreference === null) return;
+  const osReduces = window.matchMedia?.(REDUCED_MOTION_QUERY).matches === true;
+  document.documentElement.setAttribute(
+    'data-motion', motionAttribute(resolveReducedMotion(lastMotionPreference, osReduces)),
+  );
 }
 
 /** Read this device's preferences once at load, without `applyPreferences`.
@@ -398,9 +421,9 @@ export const ui = {
     // every open app iframe only on its next reload.
     applyStyleOverrides(prefs['style_overrides'] || wsLocalGet('lucidos-style-overrides'));
 
-    // The external-link target, which openExternal reads WITHOUT awaiting, and
-    // the Autocorrect switch. A live re-apply is what lets a watching app follow
-    // a flip of either.
+    // The external-link target, which openExternal reads WITHOUT awaiting, the
+    // Autocorrect switch and motion. A live re-apply is what lets a watching app
+    // follow a flip of any of them.
     applyDevicePreferences(prefs, attempt);
   },
 
@@ -451,6 +474,10 @@ export const ui = {
     document.addEventListener('visibilitychange', scheduleRefresh);
     window.addEventListener('focus', scheduleRefresh);
     window.addEventListener('pageshow', scheduleRefresh);
+    // An OS reduce-motion flip under a `system` motion preference emits no
+    // PreferencesChanged either, so the media query drives it.
+    reducedMotionQuery = window.matchMedia(REDUCED_MOTION_QUERY);
+    reducedMotionQuery.addEventListener('change', resolveMotionAttribute);
   },
 
   /**

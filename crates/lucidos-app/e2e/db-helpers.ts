@@ -98,14 +98,21 @@ export function psql(sql: string): string {
  *  for the same reason: the drawer's channel filter is what narrows a window
  *  down to a list too short to scroll. It offers only the two sources this row
  *  shape is honest for. `is_coding_agent` is hardcoded false below, so a
- *  `claude_code` row here would deny being one. */
-export function seedThreadRow({ id, title, parentId, totalChildren = 0, now, source = 'chat' }: {
+ *  `claude_code` row here would deny being one.
+ *
+ *  A `failed` thread in the Current section (`archiveState: 'inbox'`) is the
+ *  simplest row that needs attention, which is what raises the Filter badge. */
+export function seedThreadRow({
+  id, title, parentId, totalChildren = 0, now, source = 'chat', status = 'idle', archiveState = 'archived',
+}: {
   id: string;
   title: string;
   parentId?: string;
   totalChildren?: number;
   now: string;
   source?: 'chat' | 'trigger';
+  status?: 'idle' | 'failed';
+  archiveState?: 'archived' | 'inbox';
 }): string {
   const cols = ['thread_id', 'title', 'source', 'created_at', 'last_activity', 'message_count',
     'is_saved', 'has_response', 'status', 'archive_state', 'state',
@@ -115,7 +122,7 @@ export function seedThreadRow({ id, title, parentId, totalChildren = 0, now, sou
     ...(parentId ? ['parent_thread_id'] : []),
   ].join(', ');
   const vals = [`'${id}'`, `'${title}'`, `'${source}'`, `'${now}'`, `'${now}'`, '1',
-    'false', 'true', `'idle'`, `'archived'`, `'active'`,
+    'false', 'true', `'${status}'`, `'${archiveState}'`, `'active'`,
     'false', '0', String(totalChildren),
     'false', 'false', 'false',
     ...(parentId ? [`'${parentId}'`] : []),

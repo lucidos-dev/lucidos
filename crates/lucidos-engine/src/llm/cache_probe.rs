@@ -188,8 +188,8 @@ fn correlation(call: Option<ProbeCall>) -> String {
             call.round,
             call.round == 1
         ),
-        // A Claude call outside the agentic loop (memory extraction, web
-        // search) has no turn to correlate to. It says so, rather than
+        // A Claude call outside the agentic loop (memory extraction) has no
+        // turn to correlate to. It says so, rather than
         // borrowing whatever context happens to sit on the task.
         None => "thread=- turn=- round=- first_of_turn=-".to_string(),
     }
@@ -216,11 +216,7 @@ fn segment<T: Serialize + ?Sized>(value: &T) -> (String, usize) {
 /// to eyeball two log lines side by side.
 fn short_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::api::hex::hex_lower(&Sha256::digest(bytes)[..8])
 }
 
 // ===== Marker census =====

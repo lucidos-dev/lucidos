@@ -515,25 +515,6 @@ fn installed_bundle_verdict(bundle: &Path) -> BundleVerdict {
     BundleVerdict::Runnable
 }
 
-/// Where the plugin just swapped the bundle, derived the way the PLUGIN derives
-/// it: its own public `extract_path_from_executable` over `current_exe()`.
-///
-/// Both halves are deliberate. `UpdaterBuilder::build` sets `extract_path` from
-/// `current_exe()` whenever no `executable_path` override is given, and `lib.rs`
-/// registers the plugin bare. So this resolves the same path `Update::install`
-/// wrote to, and ADR 0073 records why a hardcoded one is wrong.
-#[cfg(target_os = "macos")]
-fn installed_bundle_path() -> Result<std::path::PathBuf, String> {
-    let exe = tauri::utils::platform::current_exe()
-        .map_err(|e| format!("cannot resolve this app's own executable: {e}"))?;
-    tauri_plugin_updater::extract_path_from_executable(&exe).map_err(|e| {
-        format!(
-            "cannot resolve this app's bundle from {}: {e}",
-            exe.display()
-        )
-    })
-}
-
 /// What is wrong with the app on disk after an install attempt, as the middle
 /// of a sentence. `None` when there is a runnable app there.
 ///
@@ -547,7 +528,7 @@ fn installed_bundle_path() -> Result<std::path::PathBuf, String> {
 /// is the same either way.
 #[cfg(target_os = "macos")]
 fn installed_bundle_fault() -> Option<String> {
-    match installed_bundle_path() {
+    match crate::bundle_location::bundle_path() {
         Err(e) => Some(format!("Lucidos cannot tell where its own bundle is: {e}")),
         Ok(bundle) => installed_bundle_verdict(&bundle)
             .reason()
@@ -559,6 +540,26 @@ fn installed_bundle_fault() -> Option<String> {
 /// Lucidos ships, so there is nothing to check anywhere else.
 #[cfg(not(target_os = "macos"))]
 fn installed_bundle_fault() -> Option<String> {
+    None
+}
+
+/// Why the running bundle cannot be replaced in place, or `None` when it can.
+/// Every decision is in `bundle_location`; ADR 0271 records them.
+///
+/// Fails open when the bundle or a device cannot be read. The plugin then
+/// reports its own error, which is no worse than today.
+#[cfg(target_os = "macos")]
+fn update_blocker() -> Option<String> {
+    use crate::bundle_location;
+
+    let bundle = bundle_location::bundle_path().ok()?;
+    let same_device = bundle_location::same_device(&bundle, &std::env::temp_dir()).unwrap_or(true);
+    bundle_location::update_blocker(&bundle_location::current(&bundle), same_device)
+}
+
+/// The bundle traps above are macOS ones, the only packaged shape we ship.
+#[cfg(not(target_os = "macos"))]
+fn update_blocker() -> Option<String> {
     None
 }
 
@@ -606,6 +607,12 @@ pub async fn install_app_update_and_restart(
     }
 
     emit(&app, None, AppUpdatePhase::Checking);
+    // Before the download, not after it: from a disk image or another disk the
+    // plugin's first rename fails with EXDEV, once ~100 MB are already in.
+    if let Some(blocker) = update_blocker() {
+        run.release();
+        return Err(fail(&app, None, blocker));
+    }
     let updater = match app.updater() {
         Ok(updater) => updater,
         Err(e) => {

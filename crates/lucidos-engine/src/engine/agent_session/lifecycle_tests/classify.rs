@@ -37,19 +37,15 @@ fn question_tools_are_suppressed_other_tools_are_not() {
     }
 }
 
-/// CC merges back-to-back stdin inputs into a single Result, so no count of
-/// forwarded inputs can predict whether more Results are coming: for CC the
-/// answer is always "no", which is why
-/// `lifecycle::settle_inputs_awaiting_result` zeroes the count for that backend
-/// and decrements by one for Codex. A normal `Generated` Result must always emit
+/// A normal `Generated` Result must always emit
 /// `CodingAgentIdled` regardless of inflight inputs, otherwise the thread sits in
 /// stored=Archived → DisplaySection::Archive instead of Current.
 /// Inflight-followup race protection lives in the run-loop's
 /// subprocess-termination decision, not here.
 #[test]
 fn generated_result_always_emits_idle() {
-    let (terminal, emit_idle) = classify_result(false, false, false, false, None, false);
-    assert_eq!(terminal, Some(TerminalKind::Generated));
+    let (terminal, emit_idle) = classify_result(false, false, false, None, false);
+    assert_eq!(terminal, TerminalKind::Generated);
     assert!(
         emit_idle,
         "Generated Result must emit CodingAgentIdled so the thread reaches \
@@ -64,9 +60,8 @@ fn generated_result_always_emits_idle() {
 #[test]
 fn cc_error_classifies_as_failed() {
     let err = "Stream interrupted: connection reset".to_string();
-    let (terminal, emit_idle) =
-        classify_result(false, false, false, false, Some(err.clone()), false);
-    assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
+    let (terminal, emit_idle) = classify_result(false, false, false, Some(err.clone()), false);
+    assert_eq!(terminal, TerminalKind::Failed { error: err });
     assert!(
         emit_idle,
         "Failed Result is still a turn boundary — must emit CodingAgentIdled \
@@ -79,19 +74,11 @@ fn cc_error_classifies_as_failed() {
 /// double-emit on restart (Failed already landed, then Aborted overwrites).
 #[test]
 fn shutdown_wins_over_cc_error() {
-    let (terminal, emit_idle) = classify_result(
-        false,
-        false,
-        false,
-        true,
-        Some("api timeout".to_string()),
-        false,
-    );
+    let (terminal, emit_idle) =
+        classify_result(false, false, true, Some("api timeout".to_string()), false);
     assert_eq!(
         terminal,
-        Some(TerminalKind::Aborted(
-            crate::engine::thread_events::AbortCause::EngineShutdown
-        ))
+        TerminalKind::Aborted(crate::engine::thread_events::AbortCause::EngineShutdown)
     );
     assert!(
         !emit_idle,
@@ -113,10 +100,10 @@ fn shutdown_wins_over_cc_error() {
 fn user_hit_stop_wins_over_cc_error() {
     use crate::engine::thread_events::CancelCause;
     let err = "[ede_diagnostic] result_type=user stop_reason=tool_use".to_string();
-    let (terminal, emit_idle) = classify_result(false, true, false, false, Some(err), false);
+    let (terminal, emit_idle) = classify_result(true, false, false, Some(err), false);
     assert_eq!(
         terminal,
-        Some(TerminalKind::Canceled(CancelCause::UserStop)),
+        TerminalKind::Canceled(CancelCause::UserStop),
         "an interrupted turn (cc_error set by the cancel) must be Canceled, not Failed"
     );
     assert!(
@@ -135,12 +122,12 @@ fn user_hit_stop_wins_over_cc_error() {
 /// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
-    let (terminal, emit_idle) = classify_result(false, false, false, false, None, true);
+    let (terminal, emit_idle) = classify_result(false, false, false, None, true);
     assert_eq!(
         terminal,
-        Some(TerminalKind::Failed {
+        TerminalKind::Failed {
             error: EMPTY_RESPONSE_ERROR.to_string(),
-        })
+        }
     );
     assert!(
         emit_idle,
@@ -157,8 +144,8 @@ fn empty_text_classifies_as_failed_with_empty_response_error() {
 #[test]
 fn cc_error_wins_over_empty_text() {
     let err = "rate_limit_error".to_string();
-    let (terminal, _) = classify_result(false, false, false, false, Some(err.clone()), true);
-    assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
+    let (terminal, _) = classify_result(false, false, false, Some(err.clone()), true);
+    assert_eq!(terminal, TerminalKind::Failed { error: err });
 }
 
 /// User-driven cancel that happens to land on an empty Result is still a
@@ -168,11 +155,8 @@ fn cc_error_wins_over_empty_text() {
 #[test]
 fn user_hit_stop_wins_over_empty_text() {
     use crate::engine::thread_events::CancelCause;
-    let (terminal, _) = classify_result(false, true, false, false, None, true);
-    assert_eq!(
-        terminal,
-        Some(TerminalKind::Canceled(CancelCause::UserStop))
-    );
+    let (terminal, _) = classify_result(true, false, false, None, true);
+    assert_eq!(terminal, TerminalKind::Canceled(CancelCause::UserStop));
 }
 
 /// A Codex mid-turn follow-up redirect (interrupt_is_redirect=true) classifies
@@ -184,10 +168,10 @@ fn user_hit_stop_wins_over_empty_text() {
 #[test]
 fn redirect_followup_classifies_as_superseded_by_followup() {
     use crate::engine::thread_events::CancelCause;
-    let (terminal, emit_idle) = classify_result(false, true, true, false, None, false);
+    let (terminal, emit_idle) = classify_result(true, true, false, None, false);
     assert_eq!(
         terminal,
-        Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
+        TerminalKind::Canceled(CancelCause::SupersededByFollowup),
         "a follow-up redirect interrupt must carry the SupersededByFollowup cause"
     );
     assert!(
@@ -197,7 +181,6 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
     // Same inputs but with an interrupt-caused cc_error still classify as the
     // redirect cancel (user_hit_stop ranks above cc_error).
     let (with_err, _) = classify_result(
-        false,
         true,
         true,
         false,
@@ -206,18 +189,16 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
     );
     assert_eq!(
         with_err,
-        Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
+        TerminalKind::Canceled(CancelCause::SupersededByFollowup),
     );
     // redirect flag without user_hit_stop is inert: a clean Result is Generated.
-    let (clean, _) = classify_result(false, false, true, false, None, false);
-    assert_eq!(clean, Some(TerminalKind::Generated));
+    let (clean, _) = classify_result(false, true, false, None, false);
+    assert_eq!(clean, TerminalKind::Generated);
     // Shutdown still wins over a redirect interrupt.
-    let (shutdown, _) = classify_result(false, true, true, true, None, false);
+    let (shutdown, _) = classify_result(true, true, true, None, false);
     assert_eq!(
         shutdown,
-        Some(TerminalKind::Aborted(
-            crate::engine::thread_events::AbortCause::EngineShutdown
-        )),
+        TerminalKind::Aborted(crate::engine::thread_events::AbortCause::EngineShutdown),
     );
 }
 
@@ -228,26 +209,12 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
 #[test]
 fn shutdown_wins_over_empty_text() {
     use crate::engine::thread_events::AbortCause;
-    let (terminal, emit_idle) = classify_result(false, false, false, true, None, true);
-    assert_eq!(
-        terminal,
-        Some(TerminalKind::Aborted(AbortCause::EngineShutdown))
-    );
+    let (terminal, emit_idle) = classify_result(false, false, true, None, true);
+    assert_eq!(terminal, TerminalKind::Aborted(AbortCause::EngineShutdown));
     assert!(
         !emit_idle,
         "shutdown must skip CodingAgentIdled even when text is empty"
     );
-}
-
-/// Silent resume drops the empty-text Failed too — a warmup with no user
-/// content always emits nothing, regardless of what CC produced. Without
-/// this, an engine-internal warmup resume would surface a spurious
-/// "no visible response" failure on a thread the user never engaged.
-#[test]
-fn silent_resume_drops_empty_text_too() {
-    let (terminal, emit_idle) = classify_result(true, false, false, false, None, true);
-    assert!(terminal.is_none());
-    assert!(!emit_idle);
 }
 
 /// Empty-text Result on an otherwise-clean turn classifies as `Failed`
@@ -259,9 +226,9 @@ fn silent_resume_drops_empty_text_too() {
 /// turn AND auto-propose the partial work as Apply-ready.
 #[test]
 fn empty_text_failed_does_not_propose() {
-    let (terminal, _) = classify_result(false, false, false, false, None, true);
+    let (terminal, _) = classify_result(false, false, false, None, true);
     assert!(
-        !may_touch_change_state_at_idle(false, false, false, &terminal),
+        !may_touch_change_state_at_idle(false, false, false, &Some(terminal)),
         "empty-text Failed (OOM / SIGTERM) must NOT auto-propose — half-assed"
     );
 }
@@ -277,7 +244,6 @@ fn stale_baseline() -> StaleResumeInputs {
         buffered_text_empty: true,
         no_prior_results_this_turn: true,
         no_tool_calls_this_turn: true,
-        user_message_present: true,
         cc_error: false,
     }
 }
@@ -497,21 +463,6 @@ fn fresh_session_has_no_settle_turn_to_skip() {
     ));
 }
 
-/// An engine-internal warm-up resume sends no user content, so there is no
-/// pending answer to protect. `is_silent_resume` already returns that Result to
-/// `classify_result` as a no-op; the settle skip must not claim it too and
-/// suppress a turn boundary the loop still needs.
-#[test]
-fn silent_resume_is_not_a_settle_turn() {
-    assert!(!is_resume_settle_result(
-        StaleResumeInputs {
-            user_message_present: false,
-            ..settle_baseline()
-        },
-        true
-    ));
-}
-
 /// The OOM case `EMPTY_RESPONSE_ERROR` was written for stays a failure. A killed
 /// Bash tool leaves tool calls behind, so the settle predicate refuses it and
 /// `classify_result` still lands `Failed`.
@@ -523,11 +474,11 @@ fn oom_killed_turn_still_fails_rather_than_being_skipped() {
     };
     assert!(!is_resume_settle_result(oom_shaped, true));
     assert_eq!(
-        classify_result(false, false, false, false, None, true),
+        classify_result(false, false, false, None, true),
         (
-            Some(TerminalKind::Failed {
+            TerminalKind::Failed {
                 error: EMPTY_RESPONSE_ERROR.to_string()
-            }),
+            },
             true
         )
     );
@@ -564,23 +515,6 @@ fn no_error_is_not_session_not_found() {
     assert!(!is_definitive_session_not_found(None));
 }
 
-/// Silent resume (warmup with no user content) still drops every Result,
-/// even when CC reports an error. Without this, an error-during-warmup
-/// would emit ResponseFailed against a thread the user never engaged.
-#[test]
-fn silent_resume_drops_cc_error_too() {
-    let (terminal, emit_idle) = classify_result(
-        true,
-        false,
-        false,
-        false,
-        Some("error_during_execution".to_string()),
-        false,
-    );
-    assert!(terminal.is_none());
-    assert!(!emit_idle);
-}
-
 /// Pin every input combination to its expected (terminal, emit_idle) pair.
 /// The invariants this guards:
 ///   - `Generated` → `emit_idle = true`. Skipping idle here is the bug —
@@ -596,40 +530,28 @@ fn silent_resume_drops_cc_error_too() {
 fn classify_result_table() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let cases = [
-        // (is_silent_resume, user_hit_stop, is_shutdown) → (terminal, emit_idle)
-        ((false, false, false), (Some(TerminalKind::Generated), true)),
+        // (user_hit_stop, is_shutdown) → (terminal, emit_idle)
+        ((false, false), (TerminalKind::Generated, true)),
         (
-            (false, true, false),
-            (Some(TerminalKind::Canceled(CancelCause::UserStop)), true),
+            (true, false),
+            (TerminalKind::Canceled(CancelCause::UserStop), true),
         ),
         (
-            (false, false, true),
-            (
-                Some(TerminalKind::Aborted(AbortCause::EngineShutdown)),
-                false,
-            ),
+            (false, true),
+            (TerminalKind::Aborted(AbortCause::EngineShutdown), false),
         ),
-        // Shutdown overrides user_hit_stop — Aborted, idle skipped.
+        // Shutdown overrides user_hit_stop: Aborted, idle skipped.
         (
-            (false, true, true),
-            (
-                Some(TerminalKind::Aborted(AbortCause::EngineShutdown)),
-                false,
-            ),
+            (true, true),
+            (TerminalKind::Aborted(AbortCause::EngineShutdown), false),
         ),
-        // Silent resume / warmup (no user content) emits nothing.
-        ((true, false, false), (None, false)),
-        ((true, true, false), (None, false)),
-        ((true, false, true), (None, false)),
-        ((true, true, true), (None, false)),
     ];
-    for ((silent, stop, shutdown), expected) in cases {
+    for ((stop, shutdown), expected) in cases {
         assert_eq!(
             // redirect=false: this table pins the non-redirect cause matrix.
-            classify_result(silent, stop, false, shutdown, None, false),
+            classify_result(stop, false, shutdown, None, false),
             expected,
-            "(is_silent_resume={}, user_hit_stop={}, is_shutdown={})",
-            silent,
+            "(user_hit_stop={}, is_shutdown={})",
             stop,
             shutdown,
         );
@@ -907,16 +829,46 @@ fn conflict_abort_deletes_only_temp_merge_state() {
     ));
 }
 
-/// Only "no text AND no images" counts as silent — image-only turns are
-/// real user content. Skipping the image check here freezes the thread row
-/// at `running` after CC delivers an answer, because `classify_result`
-/// then suppresses both the terminal event and `CodingAgentIdled`.
+/// A spawn with nothing to send parks the agent on stdin, and the thread reads
+/// as working until the watchdog. Text or an image is input; blank text alone
+/// is not.
 #[test]
-fn image_only_message_is_not_silent_resume() {
-    assert!(!is_silent_resume(true, true));
-    assert!(is_silent_resume(true, false));
-    assert!(!is_silent_resume(false, false));
-    assert!(!is_silent_resume(false, true));
+fn a_spawn_needs_text_or_an_image() {
+    let image = crate::api::ChatImage {
+        base64: "aGk=".into(),
+        mime_type: "image/png".into(),
+    };
+    assert!(require_agent_input("fix the test", None).is_ok());
+    assert!(require_agent_input("", Some(std::slice::from_ref(&image))).is_ok());
+    for (text, images) in [("", None), (" \n", None), ("", Some(&[][..]))] {
+        assert_eq!(
+            require_agent_input(text, images),
+            Err(EMPTY_INPUT_ERROR),
+            "{text:?} with {images:?} images must be refused"
+        );
+    }
+}
+
+/// The refusal must come before the spawn touches the database, a worktree or
+/// a process. Anything ahead of it could leave state behind for a turn that
+/// never runs.
+#[test]
+fn run_direct_agent_refuses_empty_input_before_anything_else() {
+    let source = include_str!("../run_session/run.rs");
+    let signature = source
+        .find("pub(crate) async fn run_direct_agent(")
+        .expect("run_direct_agent is defined in run_session/run.rs");
+    let body_start = signature
+        + source[signature..]
+            .find("> {\n")
+            .expect("run_direct_agent has a body")
+        + "> {\n".len();
+    let first_statement = source[body_start..].trim_start();
+    assert!(
+        first_statement.starts_with("require_agent_input(user_message, user_images)?;"),
+        "run_direct_agent must refuse empty input first, found: {}",
+        first_statement.lines().next().unwrap_or_default()
+    );
 }
 
 /// Pin every input combination of `classify_session_end_action`. The
@@ -1044,7 +996,6 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
     //    interrupt diagnostic (is_error) and the latch is set.
     let mut user_hit_stop = true;
     let (first, _) = classify_result(
-        false,
         user_hit_stop,
         false,
         false,
@@ -1053,16 +1004,14 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
     );
     assert_eq!(
         first,
-        Some(TerminalKind::Canceled(CancelCause::UserStop)),
+        TerminalKind::Canceled(CancelCause::UserStop),
         "the interrupt must classify as the first Canceled"
     );
 
     // 2) The run loop clears the latch once that cancel terminal is emitted,
     //    because the subprocess is kept alive to drain inflight follow-ups.
-    if let Some(kind) = &first {
-        if terminal_clears_user_hit_stop(kind) {
-            user_hit_stop = false;
-        }
+    if terminal_clears_user_hit_stop(&first) {
+        user_hit_stop = false;
     }
     assert!(
         !user_hit_stop,
@@ -1072,10 +1021,10 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
 
     // 3) The drained follow-ups complete successfully with full text. With the
     //    latch cleared this is a clean completion, NOT a second cancel.
-    let (second, _) = classify_result(false, user_hit_stop, false, false, None, false);
+    let (second, _) = classify_result(user_hit_stop, false, false, None, false);
     assert_eq!(
         second,
-        Some(TerminalKind::Generated),
+        TerminalKind::Generated,
         "a successful completion after an interrupt superseded by inflight \
          follow-ups must be ResponseGenerated, not a second ResponseCanceled"
     );

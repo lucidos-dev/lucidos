@@ -3,7 +3,7 @@ import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { shortcutDef } from '../../utils/shortcuts';
 import { attentionThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
-import { ThreadsIcon } from './icons';
+import { SidebarIcon, ThreadListIcon } from './icons';
 
 interface Props {
   class?: string;
@@ -34,9 +34,13 @@ export function threadToggleBadgeCount(
 }
 
 export function ThreadToggleButton({ class: cls }: Props) {
+  const mobile = viewportIsMobile.value;
   const badgeCount = threadToggleBadgeCount(
-    attentionThreadCount.value, viewportIsMobile.value, mobileView.value, threadDrawerOpen.value,
+    attentionThreadCount.value, mobile, mobileView.value, threadDrawerOpen.value,
   );
+  // A sidebar glyph where the list IS a sidebar. On a phone the toggle swipes
+  // to a whole pane of threads, so it draws the list it takes you to.
+  const Glyph = mobile ? ThreadListIcon : SidebarIcon;
   // The badge is decorative markup, so the count has to reach assistive tech
   // through the label or it's invisible there.
   const label = badgeCount > 0 ? `${LABEL} (${badgeCount} needing attention)` : LABEL;
@@ -44,11 +48,9 @@ export function ThreadToggleButton({ class: cls }: Props) {
   return (
     <button
       class={`icon-btn header-icon thread-toggle${cls ? ` ${cls}` : ''}`}
-      // The toggle is purely show/hide and must not change pane focus. Its hosts
-      // fire focusPane via different events: the desktop header's own slot
-      // (.thread-toggle-slot) on CLICK, and the thread pane body (.pane-thread,
-      // via SplitLayout) on POINTERDOWN. Swallow BOTH so toggling the drawer
-      // never shifts pane focus to the thread pane.
+      // The toggle is purely show/hide and must not change pane focus, whatever
+      // it is mounted inside. Header regions focus their pane on CLICK and pane
+      // bodies on POINTERDOWN (SplitLayout), so swallow BOTH.
       // stopPropagation is bubble-phase only, so the capture-phase overlay
       // outside-dismiss still closes any open popover (see useAnchoredPopover).
       onPointerDown={(e) => e.stopPropagation()}
@@ -56,7 +58,7 @@ export function ThreadToggleButton({ class: cls }: Props) {
       aria-label={label}
       data-tooltip={tooltipWithShortcut(label, 'toggleThreadDrawer')}
     >
-      <ThreadsIcon />
+      <Glyph />
       {badgeCount > 0 && <span class="badge">{badgeCount}</span>}
     </button>
   );

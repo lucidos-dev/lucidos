@@ -937,9 +937,7 @@ async fn question_parked_child_survives_the_startup_reconcile() {
     emit_question_asked(&bus, child_id).await;
     assert_active_children(&pool, parent_id, 1, "the parked child is in flight").await;
 
-    EventBus::rebuild_active_children_count(&pool)
-        .await
-        .unwrap();
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
 
     assert_active_children(
         &pool,
@@ -969,9 +967,7 @@ async fn startup_reconcile_repairs_a_drifted_active_children_count() {
         .execute(&pool)
         .await
         .unwrap();
-    EventBus::rebuild_active_children_count(&pool)
-        .await
-        .unwrap();
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
     assert_active_children(&pool, parent_id, 1, "over-count repaired").await;
 
     // Under-count: the child is still running but the parent claims zero.
@@ -980,9 +976,7 @@ async fn startup_reconcile_repairs_a_drifted_active_children_count() {
         .execute(&pool)
         .await
         .unwrap();
-    EventBus::rebuild_active_children_count(&pool)
-        .await
-        .unwrap();
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
     assert_active_children(&pool, parent_id, 1, "under-count repaired").await;
 
     // A child that really did finish drops the parent back to zero.
@@ -992,9 +986,7 @@ async fn startup_reconcile_repairs_a_drifted_active_children_count() {
         .execute(&pool)
         .await
         .unwrap();
-    EventBus::rebuild_active_children_count(&pool)
-        .await
-        .unwrap();
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
     assert_active_children(&pool, parent_id, 0, "an idle child counts for nothing").await;
 
     pool.close().await;

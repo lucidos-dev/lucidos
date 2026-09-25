@@ -4,7 +4,7 @@
  *  `actions/compose-toggle-channel.test.ts`; this suite covers the picker's
  *  state plumbing. */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {
   const storage = new Map<string, string>();
@@ -57,7 +57,7 @@ vi.mock('../utils/platform', () => ({
   isIOS: () => false,
 }));
 
-import { inputMode, selectedScope, threadMap, type Scope } from './store';
+import { inputMode, repositories, selectedScope, threadMap, type Scope } from './store';
 import {
   destinationFromState,
   destinationToOptionValue,
@@ -68,9 +68,17 @@ import {
   REGISTER_REPO_OPTION_VALUE,
   type ComposeDestination,
 } from './composeDestination';
-import { applyDestination } from './actions/compose';
+import { applyDestination, dropRepoTargets, installUnregisteredRepoTargetReset } from './actions/compose';
 import { getDraft, setDraft, _resetComposeDraftsForTesting } from './composeDrafts';
-import { getComposeSelectionOverride, pendingComposeSelection, resolveScope, _resetComposeSelectionsForTesting } from './composeSelections';
+import {
+  composeSelections,
+  getComposeSelectionOverride,
+  patchComposeSelection,
+  pendingComposeSelection,
+  resolveScope,
+  setComposeSelectionFromServer,
+  _resetComposeSelectionsForTesting,
+} from './composeSelections';
 import { makeOptimisticThreadState } from './thread-events';
 
 function putThread(id: string, state: 'composing' | 'active'): void {
@@ -214,6 +222,199 @@ describe('applyDestination', () => {
     applyDestination(id, { kind: 'coding', scope: { kind: 'lucidos' } });
 
     expect(getDraft(id).mode).toBe('claude_code');
+  });
+});
+
+describe('a deleted repository stops being the compose target', () => {
+  const gone: Scope = { kind: 'external', repoId: 'gone' };
+  const kept: Scope = { kind: 'external', repoId: 'kept' };
+  const goneIds = new Set(['gone']);
+
+  it('the no-draft view on a deleted repo falls back to the Lucidos Agent and forgets the repo', () => {
+    inputMode.value = { type: 'coding_agent' };
+    selectedScope.value = gone;
+    pendingComposeSelection.value = { scope: gone };
+
+    dropRepoTargets(goneIds);
+
+    expect(inputMode.value).toEqual({ type: 'do' });
+    expect(selectedScope.value).toEqual({ kind: 'lucidos' });
+    expect(pendingComposeSelection.value.scope).toEqual({ kind: 'lucidos' });
+  });
+
+  it('a stale last-used seed is dropped without moving a valid pending pick', () => {
+    inputMode.value = { type: 'coding_agent' };
+    selectedScope.value = gone;
+    pendingComposeSelection.value = { scope: kept };
+
+    dropRepoTargets(goneIds);
+
+    expect(selectedScope.value).toEqual({ kind: 'lucidos' });
+    expect(pendingComposeSelection.value.scope).toEqual(kept);
+    expect(inputMode.value).toEqual({ type: 'coding_agent' });
+  });
+
+  it('a draft on a deleted repo moves to the Lucidos Agent, and no other draft moves', () => {
+    inputMode.value = { type: 'coding_agent' };
+    putThread('on-gone', 'composing');
+    setDraft('on-gone', { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    applyDestination('on-gone', { kind: 'coding', scope: gone });
+    putThread('on-kept', 'composing');
+    setDraft('on-kept', { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    applyDestination('on-kept', { kind: 'coding', scope: kept });
+
+    dropRepoTargets(goneIds);
+
+    expect(getComposeSelectionOverride('on-gone').scope).toEqual({ kind: 'lucidos' });
+    expect(getDraft('on-gone').mode).toBe('lucidos');
+    expect(getComposeSelectionOverride('on-kept').scope).toEqual(kept);
+    expect(getDraft('on-kept').mode).toBe('claude_code');
+  });
+
+  // The draft has no mode of its own, and `inputMode` flips to the agent in
+  // the same pass. The draft still needs an explicit mode, or a later flip
+  // back to coding would aim it at the Lucidos source.
+  it('a draft that inherits the coding mode gets an explicit Lucidos Agent mode', () => {
+    inputMode.value = { type: 'coding_agent' };
+    selectedScope.value = gone;
+    putThread('inherits', 'composing');
+    setDraft('inherits', { text: 'fix it', image_hashes: [], mode: null });
+    patchComposeSelection('inherits', { scope: gone });
+
+    dropRepoTargets(goneIds);
+
+    expect(inputMode.value).toEqual({ type: 'do' });
+    expect(getDraft('inherits').mode).toBe('lucidos');
+  });
+
+  it('a Lucidos Agent draft only forgets the repo', () => {
+    putThread('agent-draft', 'composing');
+    setDraft('agent-draft', { text: 'hi', image_hashes: [], mode: 'lucidos' });
+    patchComposeSelection('agent-draft', { scope: gone });
+
+    dropRepoTargets(goneIds);
+
+    expect(getComposeSelectionOverride('agent-draft').scope).toEqual({ kind: 'lucidos' });
+    expect(getDraft('agent-draft').mode).toBe('lucidos');
+  });
+
+  it('writes nothing when no target is on a deleted repo', () => {
+    inputMode.value = { type: 'coding_agent' };
+    selectedScope.value = kept;
+    pendingComposeSelection.value = { scope: kept };
+    patchComposeSelection('on-kept', { scope: kept });
+    const before = {
+      mode: inputMode.value,
+      seed: selectedScope.value,
+      pending: pendingComposeSelection.value,
+      selections: composeSelections.value,
+    };
+
+    dropRepoTargets(goneIds);
+
+    expect(inputMode.value).toBe(before.mode);
+    expect(selectedScope.value).toBe(before.seed);
+    expect(pendingComposeSelection.value).toBe(before.pending);
+    expect(composeSelections.value).toBe(before.selections);
+  });
+
+  describe('the installed watch', () => {
+    const repo = (id: string) => ({ id, name: id, path: `/repos/${id}` });
+    const listOf = (...ids: string[]): void => {
+      repositories.value = { status: 'loaded', data: ids.map(repo) };
+    };
+    /** The refetch the watch confirms with, answering with `ids`. */
+    const serverHas = (...ids: string[]) => vi.fn(async () => { listOf(...ids); });
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+    let dispose: () => void = () => {};
+
+    afterEach(() => {
+      dispose();
+      repositories.value = { status: 'not-loaded' };
+    });
+
+    it('acts only on a loaded repository list', async () => {
+      inputMode.value = { type: 'coding_agent' };
+      selectedScope.value = gone;
+      repositories.value = { status: 'loading' };
+      dispose = installUnregisteredRepoTargetReset(serverHas('kept'));
+      await settle();
+      expect(selectedScope.value).toEqual(gone);
+      repositories.value = { status: 'failed', error: 'offline' };
+      await settle();
+      expect(selectedScope.value).toEqual(gone);
+
+      listOf('kept');
+      await settle();
+
+      expect(selectedScope.value).toEqual({ kind: 'lucidos' });
+      expect(inputMode.value).toEqual({ type: 'do' });
+    });
+
+    // A thread load writes a draft's selection first, then its thread row and
+    // its mode, all in one task. The watch must judge the draft after all three.
+    it.each([
+      ['the thread row lands after the selection', false],
+      ['the thread row is already there', true],
+    ])('resets a draft restored by a thread load once the load finishes: %s', async (_name, rowFirst) => {
+      listOf('kept');
+      dispose = installUnregisteredRepoTargetReset(serverHas('kept'));
+      if (rowFirst) putThread('restored', 'composing');
+      setComposeSelectionFromServer('restored', { scope: gone });
+      if (!rowFirst) putThread('restored', 'composing');
+      setDraft('restored', { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+      await settle();
+
+      expect(getComposeSelectionOverride('restored').scope).toEqual({ kind: 'lucidos' });
+      expect(getDraft('restored').mode).toBe('lucidos');
+    });
+
+    // This device's list can lag a repo another device just registered and
+    // aimed a draft at. Resetting on the cache alone would sync the reset
+    // to every device.
+    it('keeps a target that the cached list lacks but the server has', async () => {
+      listOf('kept');
+      const refetch = serverHas('kept', 'added-elsewhere');
+      dispose = installUnregisteredRepoTargetReset(refetch);
+      putThread('peer-draft', 'composing');
+      setComposeSelectionFromServer('peer-draft', { scope: { kind: 'external', repoId: 'added-elsewhere' } });
+      setDraft('peer-draft', { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+      await settle();
+
+      expect(refetch).toHaveBeenCalledTimes(1);
+      expect(getComposeSelectionOverride('peer-draft').scope)
+        .toEqual({ kind: 'external', repoId: 'added-elsewhere' });
+      expect(getDraft('peer-draft').mode).toBe('claude_code');
+    });
+
+    it('does not refetch while every target is registered', async () => {
+      listOf('kept');
+      selectedScope.value = kept;
+      const refetch = serverHas('kept');
+      dispose = installUnregisteredRepoTargetReset(refetch);
+      putThread('on-kept', 'composing');
+      await settle();
+
+      expect(refetch).not.toHaveBeenCalled();
+    });
+
+    // A draft being sent is `active`, so the watch skips it. A failed send
+    // hands it back as `composing`, and the watch must catch it then.
+    it('resets a draft that a failed send hands back', async () => {
+      listOf('kept');
+      dispose = installUnregisteredRepoTargetReset(serverHas('kept'));
+      putThread('sending', 'active');
+      setDraft('sending', { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+      patchComposeSelection('sending', { scope: gone });
+      await settle();
+      expect(getComposeSelectionOverride('sending').scope).toEqual(gone);
+
+      putThread('sending', 'composing');
+      await settle();
+
+      expect(getComposeSelectionOverride('sending').scope).toEqual({ kind: 'lucidos' });
+      expect(getDraft('sending').mode).toBe('lucidos');
+    });
   });
 });
 

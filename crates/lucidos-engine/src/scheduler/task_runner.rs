@@ -34,7 +34,7 @@ pub(super) struct TrackedTask {
 /// token instead of aborting the handle to let the task emit its terminal
 /// events before exiting.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_task_runner(
+fn spawn_task_runner(
     trigger_id: String,
     task_name: String,
     cron_expressions: Vec<String>,
@@ -569,7 +569,7 @@ pub(super) async fn handle_trigger_event(
 }
 
 /// Spawn a task runner for a trigger config and track its handle.
-async fn register_and_track(
+pub(super) async fn register_and_track(
     config: &TriggerConfig,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,

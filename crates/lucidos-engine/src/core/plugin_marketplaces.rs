@@ -678,13 +678,8 @@ pub(crate) fn content_dirs_from_files<'a>(files: impl Iterator<Item = &'a str>) 
 }
 
 fn marketplace_id(source: &MarketplaceSource, raw_source: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_source_key(source).as_bytes());
-    let hash = hasher.finalize();
-    let short = hash[..4]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let hash = Sha256::digest(canonical_source_key(source).as_bytes());
+    let short = crate::api::hex::hex_lower(&hash[..4]);
     format!("{}-{}", slug_for_source(raw_source), short)
 }
 

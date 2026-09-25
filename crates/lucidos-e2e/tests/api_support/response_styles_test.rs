@@ -73,7 +73,7 @@ async fn the_style_library_round_trips_over_http() {
     put_ok(&client, &api, "[]").await;
     let styles = library(&client, &api).await;
     let ids: Vec<&str> = styles.iter().map(|s| s["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["standard", "concise", "minimal"]);
+    assert_eq!(ids, vec!["standard", "concise", "minimal", "learning"]);
 
     // Standard is the off switch: no instruction, and no editor.
     let standard = row(&styles, "standard");
@@ -103,9 +103,11 @@ async fn the_style_library_round_trips_over_http() {
     )
     .await;
 
+    let shipped_description = row(&styles, "minimal")["description"].clone();
     let edited = row(&library(&client, &api).await, "minimal");
     assert_eq!(edited["label"], json!("Terse"));
     assert_eq!(edited["source"], json!("overridden"));
+    assert_eq!(edited["description"], shipped_description);
     assert_eq!(
         edited["instruction"],
         json!("- One sentence, and only one.")
@@ -133,7 +135,7 @@ async fn the_style_library_round_trips_over_http() {
     .await;
 
     let styles = library(&client, &api).await;
-    assert_eq!(styles.len(), 4);
+    assert_eq!(styles.len(), 5);
     let mine = row(&styles, "board-report");
     assert_eq!(mine["source"], json!("user"));
     assert_eq!(mine["editable"], json!(true));

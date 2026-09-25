@@ -4416,6 +4416,7 @@ dependencies = [
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
+ "mach2",
  "qrcode",
  "rcgen",
  "reqwest 0.12.28",

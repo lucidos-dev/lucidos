@@ -1,7 +1,7 @@
 import { useRef, useState } from 'preact/hooks';
 import { activeInlineForm, closeInlineForm, showToast } from '../../store/store';
 import type { EmailConfirmForm } from '../../store/store';
-import { markEmailSent } from '../../store/actions/email-confirm';
+import { cancelEmailConfirm, markEmailSent } from '../../store/actions/email-confirm';
 import { sendEmailConfirmed } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatMessageTimestamp } from '../../utils/formatTime';
@@ -130,6 +130,7 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
           reply_to_message_id: draft.reply_to_message_id,
           account: draft.account,
           attachments: draft.attachments,
+          form_request_id: draft.form_request_id,
         });
       },
       toast: showToast,
@@ -163,7 +164,7 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
         <EmailAttachments names={draft.attachment_names} />
       )}
       <div class="form-actions">
-        <button type="button" class="btn-cancel" onClick={() => closeInlineForm()} disabled={sending}>Cancel</button>
+        <button type="button" class="btn-cancel" onClick={() => cancelEmailConfirm(form)} disabled={sending}>Cancel</button>
         <button type="button" class="btn-save" onClick={handleSend} disabled={sending}>{sending ? 'Sending…' : 'Send Email'}</button>
       </div>
     </div>

@@ -2,25 +2,26 @@ import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../..
 import type { Change } from '../../api/client';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
+import { HELD_UNTIL_REPLY } from '../../store/exchange-status';
 import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_LABEL, awaitedSubject, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus, waitSubscriptionLabel } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
-import type { EventSubscription, EventWaitCancelCause, Exchange } from '../../store/thread-events';
+import type { EventSubscription, EventWaitCancelCause, Exchange, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { HEARING_YOU } from '../../voice/callState';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
-import { formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
+import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowChip, EventRowFact, EventRowMark, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
-import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon } from '../shared/icons';
+import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon, StepOutcomeIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
 import { getSessionBlobUrlForHash } from './pastedImages';
 import { useSignal } from '@preact/signals';
@@ -193,7 +194,7 @@ export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
  *  either. That reason lives on the `EventWaitStarted`, routinely outside the
  *  loaded window by then, and a row states no fact its own event carries.
  *
- *  **"Event arrived", never "Woke on".** The anchor records no idle flag.
+ *  **"arrived", never "Woke on".** The anchor records no idle flag.
  *  `resume_from_event_wake` injects the delivery into a live turn when there is
  *  one, so the card must be true of both lanes. See
  *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
@@ -289,21 +290,19 @@ export function eventDeliveryBody({
     // `ChangeProposed` from the coding-agent thread this one watched. So the
     // jump resolves the owning thread first and navigates there, rather than
     // searching the open thread's DOM for an event not in it.
-    subject: (
-      <>
-        {'Event arrived: '}
-        {eventNameChip({
-          kind: 'chip',
-          name: eventType,
-          onClick: onOpenMatched,
-          pending: opening,
-          role: 'event-delivery-jump',
-        })}
-      </>
-    ),
-    stateLabel: 'delivered',
+    // The chip IS the sentence: "Background job finished". Event types are
+    // past tense, so the plain name already says what happened.
+    subject: eventNameChip({
+      kind: 'chip',
+      name: eventType,
+      sentenceStart: true,
+      onClick: onOpenMatched,
+      pending: opening,
+      role: 'event-delivery-jump',
+    }),
+    stateLabel: 'arrived',
     tone: 'arrived',
-    fold: payloadJson ? { label: 'Payload', pre: true, body: payloadJson } : undefined,
+    fold: payloadJson ? { label: 'Details', pre: true, body: payloadJson } : undefined,
   });
 }
 
@@ -841,7 +840,7 @@ export function InlineStep(
     rowRef?: (el: HTMLDivElement | null) => void;
   },
 ) {
-  const { label, icon, className } = stepStatus(event.outcome);
+  const { label, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
   const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
   const window = snap?.context_window;
@@ -896,12 +895,10 @@ export function InlineStep(
         data-role="step-main"
         onClick={() => { stepDetailModal.value = event; }}
       >
-        {/* In-progress step: no leading mark (`stepStatus` returns an empty
-            icon), because the shimmering description is the "live" affordance.
-            The span still renders, empty: the slot is a fixed-width column in
-            CSS, so the running row's text sits on the same column as the
-            finished rows above it. */}
-        <span class="step-icon">{icon || null}</span>
+        {/* A running step draws no mark, but the span still renders: the slot
+            is a fixed-width column in CSS, so the running row's text sits on
+            the same column as the finished rows above it. */}
+        <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>
         <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
         {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       </button>
@@ -940,24 +937,39 @@ type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
  *  `timed_out` and `canceled` are told apart by their words, not by red:
  *  nothing failed either time, the watch simply ended without its event.
  *
- *  **`matched`, never "woke"**, and that is a fact about the subscription
- *  rather than about the thread. A delivery does not require an idle thread:
+ *  **A check and when it was done, never "woke"**, and that is a fact about the
+ *  wait rather than about the thread. A delivery does not require an idle thread:
  *  `resume_from_event_wake` injects into a live turn when there is one, and
  *  frames it to the model as arriving "while you were working". The row cannot
  *  tell the two lanes apart (its anchor records no such flag), so it says the
- *  thing that is true of both. Same reason `eventDeliveryBody` reads "Event
- *  arrived" below. */
-const EVENT_WAIT_ROW_STATE: Record<
-  EventWaitState,
-  { mark: EventRowMark; label: string; tone: EventRowTone }
-> = {
-  waiting: { mark: 'pending', label: 'waiting', tone: 'live' },
-  matched: { mark: 'arrived', label: 'matched', tone: 'arrived' },
-  timed_out: { mark: 'pending', label: 'timed out', tone: 'lapsed' },
-  canceled: { mark: 'pending', label: 'stopped', tone: 'halted' },
+ *  thing that is true of both. Same reason `eventDeliveryBody` says "arrived". */
+const EVENT_WAIT_ROW_STATE: Record<EventWaitState, { mark: EventRowMark; tone: EventRowTone }> = {
+  waiting: { mark: 'pending', tone: 'live' },
+  matched: { mark: 'arrived', tone: 'arrived' },
+  timed_out: { mark: 'pending', tone: 'lapsed' },
+  canceled: { mark: 'pending', tone: 'halted' },
 };
 
-/** Who stopped a subscription, in the words of whatever they pressed.
+/** The state pill, which says the outcome once. The headline already says
+ *  "Waiting", so a live pill gives the deadline instead of repeating it, and a
+ *  delivered one gives a check and when it was done. */
+function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt?: string): string {
+  const deadline = waitMoment(expiresAt);
+  switch (state) {
+    case 'waiting':
+      return deadline ? `until ${deadline}` : 'waiting';
+    case 'matched': {
+      const done = waitMoment(matchedAt);
+      return done ? `✓ ${done}` : '✓';
+    }
+    case 'timed_out':
+      return deadline ? `gave up at ${deadline}` : 'gave up';
+    case 'canceled':
+      return 'stopped';
+  }
+}
+
+/** Who stopped a wait, in plain words.
  *
  *  The word is **stopped**, never "discarded". *Discarded* already means
  *  throwing a thing away in Lucidos, and one of these causes IS a discarded
@@ -965,17 +977,16 @@ const EVENT_WAIT_ROW_STATE: Record<
  *  The `canceled` identifiers underneath keep their names: they are on disk in
  *  persisted rows.
  *
- *  A row carrying no cause falls back to the bare note, which says it stopped
- *  without claiming to know how. */
-const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
-  user_stop: 'stopped from the panel',
-  agent_stand_down: 'stood down',
-  thread_archived: 'stopped by archiving',
-  thread_discarded: 'stopped by discarding the thread',
+ *  An unknown cause gets no note, since the pill already says it stopped. */
+const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string | null> = {
+  user_stop: 'you stopped it',
+  agent_stand_down: 'the agent stopped it',
+  thread_archived: 'stopped when the thread was archived',
+  thread_discarded: 'stopped when the thread was discarded',
   // Retired: a thread-level Stop no longer stops a subscription. Only old rows
   // carry it, and they still have to render.
-  thread_canceled: 'stopped by a thread Stop',
-  unknown: 'stopped',
+  thread_canceled: 'stopped by Stop',
+  unknown: null,
 };
 
 /** The mark on a user message that was spoken rather than typed.
@@ -1136,50 +1147,36 @@ export function eventWaitRowBody({
 }: {
   event: Extract<ResponseEvent, { type: 'event_wait' }>;
 }) {
-  const { mark, label, tone } = EVENT_WAIT_ROW_STATE[event.state];
+  const { mark, tone } = EVENT_WAIT_ROW_STATE[event.state];
   const stopped = event.state === 'canceled';
-  // A stop is a different action from an arming and says so. The wording comes
-  // from `eventWaitStoppedSummary` rather than being spelled again here: the
-  // user's own stop renders as a TURN with that same header, and one concept
-  // must not acquire two phrasings. It also handles the reason-less row, whose
-  // `EventWaitCanceled` carries no copy of what it stopped.
-  //
-  // "event wait" is the canonical term in both glossaries, and the indicator
-  // beside this reads "Watching for an event". A synonym here is exactly the
-  // drift `.claude/rules/glossary.md` exists to stop.
-  //
-  // A colon rather than "for", because `reason` is the model's own words and
-  // reaches for a gerund as often as a noun phrase. The colon reads as an
-  // introduction either way.
-  //
-  // `awaitedSubject` is what keeps the gerund case from stuttering. Both labels
-  // here carry the verb already, so a reason opening "waiting for" would say it
-  // twice.
+  // One phrasing for every label about a wait: "<verb> for <subject>". A stop
+  // takes it from `eventWaitStoppedSummary`, because the user's own stop renders
+  // as a TURN with that same header. The UI never says "event wait": that is
+  // the internal name (`system-knowhow/glossary.md` § Event wait).
   const subject = stopped
     ? eventWaitStoppedSummary(event.reason)
-    : `Set up an event wait: ${awaitedSubject(event.reason)}`;
-  const deadline = event.state === 'waiting' ? waitDeadline(event.expires_at) : undefined;
+    : waitingFor(event.state === 'waiting' ? 'Waiting' : 'Waited', event.reason);
+  const stopNote = stopped && event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : null;
   return eventRowBody({
     kind: 'wait',
     mark,
     state: event.state,
     role: 'event-wait-row',
     subject,
-    stateLabel: label,
+    stateLabel: eventWaitStateLabel(event.state, event.expires_at, event.matched_at),
     tone,
+    time: eventWaitTime(event.created),
     facts: [
       // A stop names how it ended instead of what it watched: the subscription
-      // is over, and how it ended is the new fact. A row knowing neither cause
-      // nor types says only that it stopped.
-      stopped && event.cause ? { kind: 'text' as const, text: EVENT_WAIT_STOP_NOTE[event.cause] } : null,
+      // is over, and how it ended is the new fact.
+      stopNote ? { kind: 'text' as const, text: stopNote } : null,
       // The matched event REPLACES the subscription list on a match: one of the
       // types it was watching for is now a specific thing that happened.
       ...(event.state === 'matched'
         ? [event.matched_event_type ? { kind: 'chip' as const, name: event.matched_event_type } : null]
-        : stopped
-          ? []
-          : subscriptionFacts(event.subscriptions)),
-      deadline ? { kind: 'text' as const, text: deadline } : null,
+        : event.state === 'waiting'
+          ? subscriptionFacts(event.subscriptions)
+          : []),
       // **No jump from here.** This card records the ARMING: an action the
       // agent took, at the moment it took it. A link out to the matched event
       // belongs on a card about that event, which is the delivery below
@@ -1194,8 +1191,9 @@ export function eventWaitRowBody({
 }
 
 /** An agent-sent message the coding agent holds until a human replies
- *  (ADR 0256). It stays in the transcript once released, marked delivered;
- *  the delivered copy is the message below it, so the text sits in a fold. */
+ *  (ADR 0256). Once its delivered copy is on record, that copy is the one
+ *  card and this row stops drawing (`Exchange.deliveredHeldIds`). A released
+ *  row without one stays, so a lost delivery is visible; its text is folded. */
 export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type: 'held_message' }> }) {
   return eventRowBody({
     kind: 'held',
@@ -1203,40 +1201,52 @@ export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type
     state: event.released ? 'released' : 'held',
     role: 'held-message-row',
     subject: `Message from ${event.sender}`,
-    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : HELD_MESSAGE_WAITING,
+    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : HELD_UNTIL_REPLY,
     tone: event.released ? 'arrived' : 'live',
     fold: { label: 'Message', body: event.text },
   });
 }
 
-export const HELD_MESSAGE_WAITING = 'Held until you reply';
 export const HELD_MESSAGE_DELIVERED = 'Delivered';
 
-/** The watched event types as chips, joined by the word the subscription
- *  language itself uses. "or" is `glue` rather than a fact, so the row's middot
- *  separator steps over it: three items, one fact.
+/** The watched event types as chips, one per type, after "watching for" and joined
+ *  by the word the subscription language itself uses. Both words are `glue`
+ *  rather than facts, so the row's middot separator steps over them: one fact.
  *
- *  A chip whose subscription carries a `condition` is the door to it. The chip
- *  says "(filtered)", which reports that a filter exists and nothing about what
- *  it says. The raw operator JSON is far too wide for a facts line. So the
- *  summary stays on the row and the condition opens in a modal. */
+ *  A filtered chip is the door to its conditions. Its note says a filter exists
+ *  and nothing about what it says, since the raw operator JSON is far too wide
+ *  for a facts line. So the summary stays on the row and the conditions open in
+ *  a modal. */
 function subscriptionFacts(subscriptions: EventSubscription[]): EventRowFact[] {
-  const chip = (s: EventSubscription): EventRowChip => {
-    const name = waitSubscriptionLabel(s);
-    // `eventConditionDoor` reads the same truthiness the label does, so the
-    // chip is pressable exactly when it says "(filtered)". The waiting panel
-    // asks the same question through it, which is what keeps the two surfaces
-    // from drifting apart.
-    const door = eventConditionDoor(s);
-    if (!door) return { kind: 'chip', name };
-    return { kind: 'chip', name, action: door.label, onClick: door.open };
+  const chip = (g: SubscriptionGroup): EventRowChip => {
+    const name = g.event_type;
+    const note = subscriptionFilterNote(g);
+    // `eventConditionDoor` reads the same conditions the note does, so the chip
+    // is pressable exactly when it carries one. The waiting panel asks the same
+    // question through it, which keeps the two surfaces from drifting apart.
+    const door = eventConditionDoor(g);
+    if (!door) return { kind: 'chip', name, note };
+    return { kind: 'chip', name, note, action: door.label, onClick: door.open };
   };
-  return subscriptions.flatMap((s, i) =>
-    i === 0 ? [chip(s)] : [{ kind: 'glue' as const, text: 'or' }, chip(s)],
-  );
+  return groupSubscriptions(subscriptions).flatMap((g, i) => [
+    // "watching for", never "wakes on": a match can land in a running turn,
+    // so no wait surface claims the thread was asleep.
+    { kind: 'glue' as const, text: i === 0 ? 'watching for' : 'or' },
+    chip(g),
+  ]);
 }
 
-/** When an unresolved wait gives up, as a fact rather than a countdown.
+/** When the row's event happened, in the format a message header uses: the
+ *  start of a wait, or the moment a stop row records. The row sits inside a
+ *  response body, whose header shows when the TURN ended, so nothing else says
+ *  when the watch began. Absent when missing or unparseable. */
+function eventWaitTime(created: string | undefined): { label: string; iso: string } | undefined {
+  if (!created || Number.isNaN(new Date(created).getTime())) return undefined;
+  return { label: formatMessageTimestamp(created), iso: created };
+}
+
+/** A moment on the pill: when an unresolved wait gives up, or when a delivered
+ *  one was done. A fact rather than a countdown.
  *
  *  Deliberately not ticking. ADR 0047 puts the live countdown on the
  *  waiting indicator and keeps the transcript record LIGHTER. A per-second
@@ -1244,20 +1254,20 @@ function subscriptionFacts(subscriptions: EventSubscription[]): EventRowFact[] {
  *  store is shaped around not re-rendering. The panel's own countdown keeps its
  *  interval, being one open popover rather than one row per wait.
  *
- *  **The day is named whenever the deadline is not today.** An `await_event`
+ *  **The day is named whenever the moment is not today.** An `await_event`
  *  timeout runs up to 24 hours, so a deadline is routinely tomorrow. A bare
  *  "until 09:15" read at 14:00 points at a time that already passed. Same-day
  *  is compared in the user's configured timezone (`isSameDayInUserTz`).
  *
- *  Absent when the deadline is unparseable or missing, rather than rendering an
+ *  Absent when the moment is unparseable or missing, rather than rendering an
  *  "Invalid Date": a row states no fact its event does not carry. */
-function waitDeadline(expiresAt: string): string | undefined {
-  if (!expiresAt) return undefined;
-  const at = new Date(expiresAt);
+function waitMoment(iso: string | undefined): string | undefined {
+  if (!iso) return undefined;
+  const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return undefined;
   return isSameDayInUserTz(at, new Date())
-    ? `until ${formatShortTime(at)}`
-    : `until ${formatShortDate(at)} ${formatShortTime(at)}`;
+    ? formatShortTime(at)
+    : `${formatShortDate(at)} ${formatShortTime(at)}`;
 }
 
 /** What Undo will do to the workspace, in words, from the counts the engine

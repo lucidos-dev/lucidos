@@ -4,9 +4,6 @@ const mocks = vi.hoisted(() => ({
   fetchWorkspaces: vi.fn(),
   listWorkspaces: vi.fn(),
   locateWorkspace: vi.fn(),
-  slugifyWorkspaceName: vi.fn((n: string) =>
-    n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '') || 'workspace',
-  ),
   openUrl: vi.fn(),
   showToast: vi.fn(),
   isTauri: vi.fn(() => false),
@@ -26,7 +23,6 @@ vi.mock('../../api/client', () => ({ fetchWorkspaces: mocks.fetchWorkspaces }));
 vi.mock('../../api/client/control', () => ({
   listWorkspaces: mocks.listWorkspaces,
   locateWorkspace: mocks.locateWorkspace,
-  slugifyWorkspaceName: mocks.slugifyWorkspaceName,
 }));
 vi.mock('../../utils/basePath', () => ({
   get WORKSPACE_ID() {

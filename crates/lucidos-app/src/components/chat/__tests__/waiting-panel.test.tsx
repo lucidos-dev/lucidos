@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
-  activeSubThreads,
+  unfinishedSubThreads,
   SubThreadRow,
   subscriptionLine,
   waitingIndicatorBody,
@@ -93,31 +93,32 @@ function map(...threads: ThreadState[]): Map<string, ThreadState> {
 // Which children count, and who decides how many there are.
 // ──────────────────────────────────────────────────────────────────────────
 
-describe('activeSubThreads', () => {
-  it('names nothing while the server counts no active child', () => {
+describe('unfinishedSubThreads', () => {
+  it('names nothing while the server counts no unfinished child', () => {
     const children = map(thread('c', { parentThreadId: 'p', status: 'running' }));
-    expect(activeSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
+    expect(unfinishedSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
   });
 
-  it('takes the running and question children, and no others', () => {
+  it('takes the running, question and waiting children, and no others', () => {
     const children = map(
       thread('running', { parentThreadId: 'p', status: 'running' }),
       thread('asking', { parentThreadId: 'p', status: 'waiting_for_user_answer' }),
-      // Idle while holding its own subscription, and idle with a proposed
-      // change: both are waiting for somebody, neither is mid-turn, and the
-      // engine's `active_thread_statuses()` excludes both.
+      // Idle while holding its own subscription: it has not finished
+      // (ADR 0254), and the engine counts it in `waiting_children_count`.
       thread('subscribed', { parentThreadId: 'p', status: 'idle', liveEventWaitCount: 1 }),
+      // Idle with a proposed change: it reported, and waits only for the user.
       thread('proposed', { parentThreadId: 'p', status: 'waiting', codingAgentProposed: true }),
+      thread('finished', { parentThreadId: 'p', status: 'idle' }),
       thread('elsewhere', { parentThreadId: 'other', status: 'running' }),
     );
-    const found = activeSubThreads('p', children, 2);
-    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['asking', 'running']);
+    const found = unfinishedSubThreads('p', children, 3);
+    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['asking', 'running', 'subscribed']);
     expect(found.unresolved).toBe(0);
   });
 
   it('reports the children the server counts and the map cannot name', () => {
     const children = map(thread('c1', { parentThreadId: 'p', status: 'running' }));
-    const found = activeSubThreads('p', children, 3);
+    const found = unfinishedSubThreads('p', children, 3);
     expect(found.threads.map((t) => t.meta.id)).toEqual(['c1']);
     expect(found.unresolved).toBe(2);
   });
@@ -127,7 +128,7 @@ describe('activeSubThreads', () => {
       thread('c1', { parentThreadId: 'p', status: 'running' }),
       thread('c2', { parentThreadId: 'p', status: 'running' }),
     );
-    expect(activeSubThreads('p', children, 1).unresolved).toBe(0);
+    expect(unfinishedSubThreads('p', children, 1).unresolved).toBe(0);
   });
 });
 
@@ -158,7 +159,7 @@ describe('waitingIndicatorBody', () => {
         onClick: NOOP,
       }),
     );
-    expect(many).toContain('data-tooltip="2 subscriptions"');
+    expect(many).toContain('data-tooltip="2 events"');
   });
 
   it('renders for sub-threads alone, naming them rather than a subscription', () => {
@@ -211,8 +212,8 @@ describe('waitingIndicatorBody', () => {
       }),
     );
     // The lone-reason shortcut is off here: two reasons do not fit a tooltip.
-    expect(text).toContain('data-tooltip="1 subscription, 1 sub-thread"');
-    expect(text).toContain('aria-label="Waiting for 1 subscription, 1 sub-thread. Click to expand."');
+    expect(text).toContain('data-tooltip="1 event, 1 sub-thread"');
+    expect(text).toContain('aria-label="Waiting for 1 event, 1 sub-thread. Click to expand."');
   });
 });
 
@@ -272,7 +273,7 @@ describe('waitingPanelBody', () => {
 
   it('labels both sections when the thread is parked on both', () => {
     const text = body({ subThreads: { threads: [thread('c1')], unresolved: 0 } });
-    expect(text).toContain('>Subscriptions<');
+    expect(text).toContain('>Events<');
     expect(text).toContain('>Sub-threads<');
   });
 
@@ -292,11 +293,11 @@ describe('waitingPanelBody', () => {
   });
 });
 
-/** **The panel says "(filtered)" too, so it owes the same answer as the
+/** **The panel says "(matching only)" too, so it owes the same answer as the
  *  transcript.** Both go through `eventConditionDoor`, which is what keeps one
  *  affordance from acquiring two behaviours.
  *
- *  The joined LOOK survives: still one muted mono line reading `A or B`. Only a
+ *  The joined LOOK survives: still one muted line reading `watching for A or B`. Only a
  *  filtered entry becomes a button, and the modal it opens stacks over this
  *  popover rather than replacing it. */
 describe('the panel subscription line', () => {
@@ -309,32 +310,36 @@ describe('the panel subscription line', () => {
       { event_type: 'GithubWorkflowRunStateChanged', condition: CONDITION },
       { event_type: 'ChangeProposed' },
     ]));
-    expect(text).toContain('GithubWorkflowRunStateChanged (filtered)');
+    expect(text).toContain('watching for ');
+    expect(text).toContain('github workflow run state changed (matching only)');
     expect(text).toContain(' or ');
-    expect(text).toContain('ChangeProposed');
+    expect(text).toContain('change proposed');
   });
 
   it('opens the condition from a filtered entry', () => {
     const line = subscriptionLine([
       { event_type: 'GithubWorkflowRunStateChanged', condition: CONDITION },
     ]);
-    const button = line[0] as VNode<{ 'aria-label': string; onClick: () => void }>;
+    const button = line[1] as VNode<{ 'aria-label': string; onClick: () => void }>;
     expect(button.type).toBe('button');
     // The same accessible name the transcript chip carries, because both come
     // from the one door.
-    expect(button.props['aria-label']).toBe('Show the condition filtering GithubWorkflowRunStateChanged');
+    expect(button.props['aria-label']).toBe('GithubWorkflowRunStateChanged · show the condition');
     button.props.onClick();
     expect(eventConditionModal.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
-      condition: CONDITION,
+      conditions: [CONDITION],
     });
   });
 
-  /** An entry with no condition promises nothing, so it must offer no door. */
+  /** An entry with no condition promises nothing, so it must offer no door. It
+   *  keeps its raw type on the tooltip, as the transcript chip does. */
   it('leaves an unfiltered entry as plain text', () => {
     const line = subscriptionLine([{ event_type: 'ChangeProposed' }]);
-    expect((line[0] as VNode).type).toBe('span');
-    expect(vnodeToText(line)).toBe('<span>ChangeProposed</span>');
+    expect((line[1] as VNode).type).toBe('span');
+    expect(vnodeToText(line)).toBe(
+      '<span>watching for </span><span data-tooltip="ChangeProposed">change proposed</span>',
+    );
   });
 });
 

@@ -24,7 +24,6 @@ const propsOf = (node: ComponentChild): Props => (node as VNode<Props>).props;
 
 const TRIGGER = { id: 'the-more-trigger' } as unknown as HTMLElement;
 const ctx: OverflowMenuContext = {
-  open: true,
   openedViaKeyboard: false,
   run: (fn) => () => fn(),
   anchor: TRIGGER,

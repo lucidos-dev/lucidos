@@ -1159,7 +1159,7 @@ export function MobileAccessPage() {
                     address to open is under Connect URLs.</>
                 : row.canRun
                   ? 'Sets up tailnet HTTPS for the engine, which is what enables the installable PWA and push. Setup runs in the background and reports on the Lucidos badge, and it may ask you to enable Serve for your tailnet.'
-                  : 'Your phone can already reach the plain-HTTP address above. HTTPS is what adds the installable PWA and push, and it needs `tailscale serve`. Install the Tailscale command-line tool to set it up: use Install CLI in the Tailscale app, or `brew install tailscale`.'}
+                  : <>Your phone can already reach the plain-HTTP address above. HTTPS is what adds the installable PWA and push, and it needs <code>tailscale serve</code>. Install the Tailscale command-line tool to set it up: use Install CLI in the Tailscale app, or <code>brew install tailscale</code>.</>}
             </div>
           </div>
           {row.canRun && (

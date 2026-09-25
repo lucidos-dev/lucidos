@@ -159,6 +159,13 @@ async fn archive_cascade_archives_idle_descendants() {
         child_id,
         ids,
     );
+    // Every member was archived, so nothing is reported as skipped. The key is
+    // always present, so a client never has to guess what an absence means.
+    assert_eq!(
+        body["skipped"],
+        json!([]),
+        "an archive that left nobody behind reports no skips: {body:?}"
+    );
 
     // EventBus emits run their own per-event transactions after the handler
     // releases the FOR UPDATE lock — give the projection a beat to settle.

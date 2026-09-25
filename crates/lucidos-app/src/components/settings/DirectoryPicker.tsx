@@ -97,14 +97,19 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const showLoading = useDelayedLoading(data);
 
   useEffect(() => {
+    // Fast breadcrumb clicks overlap reads. A superseded reply must not land,
+    // or Select would return a directory the user already left.
+    let cancelled = false;
     setData({ status: 'loading' });
     setSelectedIndex(-1);
     browseDirectories(browsePath)
       .then(result => {
+        if (cancelled) return;
         setData({ status: 'loaded', data: result });
         setManualPath(result.path);
       })
-      .catch(e => setData(toFailed(e)));
+      .catch(e => { if (!cancelled) setData(toFailed(e)); });
+    return () => { cancelled = true; };
   }, [browsePath]);
 
   useEffect(() => {

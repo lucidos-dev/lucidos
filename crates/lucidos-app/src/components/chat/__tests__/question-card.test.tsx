@@ -9,10 +9,14 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import * as QuestionCardModule from '../QuestionCard';
+import { render } from 'preact';
 import {
   OptionIndicator,
   AnsweredBody,
+  QuestionBody,
   TerminatedQuestionBody,
+  getMultiSelectedIds,
+  setMultiSelectedIds,
 } from '../QuestionCard';
 import { PLACEHOLDER_ANSWERING } from '../prompt-input-helpers';
 import { ANSWER_CANCEL_TOOLTIP } from '../PromptInput';
@@ -308,5 +312,105 @@ describe('question text — URL linkification', () => {
     }));
     expect(text).toContain('href="https://github.com/example-org/example-repo/pull/1488"');
     expect(text).toContain('target="_blank"');
+  });
+});
+
+// A coding agent rendered five variants and put each one in its option's
+// `preview`. The card dropped the field, so the user saw no pictures at all.
+describe('an option preview', () => {
+  const options = [
+    { id: 'opt-0', label: 'D', preview: '![D](artifacts/variant-d.png)' },
+    { id: 'opt-1', label: 'C', preview: '  Sent  21:30\n  ^^^^  dim' },
+    { id: 'opt-2', label: 'B' },
+  ];
+
+  const expectPictureAndSample = (html: string) => {
+    expect(html).toContain('question-option-preview');
+    expect(html).toMatch(/<img[^>]*src="[^"]*\/data\/artifacts\/variant-d\.png"/);
+    expect(html).not.toContain('src="artifacts/');
+    expect(html).toContain('  Sent  21:30<br>  ^^^^  dim');
+    // One preview box per option that has one: B stays as it was.
+    expect(html.match(/question-option-preview/g)).toHaveLength(2);
+  };
+
+  it('shows on the live card, with no link inside the option button', () => {
+    const host = document.createElement('div');
+    render(
+      <QuestionBody
+        threadId="t"
+        toolUseId="tu-preview"
+        question="Which one should I build?"
+        options={[...options, { id: 'opt-3', label: 'L', preview: '[x](https://example.com)' }]}
+      />,
+      host,
+    );
+    const buttons = Array.from(host.querySelectorAll('button.question-option'));
+    expect(buttons).toHaveLength(4);
+    expectPictureAndSample(buttons.slice(0, 3).map(b => b.outerHTML).join(''));
+    expect(host.querySelector('button.question-option a')).toBeNull();
+    render(null, host);
+  });
+
+  // A tap on the picture opens the image viewer, through the one global click
+  // handler. Answering on the same tap would send a choice the user was
+  // still looking at.
+  it('lets a tap on its picture open the viewer instead of choosing', () => {
+    const host = document.createElement('div');
+    document.body.append(host);
+    render(
+      <QuestionBody
+        threadId="t"
+        toolUseId="tu-preview-tap"
+        question="Which one?"
+        options={options}
+        multiSelect
+      />,
+      host,
+    );
+    const button = host.querySelector<HTMLButtonElement>('button.question-option')!;
+    const img = button.querySelector<HTMLImageElement>('.image-scroll-wrapper > img');
+    expect(img, 'the picture sits in the same wrapper as a reply image').toBeTruthy();
+
+    img!.click();
+    expect(getMultiSelectedIds('tu-preview-tap')).toEqual([]);
+
+    // Dragging the picture's scrollbar ends in a click on the wrapper itself.
+    img!.closest<HTMLElement>('.image-scroll-wrapper')!.click();
+    expect(getMultiSelectedIds('tu-preview-tap')).toEqual([]);
+
+    button.querySelector<HTMLElement>('.question-option-label')!.click();
+    expect(getMultiSelectedIds('tu-preview-tap')).toEqual(['opt-0']);
+
+    setMultiSelectedIds('tu-preview-tap', []);
+    render(null, host);
+    host.remove();
+  });
+
+  // Scrolling a picture sideways pressed the whole option in, as if choosing.
+  it('does not sink the option while its picture is pressed', () => {
+    const css = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../../styles/chat/response.css'),
+      'utf8',
+    );
+    expect(css).toContain('.question-option:active:not(:has(.image-scroll-wrapper:active)) {');
+    expect(css).not.toMatch(/\.question-option:active\s*\{/);
+  });
+
+  it('shows on the answered card', () => {
+    expectPictureAndSample(vnodeToText(AnsweredBody({
+      toolUseId: 'tu-preview',
+      question: 'q',
+      options,
+      multiSelect: false,
+      resolved: { kind: 'Selected', option_id: 'opt-0' },
+    })));
+  });
+
+  it('shows on the terminated card', () => {
+    expectPictureAndSample(vnodeToText(TerminatedQuestionBody({
+      question: 'q',
+      options,
+      multiSelect: false,
+    })));
   });
 });

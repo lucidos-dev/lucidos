@@ -34,6 +34,7 @@ import {
   submittedScopes,
 } from './credentialScopes';
 import { LoadableError } from '../shared/LoadableError';
+import { inlineFormKey } from '../layout/contentViewKey';
 import { linkifyText } from '../shared/linkifyText';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
@@ -91,8 +92,11 @@ export function CredentialModal() {
     );
   }
 
+  // Keyed so a new request remounts the form. Its fields seed once, from their
+  // initial values, and would otherwise keep the previous request's service.
   return (
     <CredentialFormInner
+      key={inlineFormKey(form)}
       editing={undefined}
       request={form.request}
       existingCred={null}
@@ -136,6 +140,8 @@ function CredentialStoredLoader({
 }) {
   const credLoadable = credentials.value;
   const [data, setData] = useState<Loadable<EditData>>({ status: 'not-loaded' });
+  // Bumped by Retry, to run the secret read again after a failure.
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     if (credLoadable.status === 'not-loaded') void loadCredentials();
@@ -171,7 +177,7 @@ function CredentialStoredLoader({
       cancelled = true;
     };
     // existingCred identity changes only with the credentials list / editing key.
-  }, [credLoadable.status, credentialId, existingCred?.auth_type]);
+  }, [credLoadable.status, credentialId, existingCred?.auth_type, attempt]);
 
   // Delay the spinner so a fast secret fetch never flashes it. The failed
   // branches below render first.
@@ -182,14 +188,22 @@ function CredentialStoredLoader({
   if (credLoadable.status === 'failed') {
     return (
       <div class="inline-form">
-        <LoadableError error={credLoadable.error} noun="credentials" />
+        <LoadableError
+          error={credLoadable.error}
+          noun="credentials"
+          onRetry={() => void loadCredentials()}
+        />
       </div>
     );
   }
   if (data.status === 'failed') {
     return (
       <div class="inline-form">
-        <LoadableError error={data.error} noun="credential" />
+        <LoadableError
+          error={data.error}
+          noun="credential"
+          onRetry={() => setAttempt((n) => n + 1)}
+        />
       </div>
     );
   }
@@ -516,7 +530,7 @@ function CredentialFormInner({
               <input
                 ref={serviceRef}
                 type="text"
-                value={initialService}
+                defaultValue={initialService}
                 disabled={serviceDisabled}
                 placeholder="e.g. GitHub, Jira"
                 required

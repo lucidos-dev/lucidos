@@ -17,7 +17,7 @@ vi.mock('../../api/client', async (importActual) => {
 });
 
 import { json, ApiError } from '../../api/client';
-import { loadRepositories } from './repositoriesLoader';
+import { loadRepositories, refreshRepositories } from './repositoriesLoader';
 
 const read = json as unknown as Mock;
 
@@ -69,5 +69,36 @@ describe('loadRepositories — transient failures retry, real ones surface', () 
 
     expect(read).toHaveBeenCalledTimes(2);
     expect(repositories.value).toEqual({ status: 'failed', error: 'request cancelled' });
+  });
+});
+
+describe('refreshRepositories answers with a request sent after the call', () => {
+  beforeEach(() => {
+    read.mockReset();
+    repositories.value = { status: 'not-loaded' };
+  });
+
+  it('waits out a load already in flight, then sends its own', async () => {
+    let answerFirst: (repos: unknown) => void = () => {};
+    read
+      .mockImplementationOnce(() => new Promise(resolve => { answerFirst = resolve; }))
+      .mockResolvedValueOnce([{ id: 'r2', name: 'added-later', path: '/repos/added-later' }]);
+    const earlier = loadRepositories();
+
+    const refreshed = refreshRepositories();
+    answerFirst([]);
+    await earlier;
+    await refreshed;
+
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(repositories.value).toMatchObject({ status: 'loaded', data: [{ id: 'r2' }] });
+  });
+
+  it('sends one request when nothing is in flight', async () => {
+    read.mockResolvedValueOnce([]);
+
+    await refreshRepositories();
+
+    expect(read).toHaveBeenCalledTimes(1);
   });
 });

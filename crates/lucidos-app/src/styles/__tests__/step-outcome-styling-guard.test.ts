@@ -16,7 +16,7 @@
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
@@ -54,4 +54,20 @@ describe('step outcome styling', () => {
     expect(steps).not.toContain('.inline-step.pending .step-icon {');
     expect(steps).toContain('There is deliberately no `.inline-step.pending .step-icon` rule');
   });
+
+  // An outcome is a modifier on a step element, so a rule styling the bare
+  // word lands on every step with that outcome.
+  it.each(ALL)('no stylesheet styles a bare .%s class', (outcome) => {
+    const bare = new RegExp(`(?:^|[{},])\\s*\\.${outcome}\\s*(?=[,{:])`, 'm');
+    const hits = cssFiles(resolve(here, '..')).filter(f => bare.test(readFileSync(f, 'utf8')));
+    expect(hits).toEqual([]);
+  });
 });
+
+function cssFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry: { name: string; isDirectory(): boolean }) => {
+    const path = resolve(dir, entry.name);
+    if (entry.isDirectory()) return cssFiles(path);
+    return entry.name.endsWith('.css') ? [path] : [];
+  });
+}

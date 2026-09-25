@@ -45,10 +45,11 @@ Ownership is decided by `change_ops::decide_merge_ownership`, from two terms:
    `ChangeApplyFailed` / `MergeResolutionCleared` close it
    (`ChangesProjection::conflict_pairing_open`).
 2. **The resolver term**: a live session on the thread is bound to THIS change's
-   resolution (`AgentSession::conflict_change_id`). Tier 2 and Tier 3 get the
-   binding at session registration, from the `conflict_change_id` they already
-   carry; Tier 1 sets it in `cc_assisted_merge_then_ff`, because it injects the
-   merge prompt into a session that already existed.
+   resolution (`AgentSession::conflict`, a `ConflictBinding`). Tier 2 and
+   Tier 3 get a `Detached` binding at session registration, from the
+   `conflict_change_id` they already carry. Tier 1 gets an `InPlace` one in
+   `cc_assisted_merge_then_ff`, because it injects the merge prompt into a
+   session that already existed.
 
 A refusal is `ApplyStatus::Conflict`, never an `Err`.
 
@@ -94,9 +95,9 @@ result. An `Err` would surface a red failure for a change that is fine.
 return, so its refusal IS an `Err`, and the HTTP layer must map it to **409**.
 `404` there is not a generic failure: it is the frontend's "no live
 coding-agent session" signal, and it answers by applying the thread's pending
-changes one at a time. `api::claude_code::apply_now_error_status` therefore
-matches the refusal by identity against the message const, so rewording the
-message cannot silently reclassify it.
+changes one at a time. `api::claude_code::apply_now_error` therefore matches
+the refusal by identity against the message const, so rewording the message
+cannot silently reclassify it.
 
 ## Consequences
 
@@ -135,7 +136,7 @@ diff, and it reuses the guard that already exists. Rejected because an in-memory
 death, engine restart), and a missed clear wedges Apply for that thread with no
 self-heal. This codebase has been bitten by exactly that shape.
 
-`conflict_change_id` is not that. A claim says "I hold this, until I release
+The binding (`AgentSession::conflict`) is not that. A claim says "I hold this, until I release
 it", so a lost release is a lock nobody can open. The binding says "this session
 was spawned to resolve X", which stops being true when the session stops
 existing, and which cannot refuse anything on its own because the guard also

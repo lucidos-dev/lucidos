@@ -20,7 +20,7 @@
  * once per document, while a button press opens it every time.
  *
  * Everything here is a PURE function of explicit arguments, with the signal
- * reads left to the callsite (the `currentWorkspaceRefreshState` precedent in
+ * reads left to the callsite (the `refreshRowState` precedent in
  * WorkspaceMenuRows.tsx), so the derivation and the toast copy are unit-testable
  * without a render. Actions are carried as DESCRIPTORS rather than callbacks for
  * the same reason: a closure in here would be the end of that.
@@ -29,7 +29,7 @@
 import { signal } from '@preact/signals';
 import type { EmbeddingModelStatus } from '../api/types';
 import type { TailscaleServeProgress } from '../utils/tauri';
-import type { CommitGroupKind, PendingCommits } from '../api/client';
+import type { CommitGroup, CommitGroupKind, PendingCommits } from '../api/client';
 import { formatBytes } from '../utils/formatBytes';
 import { formatElapsed } from '../utils/formatTime';
 
@@ -272,7 +272,7 @@ export const GROUP_LABEL: Record<Exclude<CommitGroupKind, 'housekeeping'>, strin
  *  git could not answer) would otherwise be reported as "0 commits", telling the
  *  user nothing is coming while a build runs. **Zero** is a real answer, but not
  *  one worth a section: the badge is spinning, so something IS being built, and
- *  "0 commits since your running version" reads as a contradiction rather than
+ *  "0 commits come with the new version" reads as a contradiction rather than
  *  information (it happens legitimately, e.g. a rebuild of a dirty tree whose
  *  commit has not moved). */
 function pendingCommitsNote(commits: PendingCommits | null): string | undefined {
@@ -282,26 +282,38 @@ function pendingCommitsNote(commits: PendingCommits | null): string | undefined 
     if (group.kind === 'housekeeping') {
       // Title-less, so it reads as a footnote under the described work rather
       // than as another category of it.
-      sections.push(`• ${housekeepingLine(group.total)}`);
+      sections.push(bullet(housekeepingLine(group.total)));
       continue;
     }
-    const lines = group.descriptions.map((d) => `• ${d}`);
-    const hidden = group.total - group.descriptions.length;
-    if (hidden > 0) lines.push(`• and ${hidden} more`);
-    sections.push([GROUP_LABEL[group.kind], ...lines].join('\n'));
+    sections.push([GROUP_LABEL[group.kind], ...describedItems(group).map(bullet)].join('\n'));
   }
   return sections.join('\n\n');
+}
+
+/** One group's items, with the tail the engine capped off named rather than
+ *  dropped. A list that silently under-reports its own count is how a reader
+ *  concludes a version is smaller than it is.
+ *
+ *  Shared with the new-version confirm, for the reason below. */
+export function describedItems(group: CommitGroup): string[] {
+  const hidden = group.total - group.descriptions.length;
+  return hidden > 0 ? [...group.descriptions, `and ${hidden} more`] : [...group.descriptions];
 }
 
 /** How a pending range is counted, wherever it is counted.
  *
  *  Shared with the new-version confirm (`store/restartConfirmCopy.ts`), which
  *  describes the same range at the other end of the same build. The two must
- *  not phrase it differently, so neither owns the sentence. */
+ *  not phrase it differently, so neither owns the sentence. The count is what
+ *  the switch adds (see `PendingCommits`). */
 export function pendingCommitsHeadline(total: number): string {
-  return total === 1
-    ? '1 commit since your running version'
-    : `${total} commits since your running version`;
+  return `${total === 1 ? '1 commit' : `${total} commits`} ${comeWithTheNewVersion(total)}`;
+}
+
+/** The verb phrase after a count of `total` commits, shared with the
+ *  new-version confirm's all-housekeeping intro. */
+export function comeWithTheNewVersion(total: number): string {
+  return total === 1 ? 'comes with the new version' : 'come with the new version';
 }
 
 /** The one counted line for the commits the toast does not describe. Names what

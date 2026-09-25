@@ -134,6 +134,8 @@ run whenever the two disagree:
 ```sh
 # Rust: every allow attribute, grouped by lint
 git ls-files '*.rs' | xargs grep -ho '#\[allow([^)]*)\]' | sort | uniq -c | sort -rn
+# Rust: allows wrapped in cfg_attr, which the grep above cannot see. Must print nothing.
+git ls-files '*.rs' | xargs grep -n 'cfg_attr(.*allow('
 # TS: eslint-disable sites (the *.ts/*.tsx filter keeps prose mentions out)
 git ls-files '*.ts' '*.tsx' | xargs grep -n 'eslint-disable'
 # TS: @ts-expect-error scale
@@ -144,12 +146,14 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-09-23. Every Rust site
-count below was confirmed unchanged, file spread included, and so was every
-`eslint-disable` site; the `@ts-expect-error` count moved by thirty.
+The currently-accepted categories, re-counted on 2026-09-24. Every
+`eslint-disable` site was unchanged. `too_many_arguments` rose by one and
+`@ts-expect-error` by nine. The run also removed five `cfg_attr(...,
+allow(dead_code))` silencers from the gateway's slowness watcher, which
+the first grep above had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 53 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 52 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -157,9 +161,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 81 shares an attribute with `format_in_format_args`, which is
+  One of the 82 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 80 across 52 files. Both numbers here count the shared attribute.
+  reports 81 across 51 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -181,8 +185,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 679 sites across 235 files, every one of them
-  test-only code: 225 `*.test.ts`, nine `*.test.tsx`
+  `@types/node` in project**, 688 sites across 238 files, every one of them
+  test-only code: 228 `*.test.ts`, nine `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -299,8 +303,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   devDependency of `packages/lucidos-sdk` would make that solid. That is a
   dependency plus lockfile change (ADR 0020), and belongs in its own commit.
 
-- **Phase 4's entry chunk is 819.32 kB against its 600 kB ceiling, and the
-  2026-09-23 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 836.16 kB against its 600 kB ceiling, and the
+  2026-09-24 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -320,32 +324,33 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.92 kB, against a 219.32 kB gap,
-  re-measured on 2026-09-23:
+  attribution now puts the whole list at 39.20 kB, against a 236.16 kB gap,
+  re-measured on 2026-09-24:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.35 |
-  | `CodingAgentControlMenu` | 8.59 |
-  | `ThreadFilterPanel` | 5.92 |
-  | `WorkspaceSwitcher` | 4.38 |
-  | `QuestionCard` | 3.93 |
+  | `CodingAgentControlMenu` | 8.58 |
+  | `ThreadFilterPanel` | 6.06 |
+  | `WorkspaceSwitcher` | 4.50 |
+  | `QuestionCard` | 3.95 |
   | `TodoListPanel` | 3.12 |
-  | `OverflowMenu` | 2.63 |
+  | `OverflowMenu` | 2.64 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 180 kB of it. The next
+  leave the advisory firing, and would now leave 197 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes. The 2026-09-23 run read the whole 422-module ranking
-  looking for a fresh module of the cut's shape, and found none.
+  looking for a fresh module of the cut's shape, and found none. The
+  2026-09-24 run read the top of the 430-module ranking and found none either.
 
   Two smaller menus of the same shape sit beside them, `ThreadOverflowMenu` at
   1.64 kB and `DraftOverflowMenu` at 0.41 kB. They are left out of the table so
   its total stays comparable with the `manualChunks` measurement below, which
   covers the seven.
 
-  **The two composer diagnostics are 14.60 kB of the entry chunk and are NOT a
-  cut.** Measured on the 2026-09-23 run: `deadPressProbe.ts` at 13.26,
+  **The two composer diagnostics are 14.61 kB of the entry chunk and are NOT a
+  cut.** Measured on the 2026-09-24 run: `deadPressProbe.ts` at 13.27,
   `deadKeystrokeProbe.ts` at 0.99, `probeViewport.ts` at 0.35. That outweighs
   every surface in the table above, so it reads as the obvious lift. It is not
   one. `main.tsx` installs both before the first render, on purpose, because a
@@ -365,6 +370,9 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   existing modules growing, `store/thread-events/` by 1.13 KiB among them. No
   single module answers for the run.
 
+  The 2026-09-24 run rose 16.84 kB and added eight modules to the chunk. It
+  did not trace which ones.
+
   Every run since has re-run the check and found no lazy-to-eager regression:
 
   | Run | Entry chunk | Change |
@@ -382,9 +390,10 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | 2026-09-19 | 769.95 kB | +6.82 kB |
   | 2026-09-21 | 797.32 kB | +27.37 kB |
   | 2026-09-23 | 819.32 kB | +22.00 kB |
+  | 2026-09-24 | 836.16 kB | +16.84 kB |
 
-  The 2026-09-23 run makes seventeen in a row with no regression. Sourcemap
-  attribution put 422 of our own modules in the entry chunk, ten more than the
+  The 2026-09-24 run makes eighteen in a row with no regression. Sourcemap
+  attribution put 430 of our own modules in the entry chunk, eight more than the
   run before, and zero `node_modules` bytes.
 
   Both regression questions came back clean. No module sits in both the entry
@@ -415,7 +424,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   compile time and reaches no bundle. All 6 apparent entry-chunk hits were that
   form, in `api/threads.ts`, `api/types.ts`, `store/actions/navigation.ts` and
   `store/store.ts`. So the real answer was zero. The six runs from 2026-09-15
-  on all found the same four files holding 8 of them. The 2026-09-23 run saw 40
+  on all found the same four files holding 8 of them. The 2026-09-24 run saw 40
   non-test sites across the same 9 files, so 32 value imports once the 8 go.
 
   **Write that second filter carefully.** "The character after the closing
@@ -424,17 +433,17 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   site where there were 32. Keep `.then`, `.catch` and `.finally`; drop only
   the other dotted forms.
 
-  `icons.tsx` still leads, at 21.28 kB on 2026-09-23.
-  `thread-events/exchange-grouping.ts` keeps second at 19.83 kB. Then come
-  `exchange-render.ts` at 18.00, `ThreadDrawer.tsx` at 17.96 and `store.ts` at
-  17.67. The first two of those sit 0.04 kB apart, so read their swap as noise.
+  `icons.tsx` still leads, at 22.37 kB on 2026-09-24.
+  `thread-events/exchange-grouping.ts` keeps second at 21.17 kB. Then come
+  `exchange-render.ts` at 18.89, `ThreadDrawer.tsx` at 17.79 and `store.ts` at
+  17.67.
 
-  The three `thread-events/exchange*` modules add 52.15 kB
-  between them, and the whole `store/thread-events/` directory puts seven
-  modules and 58.85 kB in the chunk. A first paint reaches all of them.
+  The three `thread-events/exchange*` modules add 54.40 kB between them on
+  2026-09-24. On 2026-09-23 the whole `store/thread-events/` directory put
+  seven modules and 58.85 kB in the chunk. A first paint reaches all of them.
 
-  The next tier is `PromptInput.tsx` at 15.94 kB, then `chat/scrollState.ts`
-  at 15.77 and `ChatExchange.tsx` at 15.69. Margins that thin were never a
+  The next tier is `ChatExchange.tsx` at 15.95 kB, then `PromptInput.tsx`
+  at 15.93 and `chat/scrollState.ts` at 15.79. Margins that thin were never a
   ranking, so do not read a swap here as a signal.
 
   **Attribute built bytes, not source bytes.** Ranking the sourcemap's
@@ -445,7 +454,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   reproduces the figures above and accounts for 99.5% of the chunk.
 
   **Two units meet here, so do not chase the gap between them.** Vite divides
-  by 1000, so the 819.32 kB it reports is 819,320 bytes, which is 800.12 KiB.
+  by 1000, so the 836.16 kB it reports is 836,160 bytes, which is 816.56 KiB.
   Sourcemap columns count UTF-16 units, and every per-module figure above is
   KiB. The history table quotes vite and the attribution does not, so the two
   never sum to the same number.

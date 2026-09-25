@@ -9,7 +9,7 @@ import {
 } from '../../store/store';
 import { threadFilterActive, deletedOptionsHidden } from '../../store/threadFilterActive';
 import { draftThreadCount } from '../drawer/family-graph';
-import { DraftsIcon, AttentionIcon, ReviewIcon, RunningIcon, FilterIcon, CheckIcon, CloseIcon, CodeIcon } from '../shared/icons';
+import { DraftsIcon, AttentionIcon, ReviewIcon, RunningIcon, FilterIcon, FilteredIcon, CheckIcon, CodeIcon, StatusIcon, ThreadTypesIcon } from '../shared/icons';
 import { LucidosMark } from '../shared/LucidosMark';
 import { Explainer } from '../shared/Explainer';
 import { CategoryIcon } from '../shared/CategoryIcon';
@@ -30,7 +30,10 @@ type ChildGroup = {
   onToggleChild: (id: string) => void;
 };
 
-type ViewMeta = { view: DrawerView; label: string; Icon: ComponentType<{ size?: string }> };
+type IconType = ComponentType<{ size?: string }>;
+/** The four real statuses: every view but `all`. */
+type StatusView = Exclude<DrawerView, 'all'>;
+type ViewMeta<V extends DrawerView = DrawerView> = { view: V; label: string; Icon: IconType };
 
 /** `all` is the default sectioned list, and the odd one out: the other four are
  *  real statuses that narrow the list, while this one is the absence of a status
@@ -39,35 +42,61 @@ type ViewMeta = { view: DrawerView; label: string; Icon: ComponentType<{ size?: 
  *  that narrows it (see `ThreadFilterPanel`), which is why the four below are
  *  the whole of `VIEW_META`.
  *
- *  Named separately because it is also what the closed Filter button falls back
- *  to for its default glyph, by name rather than by index. */
+ *  Named separately because it is also what the Filter button falls back to for
+ *  its default glyph, by name rather than by index. */
 const ALL_STATUSES_META: ViewMeta = { view: 'all', label: 'All statuses', Icon: FilterIcon };
 
 /** The four real statuses, in menu order, single-select. Counts come from the
  *  store / family-graph (see `DrawerView` in store.ts). */
-const VIEW_META: readonly ViewMeta[] = [
+const VIEW_META: readonly ViewMeta<StatusView>[] = [
   { view: 'attention', label: 'Needs attention', Icon: AttentionIcon },
   { view: 'review', label: 'Review', Icon: ReviewIcon },
   { view: 'running', label: 'Running', Icon: RunningIcon },
   { view: 'drafts', label: 'Drafts', Icon: DraftsIcon },
 ];
 
+/** A glyph the Filter button can wear: a status's own, or the funnel,
+ *  outline (`all`) or filled (`filtered`). */
+export type FilterGlyph = 'all' | 'filtered' | StatusView;
+
+const statusIcon = (view: StatusView): IconType => VIEW_META.find(m => m.view === view)!.Icon;
+
+/** Every glyph the Filter button can wear. Its crossfade
+ *  (`ThreadFilterButton`) keeps all of them mounted. The record type makes a
+ *  missing glyph a compile error, and the status icons come from VIEW_META. */
+export const FILTER_BUTTON_GLYPHS: Readonly<Record<FilterGlyph, IconType>> = {
+  all: ALL_STATUSES_META.Icon,
+  filtered: FilteredIcon,
+  attention: statusIcon('attention'),
+  review: statusIcon('review'),
+  running: statusIcon('running'),
+  drafts: statusIcon('drafts'),
+};
+
+/** The funnel, filled while thread types narrow "All statuses". The Filter
+ *  button and the panel's All statuses row both draw it from here, so the two
+ *  never disagree. */
+function allStatusesIcon(typeFilterOn: boolean): IconType {
+  return FILTER_BUTTON_GLYPHS[typeFilterOn ? 'filtered' : 'all'];
+}
+
 /** Everything the threads-header Filter button looks like, on both layouts: its
- *  glyph, whether it wears the active-control highlight, and the count on its
- *  needs-attention badge.
+ *  glyph, whether it is pressed, and the count on its needs-attention badge.
  *
- *  One function because the three answers are not independent. CLOSED, the
- *  button REPORTS: it wears the selected view's own icon (the funnel
- *  `FilterIcon` for the default `all`, each view's glyph otherwise), the
- *  highlight when a filter is on, and the badge, so the state of the list is
- *  readable without opening anything. OPEN, it OFFERS THE WAY OUT and nothing
- *  else: an X, no highlight, no badge. The panel it opened is right underneath
- *  saying what the filter is, in full and in words, so repeating "a filter is
- *  on" over the exit glyph describes something the user is already looking at
- *  while crowding the one thing the button now does.
+ *  Each part says one thing. PRESSED (the `view-selector-active` highlight)
+ *  means the panel is open, and nothing else: a filtered list must not look
+ *  like a panel left open. The GLYPH says what the list is filtered to, open or
+ *  closed. A status view wears its own icon, the `all` view the funnel, and
+ *  the funnel filled in (`FilteredIcon`) while thread types narrow it.
  *
- *  Called by `useThreadsHeaderState`, which feeds it the signals; kept pure here
- *  so it is testable and so VIEW_META stays the one source of the glyphs. */
+ *  The badge drops while the panel is open, because the panel's own Needs
+ *  attention row carries the same count.
+ *
+ *  Never an X when open. The button sits at the far end of the header, and an X
+ *  there reads as "close this pane".
+ *
+ *  Called by `ThreadFilterButton`, which feeds it the signals; kept pure here
+ *  so it is testable. */
 export function filterButtonState(opts: {
   view: DrawerView;
   panelOpen: boolean;
@@ -75,14 +104,14 @@ export function filterButtonState(opts: {
   channelFilterActive: boolean;
   /** Threads stuck waiting on the user (`attentionThreadCount`). */
   attentionCount: number;
-}): { Icon: ComponentType<{ size?: string }>; active: boolean; badge: number } {
-  if (opts.panelOpen) return { Icon: CloseIcon, active: false, badge: 0 };
+}): { glyph: FilterGlyph; pressed: boolean; badge: number } {
+  const status = VIEW_META.find(m => m.view === opts.view);
   return {
     // `all` is not in VIEW_META (it is not a status), so it resolves through the
-    // same fallback as an unrecognized view, and both land on the funnel.
-    Icon: (VIEW_META.find(m => m.view === opts.view) ?? ALL_STATUSES_META).Icon,
-    active: opts.view !== 'all' || opts.channelFilterActive,
-    badge: opts.attentionCount,
+    // same fallback as an unrecognized view. Only there do thread types apply.
+    glyph: status ? status.view : opts.channelFilterActive ? 'filtered' : 'all',
+    pressed: opts.panelOpen,
+    badge: opts.panelOpen ? 0 : opts.attentionCount,
   };
 }
 
@@ -96,7 +125,7 @@ export function filterButtonState(opts: {
 function channelIcon(value: ThreadChannel): VNode {
   if (value === 'trigger') return <CategoryIcon category="triggers" />;
   if (value === CODING_AGENT_CHANNEL) return <CodeIcon />;
-  return <LucidosMark size="1rem" background={false} />;
+  return <LucidosMark size="var(--icon-size-sm)" background={false} />;
 }
 
 /** The unified thread filter: one panel, one single-select set of five, split by
@@ -133,13 +162,14 @@ function channelIcon(value: ThreadChannel): VNode {
  *
  *  It carries neither a title row nor a footer: the pane header two rows up says
  *  "Filters" while this is up, and the way OUT is the header's own Filter
- *  button, which wears an X while the panel is open (see
- *  `useThreadsHeaderState`). A Close button down here duplicated that exit and
- *  spent a strip of the pane's height on it.
+ *  button, held down while the panel is open (see `filterButtonState`). A
+ *  Close button down here duplicated that exit and spent a strip of the pane's
+ *  height on it.
  *
- *  Mounted only while open, and hook-free at its own level so the unit test can
- *  invoke it directly (the nested `ExpandableChannelRow` / `TriCheckbox` use
- *  hooks; this component must not). */
+ *  Mounted while open and through its fade out, inside the drawer's
+ *  `.thread-filter-cover` (see `ThreadDrawer`). Hook-free at its own level so
+ *  the unit test can invoke it directly (the nested `ExpandableChannelRow` /
+ *  `TriCheckbox` use hooks; this component must not). */
 export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
   const view = drawerView.value;
   const filter = threadChannelFilter.value;
@@ -170,10 +200,11 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
   // statuses and get the ticked types of them. So the checkmark follows the VIEW
   // and stays on that row whatever is ticked below, and the narrowing is
   // reported in words next to the label instead of by moving the mark somewhere
-  // else. `threadFilterActive` is the same predicate the closed Filter button
-  // highlights on, so the row and the button never disagree.
+  // else. `threadFilterActive` is the same predicate that fills the Filter
+  // button's funnel, so the row and the button never disagree.
   const onAllStatuses = view === 'all';
   const typeFilterOn = threadFilterActive.value;
+  const AllStatusesIcon = allStatusesIcon(typeFilterOn);
   // "filtered" means what you are being shown differs from ALL of it, whichever
   // setting is doing that: a thread-type selection narrowing the list, or a
   // deleted trigger / repo / app held back from the lists below.
@@ -194,7 +225,7 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
       {/* No title row and no footer: the pane's header carries the title, which
           reads "Filters" while this is up (see ThreadsHeader /
           MobileThreadsHeader), and the same header's Filter button carries the
-          way out, wearing an X while the panel is up. So the panel is nothing
+          way out, held down while the panel is up. So the panel is nothing
           but its own scroll of filters, which is also what lets it wear the
           thread list's own spacing (drawer.css). */}
       {/* The halves are ALTERNATIVES rather than a stack of filters: picking a
@@ -203,7 +234,10 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
           either side of it are one single-select set, so the whole panel reads
           as a sentence down the page and the relationship is legible before the
           user discovers it by having a section dim on them. */}
-      <div class="thread-filter-title" id="thread-filter-status-title">Status</div>
+      <div class="thread-filter-title" id="thread-filter-status-title">
+        <span class="drawer-section-icon"><StatusIcon size="0.875rem" /></span>
+        <span class="drawer-section-label">Status</span>
+      </div>
       {/* A radiogroup, not the menu these rows used to claim: they wore
           `menuitemradio`, which is only meaningful inside a `menu`, and the
           anchored dropdown they lived in never set one. Nothing here is a menu
@@ -281,7 +315,7 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
           takeAllStatuses();
         }}
       >
-        <ALL_STATUSES_META.Icon />
+        <AllStatusesIcon />
         <span class="drawer-view-label">{ALL_STATUSES_META.label}</span>
         {onAllStatuses && (
           <span class="drawer-view-check"><CheckIcon /></span>
@@ -370,7 +404,8 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
         class={`thread-filter-title${typeFilterOn ? ' thread-filter-title-active' : ''}${channelsDimmed ? ' thread-filter-title-dimmed' : ''}`}
         id="thread-filter-types-title"
       >
-        By thread types
+        <span class="drawer-section-icon"><ThreadTypesIcon size="0.875rem" /></span>
+        <span class="drawer-section-label">By thread types</span>
         {typeFilterOn && (
           <span class="thread-filter-title-check"><CheckIcon /></span>
         )}

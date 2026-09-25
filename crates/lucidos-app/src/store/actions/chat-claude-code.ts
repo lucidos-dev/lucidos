@@ -43,6 +43,17 @@ function armApplyingSafetyTimeout(threadId: string): void {
   }, 60_000));
 }
 
+/** Refusal slugs that mean something other than an apply holds the session.
+ *  The engine sends one as `reason` beside the message on an Apply Now 409. */
+const NOT_APPLYING_REFUSALS = new Set(['discard_in_progress', 'session_stopping']);
+
+/** Whether an Apply Now 409 means an apply is genuinely running. An older
+ *  engine sends no slug, and its only 409s were apply-held. */
+function refusalMeansApplying(e: ApiError): boolean {
+  const slug = (e.body as { reason?: unknown } | undefined)?.reason;
+  return typeof slug !== 'string' || !NOT_APPLYING_REFUSALS.has(slug);
+}
+
 /** End a running Claude Code session and immediately apply its changes.
  *  The backend handles the apply flow — SSE events update the thread status.
  *  Sets optimistic "applying" state immediately so the UI responds before SSE arrives. */
@@ -58,12 +69,20 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
     await applyNow(threadId);
   } catch (e) {
     if (e instanceof ApiError && e.httpCode === 409) {
-      // Re-key under the existing applying toast so the new info replaces the
-      // initial spinner instead of stacking a second one beside it.
-      showToast('Already applying', 'info', { key: `applying-${threadId}`, spinning: true });
-      // Don't clear immediately — apply is genuinely in progress on the backend.
-      // The safety timeout covers an SSE reconnection gap dropping the resolution.
-      armApplyingSafetyTimeout(threadId);
+      // The engine's message names what refused the apply. Re-keyed under the
+      // applying toast, so it replaces the spinner instead of stacking beside it.
+      const key = `applying-${threadId}`;
+      const onClick = () => focusThread(threadId);
+      if (refusalMeansApplying(e)) {
+        showToast(changeToastMessage('Applying changes', threadId, e.reason), 'info', { key, onClick, spinning: true });
+        // An apply really is running, so its SSE resolution will clear this.
+        // The safety timeout covers an SSE gap dropping that resolution.
+        armApplyingSafetyTimeout(threadId);
+      } else {
+        // A Discard, or a stop ending the session: nothing is applying.
+        clearApplyingNow(threadId);
+        showToast(changeToastMessage('Not applied', threadId, e.reason), 'warning', { key, onClick });
+      }
       return;
     }
     if (e instanceof ApiError && e.httpCode === 404) {

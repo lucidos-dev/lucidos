@@ -5,7 +5,9 @@ impl EventStore {
     /// Multi-token queries match per-token: every whitespace-separated token must
     /// appear (case-insensitive) somewhere in the thread — title or any event
     /// payload — but they need not appear together as a phrase. Title-only
-    /// matches score 1.0; content matches score 0.7.
+    /// matches score 1.0; content matches score 0.7. The `limit` cut keeps an
+    /// exact title first, then a title holding the query as a phrase. Those are
+    /// the tiers `thread_search::rank_order` ranks above every other hit.
     pub async fn search_threads_by_text(
         &self,
         query: &str,
@@ -22,6 +24,12 @@ impl EventStore {
             return Ok(vec![]);
         }
         let token_count = patterns.len() as i64;
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        let exact_pattern = super::super::escape_like(&tokens.join(" "));
+        let phrase_pattern = format!("%{exact_pattern}%");
+        // The title the user sees, whitespace collapsed like `title_match` does.
+        let shown_title =
+            "btrim(regexp_replace(COALESCE(s.title, s.first_message, ''), '\\s+', ' ', 'g'))";
 
         // Search query joins `best_scores b` against `thread_summaries s`, so
         // the FROM alias is `s` instead of the default `t`. SearchRow below
@@ -72,7 +80,8 @@ impl EventStore {
             ) \
             SELECT {}, b.score \
             FROM best_scores b JOIN thread_summaries s ON s.thread_id = b.thread_id \
-            ORDER BY b.score DESC, s.last_activity DESC LIMIT $2",
+            ORDER BY {shown_title} ILIKE $5 DESC, {shown_title} ILIKE $4 DESC, \
+                     b.score DESC, s.last_activity DESC LIMIT $2",
             thread_cols_prefixed,
         );
 
@@ -92,6 +101,7 @@ impl EventStore {
             is_saved: bool,
             section: String,
             active_children_count: i64,
+            waiting_children_count: i64,
             total_children_count: i64,
             blocking_descendant_count: i64,
             attention_descendant_count: i64,
@@ -127,6 +137,8 @@ impl EventStore {
             .bind(&patterns)
             .bind(limit)
             .bind(token_count)
+            .bind(&phrase_pattern)
+            .bind(&exact_pattern)
             .fetch_all(&self.pool)
             .await?;
 
@@ -146,6 +158,7 @@ impl EventStore {
                         saved: r.is_saved,
                         section: r.section,
                         active_children_count: r.active_children_count,
+                        waiting_children_count: r.waiting_children_count,
                         total_children_count: r.total_children_count,
                         blocking_descendant_count: r.blocking_descendant_count,
                         attention_descendant_count: r.attention_descendant_count,
@@ -174,6 +187,7 @@ impl EventStore {
                         compose_mode: r.compose_mode,
                         compose_selection: r.compose_selection,
                         compose_epoch: r.compose_epoch,
+                        pending_sub_thread_change_count: None,
                     },
                     score: r.score,
                 })

@@ -114,6 +114,11 @@
     animation: loading-pulse 1.4s ease-in-out infinite;
 }
 
+/* Reduced motion: the dimmed italic already says "fetching", so it rests. */
+:root[data-motion="reduce"] .loading-skeleton {
+    animation: none;
+}
+
 /* AI running-text shimmer — the standard "actively working" affordance: a
  * highlight band sweeps across the text itself (clipped to the glyphs) instead
  * of a separate spinner. Applied to text that should read as "live" — the
@@ -202,37 +207,35 @@
     animation: spin 0.8s linear infinite;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .list-row,
-    .list-row-add-card,
-    .action-btn,
-    .dropdown-trigger,
-    .dropdown-option,
-    .icon-btn {
-        transition: none;
-    }
+:root[data-motion="reduce"] .list-row,
+:root[data-motion="reduce"] .list-row-add-card,
+:root[data-motion="reduce"] .action-btn,
+:root[data-motion="reduce"] .dropdown-trigger,
+:root[data-motion="reduce"] .dropdown-option,
+:root[data-motion="reduce"] .icon-btn {
+    transition: none;
+}
 
-    .progress-bar-fill {
-        transition: none;
-    }
+:root[data-motion="reduce"] .progress-bar-fill {
+    transition: none;
+}
 
-    .mini-spinner,
-    .loading-spinner::after {
-        animation: none;
-    }
+:root[data-motion="reduce"] .mini-spinner,
+:root[data-motion="reduce"] .loading-spinner::after {
+    animation: none;
+}
 
-    /* Drop the sweep AND the text-clip so the glyphs fall back to a solid,
-     * visible color (a clipped-but-unanimated gradient would freeze mid-sweep). */
-    .running-shimmer {
-        animation: none;
-        background: none;
-        -webkit-text-fill-color: currentColor;
-        color: var(--text-secondary);
-    }
+/* Drop the sweep AND the text-clip so the glyphs fall back to a solid,
+ * visible color (a clipped-but-unanimated gradient would freeze mid-sweep). */
+:root[data-motion="reduce"] .running-shimmer {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--text-secondary);
+}
 
-    /* The inverted variant rests at the full-strength label color, not the
-     * dimmed `--text-secondary` the standard shimmer falls back to. */
-    .running-shimmer-invert {
-        color: var(--text-primary);
-    }
+/* The inverted variant rests at the full-strength label color, not the
+ * dimmed `--text-secondary` the standard shimmer falls back to. */
+:root[data-motion="reduce"] .running-shimmer-invert {
+    color: var(--text-primary);
 }

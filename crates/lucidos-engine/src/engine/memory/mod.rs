@@ -1,6 +1,8 @@
 //! Engine-side memory subsystem. Split by responsibility seam:
 //! - [`extract`] — build extraction context, turn an event/text/artifact into
 //!   facts, dedup, and persist (`index_*`, `index_memory_inner_impl`).
+//! - [`read`]: the agent's on-demand search, and the walk from a memory back
+//!   to its source event.
 //! - [`rebuild`] — batch/derived operations: artifact summaries, user-profile
 //!   generation, full/incremental rebuild, correction replay, post-import hook.
 //! - [`scoring`] — pure similarity/decay helpers (Jaccard, age, relevance).

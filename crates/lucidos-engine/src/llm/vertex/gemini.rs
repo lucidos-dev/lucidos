@@ -273,6 +273,14 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
     let mut tool_calls = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut thinking_chars: usize = 0;
+    let mut thought_parts: usize = 0;
+    // Thinking billed with no thought part returned, which is how Gemini 2.5
+    // answers when thoughts are not requested.
+    let billed_thinking = parsed
+        .usage_metadata
+        .as_ref()
+        .and_then(|u| u.thoughts_token_count)
+        .is_some_and(|n| n > 0);
 
     if let Some(candidates) = parsed.candidates {
         if let Some(candidate) = candidates.into_iter().next() {
@@ -280,6 +288,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             for part in candidate.content.parts {
                 // Skip thinking parts — internal reasoning, not shown to user
                 if part.thought {
+                    thought_parts += 1;
                     if let Some(text) = part.text {
                         thinking_chars = thinking_chars.saturating_add(text.len());
                     }
@@ -326,7 +335,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             (
                 u.prompt_token_count
                     .map(|n| crate::llm::clamp_provider_token_count(n, "Vertex")),
-                u.candidates_token_count
+                u.output_token_count()
                     .map(|n| crate::llm::clamp_provider_token_count(n, "Vertex")),
             )
         })
@@ -345,12 +354,15 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         cache_creation_tokens: None,
         cache_read_tokens: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
-        thinking_blocks: None,
+        // Proof the model thought, which keeps a billed but textless thinking
+        // turn out of the dropped-output branch of `classify_empty_completion`.
+        thinking_blocks: (thought_parts > 0 || billed_thinking).then_some(thought_parts.max(1)),
         unknown_sse_dropped: 0,
         // Mutually exclusive with `content` by construction above: `narration`
         // is `Some` only on a tool-call turn, which is exactly when `content`
         // is `None`.
         model_only_text: narration,
+        content_is_progress_notes: false,
     }
 }
 
@@ -548,8 +560,8 @@ struct VertexResponse {
     candidates: Option<Vec<VertexCandidate>>,
     /// Top-level token-usage block. Present on every non-error Gemini
     /// response — we map `promptTokenCount` → `input_tokens` and
-    /// `candidatesTokenCount` → `output_tokens` so cost analytics has the
-    /// same shape as Anthropic/OpenAI provider responses.
+    /// `candidatesTokenCount` plus `thoughtsTokenCount` → `output_tokens`,
+    /// so cost analytics has the same shape as Anthropic/OpenAI responses.
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: Option<VertexUsageMetadata>,
 }
@@ -578,6 +590,24 @@ struct VertexUsageMetadata {
     prompt_token_count: Option<u64>,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: Option<u64>,
+    /// Billed at the output rate but reported apart from the candidates, so
+    /// the output total adds it back.
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts_token_count: Option<u64>,
+}
+
+impl VertexUsageMetadata {
+    /// Every billed output token: the answer plus the thinking behind it.
+    fn output_token_count(&self) -> Option<u64> {
+        match (self.candidates_token_count, self.thoughts_token_count) {
+            (None, None) => None,
+            (candidates, thoughts) => Some(
+                candidates
+                    .unwrap_or(0)
+                    .saturating_add(thoughts.unwrap_or(0)),
+            ),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1026,6 +1056,53 @@ mod tests {
         assert_eq!(resp.content.as_deref(), Some("Final answer."));
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.thinking_chars, Some(thought.len()));
+    }
+
+    /// Thinking is billed at the output rate, and Gemini reports it apart from
+    /// the candidates, so the output total adds it back.
+    #[test]
+    fn build_gemini_llm_response_counts_thought_tokens_as_output() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Final answer." }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 120,
+                "totalTokenCount": 148
+            }
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(resp.input_tokens, Some(20));
+        assert_eq!(resp.output_tokens, Some(128));
+    }
+
+    /// A turn that thought without returning a thought part still reports
+    /// that it thought. Its billed thinking tokens are output tokens, so the
+    /// empty-completion classifier would otherwise call them dropped output.
+    #[test]
+    fn build_gemini_llm_response_reports_thinking_billed_without_thought_parts() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "thoughtsTokenCount": 200,
+                "totalTokenCount": 220
+            }
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(resp.output_tokens, Some(200));
+        assert_eq!(resp.thinking_blocks, Some(1));
+        assert_eq!(resp.thinking_chars, None);
     }
 
     /// Gemini's empty-completion case is the regression target — a

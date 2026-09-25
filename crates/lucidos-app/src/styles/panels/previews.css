@@ -35,10 +35,8 @@
     opacity: 0;
 }
 
-@media (prefers-reduced-motion: reduce) {
-    .app-ui-cover {
-        transition: none;
-    }
+:root[data-motion="reduce"] .app-ui-cover {
+    transition: none;
 }
 
 /* --- Pseudo-fullscreen (CSS fallback when native Fullscreen API is unavailable, e.g. iOS Safari) --- */

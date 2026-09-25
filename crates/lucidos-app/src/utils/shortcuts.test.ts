@@ -91,9 +91,9 @@ describe('formatBinding', () => {
     expect(formatBinding(shortcutDef('maximizePaneGroup').defaultBinding, false)).toBe('Ctrl+Shift+↵');
   });
   it('renders the mod+arrow turn shortcuts as ⌘↑ / ⌘↓ (arrows are not OS-reserved alnum chords)', () => {
-    expect(formatBinding(shortcutDef('prevThreadTurn').defaultBinding, true)).toBe('⌘↑');
-    expect(formatBinding(shortcutDef('nextThreadTurn').defaultBinding, true)).toBe('⌘↓');
-    expect(formatBinding(shortcutDef('nextThreadTurn').defaultBinding, false)).toBe('Ctrl+↓');
+    expect(formatBinding(shortcutDef('prevTurnOrNotification').defaultBinding, true)).toBe('⌘↑');
+    expect(formatBinding(shortcutDef('nextTurnOrNotification').defaultBinding, true)).toBe('⌘↓');
+    expect(formatBinding(shortcutDef('nextTurnOrNotification').defaultBinding, false)).toBe('Ctrl+↓');
   });
 });
 
@@ -111,10 +111,10 @@ describe('SHORTCUT_DEFS registry invariants', () => {
     // ⌘↑ / ⌘↓ step the transcript one turn (a .chat-exchange) at a time. Free of
     // the mod+alt+arrow history shortcuts (alt differs) — the collision invariant
     // above also covers this.
-    expect(shortcutDef('prevThreadTurn').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowUp' });
-    expect(shortcutDef('nextThreadTurn').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowDown' });
-    expect(shortcutDef('prevThreadTurn').category).toBe('Navigation');
-    expect(shortcutDef('nextThreadTurn').category).toBe('Navigation');
+    expect(shortcutDef('prevTurnOrNotification').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowUp' });
+    expect(shortcutDef('nextTurnOrNotification').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowDown' });
+    expect(shortcutDef('prevTurnOrNotification').category).toBe('Navigation');
+    expect(shortcutDef('nextTurnOrNotification').category).toBe('Navigation');
   });
   it('exposes the customizable "Open thread actions" drawer shortcut', () => {
     // The keyboard route to a drawer row's ⋯ menu is a first-class registry entry

@@ -51,7 +51,7 @@ use std::collections::HashMap;
 ///
 /// The caller is responsible for the subscribability gate
 /// ([`crate::core::event_subscription::is_subscribable`]); see
-/// `start_trigger_event_subscriber` in `crates/lucidos-engine/src/scheduler/mod.rs`.
+/// `trigger_dispatch` in `crates/lucidos-engine/src/scheduler/mod.rs`.
 pub fn find_matching_event_triggers(
     configs: &HashMap<String, TriggerConfig>,
     event_type: &str,

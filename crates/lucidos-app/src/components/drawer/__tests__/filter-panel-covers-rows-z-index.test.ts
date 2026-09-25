@@ -39,21 +39,12 @@ function localZIndexes(css: string): { selector: string; z: number }[] {
  * fixed` inside it and has to escape all app chrome to fly a thread between
  * sections. So a ROW's z-index competes directly with the panel's, and "the
  * panel covers the list" is not one layer against one layer.
- *
- * It shipped at `z-index: 1` against `.family-disclosure` at 2, so every
- * sub-thread's chevron and count badge floated on top of the filters.
  */
 describe('the filter panel covers every positioned layer inside the thread list', () => {
-  const panel = localZIndexes(drawerCss).find(r => r.selector === '.thread-filter-panel');
+  const panel = localZIndexes(drawerCss).find(r => r.selector === '.thread-filter-cover');
 
   it('declares a plain local z-index', () => {
-    expect(panel, '.thread-filter-panel has no plain-number z-index').toBeDefined();
-  });
-
-  it('outranks the sub-thread disclosure (chevron + count badge)', () => {
-    const disclosure = localZIndexes(drawerCss).find(r => r.selector === '.family-disclosure');
-    expect(disclosure, '.family-disclosure has no z-index').toBeDefined();
-    expect(panel!.z).toBeGreaterThan(disclosure!.z);
+    expect(panel, '.thread-filter-cover has no plain-number z-index').toBeDefined();
   });
 
   it('outranks EVERY other local layer in the file, whatever gets added next', () => {
@@ -61,12 +52,12 @@ describe('the filter panel covers every positioned layer inside the thread list'
     // paint over the panel. `.flip-portal` is the one deliberate exception (a
     // flying thread crosses the panel on purpose) and is token-valued, so the
     // plain-number filter above already excludes it.
-    const others = localZIndexes(drawerCss).filter(r => r.selector !== '.thread-filter-panel');
+    const others = localZIndexes(drawerCss).filter(r => r.selector !== '.thread-filter-cover');
     if (others.length === 0) return; // Nothing to outrank: vacuously covered.
     const highest = others.reduce((a, b) => (b.z > a.z ? b : a));
     expect(
       panel!.z,
-      `.thread-filter-panel (${panel!.z}) must outrank ${highest.selector} (${highest.z})`,
+      `.thread-filter-cover (${panel!.z}) must outrank ${highest.selector} (${highest.z})`,
     ).toBeGreaterThan(highest.z);
   });
 });

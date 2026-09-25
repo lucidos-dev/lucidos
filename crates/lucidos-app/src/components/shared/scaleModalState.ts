@@ -173,12 +173,12 @@ export function previewSliderValue(val: number) {
 // Does NOT close the modal — closing on slider mouse-up made it vanish
 // the instant the user finished dragging on macOS Chrome.
 export function commitSliderValue(val: number) {
-  // A `change` with no `input` before it (a tap straight onto the track) has to
-  // settle the panel on its own.
+  // A commit with no preview before it (a key step) has to settle the panel on
+  // its own.
   cancelLinger();
   const clamped = clampUiScale(val);
-  // `change` can arrive for a value no `input` previewed (keyboard arrows on the
-  // range input), so apply it here too rather than waiting out the debounce.
+  // A key step commits a value no drag previewed, so apply it here too rather
+  // than waiting out the debounce.
   if (clamped !== previewScale.value) {
     previewScale.value = clamped;
     applyUiScale(clamped);

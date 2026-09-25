@@ -608,12 +608,13 @@ pub(crate) fn default_claude_config_dir() -> Option<String> {
 /// carries the field today, so `CodingAgentIdled` rows return null and are
 /// filtered out); **earliest** non-null wins. `None` for a thread that has not
 /// recorded a dir yet — turn 1 then reads the live env, which is exactly how the
-/// pin gets established.
+/// pin gets established. A failed read is an error, never `None`: reading it as
+/// "no pin" would move the thread to the live account and lose its transcript.
 pub(crate) async fn lookup_pinned_cc_config_dir(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
-) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
+) -> Result<Option<String>, sqlx::Error> {
+    let pinned = sqlx::query_scalar::<_, Option<String>>(
         "SELECT payload->>'claude_config_dir' FROM events \
          WHERE thread_id = $1 \
            AND event_type IN ('CodingAgentIdled', 'CodingAgentSettingsChanged') \
@@ -623,19 +624,8 @@ pub(crate) async fn lookup_pinned_cc_config_dir(
     )
     .bind(thread_id)
     .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        log!(
-            "[AgentSession] Failed to look up pinned claude_config_dir for {}: {}",
-            thread_id,
-            e
-        );
-        e
-    })
-    .ok()
-    .flatten()
-    .flatten()
-    .filter(|s| !s.is_empty())
+    .await?;
+    Ok(pinned.flatten().filter(|s| !s.is_empty()))
 }
 
 /// The newest `cc_session_id` recorded UNDER `config_dir` — the resume target

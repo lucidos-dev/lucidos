@@ -489,9 +489,7 @@ async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
     );
 
     delete_family(&pool, &[child]).await;
-    EventBus::rebuild_active_children_count(&pool)
-        .await
-        .unwrap();
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
     EventBus::rebuild_blocking_descendant_count(&pool)
         .await
         .unwrap();
@@ -685,7 +683,7 @@ fn the_audit_frame_is_the_last_thing_the_handler_does() {
     for earlier in [
         "drop_live_subscriptions(&state, &ids)",
         "reclaim_worktrees(&state, &coding_agents)",
-        "repair_ancestor_counts(&state, surviving_parent)",
+        "repair_ancestor_counts(&state)",
     ] {
         let at = SRC
             .find(earlier)

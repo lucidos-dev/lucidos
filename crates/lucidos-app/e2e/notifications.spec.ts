@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import {
   apiRequest, assertHealthy, clickThreadRow, clickVisibleElement, ensureMobileView,
   expectPushSent, gotoWithRetry, navigateToApp, openThreadDrawer, waitForExchangeCount,
-  waitForVisibleElement, waitForVisibleInput,
+  waitForEventStream, waitForVisibleElement, waitForVisibleInput,
 } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
@@ -97,6 +97,9 @@ test.describe('Notification detail does not auto-open', () => {
     await ensureMobileView(page, 'content');
     await expect(page.locator('.notifications-bell:visible').first()).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('.notification-detail-body')).toHaveCount(0);
+    // The live NotificationCreated is what this test watches, so the stream
+    // must be open before the post. A visible bell does not prove that.
+    await waitForEventStream(page);
 
     await postNotification(page, {
       title: 'Heads up',
@@ -420,12 +423,13 @@ test.describe('A notification clears once its event card has been seen', () => {
     const { threadId, eventId } = short;
 
     await navigateToApp(page);
-    // The bell first: it proves the page is up and subscribed. Posting before
-    // the SSE stream is open loses the NotificationCreated, so the badge below
-    // never bumps. That is a race rather than a verdict.
     await ensureMobileView(page, 'content');
     await expect(page.locator('.notifications-bell:visible').first())
       .toBeVisible({ timeout: 10_000 });
+    // The toast below comes only from the live stream, and nothing replays it.
+    // So the stream must be open before the post. A visible bell renders
+    // before it is, which is how this test raced.
+    await waitForEventStream(page);
 
     await postNotification(page, {
       title: 'Seen target',

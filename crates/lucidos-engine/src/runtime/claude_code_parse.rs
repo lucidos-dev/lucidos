@@ -1,5 +1,6 @@
 //! CC stream-output line parser, split out of claude_code.rs.
 use super::*;
+use crate::runtime::ReplayedInput;
 use std::collections::HashSet;
 
 /// The little parse state that spans lines of ONE Claude Code stdout stream.
@@ -134,6 +135,48 @@ fn describe_content_block(block: &serde_json::Value) -> String {
     }
 }
 
+/// A replay of an input the engine wrote to stdin (`--replay-user-messages`).
+/// A tool-result line is never one, whatever its flag. A tool result is Claude
+/// Code's own output, not an input it took in.
+fn is_input_replay(val: &serde_json::Value) -> bool {
+    let replayed = val.get("isReplay").and_then(|v| v.as_bool()) == Some(true);
+    let carries_tool_result = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        });
+    replayed && !carries_tool_result
+}
+
+/// What a replay carried: its text blocks and how many images. A string
+/// content is one text block.
+fn replayed_input(val: &serde_json::Value) -> ReplayedInput {
+    let content = val.get("message").and_then(|m| m.get("content"));
+    if let Some(text) = content.and_then(|c| c.as_str()) {
+        return ReplayedInput {
+            texts: vec![text.to_string()],
+            images: 0,
+        };
+    }
+    let blocks = content.and_then(|c| c.as_array()).map_or(&[][..], |b| b);
+    let of_type = |kind: &'static str| {
+        blocks
+            .iter()
+            .filter(move |b| b.get("type").and_then(|t| t.as_str()) == Some(kind))
+    };
+    ReplayedInput {
+        texts: of_type("text")
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .map(str::to_string)
+            .collect(),
+        images: of_type("image").count(),
+    }
+}
+
 /// Parse a single JSON line from Claude Code's stream output.
 /// Returns all recognized events from the line. An assistant message with
 /// multiple content blocks (text + tool_use) produces multiple events.
@@ -204,10 +247,8 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // It is CC's error SURFACE, not model prose. The same string comes back
             // as the turn's `result` error and becomes `ResponseFailed`, which the
             // transcript already renders in the failure card. Ingesting it as text
-            // therefore printed the failure twice: once as a paragraph glued into
-            // the response body (the engine concatenates consecutive assistant
-            // messages with no separator, so it ran on mid-sentence), and again in
-            // the red card right beneath it.
+            // therefore printed the failure twice: once as a paragraph in the
+            // response body, and again in the red card right beneath it.
             //
             // Only the text is skipped. A synthetic error line carries no tool_use
             // and zeroed usage, so nothing else is lost, and a sub-agent's banner,
@@ -233,11 +274,12 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 events.push(AgentEvent::Message {
                                     role: "assistant".to_string(),
                                     text: text.to_string(),
+                                    opens_block: true,
                                 });
                             }
                         }
-                        // The engine joins consecutive messages with no
-                        // separator, so a note ends its own paragraph.
+                        // The trailing break flushes the note at once, so it
+                        // shows while the model keeps thinking.
                         "thinking" if notes_are_text && !is_api_error_banner => {
                             if let Some(note) = block
                                 .get("thinking")
@@ -247,6 +289,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 events.push(AgentEvent::Message {
                                     role: "assistant".to_string(),
                                     text: format!("{note}\n\n"),
+                                    opens_block: true,
                                 });
                             }
                         }
@@ -361,9 +404,15 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 id,
             }]
         }
-        // CC 2.1.76+ sends tool results as "type": "user" with tool_result content blocks
+        // CC 2.1.76+ sends tool results as "type": "user" with tool_result content
+        // blocks. A replay of a stdin input is a "user" line too, flagged
+        // `isReplay`, and it is how Claude Code reports the input read.
         "user" => {
             let mut events = Vec::new();
+            if is_input_replay(&val) {
+                events.push(AgentEvent::InputRead(Some(replayed_input(&val))));
+                return events;
+            }
             if let Some(content) = val
                 .get("message")
                 .and_then(|m| m.get("content"))

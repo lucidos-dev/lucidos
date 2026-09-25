@@ -62,20 +62,30 @@ fn shell_quote(arg: &str) -> String {
 pub(crate) fn cmd_run(
     ws: &Workspace,
     command: &[String],
+    description: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<(), BoxError> {
     if command.is_empty() {
         return Err("Pass the command after `--`: \
-                    lucidos background-task run -- cargo test"
+                    lucidos background-task run --description \"the test suite\" -- cargo test"
             .into());
     }
     let thread_id = calling_thread()?;
     let url = tasks_url(ws, &thread_id);
-    let body = json!({
-        "command": shell_command_line(command),
-        "timeout_secs": timeout_secs,
-    });
+    let body = run_body(command, description, timeout_secs);
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
+}
+
+fn run_body(
+    command: &[String],
+    description: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> serde_json::Value {
+    json!({
+        "command": shell_command_line(command),
+        "description": description,
+        "timeout_secs": timeout_secs,
+    })
 }
 
 pub(crate) fn cmd_output(ws: &Workspace, task_id: &str) -> Result<(), BoxError> {
@@ -96,6 +106,14 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The engine names the task on the thread's waiting row by this field.
+    #[test]
+    fn the_description_reaches_the_request_body() {
+        let body = run_body(&args(&["make"]), Some("the release build"), None);
+        assert_eq!(body["description"], "the release build");
+        assert!(run_body(&args(&["make"]), None, None)["description"].is_null());
     }
 
     #[test]

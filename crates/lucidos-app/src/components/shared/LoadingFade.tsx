@@ -1,10 +1,11 @@
 import type { ComponentChildren, VNode } from 'preact';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { scaledDurationMs } from '../../store/store';
 
-/** How long the skeleton lingers (fading out) after the load completes. Slightly
- *  longer than the CSS opacity transition (var(--duration-normal) = 200ms) so the
- *  element stays mounted until the fade finishes. */
-const SKELETON_FADE_MS = 250;
+/** The skeleton's CSS opacity fade at 1x speed: `var(--duration-normal)`. */
+const SKELETON_FADE_MS = 200;
+/** Fixed margin past the fade, so the element stays mounted until it ends. */
+const SKELETON_FADE_SLACK_MS = 50;
 
 /** Crossfades a skeleton OUT as content comes in — the smooth exit that a plain
  *  delayed loader lacks (a slow load otherwise hard-snaps from skeleton to
@@ -45,7 +46,7 @@ export function LoadingFade({
   class?: string;
   children: ComponentChildren;
 }) {
-  const skeletonMounted = useLingeringFlag(showSkeleton, SKELETON_FADE_MS);
+  const skeletonMounted = useLingeringFlag(showSkeleton, scaledDurationMs(SKELETON_FADE_MS) + SKELETON_FADE_SLACK_MS);
   return (
     <div class={cls ? `loading-fade ${cls}` : 'loading-fade'}>
       <div class="loading-fade-content">{children}</div>

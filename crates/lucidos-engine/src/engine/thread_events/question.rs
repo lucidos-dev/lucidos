@@ -9,6 +9,10 @@ pub struct QuestionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Markdown the card shows under the option: a picture, or a short text
+    /// sample. Claude Code's native tool names it `preview`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// How the user answered a `UserQuestionAsked`. Tagged so the JSON payload

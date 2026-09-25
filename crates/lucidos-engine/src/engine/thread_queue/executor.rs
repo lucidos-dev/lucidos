@@ -500,6 +500,7 @@ impl LucidosEngine {
                         origin,
                         None,
                         crate::engine::FollowUpUrgency::Normal,
+                        None,
                     )
                     .await;
                 match result {
@@ -537,25 +538,7 @@ impl LucidosEngine {
         &self,
         images: Option<&[crate::api::ChatImage]>,
     ) -> Vec<String> {
-        let Some(images) = images else {
-            return Vec::new();
-        };
-        images
-            .iter()
-            .filter_map(|img| {
-                match crate::core::blobs::write_blob_from_base64(self.workspace_path(), &img.base64)
-                {
-                    Ok(blob) => Some(blob.hash),
-                    Err(e) => {
-                        log!(
-                            "[ThreadQueue] failed to persist image blob for queued spawn: {}",
-                            e
-                        );
-                        None
-                    }
-                }
-            })
-            .collect()
+        crate::engine::chat::images_to_hashes(self.workspace_path(), images)
     }
 
     /// Resolve content-addressed image hashes back to inline `ChatImage`s.

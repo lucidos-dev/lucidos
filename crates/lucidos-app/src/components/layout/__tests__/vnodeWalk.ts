@@ -47,3 +47,14 @@ export function findByType(node: ComponentChildren, type: string): AnyVNode[] {
   const out: AnyVNode[] = v.type === type ? [v] : [];
   return out.concat(findByType(v.props.children as ComponentChildren, type));
 }
+
+/** Every function-component type used in a tree, recorded without calling any.
+ *  For asserting WHICH component a surface renders, where the component's own
+ *  markup is somebody else's test. */
+export function componentTypes(node: ComponentChildren): unknown[] {
+  if (node === null || node === undefined || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap(componentTypes);
+  const v = node as AnyVNode;
+  const here: unknown[] = typeof v.type === 'string' ? [] : [v.type];
+  return here.concat(componentTypes(v.props.children as ComponentChildren));
+}

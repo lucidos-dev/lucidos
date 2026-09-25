@@ -41,7 +41,7 @@ declare global {
   }
 }
 
-const boot = applyAppearanceBoot({ styleReset: true });
+const boot = applyAppearanceBoot({ styleReset: true, durationScale: true });
 
 // After the shared program, which sets the flat background: same end state as
 // setting it inline there, and it keeps the gradient out of the contract.

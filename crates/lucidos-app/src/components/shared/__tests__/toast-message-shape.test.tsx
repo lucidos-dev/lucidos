@@ -23,7 +23,7 @@ import { findByClass, textOf } from '../../layout/__tests__/vnodeWalk';
 /** The shape `composeToastMessage` produces for a structured body: a title
  *  line, then a section title, then bullets. */
 const SECTIONED = [
-  '12 commits since your running version',
+  '12 commits come with the new version',
   'New',
   '• header: the unread total rides the brand',
   '• gateway: the pairing screen owns its own boot',
@@ -46,13 +46,13 @@ describe('the toast message splits into a heading that stays and sections that s
 
     const heading = findByClass(tree, 'toast-heading');
     expect(heading).toHaveLength(1);
-    expect(textOf(heading[0])).toBe('12 commits since your running version');
+    expect(textOf(heading[0])).toBe('12 commits come with the new version');
 
     const sections = findByClass(tree, 'toast-sections');
     expect(sections).toHaveLength(1);
     expect(textOf(sections[0])).toContain('the unread total rides the brand');
     // The heading is not repeated inside the box that scrolls away.
-    expect(textOf(sections[0])).not.toContain('commits since');
+    expect(textOf(sections[0])).not.toContain('commits come with');
   });
 
   it('renders no scroll box for a message that is all heading', () => {

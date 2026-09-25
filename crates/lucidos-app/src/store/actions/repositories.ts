@@ -4,11 +4,11 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
-  threadMap, type RepoDiff, type RepoLocator, type Repository,
+  threadMap, type RepoDiff, type RepoLocator, type RepoPendingInfo, type Repository,
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
-import { toFailed, failedIfFresh, loadedOr, setLoadingIfFresh } from '../types';
+import { toFailed, failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../types';
 import { openFilePreview } from './artifacts';
 import { revealContentPane } from './pane';
 // From the module that DEFINES it, not chat.ts's back-compat re-export: the
@@ -19,17 +19,17 @@ import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
 
-export async function switchRepoSource(repoId: string | null): Promise<void> {
-  repoSource.value = repoId;
-  selectedLines.value = null;
-  repoExpandedFolders.value = new Set();
-  repoSelectedChangeId.value = null;
+/** Bumped by every Files panel navigation. A diff load checks it after each
+ *  await and stops writing once a newer navigation has taken the panel. */
+let filesNavigation = 0;
 
+export async function switchRepoSource(repoId: string | null): Promise<void> {
+  filesNavigation++;
+  bindRepoSource(repoId);
+  repoSelectedChangeId.value = null;
   repoViewMode.value = 'all';
   repoDiff.value = { status: 'not-loaded' };
   repoPending.value = null;
-  repoFiles.value = { status: 'not-loaded' };
-  repoChanges.value = { status: 'not-loaded' };
 
   if (!repoId) return;
 
@@ -41,17 +41,58 @@ export async function switchRepoSource(repoId: string | null): Promise<void> {
   ]);
 }
 
+/** Point the Files panel at a repo and drop the previous repo's state. Leaves
+ *  the view mode, diff and change selection alone, so a diff navigation that
+ *  staged them keeps them. */
+function bindRepoSource(repoId: string | null): void {
+  repoSource.value = repoId;
+  selectedLines.value = null;
+  repoExpandedFolders.value = new Set();
+  repoFiles.value = { status: 'not-loaded' };
+  repoChanges.value = { status: 'not-loaded' };
+}
+
+/** Put the Files panel into its diff view with the diff still loading. Every
+ *  diff navigation calls this BEFORE its first await. The panel then renders
+ *  its loading state rather than the All Files tree or the previous diff.
+ *  Returns whether this navigation still owns the panel. */
+function stageDiffView(changeId: string | null): () => boolean {
+  const navigation = ++filesNavigation;
+  repoSelectedChangeId.value = changeId;
+  repoPending.value = null;
+  repoViewMode.value = 'changes';
+  repoDiff.value = { status: 'loading' };
+  return () => navigation === filesNavigation;
+}
+
+/** Report a failed diff load. The panel shows it only while this navigation
+ *  still owns the panel; the toast shows either way. */
+function failStagedDiff(isCurrent: () => boolean, reason: string): void {
+  showToast(reason, 'error');
+  if (isCurrent()) repoDiff.value = { status: 'failed', error: reason };
+}
+
+/** Land on the staged diff view: one navigation, one history entry. */
+function landOnFilesPanel(): void {
+  activeMenuItem.value = 'files';
+  panelOverlay.value = null;
+  revealContentPane();
+  pushNavState();
+}
+
 export async function loadRepoFiles(repoId: string): Promise<void> {
   // Always flip to loading: callers (selectRepoChange, viewThreadCcDiff)
   // change repoPending.branch_name before calling, so the previous file
   // tree is for a different ref and would be misleading if left visible.
   repoFiles.value = { status: 'loading' };
+  const gitRef = repoPending.value?.branch_name;
+  // A tree for a repo or branch the panel has since left must not land.
+  const stillWanted = () => repoSource.value === repoId && repoPending.value?.branch_name === gitRef;
   try {
-    const gitRef = repoPending.value?.branch_name;
     const files = await listRepoFiles(repoId, gitRef);
-    repoFiles.value = { status: 'loaded', data: files };
+    if (stillWanted()) repoFiles.value = { status: 'loaded', data: files };
   } catch (e: unknown) {
-    repoFiles.value = toFailed(e);
+    if (stillWanted()) repoFiles.value = toFailed(e);
   }
 }
 
@@ -75,8 +116,11 @@ export async function loadRepoChanges(repoId: string): Promise<void> {
   setLoadingIfFresh(repoChanges);
   try {
     const data = await getRepoChanges(repoId, 20);
+    // A list for a repo the panel has since left must not land.
+    if (repoSource.value !== repoId) return;
     repoChanges.value = { status: 'loaded', data };
   } catch (e: unknown) {
+    if (repoSource.value !== repoId) return;
     // `setLoadingIfFresh` above keeps a loaded list visible through the round
     // trip, so the failure path must match. A transient refetch failure (e.g.
     // `refreshRepoView` after a change applies) keeps the last-good list rather
@@ -115,6 +159,7 @@ export async function loadMoreRepoChanges(): Promise<void> {
 }
 
 export async function selectRepoChange(change: Change | null): Promise<void> {
+  const navigation = ++filesNavigation;
   repoSelectedChangeId.value = change?.id ?? null;
 
   if (!change) {
@@ -127,25 +172,16 @@ export async function selectRepoChange(change: Change | null): Promise<void> {
   }
 
   // Set pending info before loading so loadRepoFiles uses the right git ref
-  if (change.status === 'pending') {
-    repoPending.value = {
-      branch_name: change.branch_name,
-      files: change.files,
-      description: change.description,
-      thread_id: change.thread_id,
-    };
-  } else {
-    repoPending.value = null;
-  }
-
+  repoPending.value = pendingFromChange(change);
   repoViewMode.value = 'changes';
   repoDiff.value = { status: 'loading' };
 
   // Load diff and files in parallel
   const repoId = repoSource.value;
+  const isCurrent = () => navigation === filesNavigation;
   const diffPromise = getChangeDiff(change.id)
-    .then(diff => { repoDiff.value = { status: 'loaded', data: diff }; })
-    .catch((e: unknown) => { repoDiff.value = toFailed(e); });
+    .then(diff => { if (isCurrent()) repoDiff.value = { status: 'loaded', data: diff }; })
+    .catch((e: unknown) => { if (isCurrent()) repoDiff.value = toFailed(e); });
 
   await Promise.all([
     diffPromise,
@@ -162,51 +198,34 @@ export async function viewChangeDiffById(changeId: string): Promise<void> {
   }
 }
 
-/** A single-file diff has nothing to pick from — skip the file list and open that
- *  one file's diff directly. openRepoFilePreview pushes its own nav entry (the
- *  caller nulls panelOverlay first, so it pushes rather than replaces), so Back
- *  returns to where the user came from instead of an intermediate one-item list.
- *  Returns true when it opened the file (caller must then NOT also pushNavState).
- *  No-op (returns false) without a registered repoSource — openRepoFilePreview
- *  can't target a path there, so app coding-agent diffs keep rendering inline —
- *  or when repoDiff isn't a single loaded file, leaving the caller to push the
- *  file-list view. Shared by both diff entry points (a change row and the
- *  thread-level CC branch diff). */
-function openSingleFileDiffDirectly(): boolean {
-  const diff = repoDiff.value;
-  if (repoSource.value && diff.status === 'loaded' && diff.data.files.length === 1) {
-    openRepoFilePreview(diff.data.files[0].path, 'diff');
-    return true;
-  }
-  return false;
+/** The pending-branch info a change carries. Applied changes have none: they
+ *  read at HEAD. */
+function pendingFromChange(change: Change): RepoPendingInfo | null {
+  if (change.status !== 'pending') return null;
+  return {
+    branch_name: change.branch_name,
+    files: change.files,
+    description: change.description,
+    thread_id: change.thread_id,
+  };
 }
 
+/** Open a change's diff: the file list, never a single file, even when the
+ *  change touches only one. */
 export async function viewChangeDiff(change: Change): Promise<void> {
-  activeMenuItem.value = 'files';
-  panelOverlay.value = null;
-  revealContentPane();
-  await loadChangeContext(change);
-  // Gate on repoSelectedChangeId === change.id so we only auto-open the single
-  // file when THIS change actually loaded — both selectRepoChange (registered
-  // repo) and the inline unregistered-repo path stamp repoSelectedChangeId, so
-  // this also rejects a stale single-file diff left by a prior change. The
-  // inline path leaves repoSource null, so openSingleFileDiffDirectly no-ops
-  // there and the change's diff renders inline instead of opening a file preview.
-  if (repoSelectedChangeId.value === change.id && openSingleFileDiffDirectly()) return;
-  pushNavState();
+  const isCurrent = stageDiffView(change.id);
+  landOnFilesPanel();
+  await loadStagedChangeDiff(change, isCurrent);
 }
 
-/** Ensure the registered repositories are loaded, toasting and returning false
- *  on failure. Shared by the two diff-restore paths below. Carries the reason
- *  the Loadable already holds: a bare generic drops the last link of the error
- *  chain (.claude/rules/frontend.md, no hidden errors). */
-async function ensureRepositoriesLoaded(): Promise<boolean> {
+/** Load the registered repositories if needed. Returns why that failed, or
+ *  null. Shared by the diff paths below. Carries the reason the Loadable
+ *  already holds: a bare generic drops the last link of the error chain
+ *  (.claude/rules/frontend.md, no hidden errors). */
+async function ensureRepositoriesLoaded(): Promise<string | null> {
   if (repositories.value.status !== 'loaded') await loadRepositories();
-  if (repositories.value.status === 'failed') {
-    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
-    return false;
-  }
-  return true;
+  if (repositories.value.status !== 'failed') return null;
+  return `Failed to load repositories: ${repositories.value.error}`;
 }
 
 /** The registered `Repository` whose root is `path`, or null.
@@ -233,40 +252,58 @@ async function findRegisteredRepo(path: string): Promise<Repository | null> {
  *  Used to restore diff context after a reload, when the panel overlay was
  *  re-hydrated from nav history but its repoDiff/repoSource backing state was lost. */
 export async function loadChangeContext(change: Change): Promise<void> {
-  if (!(await ensureRepositoriesLoaded())) return;
-  const repo = await findRegisteredRepo(change.repo_root);
-  if (!repo) {
-    // No registered Repository matches change.repo_root — app coding-agent
-    // changes use the workspace root, and a change whose repo was later removed
-    // has no row either. Render the change's diff inline rather than bailing.
-    await loadUnregisteredChangeDiff(change);
-    return;
-  }
-  if (repoSource.value !== repo.id) await switchRepoSource(repo.id);
-  await selectRepoChange(change);
+  await loadStagedChangeDiff(change, stageDiffView(change.id));
 }
 
-/** Render a change's diff inline when no registered repo backs its repo_root —
+/** Resolve a staged change's repo and fill in its diff. The diff lands together
+ *  with a newly bound repo's change list, so the panel header and the file list
+ *  appear in one step. Work for a change the user has since left is dropped. */
+async function loadStagedChangeDiff(change: Change, isCurrent: () => boolean): Promise<void> {
+  const reposFailed = await ensureRepositoriesLoaded();
+  if (reposFailed) { failStagedDiff(isCurrent, reposFailed); return; }
+  const repo = await findRegisteredRepo(change.repo_root);
+  if (!isCurrent()) return;
+  if (!repo) {
+    // No registered Repository matches change.repo_root: app coding-agent
+    // changes use the workspace root, and a change whose repo was later removed
+    // has no row either. Render the change's diff inline rather than bailing.
+    await loadUnregisteredChangeDiff(change, isCurrent);
+    return;
+  }
+  const rebound = repoSource.value !== repo.id;
+  if (rebound) bindRepoSource(repo.id);
+  // Before loadRepoFiles, which reads the tree at the pending branch.
+  repoPending.value = pendingFromChange(change);
+  // The tree serves only All Files, so the diff does not wait on it.
+  const files = loadRepoFiles(repo.id);
+  const [diff] = await Promise.all([
+    getChangeDiff(change.id).then(
+      (data): Loadable<RepoDiff> => ({ status: 'loaded', data }),
+      (e: unknown) => toFailed<RepoDiff>(e),
+    ),
+    rebound ? loadRepoChanges(repo.id) : undefined,
+  ]);
+  if (isCurrent()) repoDiff.value = diff;
+  await files;
+}
+
+/** Render a change's diff inline when no registered repo backs its repo_root:
  *  app coding-agent changes (repo_root = workspace root) and changes whose repo
  *  was later removed. Mirrors viewThreadCcDiff's app branch: the backend already
  *  scopes app changes to data/apps/<id>/, and the "All Files" tab is meaningless
- *  without a registered repo, but the diff itself is not. Wipe any prior
- *  registered-repo state first (switchRepoSource(null)) so lingering signals
- *  don't observe stale paths and openSingleFileDiffDirectly no-ops on the null
- *  repoSource — the diff then renders inline regardless of file count. */
-async function loadUnregisteredChangeDiff(change: Change): Promise<void> {
-  await switchRepoSource(null);
-  repoSelectedChangeId.value = change.id;
-  repoDiff.value = { status: 'loading' };
+ *  without a registered repo, but the diff itself is not. Unbind any prior
+ *  registered repo first so lingering signals don't observe stale paths. */
+async function loadUnregisteredChangeDiff(change: Change, isCurrent: () => boolean): Promise<void> {
+  bindRepoSource(null);
 
   let diff: RepoDiff;
   try {
     diff = await getChangeDiff(change.id);
   } catch (e) {
-    repoDiff.value = toFailed(e);
-    showToast(`Failed to load diff: ${errorDetail(e)}`, 'error');
+    failStagedDiff(isCurrent, `Failed to load diff: ${errorDetail(e)}`);
     return;
   }
+  if (!isCurrent()) return;
 
   // Best-effort app-id label, mirroring viewThreadCcDiff — only when the change's
   // thread is loaded AND is an app coding-agent thread. Absent (e.g. the Changes
@@ -280,7 +317,6 @@ async function loadUnregisteredChangeDiff(change: Change): Promise<void> {
     description: appId ? `${change.description} (${appId})` : change.description,
     thread_id: change.thread_id,
   };
-  repoViewMode.value = 'changes';
   repoDiff.value = { status: 'loaded', data: diff };
 }
 
@@ -386,38 +422,32 @@ export function openEncodedRepoFilePreview(encoded: string): boolean {
  *    the diff straight into the Changes view. The backend already scopes the
  *    response to `data/apps/<id>/`. */
 export async function viewThreadCcDiff(threadId: string): Promise<void> {
-  activeMenuItem.value = 'files';
-  panelOverlay.value = null;
-  revealContentPane();
+  // A thread diff has no Change row, so no change id.
+  const isCurrent = stageDiffView(null);
+  landOnFilesPanel();
 
-  if (!(await ensureRepositoriesLoaded())) return;
-
-  // Flip to loading before the await so a stale prior diff doesn't leak
-  // through to the panel during the network round-trip.
-  repoDiff.value = { status: 'loading' };
+  const reposFailed = await ensureRepositoriesLoaded();
+  if (reposFailed) { failStagedDiff(isCurrent, reposFailed); return; }
 
   let diff: ThreadCcDiff;
   try {
     diff = await getThreadCcDiff(threadId);
   } catch (e) {
-    repoDiff.value = toFailed(e);
-    showToast(`Failed to load diff: ${errorDetail(e)}`, 'error');
+    failStagedDiff(isCurrent, `Failed to load diff: ${errorDetail(e)}`);
     return;
   }
 
   const repo = await findRegisteredRepo(diff.repo_root);
+  if (!isCurrent()) return;
 
   if (!repo) {
     const meta = threadMap.value.get(threadId)?.meta;
     if (meta?.codingAgentKind === 'app') {
       // App CC thread: no registered repo to bind to. The backend's response
-      // is already scoped to data/apps/<id>/. Route through switchRepoSource
-      // first to wipe any prior registered-repo state (repoExpandedFolders,
-      // selectedLines, repoChanges) — then layer the app-CC diff over the
-      // clean slate. Without the reset, lingering signals from a previous
-      // repo session would still observe stale paths.
+      // is already scoped to data/apps/<id>/. Unbind any prior registered repo
+      // first, so lingering signals from it don't observe stale paths.
       const appId = appIdFromFolder(meta.codingAgentFolder);
-      await switchRepoSource(null);
+      bindRepoSource(null);
       repoPending.value = {
         branch_name: diff.branch_name,
         files: diff.files.map(f => f.path),
@@ -426,37 +456,27 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
           : `${diff.branch_name} vs ${diff.base_ref}`,
         thread_id: threadId,
       };
-      repoViewMode.value = 'changes';
       repoDiff.value = { status: 'loaded', data: { files: diff.files } };
-      pushNavState();
       return;
     }
-    repoDiff.value = { status: 'not-loaded' };
-    showToast(
-      `Repo at ${diff.repo_root} is not registered — add it under Repositories to browse files`,
-      'error',
-    );
+    failStagedDiff(isCurrent, `Repo at ${diff.repo_root} is not registered. Add it under Repositories to browse files.`);
     return;
   }
 
-  if (repoSource.value !== repo.id) await switchRepoSource(repo.id);
-
-  repoSelectedChangeId.value = null;
+  const rebound = repoSource.value !== repo.id;
+  if (rebound) bindRepoSource(repo.id);
+  // Before loadRepoFiles, which reads the tree at the pending branch.
   repoPending.value = {
     branch_name: diff.branch_name,
     files: diff.files.map(f => f.path),
     description: `${diff.branch_name} vs ${diff.base_ref}`,
     thread_id: threadId,
   };
-  repoViewMode.value = 'changes';
-  repoDiff.value = { status: 'loaded', data: { files: diff.files } };
-  // Re-fetch file tree at the branch ref — switchRepoSource loaded it at HEAD
-  // because repoPending was still null at that point.
-  await loadRepoFiles(repo.id);
-  // Single-file branch diff opens the file directly, same as a change row. No
-  // stale-diff guard needed here: repoDiff was just set synchronously above and
-  // repoSelectedChangeId is null (a thread diff has no Change row), so the
-  // file-preview encodes no changeId and resolves via the branch ref.
-  if (openSingleFileDiffDirectly()) return;
-  pushNavState();
+  // The tree serves only All Files, so the diff does not wait on it. A newly
+  // bound repo's change list lands with the diff, so the header and the file
+  // list appear in one step.
+  const files = loadRepoFiles(repo.id);
+  if (rebound) await loadRepoChanges(repo.id);
+  if (isCurrent()) repoDiff.value = { status: 'loaded', data: { files: diff.files } };
+  await files;
 }

@@ -146,6 +146,7 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
                 id: "opt-0".into(),
                 label: "Approve".into(),
                 description: None,
+                preview: None,
             }],
             worktree_path: None,
             multi_select: false,

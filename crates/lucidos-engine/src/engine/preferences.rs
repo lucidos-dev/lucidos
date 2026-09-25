@@ -83,6 +83,15 @@ impl LucidosEngine {
             crate::core::response_style::validate_document(value)?;
         }
 
+        // The proxy reads this on every call and fails loudly on a bad value,
+        // so a bad write would break every proxied call. Refused here, where
+        // `PUT /api/v1/preferences` also arrives, not only in the tool.
+        if key == crate::core::PREF_PROXY_TIMEOUT_SECS {
+            if let Some(spec) = preference_catalog::lookup(key) {
+                preference_catalog::validate(spec, value)?;
+            }
+        }
+
         // A `backup_schedule` write re-registers the backup cron via the
         // scheduler's `PreferencesChanged` subscriber. Validate the cron up front
         // on this shared path (so a raw HTTP/SDK caller is covered, not just the

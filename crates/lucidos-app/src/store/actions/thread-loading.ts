@@ -55,6 +55,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       messageCount: info.message_count || 0,
       section: (info.section as ThreadMeta['section']) || 'archived',
       activeChildrenCount: info.active_children_count || 0,
+      waitingChildrenCount: info.waiting_children_count || 0,
       totalChildrenCount: info.total_children_count || 0,
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
@@ -206,6 +207,7 @@ export function upsertThread(
       existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
     }
     existing.meta.activeChildrenCount = info.active_children_count || 0;
+    existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
     existing.meta.totalChildrenCount = info.total_children_count || 0;
     existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
     existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
@@ -230,8 +232,11 @@ export function upsertThread(
     existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
     existing.meta.codingAgentApplying = info.coding_agent_applying || false;
     if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
-    if (info.parent_thread_id) existing.meta.parentThreadId = info.parent_thread_id;
-    if (info.parent_thread_title) existing.meta.parentThreadTitle = info.parent_thread_title;
+    // A null clears: a thread moved to top level has no parent any more, and a
+    // truthiness guard would re-nest it on every refresh (ADR 0278). Absent
+    // leaves the value alone, for a partial fixture.
+    if (info.parent_thread_id !== undefined) existing.meta.parentThreadId = info.parent_thread_id ?? undefined;
+    if (info.parent_thread_title !== undefined) existing.meta.parentThreadTitle = info.parent_thread_title ?? undefined;
     if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
     if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
     if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
@@ -424,7 +429,7 @@ async function loadAllThreadsInner(): Promise<void> {
   // while the list was unmounted. Pagination is then armed for the old cursor
   // space with nothing left to notice (see `filterChangedSinceLoad`).
   if (loadedFilterSelection === null) stampLoadedFilterSelection(appliedThreadFilter.value);
-  // Collapsed Archive badge total. The inline `archive_count` is the
+  // Archive badge total. The inline `archive_count` is the
   // UNFILTERED pile size: correct for the common no-filter drawer, and
   // instant. An active drawer filter, which persists across reloads, makes
   // that global total wrong, so re-fetch the filter-scoped count. `?? 0`
@@ -762,6 +767,17 @@ export function forceRetryThreadEvents(threadId: string): void {
   // its one forced retry on nothing. The post-restart resume covers it.
   if (engineRestarting.value) return;
   forcedRetries.add(threadId);
+  restartThreadEventsLoad(threadId);
+}
+
+/** The Retry buttons' entry point. The one-retry cap above stops the watchdog
+ *  looping; it must not also swallow a press the user makes after it fired. */
+export function retryThreadEvents(threadId: string): void {
+  if (engineRestarting.value) return;
+  restartThreadEventsLoad(threadId);
+}
+
+function restartThreadEventsLoad(threadId: string): void {
   loadingThreads.delete(threadId);
   const thread = threadMap.value.get(threadId);
   if (thread) {
@@ -1320,7 +1336,7 @@ export function currentThreadFilterParams(): {
   };
 }
 
-/** Refresh `archiveThreadCount`, the collapsed Archive badge total, so it
+/** Refresh `archiveThreadCount`, the Archive badge total, so it
  *  reflects the ACTIVE drawer filter. It stays stable however many rows are
  *  paginated in: the badge reads this signal directly and must NOT change as
  *  the user scrolls or expands the section. Fetches the true server-side count

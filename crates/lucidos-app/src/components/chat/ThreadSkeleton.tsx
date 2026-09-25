@@ -19,7 +19,7 @@ const RESPONSE_LINE_COUNTS = [6, 9, 5, 8, 7, 10];
  *  an immediate, consistent "opening" affordance instead of a blank gap or a
  *  spinner that flashes on slow loads. The real exchanges fade in over it once
  *  they arrive (see ThreadView). Static and data-free; the shimmer reuses the
- *  global `shimmer` keyframes and is disabled under prefers-reduced-motion (see
+ *  global `shimmer` keyframes and is disabled under reduced motion (see
  *  styles/chat/response.css). Decorative → aria-hidden so it isn't announced. */
 export function ThreadSkeleton() {
   return (

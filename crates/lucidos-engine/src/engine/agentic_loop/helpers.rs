@@ -966,22 +966,32 @@ pub(crate) fn python_call_key(code: &str) -> Option<String> {
     None
 }
 
-/// One sentinel-prefixed tool result, parsed: which transient `ThreadEvent`
-/// to broadcast to the frontend, and (when not `None`) what to substitute
-/// into the LLM-visible tool result so the model cannot read the raw JSON
-/// and act on it as if the call returned synchronously. `redacted_text:
-/// None` means "emit the event but leave the tool result alone" — the
-/// EmailConfirm tool already has a description that explains the modal
-/// flow correctly, so its raw payload is harmless to the model.
+/// One sentinel-prefixed tool result, parsed: which *form request* to emit.
+///
+/// `redacted_text` replaces the LLM-visible tool result, so the model cannot
+/// read the raw JSON and act as if the call returned synchronously. `None`
+/// leaves the result alone: the EmailConfirm tool's description already
+/// explains the confirm flow, so its raw payload is harmless to the model.
 pub(crate) struct SentinelMatch {
     pub label: &'static str,
     pub event: super::super::thread_events::ThreadEvent,
     pub redacted_text: Option<String>,
 }
 
-/// Inspect a tool result for any front-end confirm-flow sentinel and, if one
-/// matches, return the transient event to emit + the LLM-facing replacement
-/// text (or `None` to leave the LLM's view of the result unchanged).
+/// The `request_id` a plugin preview already carries under `key`. The confirm
+/// and cancel routes take that id, so the form request reuses it.
+fn preview_id(payload: &str, key: &str) -> Option<uuid::Uuid> {
+    serde_json::from_str::<serde_json::Value>(payload).ok()?[key]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// Inspect a tool result for a form-request sentinel. On a match, return the
+/// request event to emit and the LLM-facing replacement text, if any.
+///
+/// The wording says the form was SENT, never shown. The engine knows it
+/// recorded the request; whether a screen drew it is the client's to know.
 pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
     use super::super::thread_events::ThreadEvent;
     use super::super::tools::credentials::CREDENTIAL_REQUEST_PREFIX;
@@ -992,32 +1002,52 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
     type SentinelEntry = (
         &'static str,
         &'static str,
-        fn(String) -> ThreadEvent,
+        fn(String) -> Option<ThreadEvent>,
         Option<&'static str>,
     );
     let entries: &[SentinelEntry] = &[
         (
             CREDENTIAL_REQUEST_PREFIX,
-            "[AgenticLoop] CredentialPromptRequested",
-            |payload| ThreadEvent::CredentialPromptRequested { payload },
-            Some("Credential request modal shown to the user. Wait for them to enter the credential or cancel — do not chat-ask for the same value; the modal resolves the request."),
+            "[AgenticLoop] CredentialRequested",
+            |payload| {
+                Some(ThreadEvent::CredentialRequested {
+                    request_id: uuid::Uuid::new_v4(),
+                    payload,
+                })
+            },
+            Some("Credential form sent to the user. It stays open in this thread until they save or cancel it, so wait for that. Do not chat-ask for the same value: the form resolves the request."),
         ),
         (
             PLUGIN_INSTALL_REQUEST_PREFIX,
             "[AgenticLoop] PluginInstallRequested",
-            |payload| ThreadEvent::PluginInstallRequested { payload },
-            Some("Install panel shown to the user. Wait for them to click Confirm or Cancel — do not chat-ask about overwrites and do not claim the install succeeded; the panel resolves it and the next user message will tell you the outcome."),
+            |payload| {
+                Some(ThreadEvent::PluginInstallRequested {
+                    request_id: preview_id(&payload, "install_id")?,
+                    payload,
+                })
+            },
+            Some("Install panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask about overwrites and do not claim the install succeeded: the panel resolves it and the next user message will tell you the outcome."),
         ),
         (
             PLUGIN_UNINSTALL_REQUEST_PREFIX,
             "[AgenticLoop] PluginUninstallRequested",
-            |payload| ThreadEvent::PluginUninstallRequested { payload },
-            Some("Uninstall panel shown to the user. Wait for them to click Confirm or Cancel — do not chat-ask which files to delete and do not claim files were removed; the panel resolves it and the next user message will tell you the outcome."),
+            |payload| {
+                Some(ThreadEvent::PluginUninstallRequested {
+                    request_id: preview_id(&payload, "uninstall_id")?,
+                    payload,
+                })
+            },
+            Some("Uninstall panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask which files to delete and do not claim files were removed: the panel resolves it and the next user message will tell you the outcome."),
         ),
         (
             "[EMAIL_CONFIRM]",
             "[AgenticLoop] EmailConfirmRequested",
-            |payload| ThreadEvent::EmailConfirmRequested { payload },
+            |payload| {
+                Some(ThreadEvent::EmailConfirmRequested {
+                    request_id: uuid::Uuid::new_v4(),
+                    payload,
+                })
+            },
             None,
         ),
     ];
@@ -1066,7 +1096,7 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         }
         return Some(SentinelMatch {
             label,
-            event: ctor(payload),
+            event: ctor(payload)?,
             redacted_text,
         });
     }

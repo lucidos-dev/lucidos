@@ -1,3 +1,4 @@
+use crate::core::devices::SeenDevice;
 use crate::core::{DeviceStore, EventRow, EventStore, PreferenceStore};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -9,6 +10,7 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
     "theme",
     "font-family",
     "ui-scale",
+    "motion",
     "text-size",
     "font-size",
     "push_notifications",
@@ -17,36 +19,128 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
     "image_model",
 ];
 
-/// Build the per-turn user environment block shared by the chat agent and
-/// coding-agent sessions. It is intentionally compact and allowlisted:
-/// `preferences` also stores operational values such as VAPID keys.
-pub(crate) async fn build_user_device_preferences_context(
+/// Build the user environment block shared by the chat agent and coding-agent
+/// sessions, for an already resolved device. It is intentionally compact and
+/// allowlisted: `preferences` also stores operational values such as VAPID
+/// keys. Callers go through [`build_user_device_preferences_context_for_turn`].
+async fn build_user_device_preferences_context(
     pool: &PgPool,
     device_id: Option<&str>,
     event_device: Option<&str>,
 ) -> String {
     let device_section = build_device_lines(pool, device_id, event_device).await;
+    let known_device_lines = build_known_device_lines(pool).await;
     let preference_lines = build_preference_lines(pool, device_id).await;
 
-    render_user_device_preferences_context(device_section, preference_lines, device_id.is_some())
+    render_user_device_preferences_context(
+        device_section,
+        known_device_lines,
+        preference_lines,
+        device_id.is_some(),
+    )
 }
 
+/// The events a user acts through inside a turn. Each carries the device it
+/// came from, as an `actor`, an `origin`, or a bare `device_id`.
+const USER_ACTION_EVENT_TYPES: &[&str] = &[
+    "MessageReceived",
+    "UserPromptInjected",
+    "UserQuestionAnswered",
+];
+
+/// The *last used device*: the device of the user's newest action in the
+/// current turn, from `turn_anchor` (the event that started it) on.
+///
+/// A question answered from the laptop after the turn started on the phone
+/// makes the laptop the last used device. Nothing before the anchor counts.
+/// With no anchor, or a failed lookup, the turn's own device stands.
+/// `navigate_ui` and the context block both read it here, so they agree.
+pub(crate) async fn last_used_device(
+    pool: &PgPool,
+    thread_id: Uuid,
+    turn_anchor: Option<Uuid>,
+    turn_device: Option<&str>,
+) -> Option<String> {
+    let fallback = turn_device.map(str::to_string);
+    let Some(anchor) = turn_anchor else {
+        return fallback;
+    };
+    let newest = sqlx::query_scalar::<_, String>(
+        "SELECT device FROM ( \
+             SELECT sequence, COALESCE( \
+                 CASE WHEN payload->'actor'->>'kind' = 'device' \
+                      THEN payload->'actor'->>'device_id' END, \
+                 CASE WHEN payload->'origin'->>'kind' = 'device' \
+                      THEN payload->'origin'->>'device_id' END, \
+                 NULLIF(payload->>'device_id', '')) AS device \
+             FROM events \
+             WHERE thread_id = $1 \
+               AND event_type = ANY($3) \
+               AND sequence >= (SELECT sequence FROM events WHERE id = $2 AND thread_id = $1) \
+         ) turn WHERE device IS NOT NULL \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(anchor)
+    .bind(USER_ACTION_EVENT_TYPES)
+    .fetch_optional(pool)
+    .await;
+    match newest {
+        Ok(found) => found.or(fallback),
+        Err(e) => {
+            log!("[AgentContext] last used device lookup failed for thread {thread_id}: {e}");
+            fallback
+        }
+    }
+}
+
+/// The block for one turn, about its last used device.
+///
+/// `turn_device` and `turn_device_label` are what the turn's own event says.
+/// The label only describes that device, so it is dropped when a later action
+/// moved the last used device elsewhere.
+pub(crate) async fn build_user_device_preferences_context_for_turn(
+    pool: &PgPool,
+    thread_id: Uuid,
+    turn_anchor: Option<Uuid>,
+    turn_device: Option<&str>,
+    turn_device_label: Option<&str>,
+) -> String {
+    let device = last_used_device(pool, thread_id, turn_anchor, turn_device).await;
+    let label = turn_device_label.filter(|_| device.as_deref() == turn_device);
+    build_user_device_preferences_context(pool, device.as_deref(), label).await
+}
+
+/// At most this many devices are listed, most recently seen first.
+const KNOWN_DEVICES_LIMIT: i64 = 5;
+/// A device unseen for longer than this is left out of the list.
+const KNOWN_DEVICES_WITHIN_DAYS: i32 = 30;
+
+/// `device_section` is the last used device when the block is built. A later
+/// answer in the same live turn can move it, so the header says when.
+/// `navigate_ui` resolves it again at call time.
 fn render_user_device_preferences_context(
     device_section: Vec<String>,
+    known_device_lines: Vec<String>,
     preference_lines: Vec<String>,
     has_device_id: bool,
 ) -> String {
-    if device_section.is_empty() && preference_lines.is_empty() {
+    if device_section.is_empty() && known_device_lines.is_empty() && preference_lines.is_empty() {
         return String::new();
     }
 
     let mut out = String::from("[USER DEVICE & PREFERENCES]\n");
     if !device_section.is_empty() {
-        out.push_str("Current request device:\n");
+        out.push_str("Last used device (when this context was built):\n");
         out.push_str(&device_section.join("\n"));
         out.push('\n');
     } else {
-        out.push_str("Current request device: unavailable for this turn.\n");
+        out.push_str("Last used device: unavailable for this turn.\n");
+    }
+    if !known_device_lines.is_empty() {
+        out.push_str("Known devices, most recently seen first:\n");
+        out.push_str(&known_device_lines.join("\n"));
+        out.push('\n');
     }
 
     if !preference_lines.is_empty() {
@@ -63,18 +157,19 @@ fn render_user_device_preferences_context(
 
     out.push_str(
         "Use these facts when interpreting user-facing UI/UX requests. \
-         Apps should respect theme, font, and UI scale, and use rem/em-sized \
-         layout where user scale should apply.\n",
+         Apps should respect theme, font, UI scale and motion (key animations on \
+         `data-motion`), and use rem/em-sized layout where user scale should apply.\n",
     );
     out.push_str("[END USER DEVICE & PREFERENCES]");
     out
 }
 
-/// Build context for a coding-agent turn from the persisted event that caused
-/// the spawn or follow-up.
+/// Build context for a coding-agent input from the persisted event that caused
+/// it. That event anchors the turn.
 pub(crate) async fn build_user_device_preferences_context_for_origin(
     pool: &PgPool,
     event_store: &EventStore,
+    thread_id: Uuid,
     origin_id: Uuid,
 ) -> String {
     let (device_id, event_device) = match event_store.get_event_by_id(origin_id).await {
@@ -89,7 +184,14 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
             (None, None)
         }
     };
-    build_user_device_preferences_context(pool, device_id.as_deref(), event_device.as_deref()).await
+    build_user_device_preferences_context_for_turn(
+        pool,
+        thread_id,
+        Some(origin_id),
+        device_id.as_deref(),
+        event_device.as_deref(),
+    )
+    .await
 }
 
 pub(crate) fn prepend_user_device_preferences_context(context: &str, text: &str) -> String {
@@ -159,6 +261,45 @@ async fn build_device_lines(
         lines.push(format!("- details: {details}"));
     }
     lines
+}
+
+/// A failed read leaves the list out rather than failing the turn. The last
+/// used device above still stands, and `navigate_ui` defaults to it.
+async fn build_known_device_lines(pool: &PgPool) -> Vec<String> {
+    match DeviceStore::recently_seen(pool, KNOWN_DEVICES_LIMIT, KNOWN_DEVICES_WITHIN_DAYS).await {
+        Ok(devices) => devices.iter().map(format_known_device).collect(),
+        Err(e) => {
+            log!(
+                "[AgentContext] Failed to list known devices for agent context: {}",
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn format_known_device(device: &SeenDevice) -> String {
+    let mut facts: Vec<String> = device.details.iter().cloned().collect();
+    facts.push(format!("seen {}", format_age(device.seen_secs_ago)));
+    if device.visible_now {
+        facts.push("Lucidos visible now".to_string());
+    }
+    format!(
+        "- {} (id {}): {}",
+        device.label,
+        device.id,
+        facts.join("; ")
+    )
+}
+
+pub(crate) fn format_age(secs: i64) -> String {
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s if s < 2 * 86_400 => "1 day ago".to_string(),
+        s => format!("{} days ago", s / 86_400),
+    }
 }
 
 fn split_device_label_details(raw: &str) -> (String, Option<String>) {
@@ -243,9 +384,117 @@ mod tests {
         assert!(context.contains("Safari") || context.contains("iOS"));
         assert!(!context.contains("vapid"));
         assert!(!context.contains("secret"));
+        assert!(
+            context.contains("- Ios pwa (id device-ios): Safari/604.1 on iOS; seen just now"),
+            "the known devices list names the device: {context}"
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    /// A coding agent lives across many user messages. Each one the user sent
+    /// gets a block built when it is forwarded, so the device and the ages are
+    /// current. Engine-made inputs carry none: no user acted.
+    #[test]
+    fn only_a_user_input_with_an_origin_gets_a_fresh_block() {
+        use crate::engine::{AgentInputKind, AgentUserInput};
+        let origin = Uuid::new_v4();
+        let input = |origin_event_id, kind| AgentUserInput {
+            text: "go on".into(),
+            images: None,
+            origin_event_id,
+            kind,
+        };
+        assert_eq!(
+            input(Some(origin), AgentInputKind::User).user_origin(),
+            Some(origin)
+        );
+        assert_eq!(
+            input(None, AgentInputKind::User).user_origin(),
+            None,
+            "auto-harden and apply prompts have no user behind them"
+        );
+        assert_eq!(
+            input(Some(origin), AgentInputKind::ReentryFromEngine).user_origin(),
+            None,
+            "a finished child thread is not a user action"
+        );
+    }
+
+    /// The agent picks a device on purpose from this list. So each row carries
+    /// the id to pass, the label to tell the user, and how fresh it is.
+    #[test]
+    fn a_known_device_line_carries_id_label_details_and_freshness() {
+        let laptop = SeenDevice {
+            id: "laptop".into(),
+            label: "My MacBook".into(),
+            details: Some("Chrome/149.0.0.0 on macOS".into()),
+            seen_secs_ago: 5,
+            visible_now: true,
+        };
+        assert_eq!(
+            format_known_device(&laptop),
+            "- My MacBook (id laptop): Chrome/149.0.0.0 on macOS; seen just now; Lucidos visible now"
+        );
+        let phone = SeenDevice {
+            id: "phone".into(),
+            label: "device-phone".into(),
+            details: None,
+            seen_secs_ago: 2 * 3600 + 5,
+            visible_now: false,
+        };
+        assert_eq!(
+            format_known_device(&phone),
+            "- device-phone (id phone): seen 2 h ago"
+        );
+    }
+
+    #[test]
+    fn ages_read_in_the_largest_whole_unit() {
+        assert_eq!(format_age(59), "just now");
+        assert_eq!(format_age(60), "1 min ago");
+        assert_eq!(format_age(3599), "59 min ago");
+        assert_eq!(format_age(86_399), "23 h ago");
+        assert_eq!(format_age(86_400), "1 day ago");
+        assert_eq!(format_age(3 * 86_400), "3 days ago");
+    }
+
+    /// "Request device" hid the incident: the user answered from the laptop,
+    /// and the turn still counted the phone. The block names the concept the
+    /// navigate actually uses.
+    #[test]
+    fn the_block_names_the_last_used_device_and_lists_known_devices() {
+        let context = render_user_device_preferences_context(
+            vec!["- id: device-ios".to_string()],
+            vec!["- My MacBook (id laptop): seen just now".to_string()],
+            vec![],
+            true,
+        );
+        assert!(
+            context.contains("Last used device (when this context was built):\n- id: device-ios"),
+            "{context}"
+        );
+        assert!(context.contains("Known devices"), "{context}");
+        assert!(context.contains("- My MacBook (id laptop)"), "{context}");
+        assert!(!context.contains("request device"), "{context}");
+    }
+
+    /// A trigger turn has no device and may have no preferences. It still needs
+    /// the list, or it cannot aim `navigate_ui` at any device on purpose.
+    #[test]
+    fn a_turn_with_no_device_still_lists_known_devices() {
+        let context = render_user_device_preferences_context(
+            vec![],
+            vec!["- My MacBook (id laptop): seen just now".to_string()],
+            vec![],
+            false,
+        );
+        assert!(
+            context.contains("Last used device: unavailable"),
+            "{context}"
+        );
+        assert!(context.contains("- My MacBook (id laptop)"), "{context}");
     }
 
     #[test]
@@ -256,6 +505,7 @@ mod tests {
                 "- label: Ios pwa".to_string(),
                 "- details: Safari/604.1 on iOS".to_string(),
             ],
+            vec![],
             vec!["- theme: light".to_string(), "- ui-scale: 125".to_string()],
             true,
         );
@@ -293,7 +543,7 @@ mod tests {
 
     #[test]
     fn context_is_empty_when_no_device_or_safe_preferences_exist() {
-        let context = render_user_device_preferences_context(vec![], vec![], false);
+        let context = render_user_device_preferences_context(vec![], vec![], vec![], false);
 
         assert_eq!(context, "");
     }

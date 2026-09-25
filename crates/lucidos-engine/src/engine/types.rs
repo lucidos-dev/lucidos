@@ -497,6 +497,17 @@ pub struct AgentUserInput {
     pub kind: AgentInputKind,
 }
 
+impl AgentUserInput {
+    /// The event of the user message behind this input, if a user sent one.
+    /// A child wake or an engine-made prompt (auto-harden, apply) has none.
+    pub fn user_origin(&self) -> Option<uuid::Uuid> {
+        match self.kind {
+            AgentInputKind::User => self.origin_event_id,
+            AgentInputKind::ReentryFromEngine => None,
+        }
+    }
+}
+
 /// Discriminates a user-typed follow-up from an engine-synthesized re-entry.
 /// CC's `run_session` and the chat fast-paths use this to suppress duplicate
 /// exchange-starter events for re-entries (`ChildThreadCompleted` is the start
@@ -569,6 +580,36 @@ impl StopReason {
     }
 }
 
+/// Which operation holds a session's change claim (`AgentSession::change_claim`).
+/// A refusal names it, so a Discard in progress never reads as an apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeClaim {
+    /// Apply Now, or a Tier-1 in-place merge.
+    Apply,
+    /// An in-session Discard.
+    Discard,
+}
+
+/// How a session carries a merge-conflict resolution. The two tiers put the
+/// session in different worktrees, which the Diff button has to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictBinding {
+    /// Tier 2 / Tier 3: a session spawned for the merge, registered with the
+    /// binding, working in the merge worktree on a temp branch.
+    Detached { change_id: uuid::Uuid },
+    /// Tier 1: the merge prompt went into a session that already existed. It
+    /// merges in the thread's own worktree and outlives the resolution.
+    InPlace { change_id: uuid::Uuid },
+}
+
+impl ConflictBinding {
+    pub fn change_id(self) -> uuid::Uuid {
+        match self {
+            Self::Detached { change_id } | Self::InPlace { change_id } => change_id,
+        }
+    }
+}
+
 /// State for a single active coding-agent session.
 ///
 /// **Single agent per thread — deliberate.** The owning HashMap is keyed by
@@ -579,6 +620,8 @@ impl StopReason {
 /// the session records its backend in [`AgentSession::coding_agent`].
 pub struct AgentSession {
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    /// The turn reached its boundary. Only the run loop writes it, because the
+    /// loop keeps a local copy in step (`only_the_run_loop_writes_the_session_phase`).
     pub is_waiting: bool,
     pub has_changes: bool,
     pub requires_restart: bool,
@@ -643,14 +686,15 @@ pub struct AgentSession {
     /// Notified when the CC process enters idle/waiting state.
     /// Used by `apply_now` to wait for review/conflict resolution to complete.
     pub idle_notify: std::sync::Arc<tokio::sync::Notify>,
-    /// When true, an `apply_now` task is already running for this thread.
-    /// Prevents concurrent apply_now calls from causing duplicate merges.
-    pub apply_now_in_progress: bool,
-    /// The change whose merge-conflict resolution this session is carrying, set
-    /// where the resolution binds to the session: at registration for the
-    /// detached Tier-2 / Tier-3 spawns (they carry a `conflict_change_id`), and
-    /// in `cc_assisted_merge_then_ff` for the Tier-1 in-place merge, which
-    /// injects the merge prompt into a session that already existed.
+    /// The operation on this session's change that holds the session: Apply
+    /// Now or a Tier-1 in-place merge (`Apply`), or an in-session Discard
+    /// (`Discard`). Prevents two of them
+    /// from running at once, which merges twice or resets a tree under a merge.
+    /// It and `pending_stop` refuse each other: see `claude_code::stop_refusal`
+    /// and `decide_in_place_merge_claim`. Release it with `release_change_claim`.
+    pub change_claim: Option<ChangeClaim>,
+    /// The merge-conflict resolution this session is carrying, if any. See
+    /// [`ConflictBinding`] for where each variant is set.
     ///
     /// Read by the merge-ownership guard (ADR 0060) as the liveness half of
     /// "is a resolver working on this change right now". Descriptive, NOT a
@@ -663,7 +707,7 @@ pub struct AgentSession {
     /// live session as one: a pairing stranded by a crash plus a later
     /// unrelated turn on the same thread would otherwise refuse every Apply for
     /// the length of that turn.
-    pub conflict_change_id: Option<uuid::Uuid>,
+    pub conflict: Option<ConflictBinding>,
     /// Set to true when the CC process exits. Checked by `apply_now_inner`
     /// after waking from `idle_notify` to detect CC death vs normal idle.
     pub process_exited: bool,
@@ -734,35 +778,6 @@ pub struct AgentSession {
     /// Current reasoning effort level (low/medium/high).
     /// Not reported in CC's init event — only set via control request.
     pub current_reasoning_effort: Option<String>,
-    /// Inputs the run loop has **forwarded to the agent driver** that the driver
-    /// has not yet answered with a `Result`. Seeded to 1 when the spawn carries
-    /// real content (that input is the one `Result` the first turn owes) and 0 for
-    /// a silent resume / warm-up, then incremented in the `msg_rx.recv()` arm.
-    ///
-    /// Incrementing at the FORWARD site rather than at each `msg_tx.send` is what
-    /// keeps this disjoint from the channel itself: a message still sitting in
-    /// `msg_rx` is covered by `msg_rx.is_empty()`, this counter starts where that
-    /// stops, and no message is in both. It also means every sender is counted by
-    /// construction, including the three that never touched the old send-site
-    /// counter (`apply_now`'s hardening prompt, `change_ops::propose`, and a
-    /// background-task wake since removed).
-    ///
-    /// **Settled per backend at each `Result`**, by
-    /// `lifecycle::settle_inputs_awaiting_result`, because the backends make
-    /// different promises about how many Results an input earns. Claude Code merges
-    /// back-to-back stdin inputs into a SINGLE Result, so one Result answers
-    /// everything forwarded so far and the counter zeroes. The Codex app-server
-    /// driver runs one child per accepted input and emits one Result EACH
-    /// (`TurnOutcome::Continue` keeps queued inputs across an interrupt on exactly
-    /// that promise), so a Result answers one and the counter decrements.
-    ///
-    /// A non-zero remainder after the settle keeps the subprocess alive at idle: the
-    /// driver still owes a turn, and killing it would drop work the user already
-    /// sent. Applying the Codex rule to Claude Code is what made a merged
-    /// three-message turn report two phantom follow-ups, keep a dead session alive,
-    /// and swallow the API-drop auto-resume (2026-08-07; see
-    /// `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`).
-    pub inputs_awaiting_result: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Set by `answer_pending_question` when a user answers an `AskUserQuestion`
     /// on a *live* subprocess (CC continues its turn in-place once the blocked
     /// PreToolUse hook is woken). That resume path does NOT go through `msg_tx`,
@@ -869,7 +884,7 @@ impl AgentSession {
     pub(crate) fn for_test_with_sender(
         msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Self {
-        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64};
         use std::sync::Arc;
         Self {
             msg_tx,
@@ -883,8 +898,8 @@ impl AgentSession {
             stop: Arc::new(tokio::sync::Notify::new()),
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
-            apply_now_in_progress: false,
-            conflict_change_id: None,
+            change_claim: None,
+            conflict: None,
             process_exited: false,
             worktree_path: None,
             branch_name: None,
@@ -899,7 +914,6 @@ impl AgentSession {
             current_model: None,
             current_reasoning_effort: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
-            inputs_awaiting_result: Arc::new(AtomicU32::new(0)),
             question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,

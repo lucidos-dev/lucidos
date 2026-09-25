@@ -646,11 +646,10 @@ describe('groupIntoExchanges — response continuation after a mid-flight ChildT
     expect(exchangeStatus(ctc, '', /*isLast*/ true, false, false, /*threadIdle*/ false, false)).not.toBe('pending');
   });
 
-  it('leaves a CC permission divider in place — its continuation flows to the intervening card', () => {
-    // Counterpart gate: `CodingAgentPermissionRequest` is never a reqIdRedirect
-    // target (CC events aren't request-id routed), so CC's post-grant work
-    // follows `current` into the intervening boundary. Moving the divider below
-    // that boundary would strand the card under its own continuation.
+  it('re-anchors a coding-agent permission divider to its grant, continuation included', () => {
+    // A coding agent's events route by `current`, not by request id, so the
+    // re-anchored divider must take `current` too. Otherwise the post-grant
+    // work lands in the boundary that now sits ABOVE the card.
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'edit foo', _eventId: 'msg-1', created: '2026-07-28T04:00:00Z' } as StoredEvent],
       [2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: {}, summary: 'Edit /foo', created: '2026-07-28T04:00:01Z' } as StoredEvent],
@@ -661,13 +660,56 @@ describe('groupIntoExchanges — response continuation after a mid-flight ChildT
     const exchanges = groupIntoExchanges(events);
     expect(exchanges.map(e => e.userEvent.type)).toEqual([
       'MessageReceived',
+      'ChildThreadCompleted',
+      'CodingAgentPermissionRequest',
+    ]);
+    const divTypes = exchanges[2].steps.map(s => s.event.type);
+    expect(divTypes).toContain('CodingAgentPermissionResolved');
+    expect(divTypes).toContain('CodingAgentTextStreamed');
+    expect(exchanges[1].steps.map(s => s.event.type)).not.toContain('CodingAgentTextStreamed');
+  });
+
+  it('leaves a stale coding-agent card in place when a cleanup sweep resolves it', () => {
+    // The agent moved on past the card, then the engine's idle sweep resolved
+    // it. Moving the card would hand it the live turn's `current`, so the
+    // turn's own idle marker would land in the stale card.
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'edit foo', _eventId: 'msg-1', created: '2026-07-28T04:00:00Z' } as StoredEvent],
+      [2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: {}, summary: 'Edit /foo', created: '2026-07-28T04:00:01Z' } as StoredEvent],
+      [3, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'x', _eventId: 'ctc-1', created: '2026-07-28T04:00:02Z' } as StoredEvent],
+      [4, { type: 'CodingAgentTextStreamed', text: 'carrying on', created: '2026-07-28T04:00:03Z' } as StoredEvent],
+      [5, { type: 'CodingAgentPermissionResolved', request_id: 'r1', allowed: false, reason: 'session ended', created: '2026-07-28T04:00:04Z' } as StoredEvent],
+      [6, { type: 'CodingAgentIdled', created: '2026-07-28T04:00:05Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
       'CodingAgentPermissionRequest',
       'ChildThreadCompleted',
     ]);
-    // The grant routes back to its divider; the CC continuation stays with the
-    // boundary that is `current`.
     expect(exchanges[1].steps.map(s => s.event.type)).toContain('CodingAgentPermissionResolved');
-    expect(exchanges[2].steps.map(s => s.event.type)).toContain('CodingAgentTextStreamed');
+    expect(exchanges[2].steps.map(s => s.event.type)).toContain('CodingAgentIdled');
+  });
+
+  it('re-anchors a coding-agent question divider to its answer, continuation included', () => {
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'ship it', _eventId: 'msg-1', created: '2026-07-28T04:00:00Z' } as StoredEvent],
+      [2, { type: 'CodingAgentToolCalled', name: 'AskUserQuestion', tool_use_id: 'tu-q', input: {}, created: '2026-07-28T04:00:01Z' } as StoredEvent],
+      [3, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's1', question: 'Which?', options: [{ id: 'a', label: 'A' }], created: '2026-07-28T04:00:02Z' } as StoredEvent],
+      [4, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'x', _eventId: 'ctc-1', created: '2026-07-28T04:00:03Z' } as StoredEvent],
+      [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-q', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-07-28T04:00:04Z' } as StoredEvent],
+      [6, { type: 'CodingAgentTextStreamed', text: 'going with A', created: '2026-07-28T04:00:05Z' } as StoredEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(e => e.userEvent.type)).toEqual([
+      'MessageReceived',
+      'ChildThreadCompleted',
+      'UserQuestionAsked',
+    ]);
+    const divTypes = exchanges[2].steps.map(s => s.event.type);
+    expect(divTypes).toContain('UserQuestionAnswered');
+    expect(divTypes).toContain('CodingAgentTextStreamed');
+    expect(exchanges[1].steps.map(s => s.event.type)).not.toContain('CodingAgentTextStreamed');
   });
 });
 

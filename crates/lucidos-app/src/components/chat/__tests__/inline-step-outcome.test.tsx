@@ -9,6 +9,14 @@ import type { ResponseEvent, StepOutcome } from '../../../store/types';
  *  muted row among green checks, so the user can see WHICH step the kill
  *  landed on. It must not shimmer (nothing is running) and must not carry a
  *  checkmark (the tool never reported anything). */
+const MARK: Record<Exclude<StepOutcome, 'pending'>, string> = {
+  success: 'step-outcome-icon-success',
+  error: 'step-outcome-icon-error',
+  unfinished: 'step-outcome-icon-unfinished',
+  blocked: 'step-outcome-icon-blocked',
+  denied: 'step-outcome-icon-denied',
+};
+
 function row(outcome: StepOutcome) {
   const event: Extract<ResponseEvent, { type: 'step' }> = {
     type: 'step',
@@ -24,9 +32,9 @@ describe('InlineStep rendering per step outcome', () => {
   it('unfinished: muted struck row, no checkmark, no shimmer', () => {
     const { text, props } = row('unfinished');
     expect(props.class).toContain('unfinished');
-    // The distinguishing marker. A ✓ here would be the original lie.
-    expect(text).toContain('⊘');
-    expect(text).not.toContain('✓');
+    // The distinguishing marker. A success check here would be the original lie.
+    expect(text).toContain(MARK.unfinished);
+    expect(text).not.toContain(MARK.success);
     // The row is terminal: shimmering it would animate work nobody is doing.
     expect(text).not.toContain('running-shimmer');
     // Named for the user without a trip through the detail modal.
@@ -37,8 +45,9 @@ describe('InlineStep rendering per step outcome', () => {
     const { text, props } = row('pending');
     expect(props.class).toContain('pending');
     expect(text).toContain('running-shimmer');
-    expect(text).not.toContain('⊘');
-    expect(text).not.toContain('✓');
+    expect(text).not.toContain(MARK.unfinished);
+    expect(text).not.toContain(MARK.success);
+    expect(text).not.toContain('<svg');
     expect(props['data-tooltip']).toBeUndefined();
   });
 
@@ -46,15 +55,15 @@ describe('InlineStep rendering per step outcome', () => {
     const { text, props } = row('success');
     expect(props.class).toContain('success');
     expect(props.class).not.toContain('unfinished');
-    expect(text).toContain('✓');
+    expect(text).toContain(MARK.success);
     expect(text).not.toContain('running-shimmer');
   });
 
   it('error: the failure marker, distinct from unfinished', () => {
     const { text, props } = row('error');
     expect(props.class).toContain('error');
-    expect(text).toContain('⚠');
-    expect(text).not.toContain('⊘');
+    expect(text).toContain(MARK.error);
+    expect(text).not.toContain(MARK.unfinished);
   });
 
   // The reported bug: a command waiting on a permission card rendered exactly
@@ -62,9 +71,9 @@ describe('InlineStep rendering per step outcome', () => {
   it('blocked: a pause mark, no shimmer, no checkmark', () => {
     const { text, props } = row('blocked');
     expect(props.class).toContain('blocked');
-    expect(text).toContain('‖');
+    expect(text).toContain(MARK.blocked);
     expect(text).not.toContain('running-shimmer');
-    expect(text).not.toContain('✓');
+    expect(text).not.toContain(MARK.success);
     expect(props['data-tooltip']).toBe('Needs approval');
   });
 
@@ -73,11 +82,11 @@ describe('InlineStep rendering per step outcome', () => {
   it('denied: the cross, never the success check', () => {
     const { text, props } = row('denied');
     expect(props.class).toContain('denied');
-    expect(text).toContain('✗');
-    expect(text).not.toContain('✓');
+    expect(text).toContain(MARK.denied);
+    expect(text).not.toContain(MARK.success);
     expect(text).not.toContain('running-shimmer');
     // Distinct from the killed-mid-call row, which is struck instead.
-    expect(text).not.toContain('⊘');
+    expect(text).not.toContain(MARK.unfinished);
     expect(props['data-tooltip']).toBe('Denied');
   });
 });

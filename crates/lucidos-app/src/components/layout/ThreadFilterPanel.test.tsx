@@ -18,13 +18,13 @@
  */
 import type { ComponentChildren, VNode } from 'preact';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { ThreadFilterPanel, filterButtonState } from './ThreadFilterPanel';
+import { ThreadFilterPanel, filterButtonState, FILTER_BUTTON_GLYPHS } from './ThreadFilterPanel';
 import {
   ALL_CHANNELS, drawerView, setDrawerView, threadChannelFilter, threadMap, triggers,
   selectedTriggerIds, setSelectedTriggerIds, setSelectedRepoIds, setSelectedAppIds,
   setIncludeDeletedFilterOptions,
 } from '../../store/store';
-import { FilterIcon, AttentionIcon, ReviewIcon, RunningIcon, DraftsIcon, CloseIcon } from '../shared/icons';
+import { FilterIcon, FilteredIcon, AttentionIcon, ReviewIcon, RunningIcon, DraftsIcon } from '../shared/icons';
 import type { DrawerView } from '../../store/store';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 
@@ -225,9 +225,9 @@ describe('ThreadFilterPanel: shape', () => {
   it('carries no title row and no footer: the header Filter button is both ends', () => {
     // The pane header above says "Filters" while the panel is up, so a header
     // inside the panel would repeat the one two rows above it, and the same
-    // header's Filter button is the way out (it wears an X while the panel is
-    // open, see `filterButtonState`). A Close footer down here duplicated that
-    // exit and spent a strip of the pane's height on it.
+    // header's Filter button is the way out (it is held down while the panel
+    // is open, see `filterButtonState`). A Close footer down here duplicated
+    // that exit and spent a strip of the pane's height on it.
     const { children } = render();
     expect(findByClass(children, 'thread-filter-panel-header')).toHaveLength(0);
     expect(findByClass(children, 'thread-filter-panel-footer')).toHaveLength(0);
@@ -328,6 +328,19 @@ describe('ThreadFilterPanel: All statuses and the types that narrow it', () => {
     expect(render().rowNamed(ALL).props['aria-checked']).toBe(true);
     threadChannelFilter.value = new Set(['chat']);
     expect(render().rowNamed(ALL).props['aria-checked']).toBe(true);
+  });
+
+  // The row wears the same glyph as the header's Filter button, so the two never
+  // disagree with the panel open. Like the heading, it reports what is TICKED,
+  // so a status view does not empty it.
+  it('fills its funnel while thread types are ticked, as the Filter button does', () => {
+    const rowIcon = () =>
+      (render().rowNamed(ALL).props.children as AnyVNode[]).find(c => typeof c?.type === 'function')!.type;
+    expect(rowIcon()).toBe(FilterIcon);
+    threadChannelFilter.value = new Set(['chat']);
+    expect(rowIcon()).toBe(FilteredIcon);
+    setDrawerView('review');
+    expect(rowIcon()).toBe(FilteredIcon);
   });
 
   it('says "filtered" for a thread-type selection', () => {
@@ -585,40 +598,68 @@ describe('filterButtonState', () => {
   const shut = (over: Partial<Parameters<typeof filterButtonState>[0]> = {}) => filterButtonState({
     view: 'all', panelOpen: false, channelFilterActive: false, attentionCount: 0, ...over,
   });
+  const glyphOf = (over: Partial<Parameters<typeof filterButtonState>[0]> = {}) =>
+    FILTER_BUTTON_GLYPHS[shut(over).glyph];
 
-  // Closed, the threads-header Filter button reflects the selected view: the
-  // funnel for the default `all`, each view's own glyph otherwise.
+  // The glyph reports what the list is filtered to: the funnel for the default
+  // `all`, each status view's own glyph otherwise.
   it('wears the funnel for all and the view glyph otherwise', () => {
-    expect(shut().Icon).toBe(FilterIcon);
-    expect(shut({ view: 'attention' }).Icon).toBe(AttentionIcon);
-    expect(shut({ view: 'review' }).Icon).toBe(ReviewIcon);
-    expect(shut({ view: 'running' }).Icon).toBe(RunningIcon);
-    expect(shut({ view: 'drafts' }).Icon).toBe(DraftsIcon);
+    expect(glyphOf()).toBe(FilterIcon);
+    expect(glyphOf({ view: 'attention' })).toBe(AttentionIcon);
+    expect(glyphOf({ view: 'review' })).toBe(ReviewIcon);
+    expect(glyphOf({ view: 'running' })).toBe(RunningIcon);
+    expect(glyphOf({ view: 'drafts' })).toBe(DraftsIcon);
+  });
+
+  it('wears the filled funnel while thread types narrow the all view', () => {
+    expect(glyphOf({ channelFilterActive: true })).toBe(FilteredIcon);
+  });
+
+  // The header draws icons in a translucent white. A stroke laid over a fill
+  // paints the rim twice, so it reads brighter than the body of the funnel.
+  it('paints the filled funnel as one fill, with no stroke over it', () => {
+    const svg = FilteredIcon() as { props: { fill: string; stroke: string } };
+    expect(svg.props.fill).toBe('currentColor');
+    expect(svg.props.stroke).toBe('none');
+  });
+
+  it('keeps a status glyph when thread types are ticked, since a status bypasses them', () => {
+    expect(glyphOf({ view: 'review', channelFilterActive: true })).toBe(ReviewIcon);
   });
 
   it('falls back to the All statuses funnel for a view it does not recognize', () => {
     // The fallback resolves the `all` entry BY NAME. It used to take
     // `VIEW_META[0]`, which silently became "Needs attention" the moment All
     // statuses moved to the foot of the list.
-    expect(shut({ view: 'nope' as DrawerView }).Icon).toBe(FilterIcon);
+    expect(glyphOf({ view: 'nope' as DrawerView })).toBe(FilterIcon);
   });
 
-  it('is highlighted when a status view or a channel filter is on, and reports the attention count', () => {
-    expect(shut().active).toBe(false);
-    expect(shut({ view: 'review' }).active).toBe(true);
-    expect(shut({ channelFilterActive: true }).active).toBe(true);
+  // Pressed means the panel is open and nothing else. A highlight that also
+  // meant "a filter is on" left a filtered list looking pressed all the time.
+  it('is not pressed while the panel is closed, whatever the filter', () => {
+    for (const view of ['all', 'attention', 'review', 'running', 'drafts'] as const) {
+      for (const channelFilterActive of [false, true]) {
+        expect(shut({ view, channelFilterActive }).pressed).toBe(false);
+      }
+    }
+  });
+
+  it('reports the attention count while the panel is closed', () => {
     expect(shut({ attentionCount: 3 }).badge).toBe(3);
   });
 
-  // Open, the button stops reporting and offers the way out: an X, no
-  // highlight, no badge. The panel underneath is already saying what the filter
-  // is, so repeating it over the exit glyph only crowds it.
-  it('drops to a bare X while the panel is open, whatever the filter state', () => {
+  // Open, it is pressed and drops the badge, but the glyph does not change: it
+  // still says what the list is filtered to. Never an X: at the far end of the
+  // header that reads as "close this pane".
+  it('is pressed with no badge while the panel is open, wearing the same glyph', () => {
     for (const view of ['all', 'attention', 'review', 'running', 'drafts'] as const) {
-      const open = filterButtonState({ view, panelOpen: true, channelFilterActive: true, attentionCount: 4 });
-      expect(open.Icon).toBe(CloseIcon);
-      expect(open.active).toBe(false);
-      expect(open.badge).toBe(0);
+      for (const channelFilterActive of [false, true]) {
+        const closed = shut({ view, channelFilterActive, attentionCount: 4 });
+        const open = shut({ view, channelFilterActive, attentionCount: 4, panelOpen: true });
+        expect(open.glyph).toBe(closed.glyph);
+        expect(open.pressed).toBe(true);
+        expect(open.badge).toBe(0);
+      }
     }
   });
 });

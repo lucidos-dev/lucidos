@@ -127,11 +127,12 @@ uses that one rather than growing another.
   that found no window on the raising workspace. The rule now: a window takes a
   workspace's remembered frame when the client puts that workspace on screen
   with no window on it.
-- **File > New Window keeps the declared default.** It opens a SECOND window on
-  the workspace you are already on, and the record holds one frame per
+- **File > New Window never takes the remembered frame.** It opens a SECOND
+  window on the workspace you are already on, and the record holds one frame per
   workspace. Handing it that frame would drop the new window exactly over the
   one it was opened from. This is the case that shows the rule above is keyed on
-  the right thing.
+  the right thing. It cascades from the window it was opened from instead
+  (`window_restore::cascade`), one title bar down and to the right.
 - **A reopen sizes an adrift `main` too.** `reopen_plan` points it at the first
   owed workspace, and that is the same window `setup` sizes from the same
   record. The two took opposite answers, so the first tray click after a reboot

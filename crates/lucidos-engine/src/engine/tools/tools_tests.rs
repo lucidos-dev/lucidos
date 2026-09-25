@@ -8,8 +8,8 @@
 
 use super::{
     merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
-    parse_send_notification_args, parse_source_arg, parse_status_arg, query_events_impl,
-    status_filter_arg, BACKUP_SETTINGS_NAVIGATED,
+    parse_send_notification_args, parse_source_arg, parse_status_arg, pending_scope_arg,
+    query_events_impl, status_filter_arg,
 };
 use crate::core::store::{EventStore, StatusFilter};
 use crate::engine::thread_lifecycle::ThreadStatus;
@@ -842,15 +842,15 @@ fn apply_change_accepts_valid_uuid_trimming_whitespace() {
 // wording, and the wording decides whether the agent does the right next thing.
 // ============================================================================
 
-/// A working thread gets pointed at the standing apply. The panel calls that
+/// A settling thread gets pointed at the standing apply. The panel calls that
 /// affordance "Apply as it settles". It is the one answer that lands the
 /// user's change without the agent asking again.
 #[test]
-fn a_refusal_for_a_working_thread_names_apply_when_settled() {
+fn a_refusal_for_a_settling_thread_names_apply_when_settled() {
     use crate::api::changes::ChangeActionRefusal;
     use crate::engine::tools::apply_refusal_message;
 
-    let msg = apply_refusal_message(ChangeActionRefusal::ThreadWorking);
+    let msg = apply_refusal_message(ChangeActionRefusal::ThreadSettling);
     assert!(msg.starts_with("Error:"), "{msg}");
     assert!(
         msg.contains("apply_when_settled"),
@@ -860,7 +860,7 @@ fn a_refusal_for_a_working_thread_names_apply_when_settled() {
 
 /// The other three refusals must NOT name it, not even to forbid it.
 ///
-/// A parked thread is the one that bites: it reads as unsettled, so a
+/// A thread parked on a question is the one that bites: it reads as unsettled, so a
 /// bool-shaped gate pointed at a standing apply there. `standing_verdict`
 /// drops the arm on its first look, which costs the user a report and applies
 /// nothing. The bare absence is the assertion on purpose. A model reading
@@ -956,33 +956,6 @@ fn thread_queue_policy_patch_rejects_unknown_fields() {
     );
 }
 
-/// The blurb the agent gets after landing on Settings → System → Backup must
-/// name Settings → Accounts as where an account is connected, and must not
-/// re-acquire the two claims that rotted: an in-app backup LIST and an in-app
-/// RESTORE. Both moved to the workspace picker, and the stale text sent a user
-/// hunting for accounts on the Backup page (2026-08-05).
-#[test]
-fn backup_navigation_names_the_accounts_page_and_not_a_restore_ui() {
-    let s = BACKUP_SETTINGS_NAVIGATED;
-    assert!(
-        s.contains("Settings → Accounts"),
-        "must point at the page that actually connects an account: {s}"
-    );
-    assert!(
-        s.contains("workspace picker"),
-        "restore lives in the workspace picker and the agent must say so: {s}"
-    );
-    let lower = s.to_lowercase();
-    assert!(
-        !lower.contains("restore from an existing"),
-        "there is no in-app restore button to advertise: {s}"
-    );
-    assert!(
-        !lower.contains("list of available cloud backups"),
-        "the page shows no backup list: {s}"
-    );
-}
-
 /// `my_children` resolves to the CALLER's ambient thread id, never to anything
 /// the model supplies. There is no `parent` argument on the LLM surface to
 /// supply, which is the point: a model asking for "my children" cannot name a
@@ -1023,4 +996,31 @@ fn my_children_resolves_to_the_ambient_caller_thread() {
         Some(caller),
         "and an invented one alongside my_children still resolves to the caller"
     );
+}
+
+/// `current` names the calling thread; a bad id or a non-string is refused
+/// rather than silently listing every change.
+#[test]
+fn sub_threads_of_resolves_current_and_refuses_the_rest() {
+    use crate::core::changes::PendingScope;
+    let caller = Uuid::new_v4();
+    assert_eq!(pending_scope_arg(&json!({}), caller), Ok(PendingScope::All));
+    assert_eq!(
+        pending_scope_arg(&json!({"sub_threads_of": "current"}), caller),
+        Ok(PendingScope::SubThreadsOf(caller))
+    );
+    let other = Uuid::new_v4();
+    assert_eq!(
+        pending_scope_arg(&json!({"sub_threads_of": other.to_string()}), caller),
+        Ok(PendingScope::SubThreadsOf(other))
+    );
+    for bad in [
+        json!({"sub_threads_of": "nope"}),
+        json!({"sub_threads_of": 7}),
+    ] {
+        assert!(
+            pending_scope_arg(&bad, caller).is_err(),
+            "{bad} must be refused"
+        );
+    }
 }

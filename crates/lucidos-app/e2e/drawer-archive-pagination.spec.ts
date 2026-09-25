@@ -76,7 +76,7 @@ test.describe('Drawer archive pagination', () => {
         await expect(header).toHaveAttribute('aria-expanded', 'false');
         // The badge is the server's own filter-scoped total, so it states up
         // front how many rows the section owes the reader.
-        await expect(header.locator('.collapse-count-badge'))
+        await expect(header.locator('.section-count-badge'))
             .toHaveText(String(INSIDE_WINDOW + BELOW_WINDOW));
 
         await header.click();

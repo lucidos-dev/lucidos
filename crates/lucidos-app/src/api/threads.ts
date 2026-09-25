@@ -26,6 +26,10 @@ export interface ThreadSummary {
   saved?: boolean;
   section: ThreadSection;
   active_children_count: number;
+  /** Direct children idle on their own live event wait. Such a child has not
+   *  finished (ADR 0254), so the parent waits on it as on an active one.
+   *  Absent on an engine that predates the field. */
+  waiting_children_count?: number;
   total_children_count: number;
   /** Count of descendants (transitive) currently in a state that blocks this
    *  thread from being archived. Maintained by EventBus on
@@ -126,7 +130,7 @@ export interface ThreadsResponse {
     saved: ThreadSummary[];
     archive: ThreadSummary[];
     /** Total size of the archived pile (`archive_state='archived'`, unsaved) —
-     *  NOT just the loaded `archive` window. The collapsed Archive section's
+     *  NOT just the loaded `archive` window. The Archive section's
      *  count badge reads this so it shows the true total. Optional for graceful
      *  degradation: an older engine (or a test mock) that omits it falls back
      *  to the loaded count. */
@@ -191,12 +195,26 @@ export async function unsaveThread(threadId: string): Promise<void> {
     await postThreadAction('unsave', { thread_id: threadId });
 }
 
+/** A cascade member the archive left unarchived, and why. `reason` is
+ *  `apply_in_progress` / `discard_in_progress` when a change claim holds its
+ *  session, `not_archivable` otherwise; `message` is the engine's own words. */
+export interface ArchiveSkippedMember {
+  thread_id: string;
+  reason: string;
+  message: string;
+}
+
 /** Cascading archive — backend archives the target thread and every
  *  descendant in one transaction. Returns the list of thread IDs whose
  *  ThreadArchived event was emitted (excludes descendants that were
- *  already archived). 409 surfaces as ApiError with the engine's
- *  structured reason ("parent_not_archivable" | "descendants_blocking"). */
-export async function archiveThread(threadId: string): Promise<{ archived: string[] }> {
+ *  already archived), and the members it had to leave unarchived. 409
+ *  surfaces as ApiError with the engine's structured reason
+ *  ("parent_not_archivable" | "descendants_blocking" |
+ *  "apply_in_progress" | "discard_in_progress", each with `message`).
+ *  `skipped` is optional because an older engine does not send it. */
+export async function archiveThread(
+  threadId: string,
+): Promise<{ archived: string[]; skipped?: ArchiveSkippedMember[] }> {
     const res = await postThreadAction('archive', { thread_id: threadId });
     return res.json();
 }
@@ -245,6 +263,15 @@ export async function deleteThreadFamily(
     return res.json();
 }
 
+/** Move a child thread to top level (ADR 0278). Its former parent stops
+ *  waiting for it. The child keeps running. */
+export async function detachThread(threadId: string): Promise<void> {
+    const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/detach`, {
+        method: 'POST',
+    });
+    await throwIfNotOk(res);
+}
+
 export async function renameThread(threadId: string, title: string): Promise<void> {
     await postThreadAction('rename', { thread_id: threadId, title });
 }
@@ -287,15 +314,26 @@ export async function fetchOlderThreads(
   appIds?: string[],
 ): Promise<OlderThreadsResponse> {
     const params = new URLSearchParams({ before, limit: String(limit) });
-    if (sources && sources.length > 0) params.set('sources', sources.join(','));
-    if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
-    if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
-    if (appIds && appIds.length > 0) params.set('app_ids', appIds.join(','));
+    setDrawerFilterParams(params, sources, triggerIds, repoIds, appIds);
     return json<OlderThreadsResponse>(`${API}/threads/older?${params}`);
 }
 
+/** The drawer filter as query params. An absent or empty list sets nothing. */
+function setDrawerFilterParams(
+  params: URLSearchParams,
+  sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
+  appIds?: string[],
+): void {
+  if (sources && sources.length > 0) params.set('sources', sources.join(','));
+  if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
+  if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
+  if (appIds && appIds.length > 0) params.set('app_ids', appIds.join(','));
+}
+
 /** True size of the archived pile (`archive_state='archived'`, unsaved) matching
- *  the active drawer filter — drives the collapsed Archive badge so the number
+ *  the active drawer filter. It drives the Archive badge, so the number
  *  reflects the filter and stays stable regardless of how many rows are loaded.
  *  Mirrors `fetchOlderThreads`'s filter params (no cursor — it's a COUNT). Omit
  *  all four to count the whole pile. */
@@ -306,10 +344,7 @@ export async function fetchArchivedCount(
   appIds?: string[],
 ): Promise<number> {
   const params = new URLSearchParams();
-  if (sources && sources.length > 0) params.set('sources', sources.join(','));
-  if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
-  if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
-  if (appIds && appIds.length > 0) params.set('app_ids', appIds.join(','));
+  setDrawerFilterParams(params, sources, triggerIds, repoIds, appIds);
   const qs = params.toString();
   const data = await json<{ count: number }>(`${API}/threads/archived-count${qs ? `?${qs}` : ''}`);
   return data.count;
@@ -405,7 +440,7 @@ export async function fetchThreadEvents(
 /** Payload returned by the lazy-load endpoint for one `ContextCaptured`
  *  event. The snapshot endpoint strips these to keep the events list small;
  *  the step-detail modal fetches them on open. Mirrors Rust
- *  `ContextCapturePayload` in `api/threads.rs`. */
+ *  `ContextCapturePayload` in `api/threads/events_snapshot.rs`. */
 export interface ContextCapturePayload {
   sections: import('../store/types').ContextSection[];
   tools: string[];
@@ -425,7 +460,7 @@ export async function fetchContextCapture(
  *  The snapshot endpoint strips `result` to keep the events list small;
  *  the step-detail modal fetches it on open. `result` is `null` for
  *  image-only tool results (no textual result was ever written).
- *  Mirrors Rust `ToolResultPayload` in `api/threads.rs`. */
+ *  Mirrors Rust `ToolResultPayload` in `api/threads/events_snapshot.rs`. */
 export interface ToolResultPayload {
   result: string | null;
 }

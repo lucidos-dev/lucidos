@@ -49,8 +49,9 @@ live frame is still that rect. Any other frame means the user moved or resized
 the window, so the note is dropped and their frame is recorded from then on.
 
 **A workspace with no remembered frame records the correction.** There is
-nothing better to keep, and a workspace with no frame at all reopens at the
-declared default.
+nothing better to keep. A workspace with no frame at all reopens cascaded from
+the window that asked for it. With no such window, it takes most of the
+primary's work area (`window_restore::new_window_frame`).
 
 **The window-state plugin is stood down rather than corrected.** It covers
 `main` alone, and reads live geometry itself. Not calling it is therefore the
@@ -100,7 +101,8 @@ opposite failure, recording the rescue, destroys the arrangement permanently.
   hidden rather than closed, and comes back on its workspace. A note outliving
   its window would hold the record against a later, unrelated frame.
 - Nothing is added to `.window-session.json`, so an older build reads every
-  record this one writes.
+  record this one writes. ADR 0269 later adds an optional display anchor
+  beside each frame, and keeps that promise.
 - The seam is not verifiable outside a packaged build (ADR 0016). The capture
   rule and the note are pure and covered by unit tests.
 

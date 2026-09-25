@@ -8,6 +8,7 @@
 export type ExchangeStatus =
   | 'pending'          // Created, waiting for first SSE event
   | 'queued'           // Waiting for a prior active exchange to finish
+  | 'held'             // A callback waiting behind an open question's answer
   | 'streaming'        // SSE events flowing (text/tools)
   | 'coding-agent-working'       // Claude Code actively working
   | 'awaiting-answer'  // CC paused on a question or permission prompt — user's turn
@@ -38,6 +39,10 @@ export function isTerminated(status: ExchangeStatus): boolean {
   return TERMINATED_STATUSES.has(status);
 }
 
+/** What anything waiting on an open question says: a held message, and a
+ *  callback queued behind the answer. */
+export const HELD_UNTIL_REPLY = 'Held until you reply';
+
 /** Map status to a UI label and CSS class. */
 export function statusLabel(
   status: ExchangeStatus,
@@ -46,6 +51,8 @@ export function statusLabel(
   switch (status) {
     case 'queued':
       return { label: 'Queued', className: 'queued' };
+    case 'held':
+      return { label: HELD_UNTIL_REPLY, className: 'queued' };
     case 'pending':
     case 'streaming':
       return hasSteps

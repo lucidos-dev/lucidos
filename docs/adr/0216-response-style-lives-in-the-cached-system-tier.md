@@ -85,7 +85,8 @@ which is what was asked for.
   of the cached tier first.** That is a re-read of ADR 0084, not an extra field.
 - Coding-agent sessions are untouched. Both keys are kept out of
   `agent_context::SAFE_PREFERENCE_KEYS`, so neither reaches the
-  `[USER DEVICE & PREFERENCES]` block either.
+  `[USER DEVICE & PREFERENCES]` block either. ADR 0273 later added technical
+  literacy as the style's second part, and that part does reach them.
 
 ## Alternatives considered
 

@@ -232,30 +232,128 @@ async fn a_fire_naming_no_trigger_carries_none() {
     teardown_test_db(&db_name).await;
 }
 
-/// The CURRENT turn, not any turn the thread ever had. An owner-opened turn
-/// that a restart superseded no longer speaks for the owner.
-#[tokio::test]
-async fn an_engine_continuation_supersedes_the_owners_turn() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread = Uuid::new_v4();
-    open_turn(&bus, thread, ActorMode::Human, device()).await;
+/// Resume the thread's turn, stamped with whatever origin the resume path uses.
+/// Production writes both shapes: no origin at all (`auto_resume_after_switch`)
+/// and an engine origin.
+async fn resume_turn(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrigin>) {
     bus.emit(BusEvent::Thread {
-        thread_id: thread,
+        thread_id,
         event: ThreadEvent::ContinuationStarted {
             branch: String::new(),
-            origin: Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
-            reason: None,
+            origin,
+            reason: Some("auto_resume_after_switch".into()),
         },
         meta: EventMeta::NONE,
     })
     .await
     .unwrap();
+}
 
-    assert!(
-        !carries_standing_instruction(&pool, Some(thread), None).await,
-        "the engine re-opened this turn, so the owner did not"
-    );
+fn engine_resume() -> Option<MessageOrigin> {
+    Some(MessageOrigin::engine(EngineReason::ContinuationStarted))
+}
+
+fn spawning_thread() -> MessageOrigin {
+    MessageOrigin::ThreadLink {
+        thread_id: Uuid::new_v4(),
+        title: None,
+        spawning_event_id: None,
+        mode: ActorMode::Agent,
+        direction: ThreadDirection::Parent,
+    }
+}
+
+/// A resume is the owner's turn carrying on, not a new turn somebody else
+/// opened (ADR 0168 clause 6). The user's own engine switch resumed this one,
+/// and it then refused to create a top-thread.
+#[tokio::test]
+async fn an_engine_resume_keeps_the_owners_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    open_turn(&bus, thread, ActorMode::Human, device()).await;
+    resume_turn(&bus, thread, None).await;
+    resume_turn(&bus, thread, engine_resume()).await;
+
+    assert!(carries_standing_instruction(&pool, Some(thread), None).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The resume inherits, and never promotes: a turn another thread opened stays
+/// that thread's after the engine resumes it. The CURRENT turn decides, so an
+/// owner turn before it lends nothing.
+#[tokio::test]
+async fn an_engine_resume_of_an_agent_turn_carries_none() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    open_turn(&bus, thread, ActorMode::Human, device()).await;
+    open_turn(&bus, thread, ActorMode::Agent, spawning_thread()).await;
+    resume_turn(&bus, thread, engine_resume()).await;
+
+    assert!(!carries_standing_instruction(&pool, Some(thread), None).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A resumed fire is still weighed by who authored its trigger.
+#[tokio::test]
+async fn an_engine_resume_of_a_fire_is_weighed_by_its_trigger() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let owners = Uuid::new_v4();
+    let agents = Uuid::new_v4();
+    author_trigger(&bus, "nightly", Some(device())).await;
+    author_trigger(
+        &bus,
+        "self-made",
+        Some(MessageOrigin::Api {
+            user_agent: None,
+            mode: ActorMode::Agent,
+            source_thread_id: Some(Uuid::new_v4()),
+        }),
+    )
+    .await;
+    fire_trigger_on(&bus, owners, "nightly").await;
+    fire_trigger_on(&bus, agents, "self-made").await;
+    resume_turn(&bus, owners, None).await;
+    resume_turn(&bus, agents, None).await;
+
+    assert!(carries_standing_instruction(&pool, Some(owners), None).await);
+    assert!(!carries_standing_instruction(&pool, Some(agents), None).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A resume with no turn behind it has nothing to inherit, so it is a no.
+#[tokio::test]
+async fn a_lone_engine_resume_carries_none() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    resume_turn(&bus, thread, engine_resume()).await;
+
+    assert!(!carries_standing_instruction(&pool, Some(thread), None).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The owner clicking Continue is the owner speaking, whoever opened the turn
+/// it resumes.
+#[tokio::test]
+async fn the_owner_clicking_continue_carries_it() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    open_turn(&bus, thread, ActorMode::Agent, spawning_thread()).await;
+    resume_turn(&bus, thread, Some(device())).await;
+
+    assert!(carries_standing_instruction(&pool, Some(thread), None).await);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

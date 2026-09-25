@@ -3,7 +3,7 @@ import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { showConfirm, showToast } from '../../store/store';
-import { toFailed, type Loadable } from '../../store/types';
+import { setLoadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { Explainer } from '../shared/Explainer';
@@ -36,8 +36,10 @@ interface DiskSummary {
 const inventory = signal<Loadable<WorktreeRow[]>>({ status: 'not-loaded' });
 const summary = signal<Loadable<DiskSummary>>({ status: 'not-loaded' });
 
+// Both loaders keep a loaded value on screen while they re-read. They run again
+// after every cleanup, and blanking would unmount the page under the user.
 async function loadSummary(): Promise<void> {
-  summary.value = { status: 'loading' };
+  setLoadingIfFresh(summary);
   try {
     const res = await fetch(`${API}/disk-usage/summary`);
     await throwIfNotOk(res);
@@ -48,7 +50,7 @@ async function loadSummary(): Promise<void> {
 }
 
 async function loadInventory(): Promise<void> {
-  inventory.value = { status: 'loading' };
+  setLoadingIfFresh(inventory);
   try {
     const res = await fetch(`${API}/disk-usage/worktrees`);
     await throwIfNotOk(res);

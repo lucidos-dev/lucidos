@@ -802,6 +802,38 @@ impl EventBus {
                         Self::check_archive_allowed(&mut tx, thread_id).await?;
                     }
 
+                    // A card for a child moved to top level is dropped, not
+                    // delivered (ADR 0278). The fan-in read the edge before this
+                    // transaction began, so a detach can land in between. A
+                    // move whose edge is already gone is dropped the same way,
+                    // so the fan-out cap counts each move once.
+                    let dropped_child = match te {
+                        ThreadEvent::ChildThreadCompleted {
+                            child_thread_id, ..
+                        }
+                        | ThreadEvent::ChildThreadStopped {
+                            child_thread_id, ..
+                        } => Self::child_was_moved_out(&mut tx, *thread_id, *child_thread_id)
+                            .await?
+                            .then_some(*child_thread_id),
+                        ThreadEvent::ChildThreadDetached {
+                            child_thread_id, ..
+                        } => (!Self::lock_edge_for_detach(&mut tx, *thread_id, *child_thread_id)
+                            .await?)
+                            .then_some(*child_thread_id),
+                        _ => None,
+                    };
+                    if let Some(child_thread_id) = dropped_child {
+                        tx.rollback().await?;
+                        crate::log!(
+                            "[EventBus] {} suppressed on {}: child {} is not its child",
+                            te.event_type(),
+                            thread_id,
+                            child_thread_id
+                        );
+                        return Ok(None);
+                    }
+
                     // === Phase: Persist ===
                     // INSERT into the events table. Assigns the bigserial sequence
                     // that drives ordering for every downstream consumer (SSE
@@ -1033,6 +1065,11 @@ impl EventBus {
                 crate::core::DevicePresenceStore::record_visible(&self.pool, device_id).await
             }
             SystemEvent::DeviceHidden { device_id } => {
+                // A failed stamp costs an older "last seen". It must not keep
+                // the presence row, which would hold off an OS push.
+                if let Err(e) = crate::core::DeviceStore::mark_seen(&self.pool, device_id).await {
+                    log!("[EventBus] DeviceHidden: last seen stamp failed for {device_id}: {e}");
+                }
                 crate::core::DevicePresenceStore::record_hidden(&self.pool, device_id).await
             }
             _ => Ok(true),
@@ -1045,30 +1082,30 @@ impl EventBus {
     async fn get_thread_type(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: &Uuid,
-    ) -> ThreadType {
+    ) -> Result<ThreadType, sqlx::Error> {
         let source: Option<String> =
             sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
                 .bind(thread_id)
                 .fetch_optional(&mut **tx)
-                .await
-                .unwrap_or(None);
-        ThreadType::from_source(source.as_deref().unwrap_or_default())
+                .await?;
+        Ok(ThreadType::from_source(
+            source.as_deref().unwrap_or_default(),
+        ))
     }
 
     /// Get the current stored section from thread_summaries.
     async fn get_current_section(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: &Uuid,
-    ) -> ArchiveState {
+    ) -> Result<ArchiveState, sqlx::Error> {
         let section: Option<String> =
             sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
                 .bind(thread_id)
                 .fetch_optional(&mut **tx)
-                .await
-                .unwrap_or(None);
-        section
+                .await?;
+        Ok(section
             .map(|s| ArchiveState::parse(&s))
-            .unwrap_or(ArchiveState::Archived)
+            .unwrap_or(ArchiveState::Archived))
     }
 
     /// Refuse a `ThreadArchived` on a thread waiting on the user.
@@ -1096,6 +1133,60 @@ impl EventBus {
             thread_lifecycle::ThreadStatus::parse(&status),
         )?;
         Ok(())
+    }
+
+    /// Whether `child_id` still has a row that no longer names `parent_id` as
+    /// its parent: it was moved to top level (ADR 0278).
+    ///
+    /// A missing row is not a move. Deleting a child settles its parent with a
+    /// card after the row may be gone (ADR 0252).
+    ///
+    /// `FOR UPDATE`, because the card's projection writes this row next. A
+    /// shared lock would let a card and a detach both hold it, and both
+    /// upgrades would then deadlock. Whichever locks first commits first.
+    async fn child_was_moved_out(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        parent_id: Uuid,
+        child_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1 FOR UPDATE",
+        )
+        .bind(child_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(row.is_some_and(|parent| parent != Some(parent_id)))
+    }
+
+    /// Lock what a move to top level writes, and report whether `child_id`
+    /// is still `parent_id`'s child. A missing row is no edge.
+    ///
+    /// The detach rebases `depth` over the child's subtree. So the rows are
+    /// locked deepest first, the child last: a descendant's own terminal locks
+    /// its row and then its parent's, and the same order cannot deadlock.
+    async fn lock_edge_for_detach(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        parent_id: Uuid,
+        child_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let locked: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "WITH RECURSIVE subtree AS ( \
+                SELECT $1::uuid AS thread_id \
+                UNION \
+                SELECT c.thread_id FROM thread_summaries c \
+                JOIN subtree s ON c.parent_thread_id = s.thread_id \
+             ) \
+             SELECT t.thread_id, t.parent_thread_id FROM thread_summaries t \
+             WHERE t.thread_id IN (SELECT thread_id FROM subtree) \
+             ORDER BY t.depth DESC, t.thread_id \
+             FOR UPDATE OF t",
+        )
+        .bind(child_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(locked
+            .iter()
+            .any(|(id, parent)| *id == child_id && *parent == Some(parent_id)))
     }
 
     /// Apply a contract transition result to the database. Only effect is the

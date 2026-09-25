@@ -37,6 +37,10 @@ And a carrying ride needs no reading of where the reader was. `keepTheLiveEdge`
 takes `followIsCarrying()` as a third source beside its two position readings,
 matching what `honourGrowth`'s carrying arm already does.
 
+> **Amended:** ADR 0064's follow is one state again, so every armed ride is a
+> carrying one. `keepTheLiveEdge` reads the armed flag alone, and both position
+> readings and `followIsCarrying` are gone.
+
 ## Rationale
 
 The ride is a standing request, not a reaction. Serving it on events alone makes

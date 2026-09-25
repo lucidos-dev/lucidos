@@ -83,9 +83,6 @@ impl PushSubscriptionStore {
         )
         .execute(pool)
         .await?;
-        sqlx::query("ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS scope_url TEXT")
-            .execute(pool)
-            .await?;
 
         Ok(())
     }

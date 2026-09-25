@@ -223,10 +223,30 @@ fn applying_git_gate(engine_source_matches_head: Option<bool>) -> bool {
 impl LucidosEngine {
     /// Register the swappable served-frontend handle + its source dir. Called once
     /// by `api::create_router` when `LUCIDOS_STATIC_DIR` is set. A second call
-    /// (e.g. a second router in a test) is ignored — the first registration wins.
+    /// (e.g. a second router in a test) is ignored: the first registration wins.
+    ///
+    /// The boot snapshot's served commit stays unknown. `dist/` may be stale
+    /// (a failed build, a stopped build-watch, one still running), and nothing
+    /// records which commit it was built from. The first swap records one.
     pub fn init_served_frontend(&self, handle: Arc<RwLock<PathBuf>>, source: PathBuf) {
         let _ = self.served_frontend.set(handle);
         let _ = self.served_frontend_source.set(source);
+    }
+
+    /// `candidate` when a client built from it runs on this engine, else
+    /// `None`. See [`compatible_served_commit`].
+    ///
+    /// [`compatible_served_commit`]: crate::engine::engine_version::compatible_served_commit
+    async fn compatible_served_commit(candidate: &str) -> Option<String> {
+        let running = crate::engine::engine_version::build_id_commit(crate::ENGINE_BUILD_ID)?;
+        let root = crate::paths::repo_root().ok()?;
+        crate::engine::engine_version::compatible_served_commit(running, candidate, &root).await
+    }
+
+    /// The trunk HEAD the served snapshot was taken at, or `None` when unknown
+    /// or incompatible with the running engine.
+    pub(crate) fn served_frontend_commit(&self) -> Option<String> {
+        self.served_frontend_commit.lock().unwrap().clone()
     }
 
     fn frontend_refresh_superseded(&self, generation: u64) -> bool {
@@ -312,36 +332,9 @@ impl LucidosEngine {
     /// holds a new-engine client, so the disk gate alone would wrongly permit an
     /// advance.
     pub(crate) async fn engine_source_matches_head(&self) -> Option<bool> {
-        // Running engine commit = the `sha` prefix of ENGINE_BUILD_ID (strip any
-        // `-<diffhash>` dirty suffix). Empty (unstamped) or a `src-…` shipped id
-        // (no git) → can't compare via git → unknown.
-        let id = crate::ENGINE_BUILD_ID;
-        if id.is_empty() || id.starts_with("src") {
-            return None;
-        }
-        let commit = id.split('-').next().unwrap_or("");
-        if commit.is_empty() {
-            return None;
-        }
+        let commit = crate::engine::engine_version::build_id_commit(crate::ENGINE_BUILD_ID)?;
         let root = crate::paths::repo_root().ok()?;
-        let out = tokio::process::Command::new("git")
-            .args(["diff", "--name-only", commit, "HEAD"])
-            .current_dir(&root)
-            .output()
-            .await
-            .ok()?;
-        if !out.status.success() {
-            return None; // e.g. `commit` unknown in this checkout → unknown
-        }
-        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        // Safe iff NO restart-requiring (binary-affecting) file changed since the
-        // running engine's commit — the exact inverse of the Apply path's mixed-
-        // change decision, so we never strand a change it treats as frontend-only.
-        Some(!crate::engine::git_ops::files_require_restart(&files))
+        crate::engine::engine_version::no_restart_between(commit, "HEAD", &root).await
     }
 
     /// Composed INV-A gate for the APPLYING engine's own frontend-only advance:
@@ -536,6 +529,16 @@ impl LucidosEngine {
         workspace: &Path,
         generation: u64,
     ) -> bool {
+        // Read BEFORE the copy: `dist/` can only hold this commit or an older
+        // one. An unreadable or incompatible HEAD records `None`, which lists
+        // everything since the running commit.
+        let served_commit = match crate::paths::repo_root() {
+            Ok(root) => match crate::engine::git_ops::current_head_sha(&root).await {
+                Some(head) => Self::compatible_served_commit(&head).await,
+                None => None,
+            },
+            Err(_) => None,
+        };
         match frontend_snapshot::pin_generation(source, workspace, generation) {
             Ok(new_dir) => {
                 if self.frontend_refresh_superseded(generation) {
@@ -547,6 +550,7 @@ impl LucidosEngine {
                     let mut guard = handle.write().unwrap();
                     std::mem::replace(&mut *guard, new_dir.clone())
                 };
+                *self.served_frontend_commit.lock().unwrap() = served_commit;
                 crate::log!(
                     "[Frontend] serving re-snapshotted dist at {}",
                     new_dir.display()

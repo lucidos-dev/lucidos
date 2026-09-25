@@ -452,7 +452,7 @@ async fn add_paths_to_worktree_exclude_makes_git_status_honor_paths_in_worktree(
 }
 
 /// Regression test for the app-coding-agent thread bug: CC runs inside
-/// `<wt>/data/apps/<id>/` so `install_lucidos_cli_skill` writes the SKILL.md
+/// `<wt>/data/apps/<id>/` so `place_lucidos_cli_skill` writes the SKILL.md
 /// at a DEEP path (`data/apps/<id>/.claude/skills/lucidos-cli/SKILL.md`).
 /// The `.git/info/exclude` entry must therefore match at any depth, not just
 /// at the worktree root. Exercises `git status` against `WORKTREE_EXCLUDE_PATHS`
@@ -830,11 +830,9 @@ async fn hide_phantom_tracked_skill_hides_modified_tracked_skill() {
     );
 }
 
-/// The Lucidos-repo case: `SKILL.md` is intentionally tracked and (because the
-/// embedded copy is byte-identical to the committed one) shows NO divergence at
-/// session start. The guard must leave it alone so a later legitimate edit to
-/// the skill source is still seen by git — skip-worktree here would silently
-/// swallow real work.
+/// A repo that deliberately tracks a copy identical to the engine's shows NO
+/// divergence at session start. The guard must leave it alone so a later
+/// legitimate edit is still seen by git: skip-worktree would swallow it.
 #[tokio::test]
 async fn hide_phantom_tracked_skill_leaves_clean_tracked_skill_editable() {
     let (_tmp, repo) = make_test_repo().await;
@@ -904,6 +902,186 @@ async fn hide_phantom_tracked_skill_hides_deep_app_skill_from_subdir_cwd() {
         after.trim().is_empty(),
         "phantom deep app skill must be hidden when the guard runs from the app-folder cwd: {after}"
     );
+}
+
+async fn commit_skill(dir: &std::path::Path, body: &str, message: &str) {
+    let skill = dir.join(PHANTOM_SKILL_REL);
+    tokio::fs::create_dir_all(skill.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&skill, body).await.unwrap();
+    let _ = git_cmd(&["add", "--", PHANTOM_SKILL_REL], dir)
+        .await
+        .unwrap();
+    let commit = git_cmd(&["commit", "-m", message], dir).await.unwrap();
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+async fn merge_main(wt: &std::path::Path) -> std::process::Output {
+    git_cmd(&["merge", "main", "--no-edit"], wt).await.unwrap()
+}
+
+async fn skip_worktree_tag(wt: &std::path::Path) -> String {
+    String::from_utf8_lossy(
+        &git_cmd(&["ls-files", "-v", "--", PHANTOM_SKILL_REL], wt)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .into_owned()
+}
+
+/// The Lucidos repo tracks the skill and edits it on `main`, while the running
+/// engine embeds whatever version it was built from. A spawn must leave the
+/// branch's copy alone, or a later `git merge main` refuses with "local changes
+/// would be overwritten" behind a clean `git status`.
+#[tokio::test]
+async fn lucidos_source_spawn_never_blocks_merging_main() {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
+
+    let (_tmp, repo) = make_test_repo().await;
+    commit_skill(&repo, "skill v1\n", "skill v1").await;
+    let wt = add_worktree(&repo, "claude-code/source", "wt-source").await;
+
+    // The engine binary was built from a newer main than the branch base.
+    place_lucidos_cli_skill(&wt, CodingAgentKind::Lucidos, "skill v2\n").await;
+    commit_skill(&repo, "skill v2\n", "skill v2").await;
+
+    let merge = merge_main(&wt).await;
+    assert!(
+        merge.status.success(),
+        "merging main must not trip on the skill: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    assert!(
+        !skip_worktree_tag(&wt).await.starts_with('S'),
+        "a Lucidos spawn must never skip-worktree the tracked skill"
+    );
+}
+
+/// A Lucidos branch that commits its own skill edit must keep it across a
+/// respawn: the engine's embedded copy never overwrites the tracked one.
+#[tokio::test]
+async fn lucidos_source_spawn_keeps_the_branch_copy() {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
+
+    let (_tmp, repo) = make_test_repo().await;
+    commit_skill(&repo, "skill v1\n", "skill v1").await;
+    let wt = add_worktree(&repo, "claude-code/edit", "wt-edit").await;
+    commit_skill(&wt, "skill edited on the branch\n", "edit skill").await;
+
+    place_lucidos_cli_skill(&wt, CodingAgentKind::Lucidos, "skill v1\n").await;
+
+    let on_disk = tokio::fs::read_to_string(wt.join(PHANTOM_SKILL_REL))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, "skill edited on the branch\n");
+    assert!(porcelain_for(&wt, PHANTOM_SKILL_REL)
+        .await
+        .trim()
+        .is_empty());
+}
+
+/// A worktree an older engine hid, holding content git already stores (the
+/// reported case: main's new copy). The repair clears the bit and restores the
+/// tracked copy, and the merge of main then goes through.
+#[tokio::test]
+async fn lucidos_source_spawn_repairs_a_hidden_committed_copy() {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
+
+    let (_tmp, repo) = make_test_repo().await;
+    commit_skill(&repo, "skill v1\n", "skill v1").await;
+    let wt = add_worktree(&repo, "claude-code/repair", "wt-repair").await;
+    commit_skill(&repo, "skill v2\n", "skill v2").await;
+
+    // What an older engine left: its copy on disk, hidden by skip-worktree.
+    tokio::fs::write(wt.join(PHANTOM_SKILL_REL), "skill v2\n")
+        .await
+        .unwrap();
+    hide_phantom_tracked_skill(&wt, PHANTOM_SKILL_REL).await;
+    assert!(
+        skip_worktree_tag(&wt).await.starts_with('S'),
+        "precondition: the old engine's skip-worktree bit is set"
+    );
+    assert!(
+        !merge_main(&wt).await.status.success(),
+        "precondition: the hidden copy blocks merging main"
+    );
+
+    place_lucidos_cli_skill(&wt, CodingAgentKind::Lucidos, "skill v3\n").await;
+
+    assert!(!skip_worktree_tag(&wt).await.starts_with('S'));
+    assert!(porcelain_for(&wt, PHANTOM_SKILL_REL)
+        .await
+        .trim()
+        .is_empty());
+    let merge = merge_main(&wt).await;
+    assert!(
+        merge.status.success(),
+        "merging main must succeed after the repair: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+}
+
+/// Hidden content git does not store may be the agent's own edit. The repair
+/// clears the bit but never overwrites it: the change stays visible instead.
+#[tokio::test]
+async fn lucidos_source_spawn_repair_keeps_content_git_does_not_store() {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
+
+    let (_tmp, repo) = make_test_repo().await;
+    commit_skill(&repo, "skill v1\n", "skill v1").await;
+    let wt = add_worktree(&repo, "claude-code/keep", "wt-keep").await;
+
+    tokio::fs::write(wt.join(PHANTOM_SKILL_REL), "an edit only on disk\n")
+        .await
+        .unwrap();
+    hide_phantom_tracked_skill(&wt, PHANTOM_SKILL_REL).await;
+
+    place_lucidos_cli_skill(&wt, CodingAgentKind::Lucidos, "skill v1\n").await;
+
+    assert!(!skip_worktree_tag(&wt).await.starts_with('S'));
+    let on_disk = tokio::fs::read_to_string(wt.join(PHANTOM_SKILL_REL))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, "an edit only on disk\n");
+    assert!(
+        porcelain_for(&wt, PHANTOM_SKILL_REL)
+            .await
+            .contains("SKILL.md"),
+        "the kept content must show as a normal change"
+    );
+}
+
+/// External and app repos keep the engine's ownership: the embedded copy is
+/// written over a tracked stale one, and the divergence is hidden.
+#[tokio::test]
+async fn external_spawn_installs_and_hides_the_engine_copy() {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
+
+    let (_tmp, repo) = make_test_repo().await;
+    commit_skill(&repo, "stale committed skill\n", "auto-committed skill").await;
+    let wt = add_worktree(&repo, "claude-code/external", "wt-external").await;
+
+    place_lucidos_cli_skill(&wt, CodingAgentKind::External, "engine skill\n").await;
+
+    let on_disk = tokio::fs::read_to_string(wt.join(PHANTOM_SKILL_REL))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, "engine skill\n");
+    assert!(porcelain_for(&wt, PHANTOM_SKILL_REL)
+        .await
+        .trim()
+        .is_empty());
 }
 
 /// An untracked injected skill (the normal external-repo / post-cleanup case)

@@ -108,7 +108,7 @@ test.describe('Explainer in the thread filter panel: desktop layout', () => {
     await expect(page.locator('.thread-drawer .thread-filter-panel')).toBeVisible();
     // "Filters", not "Thread filters": the pane is already the Threads pane, so
     // the row says the short form (AppHeader, and the mobile row matching it).
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Filters');
+    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Filters');
     await expect(
       page.locator('.thread-filter-panel .drawer-view-option-active .drawer-view-label'),
     ).toHaveText('All statuses');

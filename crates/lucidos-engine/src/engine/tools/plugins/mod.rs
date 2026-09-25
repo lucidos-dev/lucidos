@@ -56,15 +56,15 @@ pub(crate) use registry::find_plugin_owning_app;
 pub(crate) use registry::installed_plugin_summaries;
 
 /// Sentinel prefix on the `install_plugin` / `update_plugin` tool result. The
-/// agentic loop strips it and re-emits a transient
+/// agentic loop strips it and emits the *form request*
 /// `ThreadEvent::PluginInstallRequested` so the frontend can render the install
 /// panel. Mirrors the credentials pattern in
 /// `engine::tools::credentials::CREDENTIAL_REQUEST_PREFIX`.
 pub(crate) const PLUGIN_INSTALL_REQUEST_PREFIX: &str = "[PLUGIN_INSTALL_REQUEST]";
 
 /// Sentinel prefix on the `uninstall_plugin` tool result. Same pattern as
-/// `PLUGIN_INSTALL_REQUEST_PREFIX` — agentic loop intercepts, emits a transient
-/// `ThreadEvent::PluginUninstallRequested`, and the frontend renders the
+/// `PLUGIN_INSTALL_REQUEST_PREFIX`: the agentic loop intercepts, emits the form
+/// request `ThreadEvent::PluginUninstallRequested`, and the frontend renders the
 /// uninstall confirm panel. Symmetric with install so the LLM cannot
 /// hallucinate "uninstalled" without the user seeing the panel.
 pub(crate) const PLUGIN_UNINSTALL_REQUEST_PREFIX: &str = "[PLUGIN_UNINSTALL_REQUEST]";
@@ -234,7 +234,8 @@ impl LucidosEngine {
     }
 }
 
-type PendingInstallsMap = std::sync::Mutex<std::collections::HashMap<String, PendingInstall>>;
+pub(crate) type PendingInstallsMap =
+    std::sync::Mutex<std::collections::HashMap<String, PendingInstall>>;
 
 /// Stage `source_str` into a temp dir, validate the manifest + tree, register
 /// the result in `pending_installs`, and return the
@@ -419,15 +420,34 @@ impl HasCreatedAt for PendingUninstall {
     }
 }
 
-/// Drop pending entries older than `ttl_secs`. Both install and uninstall maps
-/// use this to keep abandoned entries from leaking.
+/// Drop pending entries older than `ttl_secs` and return their ids. Both
+/// install and uninstall maps use this to keep abandoned entries from leaking.
 fn sweep_stale<T: HasCreatedAt>(
     map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, T>>>,
     ttl_secs: i64,
-) {
+) -> Vec<String> {
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(ttl_secs);
     let mut guard = map.lock().expect("pending map mutex poisoned");
-    guard.retain(|_, entry| entry.created_at() >= cutoff);
+    let mut dropped = Vec::new();
+    guard.retain(|id, entry| {
+        let live = entry.created_at() >= cutoff;
+        if !live {
+            dropped.push(id.clone());
+        }
+        live
+    });
+    dropped
+}
+
+/// Drop the stagings past their TTL from both maps. Returns the ids dropped, so
+/// the caller can close their *form requests* as expired.
+pub(crate) fn sweep_expired_stagings(
+    installs: &std::sync::Arc<PendingInstallsMap>,
+    uninstalls: &std::sync::Arc<PendingUninstallsMap>,
+) -> Vec<String> {
+    let mut dropped = sweep_stale(installs, PENDING_INSTALL_TTL_SECS);
+    dropped.extend(sweep_stale(uninstalls, PENDING_UNINSTALL_TTL_SECS));
+    dropped
 }
 
 fn sweep_stale_pending(map: &std::sync::Arc<PendingInstallsMap>) {
@@ -645,21 +665,7 @@ pub async fn confirm_pending_uninstall(
     // trigger.toml projection.
     delete_plugin_triggers(engine, &pending.plugin_id, actor).await;
 
-    let auth_prefix = format!("{}/", AUTH_MODULES_DIR);
-    if outcome
-        .files_deleted
-        .iter()
-        .any(|p| p.starts_with(&auth_prefix))
-    {
-        if let Err(e) =
-            crate::api::proxy::reload_proxy_modules_into(engine, &engine.workspace_path).await
-        {
-            log!(
-                "[Plugins] auto-reload after uninstall failed (uninstall still succeeded): {}",
-                e
-            );
-        }
-    }
+    reload_auth_modules_if_needed(engine, &outcome.files_deleted, "uninstall").await;
 
     Ok(outcome)
 }
@@ -1194,7 +1200,7 @@ pub async fn confirm_pending_install(
 
     announce_local_changes(engine, &pending, local_changes.as_ref(), actor.clone()).await;
 
-    reload_auth_modules_if_needed(engine, &installed_files).await;
+    reload_auth_modules_if_needed(engine, &installed_files, "install").await;
 
     // Auto-register the plugin's shipped event-driven triggers (ADR 0019),
     // stamped with the plugin id. On an update this re-syncs against the prior
@@ -1529,14 +1535,21 @@ fn build_setup_thread_request(
     }
 }
 
-async fn reload_auth_modules_if_needed(engine: &LucidosEngine, installed_files: &[String]) {
+/// Reload the proxy's WASM signer map when `touched_files` reaches into
+/// `auth-modules/`. `operation` names the install or uninstall for the log,
+/// which has already succeeded whatever the reload does.
+async fn reload_auth_modules_if_needed(
+    engine: &LucidosEngine,
+    touched_files: &[String],
+    operation: &str,
+) {
     let auth_prefix = format!("{}/", AUTH_MODULES_DIR);
-    if installed_files.iter().any(|p| p.starts_with(&auth_prefix)) {
+    if touched_files.iter().any(|p| p.starts_with(&auth_prefix)) {
         if let Err(e) =
             crate::api::proxy::reload_proxy_modules_into(engine, &engine.workspace_path).await
         {
             log!(
-                "[Plugins] auto-reload after install failed (install still succeeded): {}",
+                "[Plugins] auto-reload after {operation} failed ({operation} still succeeded): {}",
                 e
             );
         }

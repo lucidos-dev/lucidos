@@ -1,3 +1,5 @@
+import type { StepOutcome } from '../../store/types';
+
 export function ClaudeIcon() {
   return (
     <svg class="claude-icon" viewBox="0 0 16 16" fill="currentColor">
@@ -43,6 +45,17 @@ export function DownloadIcon() {
   );
 }
 
+/** "Move to top level": an arrow rising to the top line. */
+export function MoveToTopIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M2.5 2.5h11"/>
+      <path d="M8 13.5v-8"/>
+      <path d="M4.5 9L8 5.5 11.5 9"/>
+    </svg>
+  );
+}
+
 export function MoreIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="currentColor">
@@ -59,6 +72,28 @@ export function InfoIcon() {
       <circle cx="8" cy="8" r="6.25" />
       <path d="M8 7.25v3.5" />
       <circle cx="8" cy="5" r="0.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** A solid warning triangle with its "!" cut out, so the mark shows the
+ *  surface behind it in every theme. Solid, because an outlined "!" blurs
+ *  into its own stroke at text size. */
+export function WarningIcon({ className }: { className?: string }) {
+  return (
+    <svg class={className} viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" aria-hidden="true">
+      <path d="M6.7 2.3Q8 .3 9.3 2.3L14.6 12.2Q15.6 14 13.6 14H2.4Q.4 14 1.4 12.2ZM8 5a.9.9 0 0 1 .9.9v3.1a.9.9 0 0 1-1.8 0V5.9A.9.9 0 0 1 8 5ZM8 10.8a1 1 0 1 1 0 2a1 1 0 1 1 0-2Z" />
+    </svg>
+  );
+}
+
+/** A "↳" whose ink fills its viewBox top to bottom. Its CSS sizes the box in
+ *  cap units: the stem starts on the cap line, and the bottom two units hang
+ *  below the baseline. A font's own "↳" sits wherever its designer put it. */
+export function ContinuedIcon({ className }: { className?: string }) {
+  return (
+    <svg class={className} viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M2.75.75V10.5h9.5M9.5 7.75l2.75 2.75L9.5 13.25" />
     </svg>
   );
 }
@@ -114,9 +149,9 @@ export function ChevronRightIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
-export function PinIcon({ filled = false, size }: { filled?: boolean; size?: string }) {
+export function PinIcon({ filled = false, size, className }: { filled?: boolean; size?: string; className?: string }) {
   return (
-    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <svg class={className} {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M12 17v5" />
       <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76z" />
     </svg>
@@ -477,7 +512,26 @@ export function AttentionIcon({ size }: { size?: string } = {}) {
   );
 }
 
-export function ThreadsIcon() {
+// The thread-drawer toggle on desktop: a window with its left column split off,
+// the glyph desktop apps use for a sidebar. Never a stack of lines: the Canvas
+// hamburger is already that, and look-alikes in one bar hide the one you are
+// looking for. Desktop only, because on a phone the toggle opens a whole pane
+// rather than a sidebar (see `ThreadListIcon`).
+//
+// Frame and divider stay one path so their crossing is stroked once. Two
+// elements paint it twice, and a translucent colour shows each overlap as a dot.
+export function SidebarIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 4v16" />
+    </svg>
+  );
+}
+
+// The thread-drawer toggle on a phone: a bulleted list, since it takes the user
+// to the threads pane, which is a list of threads. Filter holds the same corner
+// of that pane, which is why Filter draws a funnel and never lines.
+export function ThreadListIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
       <circle cx="4" cy="6" r="1.5" />
@@ -500,15 +554,34 @@ export function MenuIcon() {
   );
 }
 
-// Unified thread-drawer Filter control: the funnel-style stacked lines. One
-// button toggles the merged Status + Thread type panel (see ThreadFilterPanel);
-// also the "All statuses" row icon inside that panel.
+// A funnel shape, never a stack of lines. On a phone, Filter takes the corner
+// where the pane beside it has the list-shaped thread-drawer toggle. Lines there
+// read as the way back.
+const FUNNEL_PATH = 'M2 2.5h12L9.5 8.25V14l-3-1.5V8.25z';
+
+// Unified thread-drawer Filter control. One button toggles the merged Status +
+// Thread type panel (see ThreadFilterPanel); also the "All statuses" row icon
+// inside that panel.
 export function FilterIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="2" y1="4" x2="14" y2="4" />
-      <line x1="4" y1="8" x2="12" y2="8" />
-      <line x1="6" y1="12" x2="10" y2="12" />
+      <path d={FUNNEL_PATH} />
+    </svg>
+  );
+}
+
+// FUNNEL_PATH as it looks stroked at 1.5 with round joins, traced as one outline.
+// The filled funnel paints this alone: a translucent header colour paints a
+// stroke laid over a fill twice, and the rim comes out brighter than the body.
+const FUNNEL_SILHOUETTE_PATH =
+  'M1.409 2.962A.75.75 0 0 1 2 1.75H14a.75.75 0 0 1 .591 1.212L10.25 8.509V14a.75.75 0 0 1-1.085.671l-3-1.5A.75.75 0 0 1 5.75 12.5V8.509z';
+
+// The Filter button and the panel's "All statuses" row while a thread-type
+// selection narrows the `all` view: the same funnel, filled. Outline for off and filled for on is the iOS convention.
+export function FilteredIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="currentColor" stroke="none">
+      <path d={FUNNEL_SILHOUETTE_PATH} />
     </svg>
   );
 }
@@ -616,6 +689,38 @@ export function CheckIcon({ className, size }: { className?: string; size?: stri
   );
 }
 
+/** Ink for each finished step outcome, drawn to fill a 12-unit box so a 1cap
+ *  svg spans the text's cap band exactly (see `.step-icon svg`, steps.css). */
+const STEP_OUTCOME_INK: Record<Exclude<StepOutcome, 'pending'>, preact.JSX.Element> = {
+  success: <path d="M1 6.5 4.5 10.5 11 1.5" />,
+  error: (
+    <>
+      <circle cx="6" cy="6" r="5.25" />
+      <path d="M6 3.25v3.25" />
+      <circle cx="6" cy="8.75" r="0.5" fill="currentColor" />
+    </>
+  ),
+  unfinished: (
+    <>
+      <circle cx="6" cy="6" r="5.25" />
+      <path d="M2.3 9.7 9.7 2.3" />
+    </>
+  ),
+  blocked: <path d="M4 1v10M8 1v10" />,
+  denied: <path d="M2 2l8 8M10 2l-8 8" />,
+};
+
+/** The leading mark on an inline step row. A running step has none: its
+ *  shimmering description is the live affordance. */
+export function StepOutcomeIcon({ outcome }: { outcome: StepOutcome }) {
+  if (outcome === 'pending') return null;
+  return (
+    <svg class={`step-outcome-icon-${outcome}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      {STEP_OUTCOME_INK[outcome]}
+    </svg>
+  );
+}
+
 export function EditIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -677,6 +782,27 @@ export function ArchiveIcon({ size }: { size?: string } = {}) {
       <rect x="3" y="4" width="18" height="4" rx="1" />
       <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" />
       <line x1="10" y1="12" x2="14" y2="12" />
+    </svg>
+  );
+}
+
+// Filter panel "Status" heading: a dot in a ring, like a status light.
+export function StatusIcon({ size }: { size?: string } = {}) {
+  return (
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="3" fill="currentColor" />
+    </svg>
+  );
+}
+
+// Filter panel "By thread types" heading: stacked layers, one per type.
+export function ThreadTypesIcon({ size }: { size?: string } = {}) {
+  return (
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polygon points="12 2 2 7 12 12 22 7 12 2" />
+      <polyline points="2 17 12 22 22 17" />
+      <polyline points="2 12 12 17 22 12" />
     </svg>
   );
 }
@@ -855,9 +981,9 @@ export function FolderUpIcon() {
  *
  *  The inline SIZE is load-bearing rather than tidy, and dropping it is a real
  *  bug rather than a style slip. `.search-everywhere-result-icon`, the slot on
- *  every Search Everywhere result row, HAS NO CSS RULE AT ALL: that surface has
- *  always sized its glyphs purely from the attributes that spread put on each
- *  `<svg>`. So an unsized `AppsIcon` there falls back to the default replaced
+ *  every Search Everywhere result row, sizes its own box and has NO RULE for
+ *  the `<svg>` inside it. That surface has always sized its glyphs purely from
+ *  the attributes that spread put on each `<svg>`. So an unsized `AppsIcon` there falls back to the default replaced
  *  element box and paints an app hit's mark at ~300px. Its other two consumers
  *  hide the fault, because both do size the slot in CSS
  *  (`.nav-history-icon svg`, `.message-route-panel .route-app-icon svg`), and a
@@ -875,12 +1001,11 @@ export function AppsIcon({ size = '1rem' }: { size?: string } = {}) {
 
 // The Lucidos mark: three rounded squares and a four-point spark, the same
 // geometry as `public/favicon.svg` and the installed PWA icon. Kept as paths
-// with no tile behind them, so a caller can put it on the brand gradient
-// (BrandMark's default) or paint it flat in a single colour (the thread
-// drawer's muted variant) without two copies of the artwork.
+// with no tile behind them. So one copy of the artwork serves both uses: on
+// the brand gradient, or painted flat in a single colour.
 //
-// `fill: currentColor` rather than the favicon's hardcoded white, because the
-// muted variant is exactly the same shape in a different colour.
+// `fill: currentColor` rather than the favicon's hardcoded white, because a
+// flat variant is exactly the same shape in a different colour.
 export function LucidosMarkIcon() {
   return (
     <svg class="lucidos-mark-icon" viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">

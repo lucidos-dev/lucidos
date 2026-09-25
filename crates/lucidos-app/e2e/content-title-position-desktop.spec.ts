@@ -274,7 +274,7 @@ test.describe('the desktop content title holds its position across views', () =>
     // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
     // pane width, where a divider drag has to find a live divider and land a
     // real pointer on it. Every sibling desktop spec seeds it for that reason
-    // (split-resize-desktop, repo-files, header-drawer-toggle-travel-desktop);
+    // (split-resize-desktop, repo-files, header-drawer-toggle-pinned-desktop);
     // this test hand-rolled the drag instead and it silently moved nothing,
     // leaving the pane at its 765px default and the assertion below unreached.
     //

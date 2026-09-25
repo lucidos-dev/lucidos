@@ -105,6 +105,8 @@ const IMAGE_MODELS: &[&str] = &[
 const EXTERNAL_LINK_TARGETS: &[&str] = &["safari", "ask", "in-app"];
 /// Mirrors `Theme` / `FontFamily` in the same frontend file.
 const THEMES: &[&str] = &["light", "dark", "system"];
+/// Mirrors `MOTION_PREFS` in `packages/lucidos-sdk/src/appearance.ts`.
+const MOTION_PREFS: &[&str] = &["system", "reduce", "full"];
 const FONT_FAMILIES: &[&str] = &[
     "monospace",
     "system",
@@ -162,7 +164,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "standard",
-        description: "How much comes back in a chat or trigger answer: the id of a style in the library. 'standard' is the default and adds nothing to the prompt, so answers come back as they always have. 'concise' and 'minimal' are shipped, and the user may edit either or add their own in Settings > Models > Response style, so the set is open and this is not a closed enum. Read 'response_styles' or GET /api/v1/response-styles for the ids that exist here. When the user asks for shorter or longer answers, SET THIS: it is what makes the request stick, where saying it in chat lasts one thread. An id nothing defines falls back to 'standard'. A change applies from the next message, because a turn builds its prompt once at the start.",
+        description: "The shape of a chat or trigger answer (how much comes back, and what it is for): the id of a style in the library. 'standard' is the default and adds nothing to the prompt, so answers come back as they always have. 'concise', 'minimal' (the outcome, not the process) and 'learning' (explains the why as it goes) are shipped, and the user may edit any of them or add their own in Settings > Models > Response style, so the set is open and this is not a closed enum. Read 'response_styles' or GET /api/v1/response-styles for the ids that exist here. When the user asks for shorter or longer answers, SET THIS: it is what makes the request stick, where saying it in chat lasts one thread. An id nothing defines falls back to 'standard'. A change applies from the next message, because a turn builds its prompt once at the start.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -171,7 +173,16 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "(unset: the shipped styles only)",
-        description: "The user's own response styles, as a JSON array of {id, label, instruction} objects. It holds ONLY what they changed: an entry whose id is 'concise' or 'minimal' overrides that shipped style, one with a fresh kebab-case id adds a style, and removing an entry restores the shipped text. 'standard' is the off switch and is REFUSED here. THIS KEY REPLACES THE WHOLE ARRAY, so read the current value first and send it back with your edit applied, or you will delete every style the user wrote. Bounds, all refused rather than trimmed: 40 chars of id, 40 of label, 1000 of instruction, 20 entries. The instruction is injected verbatim under a 'RESPONSE STYLE:' heading, and the engine appends a rule that keeps warnings and caveats in whatever the style asks for.",
+        description: "The user's own response styles, as a JSON array of {id, label, instruction} objects. It holds ONLY what they changed: an entry whose id is 'concise', 'minimal' or 'learning' overrides that shipped style, one with a fresh kebab-case id adds a style, and removing an entry restores the shipped text. 'standard' is the off switch and is REFUSED here. THIS KEY REPLACES THE WHOLE ARRAY, so read the current value first and send it back with your edit applied, or you will delete every style the user wrote. Bounds, all refused rather than trimmed: 40 chars of id, 40 of label, 1000 of instruction, 20 entries. The instruction is injected verbatim under a 'RESPONSE STYLE:' heading, and the engine appends a rule that keeps warnings and caveats in whatever the style asks for.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "technical_literacy",
+        label: "Technical literacy",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(crate::core::technical_literacy::SETTABLE_IDS),
+        default: crate::core::technical_literacy::NOT_SET_ID,
+        description: "How technical the words are in every answer: the response style's second part, beside 'response_style' (the shape of an answer). 'non-technical' (shown as Keep it plain) means plain words, no jargon or code, and no question they cannot answer. 'technical' means technical terms need no explanation. 'developer' means engineering terms, code and ids need no explanation. A level sets which words to use, never how much to say: that is 'response_style'. Chat and triggers read it from the next message, and a coding-agent session or voice call from its next start. Store ONLY a level the user stated or picked, never one you inferred from how they write. When they say 'I am not technical' or 'I am a developer', SET THIS. 'not-set', the default, adds nothing; set it to clear the level.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -346,6 +357,18 @@ pub const CATALOG: &[PrefSpec] = &[
         description: "Off by default. When 'true', the keyless OpenCode Free tier is available and its models appear in the picker. Requests go anonymously to a third-party relay with no API key and no account, and several of those free models may train on what they receive. Turn it on only if the user asked for free models and accepts that.",
         side_effect: PrefSideEffect::None,
     },
+    PrefSpec {
+        key: "proxy_timeout_secs",
+        label: "Proxy timeout (seconds)",
+        scope: PrefScope::Global,
+        value: PrefValue::Number {
+            min: crate::api::proxy_timeout::MIN_SECS as f64,
+            max: crate::api::proxy_timeout::MAX_SECS as f64,
+        },
+        default: "30",
+        description: "How long the engine proxy waits on one upstream request before it answers 504, in seconds. It covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the proxy_request tool, and the builtin model routes such as vertex and openai. A streamed reply counts in full, because the proxy reads the whole body before it answers. Raise it when a long model call through the proxy times out. An apis.json entry's own `timeout_secs` wins over this for that entry. Applies from the next call.",
+        side_effect: PrefSideEffect::None,
+    },
     // ---- Behavior (global) ----
     PrefSpec {
         key: "notifications_filter",
@@ -486,6 +509,15 @@ pub const CATALOG: &[PrefSpec] = &[
         value: PrefValue::Number { min: 75.0, max: 200.0 },
         default: "100",
         description: "UI scale percent for THIS device (75–200, snapped to 12.5 steps; 100 = default). Device-scoped.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "motion",
+        label: "Motion",
+        scope: PrefScope::Device,
+        value: PrefValue::Enum(MOTION_PREFS),
+        default: "system",
+        description: "Whether animations are reduced on THIS device. Defaults to 'system', which follows the OS reduce-motion setting. 'reduce' calms the app (no slides, pulses or spinners) whatever the OS says; 'full' keeps every animation even when the OS asks to reduce. Device-scoped.",
         side_effect: PrefSideEffect::None,
     },
     // ---- Typing (device-scoped) ----
@@ -850,6 +882,11 @@ mod tests {
             declared("DEFAULT_FONT_FAMILY"),
             "the catalog's font default has drifted from the client contract"
         );
+        assert_eq!(
+            lookup("motion").unwrap().default,
+            declared("DEFAULT_MOTION"),
+            "the catalog's motion default has drifted from the client contract"
+        );
     }
 
     /// Settings advertises a default the sweep must actually run at. The pair
@@ -1052,6 +1089,20 @@ mod tests {
         assert_eq!(lookup("language").unwrap().scope, PrefScope::Global);
     }
 
+    /// Motion is a comfort setting for one screen, so it must not reach another
+    /// device. Unset follows the OS, like theme.
+    #[test]
+    fn motion_is_a_device_scoped_three_way_choice() {
+        let spec = lookup("motion").expect("the agent can set motion");
+        assert_eq!(spec.scope, PrefScope::Device);
+        for value in ["system", "reduce", "full"] {
+            assert!(validate(spec, value).is_ok(), "{value} must be accepted");
+        }
+        assert!(validate(spec, "off").is_err());
+        assert!(validate(spec, "true").is_err());
+        assert_eq!(spec.default, "system", "unset follows the OS");
+    }
+
     /// The dead-Send bug belongs to one keyboard, so turning autocorrect off on
     /// the phone must not reach another device. Unset means on, on every client.
     #[test]
@@ -1089,5 +1140,23 @@ mod tests {
                 k
             );
         }
+    }
+
+    /// The catalog's literal default and bounds are what the proxy applies.
+    #[test]
+    fn the_proxy_timeout_entry_matches_the_proxy() {
+        use crate::api::proxy_timeout::{DEFAULT_SECS, MAX_SECS};
+        let spec = lookup(crate::core::PREF_PROXY_TIMEOUT_SECS).expect("catalogued");
+        assert_eq!(spec.scope, PrefScope::Global);
+        assert_eq!(spec.default, DEFAULT_SECS.to_string());
+        assert!(validate(spec, "1").is_ok());
+        assert!(validate(spec, &MAX_SECS.to_string()).is_ok());
+        let err = validate(spec, "601").unwrap_err();
+        assert!(
+            err.contains("proxy_timeout_secs") && err.contains("600"),
+            "the refusal must name the key and the maximum: {err}"
+        );
+        assert!(validate(spec, "0").is_err());
+        assert!(validate(spec, "soon").is_err());
     }
 }

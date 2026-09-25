@@ -62,6 +62,7 @@ impl NoDecisions {
                     id: "opt-0".to_string(),
                     label: "Run it".to_string(),
                     description: None,
+                    preview: None,
                 }],
                 false,
             )),
@@ -3757,11 +3758,13 @@ fn asks_the_caller() -> ThreadEvent {
                 id: "opt-0".to_string(),
                 label: "Run the tail now".to_string(),
                 description: Some("Chunks 25-33, on the current main".to_string()),
+                preview: None,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
                 label: "Leave it for tonight".to_string(),
                 description: None,
+                preview: None,
             },
         ],
         worktree_path: None,
@@ -4134,6 +4137,7 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
         id: "opt-0".to_string(),
         label: "Ship it".to_string(),
         description: None,
+        preview: None,
     }];
     let single = decision_to_ask(
         &OpenDecision::question("toolu_q0", "Ready?", &one, false),

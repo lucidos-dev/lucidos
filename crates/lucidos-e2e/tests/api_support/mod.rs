@@ -161,6 +161,17 @@ pub fn workspace_tree_lock() -> &'static tokio::sync::RwLock<()> {
     &LOCK
 }
 
+/// Held by every test that writes `data/config/apis.json`.
+///
+/// It is one file per workspace, and each such test writes it whole and
+/// deletes it when done. Two at once delete each other's entries. The tree
+/// lock above cannot help: its `read()` guards are shared.
+pub fn apis_json_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &LOCK
+}
+
 pub fn workspace_path() -> PathBuf {
     if let Ok(ws) = std::env::var("E2E_WORKSPACE") {
         PathBuf::from(ws)

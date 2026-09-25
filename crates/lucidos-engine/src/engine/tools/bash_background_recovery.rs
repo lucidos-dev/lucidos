@@ -354,8 +354,9 @@ impl LucidosEngine {
         }
         // ONE deadline for the whole loop, not one per task. The kills all went
         // out together, so the reaps overlap, and a task that had already
-        // finished costs nothing at all. A per-task budget would multiply by N inside a shutdown the
-        // supervisor SIGKILLs at 15 s, and the sweeps below this would never
+        // finished costs nothing at all. A per-task budget would multiply by N
+        // inside a shutdown the supervisor SIGKILLs at 15 s, and the sweeps
+        // below this would never
         // run: in-flight threads would get no abort and Chrome would be
         // orphaned.
         let deadline = std::time::Instant::now() + REAP_WAIT;

@@ -1,6 +1,6 @@
 /**
  * The appearance boot contract: the single source for what a device's theme, UI
- * font, ligature settings and UI scale resolve to.
+ * font, ligature settings, UI scale and motion resolve to.
  *
  * Four surfaces must agree on these values: the host store
  * (`store/actions/preferences.ts`), the host's inline FOUC script
@@ -172,6 +172,72 @@ export function resolveTheme(theme: ThemePref, prefersLight: boolean): ResolvedT
  * so this is here for the single definition rather than for agreement.
  */
 export const SYSTEM_THEME_SETTLE_MS = 300;
+
+// --- Motion ---
+
+/** The device-scoped `motion` preference. `system` follows the OS switch,
+ *  `reduce` and `full` override it either way. */
+export type MotionPref = 'system' | 'reduce' | 'full';
+
+export const MOTION_PREFS: readonly MotionPref[] = ['system', 'reduce', 'full'];
+
+export const DEFAULT_MOTION: MotionPref = 'system';
+
+/** Workspace-scoped mirror of `motion`, read by the boot script before any
+ *  module loads. */
+export const MOTION_STORAGE_KEY = 'lucidos-motion';
+
+/** The media query the resolver reads. Nothing else may read it: the resolved
+ *  answer lives on `<html>` as `data-motion`, and every surface keys on that. */
+export const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+
+export function parseMotion(raw: string | null | undefined): MotionPref {
+  return raw && (MOTION_PREFS as readonly string[]).includes(raw)
+    ? raw as MotionPref
+    : DEFAULT_MOTION;
+}
+
+/** Whether motion is reduced. The single definition every surface uses. */
+export function resolveReducedMotion(pref: MotionPref, osReduces: boolean): boolean {
+  if (pref === 'system') return osReduces;
+  return pref === 'reduce';
+}
+
+/** The `data-motion` value for a resolved answer. */
+export function motionAttribute(reduced: boolean): 'reduce' | 'full' {
+  return reduced ? 'reduce' : 'full';
+}
+
+/** Device-local position of the diagnostic Animation speed slider, -10..10. */
+export const ANIMATION_SPEED_STORAGE_KEY = 'lucidos-animation-speed-slider';
+export const ANIMATION_SPEED_MIN = -10;
+export const ANIMATION_SPEED_MAX = 10;
+
+export function parseAnimationSpeed(raw: string | null | undefined): number {
+  const n = parseInt(raw ?? '', 10);
+  if (isNaN(n)) return 0;
+  return Math.max(ANIMATION_SPEED_MIN, Math.min(ANIMATION_SPEED_MAX, n));
+}
+
+/** Slider position to speed multiplier, 0.1x..10x, via 10^(v/10). */
+export function speedMultiplierFor(position: number): number {
+  return Math.pow(10, position / 10);
+}
+
+/**
+ * What reduced motion multiplies every scaled duration by.
+ *
+ * Above zero on purpose. A 0s transition never starts, so it never fires
+ * `transitionend`, and code waiting on one would hang until its fallback.
+ * Small enough that the slowest duration token ends inside one frame.
+ */
+export const REDUCED_MOTION_DURATION_SCALE = 0.001;
+
+/** What every animated duration is multiplied by: the reciprocal of the speed,
+ *  or the reduced-motion constant, which wins over the slider. */
+export function durationScaleFor(sliderPosition: number, reduced: boolean): number {
+  return reduced ? REDUCED_MOTION_DURATION_SCALE : 1 / speedMultiplierFor(sliderPosition);
+}
 
 /**
  * Which font a stored value selects, defaulting to {@link DEFAULT_FONT_FAMILY}.

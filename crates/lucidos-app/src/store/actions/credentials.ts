@@ -1,4 +1,5 @@
 import {
+  activeInlineForm,
   credentials,
   closeInlineForm,
   showToast,
@@ -20,6 +21,7 @@ import {
   resumeOAuthConnectAfterCredentialSaved,
 } from './oauth';
 import { pushNavState } from './navigation';
+import { cancelFormRequestById } from './form-request-cancel';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadCredentials(): Promise<void> {
@@ -53,7 +55,11 @@ export function closeCredentialForm(): void {
   // this, cancelling a registration and later saving an unrelated credential
   // would open a browser for a provider the user walked away from.
   cancelPendingOAuthConnect();
+  // And it answers the request that opened it, so it is not offered again.
+  const form = activeInlineForm.value;
+  const requestId = form?.type === 'credential' ? form.request?.form_request_id : undefined;
   closeInlineForm();
+  if (requestId) void cancelFormRequestById(requestId);
 }
 
 /** Save a credential the engine ASKED for, then continue whatever was blocked.
@@ -91,8 +97,16 @@ export async function submitRequestedCredential(
         auth_header: authHeader?.trim() || 'Authorization',
         auth_value: authValue,
         env_var_name: envVarName,
+        form_request_id: request.form_request_id,
       })
-    : await submitNewCredential(service, baseUrls, authType, authValue, envVarName);
+    : await submitNewCredential(
+        service,
+        baseUrls,
+        authType,
+        authValue,
+        envVarName,
+        request.form_request_id,
+      );
   if (!saved) return false;
   await resumeOAuthConnectAfterCredentialSaved(service);
   return true;
@@ -127,7 +141,8 @@ export async function submitNewCredential(
   baseUrls: string[],
   authType: AuthType,
   authValue: string,
-  envVarName?: string
+  envVarName?: string,
+  formRequestId?: string,
 ): Promise<boolean> {
   if (!service) {
     showToast('Service name is required', 'error');
@@ -152,6 +167,7 @@ export async function submitNewCredential(
         auth_type: authType,
         auth_value: authValue,
         env_var_name: envVarName?.trim() || undefined,
+        form_request_id: formRequestId,
       }),
     'Failed to save credential'
   );

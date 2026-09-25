@@ -4,8 +4,8 @@
 //! drives the WaitingBanner Diff button. Live updates flow through the
 //! coding-agent post-commit hook's direct refresh plus the `ChangeProposed` /
 //! `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived` handlers in
-//! `event_bus_projection.rs`. Those paths are the steady-state truth — but
-//! they only fire when a new hook or event arrives.
+//! `event_bus_projection_thread.rs`. Those paths are the steady-state truth,
+//! but they only fire when a new hook or event arrives.
 //!
 //! When the engine restarts, no new event fires for an idle CC thread that
 //! already has commits on its branch. The projection row would stay at the

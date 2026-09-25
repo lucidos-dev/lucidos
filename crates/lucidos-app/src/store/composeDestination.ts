@@ -13,14 +13,14 @@
  *  - the channel pick (`inputMode` signal / per-draft `draft.mode`, wire value
  *    `'lucidos' | 'claude_code'`) — per-thread and cross-device-synced while
  *    composing;
- *  - the coding target (a `Scope`) — resolved PER-DRAFT via
- *    `resolveScope(threadId)` (this draft's `composeSelections` override, or the
- *    global `selectedScope` default) and bound onto the thread's meta at send
- *    time (`sendCompose`). Callers pass the resolved value in; these helpers
- *    never read the global directly.
- *  The picker presents the pair as one control. (The channel pick is
- *  cross-device-synced; the per-draft scope override is device-local — a
- *  pre-existing asymmetry kept as-is.)
+ *  - the coding target (a `Scope`), resolved PER-DRAFT via
+ *    `resolveScope(threadId)` and bound onto the thread's meta at send time
+ *    (`sendCompose`). Only the no-draft compose view falls back to
+ *    `selectedScope`. Callers pass the resolved value in; these helpers never
+ *    read the global directly.
+ *  The picker presents the pair as one control. Both halves are
+ *  cross-device-synced: the scope rides the draft's DB-backed
+ *  `composeSelections` entry.
  */
 
 import type { Scope } from './store';

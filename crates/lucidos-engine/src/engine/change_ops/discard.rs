@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, find_worktree_for_branch, git_answer,
-    is_merge_of_branch_into_main, WorktreeLookup,
+    auto_commit_safe_files_if_dirty, find_worktree_for_branch, is_merge_of_branch_into_main,
+    WorktreeLookup,
 };
 
 /// Clear a discarded change's branch state, given what git said about it.
@@ -231,12 +231,13 @@ impl LucidosEngine {
             .get_by_id(change_id)
             .await?
             .ok_or("Change not found")?;
-        if change.status == "discarded" {
+        match change.status() {
+            ChangeStatus::Pending => {}
             // Idempotent: already discarded, return success
-            return Ok(());
-        }
-        if change.status != "pending" {
-            return Err(format!("Change is already {}", change.status).into());
+            ChangeStatus::Discarded => return Ok(()),
+            status @ (ChangeStatus::Applied | ChangeStatus::Reverted) => {
+                return Err(format!("Change is already {status}").into());
+            }
         }
 
         // Mark as discarded FIRST, before touching git: the event is the source
@@ -326,16 +327,17 @@ impl LucidosEngine {
             .get_by_id(change_id)
             .await?
             .ok_or("Change not found")?;
-        if change.status == "reverted" {
-            return Ok("Change already reverted.".to_string());
-        }
-        if change.status != "applied" {
-            return Err(format!(
-                "Change is '{}', only applied changes can be reverted",
-                change.status
-            )
-            .into());
-        }
+        let shas = match &change.state {
+            ChangeState::Applied(shas) => shas,
+            ChangeState::Reverted(_) => return Ok("Change already reverted.".to_string()),
+            ChangeState::Pending { .. } | ChangeState::Discarded => {
+                return Err(format!(
+                    "Change is '{}', only applied changes can be reverted",
+                    change.status()
+                )
+                .into());
+            }
+        };
 
         let repo_root = std::path::PathBuf::from(&change.repo_root);
 
@@ -344,9 +346,7 @@ impl LucidosEngine {
             return Err("Cannot revert: the repository has uncommitted changes. Commit or stash them first.".into());
         }
 
-        let result = if let (Some(ref pre_sha), Some(ref post_sha)) =
-            (&change.pre_merge_sha, &change.post_merge_sha)
-        {
+        let result = if let (Some(pre_sha), Some(post_sha)) = (&shas.pre, &shas.post) {
             self.revert_with_shas(&repo_root, pre_sha, post_sha, &change.branch_name)
                 .await
         } else {
@@ -391,14 +391,15 @@ impl LucidosEngine {
         revert_with_shas(repo_root, pre_sha, post_sha, branch_name).await
     }
 
-    /// Legacy revert: search for merge commit in recent git history,
-    /// falling back to branch-ref based revert for fast-forwarded merges.
+    /// Legacy revert: find the merge commit in recent git history. A change
+    /// that was fast-forwarded before SHA tracking left no record of main's
+    /// pre-merge commit, so it cannot be reverted and errors below.
     async fn revert_legacy(
         &self,
         repo_root: &Path,
         branch_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Try 1: find a merge commit that merged this branch INTO main.
+        // Find a merge commit that merged this branch INTO main.
         // Must match "Merge branch 'feature'" or "Merge feature:" patterns,
         // NOT "Merge branch 'main' into feature" (which is the reverse direction).
         let log_output = git_cmd(&["log", "--merges", "--oneline", "-50"], repo_root)
@@ -422,44 +423,6 @@ impl LucidosEngine {
                     }
                     Err(e) => Err(format!("Revert error: {}", e).into()),
                 };
-            }
-        }
-
-        // Try 2: branch ref still exists — find its commits via merge-base and revert the range
-        if let Ok(ref_output) = git_cmd(&["rev-parse", "--verify", branch_name], repo_root).await {
-            if ref_output.status.success() {
-                let branch_sha = String::from_utf8_lossy(&ref_output.stdout)
-                    .trim()
-                    .to_string();
-                let base_output = git_cmd(&["merge-base", "HEAD", branch_name], repo_root)
-                    .await
-                    .map_err(|e| format!("Failed to find merge-base: {}", e))?;
-                if base_output.status.success() {
-                    let base_sha = String::from_utf8_lossy(&base_output.stdout)
-                        .trim()
-                        .to_string();
-
-                    // If the branch tip is an ancestor of HEAD, its commits were
-                    // fast-forwarded into main.
-                    //
-                    // `or_unknown(false)`: a `true` here runs `git revert` against
-                    // the repo root, so an unanswered probe (spawn failure or the
-                    // 30s `git_cmd` timeout) must not authorize it. `false` falls
-                    // through to the loud "could not find commits for branch"
-                    // error below, which the user can retry.
-                    let is_ancestor = git_answer(
-                        &["merge-base", "--is-ancestor", &branch_sha, "HEAD"],
-                        repo_root,
-                    )
-                    .await
-                    .or_unknown(false);
-
-                    if is_ancestor && base_sha != branch_sha {
-                        return self
-                            .revert_with_shas(repo_root, &base_sha, &branch_sha, branch_name)
-                            .await;
-                    }
-                }
             }
         }
 

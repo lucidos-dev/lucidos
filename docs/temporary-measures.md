@@ -1324,43 +1324,52 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   line becomes.
 - **Status:** active
 
-### macOS function-key characters inserted as text at a caret boundary
+### macOS key codes inserted as text at a caret boundary
 
 - **Added:** 2026-08-15
-- **Lives in:** `crates/lucidos-app/src/utils/noFunctionKeyText.ts` and its
-  `installNoFunctionKeyText()` call in `crates/lucidos-app/src/main.tsx`.
+- **Widened:** 2026-09-24, after the square came back. The first guard refused
+  only AppKit's function-key constants, and a harness showed the arrows
+  actually insert C0 control codes.
+- **Lives in:** `isKeyCodeTextInsertion` in
+  `packages/lucidos-sdk/src/textEntry.ts` (the shared rule), and one listener
+  per document: `crates/lucidos-app/src/utils/noKeyCodeText.ts` for the host,
+  called from `crates/lucidos-app/src/main.tsx`, and
+  `packages/lucidos-sdk/src/noKeyCodeText.ts` for app frames, called from
+  `packages/lucidos-sdk/src/browser.ts`.
 - **Scope note:** the native half, `install_app_menu`
   (`crates/lucidos-app/src/lib.rs`), is **permanent** and is NOT part of this
   measure. A complete app menu is what loads the standard text-editing key
-  bindings, so without it no arrow key moves the caret at all. This row covers
-  only the frontend guard.
-- **Impermanent because:** AppKit reserves 0xF700 to 0xF8FF for function keys,
-  so the right arrow's key event carries 0xF703 as its characters. macOS maps
-  the key to `moveRight:`. At the end of the text that command has nothing to
-  move over, so the keystroke falls through to plain text insertion. WebKit's
-  guard there rejects only control characters below 0x20, so the private-use
-  character lands in the field as a tofu square. The user reported it against
-  the chat prompt in the desktop app. No web page should receive such a
-  character as text, so the guard compensates for the embedded webview rather
-  than our own design.
-- **The refusal stops at 0xF747, not 0xF8FF, and that bound replaces a platform
-  gate.** Apple assigns constants only up to Mode Switch. No key event can carry
-  anything above it, and the rest of the private-use block belongs to the fonts
-  that squat there. A narrow unconditional guard beats a wide one gated on
-  Tauri. The gate would still refuse a Character Viewer glyph in the desktop
-  app, the one client where a user is likeliest to insert one.
-- **Not covered: app iframes.** A document-level listener cannot reach into an
-  app iframe, so an app's own text field still takes the character. Nobody has
-  reported it there, and the fix would be the same guard in the SDK.
-- **Removal / resolution condition:** when a right arrow at the end of a prompt
-  inserts nothing in the packaged desktop app, with the listener disabled. Check
-  the other three arrows and Page Up/Down too, since each takes the same path at
-  its own boundary. Then delete the module, its test, and the call plus import
-  in `main.tsx`. Drop the paragraph the guard added to `install_app_menu`'s
-  docstring, and keep the menu itself.
+  bindings. This row covers only the frontend guard.
+- **Impermanent because:** an arrow key with nowhere to move the caret types a
+  square in the desktop app. WebKit runs the key's editing command, which
+  declines at the boundary, and WebKit then resends the unhandled key press.
+  It climbs to tao's content view, whose `keyDown:` runs `interpretKeyEvents:`
+  on it a second time. That path inserts the event's characters into the
+  focused field. A macOS arrow key carries 0x1C to 0x1F (left, right, up,
+  down), and the field draws the control code as a square. The guard cancels
+  its `beforeinput`, which compensates for the embedded webview rather than
+  our own design.
+- **How it was proven:** a Swift harness with a plain `WKWebView` never
+  inserts anything, with or without a menu. Parenting the web view in a view
+  whose `keyDown:` calls `interpretKeyEvents:`, as tao's does, reproduces it
+  with real system key events. The widened `beforeinput` guard then leaves the
+  field untouched. The 0xF700 range stays in the rule, since a key that
+  carries a function-key constant would take the same path.
+- **What the rule refuses:** an insertion made entirely of key codes. Those
+  are the C0 control codes except tab and the two line breaks, DEL, and
+  AppKit function-key constants up to 0xF747. Apple reserves the block to 0xF8FF,
+  but custom fonts put glyphs above 0xF747, so those stay typeable. A paste
+  leaves `data` null and is never refused.
+- **Removal / resolution condition:** when an arrow key at a text boundary
+  inserts nothing in the packaged desktop app, with both listeners disabled.
+  That needs tao to stop reinterpreting a key the web view handed back, or
+  WebKit to stop resending it. Check all four arrows, in the prompt and in an
+  app's text field. Then delete both `noKeyCodeText.ts` modules, their tests,
+  their calls, and `isKeyCodeTextInsertion` with its tests. Drop the paragraph
+  the guard added to `install_app_menu`'s docstring, and keep the menu itself.
 - **Status:** active
-- **Investigation:** n/a (the cause is upstream in the embedded webview, and
-  nothing is being chased here)
+- **Investigation:** n/a (the cause is upstream in tao and WebKit, and nothing
+  is being chased here)
 
 ### Prompt-cache wire probe
 
@@ -1659,12 +1668,39 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Vertex, Opus 5.5 and Fable 5.x then return every note before a tool call as
   an empty `thinking` block. The relay sets the display and the beta, so the
   notes come back as text.
+
+  A note is short, whatever the agent drafted: 178 to 441 characters in one
+  measured session, and 336 for the repro's 150-word ask. A draft the user
+  must read never fits in one. See § "A question card with no answer before
+  it" for the gate that catches a card pointing at one.
 - **Removal / resolution condition:** run the repro in the plan WITHOUT the
   relay, on the current Claude Code with Opus 5.5 on Vertex. When the note
   block before the `Bash` call carries text, delete the relay, its spawn stamp,
   its start in `main.rs` and the parser flag.
 - **Status:** active
 - **Investigation:** n/a. An upstream gap with a checkable repro.
+
+### Lucidos-source skill skip-worktree repair
+
+- **Added:** 2026-09-25. Plan:
+  `docs/plans/2026-09-25-lucidos-cli-skill-never-blocks-merging-main.md`.
+- **Lives in:** `unhide_tracked_skill` in `engine/git_ops/worktree.rs`, called
+  from the `Lucidos` arm of `place_lucidos_cli_skill` in
+  `runtime/lucidos_cli.rs`.
+- **Impermanent because:** older engines wrote their embedded lucidos-cli skill
+  over a Lucidos-source worktree's tracked copy and marked it skip-worktree.
+  That hidden copy blocks every `git merge main` that changes the skill. The
+  engine no longer does either, so only a worktree an older engine spawned can
+  still carry the bit. The repair clears it at the next spawn.
+- **Removal / resolution condition:** no Lucidos-source worktree carries the
+  bit. Check per workspace: `git -C <worktree> ls-files -v --
+  .claude/skills/lucidos-cli/SKILL.md` prints no `S` tag for any worktree under
+  `<workspace>/.lucidos/worktrees/`. Then:
+  - Make the `Lucidos` arm of `place_lucidos_cli_skill` a no-op.
+  - Delete `unhide_tracked_skill`.
+  - Delete the `lucidos_source_spawn_repair*` tests in
+    `engine/git_ops_tests/recover_exclude.rs`.
+- **Status:** active
 
 ---
 
@@ -2131,7 +2167,13 @@ condition; fix the condition rather than acting on it.
 ### A question card with no answer before it
 
 - **Added:** 2026-09-23, widened the same day to coding agents. Plan:
-  `docs/plans/2026-09-23-a-card-never-replaces-the-answer.md`.
+  `docs/plans/2026-09-23-a-card-never-replaces-the-answer.md`. Widened on
+  2026-09-24 to a card that points "above" at nothing. Plan:
+  `docs/plans/2026-09-24-a-card-that-points-above-at-nothing.md`. Widened on
+  2026-09-25 to a card after a saved picture the user cannot see. Plan:
+  `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md`. Widened the
+  same day to a typed reply answered only by a progress note. Plan:
+  `docs/plans/2026-09-25-a-typed-reply-answered-by-a-note.md`.
 - **Lives in:** `crates/lucidos-engine/src/engine/question_card_gate.rs`
   (rule, query, refusal text, tests in the sibling `_tests.rs`). The chat
   loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
@@ -2139,7 +2181,7 @@ condition; fix the condition rather than acting on it.
   hook turns that into a denied tool call (`ask_user_question_hook.rs`), and
   the Codex MCP tool into an error result (`mcp_permission_server.rs`).
 - **Impermanent because (tolerates):** an agent raises a question card with
-  no prose, so the user gets a menu instead of an answer. Two shapes were
+  no prose, so the user gets a menu instead of an answer. These shapes were
   observed:
   - **Chat, after tool work.** Asked what the next patch would contain, the
     agent ran `git log`, then asked "How do you want to continue?". The answer
@@ -2147,16 +2189,43 @@ condition; fix the condition rather than acting on it.
   - **Claude Code, after a typed reply.** The user typed a question into a
     plan card and got "With that answered: approve the plan?", with no answer
     and no tool call in between.
+  - **Claude Code on Opus 5.5, pointing above.** The card asked about "the
+    card copy above". The agent had drafted it in its reasoning, and only a
+    224-character progress note reached the user. A chat card offered "the
+    message above" after no words at all.
+  - **Claude Code on Opus 5.5, after a saved picture.** Twice, an agent saved
+    a mockup and pasted its `![...]` line into the reply just before the
+    card. That reply arrived as a one-line summary without the picture.
+  - **Chat on Opus 5.5, a typed reply answered by a note.** Asked for a
+    refund message, the agent said "here it is now" four times. The message
+    stayed in its reasoning, and each card followed a note under 400
+    characters. The agent reads its own reasoning back, so it believed it
+    had sent it.
 
-  `ASK_USER_QUESTION_RULE` already said "answer first", so guidance alone
-  failed. The gate refuses such a card once per user input.
+  `ASK_USER_QUESTION_RULE` already said "answer first", and
+  `REASONING_NOT_VISIBLE_RULE` said the reasoning is not shown, so guidance
+  alone failed. The gate refuses such a card once per user input. A card that
+  says "above" counts when every word since the input is note-sized, under
+  600 characters. A picture counts when this thread saved it through the data
+  API since the input. It must then appear as a markdown target in the words
+  or on the card. `SHOWING_AN_IMAGE_RULE` and the `lucidos data write`
+  reminder now name the card first, so the gate is the backstop.
+
+  In chat, a typed reply counts as unanswered when the round wrote only
+  progress notes (`LlmResponse::content_is_progress_notes`) and every word
+  since is note-sized. An unseen picture outranks every other reason. A third
+  session spent the one refusal on unreported work, the render that made the
+  picture, and its retry passed without the picture.
 
   Before 2026-09-23 a refusal could also mean the agent did answer, invisibly.
   See § "Text before a tool call arrives as hidden reasoning", now removed.
   Refusals from Claude Code sessions before that date overstate model mistakes.
 - **Removal / resolution condition:** in a per-workspace audit, count question
   cards raised after a typed reply or after tool work since the last input.
-  That is the denominator. Count refusals among them: tool-result rows
+  Add cards that say "above" after note-sized words, and cards after a saved
+  picture. That is the denominator. A chat card after a typed reply with only
+  notes since is already among the first group.
+  Count refusals among them: tool-result rows
   (`ToolResult` or `CodingAgentToolResult`) containing "Question card not
   shown.". When no routed model draws a refusal, drop the module, its two call
   sites and the `refusal` field.

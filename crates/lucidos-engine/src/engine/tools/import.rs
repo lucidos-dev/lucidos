@@ -588,12 +588,12 @@ impl LucidosEngine {
                     imported_count, dest_base, skipped_count, &commit_sha[..commit_sha.floor_char_boundary(7)]
                 ))
             }
-            _ => Ok(format!("Unknown import tool: {}", name)),
+            _ => Err(format!("Unknown import tool: {}", name).into()),
         }
     }
 
-    /// Import a file from a given path (used by upload API)
-    /// Import a file into the artifact store (write + git commit + event).
+    /// Import a file into the artifact store (write + git commit + event), for
+    /// the upload API.
     /// Returns `(result_message, commit_sha, resolved_dest_relative)` — the
     /// resolved path can differ from the requested one when a Finder-style
     /// auto-suffix was applied to avoid overwriting an existing artifact.

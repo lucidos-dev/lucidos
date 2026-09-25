@@ -28,7 +28,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -110,8 +110,7 @@ impl From<FollowUpAck> for FollowUpResponse {
 /// from `ChildFollowUpError::status_code`, which lives beside the taxonomy, so
 /// the mapping cannot drift from the ladder.
 fn api_error(e: ChildFollowUpError) -> ApiError {
-    let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    ApiError::new(status, e.to_string())
+    ApiError::with_code(e.status_code(), e.to_string())
 }
 
 pub(in crate::api) async fn follow_up_child(

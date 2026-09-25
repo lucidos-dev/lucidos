@@ -39,7 +39,7 @@ vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // the mock fn must be vi.hoisted.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
 vi.mock('./devices', () => ({
-  getDeviceId, pendingDeviceRegistration: vi.fn(),
+  getDeviceId,
 }));
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./repositories', () => ({

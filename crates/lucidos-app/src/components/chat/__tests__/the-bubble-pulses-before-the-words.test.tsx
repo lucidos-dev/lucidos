@@ -232,9 +232,9 @@ describe('the talker\'s bubble while it is being said', () => {
 
 describe('the mark', () => {
   it('holds still for a reader who asked for no motion', () => {
-    const reduce = voiceCallCss.slice(voiceCallCss.indexOf('@media (prefers-reduced-motion'));
-    expect(reduce).toContain('.live-speech-bar');
-    expect(reduce).toContain('animation: none');
+    expect(voiceCallCss).toMatch(
+      /:root\[data-motion="reduce"\] \.live-speech-bar\s*\{[^}]*animation: none/,
+    );
   });
 
   /** An indefinite animation is an activity indicator rather than a

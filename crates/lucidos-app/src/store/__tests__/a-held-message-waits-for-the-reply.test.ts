@@ -9,7 +9,7 @@ import {
   exchangeResponseEvents,
   exchangeStatus,
   groupIntoExchanges,
-  heldMessageSender,
+  agentMessageSender,
   type StoredEvent,
   type ThreadEvent,
 } from '../thread-events';
@@ -29,7 +29,8 @@ const QUESTION: ThreadEvent = {
   options: [{ id: 'a', label: 'Yes' }],
 };
 
-const HELD: ThreadEvent = { type: 'MessageHeld', text: 'Also check the Best Buy rows', origin: PARENT };
+const HELD_TEXT = 'Also check the Best Buy rows';
+const HELD: ThreadEvent = { type: 'MessageHeld', text: HELD_TEXT, origin: PARENT };
 
 describe('a held message', () => {
   it('shows as held under the question, and the question stays answerable', () => {
@@ -67,13 +68,84 @@ describe('a held message', () => {
     const held = exchangeResponseEvents(divider).find(e => e.type === 'held_message');
     expect(held).toMatchObject({ held_id: 'held-1', released: true });
   });
+
+  it('leaves the transcript once its delivered copy arrives, which says it was held', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }),
+      ev(2, QUESTION),
+      ev(3, HELD, 'held-1'),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } }),
+      ev(5, { type: 'HeldMessageReleased', held_message_id: 'held-1' }),
+      ev(6, { type: 'MessageReceived', text: HELD_TEXT, mode: 'agent', origin: PARENT }, 'delivered-1'),
+    ]));
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const delivered = exchanges.find(e => e.userEvent._eventId === 'delivered-1')!;
+
+    expect(exchangeResponseEvents(divider).some(e => e.type === 'held_message')).toBe(false);
+    expect(delivered.releasedFromHold).toBe(true);
+  });
+
+  it('stays visible when released but never delivered, so the loss is loud', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }),
+      ev(2, QUESTION),
+      ev(3, HELD, 'held-1'),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } }),
+      ev(5, { type: 'HeldMessageReleased', held_message_id: 'held-1' }),
+      ev(6, { type: 'MessageReceived', text: 'something else', mode: 'agent', origin: PARENT }, 'other-1'),
+    ]));
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const other = exchanges.find(e => e.userEvent._eventId === 'other-1')!;
+
+    expect(exchangeResponseEvents(divider).find(e => e.type === 'held_message'))
+      .toMatchObject({ held_id: 'held-1', released: true });
+    expect(other.releasedFromHold).toBeUndefined();
+  });
+
+  it('is never paired with a later lookalike after its own delivery was lost', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }),
+      ev(2, QUESTION),
+      ev(3, HELD, 'held-1'),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } }),
+      ev(5, { type: 'HeldMessageReleased', held_message_id: 'held-1' }),
+      ev(6, { type: 'MessageReceived', text: 'unrelated', mode: 'agent', origin: PARENT }, 'other-1'),
+      ev(7, { type: 'MessageReceived', text: HELD_TEXT, mode: 'agent', origin: PARENT }, 'resent-1'),
+    ]));
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const resent = exchanges.find(e => e.userEvent._eventId === 'resent-1')!;
+
+    expect(exchangeResponseEvents(divider).some(e => e.type === 'held_message')).toBe(true);
+    expect(resent.releasedFromHold).toBeUndefined();
+  });
+
+  it('is not paired with the same words from another sender', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }),
+      ev(2, QUESTION),
+      ev(3, HELD, 'held-1'),
+      ev(4, { type: 'UserQuestionAnswered', tool_use_id: 'tu1', answer: { kind: 'Selected', option_id: 'a' } }),
+      ev(5, { type: 'HeldMessageReleased', held_message_id: 'held-1' }),
+      ev(6, {
+        type: 'MessageReceived',
+        text: HELD_TEXT,
+        mode: 'agent',
+        origin: { kind: 'thread_link', thread_id: 'other-parent', title: 'Continue the Loop' },
+      }, 'other-1'),
+    ]));
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    const other = exchanges.find(e => e.userEvent._eventId === 'other-1')!;
+
+    expect(exchangeResponseEvents(divider).some(e => e.type === 'held_message')).toBe(true);
+    expect(other.releasedFromHold).toBeUndefined();
+  });
 });
 
-describe('heldMessageSender', () => {
-  it('names the sending thread, a workspace, or an agent', () => {
-    expect(heldMessageSender(PARENT)).toBe('"Continue the Loop"');
-    expect(heldMessageSender({ kind: 'thread_link', thread_id: 'p' })).toBe('another thread');
-    expect(heldMessageSender({ kind: 'workspace', workspace: 'dev', mode: 'agent' })).toBe('workspace "dev"');
-    expect(heldMessageSender(undefined)).toBe('an agent');
+describe('agentMessageSender', () => {
+  it('names the sending thread or workspace, and nobody it cannot name', () => {
+    expect(agentMessageSender(PARENT)).toBe('"Continue the Loop"');
+    expect(agentMessageSender({ kind: 'thread_link', thread_id: 'p' })).toBe('another thread');
+    expect(agentMessageSender({ kind: 'workspace', workspace: 'dev', mode: 'agent' })).toBe('workspace "dev"');
+    expect(agentMessageSender(undefined)).toBeUndefined();
   });
 });

@@ -39,6 +39,95 @@ h2 { font-size: var(--font-size-xl); }
 h3 { font-size: var(--font-size-lg); }
 h4, h5, h6 { font-size: var(--font-size-md); }
 
+/* One checkbox for every engine. The native control is a fixed pixel size, so
+   it ignores the ui-scale, and each engine draws its own. This one is sized in
+   `em` so it tracks the text of the row it sits in. Ticked, it takes a soft
+   accent tint rather than a solid fill. The box itself never moves: the tint
+   fades in, the mark wipes on left to right like a pen stroke, and unticking
+   fades the mark out rather than rewinding it. */
+input[type="checkbox"] {
+    --checkbox-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    appearance: none;
+    display: inline-grid;
+    place-content: center;
+    flex-shrink: 0;
+    width: 1.0625em;
+    height: 1.0625em;
+    margin: 0;
+    padding: 0;
+    vertical-align: middle;
+    border: 1px solid var(--text-muted);
+    border-radius: 0.25em;
+    background: transparent;
+    cursor: pointer;
+    transition:
+        background-color var(--duration-normal) ease-out,
+        border-color var(--duration-normal) ease-out;
+}
+
+/* The clip resets only after the fade, so an untick never shows the wipe run
+   backwards. */
+input[type="checkbox"]::before {
+    content: "";
+    width: 0.9em;
+    height: 0.9em;
+    background: var(--accent-light);
+    -webkit-mask: var(--checkbox-mark) center / contain no-repeat;
+    mask: var(--checkbox-mark) center / contain no-repeat;
+    clip-path: inset(0 100% 0 0);
+    opacity: 0;
+    transition:
+        opacity var(--duration-fast) ease-out,
+        clip-path 0s var(--duration-fast);
+}
+
+input[type="checkbox"]:hover:not(:disabled, :checked, :indeterminate) {
+    border-color: var(--text-secondary);
+}
+
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+input[type="checkbox"]:checked::before,
+input[type="checkbox"]:indeterminate::before {
+    clip-path: inset(0);
+    opacity: 1;
+    transition:
+        clip-path var(--duration-normal) cubic-bezier(0.25, 0.8, 0.25, 1),
+        opacity 0s;
+}
+
+input[type="checkbox"]:indeterminate {
+    --checkbox-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8h7' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+/* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+input[type="checkbox"]:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+input[type="checkbox"]:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Forced colors repaint every background with Canvas, which would hide both
+   the fill and the tick. System colours keep a ticked box readable. */
+@media (forced-colors: active) {
+    input[type="checkbox"]::before {
+        background: CanvasText;
+    }
+
+    input[type="checkbox"]:checked,
+    input[type="checkbox"]:indeterminate {
+        border-color: Highlight;
+    }
+}
+
 /* Shared segmented control: a few mutually exclusive options, one of them
    picked. Every host caller is two or three segments wide.
 
@@ -176,8 +265,10 @@ h4, h5, h6 { font-size: var(--font-size-md); }
     flex-shrink: 0;
 }
 
+/* `:where()` keeps the specificity at (0,2,0), so overrides still win. A
+   disabled button that takes the pointer back for its tooltip gets no wash. */
 @media (hover: hover) {
-    .icon-btn:hover {
+    .icon-btn:hover:where(:not(:disabled)) {
         background: var(--bg-hover);
         color: var(--text-primary);
     }

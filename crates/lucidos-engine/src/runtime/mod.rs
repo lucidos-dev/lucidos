@@ -13,7 +13,7 @@ pub mod vertex_relay;
 
 pub use agent_runtime::{
     AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent, ControlRequest,
-    RunningAgent, SpawnArgs,
+    ReplayedInput, RunningAgent, SpawnArgs,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 // The three CC wire names are re-exported beside Codex's so every consumer

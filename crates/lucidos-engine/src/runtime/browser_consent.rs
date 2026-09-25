@@ -358,7 +358,9 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                             // Typical button position: right side of dialog, upper area
                             button_x: rect.left + rect.width * 0.75,
                             button_y: rect.top + rect.height * 0.25,
-                            src: src.substring(0, 100)
+                            // Logged, so drop the query and fragment: they
+                            // can carry an OAuth `code` or `access_token`.
+                            src: src.split(/[?#]/)[0].substring(0, 100)
                         });
                     }
                 }

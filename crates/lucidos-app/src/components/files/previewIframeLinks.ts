@@ -38,6 +38,7 @@ import { openAppById } from '../../store/actions/apps';
 import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { showToast, parseRepoPath } from '../../store/store';
+import { scrollBehavior } from '../../utils/motion';
 
 /** `thread:<workspace>/<uuid>` and the bare `thread:<uuid>` form, mirroring the
  *  markdown rewrite in `utils/renderMarkdown.ts`. */
@@ -265,7 +266,7 @@ export function classifyPreviewLink(
 
 function scrollPreviewToFragment(doc: Document, id: string): void {
   if (!id) {
-    doc.defaultView?.scrollTo({ top: 0, behavior: 'smooth' });
+    doc.defaultView?.scrollTo({ top: 0, behavior: scrollBehavior() });
     return;
   }
   // `querySelector`, not `getElementById` (the `#app`-only ban in
@@ -279,7 +280,7 @@ function scrollPreviewToFragment(doc: Document, id: string): void {
     showToast(`No "${id}" section in this document`, 'error');
     return;
   }
-  (target as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
+  (target as HTMLElement).scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
 }
 
 function runPreviewLinkAction(action: PreviewLinkAction, doc: Document): void {

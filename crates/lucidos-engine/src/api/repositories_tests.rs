@@ -640,7 +640,9 @@ fn live_thread_worktree_skips_a_conflict_merge_tree() {
     session.worktree_path = Some(own.clone());
     assert_eq!(super::live_thread_worktree(Some(&session)), Some(own));
 
-    session.conflict_change_id = Some(Uuid::new_v4());
+    session.conflict = Some(crate::engine::types::ConflictBinding::Detached {
+        change_id: Uuid::new_v4(),
+    });
     session.worktree_path = Some(merge);
     assert_eq!(
         super::live_thread_worktree(Some(&session)),
@@ -649,6 +651,27 @@ fn live_thread_worktree_skips_a_conflict_merge_tree() {
     );
 
     assert_eq!(super::live_thread_worktree(None), None);
+}
+
+/// A Tier-1 resolution merges in place: the session stays in the thread's own
+/// worktree, and its binding outlives the resolution. The Diff button must keep
+/// answering from that live worktree, during the merge and for the rest of the
+/// session.
+#[test]
+fn live_thread_worktree_keeps_the_own_tree_after_a_tier_1_binding() {
+    let own = std::path::PathBuf::from("/tmp/lucidos-test/thread-worktree");
+    let thread_id = Uuid::new_v4();
+    let (mut session, _rx) = crate::engine::types::AgentSession::for_test();
+    session.worktree_path = Some(own.clone());
+    let mut sessions = std::collections::HashMap::from([(thread_id, session)]);
+
+    crate::engine::bind_in_place_conflict_resolution(&mut sessions, thread_id, Uuid::new_v4());
+
+    assert_eq!(
+        super::live_thread_worktree(sessions.get(&thread_id)),
+        Some(own),
+        "an in-place merge runs in the thread's own worktree"
+    );
 }
 
 /// The reported bug: an app coding-agent thread commits mid-turn, the Diff

@@ -365,8 +365,9 @@ fn if_enabled<T>(enabled: bool, build: impl FnOnce() -> Option<T>) -> Option<T> 
 /// OpenAI key all still apply, but stored credentials and the `local_base_url`
 /// preference can't be read. Every field degrades to `None` / an omitted
 /// backend on a BUILD error, so the engine still comes up on its other
-/// providers. A stored credential that cannot be READ is a different case and
-/// drops its provider: see [`CredentialUnreadable`].
+/// providers. A stored credential that cannot be READ is a different case. It
+/// falls through to the env fallback, with a log line: see
+/// [`CredentialUnreadable`].
 ///
 /// ONE build path serves both. The degraded boot used to re-spell the seven
 /// builders, the search chain and the result literal. That chain's order is a

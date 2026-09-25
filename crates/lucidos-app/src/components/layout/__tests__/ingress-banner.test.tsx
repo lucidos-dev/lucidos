@@ -19,6 +19,7 @@ import {
   shouldRenderIngressBanner,
 } from '../IngressBanner';
 import { REFUSAL_BANNER_HEIGHT_VAR } from '../WebhookRefusalBanner';
+import { SLOWNESS_BANNER_HEIGHT_VAR } from '../SlownessBanner';
 import { CONNECTION_BANNER_HEIGHT_VAR } from '../ConnectionBanner';
 import { BANNER_HEIGHT_VAR } from '../BackupReminderBanner';
 import { webhookIngressNotice } from '../../../utils/webhookIngressNotice';
@@ -79,6 +80,7 @@ describe('the banners never share a height reservation', () => {
     const vars = [
       INGRESS_BANNER_HEIGHT_VAR,
       REFUSAL_BANNER_HEIGHT_VAR,
+      SLOWNESS_BANNER_HEIGHT_VAR,
       CONNECTION_BANNER_HEIGHT_VAR,
       BANNER_HEIGHT_VAR,
     ];

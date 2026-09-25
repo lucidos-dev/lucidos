@@ -41,7 +41,7 @@ pub(super) enum CodexLine {
         id: String,
         kind: ItemKind,
     },
-    /// Unrecognized or non-JSON line — logged by the caller, otherwise ignored.
+    /// Unrecognized or non-JSON line. Ignored, and not logged.
     Other,
 }
 
@@ -88,8 +88,8 @@ pub(super) enum ItemKind {
     Error {
         message: String,
     },
-    /// Item type this parser doesn't know — forwarded as `Other` so a new
-    /// Codex item type degrades to a log line, not a wedged turn.
+    /// Item type this parser doesn't know. `map_item` logs it, so a new Codex
+    /// item type degrades to a log line, not a wedged turn.
     Unknown {
         item_type: String,
     },
@@ -370,6 +370,7 @@ impl TurnTracker {
                 vec![AgentEvent::Message {
                     role: "assistant".to_string(),
                     text,
+                    opens_block: true,
                 }]
             }
             // Reasoning summary — surfaced as a Thought so the timeline can show a

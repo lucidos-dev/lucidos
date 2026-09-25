@@ -101,7 +101,7 @@ describe('animateTextareaHeightFrom', () => {
     expect(el.style.height).toBe('80px');
     // Next frame: transition enabled and height driven to the target.
     flushRaf();
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
     expect(el.style.height).toBe('200px');
   });
 
@@ -119,7 +119,7 @@ describe('animateTextareaHeightFrom', () => {
     animate(el, '80px');
     flushRaf();
     fireTransitionEnd(el, 'transform');
-    expect(el.style.transition).toBe('height 0.3s ease'); // still animating
+    expect(el.style.transition).toBe('height 300ms ease'); // still animating
   });
 
   /** The safety net must outlive the transition, not race its START.
@@ -137,7 +137,7 @@ describe('animateTextareaHeightFrom', () => {
     vi.advanceTimersByTime(400);
     flushRaf();
 
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
     expect(el.style.height).toBe('200px');
   });
 
@@ -166,18 +166,18 @@ describe('animateTextareaHeightFrom', () => {
     const el = makeEl('200px');
     animate(el, '80px');
     flushRaf();
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
 
     hide();
 
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
   });
 
   it('falls back to the safety timeout if transitionend never fires', () => {
     const el = makeEl('200px');
     animate(el, '80px');
     flushRaf();
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
     vi.advanceTimersByTime(400);
     expect(el.style.transition).toBe('');
     expect(el.style.height).toBe('200px');
@@ -212,7 +212,7 @@ describe('animateTextareaHeightFrom', () => {
     animate(el, '200px'); // switch 2 — cancels switch 1's pending frames
     flushRaf();
     expect(el.style.height).toBe('120px');
-    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.transition).toBe('height 300ms ease');
     // Only switch 2 is live: its transitionend lands on switch 2's target, and
     // no stale switch-1 listener fires afterward.
     fireTransitionEnd(el, 'height');

@@ -9,8 +9,8 @@ import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 /** Thread IDs where Send was just clicked but the thread hasn't reached
  *  running/waiting_for_user_answer yet. Drives the optimistic Send→Cancel
  *  morph so the action slot doesn't flash empty during the request gap.
- *  Cleared when the thread becomes cancellable (via the effect below) or
- *  on send failure (via the catch handler in submit). */
+ *  Cleared when the thread becomes cancellable (an effect in PromptInput) or
+ *  on send failure (the catch handler in PromptInput's `beginSend`). */
 export const submittingThreadIds = signal<Set<string>>(new Set());
 
 export interface UploadSendIntent<TContext = unknown> {

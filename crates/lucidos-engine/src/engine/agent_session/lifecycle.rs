@@ -26,72 +26,44 @@ pub(super) fn idle_action(is_conflict: bool, is_shutdown: bool) -> IdleAction {
     }
 }
 
-/// Settle `AgentSession::inputs_awaiting_result` for one `Result` and return what
-/// the driver still owes.
+/// Whether a new turn opened on a session whose last turn already emitted its
+/// terminal event. The run loop forwarded nothing to start such a turn.
+/// So it must re-arm emission itself, or drop the turn's events as stragglers.
+/// Two shapes do it:
 ///
-/// The two backends promise different numbers of Results per input, which is why
-/// the counter needs a function rather than a constant:
-///
-/// * **Claude Code** merges back-to-back stdin inputs into a SINGLE Result, so
-///   one Result answers every input forwarded so far.
-/// * **Codex** runs one child per accepted input and emits one Result EACH, so
-///   the rest are still owed.
-///
-/// `result_may_predate_a_forward` is the load-bearing qualifier on the Claude
-/// Code rule, which holds only for inputs the agent had taken when it ended the
-/// turn. `events_rx` and `msg_rx` have no causal ordering, so `select!` can
-/// forward an input and only then hand the loop a `Result` produced before it.
-/// Zeroing there would terminate the subprocess with the user's message still
-/// inside it. A set flag means "this Result may not be the answer": keep one
-/// input owed and let the next Result settle it.
-///
-/// Saturating everywhere, because the count can legitimately already be zero.
-pub(super) fn settle_inputs_awaiting_result(
-    coding_agent: crate::runtime::CodingAgent,
-    before: u32,
-    result_may_predate_a_forward: bool,
-) -> u32 {
-    match coding_agent {
-        crate::runtime::CodingAgent::Codex => before.saturating_sub(1),
-        crate::runtime::CodingAgent::ClaudeCode if result_may_predate_a_forward => {
-            before.saturating_sub(1)
-        }
-        crate::runtime::CodingAgent::ClaudeCode => 0,
-    }
+/// - `question_resumed`: an answered question woke the agent's blocked hook.
+/// - `read_owed_input`: the agent read an input forwarded during the previous
+///   turn only after that turn's `Result` (ADR 0268). The caller passes false
+///   once the session is exiting, so a late replay cannot revive it.
+pub(super) fn starts_turn_after_terminal(
+    question_resumed: bool,
+    read_owed_input: bool,
+    emitted_terminal_event: bool,
+) -> bool {
+    emitted_terminal_event && (question_resumed || read_owed_input)
 }
 
-/// Advance the forward-confirmation state for one agent event, and answer whether
-/// THIS event might have been produced before the last forwarded input reached the
-/// agent.
+/// The session-side write for a turn that just reached its boundary. The run
+/// loop calls it under the `agent_sessions` lock, right after its own local
+/// `is_waiting` goes true.
 ///
-/// `events_rx` and `msg_rx` have no causal ordering. An agent event is therefore
-/// not self-evidently a reaction to the input the run loop just forwarded, and
-/// two rules make the answer safe:
+/// It also retires every interrupt aimed at the turn that just ended. A Stop or
+/// a redirect that arrived after the agent's `Result`, while the loop was still
+/// in the `Result` arm, found the turn in flight. It stored a permit, and maybe
+/// a redirect flag and a cancel actor. The turn ended on its own, so all three
+/// are stale: the permit would interrupt the NEXT turn, and the flag would
+/// relabel the next real Stop as superseded. Under this lock no interrupt can
+/// arm after it, because the session no longer reads in flight.
 ///
-/// 1. **Events already queued at the forward are skipped.** They were produced
-///    before the agent could have seen the input, so they prove nothing. Without
-///    this, a `Result` that sat in the channel the whole time reads as
-///    confirmation, which is the buffered-event hole.
-/// 2. **An event never vouches for itself.** The answer is the state as it stood
-///    BEFORE this event, so the first genuinely-later event still counts as
-///    possibly-predating. The agent can write a Result to stdout microseconds
-///    before reading stdin, and neither protocol acknowledges an input.
-///
-/// The cost of both is at most one extra kept-alive idle. The cost of the other
-/// direction is a subprocess cancelled while it still holds the user's message.
-pub(super) fn agent_event_may_predate_forward(
-    forwarded_input_unconfirmed: &mut bool,
-    agent_events_queued_at_forward: &mut usize,
-) -> bool {
-    let may_predate = *forwarded_input_unconfirmed;
-    if *forwarded_input_unconfirmed {
-        if *agent_events_queued_at_forward > 0 {
-            *agent_events_queued_at_forward -= 1;
-        } else {
-            *forwarded_input_unconfirmed = false;
-        }
+/// The follow-up promise (`redirect_followup_pending`) stays. The idle decision
+/// takes it.
+pub(crate) fn mark_turn_boundary(s: &mut crate::engine::AgentSession) {
+    s.is_waiting = true;
+    s.redirect_followup = false;
+    s.cancel_actor = None;
+    if futures::FutureExt::now_or_never(s.interrupt.notified()).is_some() {
+        crate::log!("[AgentSession] Retired an interrupt that arrived after its turn's Result");
     }
-    may_predate
 }
 
 /// Per-Result termination decision once `idle_action` returned
@@ -108,9 +80,9 @@ pub(super) enum TerminateDecision {
     KeepAliveForFollowup {
         /// Sent, not yet forwarded: messages sitting unread in `msg_rx`.
         queued: usize,
-        /// Forwarded, not yet answered: what the driver still owes after
-        /// [`settle_inputs_awaiting_result`].
-        awaiting_result: u32,
+        /// Forwarded, not yet read: what the agent has not reported read
+        /// (`InputLedger::owed`).
+        unread: u32,
         /// Armed, not yet sent: `arm_followup_redirect` reserved this subprocess
         /// and its caller has not routed the message yet.
         redirect_pending: bool,
@@ -120,13 +92,13 @@ pub(super) enum TerminateDecision {
 /// Decide whether to terminate the CC subprocess at idle.
 ///
 /// A follow-up has three disjoint windows between the moment it is promised and
-/// the moment the driver answers it, and each gets its own signal:
+/// the moment the agent reads it, and each gets its own signal:
 ///
 /// | Window | Signal |
 /// |---|---|
 /// | armed, not yet sent | `redirect_pending` |
 /// | sent, not yet forwarded | `queued`, i.e. `msg_rx.len()` |
-/// | forwarded, not yet answered | `awaiting_result`, the post-settle remainder |
+/// | forwarded, not yet read | `unread`, the inputs the agent has not reported read |
 ///
 /// All three are read under the `agent_sessions` lock the caller already holds,
 /// which makes them exact. That lock serializes against the fast-path
@@ -142,13 +114,13 @@ pub(super) enum TerminateDecision {
 /// terminated session like any other follow-up.
 pub(super) fn terminate_decision(
     queued: usize,
-    awaiting_result: u32,
+    unread: u32,
     redirect_pending: bool,
 ) -> TerminateDecision {
-    if queued > 0 || awaiting_result > 0 || redirect_pending {
+    if queued > 0 || unread > 0 || redirect_pending {
         TerminateDecision::KeepAliveForFollowup {
             queued,
-            awaiting_result,
+            unread,
             redirect_pending,
         }
     } else {
@@ -233,14 +205,23 @@ pub(super) enum TerminalKind {
     },
 }
 
-/// True when CC was woken up with no user-initiated content: engine-internal
-/// warm-up resumes only. The follow-up `Result` from such a turn is a no-op and
-/// must not produce a terminal or idle event. The previous turn's
-/// `CodingAgentIdled` already records the active `cc_session_id`. Image-only
-/// turns count as content, so the call site must include images. Otherwise CC
-/// delivers an answer and the thread row stays stuck at `running`.
-pub(super) fn is_silent_resume(user_text_empty: bool, has_images: bool) -> bool {
-    user_text_empty && !has_images
+/// Why a coding-agent spawn with nothing to send is refused.
+pub(super) const EMPTY_INPUT_ERROR: &str =
+    "Nothing to send to the coding agent: the message has no text and no image.";
+
+/// Refuse a spawn with no text and no image. Neither agent starts a turn on its
+/// own: `claude --print --resume` waits on stdin unless Claude Code's internal
+/// `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` is set, and Codex waits for an input.
+/// The thread would read as working until the watchdog. Recovery therefore
+/// sends `CONTINUE_RESUME_USER_MESSAGE` as a real input.
+pub(super) fn require_agent_input(
+    text: &str,
+    images: Option<&[crate::api::ChatImage]>,
+) -> Result<(), &'static str> {
+    if text.trim().is_empty() && images.is_none_or(<[_]>::is_empty) {
+        return Err(EMPTY_INPUT_ERROR);
+    }
+    Ok(())
 }
 
 /// User-facing error message for the empty-response branch of `classify_result`.
@@ -264,12 +245,12 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 /// and observed different values: `ResponseGenerated` would fire while the idle
 /// was skipped, leaving the thread row stuck at `running`.
 ///
-/// Every non-silent, non-shutdown Result is a turn boundary and emits
-/// `CodingAgentIdled`. Deciding whether to keep the subprocess alive for an
-/// inflight follow-up is the run loop's job, via [`terminate_decision`].
+/// Every non-shutdown Result is a turn boundary and emits `CodingAgentIdled`.
+/// Deciding whether to keep the subprocess alive for an inflight follow-up is
+/// the run loop's job, via [`terminate_decision`].
 ///
-/// Precedence: silent_resume > shutdown > user_hit_stop > cc_error >
-/// text_is_empty > generated. Shutdown wins because the engine is going down
+/// Precedence: shutdown > user_hit_stop > cc_error > text_is_empty >
+/// generated. Shutdown wins because the engine is going down
 /// whatever CC did.
 ///
 /// `user_hit_stop` sits ABOVE `cc_error` because the Stop button routes through
@@ -279,16 +260,12 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 /// user stopped, and the branch-preservation gate keys on `Canceled`.
 /// `text_is_empty` stays below for the same reason: a cancel is still a cancel.
 pub(super) fn classify_result(
-    is_silent_resume: bool,
     user_hit_stop: bool,
     interrupt_is_redirect: bool,
     is_shutdown: bool,
     cc_error: Option<String>,
     text_is_empty: bool,
-) -> (Option<TerminalKind>, bool) {
-    if is_silent_resume {
-        return (None, false);
-    }
+) -> (TerminalKind, bool) {
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let terminal = if is_shutdown {
         TerminalKind::Aborted(AbortCause::EngineShutdown)
@@ -310,7 +287,7 @@ pub(super) fn classify_result(
         TerminalKind::Generated
     };
     let emit_idle = !is_shutdown;
-    (Some(terminal), emit_idle)
+    (terminal, emit_idle)
 }
 
 /// After a `Result` is classified and its terminal emitted, decide whether the
@@ -469,13 +446,13 @@ pub(super) fn conflict_abort_deletes_temp_state(
 
 /// Inputs to [`is_stale_resume_signal`]. A named struct rather than a positional
 /// argument list because every field is a `bool`, the same reason
-/// [`super::external_watchdog::ExternalWatchdogInput`] exists next door. Eight
+/// [`super::external_watchdog::ExternalWatchdogInput`] exists next door. Seven
 /// positional bools is a silent-transposition hazard at exactly the call site
 /// where a transposition kills a live session.
 ///
 /// `Copy` because one value feeds BOTH predicates at the call site.
 /// [`is_stale_resume_signal`] and [`is_resume_settle_result`] read the same
-/// eight fields and differ only in which way `resume_attach_confirmed` points,
+/// seven fields and differ only in which way `resume_attach_confirmed` points,
 /// so restating them per call is that same hazard. The settle predicate takes
 /// one FURTHER argument, deliberately not a field here.
 #[derive(Clone, Copy)]
@@ -489,7 +466,6 @@ pub(super) struct StaleResumeInputs {
     pub buffered_text_empty: bool,
     pub no_prior_results_this_turn: bool,
     pub no_tool_calls_this_turn: bool,
-    pub user_message_present: bool,
     pub cc_error: bool,
 }
 
@@ -520,7 +496,6 @@ pub(super) fn is_stale_resume_signal(i: StaleResumeInputs) -> bool {
         && i.buffered_text_empty
         && i.no_prior_results_this_turn
         && i.no_tool_calls_this_turn
-        && i.user_message_present
         && !i.cc_error
 }
 
@@ -536,7 +511,7 @@ pub(super) fn is_stale_resume_signal(i: StaleResumeInputs) -> bool {
 /// entirely and keeps reading events.
 ///
 /// `no_api_call_this_turn` makes that skip safe, and it is a SEPARATE argument
-/// rather than a ninth field on purpose. The eight fields describe output SHAPE,
+/// rather than an eighth field on purpose. The seven fields describe output SHAPE,
 /// and a settle turn looks exactly like a model that answered our prompt with
 /// nothing. A `Usage` event separates them: it is emitted per real API call, so
 /// zero of them proves the backend never asked the model anything. It stays out
@@ -552,7 +527,6 @@ pub(super) fn is_resume_settle_result(i: StaleResumeInputs, no_api_call_this_tur
         && i.buffered_text_empty
         && i.no_prior_results_this_turn
         && i.no_tool_calls_this_turn
-        && i.user_message_present
         && !i.cc_error
 }
 

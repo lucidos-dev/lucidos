@@ -427,7 +427,7 @@ describe('handleNavigationRequest: thread target', () => {
 });
 
 // The reported bug arrived on this branch. The engine's `connect_oauth_account`
-// emits a `NavigationRequested` carrying `purpose: 'oauth'`. The desktop app had
+// emits an `OAuthAuthorizationRequested` carrying `purpose: 'oauth'`. The desktop app had
 // the experimental in-app browser on, so the sign-in page was mounted in the
 // url-preview panel and rendered nothing.
 describe('handleNavigationRequest: url target', () => {

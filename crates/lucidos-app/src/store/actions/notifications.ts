@@ -11,6 +11,7 @@ import {
   viewingNotification,
   notificationDetailPending,
   activeMenuItem,
+  focusedPane,
 } from '../store';
 import { toFailed, setLoadingIfFresh, type Notification } from '../types';
 import { savePreference } from './preferences';
@@ -520,6 +521,17 @@ export async function navigateAdjacentNotification(
   return navigateToNotification(target.id);
 }
 
+/** The keyboard route to the detail's newer/older chevrons (-1 newer, 1 older).
+ *  Acts only while the content pane is focused on an open notification, and
+ *  returns whether it did. It claims the key at either end of the list too. A
+ *  press then never falls through to a transcript the user is not reading. */
+export function stepViewedNotification(direction: -1 | 1): boolean {
+  const detail = viewingNotification.value;
+  if (!detail || focusedPane.value !== 'content') return false;
+  void navigateAdjacentNotification(detail.id, direction);
+  return true;
+}
+
 /** Run when the notification detail panel closes — the overlay is cleared by
  *  panel Back nav, a menu switch, or any restore path, so there is no single
  *  call site to hang this on. Driven by an effect on `viewingNotification` in
@@ -536,26 +548,37 @@ export function onNotificationDetailClosed(): void {
   }
 }
 
+/** Clear every unread row on the tap, then tell the server. On a slow engine
+ *  the POST can take tens of seconds, and applying after it made the tap look
+ *  dead for that whole wait.
+ *
+ *  A failure puts back what this call cleared, unless something newer has
+ *  written the set since. Then the snapshot is stale, so it reloads instead. */
 export async function markAllRead(): Promise<void> {
+  const browseBefore = notifications.value;
+  const unreadBefore = unreadNotifications.value;
+
+  const browseAfter: typeof browseBefore = browseBefore.status === 'loaded'
+    ? { status: 'loaded', data: browseBefore.data.map((n) => ({ ...n, read: true })) }
+    : browseBefore;
+  notifications.value = browseAfter;
+  // Invalidate any in-flight load first so a stale reload can't resurrect the count.
+  const seq = claimUnreadSeq();
+  unreadNotifications.value = { status: 'loaded', data: [] };
+  // Explicit re-assert: the set may already have been empty here (nothing to
+  // mark read on this device), which moves no count and notifies nobody.
+  syncWorkspaceAppBadge();
+
   try {
     await markAllNotificationsRead();
-
-    // Optimistic update: flip every loaded browse row to read...
-    const current = notifications.value;
-    if (current.status === 'loaded') {
-      notifications.value = {
-        status: 'loaded',
-        data: current.data.map((n) => ({ ...n, read: true })),
-      };
-    }
-    // ...and empty the unread set, which drops the badge to zero. Invalidate
-    // any in-flight load first so a stale reload can't resurrect the count.
-    invalidateUnreadLoad();
-    unreadNotifications.value = { status: 'loaded', data: [] };
-    // Explicit re-assert: the set may already have been empty here (nothing to
-    // mark read on this device), which moves no count and notifies nobody.
-    syncWorkspaceAppBadge();
   } catch (error) {
+    if (notifications.value === browseAfter) notifications.value = browseBefore;
+    if (isCurrentUnread(seq)) {
+      unreadNotifications.value = unreadBefore;
+      syncWorkspaceAppBadge();
+    } else {
+      void loadUnreadNotifications();
+    }
     showToast('Failed to mark all as read: ' + errorDetail(error), 'error');
   }
 }

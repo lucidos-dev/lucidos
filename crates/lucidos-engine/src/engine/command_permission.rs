@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::core::grants::{self, GrantFile};
-use crate::engine::cc_permission::{DedupKey, PermissionState};
+use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::command_guard::{
     self, GuardDecision, JudgeInput, JudgedClassification, RiskLane, SideEffectCategory,
@@ -153,6 +153,27 @@ fn canceled_refusal() -> String {
     "The command was not run — the request was canceled before you got permission.".to_string()
 }
 
+/// The tool result fed back to the LLM when the card ended with nobody
+/// answering it: a new message superseded it, or the engine is shutting down.
+fn withdrawn_refusal() -> String {
+    "The command was NOT run: the permission card was withdrawn before anyone answered it, \
+     usually because the user sent a new message. This is not a denial. Read the user's latest \
+     message before deciding whether to retry."
+        .to_string()
+}
+
+/// What the agentic loop feeds the model once the card ends. Only a human's
+/// Deny reads as a denial.
+fn decision_from_answer(
+    answer: Result<PermissionAnswer, tokio::sync::broadcast::error::RecvError>,
+) -> GuardDecision {
+    match answer {
+        Ok(PermissionAnswer::Allowed) => GuardDecision::Proceed,
+        Ok(PermissionAnswer::Denied) => GuardDecision::Refuse(denial_refusal()),
+        Ok(PermissionAnswer::Withdrawn(_)) | Err(_) => GuardDecision::Refuse(withdrawn_refusal()),
+    }
+}
+
 /// Byte cap on the command excerpt embedded in the trigger-block message. Long
 /// enough to recognise which step of a multi-command script tripped the guard,
 /// short enough that the failure notification stays readable.
@@ -246,7 +267,7 @@ fn blocked_command_excerpt(tool_name: &str, input: &Value) -> Option<String> {
 /// Resolve every unresolved `CommandPermissionRequested` on `thread_id` as
 /// denied, because the user typed a new message instead of clicking a button.
 /// Mirrors `cc_permission::resolve_pending_permissions_as_superseded`: fans a
-/// `false` to any in-process waiter and emits `CommandPermissionResolved` so the
+/// `Withdrawn` to any in-process waiter and emits `CommandPermissionResolved` so the
 /// card stops dangling and the thread status flips back to `running`.
 pub async fn resolve_pending_command_permissions_as_superseded(
     pool: &sqlx::PgPool,
@@ -290,7 +311,9 @@ pub async fn resolve_pending_command_permissions_as_superseded(
         {
             let mut state = pending.lock().unwrap();
             if let Some(entry) = state.take(&request_id) {
-                let _ = entry.tx.send(false);
+                let _ = entry
+                    .tx
+                    .send(PermissionAnswer::Withdrawn(SUPERSEDED_REASON));
             }
         }
         emit_command_permission_resolved(
@@ -389,7 +412,7 @@ pub async fn resolve_command_permission(
         return false;
     };
     // Wake the blocked loop, and every deduped waiter on the same broadcast.
-    let _ = entry.tx.send(allowed);
+    let _ = entry.tx.send(PermissionAnswer::from_decision(allowed));
 
     let reason = if allowed {
         None
@@ -1070,7 +1093,7 @@ impl LucidosEngine {
         // limiter, same as CC) or the turn is canceled. The paired
         // `CommandPermissionResolved` for an Allow/Deny click is emitted by the
         // consent endpoint; only the cancel branch resolves it here.
-        let allowed = tokio::select! {
+        let answer = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
                 if is_canonical {
@@ -1094,20 +1117,40 @@ impl LucidosEngine {
                 }
                 return GuardDecision::Refuse(canceled_refusal());
             }
-            res = rx.recv() => res.unwrap_or(false),
+            res = rx.recv() => res,
         };
-
-        if allowed {
-            GuardDecision::Proceed
-        } else {
-            GuardDecision::Refuse(denial_refusal())
-        }
+        decision_from_answer(answer)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a human's Deny tells the model the user refused. A superseded card
+    /// and a closed channel used to fold into the same "do not retry".
+    #[test]
+    fn only_a_human_deny_reads_as_a_denial() {
+        use tokio::sync::broadcast::error::RecvError;
+        assert_eq!(
+            decision_from_answer(Ok(PermissionAnswer::Allowed)),
+            GuardDecision::Proceed
+        );
+        assert_eq!(
+            decision_from_answer(Ok(PermissionAnswer::Denied)),
+            GuardDecision::Refuse(denial_refusal())
+        );
+        for nobody_decided in [
+            Ok(PermissionAnswer::Withdrawn(SUPERSEDED_REASON)),
+            Err(RecvError::Closed),
+        ] {
+            assert_eq!(
+                decision_from_answer(nobody_decided),
+                GuardDecision::Refuse(withdrawn_refusal())
+            );
+        }
+    }
+
     /// The reported bug, at the decision layer. A `run_python` step whose only
     /// destruction was an `rmtree` of a gitignored staging directory leaves the
     /// two images identical. Before 2026-08-06 that still drew a card, whose

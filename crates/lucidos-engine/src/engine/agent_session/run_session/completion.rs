@@ -28,7 +28,7 @@ use uuid::Uuid;
 /// replacement session's.
 ///
 /// The token is the run's `external_terminal_emitted`, which `run.rs` clones
-/// into the entry it inserts, so `Arc::ptr_eq` is exact. It is the identity
+/// into the entry it inserts, so pointer equality is exact. It is the identity
 /// question `SessionEntryGuard` answers with `same_channel`.
 ///
 /// A replacement can be registered on this thread while this teardown runs, and
@@ -42,23 +42,36 @@ use uuid::Uuid;
 fn own_session_entry<'a>(
     sessions: &'a HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
-    token: &Arc<std::sync::atomic::AtomicBool>,
+    token: &std::sync::atomic::AtomicBool,
 ) -> Option<&'a AgentSession> {
     sessions
         .get(&thread_id)
-        .filter(|s| Arc::ptr_eq(&s.external_terminal_emitted, token))
+        .filter(|s| std::ptr::eq(Arc::as_ptr(&s.external_terminal_emitted), token))
 }
 
-/// Drop this teardown's own entry and leave a replacement alone. See
-/// [`own_session_entry`] for why the two must be told apart.
-fn reap_own_session_entry(
+/// The model and reasoning effort a terminal event reports: what this run's
+/// session runs on now. `send_agent_control_request` changes them mid-session
+/// and never tells the run loop, so only the entry knows. An entry that is gone
+/// or replaced reports neither.
+pub(in crate::engine::agent_session) fn own_model_settings(
+    sessions: &HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    token: &std::sync::atomic::AtomicBool,
+) -> (Option<String>, Option<String>) {
+    own_session_entry(sessions, thread_id, token)
+        .map(|s| (s.current_model.clone(), s.current_reasoning_effort.clone()))
+        .unwrap_or_default()
+}
+
+/// Drop this teardown's own entry and leave a replacement alone. Returns the
+/// removed entry. See [`own_session_entry`] for why the two must be told apart.
+pub(super) fn reap_own_session_entry(
     sessions: &mut HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
-    token: &Arc<std::sync::atomic::AtomicBool>,
-) {
+    token: &std::sync::atomic::AtomicBool,
+) -> Option<AgentSession> {
     if own_session_entry(sessions, thread_id, token).is_some() {
-        sessions.remove(&thread_id);
-        return;
+        return sessions.remove(&thread_id);
     }
     if sessions.contains_key(&thread_id) {
         log!(
@@ -66,6 +79,56 @@ fn reap_own_session_entry(
             thread_id
         );
     }
+    None
+}
+
+/// What the idle exit does when the subprocess exits at a turn boundary.
+pub(super) enum IdleExit {
+    /// The entry is reaped (handed back when it was ours), and the run returns.
+    Release(Option<Box<AgentSession>>),
+    /// A stop was accepted for this session. The entry stays, and finalize
+    /// carries the stop out.
+    HonorStop,
+}
+
+/// Decide the idle exit and act on the entry, in one `agent_sessions` lock.
+///
+/// Stop stays reachable after an idle Terminate: the entry outlives the
+/// subprocess until `Exited` arrives, and `stop_agent` records its reason on
+/// any entry it finds. When `Exited` beats the stop permit to the `select!`,
+/// only this check keeps the accepted Apply, Discard or Archive from being
+/// dropped. Taking the lock for both the check and the reap closes the race
+/// with a Stop that lands in between.
+pub(super) fn idle_exit(
+    sessions: &mut HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    token: &std::sync::atomic::AtomicBool,
+) -> IdleExit {
+    if own_session_entry(sessions, thread_id, token).is_some_and(|s| s.pending_stop.is_some()) {
+        return IdleExit::HonorStop;
+    }
+    IdleExit::Release(reap_own_session_entry(sessions, thread_id, token).map(Box::new))
+}
+
+/// Whether finalize must still carry out a Discard that arrived after its
+/// cleanup read the stop.
+///
+/// The entry stays in the map until the final reap, so Stop keeps accepting
+/// requests, and HTTP has already said yes to this one. Carried out after the
+/// reap, through the same no-session path a slightly later click would take.
+/// Two cases stay out. A conflict session's cleanup never discards. And the
+/// worktree must not be deleted under another session: one a continuation is
+/// resuming (the safety net's or the auto-resume's), or one already spawning.
+pub(super) fn carries_out_late_discard(
+    at_snapshot: Option<StopReason>,
+    at_reap: Option<StopReason>,
+    is_conflict_session: bool,
+    another_session_coming: bool,
+) -> bool {
+    at_reap == Some(StopReason::Discard)
+        && at_snapshot != Some(StopReason::Discard)
+        && !is_conflict_session
+        && !another_session_coming
 }
 
 /// Remove the worktree of a session the user chose to **Discard**, and only
@@ -114,6 +177,15 @@ async fn remove_discarded_worktree(
 }
 
 impl LucidosEngine {
+    /// [`own_model_settings`] under the `agent_sessions` lock.
+    pub(in crate::engine::agent_session) async fn terminal_model_settings(
+        &self,
+        thread_id: Uuid,
+        token: &std::sync::atomic::AtomicBool,
+    ) -> (Option<String>, Option<String>) {
+        own_model_settings(&*self.agent_sessions.lock().await, thread_id, token)
+    }
+
     /// Decide, at the moment a turn's terminal is classified, whether the engine
     /// will auto-resume past it. When it will, take an *auto-resume hold* so the
     /// child-to-parent fan-in withholds the completion card.
@@ -177,6 +249,9 @@ impl LucidosEngine {
     /// unattended runs sat dead for four and eight hours on 2026-08-04 for want
     /// of it.
     ///
+    /// Returns whether a continuation was persisted, so finalize knows a
+    /// resumed turn now owns the worktree.
+    ///
     /// Bounded, unlike the watchdog's: see `auto_resume_after_api_error`.
     ///
     /// **It decides nothing.** `hold_completion_if_api_error_resume` already
@@ -230,13 +305,14 @@ impl LucidosEngine {
         meta: &crate::engine::thread_events::EventMeta,
         withheld_error: Option<String>,
         followups_queued: bool,
-    ) {
+        stop_pending: bool,
+    ) -> bool {
         // The decision arrived as a value: the error the run loop's released
         // hold handed back, or `None` for a terminal nobody withheld. Asking
         // `auto_resume_after_api_error` again here would be a second copy of the
         // predicate, and the two could disagree about a card already out.
         let Some(withheld_error) = withheld_error else {
-            return;
+            return false;
         };
         // Re-asked, not reused: a shutdown that began since the decision was
         // taken must be seen HERE. Recovery re-adopts in-flight threads after
@@ -266,6 +342,15 @@ impl LucidosEngine {
                 thread_id,
             );
             false
+        } else if stop_pending {
+            // The user asked this session to end, so a resume would contradict
+            // them. After a Discard it would also re-adopt a worktree finalize
+            // is about to delete.
+            log!(
+                "[AgentSession] thread {} ended on a transient upstream API failure, but a Stop, Apply, Discard or Archive is pending for it: telling its parent instead of resuming",
+                thread_id,
+            );
+            false
         } else {
             crate::engine::thread_events::emit_continuation_requested_or_log(
                 &self.event_bus,
@@ -287,6 +372,7 @@ impl LucidosEngine {
                     .await;
             }
         }
+        continuation_persisted
     }
 
     /// Completion / teardown lifecycle stage of `run_direct_agent`, extracted
@@ -309,8 +395,6 @@ impl LucidosEngine {
         images: Vec<String>,
         mut msg_rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::AgentUserInput>,
         claude_text_buf: String,
-        normalized_model: Option<String>,
-        cc_reasoning_effort: Option<String>,
         last_terminal_kind: Option<TerminalKind>,
         // What the run loop's released *auto-resume hold* handed back: the error
         // of a terminal whose completion card the fan-in withheld, or `None`
@@ -343,7 +427,7 @@ impl LucidosEngine {
                 s.idle_notify.notify_waiters();
             }
         }
-        self.clear_cc_debounce(thread_id);
+        self.clear_spawn_debounce(thread_id);
 
         // Drain follow-ups queued while CC was busy. Convert to orphaned injections
         // so the caller re-processes them instead of showing "interrupted".
@@ -425,14 +509,17 @@ impl LucidosEngine {
                     true,
                     crate::engine::thread_events::MessageOrigin::system(),
                 );
+                let (model, reasoning_effort) = self
+                    .terminal_model_settings(thread_id, &external_terminal_emitted)
+                    .await;
                 crate::engine::thread_events::emit_response_aborted(
                     &self.event_bus,
                     thread_id,
                     crate::engine::thread_events::AbortCause::SafetyNet,
                     claude_text_buf.clone(),
                     vec![],
-                    normalized_model.clone(),
-                    cc_reasoning_effort.clone(),
+                    model,
+                    reasoning_effort,
                     emit_meta,
                     "[AgentSession] safety-net ResponseAborted",
                 )
@@ -440,13 +527,30 @@ impl LucidosEngine {
             }
         }
 
-        self.maybe_auto_resume_after_api_error(
-            thread_id,
-            meta,
-            withheld_api_error,
-            !cc_orphans.is_empty(),
-        )
-        .await;
+        // Read discard early so we can skip unnecessary work (auto-commit,
+        // hardening) when the user chose Discard.
+        // Ours only, because this gates `remove_discarded_worktree` and a
+        // `git branch -D`. `maybe_auto_resume_after_api_error` below can spawn
+        // a replacement onto this thread, and a Discard meant for that one
+        // would delete the worktree it is running in. One snapshot serves both
+        // reads, so the resume and the Discard cannot disagree about the stop.
+        let pending_stop = {
+            let guard = self.agent_sessions.lock().await;
+            own_session_entry(&guard, thread_id, &external_terminal_emitted)
+                .and_then(|s| s.pending_stop)
+        };
+        let should_discard = matches!(pending_stop, Some(StopReason::Discard));
+        let is_conflict_session = conflict_change.is_some();
+
+        let continuation_requested = self
+            .maybe_auto_resume_after_api_error(
+                thread_id,
+                meta,
+                withheld_api_error,
+                !cc_orphans.is_empty(),
+                pending_stop.is_some(),
+            )
+            .await;
 
         // Make sure the runtime task tears down its child process — driver
         // already drained and logged stderr inside its own task.
@@ -454,20 +558,6 @@ impl LucidosEngine {
 
         // During engine shutdown, skip all cleanup — preserve the worktree and branch
         // so recover_orphaned_worktrees can resume the session after restart.
-        // Read discard early so we can skip unnecessary work (auto-commit,
-        // hardening) when the user chose Discard.
-        // Ours only, because this gates `remove_discarded_worktree` and a
-        // `git branch -D`. `maybe_auto_resume_after_api_error` above can have
-        // spawned a replacement onto this thread, and a Discard meant for that
-        // one would delete the worktree it is running in.
-        let should_discard = {
-            let guard = self.agent_sessions.lock().await;
-            matches!(
-                own_session_entry(&guard, thread_id, &external_terminal_emitted)
-                    .and_then(|s| s.pending_stop),
-                Some(StopReason::Discard),
-            )
-        };
 
         // Re-asked, not reused: a restart that began during the awaits above
         // must be seen HERE, because this is the branch that decides whether the
@@ -597,7 +687,7 @@ impl LucidosEngine {
                     // cleanup there; deleting would destroy the user's
                     // committed work (rust.md failure-path-cleanup rule).
                     if conflict_abort_deletes_temp_state(
-                        change.merge_temp_branch.as_deref(),
+                        change.merge_worktree().map(|m| m.temp_branch.as_str()),
                         &branch_name,
                     ) {
                         if let Err(e) =
@@ -1055,16 +1145,48 @@ impl LucidosEngine {
         // the stop endpoint set `pending_stop = Some(Apply)` even if the user
         // clicks "Apply Now" while cleanup is already in progress (avoids a
         // 404 race).
-        let auto_apply = {
+        let pending_stop_at_reap = {
             let mut guard = self.agent_sessions.lock().await;
-            let val = matches!(
-                own_session_entry(&guard, thread_id, &external_terminal_emitted)
-                    .and_then(|s| s.pending_stop),
-                Some(StopReason::Apply),
-            );
+            let stop = own_session_entry(&guard, thread_id, &external_terminal_emitted)
+                .and_then(|s| s.pending_stop);
             reap_own_session_entry(&mut guard, thread_id, &external_terminal_emitted);
-            val
+            stop
         };
+        let auto_apply = matches!(pending_stop_at_reap, Some(StopReason::Apply));
+
+        // A Discard can land the same way, after the cleanup above read the
+        // stop, and the cleanup then proposed the change instead.
+        let another_session_coming = continuation_requested
+            || net_action == SafetyNetAction::EmitContinuationRequested
+            || self.coding_agent_owns_thread(thread_id).await;
+        if carries_out_late_discard(
+            pending_stop,
+            pending_stop_at_reap,
+            is_conflict_session,
+            another_session_coming,
+        ) {
+            log!(
+                "[AgentSession] A Discard for thread {} arrived after its cleanup; carrying it out now",
+                thread_id
+            );
+            if let Err(e) = self
+                .clone_arc()
+                .end_stale_waiting_session(thread_id, true, None)
+                .await
+            {
+                log!(
+                    "[AgentSession] Late Discard for thread {} failed: {}",
+                    thread_id,
+                    e
+                );
+            }
+            // Finalize's own Discard settles this unconditionally. The path
+            // above settles only through a pending change it discards.
+            self.event_bus
+                .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
+                .await;
+            proposed_change = false;
+        }
 
         // SessionEnded is now terminal-only (Phase 4 of CC resume architecture).
         // Per-turn idle is signaled by `CodingAgentIdled`, which was already
@@ -1116,7 +1238,11 @@ mod tests {
         let mut sessions = HashMap::from([(thread_id, session)]);
 
         assert!(own_session_entry(&sessions, thread_id, &token).is_some());
-        reap_own_session_entry(&mut sessions, thread_id, &token);
+        let reaped = reap_own_session_entry(&mut sessions, thread_id, &token);
+        assert!(
+            reaped.is_some_and(|s| Arc::ptr_eq(&s.external_terminal_emitted, &token)),
+            "the reap hands back the entry it removed"
+        );
         assert!(
             sessions.is_empty(),
             "the teardown must still give its own entry back"
@@ -1138,10 +1264,186 @@ mod tests {
             own_session_entry(&sessions, thread_id, &our_token).is_none(),
             "identity, not liveness: an exited replacement is still not ours"
         );
-        reap_own_session_entry(&mut sessions, thread_id, &our_token);
+        assert!(
+            reap_own_session_entry(&mut sessions, thread_id, &our_token).is_none(),
+            "the outgoing teardown reaps nothing"
+        );
         assert!(
             sessions.contains_key(&thread_id),
             "the replacement's entry must survive the outgoing teardown"
+        );
+    }
+
+    /// A model change mid-session reaches a terminal event. The session was
+    /// spawned on one model, and the user switched it through a control request
+    /// the run loop never sees.
+    #[test]
+    fn a_terminal_reports_the_model_a_control_request_switched_to() {
+        use crate::runtime::ControlRequest;
+        let thread_id = Uuid::new_v4();
+        let (mut session, token, _rx) = session_with(false);
+        session.current_model = Some("spawn-model".into());
+        session.current_reasoning_effort = Some("low".into());
+
+        crate::engine::claude_code::record_control_request(
+            &mut session,
+            &ControlRequest::SetModel {
+                model: "switched-model".into(),
+            },
+        );
+        crate::engine::claude_code::record_control_request(
+            &mut session,
+            &ControlRequest::SetReasoningEffort {
+                effort: "high".into(),
+            },
+        );
+        let mut sessions = HashMap::from([(thread_id, session)]);
+
+        assert_eq!(
+            own_model_settings(&sessions, thread_id, &token),
+            (Some("switched-model".into()), Some("high".into()))
+        );
+
+        let (replacement, _their_token, _their_rx) = session_with(false);
+        sessions.insert(thread_id, replacement);
+        assert_eq!(
+            own_model_settings(&sessions, thread_id, &token),
+            (None, None),
+            "a replacement's model belongs to its own turn"
+        );
+    }
+
+    /// Apply clicked just as an idle turn terminated its subprocess. Stop found
+    /// the entry and recorded the Apply, and HTTP said yes. Then `Exited` beat
+    /// the stop permit to the `select!`. The idle exit must hand the entry to
+    /// finalize, which applies (or discards, or archives), instead of reaping
+    /// it and returning `auto_apply: false`.
+    #[test]
+    fn a_stop_accepted_during_idle_terminate_reaches_finalize() {
+        let thread_id = Uuid::new_v4();
+        for reason in [StopReason::Apply, StopReason::Discard, StopReason::Archive] {
+            let (mut session, token, _rx) = session_with(true);
+            session.pending_stop = Some(reason);
+            let mut sessions = HashMap::from([(thread_id, session)]);
+
+            assert!(
+                matches!(
+                    idle_exit(&mut sessions, thread_id, &token),
+                    IdleExit::HonorStop
+                ),
+                "{reason:?} was accepted and must not be dropped"
+            );
+            assert!(
+                sessions.contains_key(&thread_id),
+                "finalize reads {reason:?} off the entry, so it must stay"
+            );
+        }
+    }
+
+    /// A stop the idle exit hands over must not also auto-resume. A turn that
+    /// ended on a transient API error withholds a resume for finalize to emit.
+    /// Emitted beside a Discard, the resumed session re-adopts the worktree
+    /// finalize is deleting. So finalize snapshots the stop before it decides.
+    #[test]
+    fn finalize_never_auto_resumes_over_a_pending_stop() {
+        const SRC: &str = include_str!("completion.rs");
+        let body = &SRC[SRC
+            .find("async fn finalize_direct_agent(")
+            .expect("finalize is still here")..];
+        let snapshot = body
+            .find("let pending_stop = {")
+            .expect("finalize snapshots its own pending stop");
+        let call = body
+            .find("maybe_auto_resume_after_api_error(")
+            .expect("finalize still reaches the auto-resume");
+        let args = &body[call..call + body[call..].find(".await").unwrap()];
+        assert!(
+            snapshot < call,
+            "the snapshot must come before the decision"
+        );
+        assert!(
+            args.contains("pending_stop.is_some()"),
+            "the auto-resume must hear about the pending stop: {args}"
+        );
+    }
+
+    /// Stop answered yes to a Discard that landed after finalize read the stop
+    /// for its cleanup. The cleanup already proposed the change instead, so
+    /// finalize must carry the Discard out after the reap. It stays out of a
+    /// conflict session, whose cleanup never discards, and out of a session
+    /// the auto-resume just handed to a continuation.
+    #[test]
+    fn a_discard_that_missed_the_cleanup_is_still_carried_out() {
+        use StopReason::{Apply, Discard};
+        assert!(carries_out_late_discard(None, Some(Discard), false, false));
+
+        assert!(
+            !carries_out_late_discard(Some(Discard), Some(Discard), false, false),
+            "the cleanup already discarded"
+        );
+        assert!(!carries_out_late_discard(None, Some(Apply), false, false));
+        assert!(!carries_out_late_discard(None, None, false, false));
+        assert!(!carries_out_late_discard(None, Some(Discard), true, false));
+        assert!(!carries_out_late_discard(None, Some(Discard), false, true));
+    }
+
+    /// The ordinary idle exit: nothing asked to stop, so the entry goes.
+    #[test]
+    fn an_idle_exit_with_no_stop_releases_its_own_entry() {
+        let thread_id = Uuid::new_v4();
+        let (session, token, _rx) = session_with(true);
+        let mut sessions = HashMap::from([(thread_id, session)]);
+
+        assert!(matches!(
+            idle_exit(&mut sessions, thread_id, &token),
+            IdleExit::Release(Some(_))
+        ));
+        assert!(sessions.is_empty());
+    }
+
+    /// A replacement's stop is its own run's to carry out, not this one's.
+    #[test]
+    fn an_idle_exit_ignores_a_replacements_pending_stop() {
+        let thread_id = Uuid::new_v4();
+        let (_outgoing, our_token, _our_rx) = session_with(true);
+        let (mut replacement, _their_token, _their_rx) = session_with(false);
+        replacement.pending_stop = Some(StopReason::Apply);
+        let mut sessions = HashMap::from([(thread_id, replacement)]);
+
+        assert!(matches!(
+            idle_exit(&mut sessions, thread_id, &our_token),
+            IdleExit::Release(None)
+        ));
+        assert!(sessions.contains_key(&thread_id));
+    }
+
+    /// Every `agent_sessions` removal in `run.rs` goes through
+    /// [`reap_own_session_entry`].
+    ///
+    /// A Tier 2 merge spawn can replace an idle session a second before the
+    /// outgoing process exits. Removing by thread id then drops the live
+    /// replacement from the map, and the switch teardown never pauses it.
+    #[test]
+    fn run_rs_never_removes_a_session_entry_by_thread_id_alone() {
+        const RUN_SRC: &str = include_str!("run.rs");
+        let src = &RUN_SRC[..RUN_SRC.find("#[cfg(test)]").unwrap_or(RUN_SRC.len())];
+        for (at, _) in src.match_indices(".remove(&thread_id)") {
+            let lock = src[..at]
+                .rfind(".lock()")
+                .expect("every removal in run.rs sits under a lock");
+            // The whole statement, so a lock chain rustfmt splits is still read.
+            let start = src[..lock].rfind([';', '{']).map_or(0, |n| n + 1);
+            let statement = src[start..lock].trim();
+            assert!(
+                !statement.contains("agent_sessions"),
+                "run.rs removes an agent_sessions entry by thread id alone, which deletes a \
+                 replacement session's entry. Use `reap_own_session_entry`. Lock: {statement}"
+            );
+        }
+        assert!(
+            src.contains("reap_own_session_entry(") && src.contains("idle_exit("),
+            "the stale-resume retry reaps through the shared helper, and the idle exit \
+             through `idle_exit`, which wraps it"
         );
     }
 

@@ -21,7 +21,7 @@ import { progressFillWidth } from './progressBar';
  *
  *  See docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md. */
 
-/** Pure markup, hook-free so the gallery and the tests can call it directly.
+/** Pure markup, hook-free so the tests can call it directly.
  *  The `backupReminderBody` / `connectionBannerBody` idiom. */
 export function progressDialogBody(props: {
   state: ProgressDialogState;

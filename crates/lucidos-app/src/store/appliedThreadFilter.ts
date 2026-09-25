@@ -52,7 +52,7 @@ function sameSelection(a: ThreadFilterSelection, b: ThreadFilterSelection): bool
  *  value and catches up in one pass on close.
  *
  *  The panel is a view INSIDE the drawer pane that covers the list completely
- *  (`.thread-filter-panel` is `position: absolute; inset: 0` over the pane's own
+ *  (`.thread-filter-cover` is `position: absolute; inset: 0` over the pane's own
  *  opaque background), so a tick of one of its checkboxes changes nothing the
  *  user can see. Read live, each tick nonetheless re-ran the drawer's O(threads)
  *  categorization pipeline, rebuilt and re-diffed every row (swapping hundreds
@@ -73,7 +73,7 @@ function sameSelection(a: ThreadFilterSelection, b: ThreadFilterSelection): bool
  *
  *  Holding is only honest because the one surface that RENDERS from this is
  *  `ThreadList`, which is exactly what the panel covers. The panel's own
- *  checkboxes, its option lists and the header's filter-active highlight all
+ *  checkboxes, its option lists and the header's Filter glyph all
  *  read the live signals, so they answer the tap at once. A new surface that
  *  displays threads by this selection and is NOT inside the drawer pane would
  *  show a stale list whenever the panel is up: it reads the live signals, or it

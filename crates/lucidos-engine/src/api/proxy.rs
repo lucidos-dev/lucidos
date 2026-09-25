@@ -27,6 +27,7 @@ use super::*;
 
 use crate::api::hex::hex_lower;
 use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig};
+use crate::api::proxy_timeout::{CallBudget, MAX_SECS};
 use crate::core::{Credential, CredentialStore};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, Method};
@@ -54,6 +55,10 @@ pub struct ProxyConfig {
     /// needs, and both hand an on-path attacker the credential.
     #[serde(default)]
     pub insecure_transport: bool,
+    /// How long this entry waits on one upstream request, in seconds. Wins over
+    /// the workspace's `proxy_timeout_secs`; see `api::proxy_timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,7 +93,10 @@ pub enum Transport {
     Unverified,
 }
 
-/// Options both proxy clients share. Pooled, no proxy, bounded timeouts.
+/// Options both proxy clients share. Pooled, no proxy, a bounded connect.
+///
+/// No total timeout here: [`forward_request`] sets one per request, because
+/// the wait is configurable per entry and per workspace (`api::proxy_timeout`).
 ///
 /// `redirect(Policy::none())`: signed proxy requests must NOT auto-follow
 /// redirects. reqwest would replay the original Authorization header /
@@ -103,7 +111,6 @@ fn proxy_client_options() -> reqwest::ClientBuilder {
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
 }
 
@@ -416,6 +423,12 @@ fn parse_provider(name: &str, entry: &serde_json::Value) -> Result<ProxyConfig, 
             .and_then(|auth| super::proxy_migration::legacy_rejection(name, auth))
             .unwrap_or_else(|| format!("provider '{name}': {e}"))
     })?;
+    if let Some(reason) = cfg
+        .timeout_secs
+        .and_then(|secs| super::proxy_timeout::range_rejection("timeout_secs", secs))
+    {
+        return Err(format!("provider '{name}': {reason}"));
+    }
     // Walk the pipeline and validate any ScriptHandshake layer's script
     // path, before the engine can be tricked into running an out-of-workspace
     // file. The rule itself lives with the spawn, in
@@ -1235,6 +1248,7 @@ pub async fn forward_request(
     auth_headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
     transport: Transport,
+    timeout: Duration,
 ) -> Response {
     let req_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
@@ -1246,7 +1260,9 @@ pub async fn forward_request(
                 .into_response();
         }
     };
-    let mut builder = client_for(transport).request(req_method, target_url);
+    let mut builder = client_for(transport)
+        .request(req_method, target_url)
+        .timeout(timeout);
 
     let mut filtered = filter_request_headers(&request_headers);
     // The engine's own headers must REPLACE the caller's, and reqwest's
@@ -1273,7 +1289,7 @@ pub async fn forward_request(
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let resp_headers = resp.headers().clone();
             // A body read that fails mid-stream (connection dropped, the
-            // client's 30s timeout expiring during the body) must NOT be
+            // request's timeout expiring during the body) must NOT be
             // reported as the upstream's own status with an empty body: the
             // calling app would read a 200 with no data as a successful empty
             // result. Surface it as the gateway error it is. Same URL-stripping
@@ -1281,17 +1297,20 @@ pub async fn forward_request(
             let resp_body = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
+                    // A streamed reply that outlasts the wait lands here, not
+                    // in the send arm, and it is the same timeout: a 504.
+                    let is_timeout = e.is_timeout();
                     let safe_e = e.without_url();
                     log!(
                         "[Proxy] reading upstream body from {} failed: {}",
                         log_url,
                         safe_e
                     );
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("upstream body read failed: {}", safe_e),
-                    )
-                        .into_response();
+                    let (status, what) = match is_timeout {
+                        true => (StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
+                        false => (StatusCode::BAD_GATEWAY, "upstream body read failed"),
+                    };
+                    return (status, format!("{what}: {safe_e}")).into_response();
                 }
             };
             let mut response = Response::builder().status(status);
@@ -1555,9 +1574,14 @@ async fn proxy_handle_inner(
         ResolvedProxy::Builtin { base_url, layers } => {
             let ctx = ScopeContext::from_engine(&state.engine);
             match ScopedPipeline::bind(&ctx, &name, base_url, layers, false).await {
-                Ok(scoped) => {
-                    dispatch_scoped(&name, &scoped, method, path, query, headers, body).await
-                }
+                // A builtin has no entry, so only the workspace value applies.
+                Ok(scoped) => match crate::api::proxy_timeout::resolve(ctx.pool, None).await {
+                    Ok(timeout) => {
+                        dispatch_scoped(&name, &scoped, timeout, method, path, query, headers, body)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         }
@@ -1597,7 +1621,8 @@ pub async fn dispatch_proxy_request(
         config.insecure_transport,
     )
     .await?;
-    dispatch_scoped(name, &scoped, method, path, query, headers, body).await
+    let timeout = crate::api::proxy_timeout::resolve(engine.pool(), config.timeout_secs).await?;
+    dispatch_scoped(name, &scoped, timeout, method, path, query, headers, body).await
 }
 
 /// Forward through a scoped pipeline (with same-host redirect re-signing) and
@@ -1609,19 +1634,25 @@ pub async fn dispatch_proxy_request(
 /// the engine's own model-provider credentials.
 ///
 /// Takes a [`ScopedPipeline`] rather than loose layers, which is what makes the
-/// scope gate impossible to skip.
+/// scope gate impossible to skip. `timeout` is required for the same reason:
+/// every arm resolves one through `api::proxy_timeout::resolve`. It bounds
+/// each upstream request, and the call as a whole gets a [`CallBudget`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_scoped(
     name: &str,
     scoped: &ScopedPipeline,
+    timeout: Duration,
     method: Method,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, String)> {
+    let budget = CallBudget::start(timeout);
     let (response, outcome) = forward_with_redirects(
         name,
         scoped,
+        &budget,
         &method,
         &path,
         query.as_deref(),
@@ -1641,6 +1672,7 @@ pub(crate) async fn dispatch_scoped(
     let (response, _) = forward_with_redirects(
         name,
         scoped,
+        &budget,
         &method,
         &path,
         query.as_deref(),
@@ -1689,9 +1721,11 @@ async fn build_pipeline_layers(
 ///
 /// Returns the final response and the `PipelineOutcome` from the first
 /// hop (which is what the 401-retry decision inspects).
+#[allow(clippy::too_many_arguments)]
 async fn forward_with_redirects(
     name: &str,
     scoped: &ScopedPipeline,
+    budget: &CallBudget,
     method: &Method,
     initial_path: &str,
     initial_query: Option<&str>,
@@ -1722,6 +1756,14 @@ async fn forward_with_redirects(
     let mut first_outcome: Option<crate::api::proxy_pipeline::PipelineOutcome> = None;
     let mut hops = 0usize;
 
+    let out_of_time = || {
+        log!("[Proxy] {} ran out of its {}s call budget", name, MAX_SECS);
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("proxy '{name}' ran past the {MAX_SECS}s limit on one proxied call"),
+        )
+    };
+
     loop {
         // Per hop, so it also catches a same-origin `Location` that leaves the
         // prefix. The origin check below cannot see that: scheme, host and port
@@ -1744,14 +1786,22 @@ async fn forward_with_redirects(
                 },
             )?;
 
-        let outcome = crate::api::proxy_pipeline::run_pipeline(
-            layers,
-            &current_method,
-            &target_url,
-            &[],
-            &current_body,
+        // Bounded by what is left of the call. A token refresh and a
+        // handshake script can each take tens of seconds, and a client's
+        // fixed wait only holds if nothing outlasts the cap.
+        let call_left = budget.time_left().ok_or_else(out_of_time)?;
+        let outcome = tokio::time::timeout(
+            call_left,
+            crate::api::proxy_pipeline::run_pipeline(
+                layers,
+                &current_method,
+                &target_url,
+                &[],
+                &current_body,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| out_of_time())??;
 
         let body_for_send = outcome
             .replace_body
@@ -1783,6 +1833,7 @@ async fn forward_with_redirects(
         // Final URL for this hop = target + pipeline-added query params,
         // URL-encoded. Layers return raw values; engine handles encoding.
         let final_url = merge_query_params(&target_url, &outcome.query);
+        let request_timeout = budget.next_request().ok_or_else(out_of_time)?;
 
         let response = forward_request(
             current_method.clone(),
@@ -1792,6 +1843,7 @@ async fn forward_with_redirects(
             auth_headers,
             body_for_send,
             scoped.transport,
+            request_timeout,
         )
         .await;
 

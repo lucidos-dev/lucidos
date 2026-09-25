@@ -306,7 +306,7 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
 
     // A caller only gets the nominal while it still wears the class.
     expect(chatExchange, 'the queued button no longer carries the inline-icon class')
-      .toContain('class="icon-btn inline-icon queued-message-remove"');
+      .toContain('class="icon-btn inline-icon queued-message-remove exchange-status-glyph"');
     for (const name of ['trigger-group-rename', 'trigger-group-delete']) {
       expect(groupHeader, `${name} no longer carries the row-icon class`)
         .toContain(`class="icon-btn row-icon ${name}"`);

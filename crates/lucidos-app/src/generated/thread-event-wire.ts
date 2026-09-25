@@ -270,6 +270,15 @@ export type EventWaitCancelCause =
   | 'thread_canceled'
   | 'unknown';
 
+/** How a *form request* was closed. Carried by `FormRequestResolved`.
+ *  Full reasoning is on the Rust variant. */
+export type FormRequestOutcome =
+  | 'completed'
+  | 'canceled'
+  | 'superseded'
+  | 'expired'
+  | 'unknown';
+
 /** Who this thread event is the work of.
  *  Full reasoning is on the Rust variant. */
 export type MessageOrigin =
@@ -385,6 +394,22 @@ export interface QuestionOption {
   id: string;
   label: string;
   description?: string;
+  /** Markdown the card shows under the option: a picture, or a short text
+   *  sample. Claude Code's native tool names it `preview`. */
+  preview?: string;
+}
+
+/** One pending change held by a sub-thread of the thread a
+ *  `ChildThreadCompleted` reports on: any descendant, not the thread itself.
+ *  Full reasoning is on the Rust variant. */
+export interface SubThreadPendingChange {
+  change_id: string;
+  /** The sub-thread that proposed the change. */
+  thread_id: string;
+  thread_title?: string;
+  /** Same meaning as `PendingThreadState::unsettled`: that sub-thread was still
+   *  working on the change when the card was sent. */
+  thread_unsettled: boolean;
 }
 
 /** Direction of a `ThreadLink` origin: which end of the parent⇄child
@@ -959,6 +984,20 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The coding agent read an input the engine forwarded to it. Until then
+   *  the input is owed, and the session keeps its subprocess (ADR 0268). */
+  | {
+      type: 'CodingAgentInputRead';
+      /** The event that carried the input: the `MessageReceived` for a
+       *  message. */
+      input_event_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** Emitted when the engine detects that a coding-agent session ended without
    *  running the required hardening. A recovery hardening session is spawned
    *  automatically. This is NOT a completion event: the thread stays active
@@ -1396,9 +1435,85 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** Credential form request. Resolved by the credential save or the form's
+   *  Cancel (`POST /api/v1/form-requests/{request_id}/cancel`). */
   | {
       type: 'CredentialRequested';
-      provider: string;
+      request_id: string;
+      payload: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Plugin install request awaiting user confirmation. It carries the
+   *  JSON preview `install_plugin` emitted: manifest, file list, overwrites
+   *  and an optional `setup`. The frontend renders the install panel from
+   *  it. `request_id` is the preview's `install_id`.
+   *  Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`. */
+  | {
+      type: 'PluginInstallRequested';
+      request_id: string;
+      payload: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Plugin uninstall request awaiting user confirmation. It carries the
+   *  JSON preview `uninstall_plugin` emitted: plugin name and version, plus
+   *  the file list split into still-on-disk and already-missing. The
+   *  frontend renders the uninstall panel from it. `request_id` is the
+   *  preview's `uninstall_id`. Resolved by
+   *  `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`. */
+  | {
+      type: 'PluginUninstallRequested';
+      request_id: string;
+      payload: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Email send awaiting user confirmation. `payload` is the draft.
+   *  Resolved by `POST /api/v1/email/send` or the form's Cancel. */
+  | {
+      type: 'EmailConfirmRequested';
+      request_id: string;
+      payload: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The provider's authorization page for `connect_oauth_account`.
+   *  `payload` is the `{target: "url", url, purpose: "oauth"}` navigation
+   *  the client opens, on the device the meta actor names. The flow's
+   *  listener resolves it when its wait ends. */
+  | {
+      type: 'OAuthAuthorizationRequested';
+      request_id: string;
+      payload: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Closes the form request `request_id` names. Emitted once per request. */
+  | {
+      type: 'FormRequestResolved';
+      request_id: string;
+      outcome: FormRequestOutcome;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1633,9 +1748,15 @@ export type ThreadEvent =
        *  `ResponseGenerated` (truncated to 2000 chars), or the failure error
        *  for `Failure`. Indexed by [`ThreadEvent::indexable_text`]. */
       summary: string;
-      /** IDs of changes the child left in `pending` state. Empty for chat
-       *  children and for CC children that ended without proposing anything. */
+      /** IDs of changes the child left in `pending` state on its OWN branch.
+       *  Empty for chat children and for CC children that ended without
+       *  proposing anything. */
       pending_change_ids?: string[];
+      /** Pending changes held anywhere below the child: its sub-threads, at
+       *  any depth. Kept apart from `pending_change_ids` so the parent can
+       *  tell whose change is whose. An orchestrator's children hold the
+       *  changes while the orchestrator holds none. */
+      sub_thread_pending_changes?: SubThreadPendingChange[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1650,6 +1771,21 @@ export type ThreadEvent =
    *  settles it (ADR 0252). */
   | {
       type: 'ChildThreadStopped';
+      child_thread_id: string;
+      child_thread_title?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A child thread was moved to top level: it is no longer this thread's
+   *  child. Emitted on the **former parent**, never on the child, so ADR
+   *  0011's "latest event is a card" predicates stay true on the child.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      type: 'ChildThreadDetached';
       child_thread_id: string;
       child_thread_title?: string;
       /** Links this event back to the request that opened the turn. */
@@ -1977,56 +2113,6 @@ export type TransientEvent =
       actor?: MessageOrigin;
     }
   | {
-      type: 'CredentialPromptRequested';
-      payload: string;
-      /** Links this event back to the request that opened the turn. */
-      request_event_id?: string;
-      /** Source channel. Always set on an origin event. */
-      channel?: EventChannel;
-      /** Who initiated. Absent when an internal state machine acted. */
-      actor?: MessageOrigin;
-    }
-  /** Plugin install request awaiting user confirmation. It carries the
-   *  JSON preview `install_plugin` emitted: manifest, file list, overwrites
-   *  and an optional `setup`. The frontend renders the install panel from
-   *  it.
-   *  Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`. */
-  | {
-      type: 'PluginInstallRequested';
-      payload: string;
-      /** Links this event back to the request that opened the turn. */
-      request_event_id?: string;
-      /** Source channel. Always set on an origin event. */
-      channel?: EventChannel;
-      /** Who initiated. Absent when an internal state machine acted. */
-      actor?: MessageOrigin;
-    }
-  /** Plugin uninstall request awaiting user confirmation. It carries the
-   *  JSON preview `uninstall_plugin` emitted: plugin name and version, plus
-   *  the file list split into still-on-disk and already-missing. The
-   *  frontend renders the uninstall panel from it. Resolved by
-   *  `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`. */
-  | {
-      type: 'PluginUninstallRequested';
-      payload: string;
-      /** Links this event back to the request that opened the turn. */
-      request_event_id?: string;
-      /** Source channel. Always set on an origin event. */
-      channel?: EventChannel;
-      /** Who initiated. Absent when an internal state machine acted. */
-      actor?: MessageOrigin;
-    }
-  | {
-      type: 'EmailConfirmRequested';
-      payload: string;
-      /** Links this event back to the request that opened the turn. */
-      request_event_id?: string;
-      /** Source channel. Always set on an origin event. */
-      channel?: EventChannel;
-      /** Who initiated. Absent when an internal state machine acted. */
-      actor?: MessageOrigin;
-    }
-  | {
       type: 'PushNotificationRequested';
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -2130,6 +2216,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CodingAgentToolResult: true,
   CodingAgentUserMessageSent: true,
   CodingAgentPromptSent: true,
+  CodingAgentInputRead: true,
   MissingHardeningDetected: true,
   CodingAgentIdled: true,
   ContinuationRequested: true,
@@ -2155,6 +2242,11 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CodingAgentSettingsChanged: true,
   UserPromptInjected: true,
   CredentialRequested: true,
+  PluginInstallRequested: true,
+  PluginUninstallRequested: true,
+  EmailConfirmRequested: true,
+  OAuthAuthorizationRequested: true,
+  FormRequestResolved: true,
   McpConsentRequested: true,
   UserQuestionAsked: true,
   UserQuestionAnswered: true,
@@ -2169,6 +2261,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   WorktreeCleaned: true,
   ChildThreadCompleted: true,
   ChildThreadStopped: true,
+  ChildThreadDetached: true,
   ContextDismissed: true,
   ContextKeptOpen: true,
   WorkingUnderstandingWritten: true,

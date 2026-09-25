@@ -1,10 +1,20 @@
 import { useEffect, useState } from 'preact/hooks';
 import { responseStyles, responseStylesVersion, showConfirm } from '../../store/store';
-import { currentResponseStyle, setResponseStyle } from '../../store/actions/preferences';
+import {
+  currentResponseStyle,
+  currentTechnicalLiteracy,
+  setResponseStyle,
+  setTechnicalLiteracy,
+  TECHNICAL_LITERACY_LEVELS,
+  TECHNICAL_LITERACY_NOT_SET,
+  type TechnicalLiteracy,
+} from '../../store/actions/preferences';
 import { loadResponseStyles, saveStyleDocument } from '../../store/actions/responseStyles';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { useServerBackedField } from '../../hooks/useServerBackedField';
-import { Dropdown, type DropdownOption } from '../shared/Dropdown';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { Dropdown, DropdownSkeleton, type DropdownOption } from '../shared/Dropdown';
+import { LoadingFade } from '../shared/LoadingFade';
 import { Explainer } from '../shared/Explainer';
 import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
@@ -23,18 +33,46 @@ import type { ResponseStyle } from '../../api/types';
 
 /** The picker's options: every style in the library, each with its own one-line
  *  description. Standard leads, because it is the default and the way back.
+ *  An edited shipped style says so, since its description is still the
+ *  shipped one.
  *
  *  A pure function, so the row a user reads is testable without a DOM. */
 export function responseStyleOptions(library: readonly ResponseStyle[]): DropdownOption[] {
   return library.map((style) => ({
     value: style.id,
-    label: style.label,
+    label: style.source === 'overridden' ? `${style.label} (edited)` : style.label,
     description: style.description,
   }));
 }
 
-/** Settings → Models → Response style: which *response style* answers come
- *  back in.
+/** Mirrors `card_label` / `card_line` in `core/technical_literacy.rs`, so
+ *  Settings reads exactly like the first-run card. Pinned by the mirror test. */
+const LITERACY_COPY: Record<TechnicalLiteracy, { label: string; description: string }> = {
+  'non-technical': { label: 'Keep it plain', description: 'Everyday words, no jargon.' },
+  technical: { label: 'Technical', description: 'Technical terms are fine.' },
+  developer: { label: 'I write software', description: 'Talk to me like a developer.' },
+};
+
+/** The *technical literacy* picker's options, least technical first, after
+ *  "Not set". A pure function, so the rows are testable without a DOM. */
+export function technicalLiteracyOptions(): DropdownOption[] {
+  return [
+    {
+      value: TECHNICAL_LITERACY_NOT_SET,
+      label: 'Not set',
+      description: 'Nothing is added. Answers keep their usual wording.',
+    },
+    ...TECHNICAL_LITERACY_LEVELS.map((level) => ({ value: level, ...LITERACY_COPY[level] })),
+  ];
+}
+
+function onLiteracyPicked(value: string) {
+  const level = TECHNICAL_LITERACY_LEVELS.find((l) => l === value) ?? null;
+  void setTechnicalLiteracy(level);
+}
+
+/** Settings → Models → Response style: how answers come back. Two independent
+ *  picks: the *style* (the shape of an answer) and the *technical literacy*.
  *
  *  The picker and the editor are one component because they read one list.
  *  That list comes from the engine (`GET /api/v1/response-styles`), merged from
@@ -46,6 +84,7 @@ export function ResponseStylesSection() {
   const selected = currentResponseStyle();
   const [editing, setEditing] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const showStyleSkeleton = useDelayedLoading(loadable);
 
   const library = loadable.status === 'loaded' ? loadable.data : [];
   // The style the editor is open on. Re-read from the library each render
@@ -53,8 +92,9 @@ export function ResponseStylesSection() {
   const editingStyle = editing === null ? undefined : library.find((s) => s.id === editing);
   const editorOpen = adding || editingStyle !== undefined;
 
-  // Loads on mount, and again whenever a peer device or the agent rewrites the
-  // document. The version counter is the subscription (ADR 0118).
+  // Reloads whenever a peer device or the agent rewrites the document. The
+  // version counter is the subscription (ADR 0118). The mount load is the
+  // effect below.
   //
   // Paused on the editor being OPEN, never on the raw `editing` id: an id the
   // library no longer answers draws nothing, and pausing on it would leave the
@@ -84,25 +124,50 @@ export function ResponseStylesSection() {
         Response style
         <Explainer title="Response style">
           <p>
-            How much comes back in an answer. It applies to chat and to every trigger,
-            from your next message onward.
+            How answers come back, in two independent parts. <strong>Style</strong> sets
+            the shape of an answer: how much comes back, and what it is for.{' '}
+            <strong>How technical</strong> sets the words: plain
+            language, or technical terms with no explanation. Any style works with any
+            level, so a technical user who wants only the outcome picks their level and
+            a short style.
           </p>
+          <p>Both apply to chat and to every trigger, from your next message onward.</p>
           <p>
             <strong>Standard</strong> adds nothing at all, so answers come back the way
             they always have. Pick it to turn the whole setting off.
           </p>
           <p>
-            <strong>Concise</strong> and <strong>Minimal</strong> ship with Lucidos, and
-            you can edit either. An edited one keeps a Reset, which brings the original
-            wording back. Add your own with the card at the bottom.
+            <strong>Concise</strong>, <strong>Minimal</strong> and{' '}
+            <strong>Learning</strong> ship with Lucidos, and you can edit any of them.
+            Minimal gives the outcome, not the process. Learning explains the why as it
+            goes. An edited style keeps a Reset, which brings the original wording back.
+            Add your own with the card at the bottom.
           </p>
           <p>
             Whatever a style asks for, Lucidos still keeps every warning, every caveat
             that changes the answer, and every step you have to take. You cannot write
             that rule away, and asking "why" or "how" still gets a real explanation.
           </p>
-          <p>Coding-agent sessions are unaffected: they have their own instructions.</p>
+          <p>
+            Coding-agent sessions follow <strong>How technical</strong> from their next
+            start. The style does not reach them: they have their own instructions.
+          </p>
+          <p>
+            The setup guide asks how technical you are. You can change it here any time.
+          </p>
         </Explainer>
+      </div>
+
+      {/* Above Style, so the style picker keeps its editor list right under it.
+          It reads a preference rather than the library, so it never waits on
+          the library load. */}
+      <div class="settings-row" data-search-anchor="models:technical-literacy">
+        <span class="settings-row-label">How technical</span>
+        <Dropdown
+          options={technicalLiteracyOptions()}
+          value={currentTechnicalLiteracy() ?? TECHNICAL_LITERACY_NOT_SET}
+          onChange={onLiteracyPicked}
+        />
       </div>
 
       {loadable.status === 'failed' && (
@@ -111,11 +176,17 @@ export function ResponseStylesSection() {
 
       <div class="settings-row" data-search-anchor="models:response-style-picker">
         <span class="settings-row-label">Style</span>
-        <Dropdown
-          options={responseStyleOptions(library)}
-          value={selected}
-          onChange={(id) => void setResponseStyle(id)}
-        />
+        {/* Withheld until the library lands. Before that the trigger could only
+            show the raw id and open an empty menu. */}
+        <LoadingFade class="dropdown-slot" showSkeleton={showStyleSkeleton} skeleton={<DropdownSkeleton w="6rem" />}>
+          {loadable.status === 'loaded' ? (
+            <Dropdown
+              options={responseStyleOptions(library)}
+              value={selected}
+              onChange={(id) => void setResponseStyle(id)}
+            />
+          ) : null}
+        </LoadingFade>
       </div>
       {missing && (
         <div class="settings-row-note">
@@ -177,7 +248,10 @@ function StyleRow({
   return (
     <div class="list-row">
       <div class="list-row-info">
-        <div class="title">{style.label}</div>
+        <div class="title">
+          {style.label}
+          {style.source === 'overridden' && <span class="style-row-edited">Edited</span>}
+        </div>
         <div class="list-row-details list-row-details-prose">{style.description}</div>
       </div>
       <div class="list-row-actions">
@@ -198,6 +272,15 @@ function StyleRow({
     </div>
   );
 }
+
+/** Shown in the empty instruction field. Several lines, so it reads as a
+ *  sample of what to write rather than as text already filled in. */
+const INSTRUCTION_EXAMPLE = [
+  'For example:',
+  '- Start with the answer. Skip the introduction and the summary at the end.',
+  '- Keep it to three bullet points or fewer.',
+  '- Write for a busy manager who is not technical.',
+].join('\n');
 
 /** The edit form, shared by Edit and Add. `style` absent means Add.
  *
@@ -247,7 +330,7 @@ function StyleEditorModal({
     setSaving(true);
     try {
       const ok = await saveStyleDocument((current) => {
-        // Re-derived against the CURRENT library. The render-time id below is
+        // Re-derived against the CURRENT library. The render-time id above is
         // only a validity preview: computed from a stale list it could collide
         // with a style another device added, which `documentWithEdit` would
         // then overwrite in place.
@@ -274,17 +357,18 @@ function StyleEditorModal({
       panelProps={{ 'aria-label': title }}
     >
       <h2 class="style-editor-title">{title}</h2>
-      {/* The one place the instruction's job is explained. Above the fields
-          rather than under them, so the reader meets it first. */}
+      {/* What a style is for. Above the fields rather than under them, so the
+          reader meets it first. Each field then says what goes in it. */}
       <p class="style-editor-intro">
-        What this should do to an answer, written as instructions to Lucidos. It is
-        added to every reply, word for word.
+        A style tells Lucidos how to write its answers. While it is picked, Lucidos
+        reads your instructions before every reply.
       </p>
       <label class="style-editor-field">
         <span class="style-editor-field-label">Name</span>
+        <span class="style-editor-field-hint">What the style is called in the Style list.</span>
         <input
           class="settings-text-input"
-          placeholder="Board report"
+          placeholder="For example: Board report"
           value={label}
           onInput={(e) => setLabel((e.currentTarget as HTMLInputElement).value)}
         />
@@ -293,12 +377,15 @@ function StyleEditorModal({
           content keeps no height to scroll in, so a long instruction ran off
           the pane with no way to reach the end. */}
       <label class="style-editor-field style-editor-field-grow">
-        <span class="style-editor-field-label">Instruction</span>
+        <span class="style-editor-field-label">Instructions</span>
+        <span class="style-editor-field-hint">
+          How answers should read, in your own words. One rule per line works well.
+        </span>
         <textarea
           class="style-editor-instruction"
           value={instruction}
           onInput={(e) => setInstruction((e.currentTarget as HTMLTextAreaElement).value)}
-          placeholder="- Lead with the answer. No preamble, no closing recap."
+          placeholder={INSTRUCTION_EXAMPLE}
           {...PROSE_TEXT_ATTRS}
         />
       </label>

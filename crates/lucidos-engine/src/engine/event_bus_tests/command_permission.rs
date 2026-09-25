@@ -6,9 +6,10 @@
 
 use super::super::*;
 use super::*;
-use crate::engine::cc_permission::{DedupKey, PermissionEntry, PermissionState};
+use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionEntry, PermissionState};
 use crate::engine::command_permission::{
     recover_orphan_command_permission_requests, resolve_pending_command_permissions_as_superseded,
+    SUPERSEDED_REASON,
 };
 use std::sync::Mutex;
 
@@ -165,7 +166,7 @@ async fn startup_skips_already_resolved_command_permission() {
 }
 
 /// Typing a new message while parked on a command card supersedes it: the
-/// in-process waiter is unblocked with `false` (deny) and a Resolved is emitted.
+/// in-process waiter is unblocked as withdrawn and a Resolved is emitted.
 #[tokio::test]
 async fn superseded_resolves_pending_command_permission_and_unblocks_waiter() {
     let (pool, db_name) = setup_test_db().await;
@@ -196,10 +197,11 @@ async fn superseded_resolves_pending_command_permission_and_unblocks_waiter() {
 
     resolve_pending_command_permissions_as_superseded(&pool, &bus, &pending, thread_id, None).await;
 
-    // Waiter woken with a deny.
-    assert!(
-        !waiter.recv().await.unwrap(),
-        "supersede must unblock the parked loop with a deny"
+    // Waiter woken, and told nobody decided.
+    assert_eq!(
+        waiter.recv().await.unwrap(),
+        PermissionAnswer::Withdrawn(SUPERSEDED_REASON),
+        "supersede must unblock the parked loop without reading as a user deny"
     );
     // Resolution persisted; status cleared.
     assert_eq!(command_resolved_count(&pool, "req-super").await, 1);

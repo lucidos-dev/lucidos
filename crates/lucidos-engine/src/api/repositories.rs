@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::diff::{parse_diff_output, DiffFile, RepoDiff};
 use super::AppState;
+use crate::core::changes::ChangeState;
 use crate::core::repositories::{Repository, RepositoryStore};
 
 pub async fn list_repositories(
@@ -272,6 +273,13 @@ pub async fn get_repo_diff(
     Ok(Json(RepoDiff { files }))
 }
 
+fn discarded_change_has_no_diff(id: Uuid) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Change {id} was discarded, so it has no merge to show"),
+    )
+}
+
 /// GET /api/v1/changes/:id/diff — compute diff for any change (pending or applied)
 ///
 /// Mirrors `get_thread_cc_diff` for app coding-agent changes: resolves the
@@ -294,23 +302,27 @@ pub async fn get_change_diff(
         .ok_or((StatusCode::NOT_FOUND, "Change not found".into()))?;
 
     let repo_root = std::path::Path::new(&change.repo_root);
-    let range = if change.status == "pending" {
-        if super::is_dangerous_git_ref(&change.branch_name) {
-            return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+    let range = match &change.state {
+        ChangeState::Pending { .. } => {
+            if super::is_dangerous_git_ref(&change.branch_name) {
+                return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
+            }
+            let base = crate::engine::git_ops::default_diff_base(repo_root).await;
+            format!("{}...{}", base, change.branch_name)
         }
-        let base = crate::engine::git_ops::default_diff_base(repo_root).await;
-        format!("{}...{}", base, change.branch_name)
-    } else {
-        let pre_sha = change.pre_merge_sha.as_deref().ok_or((
-            StatusCode::BAD_REQUEST,
-            "No merge SHA recorded for this change — it was applied before SHA tracking was added"
-                .into(),
-        ))?;
-        let post_sha = change
-            .post_merge_sha
-            .as_deref()
-            .ok_or((StatusCode::BAD_REQUEST, "No post-merge SHA recorded".into()))?;
-        format!("{}..{}", pre_sha, post_sha)
+        ChangeState::Applied(shas) | ChangeState::Reverted(shas) => {
+            let pre_sha = shas.pre.as_deref().ok_or((
+                StatusCode::BAD_REQUEST,
+                "No merge SHA recorded for this change: it was applied before SHA tracking was added"
+                    .into(),
+            ))?;
+            let post_sha = shas
+                .post
+                .as_deref()
+                .ok_or((StatusCode::BAD_REQUEST, "No post-merge SHA recorded".into()))?;
+            format!("{}..{}", pre_sha, post_sha)
+        }
+        ChangeState::Discarded => return Err(discarded_change_has_no_diff(id)),
     };
 
     // App coding-agent changes live under `data/apps/<id>/` in the workspace
@@ -376,14 +388,16 @@ pub async fn get_thread_cc_diff(
 
 /// The worktree a live session is working the THREAD's own branch in.
 ///
-/// A conflict-resolution spawn runs in the merge worktree on a temp branch,
-/// which `conflict_change_id` marks (ADR 0060). That tree belongs to the merge,
-/// so the Diff button answers from the thread's own worktree while one runs.
+/// A detached conflict-resolution spawn (Tier 2 / Tier 3) runs in the merge
+/// worktree on a temp branch. That tree belongs to the merge, so the Diff
+/// button answers from the thread's own worktree while one runs. A Tier-1
+/// in-place merge never leaves the thread's own worktree.
 fn live_thread_worktree(
     session: Option<&crate::engine::types::AgentSession>,
 ) -> Option<std::path::PathBuf> {
+    use crate::engine::types::ConflictBinding;
     session
-        .filter(|s| s.conflict_change_id.is_none())
+        .filter(|s| !matches!(s.conflict, Some(ConflictBinding::Detached { .. })))
         .and_then(|s| s.worktree_path.clone())
 }
 
@@ -772,13 +786,13 @@ pub async fn get_change_file(
         }
     };
 
-    let git_ref = if change.status == "pending" {
-        change.branch_name.clone()
-    } else {
-        match change.post_merge_sha.as_deref() {
+    let git_ref = match &change.state {
+        ChangeState::Pending { .. } => change.branch_name.clone(),
+        ChangeState::Applied(shas) | ChangeState::Reverted(shas) => match shas.post.as_deref() {
             Some(sha) => sha.to_string(),
             None => return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response(),
-        }
+        },
+        ChangeState::Discarded => return discarded_change_has_no_diff(id).into_response(),
     };
 
     git_show_file(

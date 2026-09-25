@@ -350,6 +350,7 @@ impl OpenAiProvider {
             unknown_sse_dropped: 0,
             // Like Anthropic: text always rides in `content`, printable.
             model_only_text: None,
+            content_is_progress_notes: false,
         })
     }
 }

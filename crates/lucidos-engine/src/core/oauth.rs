@@ -1444,12 +1444,24 @@ static ACTIVE_CALLBACK_FLOW: std::sync::LazyLock<tokio::sync::Mutex<Option<Activ
 /// with the port already released.
 struct ActiveCallbackFlow {
     task: tokio::task::JoinHandle<()>,
+    /// The *form request* the flow's authorization page answers. A flow
+    /// superseded while still listening is resolved by whoever supersedes it,
+    /// because the aborted task cannot resolve itself.
+    request_id: uuid::Uuid,
     /// Set once at registration, cleared by the flow itself the instant it stops
     /// holding the listener. Ordered so that `false` implies the sockets are
     /// already closed: the store happens after the future that owns them has
     /// resolved and dropped them.
     holds_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// What a caller is told when nobody finished the authorization in time.
+///
+/// It does not claim the page opened. The engine only knows it asked the
+/// client to open it, and a lost stream frame looks identical from here.
+pub const OAUTH_TIMEOUT_MSG: &str =
+    "OAuth authorization timed out after 120 seconds. The authorization page may not have \
+     opened, or it was left unfinished. Start the connection again to retry.";
 
 /// What a caller is told when its flow's result channel closed with no result.
 ///
@@ -1462,7 +1474,7 @@ pub const FLOW_SUPERSEDED_MSG: &str =
      Start it again if you still need it.";
 
 /// Cancel the flow that owns the callback port, and wait until its socket is
-/// actually closed. Reports whether a live flow was superseded.
+/// actually closed. Returns the form request of the live flow it superseded.
 ///
 /// **The await is the whole point.** `JoinHandle::abort` only *requests*
 /// cancellation, so returning straight after it would let the caller's `bind`
@@ -1476,16 +1488,14 @@ pub const FLOW_SUPERSEDED_MSG: &str =
 /// Takes the slot by reference rather than reading [`ACTIVE_CALLBACK_FLOW`]
 /// itself, so the release-then-rebind guarantee is testable against a
 /// caller-supplied slot.
-async fn release_callback_port(slot: &mut Option<ActiveCallbackFlow>) -> bool {
-    let Some(flow) = slot.take() else {
-        return false;
-    };
+async fn release_callback_port(slot: &mut Option<ActiveCallbackFlow>) -> Option<uuid::Uuid> {
+    let flow = slot.take()?;
     if !flow.holds_port.load(std::sync::atomic::Ordering::Acquire) {
-        return false;
+        return None;
     }
     flow.task.abort();
     let _ = flow.task.await;
-    true
+    Some(flow.request_id)
 }
 
 /// Explain a callback-listener bind failure.
@@ -1834,10 +1844,27 @@ pub struct OAuthFlowOutcome {
 /// Outcome of an OAuth token exchange, or the reason it failed.
 pub type OAuthFlowResult = Result<OAuthFlowOutcome, String>;
 
+/// How the authorization page was answered, from how the wait for its
+/// callback ended: the outer error is the 120 s timeout, the inner one a
+/// provider that redirected back with an error.
+fn authorization_outcome<T, E, F>(
+    waited: &Result<Result<T, E>, F>,
+) -> crate::engine::thread_events::FormRequestOutcome {
+    use crate::engine::thread_events::FormRequestOutcome;
+    match waited {
+        Err(_) => FormRequestOutcome::Expired,
+        Ok(Err(_)) => FormRequestOutcome::Canceled,
+        Ok(Ok(_)) => FormRequestOutcome::Completed,
+    }
+}
+
 /// Result of preparing an OAuth flow: the auth URL, plus a receiver that
 /// resolves when the background flow completes.
 pub struct PreparedOAuthFlow {
     pub auth_url: String,
+    /// The id an `OAuthAuthorizationRequested` for this flow must carry. The
+    /// flow resolves it when its wait for the callback ends.
+    pub request_id: uuid::Uuid,
     pub result_rx: tokio::sync::oneshot::Receiver<OAuthFlowResult>,
 }
 
@@ -1920,11 +1947,19 @@ pub async fn prepare_oauth_flow(
     // cannot both find the slot empty and race for the socket. See
     // `docs/adr/0068-oauth-callback-port-has-one-owner.md`.
     let mut active_flow = ACTIVE_CALLBACK_FLOW.lock().await;
-    if release_callback_port(&mut active_flow).await {
+    if let Some(superseded) = release_callback_port(&mut active_flow).await {
         crate::log!(
             "[OAuth] Superseded an authorization still waiting on port {}",
             CALLBACK_PORT
         );
+        crate::engine::form_requests::resolve_or_log(
+            pool,
+            event_bus,
+            superseded,
+            crate::engine::thread_events::FormRequestOutcome::Superseded,
+            None,
+        )
+        .await;
     }
 
     // Bind BEFORE returning the URL, so the callback cannot arrive before
@@ -1953,6 +1988,7 @@ pub async fn prepare_oauth_flow(
     );
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let request_id = uuid::Uuid::new_v4();
     let pool = pool.clone();
     let event_bus = event_bus.clone();
     let provider = provider.to_string();
@@ -1974,8 +2010,19 @@ pub async fn prepare_oauth_flow(
             // not be abortable by a supersede.
             task_holds_port.store(false, std::sync::atomic::Ordering::Release);
 
+            // The authorization page is answered the moment the wait ends,
+            // whatever the token exchange below makes of it.
+            crate::engine::form_requests::resolve_or_log(
+                &pool,
+                &event_bus,
+                request_id,
+                authorization_outcome(&waited),
+                None,
+            )
+            .await;
+
             let code = waited
-                .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?
+                .map_err(|_| OAUTH_TIMEOUT_MSG.to_string())?
                 .map_err(|e| format!("OAuth callback error: {}", e))?;
 
             // `exchange_code` already names the leg and carries the provider's
@@ -2043,11 +2090,16 @@ pub async fn prepare_oauth_flow(
 
     // Register the new owner before releasing the lock, so the next flow has
     // something to supersede and the port is never orphaned again.
-    *active_flow = Some(ActiveCallbackFlow { task, holds_port });
+    *active_flow = Some(ActiveCallbackFlow {
+        task,
+        request_id,
+        holds_port,
+    });
     drop(active_flow);
 
     Ok(PreparedOAuthFlow {
         auth_url: auth_request_url,
+        request_id,
         result_rx,
     })
 }
@@ -2070,7 +2122,7 @@ pub async fn run_oauth_flow<F>(
     open_auth_url: F,
 ) -> Result<OAuthFlowOutcome, BoxError>
 where
-    F: AsyncFnOnce(&str) -> Result<(), BoxError>,
+    F: AsyncFnOnce(&str, uuid::Uuid) -> Result<(), BoxError>,
 {
     let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes, initiator).await?;
 
@@ -2081,11 +2133,27 @@ where
     // A failed hand-off is fatal to the flow, not best-effort: nothing will
     // ever reach the callback, so waiting out the timeout would only turn a
     // precise error into "authorization timed out".
-    open_auth_url(&prepared.auth_url).await?;
+    open_auth_url(&prepared.auth_url, prepared.request_id).await?;
 
-    prepared
-        .result_rx
-        .await
+    let result = prepared.result_rx.await;
+    // The listener resolves the page when its wait ends. The opener can write
+    // the page's row after that, or after a newer flow superseded this one, so
+    // close it here too. Resolving an already-closed request is a no-op.
+    use crate::engine::thread_events::FormRequestOutcome;
+    let answered = match &result {
+        Ok(Ok(_)) => FormRequestOutcome::Completed,
+        Ok(Err(_)) => FormRequestOutcome::Expired,
+        Err(_) => FormRequestOutcome::Superseded,
+    };
+    crate::engine::form_requests::resolve_or_log(
+        pool,
+        event_bus,
+        prepared.request_id,
+        answered,
+        None,
+    )
+    .await;
+    result
         .map_err(|_| FLOW_SUPERSEDED_MSG)?
         .map_err(|e| e.into())
 }

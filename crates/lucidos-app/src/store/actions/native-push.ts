@@ -123,7 +123,7 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
       // client adds, naming the workspace that RAISED the banner. One packaged
       // process fronts the gateway and can point any window at any workspace
       // (ADR 0014), so without it a drained tap lands wherever the page happens
-      // to be (see `nativeTapRoute`). It also composes the UN request
+      // to be (see `route_native_tap` in app_window.rs). It also composes the UN request
       // identifier, which is what carries the identity across a client relaunch.
       deepLink: {
         notification_id: payload.notification_id,

@@ -133,6 +133,8 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 `status` is `applied`, `noop`, `hardening`, or `conflict`. See `docs/apply-change-api.md` for the full response shape. Exit non-zero on transport / HTTP error with the engine's error body on stderr.
 
+**Applying never restarts Lucidos.** With `restart_required: true`, the engine builds the new version in the background. The user then taps "Switch to new version" to restart onto it. So never tell them an apply restarts Lucidos.
+
 ### `lucidos await-event --on <EventType> [--condition <json>] --timeout-secs <n> --reason <text>`
 
 Subscribe THIS thread to a Lucidos event, then **finish your session**. Returns
@@ -156,9 +158,9 @@ $ lucidos await-event --on CodingAgentIdled \
 thread with the child's result, so the wait buys nothing. Its timeout also wakes
 you a second time, for nothing.
 
-`--reason` names **what** you await, not the fact that you await it. The
-transcript labels it `Set up an event wait: <reason>`, so a reason opening with
-a waiting word says it twice.
+`--reason` names **what** you await, as a short noun phrase, not the fact that
+you await it. The transcript labels it `Waiting for <reason>`, so a reason
+opening with a waiting word says it twice.
 
 **Use it instead of a sleep-and-recheck loop.** A `while sleep 60; do lucidos
 events query ...; done` for anything the engine emits burns a tool call per

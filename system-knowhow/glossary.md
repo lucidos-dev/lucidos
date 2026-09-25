@@ -98,15 +98,19 @@ A message from a *parent thread* to one of its own *child threads*, sent with th
 See also: *child thread*, *parent thread*, *urgent follow-up*.
 
 ### Held message
-An agent-sent message a *coding-agent thread* keeps back because it waits on a human: an open question, a pending permission card, or older held messages. A parent's *child follow-up* is the usual case, and its result reports `held`. The transcript shows it under the question as "Held until you reply", and the question stays answerable.
+An agent-sent message a *coding-agent thread* keeps back because it waits on a human: an open question, a pending permission card, or older held messages. A parent's *child follow-up* is the usual case, and its result reports `held`. The transcript shows it under the question as "Held until you reply", and the question stays answerable. Once delivered, the held row gives way to the delivered message, which names its sender and says it was held until you replied.
 
 Any answer to the question or the card releases it, oldest first, and so does the user's next message or Continue. A Cancel keeps it held, since Cancel means stop. Events: `MessageHeld`, then `HeldMessageReleased` just before the ordinary `MessageReceived`. See ADR 0256.
-See also: *child follow-up*.
+
+A callback that lands under an open question, a returned child or an event-wait delivery, reads "Held until you reply" too, on any thread. It is queued rather than held: the agent reads it right after the answer (ADR 0255).
+See also: *child follow-up*, *read marker*.
 
 ### Child thread
 A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). The engine wires a callback so the *parent thread* resumes with the child's result when it terminates. The reverse direction also exists: the parent can address a child it already spawned with a *child follow-up*, and a child that is followed up on reports again when its next turn ends. Identifiers: DB column `parent_thread_id` on the child row points up to the parent; Rust struct field and event payload field `child_thread_id` (on the `Callback` struct and the `ChildThreadCompleted` event) name the child. A child is a *sub-thread*; the reverse isn't true.
 
 **Two ends of a turn send no callback.** A user Stop makes the child a *stopped child*, and its parent gets a note instead. A turn that ends holding an *event wait* sends nothing, because the turn the wait wakes reports.
+
+A child stops being one when it is *moved to top level*.
 
 ### Command guard
 An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools. Toggled under **Settings → Permissions → Command safety** (off by default). A fast static check settles the obvious cases, and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. The safe majority of commands run untouched, including reads anywhere and writes inside the workspace.
@@ -301,6 +305,10 @@ A past-tense fact about something that happened in the workspace. Always past-te
 A read-only view of one file, rendered by Lucidos over whatever the *content pane* is showing, without navigating there. Opened by an *app* through `lucidos.ui.previewFile` so a reader following a citation in a report glances at the file and carries on, instead of losing their place. It takes the same locators and the same `line` / `line_end` as the `file` navigation target (a workspace data path or a `repo:<repoId>:file:<path>` one), shows the same highlight and line numbers the *content pane*'s preview shows, and carries a link that escalates the glance into that full preview. Dismissed by Esc, a click outside it, or its close control. Distinct from the *content pane*'s file preview, which IS a navigation: that one replaces what the pane was showing and lands in the Back history.
 See also: `system-knowhow/js-sdk.md` § lucidos.ui.
 
+### Form request
+Something the agent put in front of the user to fill in or confirm: a credential form, a plugin install or uninstall panel, an email confirmation, or an OAuth authorization page. It is persisted, so it survives a reload or a dropped connection. It stays open until the user answers it, cancels it, or something newer replaces it, and one `FormRequestResolved` records which. An open one shows in its thread with an Open button. It does not change the thread's status.
+See also: `system-knowhow/thread-events.md` § Form requests.
+
 ### Event address
 How one event in the store is named to an agent, written `evt-<32 hex>`. The hex is the event's own id, so the address is stable forever and resolves to exactly one row. Every live tool result ends with the address of the `ToolCalled` behind it, and a resumed tool block carries the same string as its `tool_use_id`. Two readers take it: the `events` tool's `query` action with `event_id`, and a `[KEEP OPEN]` line in the *working understanding*. A bare uuid, hyphenated or simple, works wherever the `evt-` form does.
 
@@ -333,6 +341,14 @@ See also: `system-knowhow/building-knowhow.md` § "Where the file goes".
 ### Knowhow reference
 A knowhow file that belongs to one *knowhow doc* instead of standing on its own: a long endpoint table, a payload dump, an error matrix. It sits in a folder named after the doc, below the depth its root lists, so it takes no row in the routing list. Placement is the whole distinction: a file at the listed depth is a doc, anything deeper is a reference. A reference keeps its full id and `load_knowhow` still reads it. Nothing routes to one, so the doc that owns it must name its id, and the workspace audit flags a reference no doc names.
 See also: `system-knowhow/building-knowhow.md` § "Where the file goes", `docs/taxonomy.md` § "Knowhow: Docs and References".
+
+### Last used device
+The *device* of your newest action in the current turn. That is the message that started the turn, a prompt sent while it runs, or an answer to a question card. Start a turn on your phone and answer the agent's question from your laptop, and the laptop is the last used device from then on. It is where `navigate_ui` sends a file, app or page unless the agent names another device. It is also where a sign-in page opens. A turn with no device, such as a trigger run, has none, and a navigate then reaches every device showing the thread.
+
+The agent's `[USER DEVICE & PREFERENCES]` block names it too, from the same lookup, so the block and the navigate agree. The block is a snapshot from when it was built. A coding agent gets a fresh one with every message you send.
+
+Not an *active device*. That one is a device showing Lucidos right now, and the engine asks it fresh for each notification. Several devices can be active at once, but a turn has one last used device.
+See also: *device*, *active device*.
 
 <!--gloss-live-cocreation-start-->
 ### Live co-creation
@@ -376,6 +392,22 @@ The database-backed list of chat models the user manages in **Settings → Model
 
 A model can list more than one provider. It is then served by whichever the workspace has credentials for: see *preferred provider*. Separate from the *Claude Code* model picker, which keeps its own list.
 
+### Motion
+How much Lucidos moves on one device, set under **Settings → Appearance → Motion** and stored as the device-scoped `motion` *preference*. **System** follows the device's own reduce-motion switch. **Reduce** calms the app whatever the device says: nothing slides, pulses or spins, and changes appear at once. **Full** keeps every animation even when the device asks for less. The answer is written onto the page as `data-motion="reduce"` or `data-motion="full"` before the first frame paints, and apps read the same attribute. Distinct from the Animation speed slider under **Settings → System → Debugging**, a diagnostic that slows animations down to inspect them: while Motion reduces, the slider has no effect.
+
+### Move to top level
+Cutting a *child thread* loose from its *parent thread*, so the parent stops waiting for it and it becomes a top-level thread. The thread menu's item, the `threads` tool's `detach_child` action and `lucidos threads detach` all make the same move, recorded as `ChildThreadDetached` on the former parent. Nothing is stopped: the child finishes its turn and keeps its work.
+
+The parent gets no further result, cannot follow up on it, and does not get the child slot back. An agent can move only its own direct children; the user can move any nested thread. It cannot be undone. Not the same as a *detached* event wait, which is about a subscription holding no turn.
+See also: *child thread*, *parent thread*.
+
+### Read marker
+The "Sent" or "Read" label on a message sent to a thread. "Sent" means the engine handed it to the agent. "Read" means the agent took it in. A message stuck on "Sent" never reached the agent.
+
+On a *coding-agent thread* the engine records each read as `CodingAgentInputRead` (ADR 0268). While the agent is busy, an unread message waits at the bottom as "Queued", like the Lucidos Agent's queue but with no bin: the agent already holds it, so it cannot be taken back. Once read it moves into place, and what the agent does next shows under it.
+
+On a *Lucidos Agent* thread a message is read once the agent starts its turn, or takes it into the turn already running. A queued message shows "Queued" with a bin until then. What a caller says on a call carries no marker.
+
 ### Reasoning effort
 How hard a *model* is told to think before it answers, chosen beside the model in the picker and in **Settings → Models**. Six levels: Off, Low, Med, High, X-High, Max.
 
@@ -384,10 +416,26 @@ Not every model offers all six, and which it offers depends on the *provider* se
 Asking for a level a model does not offer snaps to the nearest one it does, ties going upward. So switching model never quietly spends less thought than you asked for.
 
 ### Response style
-How much comes back in an answer, chosen in **Settings → Models → Response style**. It applies to chat and to every *trigger*, from the next message onward, and changes nothing about a *coding-agent thread*. **Standard** is the default and adds nothing at all, so answers come back the way they always have. Whatever a style asks for, Lucidos still keeps every warning, every caveat that changes the answer, and every step the user has to take: that rule sits outside the editable text and cannot be written away.
+How an answer comes back, chosen in **Settings → Models → Response style**. It has two independent parts. The **style** is the shape of an answer: how much comes back and what it is for, from outcome-only to explaining the why as it goes. The *technical literacy* is how technical the words are. Any style works with any level.
+
+The style applies to chat and to every *trigger*, from the next message onward, and changes nothing about a *coding-agent thread*. **Standard** is the default style and adds nothing at all, so answers come back the way they always have. Whatever a style asks for, Lucidos still keeps every warning, every caveat that changes the answer, and every step the user has to take: that rule sits outside the editable text and cannot be written away.
+
+### Technical literacy
+How technical the user is, and so how technical the words are in every answer. Three levels, shown on every card as **Keep it plain** (non-technical), **Technical** and **I write software** (developer). It is the *response style*'s second part. The first chat asks for it, as part of first-run setup. It can also be set in the *setup interview*, by telling the agent, or in Settings, where the row is labelled **How technical**. It reaches chat and *triggers* from the next message, and a *coding-agent thread* or a voice call from its next start.
+
+Unset adds nothing. Lucidos stores only a level the user stated, never one guessed from how they write. The level changes the words, never the substance or the amount: warnings and steps stay, and how much comes back is the style's job.
+
+At **Keep it plain**, the level also decides which questions reach the user. The agent never asks one they cannot answer, such as what to do with a git branch. It decides, and says what happened in their terms. It also does the work itself rather than suggesting a *coding-agent thread*.
 
 ### Style library
-The list of *response styles* a workspace can pick between. Lucidos ships three. **Standard** is the off switch and cannot be edited or deleted. **Concise** and **Minimal** can be edited, and an edited one keeps a *Reset* that brings the shipped wording back. The user can add as many of their own as they like, each a name plus an instruction written in their own words. One style is selected at a time.
+The list of *response styles* a workspace can pick between. Lucidos ships four:
+
+- **Standard**, the off switch, which cannot be edited or deleted;
+- **Concise**, the answer first with no preamble;
+- **Minimal**, the outcome and not the process;
+- **Learning**, which explains the why as it goes.
+
+The last three can be edited. An edited one keeps its shipped description, shows as edited in Settings, and keeps a *Reset* that brings the shipped wording back. The user can add as many of their own as they like, each a name plus an instruction written in their own words. One style is selected at a time.
 
 ### Preferred provider
 The *provider* a *model* was last picked on, remembered per model. Choosing a provider in the model picker stores it on that model's row. So Grok stays on xAI and Opus stays on Anthropic, neither choice overwriting the other.
@@ -553,7 +601,27 @@ See also: `system-knowhow/best-practices.md` rules 8 and 10; ADR 0051.
 Code (Python, shell, JS) invoked by an *intent* or *knowhow*. Lives with its primary consumer when scoped (`data/apps/<id>/scripts/`, `data/triggers/<slug>/scripts/`, `data/knowhow/<domain>/scripts/`) — or at top level (`data/scripts/`) when shared across multiple consumers (mirroring how knowhow can be standalone or app-scoped).
 
 ### Setup interview
-A guided interview the *Lucidos Agent* runs to work out what this particular person should use Lucidos for, ending with *app*s, *trigger*s and *knowhow* actually built in their *workspace* in that session. Deliberately not work-only: its first question asks which parts of the person's life to cover (work, home and personal admin, health and training, learning and side projects) and takes more than one answer, so a kit can be built around training or a household just as readily as around a job. Started from the "Help me get the most out of Lucidos" button on the first-run welcome, or at any later point from the "Setup guide" row in the *Lucidos menu* (the menu the Lucidos mark opens, on every viewport; that row is the one surface whose label says "guide" rather than "interview", which reads as an interrogation to someone who does not yet know what the row does), or from the help button beside New thread on the desktop header. Both of those later entry points confirm first, since they send. There is no such header *button* on mobile, where a header row has no slot to spare for a once-or-twice action, but the menu row costs no row space and is the durable mobile route; mobile can also start it from the welcome or by asking. Every entry point sends the same ordinary message, so it is always reachable by typing. Driven by `system-knowhow/setup-interview`, which owns which areas to ask about, the question ladder, which cards allow more than one answer, the mapping from answers to a kit, the confirm-before-building rule, and what gets persisted: the interview record at `artifacts/setup-interview.md` (appended per run, never overwritten) plus a `SetupInterviewCompleted` *domain event*. Only facts the user actually stated reach memory or `user_profile.md`; everything the agent merely concluded stays in the artifact. Sibling to the two other workspace-wide recipes and distinct from both: *workspace audit* asks whether the workspace matches current conventions, *workspace learning* asks whether the conventions match this user, and the setup interview asks whether the workspace matches the person. It is the only one of the three that needs the user present, because it asks and then builds rather than sweeping and proposing. Distinct from a *setup thread*, which finishes installing one *plugin*.
+A guided interview the *Lucidos Agent* runs to work out what this person should use Lucidos for. It ends with *app*s, *trigger*s and *knowhow* actually built in their *workspace* in that session.
+
+Its first card asks how technical the person is, unless first-run setup already did, and stores the answer as their *technical literacy*. Every later card and thread is worded at that level. It is deliberately not work-only. Its next question asks which parts of the person's life to cover: work, home and personal admin, health and training, learning and side projects. That card takes more than one answer, so a kit can be built around training or a household as readily as around a job.
+
+Three entry points start it:
+
+- the "Help me get the most out of Lucidos" button on the first-run welcome;
+- the "Setup guide" row in the *Lucidos menu*, which the Lucidos mark opens on every viewport;
+- the help button beside New thread on the desktop header.
+
+The menu row says "guide" rather than "interview", because "interview" reads as an interrogation to someone who does not yet know what the row does. The two later entry points confirm first, since they send. Mobile has no header *button*, because a header row there has no slot to spare for a once-or-twice action. The menu row costs no row space and is the durable mobile route, and mobile can also start it from the welcome or by asking. Every entry point sends the same ordinary message, so it is always reachable by typing.
+
+`system-knowhow/setup-interview` drives it. That file owns the areas to ask about, the question ladder, and which cards allow more than one answer. It also owns the mapping from answers to a kit, the confirm-before-building rule, and what gets persisted. The interview record lives at `artifacts/setup-interview.md`, appended per run and never overwritten, plus a `SetupInterviewCompleted` *domain event*. Only facts the user actually stated reach memory or `user_profile.md`. Everything the agent merely concluded stays in the artifact.
+
+It is a sibling to the two other workspace-wide recipes, and distinct from both:
+
+- *workspace audit* asks whether the workspace matches current conventions;
+- *workspace learning* asks whether the conventions match this user;
+- the setup interview asks whether the workspace matches the person.
+
+It is the only one of the three that needs the user present, because it asks and then builds rather than sweeping and proposing. It is also distinct from a *setup thread*, which finishes installing one *plugin*.
 
 ### Setup thread
 A *Lucidos Agent* *thread* the engine spawns when a *plugin* shipping a `setup` field is installed, from the *Plugins panel* or the `install_plugin` tool. On an **update** it spawns only when the new version's `setup` differs from the installed version's. An unchanged version bump re-runs nothing. The user is navigated straight into it on install.
@@ -577,6 +645,18 @@ The grant does not govern everything an unattended session is denied. A command 
 
 ### Signer manifest
 The `<name>.manifest.json` sidecar next to a `<name>.wasm` signer artifact in `data/auth-modules/`. Carries WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries.
+
+### Slowness warning
+An amber bar at the top of a workspace window that says Lucidos is slow, and why when it can tell. It has two reasons.
+
+- **Short on memory.** The computer running Lucidos is short on memory. The bar lists the biggest memory users, summed by app, with Lucidos (its engines, coding agents and database) counted as one. It shows in every workspace, because memory belongs to the whole computer.
+- **Responding slowly.** Lucidos is slow and memory is not the clear cause. The bar lists the apps using the most processor time, grouped the same way. It shows only in windows of the workspace that was slow.
+
+Either way it recommends one thing: quit or restart the busiest app, or stop idle coding-agent threads when Lucidos is itself the biggest. When nothing stands out, it suggests restarting the computer if the slowness lasts.
+
+One stretch of slowness is an *episode*. An episode opens when, for most of the last five minutes, a workspace answered slowly or lost its database. Sustained memory pressure opens one too; on a Mac, real swap use must come with it. The bar names memory when the operating system reported memory pressure for at least half of that time. The episode closes after five quiet minutes.
+
+Dismissing the bar hides it on that device until the next episode. The gateway measures it once for the whole machine.
 
 ### Source event
 The specific *event* a notification points to, stored as `notifications.event_id`. Used by the *in-app surface* to decide whether the user is currently looking at the very thing the notification is about: if the page is on the source event's thread AND the source event is in viewport, the notification is auto-marked-read with no toast and no badge increment. A notification with `tap = { kind: 'navigate', to: { target: 'thread', id: '...', event_id: '...' } }` also lands on the source event (scroll + pulse). Both uses resolve the event the same way, and they resolve it whether it starts a turn or is folded into one as a step: an event rendered as a step is addressed by its own card (a failed response by its failure card), not by the turn around it. A source event that never renders is reported rather than silently ignored, and the transcript is left exactly where it was.
@@ -616,7 +696,7 @@ Any descendant in the *thread* tree (transitive). A *child thread* is a sub-thre
 A single conversation — a stream of events sharing one `aggregate_id`. Every chat reply, trigger run, and *coding-agent thread* run is a thread. Threads have a persisted `source` (`chat` / `trigger` / `claude_code` today — values are *channel* identifiers; see dev glossary), while user-facing/API source filters call the coding-agent bucket `coding-agent` and accept legacy `claude_code`. Threads also have a compose state (`composing` / `active` / `discarded` on the compose side; running / idled / failed on the runtime side), an archive flag (`inbox` / `archived`, orthogonal to compose state — an archived thread keeps `state='active'` and only flips `archive_state`), and may spawn other threads.
 
 ### Event wait
-The internal name for a **thread subscription**: a *thread* asking to be re-opened when something happens, instead of checking over and over. The word survives because it is on disk, in the persisted `EventWait*` events and in the `await_event` tool's own name, so the code and the event log say *event wait* where this glossary says *thread subscription*. They are the same thing.
+The internal name for a **thread subscription**: a *thread* asking to be re-opened when something happens, instead of checking over and over. The word survives because it is on disk, in the persisted `EventWait*` events and in the `await_event` tool's own name. So the code and the event log say *event wait* where this glossary says *thread subscription*. They are the same thing. The screen says neither: the conversation row reads **Waiting for** the agent's reason, then **Waited for** or **Stopped waiting for** once it ends.
 
 The agent says what it is waiting for (an *event subscription*, optionally filtered), why, and for how long, then finishes its turn. The thread holds nothing and blocks nothing while it watches. Lucidos re-opens it the moment a matching *event* arrives, or tells it the wait timed out. The *waiting indicator* shows what it is watching and how long is left. Available to the *Lucidos Agent* and to a *coding agent* alike. Each can also list what it is watching and stop watching (`list_event_waits` / `cancel_event_wait`, or `lucidos event-waits list` / `cancel`).
 
@@ -632,16 +712,22 @@ So "tell me **here** when a change is proposed" is an event wait, even though it
 See also: *event subscription*, *trigger*, *waiting indicator*, `system-knowhow/thread-events.md`.
 
 ### Waiting indicator
-The control on the prompt bar showing what the open *thread* is currently waiting for. It appears whenever the thread is parked, and two things park one: a live *thread subscription* (an *event wait*), or *sub-threads* still working. A subscription is listed with the agent's reason, the event it watches, a countdown to its deadline, and a **Stop waiting** button. A sub-thread is listed by title, and tapping it opens that thread. It answers "is this thread stuck, or is it asleep on purpose?", without scrolling back through the conversation. The thread's **Waiting** status says *that* it is waiting, on every list; this says *what for*, on the thread you have open.
+The control on the prompt bar showing what the open *thread* is currently waiting for. It appears whenever the thread is parked, and two things park one: a live *thread subscription* (an *event wait*), or *sub-threads* not yet finished (working, or asleep on an event wait of their own). A subscription is listed with the agent's reason, the event it watches, a countdown to its deadline, and a **Stop waiting** button. A sub-thread is listed by title, and tapping it opens that thread. It answers "is this thread stuck, or is it asleep on purpose?", without scrolling back through the conversation. The thread's **Waiting** status says *that* it is waiting, on every list; this says *what for*, on the thread you have open.
 
 One control covers both because the **Waiting** status already merges them. Either way the thread is not finished, and something else will re-open it. A sub-thread row links rather than stops: ending one is done on the sub-thread itself. A thread with a proposed change that waits only on sub-threads reads **Changes to review** instead, because its change can be applied.
 
-An event watched under a `condition` says **(filtered)**, and tapping that opens the condition itself. The transcript's own record of the wait opens the same thing.
+Each subscription reads **watching for** and the event in plain words ("background job finished"), with the exact event type on its tooltip. An event watched under a `condition` says **(matching only)**, and tapping that opens the condition itself. The transcript's own record of the wait opens the same thing.
 
-Its subscriptions section is headed the unqualified **SUBSCRIPTIONS**, and that is exact rather than loose. A *trigger subscription* belongs to a trigger and never appears on a thread screen, so the only species listed here is the thread one.
+Its subscriptions section is headed **EVENTS**, since a person waits for things to happen rather than for subscriptions. A *trigger subscription* belongs to a trigger and never appears on a thread screen, so the only species listed here is the thread one.
 
 ### Thread drawer
 The pane listing your *threads*: the Pinned, *Current* and Archive sections, with the attention badge and the thread filter. That badge has a second home: the same needs-attention count rides the **thread-drawer toggle** whenever the list itself is hidden (the drawer closed on desktop; any pane other than the threads pane on mobile), so a *thread* waiting on you stays visible from the conversation. Exactly one of the two shows it at a time. On mobile the toggle is the leading control of the *thread pane* header and takes you to the threads pane, with the hamburger **menu drawer** mirrored at that header's trailing edge (it slides out from the right, the edge its button sits on). First of the three panes; one of the two making up the *Conversation* side, the other being the *thread pane*. CSS container `.thread-drawer` (`FocusedPane = 'drawer'`; on mobile the leftmost swipe pane, `MobileView = 'threads'`). Always say *thread drawer*, never a bare "drawer". The hamburger **menu drawer** (Files / Apps / Plugins / Triggers plus pinned *apps*, `Drawer.tsx` / `drawerOpen`) is a different surface.
+
+On desktop the toggle rests in the header's top-left corner whether the thread drawer is open or closed. In the Mac app it sits right after the window buttons. Its icon is a window with a column on the left; on a phone it is a bulleted list. With the thread drawer open, Filter and Search sit together at the far end of its own header.
+
+Filter shows as pressed only while the thread filter is open. Its icon says what the list shows: a status's own icon, an outline funnel for all threads, and a filled funnel while thread types narrow it. Filter draws a funnel shape, never lines, so on a phone you cannot mistake it for the list icon.
+
+Filter, its badge, the header title and the thread filter change together with one quick fade. The thread filter's background covers the list at once, and its options fade in over it. With motion reduced, every change is instant.
 See also: *Conversation*, *thread pane*, *content pane*, *Current section*.
 
 ### Thread pane
@@ -1012,7 +1098,7 @@ These terms describe the surface for users running coding-agent workflows: Claud
 ### Apply
 The user-clicked action that merges a *coding-agent thread*'s worktree branch into `main`. **Always non-disruptive**: it never restarts the engine on click. The button reads **Apply** for a change that needs no restart. It reads **Apply\*** when the change is engine-affecting, a compact asterisk marker the tooltip explains.
 
-**Asking the agent to apply asks the same question the button does.** A *thread* that has not settled is refused either way (ADR 0233). The agent is pointed at a *standing apply* when the thread is still working, and told to come back to you when it is parked.
+**Asking the agent to apply asks the same question the button does.** A *thread* that has not settled is refused either way (ADR 0233). The agent is pointed at a *standing apply* when the thread is *settling*. When it is parked on a question or a failed turn, the agent comes back to you.
 
 The former "Apply & Restart" dual label stays retired, because it implied the restart happens on click. Even for an **Apply\***, the restart is the separate *Switch to new version*, never Apply itself. A merged *change* touching engine-affecting source also starts a background engine rebuild (dev only). That surfaces later as *New version available / Switch to new version*. If the session didn't run *hardening* first, Apply runs it synchronously and the user waits. Source: `crates/lucidos-engine/src/engine/git_ops/restart_detection.rs` (`files_require_restart`).
 
@@ -1021,37 +1107,48 @@ The affordance for moving the *engine* onto a newer version. Lucidos surfaces **
 
 **The gateway detects the packaged half now** (ADR 0108), not the app updater named above. One poll per machine finds a published release, for every install shape rather than the macOS app alone. The client still performs the install, so everything above about narration, cancelling and failure is unchanged. A headless install has no client, so it gets the `install.sh` command to re-run instead. Settings > System > Overview carries the off switch, and `PRIVACY.md` says what the poll sends.
 
-**Taking the offer opens a confirm that says what the switch brings**, rather than restarting on the spot (ADR 0229). It names the version and counts the commits since the one you are running, listed under *New*, *Fixed* and *Improved*. **Switch to new version** commits; **Later** just closes it, which is not a dismissal, so the toast stays where it was. The same confirm opens from the Lucidos menu's **Restart** row while it wears the *New version* pill, and from Settings → System. A packaged build reports no commits, so its confirm lists the applied *changes* the restart activates, grouped by the *thread* that proposed them. That is also what a plain restart shows, under the shorter question it has always asked.
+**Taking the offer opens a confirm that says what the switch brings**, rather than restarting on the spot (ADR 0229). It names the version and counts only the commits the switch brings, listed under *New*, *Fixed* and *Improved*. **Switch to new version** commits; **Later** just closes it, which is not a dismissal, so the toast stays where it was. The same confirm opens from the Lucidos menu's **Restart** row while it wears the *New version* pill, and from Settings → System. A packaged build reports no commits, so its confirm lists the applied *changes* the restart activates, grouped by the *thread* that proposed them. That is also what a plain restart shows, under the shorter question it has always asked.
 
 **A version that is not built yet is its own, quieter signal** (dev only). When new engine code exists in source with nothing built behind it, there is nothing to switch onto, so instead of the switch badge the brand mark carries a small dot, and the toast offers *Rebuild* rather than *Switch to new version*. It defers on dismiss exactly like the one above, keyed on the checkout's commit instead of an on-disk build id (there is no on-disk build to name, which is what makes it pending), and tapping the dot brings it back. Where a rebuild has already been tried for that commit and produced nothing to switch onto, rebuilding cannot help: the button is withheld and the toast names what does resolve it.
 
 One packaged failure is reported differently from the rest, and it is worth knowing on sight: if the swap leaves no runnable app on disk, Lucidos does **not** restart anything. It says so, and tells you to reinstall from the `.dmg`, because retrying an update has nothing left to install over. The background service keeps running the version it already loaded, so your workspaces stay up until you reboot.
 
 ### Apply All
-The user-clicked action that triggers an *Apply* on every pending *change* in one batch. UI button label: **Apply All** (sibling to per-row *Apply* / Discard on the changes panel). The batch skips exactly what a per-row *Apply* refuses — changes whose thread is still working, and changes with no file changes left — so the bulk path can't do what the button won't. Discard All skips neither. Engine emits `ApplyAllBatchStarted` with the full change-id list + actor, then advances the batch as each member's `ChangeApplied` / `ChangeApplyFailed` event lands, and emits `ApplyAllBatchCompleted` with `applied: Vec<Uuid>` + `failed: Vec<ApplyFailure>` when every member has resolved. Member status is first-write-wins — one failure does not abandon the rest of the batch. Each member individually goes through the same *hardening* and restart-derivation rules as a single *Apply*. Persisted under aggregate `apply_all_batch`, `aggregate_id` = `batch_id` (UUID). While the batch runs, a sticky toast with a spinner shows progress and offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`): the engine stops advancing to further members, interrupts the in-flight *hardening*/merge session, and marks the remaining members `failed` with "Apply All canceled" so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied; the rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
+The user-clicked action that triggers an *Apply* on every pending *change* in one batch. UI button label: **Apply All** (sibling to per-row *Apply* / Discard on the changes panel).
 
-**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every thread still working whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. With nothing appliable now, arming IS the action and the button reads **Apply as they settle**. The batch toast's **Cancel** takes the whole sweep back with it.
+The batch skips exactly what a per-row *Apply* refuses: changes whose thread has not settled, and changes with no file changes left. So the bulk path can't do what the button won't. Discard All skips neither.
+
+The engine emits `ApplyAllBatchStarted` with the full change-id list and the actor. It advances the batch as each member's `ChangeApplied` / `ChangeApplyFailed` event lands. Once every member has resolved, it emits `ApplyAllBatchCompleted` with `applied: Vec<Uuid>` and `failed: Vec<ApplyFailure>`. Member status is first-write-wins, so one failure does not abandon the rest of the batch. Each member goes through the same *hardening* and restart-derivation rules as a single *Apply*. Persisted under aggregate `apply_all_batch`, `aggregate_id` = `batch_id` (UUID).
+
+While the batch runs, a sticky toast with a spinner shows progress and offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`). The engine then stops advancing to further members and interrupts the in-flight *hardening* or merge session. It marks the remaining members `failed` with "Apply All canceled", so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied. The rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
+
+**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. With nothing appliable now, arming IS the action and the button reads **Apply as they settle**. The batch toast's **Cancel** takes the whole sweep back with it.
 
 ### Standing apply
-The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still working, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
+The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still settling, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
 
-Two forms. **Apply as it settles** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply as they settle**, the *Apply All* checkbox, arms every thread still working. Both read the same rule and both are one-shot.
+Two forms. **Apply as it settles** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply as they settle**, the *Apply All* checkbox, arms every *settling* thread. Both read the same rule and both are one-shot.
 
 It goes wherever *Apply* goes, and nowhere else. An *external-repo coding-agent thread* is never offered one: Lucidos does not merge into that repo, and the thread proposes no *change* to arm. So its prompt row draws no flag, the sweep passes it over, and the engine refuses an arm anything else asks for.
 
 A change whose *Apply* hit merge conflicts is not offered one either. Its thread works only to resolve that merge, and the resolver lands the change itself. So the apply is already in flight: its Changes panel row reads **Applying...** with "Resolving merge conflicts", and its prompt row draws no flag.
 
-It always ends. The change applies the moment the thread finishes. A thread that parks or fails never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
+It always ends. The change applies the moment the thread finishes, once the agent has saved its last edits. A thread waiting on an *event wait* keeps the instruction, because the wait ends by itself and the thread finishes after it wakes. A thread parked on a question, whose turn failed, or whose session stopped before the turn finished settling never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
 
 Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying as it settles** once armed. The bulk control above it reads **✓ Applying as they settle**, and cancels every standing apply here. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
 
 Cancelling stops what has not started. A change already merging or hardening finishes, and nothing already applied is undone. Stopping a running *Apply All* is its own Cancel, on the "Applying changes" notice.
+
+### Settling thread
+A *coding-agent thread* that has not finished but will by itself: it is running, paused, or waiting on an *event wait*. A *standing apply* waits through these, and through the moment after a turn ends while the agent saves its last edits. A thread parked on a question is not settling, because only you can end that. While it runs or watches an event, its *Apply* is withheld, and the standing apply takes its place.
 
 ### Cancel (Stop)
 The user-clicked **Stop** action on a working *coding-agent thread*. Behaves like pressing **Esc** in the *Claude Code* CLI: it *interrupts* the current turn but keeps the session resumable — the same `cc_session_id` and branch are preserved, so the next message continues the *same* conversation (a `--resume`) with full context. It is NOT a kill and NOT a fresh start. Emits `ResponseCanceled` (the visible "Canceled" chip) + `CodingAgentIdled` (the resume anchor). Distinct from *Apply* / Discard / Archive, which terminate the turn via their own lifecycle event. Routed through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `StopReason::UserStop`); a bounded fallback hard-stops only if the agent fails to honor the interrupt. Source: `crates/lucidos-engine/src/engine/claude_code/control.rs`, `agent_session/lifecycle.rs` (`SessionEndAction::KeepCanceledBranch`).
 
 ### Change
 A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. Resolved by *Apply* (non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*) or Discard. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
+
+A change's `status` is one of four values: `pending` (awaiting Apply or Discard), `applied`, `discarded`, or `reverted` (applied, then undone). No other value exists.
 
 A change's file list tracks git: when later commits on the branch cancel the diff out (a commit plus its revert), the engine re-syncs the row to **zero files** and the card reads "No file changes" instead of claiming edits its Diff can't show. Such a change stays pending — the engine never resolves a change on the user's behalf — but *Apply* is refused (there is nothing to merge, and it would only add no-op commits); **Discard** is the resolution. The re-sync runs when the coding agent next idles, when its session ends, and as an engine-startup sweep for rows that went stale while nothing was running.
 
@@ -1086,7 +1183,7 @@ Which of Claude Code's own permission modes its threads run in, set under **Sett
 Auto has costs worth knowing before you pick it. It ignores a blanket `Bash` entry in your Claude Code permissions, so more commands reach the classifier and each pays a round-trip. A classifier it cannot reach denies the action rather than asking you. And a run of denials falls back to asking anyway. Codex threads are unaffected: it has no equivalent setting. Changes apply to new sessions.
 
 ### Background task
-Work Lucidos runs for a *thread* so it can outlive the agent's turn: a test suite, an e2e run, a long build. A *coding agent* starts one with `lucidos background-task run -- <command>`; the *Lucidos Agent* with `run_bash_background`. Lucidos runs it in the thread's own worktree and arms an *event wait* on its completion, so the agent ends its turn instead of waiting. When the task finishes, the thread re-opens with the exit status and the tail of the output.
+Work Lucidos runs for a *thread* so it can outlive the agent's turn: a test suite, an e2e run, a long build. A *coding agent* starts one with `lucidos background-task run --description "<what it is>" -- <command>`; the *Lucidos Agent* with `run_bash_background`. The description names the task on the thread's waiting row. Lucidos runs it in the thread's own worktree and arms an *event wait* on its completion, so the agent ends its turn instead of waiting. When the task finishes, the thread re-opens with the exit status and the tail of the output.
 
 A command the agent backgrounds on its own dies when its turn ends, which is why this exists. Discarding or archiving the thread stops its running tasks.
 

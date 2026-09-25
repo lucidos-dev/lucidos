@@ -62,10 +62,14 @@ export function NavChevron({
   const longPress = useLongPress((el) => setAnchor(el), handleClick);
 
   const Icon = direction === 'back' ? BackIcon : ForwardIcon;
-  const cls = `icon-btn header-icon${buttonClass ? ` ${buttonClass}` : ''}`;
+  const cls = `icon-btn header-icon nav-chevron${buttonClass ? ` ${buttonClass}` : ''}`;
   const items = open ? getItems() : [];
 
-  const handlers = history
+  // A disabled chevron still takes the pointer, for its tooltip. It gets no
+  // handlers, so a hold or a right-click cannot open a menu with no history.
+  const handlers = disabled
+    ? {}
+    : history
     ? {
         onClick: longPress.onClick,
         onPointerDown: longPress.onPointerDown,

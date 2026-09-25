@@ -1,6 +1,7 @@
 use super::register::ARMING_LOOKBACK_SECS;
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::MessageOrigin;
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 
@@ -379,6 +380,7 @@ async fn seed_completion_card(
             status: crate::engine::thread_events::ChildCompletionStatus::Success,
             summary: "all green".into(),
             pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
         },
     )
     .await;
@@ -2307,6 +2309,25 @@ async fn the_lost_reentry_sweep_skips_a_discarded_thread() {
 
 // ── the recent-subscription cap (I13) ────────────────────────────────
 
+/// An agent-authored message, the traffic a child callback posts.
+fn an_agent_message() -> ThreadEvent {
+    ThreadEvent::MessageReceived {
+        provider: None,
+        voice_session_id: None,
+        text: "[CHILD THREAD COMPLETED]".into(),
+        user_image_hashes: vec![],
+        device_id: None,
+        device: None,
+        image_description: None,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        mode: crate::engine::thread_events::ActorMode::Agent,
+        model: None,
+        reasoning_effort: None,
+        origin: None,
+    }
+}
+
 #[tokio::test]
 async fn recent_subscriptions_counts_only_since_the_last_human_message() {
     let (pool, db_name) = setup_test_db().await;
@@ -2323,26 +2344,7 @@ async fn recent_subscriptions_counts_only_since_the_last_human_message() {
 
     // An AGENT message must NOT reset the counter: cross-thread ping-pong is
     // made of exactly those, so counting it would disarm the cap it should trip.
-    seed_thread_event(
-        &bus,
-        thread_id,
-        ThreadEvent::MessageReceived {
-            provider: None,
-            voice_session_id: None,
-            text: "[CHILD THREAD COMPLETED]".into(),
-            user_image_hashes: vec![],
-            device_id: None,
-            device: None,
-            image_description: None,
-            parent_thread_id: None,
-            spawning_event_id: None,
-            mode: crate::engine::thread_events::ActorMode::Agent,
-            model: None,
-            reasoning_effort: None,
-            origin: None,
-        },
-    )
-    .await;
+    seed_thread_event(&bus, thread_id, an_agent_message()).await;
     assert_eq!(
         recent_subscriptions(&pool, thread_id).await.unwrap(),
         2,
@@ -2391,6 +2393,200 @@ async fn recent_subscriptions_forgets_waits_older_than_the_window() {
         recent_subscriptions(&pool, thread_id).await.unwrap(),
         1,
         "a wait armed before the window is serial progress, not a loop"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Arm a wait on `thread_id` and resolve it with a delivery naming `event_id`.
+async fn subscribe_and_deliver(bus: &EventBus, thread_id: Uuid, event_id: Uuid) {
+    let wait_id = emit_subscribe(bus, thread_id, vec![sub("ChangeProposed", None)]).await;
+    seed_thread_event(
+        bus,
+        thread_id,
+        ThreadEvent::EventWaitDelivered {
+            wait_id,
+            event_id,
+            event_type: "ChangeProposed".into(),
+            payload: json!({}),
+            matched_index: 0,
+        },
+    )
+    .await;
+}
+
+/// A domain event's row id, emitted with `actor`.
+async fn emit_domain_event(bus: &EventBus, actor: Option<MessageOrigin>) -> Uuid {
+    bus.emit(BusEvent::System(
+        crate::engine::event_bus::SystemEvent::DomainEvent {
+            event_type: "BuildFinished".to_string(),
+            payload: json!({"summary": "the build finished"}),
+            depth: 0,
+            transient: false,
+            actor,
+        },
+    ))
+    .await
+    .unwrap()
+    .expect("a domain event writes a row")
+    .event_id
+}
+
+/// **Waiting on other threads' work is progress, however fast it re-arms.**
+/// The nightly waited for seven coding sessions, re-arming each time one
+/// finished, and was refused after ten waits in fifty minutes (ADR 0280).
+#[tokio::test]
+async fn recent_subscriptions_skips_waits_another_thread_ended() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    use super::register::recent_subscriptions;
+
+    let waiter = Uuid::new_v4();
+    // A child's completion card lands on the waiter itself, so it is seeded
+    // first: its `seed_thread` is a human message that would reset the count.
+    let card = seed_completion_card(&bus, &pool, waiter, Uuid::new_v4(), "A child").await;
+
+    let session = seed_coding_agent_idle(&bus, &pool, Uuid::new_v4()).await;
+    subscribe_and_deliver(&bus, waiter, session.id).await;
+    subscribe_and_deliver(&bus, waiter, card.id).await;
+    // A script's domain event names the thread that ran it.
+    let released = emit_domain_event(
+        &bus,
+        Some(MessageOrigin::Api {
+            user_agent: None,
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            source_thread_id: Some(Uuid::new_v4()),
+        }),
+    )
+    .await;
+    subscribe_and_deliver(&bus, waiter, released).await;
+
+    assert_eq!(
+        recent_subscriptions(&pool, waiter).await.unwrap(),
+        0,
+        "every wait here was ended by another thread's work"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The loop the cap still exists for: a thread woken by its own events, or by
+/// an event nobody can attribute. The `emit_event` tool writes domain events
+/// with no actor, so "unknown" must never read as "someone else".
+#[tokio::test]
+async fn recent_subscriptions_counts_self_wakes_unattributed_wakes_and_timeouts() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    use super::register::recent_subscriptions;
+
+    let waiter = Uuid::new_v4();
+    seed_thread(&bus, waiter).await;
+
+    let own = seed_thread_event(&bus, waiter, an_agent_message()).await;
+    subscribe_and_deliver(&bus, waiter, own).await;
+
+    let anonymous = emit_domain_event(&bus, None).await;
+    subscribe_and_deliver(&bus, waiter, anonymous).await;
+
+    let own_script = emit_domain_event(
+        &bus,
+        Some(MessageOrigin::Api {
+            user_agent: None,
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            source_thread_id: Some(waiter),
+        }),
+    )
+    .await;
+    subscribe_and_deliver(&bus, waiter, own_script).await;
+
+    let expired = emit_subscribe(&bus, waiter, vec![sub("ChangeProposed", None)]).await;
+    seed_thread_event(
+        &bus,
+        waiter,
+        ThreadEvent::EventWaitExpired { wait_id: expired },
+    )
+    .await;
+
+    emit_subscribe(&bus, waiter, vec![sub("ResponseGenerated", None)]).await; // still live
+
+    assert_eq!(recent_subscriptions(&pool, waiter).await.unwrap(), 5);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Tapping an answer on a question card is the user replying. On the nightly,
+/// a tapped "Keep waiting" left the count standing and the next wait refused.
+#[tokio::test]
+async fn recent_subscriptions_resets_on_a_human_answer_only() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    use super::register::recent_subscriptions;
+
+    let thread_id = Uuid::new_v4();
+    seed_thread(&bus, thread_id).await;
+    // One answer per question: the store refuses a second on the same id.
+    let answer = |tool_use_id: &str, actor: MessageOrigin| BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: tool_use_id.into(),
+            answer: crate::engine::thread_events::AnswerKind::Canceled,
+        },
+        meta: crate::engine::thread_events::EventMeta::with_actor(Some(actor)),
+    };
+
+    emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
+    bus.emit(answer(
+        "toolu_agent",
+        MessageOrigin::ThreadLink {
+            thread_id: Uuid::new_v4(),
+            title: None,
+            spawning_event_id: None,
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            direction: crate::engine::thread_events::ThreadDirection::Parent,
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
+        1,
+        "an agent answering is not a human in the loop"
+    );
+
+    bus.emit(answer(
+        "toolu_human",
+        MessageOrigin::Device {
+            device_id: "test-device".into(),
+            label: "Test Device".into(),
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
+        0,
+        "a tapped answer resets the count"
+    );
+
+    // Same rule as a message: any actor whose mode is human, not only a device.
+    emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
+    bus.emit(answer(
+        "toolu_api",
+        MessageOrigin::Api {
+            user_agent: None,
+            mode: crate::engine::thread_events::ActorMode::Human,
+            source_thread_id: None,
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        recent_subscriptions(&pool, thread_id).await.unwrap(),
+        0,
+        "a person answering over the API resets the count too"
     );
 
     pool.close().await;

@@ -12,6 +12,7 @@ import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
 import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
+import type { SlownessEpisode } from '../../store/actions/slowness';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
  *  the page is layout and this is content.
@@ -142,6 +143,32 @@ export const SAMPLE_WEBHOOK_REFUSAL: WebhookRefusal = {
   reasons: { disabled: 42 },
   refusing_since: '2026-09-02T04:41:06Z',
   refusing_secs: 1_555_200,
+};
+
+/** A machine short on memory because of another app, the case that prompted
+ *  the bar: Lucidos was the victim, and the bar says so by naming the app. */
+export const SAMPLE_MEMORY_EPISODE: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'sample',
+  reason: 'memory',
+  top_users: [
+    { name: 'Google Chrome', bytes: 7_000_000_000, kind: 'app' },
+    { name: 'Lucidos', bytes: 1_400_000_000, kind: 'lucidos' },
+    { name: 'Slack', bytes: 600_000_000, kind: 'app' },
+  ],
+};
+
+/** Lucidos slow with memory calm, as when a build saturates the processor.
+ *  The bar names no cause, only the busiest apps and one thing to do. */
+export const SAMPLE_UNCLEAR_EPISODE: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'sample-unclear',
+  reason: 'unclear',
+  busiest_apps: [
+    { name: 'Xcode', percent: 40, kind: 'app' },
+    { name: 'Lucidos', percent: 12, kind: 'lucidos' },
+  ],
+  slow_workspaces: ['dev'],
 };
 
 /** The other cause, which wants different words and a different fix.

@@ -86,7 +86,7 @@ impl LucidosEngine {
                 )
                 .await
             }
-            _ => Ok(format!("Unknown app tool: {}", name)),
+            _ => Err(format!("Unknown app tool: {}", name).into()),
         }
     }
 

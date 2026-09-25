@@ -4,6 +4,7 @@ mod cc_spawn_coalesce;
 pub(crate) mod coding_agent_kind;
 mod external_edits;
 pub(crate) mod external_watchdog;
+mod input_ledger;
 mod io_helpers;
 pub(crate) mod lifecycle;
 mod node_modules_setup;
@@ -15,8 +16,11 @@ mod run_session;
 mod runtime_helpers;
 mod spawn;
 pub(crate) mod spawn_dispatcher;
+mod spawns_in_flight;
 mod text_buffer;
 mod turn_gap;
+
+pub(crate) use spawns_in_flight::SpawnsInFlight;
 
 pub(crate) use cc_spawn_coalesce::{
     combine_messages, queued_to_orphans, CcSpawnCoalescer, LeaderElection, QueuedMessage,
@@ -26,7 +30,9 @@ pub(crate) use coding_agent_kind::{
     FolderClassification,
 };
 
-pub(crate) use apply_now::{probe_merge_conflicts, InPlaceMergeStart};
+#[cfg(test)]
+pub(crate) use apply_now::{decide_in_place_merge_claim, release_change_claim, InPlaceMergeClaim};
+pub(crate) use apply_now::{probe_merge_conflicts, ChangeClaimGuard, InPlaceMergeStart};
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
 // Engine construction passes the hung-tool ceiling to the external watchdog;
 // `lifecycle` is private, so re-export it here.

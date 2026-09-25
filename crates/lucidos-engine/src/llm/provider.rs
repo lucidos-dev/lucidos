@@ -155,6 +155,11 @@ pub struct LlmResponse {
     /// or the other, so setting both would send the same text twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_only_text: Option<String>,
+    /// Every part of `content` came from progress notes, and none from a reply.
+    /// A note summarizes what the model drafted, so a draft never reaches the
+    /// user through one. The question card gate reads this.
+    #[serde(default)]
+    pub content_is_progress_notes: bool,
 }
 
 impl LlmResponse {

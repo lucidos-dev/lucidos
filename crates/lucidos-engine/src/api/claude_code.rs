@@ -139,6 +139,9 @@ pub(super) async fn claude_code_stop(
         other => match state.engine.stop_agent(other, thread_id, actor).await {
             Ok(()) => Ok(Json(super::CancelResponse { canceled: true })),
             Err(e) => {
+                if let Some(refused) = claim_refusal_error(&e.to_string()) {
+                    return Err(refused);
+                }
                 crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
                 Err(StatusCode::NOT_FOUND.into())
             }
@@ -156,25 +159,33 @@ pub(super) struct ApplyNowQuery {
     thread_id: String,
 }
 
-/// Classify an `apply_now` error into its HTTP status.
+/// The `409` for a refusal a change claim or a stopping session gave, carrying
+/// the engine's message and its `reason` slug. `None` for any other error.
+fn claim_refusal_error(msg: &str) -> Option<ApiError> {
+    crate::engine::claude_code::claim_refusal_reason(msg)
+        .map(|reason| ApiError::new(StatusCode::CONFLICT, msg).with_reason(reason))
+}
+
+/// Classify an `apply_now` error into its HTTP error.
 ///
 /// `404` is not a generic failure here, it is a SIGNAL: the frontend
 /// (`endClaudeCodeAndApply`) reads it as "no live coding-agent session" and
-/// falls back to applying the thread's pending changes one at a time. `409` is
-/// its "already applying" branch, which keeps the spinner and arms the safety
-/// timeout. So every refusal that is not literally "there is no session" has to
-/// be `409`, or the UI runs the wrong fallback.
+/// falls back to applying the thread's pending changes one at a time. So every
+/// refusal that is not literally "there is no session" has to be `409`, or the
+/// UI runs the wrong fallback.
 ///
-/// The merge-ownership refusal is matched by identity against the const rather
-/// than by another substring sniff, so rewording the message cannot silently
-/// reclassify it as "no session".
-fn apply_now_error_status(msg: &str) -> StatusCode {
-    if msg.contains("already in progress") || msg == crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE
-    {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::NOT_FOUND
+/// Each refusal carries its message and a `reason` slug. The frontend keeps its
+/// "applying" spinner only when an apply really holds the session, and shows
+/// the message either way. Refusals are matched by identity against their
+/// consts, so rewording one cannot silently reclassify it as "no session".
+fn apply_now_error(msg: &str) -> ApiError {
+    if let Some(refused) = claim_refusal_error(msg) {
+        return refused;
     }
+    if msg == crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE {
+        return ApiError::new(StatusCode::CONFLICT, msg).with_reason("resolving_conflicts");
+    }
+    StatusCode::NOT_FOUND.into()
 }
 
 pub(super) async fn claude_code_apply_now(
@@ -198,7 +209,7 @@ pub(super) async fn claude_code_apply_now(
         Err(e) => {
             let msg = e.to_string();
             crate::log!("[API] apply_now failed for {}: {}", thread_id, msg);
-            Err(apply_now_error_status(&msg).into())
+            Err(apply_now_error(&msg))
         }
     }
 }
@@ -206,6 +217,14 @@ pub(super) async fn claude_code_apply_now(
 #[cfg(test)]
 mod apply_now_status_tests {
     use super::*;
+    use crate::engine::claude_code::{
+        APPLY_IN_PROGRESS_MESSAGE, DISCARD_IN_PROGRESS_MESSAGE, SESSION_STOPPING_MESSAGE,
+    };
+
+    fn refusal(msg: &str) -> (StatusCode, String, Option<&'static str>) {
+        let e = apply_now_error(msg);
+        (e.status, e.message, e.reason)
+    }
 
     /// The refusal added with the merge-ownership guard must reach the
     /// frontend's "already applying" branch. As a 404 it would instead hit the
@@ -214,29 +233,41 @@ mod apply_now_status_tests {
     /// whose merge a resolver already owns.
     #[test]
     fn a_resolver_owned_merge_is_a_conflict_not_a_missing_session() {
+        let msg = crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE;
         assert_eq!(
-            apply_now_error_status(crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE),
-            StatusCode::CONFLICT
+            refusal(msg),
+            (
+                StatusCode::CONFLICT,
+                msg.to_string(),
+                Some("resolving_conflicts")
+            )
         );
     }
 
-    /// The pre-existing concurrent-apply refusal keeps its 409.
+    /// Each claim refusal answers 409 with its own message and slug, so the
+    /// toast can say which holder refused. A Discard never reads as an apply.
     #[test]
-    fn a_concurrent_apply_stays_a_conflict() {
-        assert_eq!(
-            apply_now_error_status("Apply is already in progress for this thread"),
-            StatusCode::CONFLICT
-        );
+    fn a_claim_refusal_names_its_holder() {
+        for (msg, slug) in [
+            (APPLY_IN_PROGRESS_MESSAGE, "apply_in_progress"),
+            (DISCARD_IN_PROGRESS_MESSAGE, "discard_in_progress"),
+            (SESSION_STOPPING_MESSAGE, "session_stopping"),
+        ] {
+            assert_eq!(
+                refusal(msg),
+                (StatusCode::CONFLICT, msg.to_string(), Some(slug)),
+                "{msg}"
+            );
+        }
+        assert!(!DISCARD_IN_PROGRESS_MESSAGE.contains("apply"));
     }
 
     /// Anything else still reads as "no live session" so the frontend can fall
     /// back to applying the pending changes directly.
     #[test]
     fn an_unrecognised_failure_still_signals_no_live_session() {
-        assert_eq!(
-            apply_now_error_status("Session channel closed"),
-            StatusCode::NOT_FOUND
-        );
+        let (status, _, reason) = refusal("Session channel closed");
+        assert_eq!((status, reason), (StatusCode::NOT_FOUND, None));
     }
 }
 
@@ -380,9 +411,9 @@ pub(super) async fn claude_code_discard(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ThreadIdBody>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, ApiError> {
     let thread_uuid = uuid::Uuid::parse_str(&body.thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+        .map_err(|e| ApiError::bad_request(format!("Invalid thread_id: {}", e)))?;
     // Discard by another route, so it takes the same gate. Before the branch
     // and worktree go.
     super::thread_reach::refuse_without_authority(
@@ -391,14 +422,16 @@ pub(super) async fn claude_code_discard(
         Some(thread_uuid),
         super::thread_reach::ThreadReachVerb::Discard,
     )
-    .await
-    .map_err(|e| (e.status_code(), e.to_string()))?;
+    .await?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
         .discard_cc_changes(thread_uuid, actor)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            let message = e.to_string();
+            claim_refusal_error(&message).unwrap_or_else(|| ApiError::internal(message))
+        })?;
     Ok(StatusCode::OK)
 }
 

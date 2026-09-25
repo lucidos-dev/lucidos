@@ -93,11 +93,10 @@ export function retryFailedDestinationLists(
   if (appsList.value.status === 'failed') deps.loadAppsList();
 }
 
-/** The compose destination picker — its consequence caption,
- *  and the hand-off hint. Lives in its own component so the signal
- *  subscriptions (repositories, appsList, selectedScope, selectedCodingAgent,
- *  preferences via the hint check) re-render this small subtree instead of
- *  the whole PromptInput on unrelated SSE refreshes. */
+/** The compose destination picker and its consequence caption. It is its own
+ *  component for the sake of its signal reads: repositories, appsList, and the
+ *  draft's scope and backend. On an unrelated SSE refresh they re-render this
+ *  small subtree instead of the whole PromptInput. */
 export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   threadId: string | null;
   toggleMode: ComposeMode;

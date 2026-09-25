@@ -395,7 +395,10 @@ impl LucidosEngine {
         last_log = progress;
         // Reset deferred deletes for Phase 2
         let deferred_deletes = std::sync::Mutex::new(Vec::<Uuid>::new());
-        {
+        // A cancel in Phase 1 skips this phase outright. Seeding it would start
+        // up to CONCURRENCY billed extraction calls before the loop's first
+        // cancel check.
+        if !canceled {
             use futures::stream::StreamExt;
             // Filter out binary/image/archive artifacts that can't contain prose
             let artifacts_after_ext_filter: Vec<_> = artifacts_to_process

@@ -2602,6 +2602,49 @@ test_an_unlisted_workspace_still_takes_the_post() {
 test_a_listed_workspace_is_adoptable
 test_an_unlisted_workspace_still_takes_the_post
 
+# ── wait_for_workspace_health: the probe carries the local credential ──
+#
+# The gateway gates every `/<slug>/api/v1/*` path, health included, so an
+# uncredentialed probe gets 401 and `curl -f` fails on every tick. The launch
+# then waited the full 90 seconds on a healthy engine. The stub answers like
+# the gateway: 200 with the token, curl's `-f` exit 22 without it.
+health_wait_with_token() { # <token-or-empty>
+    rm -f "$HOME/.lucidos/local-token"
+    if [ -n "$1" ]; then
+        mkdir -p "$HOME/.lucidos"
+        printf '%s' "$1" >"$HOME/.lucidos/local-token"
+    fi
+    : >"$SANDBOX/curl-calls"
+    (
+        PROTO=https; GATEWAY_PORT=5251; GATEWAY_WS_ID=dev
+        # shellcheck disable=SC2317 # called by wait_for_workspace_health
+        sleep() { :; }
+        # shellcheck disable=SC2317 # called through gateway_curl
+        curl() {
+            printf 'CALL\n' >>"$SANDBOX/curl-calls"
+            case " $* " in
+                *" x-lucidos-local-token: secret "*) return 0 ;;
+                *) return 22 ;;
+            esac
+        }
+        wait_for_workspace_health
+    )
+}
+
+test_the_health_wait_sends_the_local_token() {
+    echo "test: wait_for_workspace_health authenticates to the gateway"
+    local out
+    out="$(health_wait_with_token secret)"
+    if [[ "$out" == *"ready!"* ]] && [ "$(curl_calls)" = "1" ]; then
+        pass "a healthy engine is ready on the first probe"
+    else
+        fail "want ready in one call, got $(curl_calls) calls: $out"
+    fi
+    rm -f "$HOME/.lucidos/local-token"
+}
+
+test_the_health_wait_sends_the_local_token
+
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

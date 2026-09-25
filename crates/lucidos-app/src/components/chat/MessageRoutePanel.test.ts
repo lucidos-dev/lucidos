@@ -262,8 +262,7 @@ describe('resolveOrigin', () => {
     expect(resolveOrigin(exch(userEvent))).toBeUndefined();
   });
 
-  it('returns undefined for CredentialRequested / McpConsentRequested (no answer event today)', () => {
-    expect(resolveOrigin(exch({ type: 'CredentialRequested', provider: 'github' }))).toBeUndefined();
+  it('returns undefined for McpConsentRequested (no answer event today)', () => {
     expect(resolveOrigin(exch({ type: 'McpConsentRequested', tool: 'fs.read', args: {} }))).toBeUndefined();
   });
 });
@@ -758,9 +757,25 @@ describe('renderInitiatorRow', () => {
     expect(s).toContain('Claude Code (permission gate)');
   });
 
-  it('discloses Lucidos as the asker for CredentialRequested', () => {
-    const node = renderInitiatorRow({ type: 'CredentialRequested', provider: 'github' });
-    expect(JSON.stringify(node)).toContain('Lucidos (credential request)');
+  it('names Codex, not Claude Code, on a Codex thread', () => {
+    const permission = renderInitiatorRow({
+      type: 'CodingAgentPermissionRequest',
+      request_id: 'r1',
+      tool_use_id: 'tu',
+      tool_name: 'Edit',
+      input: {},
+      summary: 's',
+    }, 'codex');
+    const question = renderInitiatorRow({
+      type: 'UserQuestionAsked',
+      tool_use_id: 'tu',
+      cc_session_id: 's',
+      question: 'q',
+      options: [],
+    }, 'codex');
+    expect(JSON.stringify(permission)).toContain('Codex (permission gate)');
+    expect(JSON.stringify(question)).toContain('Codex');
+    expect(JSON.stringify(question)).not.toContain('Claude Code');
   });
 
   it('discloses Lucidos as the asker for McpConsentRequested', () => {

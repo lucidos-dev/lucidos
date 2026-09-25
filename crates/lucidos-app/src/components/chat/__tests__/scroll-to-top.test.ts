@@ -10,6 +10,7 @@ import {
   awayFromBottom,
   stopFollowingBottom,
 } from '../scrollState';
+import { osReducesMotion } from '../../../utils/motion';
 
 // The chevron scroll is rAF-driven (vsync-aligned, time-based easeOutCubic). Fake
 // timers fake requestAnimationFrame too, so advanceTimersByTime steps the frames.
@@ -95,19 +96,14 @@ describe('scrollToTop (rAF easeOutCubic)', () => {
   });
 
   it('reduced motion jumps instantly with no animation', () => {
-    const realMatchMedia = window.matchMedia;
-    (window as any).matchMedia = (q: string) => ({
-      matches: q.includes('reduced-motion'),
-      addEventListener: () => {}, removeEventListener: () => {},
-      addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
-    });
+    osReducesMotion.value = true;
     try {
       const el = mockScrollEl({ scrollTop: 4000, scrollHeight: 5000, clientHeight: 500 });
       setActiveScrollElement(el);
       scrollToTop();
       expect(el.scrollTop).toBe(0); // synchronous, no eased frames
     } finally {
-      (window as any).matchMedia = realMatchMedia;
+      osReducesMotion.value = false;
     }
   });
 });
@@ -184,19 +180,14 @@ describe('scrollToBottomAnimated', () => {
   });
 
   it('reduced motion snaps straight to the bottom (scrollToBottom) with no ease', () => {
-    const realMatchMedia = window.matchMedia;
-    (window as any).matchMedia = (q: string) => ({
-      matches: q.includes('reduced-motion'),
-      addEventListener: () => {}, removeEventListener: () => {},
-      addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
-    });
+    osReducesMotion.value = true;
     try {
       const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
       setActiveScrollElement(el);
       scrollToBottomAnimated();
       expect(el.scrollTop).toBe(5000); // synchronous snap, no eased frames
     } finally {
-      (window as any).matchMedia = realMatchMedia;
+      osReducesMotion.value = false;
     }
   });
 

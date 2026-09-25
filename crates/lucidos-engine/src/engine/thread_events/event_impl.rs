@@ -5,11 +5,12 @@ use crate::runtime::CodingAgent;
 use super::{EventMeta, ThreadEvent};
 
 impl ThreadEvent {
-    /// Names of every event variant that closes a chat-mode request.
-    /// Excludes CC-specific terminators (`CodingAgentIdled`, `SessionEnded`)
-    /// — `chat::recovery::recover_orphaned_threads` checks both sets and
-    /// keeps its own enumeration. Use this for code that operates on the
-    /// chat agentic loop only.
+    /// Names of the four `Response*` events that close a request. A chat turn
+    /// ends on one, and so does a coding-agent turn, which stamps its channel.
+    /// Excludes the coding-agent lifecycle events (`CodingAgentIdled`,
+    /// `SessionEnded`), which `chat::recovery::recover_orphaned_threads`
+    /// enumerates itself. A caller that wants only one agent's turns filters
+    /// on the channel, as `agent_session::turn_gap` does.
     pub const TERMINATOR_EVENT_TYPES: &'static [&'static str] = &[
         "ResponseGenerated",
         "ResponseCanceled",
@@ -130,6 +131,7 @@ impl ThreadEvent {
             Self::CodingAgentToolResult { .. } => "CodingAgentToolResult",
             Self::CodingAgentUserMessageSent { .. } => "CodingAgentUserMessageSent",
             Self::CodingAgentPromptSent { .. } => "CodingAgentPromptSent",
+            Self::CodingAgentInputRead { .. } => "CodingAgentInputRead",
             Self::MissingHardeningDetected { .. } => "MissingHardeningDetected",
             Self::CodingAgentIdled { .. } => "CodingAgentIdled",
             Self::ContinuationRequested { .. } => "ContinuationRequested",
@@ -155,6 +157,11 @@ impl ThreadEvent {
             Self::CodingAgentSettingsChanged { .. } => "CodingAgentSettingsChanged",
             Self::UserPromptInjected { .. } => "UserPromptInjected",
             Self::CredentialRequested { .. } => "CredentialRequested",
+            Self::PluginInstallRequested { .. } => "PluginInstallRequested",
+            Self::PluginUninstallRequested { .. } => "PluginUninstallRequested",
+            Self::EmailConfirmRequested { .. } => "EmailConfirmRequested",
+            Self::OAuthAuthorizationRequested { .. } => "OAuthAuthorizationRequested",
+            Self::FormRequestResolved { .. } => "FormRequestResolved",
             Self::McpConsentRequested { .. } => "McpConsentRequested",
             Self::UserQuestionAsked { .. } => "UserQuestionAsked",
             Self::UserQuestionAnswered { .. } => "UserQuestionAnswered",
@@ -169,6 +176,7 @@ impl ThreadEvent {
             Self::WorktreeCleaned { .. } => "WorktreeCleaned",
             Self::ChildThreadCompleted { .. } => "ChildThreadCompleted",
             Self::ChildThreadStopped { .. } => "ChildThreadStopped",
+            Self::ChildThreadDetached { .. } => "ChildThreadDetached",
             Self::ContextDismissed { .. } => "ContextDismissed",
             Self::ContextKeptOpen { .. } => "ContextKeptOpen",
             Self::ImageDescribed { .. } => "ImageDescribed",
@@ -186,10 +194,6 @@ impl ThreadEvent {
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
             Self::PreambleCompleted => "PreambleCompleted",
-            Self::CredentialPromptRequested { .. } => "CredentialPromptRequested",
-            Self::PluginInstallRequested { .. } => "PluginInstallRequested",
-            Self::PluginUninstallRequested { .. } => "PluginUninstallRequested",
-            Self::EmailConfirmRequested { .. } => "EmailConfirmRequested",
             Self::PushNotificationRequested => "PushNotificationRequested",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::AppUiCaptureRequested { .. } => "AppUiCaptureRequested",
@@ -242,6 +246,7 @@ impl ThreadEvent {
         "CodingAgentToolResult",
         "CodingAgentUserMessageSent",
         "CodingAgentPromptSent",
+        "CodingAgentInputRead",
         "MissingHardeningDetected",
         "CodingAgentIdled",
         "ContinuationRequested",
@@ -267,6 +272,11 @@ impl ThreadEvent {
         "CodingAgentSettingsChanged",
         "UserPromptInjected",
         "CredentialRequested",
+        "PluginInstallRequested",
+        "PluginUninstallRequested",
+        "EmailConfirmRequested",
+        "OAuthAuthorizationRequested",
+        "FormRequestResolved",
         "McpConsentRequested",
         "UserQuestionAsked",
         "UserQuestionAnswered",
@@ -281,6 +291,7 @@ impl ThreadEvent {
         "WorktreeCleaned",
         "ChildThreadCompleted",
         "ChildThreadStopped",
+        "ChildThreadDetached",
         "ContextDismissed",
         "ContextKeptOpen",
         "ImageDescribed",
@@ -292,10 +303,6 @@ impl ThreadEvent {
         "CumulativeTextUpdated",
         "LlmCallRetried",
         "PreambleCompleted",
-        "CredentialPromptRequested",
-        "PluginInstallRequested",
-        "PluginUninstallRequested",
-        "EmailConfirmRequested",
         "PushNotificationRequested",
         "AppUiRefreshRequested",
         "AppUiCaptureRequested",
@@ -330,6 +337,7 @@ impl ThreadEvent {
         "ClaudeCodeToolResult",
         "ClaudeCodeUserMessageSent",
         "ContinueSignal",
+        "CredentialPromptRequested",
         "CredentialRequest",
         "EmailConfirmRequest",
         "MemorySearched",
@@ -374,10 +382,6 @@ impl ThreadEvent {
             Self::CumulativeTextUpdated { .. }
                 | Self::LlmCallRetried { .. }
                 | Self::PreambleCompleted
-                | Self::CredentialPromptRequested { .. }
-                | Self::PluginInstallRequested { .. }
-                | Self::PluginUninstallRequested { .. }
-                | Self::EmailConfirmRequested { .. }
                 | Self::PushNotificationRequested
                 | Self::AppUiRefreshRequested { .. }
                 | Self::AppUiCaptureRequested { .. }

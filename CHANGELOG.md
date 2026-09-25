@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.40.0 — 2026-09-25
+
+### Added
+
+- A Motion setting under Settings > Appearance: System, Reduce or Full, set per device. Reduce stills every animation in the app, the boot splash included, and Lucidos apps get the value through the SDK.
+- Choose how technical the agent's words are: Keep it plain, Technical or I write software. The first chat asks, and you can change it under Settings > Response style. At the two plainer levels, no agent asks you a question you cannot answer.
+- A Learning response style that explains the why as it goes.
+- Move a sub-thread to top level from the thread menu. It keeps running on its own. Agents and the `lucidos` CLI can do the same.
+- A low-memory banner names the apps that hold the memory.
+- A proxy timeout setting (1 to 600 seconds, default 30) for every call through the engine proxy, with a per-entry `timeout_secs` override in `apis.json`.
+- A question card can show a picture or a short text sample under each option.
+- Messages you send to a coding agent or the Lucidos Agent show Sent, then Read.
+
+### Changed
+
+- Thread search puts title matches first, then newer threads.
+- The slowness bar says why Lucidos is slow, or says that it cannot tell.
+- Waiting rows and the waiting panel say in plain words what a thread waits for. Each watched event type gets its own chip, and the condition pop-up shows the event type and its payload filter as a block.
+- An edited shipped response style keeps its own description, and the list and the picker mark it as edited.
+- Credential requests, plugin install confirmations and OAuth pages survive a dropped connection, a reload and an engine restart.
+- A parent thread reads as Waiting while one of its sub-threads waits on you.
+- A message that waited behind your question arrives as one card that names its sender.
+- A card that waits on your answer sits at the bottom of the thread, below later activity. Once you answer, it drops back to its place in the timeline.
+- Startup recovery checks run side by side, so a cold start is faster. The engine log shows how long each startup stage takes.
+- Step through notifications with up and down chevrons, or Cmd+Up and Cmd+Down.
+- The thread drawer toggle is a sidebar icon in the header corner. The Filter button stays pressed while its panel is open, and fills in when a filter narrows the list.
+- A parent thread's "Show / Hide N sub-threads" link sits under its date, right above the sub-threads it controls. Sub-threads unroll from under their parent when you show them, and roll back under it when you hide them.
+- Drawer sections unroll and roll back the same way, and show their thread count while open. Archived and deleted threads slide out of the list.
+- The Filter button, its badge, the drawer title and the filter panel fade in and out together.
+- In the desktop app, right-click a drawer row to open its menu at the pointer. The system context menu shows on content only, and Option+right-click brings it back on a row.
+- Follow keeps you at the live edge while it is on. Scrolling away turns it off while the agent works. On a waiting thread a scroll parks it instead, and it picks up again when the thread goes live.
+- An event wait row shows when the wait started. Once the event arrives, its pill shows a check and the time.
+- A change's diff opens straight onto its file list.
+- A step's outcome mark is a thin drawn icon. A failed step shows its mark without a red box.
+- System comes first in the Theme row, as it does in Motion. The default font comes first in the Font list. Theme, Motion and Network access use the same segmented control.
+- One checkbox style that looks the same in every browser.
+- An aborted turn shows a solid warning triangle.
+- When an agent opens something for you, it goes to the device you used last, and says which one.
+
+### Fixed
+
+- A new window opens offset from the window it came from.
+- The arrow beside an interrupted turn's status sits level with the word in every font.
+- A squeezed settings row wraps instead of crushing its label. A short label keeps its control on the same line, and a wrapped control stays on the right.
+- Lucidos refuses to run from the mounted disk image or a translocated copy, where the engine could not be reached and Update & Restart failed.
+- On the desktop app, arrow keys no longer type squares at the start or end of a text field.
+- A failed app worktree setup no longer removes live work at the same path.
+- A failed trigger replay no longer stops the engine from starting.
+- OpenAI Responses streams end cleanly on an incomplete or error event.
+- A provider's key field in Settings no longer folds away while you type.
+- Retry on a thread that failed to load always fetches it again.
+- A file written while the Files list loads still appears, and the list refreshes after a reconnect.
+- The bell counts a notification that arrives while the page connects. Mark all read clears the list on the tap.
+- Your first keystroke no longer races device registration.
+- Follow-up messages to a coding agent arrive in the order you sent them.
+- A coding-agent session that restarts as its change lands no longer comes back as a crash after Switch to new version, and Stop reaches it again.
+- Pressing or scrolling a picture on a question card never picks its option.
+- A deleted repository is no longer offered as the composer's target.
+- The credential form keeps the service name you typed.
+- A withdrawn permission card never tells the agent that you denied it.
+- An agent that sets up an auto-apply with nothing left to wait for gets told no, and you no longer see a stray warning toast.
+- A thread's auto-apply marker clears when the auto-apply fires or is already gone.
+- Agents no longer promise that Apply restarts Lucidos.
+- The Vite preview server checks your device login before it serves files or the API.
+- A coding agent's separate text blocks show as separate paragraphs.
+- Stop, Discard and Apply Now on a coding-agent session no longer race each other. A refused one says what holds the session.
+- A coding-agent session's final status names the model it ended on.
+- The thread drawer no longer shifts sideways when its scrollbar appears.
+- A drawer row's date stays clear of a wrapped title.
+- On a phone, an event row wraps its time and state below the subject.
+- Count badges stay round and sharp at every UI scale.
+- Screen readers read Settings toggles as pressed or not pressed.
+- Tapping a row in the Filter panel leaves no highlight band behind.
 ## v0.39.5 — 2026-09-24
 
 ### Changed
@@ -15,7 +88,7 @@
 - Claude Code sessions on Vertex show their progress notes between tool calls.
 - A plan approval card is one short line, and the plan stays in the message. A revised card names only what changed.
 - A permission card that the engine resolved says why.
-- The limit on event waits counts the waits a thread armed in the last hour.
+- The limit on event waits skips waits another thread ended, so waiting on other threads one by one is never refused. It allows 20 an hour, up from 10.
 
 ### Fixed
 

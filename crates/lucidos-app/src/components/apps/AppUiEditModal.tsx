@@ -1,9 +1,6 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { activeInlineForm, appsList, appSourceEpoch, showToast } from '../../store/store';
 import { closeAppForm, saveAppMetadata, refreshAppUI } from '../../store/actions/apps';
-// Preact lint flags signal writes from a render body as a side-effect-in-render
-// bug; the missing-app close is moved into a useEffect via MissingAppCloser
-// instead of calling closeAppForm() inline.
 import type { App, Loadable } from '../../store/types';
 import { readAppSourceApi, writeAppSourceApi } from '../../api/client';
 import type { UiSourceFile } from '../../api/client';

@@ -112,6 +112,10 @@ pub const PREF_RESPONSE_STYLE: &str = "response_style";
 /// Deleting that entry restores the shipped text.
 pub const PREF_RESPONSE_STYLES: &str = "response_styles";
 
+/// The response style's second part: how technical the words are. One of
+/// `core::technical_literacy::IDS`. Unset adds nothing.
+pub const PREF_TECHNICAL_LITERACY: &str = "technical_literacy";
+
 // Coding-agent binary path overrides (also written by frontend Settings UI).
 // Unset = auto-detect (probe list → PATH); a set path wins outright and a
 // wrong one fails the spawn naming the key (see
@@ -145,6 +149,10 @@ pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";
 /// OpenAI-compatible endpoint. Mirrored on the frontend in
 /// `crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx`.
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
+
+// How long the engine proxy waits on one upstream request, in seconds. An
+// `apis.json` entry's own `timeout_secs` wins over it (`api::proxy_timeout`).
+pub const PREF_PROXY_TIMEOUT_SECS: &str = "proxy_timeout_secs";
 
 // The keyless OpenCode Free tier, off unless the user turns it on (also written
 // by frontend Settings UI). A preference rather than a credential because there

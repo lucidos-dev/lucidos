@@ -117,6 +117,8 @@ Use exactly one question. `Approve` is always the first option. What goes in the
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
 | `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork. Never alongside one. |
 
+**The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the plan: the preference picks which variant to recommend, not whether to ask.
+
 Claude Code's tool requires **2-4 options**, so a lone `Approve` button cannot be expressed. That is the *only* reason `Request changes` exists as a default second option: it fills the mandatory slot while carrying a real "don't start yet" decision. A genuine fork fills the same slot better, because it satisfies the minimum **and** tells you what to do.
 
 Carrying `Request changes` as a *third* option beside a fork is the failure this rule prevents. It then means only "I will type what I want changed", which is the escape every card already has, and tapping it sends back the literal label so you have to re-ask what to change. That is precisely the dead-end shape the system prompt's NEVER AUTHOR AN "OTHER" OPTION rule bans, and a live card carried it on 2026-08-04 (`Approve` / `Frontend only` / `Request changes`).

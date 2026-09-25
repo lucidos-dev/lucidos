@@ -172,7 +172,7 @@ impl LucidosEngine {
         src_created_at: DateTime<Utc>,
         context: Option<&str>,
     ) -> bool {
-        self.index_memory_inner(source, content, src_created_at, context)
+        self.index_memory_inner_impl(source, content, src_created_at, context, None)
             .await
     }
 
@@ -194,7 +194,7 @@ impl LucidosEngine {
     const SKIP_ARTIFACT_PATHS: &[&str] = &["user_profile.md"];
 
     pub(crate) fn should_skip_artifact_for_memory(path: &str) -> bool {
-        // Skip by exact path
+        // Skip by path suffix
         if Self::SKIP_ARTIFACT_PATHS.iter().any(|p| path.ends_with(p)) {
             return true;
         }
@@ -234,16 +234,7 @@ impl LucidosEngine {
         src_created_at: DateTime<Utc>,
         context: Option<&str>,
     ) -> bool {
-        if Self::should_skip_artifact_for_memory(path) {
-            return false;
-        }
-        let truncated: String = content.chars().take(4000).collect();
-        let formatted = format!("File: {}\n\n{}", path, truncated);
-        let source = MemorySource::Artifact {
-            path: path.to_string(),
-            commit: commit.to_string(),
-        };
-        self.index_memory_inner(source, &formatted, src_created_at, context)
+        self.index_artifact_memory_impl(path, content, commit, src_created_at, context, None)
             .await
     }
 
@@ -257,6 +248,26 @@ impl LucidosEngine {
         context: Option<&str>,
         deferred_deletes: &std::sync::Mutex<Vec<Uuid>>,
     ) -> bool {
+        self.index_artifact_memory_impl(
+            path,
+            content,
+            commit,
+            src_created_at,
+            context,
+            Some(deferred_deletes),
+        )
+        .await
+    }
+
+    async fn index_artifact_memory_impl(
+        &self,
+        path: &str,
+        content: &str,
+        commit: &str,
+        src_created_at: DateTime<Utc>,
+        context: Option<&str>,
+        deferred_deletes: Option<&std::sync::Mutex<Vec<Uuid>>>,
+    ) -> bool {
         if Self::should_skip_artifact_for_memory(path) {
             return false;
         }
@@ -266,41 +277,12 @@ impl LucidosEngine {
             path: path.to_string(),
             commit: commit.to_string(),
         };
-        self.index_memory_inner_deferred(
+        self.index_memory_inner_impl(
             source,
             &formatted,
             src_created_at,
             context,
             deferred_deletes,
-        )
-        .await
-    }
-
-    pub(crate) async fn index_memory_inner(
-        &self,
-        source: MemorySource,
-        content: &str,
-        src_created_at: DateTime<Utc>,
-        context: Option<&str>,
-    ) -> bool {
-        self.index_memory_inner_impl(source, content, src_created_at, context, None)
-            .await
-    }
-
-    pub(crate) async fn index_memory_inner_deferred(
-        &self,
-        source: MemorySource,
-        content: &str,
-        src_created_at: DateTime<Utc>,
-        context: Option<&str>,
-        deferred_deletes: &std::sync::Mutex<Vec<Uuid>>,
-    ) -> bool {
-        self.index_memory_inner_impl(
-            source,
-            content,
-            src_created_at,
-            context,
-            Some(deferred_deletes),
         )
         .await
     }

@@ -1,5 +1,5 @@
 import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
-import { popupImage } from '../../store/store';
+import { popupImage, scaledDurationMs } from '../../store/store';
 import { CloseIcon, ChevronLeftIcon, ChevronRightIcon } from './icons';
 import { Overlay } from './Overlay';
 import {
@@ -27,11 +27,12 @@ import { SwipeTouch } from '../../utils/swipe';
 const MAX_ZOOM_PAST_FIT = 10;
 const WHEEL_FACTOR = 0.002;
 const DOUBLE_TAP_SCALE = 3;
+// Both ride the Animation speed slider, and so does the safety net below.
 const SWIPE_COMMIT_MS = 220;
 const SWIPE_SNAP_BACK_MS = 200;
-// transitionend isn't 100% reliable (background tab, dropped paint). Safety
-// timer guarantees the post-animation cleanup runs.
-const TRANSITION_TIMEOUT_MS = 400;
+// transitionend isn't 100% reliable (background tab, dropped paint). The safety
+// timer outlives the longer of the two moves by this, so cleanup always runs.
+const TRANSITION_SLACK_MS = 180;
 
 // Strip rest position: slides are positioned by shortestDelta around the
 // current index, so the centered slide always sits at left=0 and the strip
@@ -416,7 +417,8 @@ export function ImagePopup() {
     }
 
     // Run `done` exactly once when the strip's transform transition ends, or
-    // after TRANSITION_TIMEOUT_MS as a safety net. Cancel previous listener.
+    // after the scaled commit plus the slack as a safety net. Cancel previous
+    // listener.
     function onTransitionDone(done: () => void) {
       cancelTransition();
       let fired = false;
@@ -439,7 +441,7 @@ export function ImagePopup() {
         clearTimeout(timeoutId);
       };
       strip.addEventListener('transitionend', onEnd);
-      const timeoutId = window.setTimeout(finish, TRANSITION_TIMEOUT_MS);
+      const timeoutId = window.setTimeout(finish, scaledDurationMs(SWIPE_COMMIT_MS) + TRANSITION_SLACK_MS);
       transitionCleanupRef.current = cleanup;
     }
 
@@ -577,7 +579,7 @@ export function ImagePopup() {
         // Animate exactly one slot in the swipe direction; the wrapped slide
         // already sits at ±W (see shortestDelta) and rides in from that side.
         const targetPx = -result * drag.w;
-        strip.style.transition = `transform ${SWIPE_COMMIT_MS}ms ease-out`;
+        strip.style.transition = `transform ${scaledDurationMs(SWIPE_COMMIT_MS)}ms ease-out`;
         strip.style.transform = `translate3d(${targetPx}px, 0, 0)`;
         pendingCommitRef.current = { from: fromIndex, to: newIndex };
         onTransitionDone(() => {
@@ -599,7 +601,7 @@ export function ImagePopup() {
 
       if (wasHorizontal) {
         cancelSwipeRaf();
-        strip.style.transition = `transform ${SWIPE_SNAP_BACK_MS}ms ease-out`;
+        strip.style.transition = `transform ${scaledDurationMs(SWIPE_SNAP_BACK_MS)}ms ease-out`;
         strip.style.transform = STRIP_REST_TRANSFORM;
         onTransitionDone(releaseGesture);
         return;

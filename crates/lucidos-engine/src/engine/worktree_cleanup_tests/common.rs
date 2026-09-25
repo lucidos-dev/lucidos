@@ -16,6 +16,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::core::changes::ChangeStatus;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::engine::thread_events::ThreadEvent;
@@ -212,7 +213,7 @@ pub(crate) async fn insert_change(
     change_id: Uuid,
     branch: &str,
     repo_root: &Path,
-    status: &str,
+    status: ChangeStatus,
 ) {
     sqlx::query(
         "INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, status, created_at) \

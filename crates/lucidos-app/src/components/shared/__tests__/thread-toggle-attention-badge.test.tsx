@@ -17,18 +17,17 @@
  * (attention-only, excluding review / running) live in
  * `components/drawer/attention-view.test.ts`.
  */
-import type { ComponentChildren, VNode } from 'preact';
+import type { ComponentChildren } from 'preact';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   ThreadToggleButton, threadListVisible, threadToggleBadgeCount,
 } from '../ThreadToggleButton';
 import { MOBILE_PANE_CONFIGS } from '../../layout/MobileAppHeader';
 import { HamburgerButton } from '../../layout/ContentNav';
+import { componentTypes, findByClass, textOf, type AnyVNode } from '../../layout/__tests__/vnodeWalk';
 import { mobileView, threadDrawerOpen, threadMap } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
 import type { ThreadState, ThreadStatus } from '../../../store/thread-events';
-
-type AnyVNode = VNode<Record<string, unknown>>;
 
 function makeThread(id: string, status: ThreadStatus): ThreadState {
   return {
@@ -72,39 +71,6 @@ function seedAttention(n: number): void {
   const threads: ThreadState[] = [];
   for (let i = 0; i < n; i++) threads.push(makeThread(`t${i}`, 'waiting_for_user_answer'));
   threadMap.value = new Map(threads.map(t => [t.meta.id, t]));
-}
-
-/** Collect DOM (string-typed) vnodes matching `cls`. Deliberately does NOT
- *  descend into function components, so no nested hooks are ever invoked. */
-function findByClass(node: ComponentChildren, cls: string): AnyVNode[] {
-  if (node === null || node === undefined || typeof node !== 'object') return [];
-  if (Array.isArray(node)) return node.flatMap(n => findByClass(n, cls));
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return [];
-  const out: AnyVNode[] = [];
-  const klass = (v.props.class as string | undefined) ?? '';
-  if (klass.split(' ').includes(cls)) out.push(v);
-  return out.concat(findByClass(v.props.children as ComponentChildren, cls));
-}
-
-/** Every function-component type used anywhere in a vnode subtree. Walks
- *  through DOM nodes and arrays, and records component types without calling
- *  them. */
-function componentTypes(node: ComponentChildren): unknown[] {
-  if (node === null || node === undefined || typeof node !== 'object') return [];
-  if (Array.isArray(node)) return node.flatMap(componentTypes);
-  const v = node as AnyVNode;
-  const here: unknown[] = typeof v.type === 'string' ? [] : [v.type];
-  return here.concat(componentTypes(v.props.children as ComponentChildren));
-}
-
-function textOf(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join('');
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return '';
-  return textOf(v.props.children as ComponentChildren);
 }
 
 function renderToggle(): AnyVNode {

@@ -1,12 +1,12 @@
 import type { ComponentChildren } from 'preact';
 import type { Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useMemo, useState } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
-import type { Exchange, StoredEvent, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -15,17 +15,17 @@ import { openApp, openAppById } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
-import { ChildCompletionRow, ChildStoppedRow } from './ChildCompletionRow';
+import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
 import { headClampApplies, getCollapsedVisibleEvents, splitEventSections, liveStepIndex, drawsResponseRow } from '../../store/event-rendering';
-import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
+import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
+import { FormRequestRow } from './FormRequestRow';
 import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
-import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
-import { setAgentLive } from './scrollState';
+import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
@@ -89,6 +89,10 @@ interface Props {
    *  which has the thread-level busy state and the active-exchange index. Drives
    *  the "Queued" marker on the bubble. */
   isQueued?: boolean;
+  /** Whether the agent has read the message that opened this exchange.
+   *  Computed in `renderExchanges` by `readMarkers`, which needs every
+   *  exchange to know where a coding agent's markers start. */
+  readMarker?: ReadMarker;
   /** Lifted from `threadMap.value.get(threadId)?.meta.channel === 'claude_code'`
    *  in `renderExchanges` so this component does not subscribe to threadMap
    *  itself — see `chatExchangePropsEqual` below for the memo contract. */
@@ -137,6 +141,11 @@ interface Props {
   matchedEventType?: string;
   matchedEventId?: string;
   matchedPayloadJson?: string;
+  /** The "Paused by restart" boundary this resume answers, folded in by
+   *  `renderExchanges` (see `restartPauseFoldsInto`). Draws nothing in the
+   *  panel; the info popover discloses it. A persisted event is immutable, so
+   *  the memo compares it by reference. */
+  pausedBy?: StoredEvent;
 }
 
 /**
@@ -185,33 +194,6 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
   return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
 }
 
-/** Does this exchange mean the AGENT IS RUNNING on the thread being shown? The
- *  follow's live term (see `setAgentLive` in `scrollState`), and nothing else,
- *  so it can afford to be strict: it decides whether the reader's scroll means
- *  "stop dragging me" or merely "I am browsing" (ADR 0064).
- *
- *  TWO sources have to agree, and the second is load-bearing. The exchange
- *  status alone is a RENDERING verdict about one turn, and its final
- *  fallthrough is `'pending'`. A stepless SYSTEM boundary reaches that line
- *  too. `ChangeApplied` opens an exchange of its own, so a coding-agent thread
- *  whose change was applied ends with no steps and no terminal. `'pending'` is
- *  in `ACTIVE_STATUSES` and nothing paints it, so the follow would believe such
- *  a thread was live forever.
- *
- *  So ask the THREAD PROJECTION as well. `threadIdle` is the aggregate's own
- *  "this thread is quiescent", which is the exact question and the only
- *  authority on it. Parked on a question counts as idle, correctly.
- *
- *  Deliberately NOT fixed in `exchangeStatus`. Its `'pending'` fallthrough is
- *  load-bearing, and every status label in the app hangs off that function. */
-export function exchangeMarksAgentLive(
-  isLast: boolean,
-  status: ExchangeStatus,
-  threadIdle: boolean,
-): boolean {
-  return isLast && isStatusActive(status) && !threadIdle;
-}
-
 /** Run `fn` with the control the reader pressed pinned exactly where it is.
  *
  *  The anchor is `currentTarget`, the element carrying this handler, so it IS
@@ -227,7 +209,7 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy }: Props) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -241,24 +223,6 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
-
-  // Tell `scrollState` whether the AGENT is live on this thread. It is one of
-  // the two things deciding whether the reader's scroll retires their standing
-  // follow: fleeing a reply in flight does, browsing an idle thread does not.
-  // A voice call is the other, and pushes its own half in. Here because this
-  // component already derives the status, and `scrollState` deliberately
-  // cannot import `store` to derive it itself.
-  //
-  // Only the LAST exchange answers, since only it can be running. The cleanup
-  // clears the answer rather than leaving it. A thread switch unmounts this
-  // exchange, and the incoming thread's last exchange sets its own value.
-  // Between the two nobody may read the thread they just left.
-  const agentLive = exchangeMarksAgentLive(isLast, status, threadIdle);
-  useEffect(() => {
-    if (!isLast) return;
-    setAgentLive(agentLive);
-    return () => setAgentLive(false);
-  }, [isLast, agentLive]);
 
   // Cap detection reads `ResponseGenerated.text` directly via
   // `exchangeEngineLimitDetail`. The cap is emitted with no preceding
@@ -340,8 +304,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       const triggerId = triggerTarget.dataset.triggerId;
       // navigateToTrigger, not a `triggers.find(...)` on the cached list: it
       // re-fetches the registry on a miss before concluding the trigger is
-      // gone, and names it in the toast if it really is. The app branch above
-      // still reads its cached list, so a miss there is silent.
+      // gone, and names it in the toast if it really is.
       if (triggerId) void navigateToTrigger(triggerId);
       return;
     }
@@ -487,7 +450,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     : getStatusLabel(status, hasSteps);
   const statusLabelText = sl.label;
   const statusClass = sl.className;
-  const showStatus = exchangeActive || hasResponse || hasEvents || status === 'queued' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
+  const showStatus = exchangeActive || hasResponse || hasEvents || status === 'queued' || status === 'held' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
 
   const responseTimestamp = exchangeResponseTimestamp(exchange);
 
@@ -500,6 +463,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       section,
       priorModel,
       priorEffort,
+      pausedBy,
     });
   }
 
@@ -657,11 +621,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
   // A queued follow-up shows a "Queued" tag in its own bubble header, where
-  // dividers show "Answered ✓". A faux "Lucidos Agent" response panel below it
+  // dividers show "Answered". A faux "Lucidos Agent" response panel below it
   // would misattribute it: the message is the user's, and a stack of them
   // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
-  const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
+  // A coding agent already holds its queued messages, so it offers no bin.
+  const queuedMessageId = isQueuedUserMessage && !threadIsCC ? exchange.userEvent._eventId : undefined;
   const isLiveRow = liveRowDrawsNoPanel(exchange.userEvent);
   // The trash button lives INSIDE the status label, an existing `display: flex`
   // row, rather than in a separate wrapper. "Queued" and the trash then stay on
@@ -672,7 +637,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       {queuedMessageId && (
         <button
           type="button"
-          class="icon-btn inline-icon queued-message-remove"
+          class="icon-btn inline-icon queued-message-remove exchange-status-glyph"
           aria-label="Remove queued message"
           data-tooltip="Remove queued message"
           onClick={(e) => {
@@ -685,6 +650,14 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       )}
     </span>
   );
+  const readStatus = readMarker && !isQueuedUserMessage && (
+    <span class={`exchange-status-label exchange-status-${readMarker}`}>
+      {readMarker === 'read' ? 'Read' : 'Sent'}
+    </span>
+  );
+  const initiatorStatus = isQueuedUserMessage || readStatus
+    ? <>{initiator.status}{isQueuedUserMessage && queuedStatus}{readStatus}</>
+    : undefined;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
   const isUnansweredDivider = dividerBodyIsSuppressed(exchange, events);
@@ -778,6 +751,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
       // Ungated too: a held message is the user's cue that a reply is owed.
       if (evt.type === 'held_message') return <HeldMessageRow key={`hm${k}`} event={evt} />;
+      // Ungated: an open one is how the user reaches a form they closed or
+      // never saw, and a resolved one records how the request ended.
+      if (evt.type === 'form_request') return <FormRequestRow key={`fr${k}`} row={evt} threadId={threadId} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
@@ -807,10 +783,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       {drawsInitiatorPanel(exchange) && (
       <InitiatorPanel
         key="initiator"
-        initiator={isQueuedUserMessage
+        initiator={initiatorStatus
           // Appended, not replaced. A spoken message already put its own chip
           // in this slot, and both facts are true of a queued utterance.
-          ? { ...initiator, status: <>{initiator.status}{queuedStatus}</> }
+          ? { ...initiator, status: initiatorStatus }
           : initiator}
         timestamp={formatMessageTimestamp(timestamp)}
         onActorClick={initiator.actorClickable === false
@@ -844,14 +820,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
                   spinner (no mini-spinner in the 'working' state). Suppressed
                   when a live step is already shimmering on screen, so only one
                   running-text affordance moves at a time (see liveStepOnScreen). */}
-              <span class={statusClass === 'working' && !liveStepOnScreen ? 'running-shimmer' : undefined}>{statusLabelText}</span>
-              {statusClass === 'queued' && <span class="exchange-status-queued">{'○'}</span>}
-              {statusClass === 'waiting' && <span class="progress-dot progress-dot-waiting" />}
-              {statusClass === 'done' && status !== 'interrupted' && <span class="exchange-status-check">{'✓'}</span>}
-              {status === 'interrupted' && <span class="exchange-status-continued">{'↳'}</span>}
-              {statusClass === 'canceled' && <span class="exchange-status-x">{'✕'}</span>}
-              {statusClass === 'error' && <span class="exchange-status-x">{'✕'}</span>}
-              {statusClass === 'aborted' && <span class="exchange-status-warning">{'⚠'}</span>}
+              {/* The arrow rides inside the word, inline, so it sits on the
+                  word's own baseline rather than on the row's centre line. */}
+              <span class={statusClass === 'working' && !liveStepOnScreen ? 'running-shimmer' : undefined}>
+                {statusLabelText}
+                {status === 'interrupted' && <ContinuedIcon className="exchange-status-continued exchange-status-glyph" />}
+              </span>
+              {statusClass === 'waiting' && <span class="progress-dot progress-dot-waiting exchange-status-glyph" />}
+              {statusClass === 'canceled' && <span class="exchange-status-x exchange-status-glyph">{'✕'}</span>}
+              {statusClass === 'error' && <span class="exchange-status-x exchange-status-glyph">{'✕'}</span>}
+              {statusClass === 'aborted' && <WarningIcon className="exchange-status-warning exchange-status-glyph" />}
             </span>
           ) : null}
           timestamp={formatMessageTimestamp(responseTimestamp || timestamp)}
@@ -907,17 +885,17 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   );
 }
 
-/** Are two gated-step mark sets the same? Absent and empty are one state: a
- *  resolution deletes the last entry rather than dropping the set, so the two
- *  spellings of "nothing is marked" must not read as a change.
+/** Are two mark sets the same? Absent and empty are one state: a resolution
+ *  deletes the last entry rather than dropping the set, so the two spellings
+ *  of "nothing is marked" must not read as a change.
  *
  *  Iterated rather than compared by identity, because a FULL rebuild allocates
  *  fresh sets. See the `blockedStepSeqs` line in `chatExchangePropsEqual`. */
-function sameStepSeqs(a: Set<number> | undefined, b: Set<number> | undefined): boolean {
+function sameMarks<T>(a: Set<T> | undefined, b: Set<T> | undefined): boolean {
   if (a === b) return true;
   if (!a || !b) return (a?.size ?? 0) === (b?.size ?? 0);
   if (a.size !== b.size) return false;
-  for (const seq of a) if (!b.has(seq)) return false;
+  for (const mark of a) if (!b.has(mark)) return false;
   return true;
 }
 
@@ -951,9 +929,11 @@ function userBubbleText(exchange: Exchange): string | undefined {
  *   - `questionOvertaken`, flipped when the agent ignored a question.
  *   - `continuationMoved`, the turn handed to a later exchange, which
  *     finalizes this one's pending Thinking marker.
+ *   - `releasedFromHold`, which a rebuild can settle differently once a late
+ *     release arrives. It changes the header text.
  *   - `blockedStepSeqs` / `deniedStepSeqs`, a permission decision on a call
- *     this exchange owns. They are the one mark written from OUTSIDE, by a
- *     card that is its own later exchange, so nothing else here moves with it.
+ *     this exchange owns, and `deliveredHeldIds`. These marks are written from
+ *     OUTSIDE, by a later exchange, so nothing else here moves with them.
  *
  *  All other props are primitives or strings, compared with Object.is. */
 export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
@@ -961,6 +941,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.streamingBuffer !== next.streamingBuffer) return false;
   if (prev.isLast !== next.isLast) return false;
   if (prev.isQueued !== next.isQueued) return false;
+  if (prev.readMarker !== next.readMarker) return false;
   if (prev.threadId !== next.threadId) return false;
   if (prev.hasPriorActive !== next.hasPriorActive) return false;
   if (prev.priorModel !== next.priorModel) return false;
@@ -980,6 +961,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.matchedEventType !== next.matchedEventType) return false;
   if (prev.matchedEventId !== next.matchedEventId) return false;
   if (prev.matchedPayloadJson !== next.matchedPayloadJson) return false;
+  if (prev.pausedBy !== next.pausedBy) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
@@ -1000,6 +982,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   // could only ever answer with itself.
   if (a.questionOvertaken !== b.questionOvertaken) return false;
   if (a.continuationMoved !== b.continuationMoved) return false;
+  if (a.releasedFromHold !== b.releasedFromHold) return false;
   if (a.steps.length !== b.steps.length) return false;
   const aLast = a.steps[a.steps.length - 1]?.seq;
   const bLast = b.steps[b.steps.length - 1]?.seq;
@@ -1010,8 +993,11 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   // objects carrying no revision, and there the fingerprint is the only thing
   // deciding. Without these two the held call keeps rendering "In progress"
   // after an out-of-order event forced the rebuild.
-  if (!sameStepSeqs(a.blockedStepSeqs, b.blockedStepSeqs)) return false;
-  if (!sameStepSeqs(a.deniedStepSeqs, b.deniedStepSeqs)) return false;
+  if (!sameMarks(a.blockedStepSeqs, b.blockedStepSeqs)) return false;
+  if (!sameMarks(a.deniedStepSeqs, b.deniedStepSeqs)) return false;
+  // Same shape: a held message's delivered copy, a later exchange, hides the
+  // held row here.
+  if (!sameMarks(a.deliveredHeldIds, b.deliveredHeldIds)) return false;
   return true;
 }
 
@@ -1080,7 +1066,8 @@ export interface InitiatorDescriptor {
 }
 
 /** Action label shared by the panel header and the route popover's Origin row. */
-function initiatorSummary(ev: Exchange['userEvent']): string {
+function initiatorSummary(exchange: Exchange): string {
+  const ev = exchange.userEvent;
   switch (ev.type) {
     // No summary line: the event row in the body says "Trigger fired: <name>",
     // so a header saying "Trigger fired" above it states the same thing twice.
@@ -1101,18 +1088,22 @@ function initiatorSummary(ev: Exchange['userEvent']): string {
     case 'ChangeApplyFailed':        return 'Change failed';
     case 'UserPromptInjected':       return 'Auto-prompt sent';
     case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
-    case 'MessageReceived':
+    case 'MessageReceived': {
       if (ev.origin?.kind === 'api') return 'API message';
-      if (modeToInitiator(ev.mode) === 'system') return 'Forwarded message';
-      return '';
+      if (modeToInitiator(ev.mode) !== 'system') return '';
+      // The chip says only "Lucidos Agent", so the summary names the sender.
+      const sender = agentMessageSender(ev.origin);
+      const said = sender ? `Message from ${sender}` : 'Forwarded message';
+      return exchange.releasedFromHold ? `${said}, held until you replied` : said;
+    }
     // Divider exchanges — the body component carries the question/permission
     // text, so the panel needs no separate summary line.
     case 'UserQuestionAsked':            return '';
     case 'CodingAgentPermissionRequest': return '';
-    case 'CredentialRequested':          return `Credentials requested: ${ev.provider}`;
     case 'McpConsentRequested':          return `Tool consent requested: ${ev.tool}`;
     case 'ChildThreadCompleted':         return '';
     case 'ChildThreadStopped':           return '';
+    case 'ChildThreadDetached':          return '';
     default:                         return '';
   }
 }
@@ -1193,7 +1184,7 @@ type DividerTerminalKind = 'canceled' | 'superseded' | 'dropped';
  *  initiator header. The header describes what happened to the PROMPT, never
  *  the turn:
  *
- *  - "Answered" or "Resolved" (✓) when the user responded.
+ *  - "Answered" or "Resolved" when the user responded.
  *  - "Canceled" (✕) when they dismissed it.
  *  - "Unanswered" or "Unresolved" when the turn ended for any other reason.
  *  - "Needs your answer" while pending.
@@ -1209,14 +1200,21 @@ function dividerStatus(
   droppedLabel: string,
   terminal: DividerTerminalKind | null,
 ): ComponentChildren {
-  if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}<span class="exchange-status-check">{'✓'}</span></span>;
-  if (terminal === 'canceled') return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x">{'✕'}</span></span>;
+  if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}</span>;
+  if (terminal === 'canceled') return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x exchange-status-glyph">{'✕'}</span></span>;
   // Neutral, like a Codex follow-up redirect: the user steered, they did not
   // dismiss. A "Canceled ✕" here would blame them for a question they replied
   // past.
   if (terminal === 'superseded') return <span class="exchange-status-label exchange-status-dropped">{'Superseded'}</span>;
   if (terminal === 'dropped') return <span class="exchange-status-label exchange-status-dropped">{droppedLabel}</span>;
   return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
+}
+
+/** A permission step's verdict, in the one shape every permission card reads. */
+type PermissionVerdict = Pick<ResolvedPermission, 'allowed' | 'reason' | 'persist_scope'>;
+
+function permissionVerdict(step: PermissionVerdict | undefined): PermissionVerdict | undefined {
+  return step && { allowed: step.allowed, reason: step.reason, persist_scope: step.persist_scope };
 }
 
 export function describeInitiator(
@@ -1277,7 +1275,7 @@ export function describeInitiator(
   // `canCollapseInitiator`. Falling to the default below hands an agent's turn
   // the reader's own "You" chip, which is what those two would then read.
   if (exchange.continuationFragment) return { variant: 'system', icon: null, label: '' };
-  const summary = initiatorSummary(ev);
+  const summary = initiatorSummary(exchange);
   switch (ev.type) {
     case 'TriggerStarted':
       // The row carries the subject now ("Trigger fired: <name>"), so the panel
@@ -1453,6 +1451,7 @@ export function describeInitiator(
             status={ev.status}
             summary={ev.summary}
             pendingChangeIds={ev.pending_change_ids}
+            subThreadPendingChanges={ev.sub_thread_pending_changes}
           />
         ),
       };
@@ -1467,6 +1466,21 @@ export function describeInitiator(
         actorClickable: false,
         details: (
           <ChildStoppedRow
+            childThreadId={ev.child_thread_id}
+            childThreadTitle={ev.child_thread_title}
+          />
+        ),
+      };
+    case 'ChildThreadDetached':
+      // One of this thread's children moved to top level (ADR 0278). A note on
+      // the former parent, attributed like its siblings above.
+      return {
+        variant: 'system',
+        icon: <LucidosGlyph />,
+        label: ENGINE_LABEL,
+        actorClickable: false,
+        details: (
+          <ChildMovedOutRow
             childThreadId={ev.child_thread_id}
             childThreadTitle={ev.child_thread_title}
           />
@@ -1508,13 +1522,7 @@ export function describeInitiator(
     }
     case 'CodingAgentPermissionRequest': {
       const resolvedStep = findPermissionResolution(exchange, ev.request_id);
-      const resolved = resolvedStep
-        ? {
-            allowed: resolvedStep.allowed,
-            reason: resolvedStep.reason,
-            persist_scope: resolvedStep.persist_scope,
-          }
-        : undefined;
+      const resolved = permissionVerdict(resolvedStep);
       const agent = describeExecutor(true, threadCodingAgent);
       return {
         variant: 'lucidos',
@@ -1538,13 +1546,7 @@ export function describeInitiator(
     }
     case 'CommandPermissionRequested': {
       const resolvedStep = findCommandPermissionResolution(exchange, ev.request_id);
-      const resolved = resolvedStep
-        ? {
-            allowed: resolvedStep.allowed,
-            reason: resolvedStep.reason,
-            persist_scope: resolvedStep.persist_scope,
-          }
-        : undefined;
+      const resolved = permissionVerdict(resolvedStep);
       // The command guard only fires on chat threads → the Lucidos Agent.
       const agent = describeExecutor(false);
       return {
@@ -1569,13 +1571,7 @@ export function describeInitiator(
     }
     case 'McpPermissionRequested': {
       const resolvedStep = findMcpPermissionResolution(exchange, ev.request_id);
-      const resolved = resolvedStep
-        ? {
-            allowed: resolvedStep.allowed,
-            reason: resolvedStep.reason,
-            persist_scope: resolvedStep.persist_scope,
-          }
-        : undefined;
+      const resolved = permissionVerdict(resolvedStep);
       // The chat MCP permission lane only fires on chat threads → Lucidos Agent.
       const agent = describeExecutor(false);
       return {
@@ -1599,11 +1595,9 @@ export function describeInitiator(
         ),
       };
     }
-    case 'CredentialRequested':
     case 'McpConsentRequested':
-      // Iconless action label (ResponseCanceled style); the asker — "Lucidos
-      // credential request" — is disclosed in the timestamp popover. No body
-      // component today; the engine surfaces these via separate transient flows.
+      // Iconless action label (ResponseCanceled style); the asker is disclosed
+      // in the timestamp popover. No body component: nothing emits it today.
       return actionInitiator(summary);
     default:
       // Unreachable in production (groupIntoExchanges only assigns starter

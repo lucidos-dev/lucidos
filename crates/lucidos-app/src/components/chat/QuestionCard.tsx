@@ -5,7 +5,7 @@ import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { followAnsweredQuestion } from './scrollState';
-import type { AnswerKind } from '../../store/thread-events';
+import type { AnswerKind, QuestionOption } from '../../store/thread-events';
 
 /** Local name for the wire `AnswerKind`. Aliased rather than restated, because
  *  this card renders every kind the engine can persist. A second copy of the
@@ -16,7 +16,7 @@ export interface QuestionBodyProps {
   threadId: string;
   toolUseId: string;
   question: string;
-  options: Array<{ id: string; label: string; description?: string }>;
+  options: QuestionOption[];
   multiSelect?: boolean;
   resolved?: ResolvedAnswer;
   /** Surrounding response was canceled / aborted / failed / superseded
@@ -94,7 +94,7 @@ function OptionContent({
   multiSelect,
   selected,
 }: {
-  option: { id: string; label: string; description?: string };
+  option: QuestionOption;
   multiSelect: boolean;
   selected: boolean;
 }) {
@@ -106,6 +106,14 @@ function OptionContent({
         <span
           class="question-option-desc"
           dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.description) }}
+        />
+      )}
+      {/* Inline markdown only: the option is a <button>, so no link may
+          appear inside it. */}
+      {option.preview && (
+        <span
+          class="question-option-preview"
+          dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.preview) }}
         />
       )}
     </>
@@ -266,7 +274,7 @@ function OptionButton({
   pressed,
   onActivate,
 }: {
-  option: { id: string; label: string; description?: string };
+  option: QuestionOption;
   pressed?: boolean;
   onActivate: (id: string) => void;
 }) {
@@ -280,8 +288,12 @@ function OptionButton({
       onPointerDown={e => gate.down(e)}
       onPointerMove={e => gate.move(e)}
       onPointerCancel={() => gate.cancel()}
-      onClick={() => {
+      onClick={(e) => {
         if (!gate.isTap()) return;
+        // A tap on a picture opens the image viewer (the global click
+        // handler), and dragging its scrollbar ends in a click on the
+        // wrapper. Neither is a choice.
+        if (e.target instanceof Element && e.target.closest('.image-scroll-wrapper')) return;
         onActivate(option.id);
       }}
       aria-label={`${isToggle ? 'Toggle' : 'Answer'}: ${option.label}`}

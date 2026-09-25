@@ -180,46 +180,61 @@ pub(crate) fn workspace_script_env_vars(
     vars
 }
 
-/// Skill content embedded at compile time — written into each CC worktree's
-/// `.claude/skills/lucidos-cli/SKILL.md` so CC discovers the CLI workflow.
-/// The embedded source is the very file we write to: in the Lucidos repo
-/// itself, `.claude/skills/lucidos-cli/SKILL.md` is tracked, and pointing
-/// `include_str!` at it makes the engine's compiled-in copy byte-identical to
-/// what's committed — so `install_lucidos_cli_skill` is a no-op there and a
-/// fresh CC worktree never starts with a phantom `M` on this path.
+/// Skill content embedded at compile time, so CC discovers the CLI workflow in
+/// app and external repos. It is the Lucidos repo's own tracked copy, as of the
+/// commit the engine was built from.
 pub(crate) const LUCIDOS_CLI_SKILL: &str =
     include_str!("../../../../.claude/skills/lucidos-cli/SKILL.md");
 
-/// Worktree-relative path the skill is written to. `install_lucidos_cli_skill`
-/// writes here relative to its `worktree` arg (CC's cwd: the app folder for app
-/// coding-agent threads, the worktree root otherwise), and the spawn path feeds
-/// the same constant to `hide_phantom_tracked_skill` so the install site and the
-/// phantom-change guard can never drift apart.
+/// Where the skill lives, relative to CC's cwd: the app folder for app
+/// coding-agent threads, the worktree root otherwise.
 pub(crate) const LUCIDOS_CLI_SKILL_REL_PATH: &str = ".claude/skills/lucidos-cli/SKILL.md";
 
-/// Install the lucidos-cli skill into a CC worktree. Skipped when the binary
-/// isn't reachable — teaching CC about a tool it can't run wastes context.
+/// Give a CC session the lucidos-cli skill. Who owns the file decides how.
+///
+/// - **Lucidos source repo:** the branch's tracked copy owns it, and `main`
+///   edits it. The engine never writes or hides it. An engine built from
+///   another commit would otherwise block every merge of `main` that changes it.
+/// - **App and external repos:** the engine owns it and writes `engine_copy`,
+///   then hides a tracked stale copy (`hide_phantom_tracked_skill`).
+pub(crate) async fn place_lucidos_cli_skill(
+    cwd: &Path,
+    kind: crate::engine::agent_session::CodingAgentKind,
+    engine_copy: &str,
+) {
+    use crate::engine::agent_session::CodingAgentKind;
+    use crate::engine::git_ops::{hide_phantom_tracked_skill, unhide_tracked_skill};
+
+    match kind {
+        CodingAgentKind::Lucidos => unhide_tracked_skill(cwd, LUCIDOS_CLI_SKILL_REL_PATH).await,
+        CodingAgentKind::App | CodingAgentKind::External => {
+            if let Err(e) = write_lucidos_cli_skill(cwd, engine_copy) {
+                crate::log!(
+                    "[LucidosCLI] failed to install lucidos-cli skill into {}: {}",
+                    cwd.display(),
+                    e
+                );
+            }
+            hide_phantom_tracked_skill(cwd, LUCIDOS_CLI_SKILL_REL_PATH).await;
+        }
+    }
+}
+
 /// Idempotent: skips rewriting if the on-disk content already matches, which
 /// avoids mtime churn that would invalidate CC's skill cache on every spawn.
-pub(crate) fn install_lucidos_cli_skill(
-    worktree: &Path,
-    cli_dir: Option<&Path>,
-) -> std::io::Result<()> {
-    if cli_dir.is_none() {
-        return Ok(());
-    }
+fn write_lucidos_cli_skill(worktree: &Path, content: &str) -> std::io::Result<()> {
     let skill_file = worktree.join(LUCIDOS_CLI_SKILL_REL_PATH);
     let skill_dir = skill_file
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| worktree.to_path_buf());
     if let Ok(existing) = std::fs::read_to_string(&skill_file) {
-        if existing == LUCIDOS_CLI_SKILL {
+        if existing == content {
             return Ok(());
         }
     }
     std::fs::create_dir_all(&skill_dir)?;
-    std::fs::write(skill_file, LUCIDOS_CLI_SKILL)
+    std::fs::write(skill_file, content)
 }
 
 #[cfg(test)]

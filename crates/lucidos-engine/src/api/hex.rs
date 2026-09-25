@@ -1,6 +1,6 @@
-//! Lowercase-hex byte encoding, shared by every module that renders bytes as
-//! text: the proxy signers, their HMAC helpers, the body-hash snapshots, the
-//! WASM-host tests, and the thread-bound origin token in `api::actor`.
+//! Lowercase-hex byte encoding, shared by every engine module that renders
+//! bytes as text: digests, signatures and tokens, across `api`, `core`, `llm`
+//! and `runtime`.
 //!
 //! Centralised here so the encoding format stays consistent. Historically
 //! each proxy module grew its own near-identical helper (`hex_lower`,

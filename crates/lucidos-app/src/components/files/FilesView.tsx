@@ -1,6 +1,6 @@
 import type { VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { artifacts, repositories, repoSource, repoPending, repoFiles, repoDiff, repoViewMode, visibleWorkspaceName } from '../../store/store';
+import { artifacts, repositories, repoSource, repoFiles, repoDiff, repoViewMode, visibleWorkspaceName } from '../../store/store';
 import { uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
 import { switchRepoSource } from '../../store/actions/repositories';
@@ -21,13 +21,14 @@ export function FilesView() {
   const repos = loadedOr(repositories.value, []);
 
   const isRepo = repoSource.value !== null;
-  // App coding-agent threads have no registered repo (the workspace itself
-  // is the git root). viewThreadCcDiff sets repoPending + repoDiff in that
-  // case; RepoFilesView's no-registered-repo branch knows how to render the
-  // diff inline. Without this fallback the user lands on WorkspaceFilesView
-  // (the artifacts tree) and the diff they clicked is invisible.
-  const isAppCcDiff = !isRepo && repoPending.value != null;
-  const showRepoView = isRepo || isAppCcDiff;
+  // A diff shows in the repo view even with no repo bound. App coding-agent
+  // diffs never bind one (the workspace itself is the git root), and every
+  // diff navigation stages this mode before it knows the repo. Keying on the
+  // repo alone would flash the workspace artifacts tree on the way. A failed
+  // diff with no repo falls back to the workspace view: with no repo to switch
+  // from, an error screen there would have no way out. Its toast says why.
+  const showRepoView = isRepo
+    || (repoViewMode.value === 'changes' && repoDiff.value.status !== 'failed');
 
   const sourceOptions = repos.length > 0 ? [
     { value: '', label: `Current Workspace (${visibleWorkspaceName.value || 'unknown'})` },
@@ -114,7 +115,7 @@ function RepoContentView({
               <div class="files-source-switcher">
                 {/* Source switcher renders even in app-CC mode — selecting
                     "Current Workspace" routes back through the dropdown's
-                    onChange, which clears repoPending and drops the user back
+                    onChange, which leaves the diff view and drops the user back
                     into WorkspaceFilesView. Without this, an app-CC diff has no
                     in-pane escape control. */}
                 {sourceDropdown}

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, openThreadDrawer, DRAWER_TOGGLE_LABEL } from './helpers';
+import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
 
 /** Clamped divider drags (SplitLayout / DrawerDivider + splitHelpers; ADR 0056):
  *  a drag is clamped to the pane minimums as it moves, so it stops at the wall
@@ -72,16 +72,17 @@ async function threadHeaderGapX(page: Page): Promise<number> {
   const gap = await page.evaluate(() => {
     const header = document.querySelector('.desktop-header');
     if (!header) return null;
-    // The leading icon host. One element in both drawer states: it used to be a
-    // pair crossfading on data-thread-drawer-open, and is a single slot that
-    // travels between the two positions now.
+    // The drawer toggle rests in the header's corner. With the drawer shut, it
+    // leads the thread side. With the drawer open, it sits over the drawer, so
+    // the gap starts no earlier than the thread side itself does.
     const leading = header.querySelector('.thread-toggle-slot')?.getBoundingClientRect();
     const leadingRight = leading && leading.width > 0 ? leading.right : 0;
+    const threadSide = header.querySelector('.pane-header-brand')?.getBoundingClientRect();
     // The whole centred cluster, not the mark inside it: the chevrons take its
     // ends, so the mark's left edge is well inside the interactive run.
     const cluster = header.querySelector('.pane-header-brand-label')?.getBoundingClientRect();
     if (!cluster || cluster.width === 0) return null;
-    return { from: leadingRight, to: cluster.left };
+    return { from: Math.max(leadingRight, threadSide?.left ?? 0), to: cluster.left };
   });
   expect(gap, 'desktop header: leading cluster / brand cluster not laid out').not.toBeNull();
   expect(
@@ -398,16 +399,17 @@ async function openDrawerAtWidth(page: Page, width: number): Promise<void> {
 }
 
 /** Where the drawer header's title actually landed, against the band it is
- *  centred on and the two buttons it must clear. Scoped to `.desktop-header`:
- *  `MobileAppHeader` renders first and carries its own copies (the 0x0-rect trap
- *  in .claude/rules/frontend.md). */
+ *  centred on and the controls it must clear: the drawer toggle resting over
+ *  the row's leading end, and Filter at its trailing end. Scoped to
+ *  `.desktop-header`: `MobileAppHeader` renders first and carries its own
+ *  copies (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function threadsHeaderGeometry(page: Page) {
   const geo = await page.evaluate(() => {
     const band = document.querySelector('.desktop-header .threads-header');
     const title = band?.querySelector('.threads-header-title');
+    const toggle = document.querySelector('.desktop-header .thread-toggle-slot .thread-toggle');
     const filter = band?.querySelector('button[aria-label="Filter threads"]');
-    const search = band?.querySelector('button[aria-label="Search threads"]');
-    if (!band || !title || !filter || !search) return null;
+    if (!band || !title || !toggle || !filter) return null;
     const b = band.getBoundingClientRect();
     const t = title.getBoundingClientRect();
     return {
@@ -416,8 +418,8 @@ async function threadsHeaderGeometry(page: Page) {
       titleLeft: t.left,
       titleRight: t.right,
       titleWidth: t.width,
-      filterRight: filter.getBoundingClientRect().right,
-      searchLeft: search.getBoundingClientRect().left,
+      toggleRight: toggle.getBoundingClientRect().right,
+      filterLeft: filter.getBoundingClientRect().left,
     };
   });
   expect(geo, 'desktop threads header not laid out').not.toBeNull();
@@ -443,31 +445,30 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
       `title centred at ${web.titleCentre.toFixed(1)}, the drawer pane at ${web.bandCentre.toFixed(1)}`)
       .toBeLessThanOrEqual(1);
     expect(web.titleWidth, 'the title clamped away to nothing').toBeGreaterThan(20);
-    expect(web.titleLeft, 'the title runs under the Filter button').toBeGreaterThanOrEqual(web.filterRight);
-    expect(web.titleRight, 'the title runs under the Search button').toBeLessThanOrEqual(web.searchLeft);
+    expect(web.titleLeft, 'the title runs under the drawer toggle').toBeGreaterThanOrEqual(web.toggleRight);
+    expect(web.titleRight, 'the title runs under the Filter button').toBeLessThanOrEqual(web.filterLeft);
 
-    // Now the packaged macOS layout, which is where this was reported: the row
-    // starts after --titlebar-lights-reserve there, and a title centred on the
-    // GAP between the two buttons lands (reserve - 0.5rem) / 2 to the right of
-    // the pane's middle. The real build cannot be driven by a browser test
-    // (ADR 0016: WKWebView exposes no WebDriver), but the layout is switched by
-    // an attribute and the reserve is a flat px, so stamping the attribute
-    // reproduces exactly the geometry that was wrong.
-    await page.evaluate(() => document.documentElement.setAttribute('data-titlebar-overlay', ''));
-    await page.waitForTimeout(SETTLE_MS); // the row's padding transitions to the reserve
+    // Now the packaged macOS layout, where the row's two ends differ the most:
+    // the toggle rests after --titlebar-lights-reserve there. A title centred
+    // on the GAP between the ends would land well right of the pane's middle.
+    // The real build cannot be driven by a browser test (ADR 0016). But an
+    // attribute switches the layout and the reserve is a flat px, so stamping
+    // the attribute reproduces the geometry.
+    await stampOverlayBuild(page);
+    await page.waitForTimeout(SETTLE_MS); // the row's lead moves to the reserve
 
     const overlay = await threadsHeaderGeometry(page);
-    expect(overlay.filterRight, 'the lights reserve did not apply, so this proves nothing')
-      .toBeGreaterThan(web.filterRight + 40);
+    expect(overlay.toggleRight, 'the lights reserve did not apply, so this proves nothing')
+      .toBeGreaterThan(web.toggleRight + 40);
     expect(Math.abs(overlay.titleCentre - overlay.bandCentre),
       `with the lights reserve applied the title centred at ${overlay.titleCentre.toFixed(1)}, `
         + `the drawer pane at ${overlay.bandCentre.toFixed(1)}`)
       .toBeLessThanOrEqual(1);
     expect(overlay.titleWidth, 'the title clamped away to nothing').toBeGreaterThan(20);
-    expect(overlay.titleLeft, 'the title runs under the Filter button')
-      .toBeGreaterThanOrEqual(overlay.filterRight);
-    expect(overlay.titleRight, 'the title runs under the Search button')
-      .toBeLessThanOrEqual(overlay.searchLeft);
+    expect(overlay.titleLeft, 'the title runs under the drawer toggle')
+      .toBeGreaterThanOrEqual(overlay.toggleRight);
+    expect(overlay.titleRight, 'the title runs under the Filter button')
+      .toBeLessThanOrEqual(overlay.filterLeft);
   });
 
   test('double-clicking the drawer header changes no pane geometry', async ({ page }) => {

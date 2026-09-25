@@ -336,15 +336,17 @@ impl ChildRow {
     /// Title, falling back to the opening of the spawn prompt, falling back to
     /// a generic label. Mirrors the label the fan-in puts on a completion card.
     pub(crate) fn label(&self) -> String {
-        self.title
-            .clone()
-            .or_else(|| {
-                self.first_message
-                    .as_ref()
-                    .map(|m| m.chars().take(80).collect())
-            })
-            .unwrap_or_else(|| "untitled child thread".into())
+        child_label(self.title.clone(), self.first_message.as_deref())
     }
+}
+
+/// A child's handle for the caller: its title, else the opening of its spawn
+/// prompt, else a generic label. Shared by the follow-up and the move to top
+/// level, so both name one child the same way.
+pub(crate) fn child_label(title: Option<String>, first_message: Option<&str>) -> String {
+    title
+        .or_else(|| first_message.map(|m| m.chars().take(80).collect()))
+        .unwrap_or_else(|| "untitled child thread".into())
 }
 
 impl crate::engine::LucidosEngine {
@@ -703,6 +705,7 @@ impl crate::engine::LucidosEngine {
                             Some(spawn_origin),
                             None,
                             urgency,
+                            None,
                         )
                         .await;
                     match result {

@@ -17,7 +17,8 @@ find out which mix you are dealing with, before any of it is assumed.
 
 The user is usually new and often skeptical. They do not know what an app or a
 trigger is here, and they should not have to. Never send them to read anything
-to keep going.
+to keep going. **The first card finds out how technical they are** (§1), and
+every word after it is pitched at that level.
 
 **The mechanics of building live elsewhere.** Load
 `system-knowhow/building-an-app` before the first `create_app` and
@@ -82,6 +83,10 @@ and the point of having written it is that you do not start over:
 
 If it does not exist, this is a first run and the whole ladder applies.
 
+**Also read `technical_literacy` with `get_preferences`.** If it holds any
+value, `not-set` included, skip the literacy card below. The user already
+answered, usually in the first-run setup or in Settings.
+
 Then open: one or two sentences, and the first card immediately. Say what is
 about to happen and what they get at the end, in concrete terms: a few
 questions, then you build the things that fit. Word it as **"we build", never
@@ -94,10 +99,40 @@ define "app" or "trigger", and do not list capabilities.
 never `send_notification` during the interview or the build. A push about work
 they are watching happen is noise.
 
+### The literacy card comes first
+
+Before rung 1, ask how technical they are, as a single-pick card. It changes
+how you word every card, the proposal and the build summary, so it cannot wait.
+Ask "How technical should I be with you?" with exactly these three options,
+word for word. Translate them only when the user writes another language.
+
+| Label | Description | Store |
+|---|---|---|
+| Keep it plain | Everyday words, no jargon. | `non-technical` |
+| Technical | Technical terms are fine. | `technical` |
+| I write software | Talk to me like a developer. | `developer` |
+
+**Never write your own descriptions.** An improvised line drifts into how much
+detail comes back ("full depth"), which a level must not mean.
+
+**Store the answer at once** with
+`set_preference(key="technical_literacy", value=<level>)`, before the next card. Then word
+everything after it at that level. This is the response style's second part,
+so it also reaches every later thread, trigger and coding-agent session.
+
+A typed answer that clearly maps to one level counts as that pick. If it maps
+to none, or they Cancel, store `not-set` and word the rest plainly. Never set a
+level from your own impression of how they write.
+
+**A level sets the words, not the amount.** A technical person who wants only
+the outcome still picks their real level. How much comes back is the style's
+job, so offer them a short one instead of a lower level.
+
 ### The question ladder
 
-**Target 5 to 7 cards. Hard stop at 8.** Each rung should change what you would
-build; if an answer would not change the kit, skip that rung.
+**Target 5 to 7 cards. Hard stop at 8**, the literacy card included. Each rung
+should change what you would build; if an answer would not change the kit, skip
+that rung.
 
 | # | Ask | Multi? | Why it earns its card |
 |---|---|---|---|
@@ -294,6 +329,9 @@ is itself the useful part.
 
 ## <today's date, YYYY-MM-DD>
 
+### Technical literacy
+...the level they picked, or "not asked: already answered" / "declined"
+
 ### Areas they want covered
 ...what they picked at rung 1, and anything they ruled out
 
@@ -396,6 +434,12 @@ piece from "Considered and not built". Do not re-run the ladder.
 - **Building before the confirm.** It removes their exit and it is the one
   irreversible thing in this whole workflow.
 - **Writing inferences to memory.** See §6.
+- **Guessing their technical level.** A fluent writer may still want plain
+  words, and a terse one may be a developer. Ask the literacy card; never set
+  `technical_literacy` from an impression.
+- **Asking the literacy card, then ignoring it.** A "keep it plain" user who
+  then sees a file path or the word "trigger" undefined has been told their
+  answer did not matter.
 - **Proposing something you cannot actually build.** This is about a genuinely
   unreachable source: a closed practice system with no API, data that exists
   nowhere Lucidos can reach. "No account connected yet" is not that. It is one
