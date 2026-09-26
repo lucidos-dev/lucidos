@@ -35,17 +35,16 @@ export function TriggersView() {
   // keeps it off a chat link wearing the same attribute. See the effect below.
   const listRef = useRef<HTMLDivElement>(null);
   const [newGroupName, setNewGroupName] = useState<string | null>(null);
-  // Enter and blur BOTH call commitNewGroup; committing unmounts the field,
-  // which fires a trailing blur that would POST the same name again (409
-  // "already exists", a sticky error toast). Guard with a submit-once flag,
-  // reset when the field is reopened.
-  const creatingGroupRef = useRef(false);
+  // Set once the draft is submitted or cancelled. Closing the field fires a
+  // trailing blur into commitNewGroup, which would POST again (a sticky 409
+  // toast) or create the group Escape cancelled. Reset when the field reopens.
+  const groupDraftSettledRef = useRef(false);
 
   async function commitNewGroup() {
-    if (creatingGroupRef.current) return;
+    if (groupDraftSettledRef.current) return;
     const trimmed = (newGroupName ?? '').trim();
     if (!trimmed) { setNewGroupName(null); return; }
-    creatingGroupRef.current = true;
+    groupDraftSettledRef.current = true;
     const group = await createTriggerGroup(trimmed);
     if (group) showToast(`Group "${group.name}" created`, 'info');
     setNewGroupName(null);
@@ -72,7 +71,7 @@ export function TriggersView() {
               newGroupName={newGroupName}
               setNewGroupName={setNewGroupName}
               commitNewGroup={commitNewGroup}
-              creatingGroupRef={creatingGroupRef}
+              groupDraftSettledRef={groupDraftSettledRef}
               listRef={listRef}
             />
           ) : null}
@@ -88,7 +87,7 @@ function TriggersLoaded({
   newGroupName,
   setNewGroupName,
   commitNewGroup,
-  creatingGroupRef,
+  groupDraftSettledRef,
   listRef,
 }: {
   triggersData: TriggerInfo[];
@@ -96,7 +95,7 @@ function TriggersLoaded({
   newGroupName: string | null;
   setNewGroupName: (v: string | null) => void;
   commitNewGroup: () => void;
-  creatingGroupRef: { current: boolean };
+  groupDraftSettledRef: { current: boolean };
   listRef: { current: HTMLDivElement | null };
 }) {
   // Group registry is small; if it failed, fall back to a flat panel under
@@ -213,9 +212,18 @@ function TriggersLoaded({
           aria-hidden={!creatingGroup}
           onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
           onBlur={creatingGroup ? commitNewGroup : undefined}
+          // Escape cancels. The central Escape policy would blur the field
+          // first, and the blur commits, so the field handles it. The latch
+          // turns the blur below into a plain defocus.
+          data-escape-self
           onKeyDown={e => {
             if (e.key === 'Enter') void commitNewGroup();
-            else if (e.key === 'Escape') setNewGroupName(null);
+            else if (e.key === 'Escape') {
+              e.preventDefault();
+              groupDraftSettledRef.current = true;
+              setNewGroupName(null);
+              e.currentTarget.blur();
+            }
           }}
         />
       </div>
@@ -224,7 +232,7 @@ function TriggersLoaded({
         <ListRowAddCard
           label="New Group"
           onClick={() => {
-            creatingGroupRef.current = false;
+            groupDraftSettledRef.current = false;
             // Synchronous, and before the state flip: see the note above.
             createInputRef.current?.focus();
             setNewGroupName('');

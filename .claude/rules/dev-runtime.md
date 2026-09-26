@@ -31,6 +31,7 @@ paths:
   - "scripts/check-build-script-paths.sh"
   - "scripts/check-eval-not-a-test.sh"
   - "scripts/eval-context-mode.sh"
+  - "scripts/eval-comments/**"
   - "scripts/lib/build_script_path_scan*.sh"
   - "scripts/adr-new.sh"
   - "scripts/lib/adr_scan*.sh"
@@ -98,7 +99,7 @@ opt-in itself, and never starts a gateway.
 ```bash
 ./scripts/web-dev.sh -w <ws> [-b] [-r]    # DEV start (-b builds engine+gateway; -r release; engine serves built dist/; vite watch)
 ./scripts/run.sh -w <ws>                  # USER start (installer entry point): release engine + one-shot vite build, no watcher
-./scripts/tauri-dev.sh -w <ws> [-b]       # web-dev.sh plus a Tauri window: same gateway stack, window on /<slug>/
+./scripts/tauri-dev.sh -w <ws> [-b]       # web-dev.sh plus a Tauri window: same gateway stack, window on /<slug>/; the window rebuilds on app Rust changes, scoped by the allow-list in crates/.taurignore
 ./scripts/stop.sh -w <ws>                 # Stop a specific workspace
 ./scripts/status.sh                       # Check running status
 ./scripts/populate.sh -w <ws> [-c]        # Populate test history
@@ -121,7 +122,26 @@ opt-in itself, and never starts a gateway.
 ./scripts/check-build-script-paths.sh [--report] # Fail if a cargo build script bakes its checkout path with compile-time `env!` instead of reading it at run time (whole-tree; /harden Phase 4.5, every diff). Rationale: ADR 0079
 ./scripts/check-eval-not-a-test.sh        # Fail if the context-handling benchmark became reachable from `cargo test` (= make lint-eval; part of make lint / make check). Rationale: ADR 0087 decision 15
 ./scripts/eval-context-mode.sh <cmd>      # Run the ADR 0110 context-handling benchmark. SPENDS MONEY, see below
+./scripts/eval-comments/eval-comments.sh <cmd>  # Comment-ablation eval: headless coding agents on past bug fixes, with and without justifying comments. SPENDS MONEY, see below
 ```
+
+### The comment-ablation eval spends money and runs by hand only
+
+`scripts/eval-comments/eval-comments.sh` asks whether comments that defend a
+limitation make coding agents paper over bugs. Each task is a past fix on
+`main`: the agent gets a symptom-only report at the fix's parent, and a withheld
+regression test grades it. Arm A keeps the code as is, arm C strips the
+justifying comment blocks, and arm B strips every comment.
+
+- **Sessions never see the fix or the experiment.** Each run works in a clone
+  fetched by sha, so nothing newer than the parent exists in it, under a path
+  that names nothing. The harness docstring lists the isolation rules.
+- **Memory is gated.** At most two sessions run, and a launch waits for free
+  memory. A watchdog kills the newest session on exhaustion, and a `cargo`
+  shim allows one build at a time.
+- **Nothing runs it from `make test`, `/harden` or a workflow.** Run
+  `python3 scripts/eval-comments/strip_comments_test.py` after touching the
+  stripper.
 
 ### The context-handling benchmark spends money and runs by hand only
 

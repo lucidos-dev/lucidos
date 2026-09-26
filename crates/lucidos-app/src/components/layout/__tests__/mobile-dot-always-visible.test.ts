@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error - same
 import { fileURLToPath } from 'node:url';
-import { drawerOpen } from '../Drawer';
+import { drawerOpen } from '../drawerState';
 import { threadDrawerOpen, mobileView } from '../../../store/store';
 import { MobileDotIndicator } from '../MobileAppHeader';
 import { navigateToPane } from '../../../store/actions/pane';

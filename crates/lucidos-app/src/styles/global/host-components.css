@@ -418,8 +418,8 @@
 
 /* A crossfade between layers stacked in one grid cell
    (components/shared/CrossfadeStack.tsx). Every layer stays mounted, so a swap
-   is a transition that can reverse mid-way. `min-width: 0` lets a text layer
-   shrink and ellipsise inside a capped title. */
+   is a transition that can reverse mid-way. `min-width: 0` lets a layer
+   shrink inside a capped box. */
 .crossfade-stack {
     display: grid;
 }
@@ -440,6 +440,55 @@
    under load. So reduced motion cancels it outright. */
 :root[data-motion="reduce"] .crossfade-layer {
     transition: none;
+}
+
+/* The navigation cover (components/shared/NavigationCover.tsx): an opaque
+   theme surface that every arriving view of a pane fades in from, so a view
+   switch never shows its swap frame. It clears on its own animation and never
+   waits on the view. Its host sets the z-index: the content pane
+   (panels/shell.css) and the thread drawer (drawer.css).
+
+   Named a cover, never a "reveal": `revealContentPane()` is a different thing
+   (swipe to the pane on mobile, focus its pane group on desktop). Every surface
+   that hides a not-yet-ready view is a cover (`.app-ui-cover`, the quiet boot
+   cover). */
+.nav-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-primary);
+    pointer-events: none;
+    animation: nav-cover-clear var(--duration-normal) ease-out forwards;
+}
+
+@keyframes nav-cover-clear {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+/* The cover's mirror, for a pane's header title: it fades in with the arriving
+   view, on the same curve and from the same frame. It rests transparent, so a
+   first frame the animation misses shows nothing rather than a flash of the
+   word. The cover rests opaque for the same reason. */
+.nav-arrive {
+    opacity: 0;
+    animation: nav-arrive var(--duration-normal) ease-out forwards;
+}
+
+@keyframes nav-arrive {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* No animation. The cover is transparent from its first frame, since it stays
+   mounted until its fuse, and the title shows at once. */
+:root[data-motion="reduce"] .nav-cover {
+    animation: none;
+    opacity: 0;
+}
+
+:root[data-motion="reduce"] .nav-arrive {
+    animation: none;
+    opacity: 1;
 }
 
 /* Send → Cancel morph button. Always rendered at the same JSX position

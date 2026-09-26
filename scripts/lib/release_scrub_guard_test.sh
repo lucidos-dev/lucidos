@@ -113,6 +113,9 @@ assert_eq!(url, "https://www.dropbox.com/home/Lucidos%20Backups");'
 # Keycap prose, not a path — pins the home-path pass being case-EXACT. Folded,
 # `/Home/End` reads as `/home/<name>` and refuses the release.
 write clean_home_keycaps.tsx '// ↑/↓/Home/End rove focus across the menu items'
+# The one email-shaped placeholder, on the RFC 2606 reserved domain. Autolink
+# fixtures need a home dir shaped like an address, and no other token has an `@`.
+write clean_home_email.ts "renderMarkdown('file:///Users/me.x@example.com/p/Lucidos.dmg');"
 
 # ── Planted leaks — must be flagged ─────────────────────────────────────
 write leak_token.md 'the skattemelding form, filed via portal.contoso.example'   # denylist (2 fragments)
@@ -125,6 +128,10 @@ write leak_home_linux.rs 'let p = "/home/alicejones/secret";'                   
 # character a name can contain, not just alphanumerics.
 write leak_home_dotted.rs 'let p = "/Users/k.thornbury/secret";'                 # heuristic: `k` + `.` is not the `k` placeholder
 write leak_home_underscored.rs 'let p = "/home/user_thornbury/secret";'          # heuristic: `user` + `_` is not the `user` placeholder
+# The email placeholder allows only its exact spelling. A registrable domain is
+# an address someone can own, and a longer name merely starts with the token.
+write leak_home_email_domain.ts 'const p = "/Users/me.x@example.io/p";'          # heuristic: a real, registrable domain
+write leak_home_email_longer.ts 'const p = "/Users/me.x@example.com.au/p";'      # heuristic: the token is a prefix, not the name
 # An approved placeholder and a REAL home dir on the SAME line — the shape doc
 # comments and fixtures produce constantly ("here's the generic example, here's
 # the real thing"). A line-wise `grep -v` allow filter drops the whole line, so
@@ -168,7 +175,8 @@ flagged() { printf '%s\n' "$HITS" | grep -q "$1"; }
 
 echo "test: planted leaks are flagged"
 for f in leak_token.md leak_app.ts leak_ws.sh leak_home.rs leak_home_linux.rs \
-  leak_home_dotted.rs leak_home_underscored.rs leak_home_mixed.md \
+  leak_home_dotted.rs leak_home_underscored.rs leak_home_email_domain.ts \
+  leak_home_email_longer.ts leak_home_mixed.md \
   leak_home_mixed_linux.rs leak_home_real_first.rs leak_device.ts \
   leak_maintainer.rs leak_contributor.md; do
   if flagged "$f"; then pass "flagged $f"; else fail "did NOT flag $f"; fi
@@ -177,7 +185,7 @@ done
 echo "test: attribution sites + approved placeholders pass"
 for f in LICENSE GOVERNANCE.md clean.md clean_ws.md clean_home_linux.md \
   clean_home_placeholder_pair.md clean_home_escaped.rs clean_home_boundary.rs \
-  clean_home_keycaps.tsx; do
+  clean_home_keycaps.tsx clean_home_email.ts; do
   if flagged "$f"; then
     fail "wrongly flagged $f → $(printf '%s\n' "$HITS" | grep "$f")"
   else
@@ -371,7 +379,8 @@ CLEAN_INDEX="$FIXTURES/clean.index"
 GIT_INDEX_FILE="$CLEAN_INDEX" git -C "$REPO" read-tree "$TREE"
 GIT_INDEX_FILE="$CLEAN_INDEX" git -C "$REPO" rm --cached -rq -- \
   leak_token.md leak_app.ts leak_ws.sh leak_home.rs leak_home_linux.rs \
-  leak_home_dotted.rs leak_home_underscored.rs leak_home_mixed.md \
+  leak_home_dotted.rs leak_home_underscored.rs leak_home_email_domain.ts \
+  leak_home_email_longer.ts leak_home_mixed.md \
   leak_home_mixed_linux.rs leak_home_real_first.rs leak_device.ts \
   leak_maintainer.rs leak_contributor.md
 CLEAN_TREE="$(GIT_INDEX_FILE="$CLEAN_INDEX" git -C "$REPO" write-tree)"

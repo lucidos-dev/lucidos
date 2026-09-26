@@ -72,7 +72,7 @@ describe('syncClientUpdateFromBuild — badge', () => {
   it('skips entirely until preferences load (durable global dismissal not yet known)', async () => {
     // Before preferences load, the global refresh-dismissal is unknown — surfacing
     // would flash an already-dismissed toast on cold start. Skip without even
-    // fetching the served build; useStartup re-runs this after loadPreferences.
+    // fetching the served build; startClient re-runs this after loadPreferences.
     preferences.value = { status: 'loading' };
     updateAvailable.value = true;
     mockGetServedBuildId.mockResolvedValue('server999');

@@ -30,7 +30,7 @@ import { PromptRowControls, promptRowToggles } from './PromptRowControls';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
-import { TodoPanelHost, closeTodoPanel, todoIndicatorAction } from './TodoListPanel';
+import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { getBannerActions, getWaitingState, getStandaloneActions, type BannerState } from './WaitingBanner';
 import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
@@ -1520,7 +1520,7 @@ export function PromptInput() {
       {/* The two indicator panels, mounted here rather than by their controls:
           a control that folds into the ⋯ menu unmounts its button, and the
           panel has to outlive that. Both portal, so this is placement only. */}
-      <TodoPanelHost />
+      <TodoPanelSlot />
       <WaitingPanelHost />
       {cameraOpen.value && <CameraCapture />}
     </div>

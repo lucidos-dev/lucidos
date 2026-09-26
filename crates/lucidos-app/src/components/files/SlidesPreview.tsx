@@ -206,6 +206,9 @@ interface Props {
   content: string;
 }
 
+/** The model writes these files, so valid JSON can still have the wrong shape:
+ *  `null`, a string where a list goes. Every node renders eagerly inside the
+ *  try, and the app has no error boundary, so a throw here would blank it. */
 export function SlidesPreview({ content }: Props) {
   let deck: SlidesDeck;
   try {
@@ -213,7 +216,14 @@ export function SlidesPreview({ content }: Props) {
   } catch {
     return <div class="empty-state error-text">Invalid .slides JSON</div>;
   }
+  try {
+    return renderDeck(deck);
+  } catch {
+    return <div class="empty-state error-text">This .slides file does not have the expected shape</div>;
+  }
+}
 
+function renderDeck(deck: SlidesDeck): preact.JSX.Element {
   const slides = flattenSlides(deck);
 
   return (

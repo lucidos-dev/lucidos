@@ -181,7 +181,7 @@ describe('the shell attaching to a transport', () => {
   });
 
   it('reconciles on the open that follows an error, not on the first one', async () => {
-    // The first open is a page load, where useStartup has already read state.
+    // The first open is a page load, where startClient has already read state.
     // Every later one follows a gap whose frames nobody replayed.
     connectThreadEvents();
     opened?.handlers.onOpen();

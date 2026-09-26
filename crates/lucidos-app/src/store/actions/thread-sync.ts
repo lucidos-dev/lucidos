@@ -95,7 +95,7 @@ function markEventStreamStatus(status: 'connecting' | 'connected' | 'disconnecte
 
 /** Set when `onerror` fires, consumed by the next `onopen`, so the resync runs
  *  only on RECONNECT. On the initial connect `loadAllThreads()` is already
- *  driving state via useStartup.ts. */
+ *  driving state via startup.ts. */
 let needsResyncOnOpen = false;
 
 /** In-flight resync coalescer. Multiple Lagged events, or back-to-back
@@ -317,7 +317,7 @@ export function connectThreadEvents(): void {
       // during a listing asks for one more, and the newest unread read wins.
       refreshArtifacts();
       void loadUnreadNotifications();
-      // Only resync after a reconnect. On the initial connect, useStartup.ts
+      // Only resync after a reconnect. On the initial connect, startup.ts
       // already loads thread state. Without the flag we'd double-fetch on every
       // page load.
       if (needsResyncOnOpen) {
@@ -1105,7 +1105,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // Transient frame from the engine's background embedding-model loader:
       // download progress and every transition between downloading / loading /
       // ready / waiting / failed. Same shape as the
-      // `/memory/embedding-model-status` snapshot useStartup reads, so this is
+      // `/memory/embedding-model-status` snapshot startClient reads, so this is
       // a straight assignment with no translation.
       // Routed through the action rather than assigning the signal here, so the
       // freshness counter an in-flight snapshot read compares against cannot be

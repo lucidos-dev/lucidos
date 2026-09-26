@@ -7,7 +7,7 @@ import {
 } from '../store';
 import { contentViewKey } from '../../components/layout/contentViewKey';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx, splitBounds } from '../paneMinimums';
-import { forceCloseDrawer } from '../../components/layout/Drawer';
+import { forceCloseDrawer } from '../../components/layout/drawerState';
 import {
   setSplitRatio, DEFAULT_SPLIT_RATIO,
   computeStepRatio, computeDrawerStepWidth,

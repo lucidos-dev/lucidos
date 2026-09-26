@@ -1216,6 +1216,17 @@ function readerGestureActive(el: HTMLElement): boolean {
   return _gestureEl === el && nowMs() - _gestureAt < READER_GESTURE_WINDOW_MS;
 }
 
+/** Has the reader moved `el` themselves since `since` (a `nowMs` reading)?
+ *  What ends `withScrollAnchor`'s re-assert.
+ *
+ *  Not `readerGestureActive`: its window reaches back past the press. A reader
+ *  who scrolled to a control and then pressed it would read as still
+ *  scrolling, and lose the re-assert their press is owed. */
+export function readerGestureSince(el: HTMLElement, since: number): boolean {
+  if (_scrollbarHoldEl === el) return true;
+  return _gestureEl === el && _gestureAt > since;
+}
+
 /** Keys that scroll a focused container. The transcript is `tabindex=0`, so it
  *  takes them directly; there is no other way for a keyboard reader to move it,
  *  which is why the list is closed rather than "any key". */

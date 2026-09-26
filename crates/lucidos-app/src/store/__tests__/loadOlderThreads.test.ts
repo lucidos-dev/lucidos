@@ -220,6 +220,30 @@ describe('loadOlderThreads', () => {
     );
   });
 
+  it.each(['composing', 'discarded'] as const)('ignores an archived %s draft when computing the archive cursor', async (state) => {
+    // A draft never comes from the archive window, so its created_at says
+    // nothing about how far the archive has been paged. Counting it would send
+    // the first page to the draft's date and skip every archived thread newer
+    // than the draft.
+    const draft = makeOptimisticThreadState({
+      id: 'draft', title: '', channel: 'chat', initiator: 'user',
+      eventsLoaded: true, state, status: 'idle', timestamp: '2026-05-05T09:02:09Z',
+    });
+    draft.meta.section = 'archived';
+    draft.meta.createdAt = '2026-05-05T09:02:09Z';
+    const archived = loaded(makeOptimisticThreadState({
+      id: 'arch', title: 'Archived', channel: 'chat', initiator: 'user', eventsLoaded: false,
+    }), '2026-06-09T13:19:05Z');
+    archived.meta.section = 'archived';
+    threadMap.value = new Map([['draft', draft], ['arch', archived]]);
+
+    await loadOlderThreads();
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '2026-06-09T13:19:05Z', 15, undefined, undefined, undefined, undefined,
+    );
+  });
+
   it('a failed archived thread participates in the archive cursor (no outlier skipping)', async () => {
     // `get_recent_threads` no longer injects any archived row out of its
     // created_at position (the actionable / proposed bypasses were removed), so a

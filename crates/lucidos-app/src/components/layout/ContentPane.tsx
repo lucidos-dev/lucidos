@@ -1,11 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
+import { useEffect, useLayoutEffect, useRef } from 'preact/hooks';
+import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath } from '../../store/store';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { contentViewKey } from './contentViewKey';
 import { reportNavigation } from '../../utils/navigationMarks';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
+import { NavigationCover } from '../shared/NavigationCover';
 import { FilePreviewPath } from '../files/FilePreviewPath';
 // The two notification views are the exception to the code-split below, because
 // `lazyComponent` renders NOTHING until its chunk lands. Every other view can
@@ -32,17 +33,6 @@ const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFile
 const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
 const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
-
-/** The navigation cover's CSS clear animation at 1x (`--duration-normal`). The
- *  fuse below is this scaled by the Animation speed slider plus a little slack,
- *  so the element survives its own fade and then leaves however fast that fade
- *  is running. It is also the fuse that unmounts the cover when no animation
- *  runs at all: under reduced motion (`data-motion="reduce"`) the CSS drops the
- *  animation, and an `animationend`-driven unmount would then never fire and
- *  leave the pane covered forever (harmless to stretch, since that rule also
- *  makes the cover transparent from its first frame). */
-const NAV_COVER_ANIM_MS = 200;
-const NAV_COVER_SLACK_MS = 50;
 
 /** The one state the WebKit repaint below skips: something is painted FULLSCREEN
  *  over this pane. Not merely an app panel being open.
@@ -101,41 +91,13 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // from the prior view persists on the DOM and reappears when content grows.
   useScrollMemory(bodyRef, viewKey ? contentScrollKey(viewKey) : null, { resetOnEmpty: true });
 
-  // Every content-pane navigation fades its view in from behind an opaque theme
-  // surface, the same crossfade an app open has had since `.app-ui-cover`. What
-  // it buys generically is what it bought there: the swap frame is never seen.
-  // A view switch unmounts the old subtree, mounts a lazy chunk that may not
-  // have arrived, restores a remembered scrollTop and lets the new view's own
-  // skeleton settle, and all of that used to hard-cut in front of the user.
-  //
-  // A COVER rather than a fade on the content itself, for the reason
-  // AppUiInline.test.ts spells out: half the views in this pane host an iframe
-  // (app UI, file / url / repo previews), and a frame WebKit has to
-  // re-composite up from transparent is the shape of the iOS paint-loss bugs
-  // this pane keeps hitting. The cover is a sibling with its own layer, so no
-  // view's own compositing is touched, and it uncovers whatever the view has
-  // painted rather than waiting on it. Nothing here delays content by a frame.
-  //
-  // A keyed element replaying a CSS ANIMATION, not a mounted element
-  // transitioning a class: a transition needs the opaque state to reach the
-  // screen before the clearing class lands, which from a Preact commit is a
-  // double-rAF dance that silently degrades to a hard cut when it loses the
-  // race. A fresh element's animation starts from its own first frame, always.
-  const [coverKey, setCoverKey] = useState<string | null>(null);
-  const coveredKeyRef = useRef(viewKey);
+  // The content half of the navigation mark: a view swap is a navigation
+  // whether or not anything arrives to be covered. The first render is not one.
+  const reportedKeyRef = useRef(viewKey);
   useLayoutEffect(() => {
-    if (coveredKeyRef.current === viewKey) return;
-    coveredKeyRef.current = viewKey;
-    // The content half of the navigation mark, ahead of the cover's own
-    // branches: a view swap is a navigation whether or not anything arrives to
-    // be covered. This effect is already the content-pane navigation edge.
+    if (reportedKeyRef.current === viewKey) return;
+    reportedKeyRef.current = viewKey;
     reportNavigation('content-view', viewKey);
-    // Navigating to nothing (the pane emptying as a thread takes over) has no
-    // arriving view, so there is nothing to cover.
-    if (viewKey === null) { setCoverKey(null); return; }
-    setCoverKey(viewKey);
-    const fuse = setTimeout(() => setCoverKey(null), scaledDurationMs(NAV_COVER_ANIM_MS) + NAV_COVER_SLACK_MS);
-    return () => clearTimeout(fuse);
   }, [viewKey]);
 
   // WebKit paint loss (see utils/webkitRepaint.ts for the mechanism), reported
@@ -246,13 +208,8 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
       </div>
       {/* Outside `.content-pane-body`, so it covers the pane's viewport rather
           than scrolling away with the body's content, and so a remembered
-          scrollTop being restored underneath it stays hidden. Keyed on the view
-          it is covering: a navigation arriving mid-fade replaces the element
-          and restarts the animation from opaque, instead of inheriting the
-          outgoing one's progress. */}
-      {coverKey !== null && (
-        <div key={coverKey} class="content-nav-cover" aria-hidden="true" />
-      )}
+          scrollTop being restored underneath it stays hidden. */}
+      <NavigationCover viewKey={viewKey} />
     </div>
   );
 }

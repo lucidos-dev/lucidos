@@ -59,9 +59,11 @@ function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
               aria-hidden={!renaming}
               onInput={(e) => setDraft((e.currentTarget as HTMLInputElement).value)}
               onBlur={renaming ? commit : undefined}
+              // The blur commits, so the central Escape policy must not blur it.
+              data-escape-self
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void commit();
-                else if (e.key === 'Escape') cancel();
+                else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
               }}
             />
           )}

@@ -1164,6 +1164,36 @@ describe('linkifyPaths', () => {
   });
 });
 
+describe('linkifyPaths bare file URLs', () => {
+  beforeEach(() => _resetLinkifyCacheForTesting());
+
+  it('links a bare file:// URL in prose, like a bare https URL', () => {
+    const out = linkifyPaths('<p>DMG: file:///Users/me/p/Lucidos.dmg</p>', [], []);
+    expect(out).toContain('<a href="file:///Users/me/p/Lucidos.dmg"');
+    expect(extractLocalFileTarget('file:///Users/me/p/Lucidos.dmg')).toBe('file:///Users/me/p/Lucidos.dmg');
+  });
+
+  it.each([
+    ['Open file:///tmp/report.pdf.', 'file:///tmp/report.pdf'],
+    ['See https://example.com/a, then', 'https://example.com/a'],
+    ['Is it file:///tmp/a.dmg?', 'file:///tmp/a.dmg'],
+  ])('leaves sentence punctuation out of the link in %s', (text, href) => {
+    const out = linkifyPaths(`<p>${text}</p>`, [], []);
+    expect(out).toContain(`<a href="${href}"`);
+  });
+
+  it('never links a file:// URL inside code', () => {
+    const out = linkifyPaths('<p><code>file:///Users/me/p/Lucidos.dmg</code></p>', [], []);
+    expect(out).not.toContain('<a ');
+  });
+
+  it('keeps a workspace path inside a file:// URL part of that URL', () => {
+    const out = linkifyPaths('<p>file:///Users/me/ws/data/artifacts/notes.md</p>', [], []);
+    expect(out).not.toContain('artifact-link');
+    expect(out).toContain('<a href="file:///Users/me/ws/data/artifacts/notes.md"');
+  });
+});
+
 describe('linkifyPaths caching', () => {
   beforeEach(() => _resetLinkifyCacheForTesting());
 

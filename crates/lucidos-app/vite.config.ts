@@ -6,6 +6,8 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { previewAuthGate, previewGatewayFromEnv, previewProxy } from './vite/frontendPreviewGateway';
 import { askGatewaySession } from './vite/gatewaySession';
+import { entryChunkBudget } from './vite/entryChunkBudget';
+import { shellChunkPreload } from './vite/shellChunkPreload';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -107,7 +109,7 @@ function buildIdVirtualModule(): Plugin {
  *  - dist/sw.js — folded into the cache name, so every rebuild is a
  *    byte-different sw.js. That byte difference is what the browser's
  *    service-worker update check detects, firing the client's "New version
- *    available → Refresh" toast (hooks/useStartup.ts). Without it a rebuild
+ *    available → Refresh" toast (store/startup.ts). Without it a rebuild
  *    produces an identical sw.js and the toast never fires.
  *  - the emitted app JS — the `virtual:build-id` module's `CLIENT_BUILD_ID`, so
  *    the running code carries its own build id and can compare it against the
@@ -299,18 +301,16 @@ export default defineConfig({
       ? [previewAuthGate(previewGateway, (cookie) => askGatewaySession(previewGateway, cookie))]
       : []),
     buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
-    stampServiceWorker(), preact(), atomicDistPublish(),
+    stampServiceWorker(), preact(), entryChunkBudget(), shellChunkPreload(), atomicDistPublish(),
   ],
   build: {
-    // The eager entry chunk is the first-paint-critical app core: shell, store,
-    // event handling, signals, layout. Views are lazy-loaded and the heavy libs
-    // are split out below, so the remaining core is irreducible without
-    // lazy-loading first-paint code. Rollup's 500 kB default advisory is too
-    // conservative for it.
+    // The entry chunk is the data layer and startup: store, actions, event
+    // stream, API client. The UI is the shell chunk, which loads beside it
+    // under the boot splash, and views load on demand (ADR 0288).
     //
-    // 600 is a CEILING, not a budget to spend. When it fires, code-split the
-    // next thing the eager graph does not need on first paint, rather than
-    // raising the number.
+    // 600 is a CEILING, not a budget to spend. `entryChunkBudget` fails the
+    // build when the entry chunk passes it. Then move the next thing the first
+    // frame does not need behind a dynamic import, rather than raising it.
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {

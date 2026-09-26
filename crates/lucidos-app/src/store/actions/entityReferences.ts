@@ -33,7 +33,7 @@ export const NAV_KEY = 'lucidos-nav-history';
  *  brief race between that swap and this probe: fire one immediate probe (it
  *  usually wins — the in-process rebuild beats the SSE→browser→`/health`
  *  round-trip) plus one short delayed re-check for the loser case. The 5s
- *  connection poll (`useStartup.ts` → `checkConnection`) is the guaranteed
+ *  connection poll (`startup.ts` → `checkConnection`) is the guaranteed
  *  backstop, so first-run provider onboarding clears (or reappears on the last
  *  credential's removal) WITHOUT a manual page refresh.
  *

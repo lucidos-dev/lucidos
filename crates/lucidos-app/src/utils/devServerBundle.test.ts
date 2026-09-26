@@ -54,7 +54,7 @@ describe('service-worker registration is gated on the dev-server check', () => {
 
   it('finds the registration sites it expects, so the scan is not vacuous', () => {
     const names = registrars.map((f) => relative(SRC, f)).sort();
-    expect(names).toEqual(['hooks/useStartup.ts', 'store/actions/push.ts']);
+    expect(names).toEqual(['store/actions/push.ts', 'store/startup.ts']);
   });
 
   it('every file that registers a service worker consults isDevServerBundle', () => {

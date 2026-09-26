@@ -18,7 +18,7 @@ import { API, json as apiJson, retryTransientRead } from '../../api/client';
 
 // Shared in-flight load so concurrent callers await the SAME fetch instead of
 // racing duplicate GETs: the compose destination picker's render-path kick-off
-// and useStartup's eager load both fire on a cold start. An early `return`
+// and startClient's eager load both fire on a cold start. An early `return`
 // would resolve immediately while the real fetch is still in flight, so an
 // `await loadRepositories()` caller (loadChangeContext, viewThreadCcDiff) would
 // then read a still-'loading' Loadable — hence sharing the promise, not skipping.

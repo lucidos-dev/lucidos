@@ -3,15 +3,15 @@ import {
   notificationsHasMore,
   viewingNotification,
   appsList,
-  showToast,
 } from '../../store/store';
-import { openApp, openAppById } from '../../store/actions/apps';
+import { openApp } from '../../store/actions/apps';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { navigateAdjacentNotification } from '../../store/actions/notifications';
 import { discussNotification } from '../../store/actions/notification-discuss';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { composeHandlers } from '../chat/promptFocus';
+import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
@@ -93,41 +93,14 @@ export function NotificationDetailInline() {
     if (!triggerId) return;
     // navigateToTrigger re-fetches the trigger list on a cache miss before
     // concluding the trigger is gone, and names this notification as the origin
-    // in that toast. Mirrors handleBodyClick's openAppById call.
+    // in that toast.
     void navigateToTrigger(triggerId, 'a notification');
   }
 
+  // The same router the transcript uses, so every link kind an agent writes
+  // opens here too: artifacts, files on disk, panels, apps and triggers.
   function handleBodyClick(e: MouseEvent) {
-    const target = e.target as HTMLElement;
-    // A `[name](trigger:<id>)` the agent wrote into the notification body. Same
-    // destination as the Open trigger button above, so the same call.
-    const triggerLink = target.closest<HTMLAnchorElement>('a.trigger-link');
-    if (triggerLink) {
-      e.preventDefault();
-      const linkedTriggerId = triggerLink.dataset.triggerId;
-      if (!linkedTriggerId) {
-        showToast('Cannot open trigger link: the link is missing its trigger id', 'error');
-        return;
-      }
-      void navigateToTrigger(linkedTriggerId, 'a notification');
-      return;
-    }
-    const link = target.closest<HTMLAnchorElement>('a.app-link');
-    if (!link) return;
-    e.preventDefault();
-    const appId = link.dataset.appId;
-    if (!appId) {
-      showToast('Cannot open app link: the link is missing its app id', 'error');
-      return;
-    }
-    // Route through openAppById, NOT a `apps.find(...)` on the cached list:
-    // openAppById re-scans disk on a cache miss before concluding the app is
-    // gone, so a link to an app written by a hint-less channel (run_bash /
-    // run_python) — which the cached appsList may lag on — still opens instead
-    // of falsely toasting "Unknown app". It also names the id + origin on a
-    // genuine miss. `data-app-fragment` is the app fragment the link named,
-    // absent when it named none.
-    void openAppById(appId, 'a notification', link.dataset.appFragment);
+    handleMarkdownLinkClick(e, apps, 'a notification');
   }
 
   return (

@@ -9,7 +9,7 @@
 // of view is a real cross-document navigation: the iframe loads the whole
 // Lucidos app shell into the content pane. The same is true of every relative
 // path in the document. The host's global `.thread-link` click handler
-// (`useStartup`) cannot help, because the click happens in a different document
+// (`startClient`) cannot help, because the click happens in a different document
 // and never reaches the host `document`.
 //
 // Preview iframes are SAME-ORIGIN (`about:srcdoc` inherits the host origin), so

@@ -1,5 +1,43 @@
-import { describe, it, expect } from 'vitest';
-import { formatAgoPhrase, formatDurationPhrase, formatElapsed } from './formatTime';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { formatAgoPhrase, formatDateTime, formatDurationPhrase, formatElapsed, formatMessageTimestamp } from './formatTime';
+import { preferences } from '../store/store';
+
+/** Every drawer row renders a created-at stamp, and a landed archive page
+ *  re-renders every row. Building an `Intl` formatter costs about 100µs, so a
+ *  formatter per call makes each page cost grow with the rows loaded. */
+describe('formatMessageTimestamp', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  it('reuses its formatters across calls', () => {
+    preferences.value = { status: 'loaded', data: { timezone: 'Europe/Oslo' } };
+    formatMessageTimestamp('2026-05-05T09:02:09Z');
+    // `toLocale*String` builds a formatter internally, out of the spy's sight.
+    const construct = vi.spyOn(Intl, 'DateTimeFormat');
+    const localeTime = vi.spyOn(Date.prototype, 'toLocaleTimeString');
+    const localeDate = vi.spyOn(Date.prototype, 'toLocaleDateString');
+    for (let i = 0; i < 50; i++) formatMessageTimestamp('2026-05-05T09:02:09Z');
+    expect(construct).not.toHaveBeenCalled();
+    expect(localeTime).not.toHaveBeenCalled();
+    expect(localeDate).not.toHaveBeenCalled();
+  });
+
+  it('reads "Invalid Date" for a malformed stamp rather than throwing', () => {
+    // `toLocaleString` returned this string, while a cached formatter's
+    // `format` throws, which would take down the row rendering the stamp.
+    expect(formatMessageTimestamp('not a date')).toBe('Invalid Date Invalid Date');
+    expect(formatDateTime(new Date(Number.NaN))).toBe('Invalid Date');
+  });
+
+  it('follows a change of timezone preference', () => {
+    preferences.value = { status: 'loaded', data: { timezone: 'Europe/Oslo' } };
+    expect(formatMessageTimestamp('2026-05-05T09:02:09Z')).toMatch(/11:02:09$/);
+    preferences.value = { status: 'loaded', data: { timezone: 'UTC' } };
+    expect(formatMessageTimestamp('2026-05-05T09:02:09Z')).toMatch(/09:02:09$/);
+  });
+});
 
 /** The status toast's build timer is redrawn once a second, so the boundaries
  *  matter: a counter that skips a value, or renders a negative one, is read as a

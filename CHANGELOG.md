@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.40.1 — 2026-09-26
+
+### Changed
+
+- The app shows its first screen sooner. It loads the core UI first, then fetches menus and panels in the background once the splash lifts.
+- The thread drawer switches between Threads and Filters with the same crossfade as the content pane, and each pane's title arrives with its view.
+- The thread filter panel and the thread list behind it fade in and out.
+- The thread filter's checkbox rows have no hover band.
+- The control that folds a turn shows a minus inside a circle, and a plus to unfold it. The full-response toggle shows two speech bubbles, and the step-log glyph has three equal lines.
+- The thread drawer loads deep archive pages much faster on a phone.
+
+### Fixed
+
+- An app can no longer read the Web Push signing key or other engine bookkeeping from preferences.
+- An app can no longer change the local model base URL, and the local model key goes only to the host its credential covers.
+- An app can no longer set the coding-agent program paths or the coding-agent permission mode.
+- Saving a new local model base URL in Settings keeps the saved key working with it.
+- Local model chat keeps its key after an upgrade from an older workspace.
+- A reply that hits a network error after text has appeared no longer streams twice.
+- A Codex prompt that starts with a dash no longer fails the turn.
+- An MCP server id that ends in an underscore is refused, since its tools could not run.
+- Artifact and file links in a notification open when you tap them.
+- A bare `file://` URL in a message becomes a link. A path segment that looks like an email address stays plain text, and sentence punctuation stays out of a link.
+- Pressing a turn control keeps the chat where it was, even when the new render lands late or WebKit nudges the page.
+- A menu or panel that is still loading closes on a second press or a press outside it, and it never opens after its load failed.
+- The thread filter panel stays open when you collapse the drawer, and it takes no input while the drawer is collapsed.
+- A closed filter panel no longer draws a scrollbar over the thread list.
+- A drawer section's count grows smoothly from its baseline when the section opens, and it stays sharp in Chromium.
+- The sub-thread link in the drawer stays on one line.
+- A thread you archive finishes its exit from the drawer, even when another thread changes section at the same moment. A row that comes back, as after a refused archive, never shows beside its leaving copy.
+- Escape cancels an edit in the device name, trigger group rename, marketplace rename and new-group fields. It no longer saves the edit, and it no longer closes the trigger form around it.
+- One Escape in a field no longer also closes the open inline form.
+- A malformed slides deck shows an error instead of a blank app.
+- Renaming a thread cannot rename a different thread after you navigate away.
+- The workspace picker keeps a failed action's error on screen.
+- Disk Usage retries a failed read, and a failed Cancel Update says so.
+- The thread drawer no longer skips older archived threads when a draft sits on an archived thread.
+- A malformed timestamp shows "Invalid Date" and no longer breaks the row.
+- On a phone, a turn's status stays on the header line beside its controls when the timestamp wraps.
 ## v0.40.0 — 2026-09-25
 
 ### Added

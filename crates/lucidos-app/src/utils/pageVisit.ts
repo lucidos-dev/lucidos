@@ -7,7 +7,7 @@
  *
  *  ── Paired, not throttled ───────────────────────────────────────────────────
  *  The coalescing here is a STATE PAIRING (a hide arms the next wake, and only a
- *  wake disarms it), not a time window. `useStartup` throttles the same event
+ *  wake disarms it), not a time window. `startClient` throttles the same event
  *  set on a leading-edge gate and is right to: its work is a reconciliation
  *  fan-out that is wanted whenever the app is brought forward, so approximating
  *  "one wake" with a window costs nothing. The consumers here need the opposite

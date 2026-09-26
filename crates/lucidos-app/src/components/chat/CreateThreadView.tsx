@@ -13,15 +13,17 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll } from './scrollState';
+import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
 import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
-import { forceWebKitRepaint } from '../../utils/webkitRepaint';
+import { forceWebKitRepaint, settledScrollTop } from '../../utils/webkitRepaint';
 import { opensSoftwareKeyboard } from '../../utils/dom';
+import { nowMs } from '../../utils/scrollActivity';
 
 /** First line of a change's description and its file count, keyed by change_id.
  *  Harvested from the `ChangeProposed` events riding a thread's coding-agent
@@ -401,13 +403,6 @@ function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
  * sticky. Full account, and what the ranking cost:
  * docs/plans/2026-08-28-a-turn-control-holds-what-you-pressed.md
  */
-/** The correction to write, snapped to a whole pixel because that is all a
- *  scroll offset can hold. The tween deliberately does the opposite, and both
- *  measurements are in ADR 0078. */
-function reachableScrollTop(target: number): number {
-  return Math.round(target);
-}
-
 /** How many frames the correction may re-assert while the transcript settles.
  *
  *  WebKit does not settle a large reveal inside the frame its mutation commits,
@@ -463,15 +458,24 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   const offsetBefore = contentOffsetTop(container, held);
   const scrollBefore = container.scrollTop;
   const overflowBefore = container.style.overflow;
+  const pressedAt = nowMs();
   let restored = false;
 
   // Freeze: prevent browser from adjusting scroll during DOM changes.
   container.style.overflow = 'hidden';
+  // The freeze can move the anchor by itself. WebKit drops the scrollbar gutter
+  // under `overflow: hidden`, which rewraps every line. So the synchronous
+  // check below compares against this frozen reading, never `offsetBefore`.
+  const offsetFrozen = contentOffsetTop(container, held);
 
   const restore = () => {
     if (restored) return;
     restored = true;
     observer.disconnect();
+    // Unfrozen BEFORE anything is measured, so `targetNow` reads the layout
+    // `offsetBefore` was taken in. Measured frozen, the gutter reflow lands in
+    // the correction as a jump of several pixels.
+    container.style.overflow = overflowBefore;
 
     // Did the anchor survive the mutation? A detached element does not say so by
     // measuring nothing: it answers an all-zero rect, which reads as content
@@ -484,31 +488,23 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // Where the correction wants the container, read from the layout the
     // mutation left. One definition, because the next-frame re-check has to ask
     // the same question a frame later.
-    const targetNow = (): number => {
+    //
+    // The spacer is subtracted because it sits above the anchor and is ours to
+    // rewrite: the correction carries its sub-pixel rest there (ADR 0286).
+    const targetNow = (): { scrollTop: number; spacer: number } => {
       const offset = contentOffsetTop(container, held);
-      return reachableScrollTop(scrollBefore + (offset - offsetBefore));
+      return splitAnchorCorrection(scrollBefore + (offset - anchorSpacer(container) - offsetBefore));
     };
     // What the write carries. A press whose anchor left the DOM writes the
     // offset the container already holds, so the MARK is the whole of it and
-    // nobody moves. See the try block below for why the mark is owed anyway.
-    const wanted = anchored ? targetNow() : container.scrollTop;
-    // The unfreeze is the one step that MUST happen, so it goes in a `finally`.
-    // `restored` is already true and the observer already gone, so the rAF
-    // safety net below cannot lift the freeze a second time: a throw between
-    // here and the unfreeze would leave the transcript unscrollable until a
-    // reload. `markAnchorScroll` fans out to subscribers, which is the first
-    // extensible call inside the freeze. The throw still propagates, since a
-    // subscriber failing silently is its own bug (`frontend.md`).
-    //
+    // nobody moves. The mark is owed anyway, see below.
+    const wanted = anchored ? targetNow() : { scrollTop: container.scrollTop, spacer: anchorSpacer(container) };
     // Every press gets the mark, whether or not it moves the reader. The mark is
     // what stands the growth round's own edge write down (`keepTheLiveEdge`)
     // and what re-bases the mobile header. Declining to correct is still the app
     // deciding the reader stays put.
-    try {
-      markAnchorScroll(container, wanted);
-    } finally {
-      container.style.overflow = overflowBefore;
-    }
+    setAnchorSpacer(container, wanted.spacer);
+    markAnchorScroll(container, wanted.scrollTop);
 
     // The overflow freeze plus a large DOM shrink can leave iOS WKWebView
     // showing a blanked layer texture. The whole `.thread-content` renders
@@ -531,22 +527,25 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // clamp moves the reader there as readily as anywhere else.
     if (anchored) {
       let framesLeft = ANCHOR_SETTLE_FRAMES;
-      // Where the correction left the container, re-read after each write so a
-      // clamp counts as ours. It is the whole reader-took-over test below.
-      let leftAt = container.scrollTop;
       const reassert = () => {
         if (!held.isConnected || isOtherNavigationScroll(container)) return;
-        // THE READER ENDS IT. The container anywhere but where we left it is
-        // somebody else's scroll, and a press must never fight a flick made a
-        // moment after it. A content shrink clamping the offset reads the same
-        // way, which costs that press its re-assert and moves nobody.
-        if (Math.abs(container.scrollTop - leftAt) > 1) return;
+        // THE READER ENDS IT, and only a gesture made since the press says so.
+        // A press must never fight a flick made a moment after it.
+        //
+        // Not "the container moved since our write". A render landing after
+        // the correction clamps the offset against the shrunk content, which
+        // moves it with nobody scrolling. Read as the reader, that clamp left
+        // them at the bottom of the thread (WebKit, which has no scroll anchoring).
+        if (readerGestureSince(container, pressedAt)) return;
         const target = targetNow();
-        if (Math.abs(container.scrollTop - target) > 1) {
-          markAnchorScroll(container, target);
+        setAnchorSpacer(container, target.spacer);
+        // Discounts the WebKit repaint nudge. It lands in the same frame as the
+        // first re-assert, 1px off under a compensating transform. Writing that
+        // pixel back mid-nudge showed the transcript 1px off.
+        if (settledScrollTop(container) !== target.scrollTop) {
+          markAnchorScroll(container, target.scrollTop);
           honourAnchoredMutation(container);
         }
-        leftAt = container.scrollTop;
         if (--framesLeft <= 0) return;
         requestAnimationFrame(reassert);
       };
@@ -560,7 +559,7 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   fn();
 
   // Synchronous check, for a `fn` that changed the DOM before returning.
-  if (!restored && contentOffsetTop(container, held) !== offsetBefore) restore();
+  if (!restored && contentOffsetTop(container, held) !== offsetFrozen) restore();
 
   // After Preact's Promise microtask render
   queueMicrotask(() => queueMicrotask(restore));

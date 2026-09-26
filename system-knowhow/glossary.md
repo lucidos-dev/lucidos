@@ -727,7 +727,7 @@ On desktop the toggle rests in the header's top-left corner whether the thread d
 
 Filter shows as pressed only while the thread filter is open. Its icon says what the list shows: a status's own icon, an outline funnel for all threads, and a filled funnel while thread types narrow it. Filter draws a funnel shape, never lines, so on a phone you cannot mistake it for the list icon.
 
-Filter, its badge, the header title and the thread filter change together with one quick fade. The thread filter's background covers the list at once, and its options fade in over it. With motion reduced, every change is instant.
+Filter, its badge, the header title and the thread filter change together with one quick fade. Whichever view arrives, the thread filter or the thread list, fades in, and the one leaving goes at once. With motion reduced, every change is instant.
 See also: *Conversation*, *thread pane*, *content pane*, *Current section*.
 
 ### Thread pane

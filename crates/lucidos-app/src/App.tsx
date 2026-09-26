@@ -20,7 +20,6 @@ import { DrawerDivider } from './components/layout/DrawerDivider';
 import { DropZone } from './components/files/DropZone';
 import { UiBlockingOverlay } from './components/layout/UiBlockingOverlay';
 import { Toast } from './components/shared/Toast';
-import { useStartup } from './hooks/useStartup';
 import { useBootSplashReady } from './hooks/useBootSplashReady';
 import { useTooltip } from './hooks/useTooltip';
 import { useScrollLock } from './hooks/useScrollLock';
@@ -83,7 +82,6 @@ function FileSearchModalSlot()   { return fileSearchEverOpen.value      ? <FileS
 function SearchEverywhereSlot()  { return searchEverywhereEverOpen.value ? <SearchEverywhere /> : null; }
 
 export function App() {
-  useStartup();
   useBootSplashReady();
   useTooltip();
   useScrollLock();

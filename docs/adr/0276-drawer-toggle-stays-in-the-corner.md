@@ -35,11 +35,16 @@ narrow it. While the panel is open the badge drops. It no longer turns into an X
 
 Filter draws a funnel shape, never a stack of lines.
 
+*Superseded in part 2026-09-26, for the panel and the pane title (ADR 0287):
+they now move like a page navigation. The button's fades below still hold.*
+
 Every state change of Filter fades, on one timing, `--duration-fast`: the
 glyph, its badge, the pressed highlight, the pane title and the filter panel.
-The glyph and the title crossfade. The panel fades THROUGH: its opaque cover
-lands at once and its options fade in over it, and on close the options fade
-out before the cover goes. Nothing scales, bounces or slides.
+The glyph and the title crossfade. The panel fades THROUGH the pane
+background: the arriving view fades in and the leaving one goes at once, both
+ways. Opening hides the list and fades the cover in with its options. Closing
+hides the options and fades the cover out over the list. Nothing scales,
+bounces or slides.
 
 ## Rationale
 
@@ -93,9 +98,9 @@ slides.
 Every fade runs on an element that already exists when the state changes.
 WebKit can start an animation on a freshly mounted element a frame late, and
 that frame would split the fades apart. So the glyph keeps all six shapes
-mounted, the badge stays mounted while hidden, and the panel's cover is always
-there. The panel's options stay mounted for the exit, and the open signal
-still drives Escape, the overlay stack and the pressed state at once.
+mounted, the badge stays mounted while hidden, and the panel's cover and
+options are always there. The open signal still drives Escape, the overlay
+stack and the pressed state at once.
 
 The header paints resting icons in a translucent white. Two translucent shapes
 stacked mid-crossfade paint their overlap twice, which is the bright rim the
@@ -123,9 +128,9 @@ translucency, and the shapes inside paint opaque.
   reduced. Its pressed highlight moved from `--duration-normal` to that timing.
 - The pane title's box is as wide as "Threads" or "Filters", whichever is
   wider, so the centred title no longer shifts when it swaps.
-- The panel's box is `.thread-filter-cover`, always mounted, and
-  `.thread-filter-panel` mounts inside it. A test that reads the panel right
-  after a close must wait for the fade out.
+- The panel's box is `.thread-filter-cover`, and `.thread-filter-panel`
+  inside it is always mounted. A closed panel is hidden, not gone, so a test
+  asserts it is hidden rather than counting it.
 
 ## Alternatives considered
 

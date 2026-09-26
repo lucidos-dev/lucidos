@@ -274,6 +274,12 @@ function WorktreeRowView({
   );
 }
 
+/** Whether opening the page owes a read. A failed read counts: the signals are
+ *  module-level, so a one-off failure would otherwise stick until a reload. */
+export function diskUsageLoadOwed(loadable: Loadable<unknown>): boolean {
+  return loadable.status === 'not-loaded' || loadable.status === 'failed';
+}
+
 export function DiskUsagePage() {
   const loadable = inventory.value;
   const summaryLoadable = summary.value;
@@ -281,15 +287,15 @@ export function DiskUsagePage() {
   const showSummarySpinner = useDelayedLoading(summaryLoadable);
 
   useEffect(() => {
-    if (loadable.status === 'not-loaded') void loadInventory();
-    if (summaryLoadable.status === 'not-loaded') void loadSummary();
+    if (diskUsageLoadOwed(loadable)) void loadInventory();
+    if (diskUsageLoadOwed(summaryLoadable)) void loadSummary();
   }, []);
 
   if (loadable.status === 'failed') {
     return (
       <div class="settings-section">
         <div class="list-rows">
-          <LoadableError noun="disk usage" error={loadable.error} />
+          <LoadableError noun="disk usage" error={loadable.error} onRetry={() => void loadInventory()} />
         </div>
       </div>
     );

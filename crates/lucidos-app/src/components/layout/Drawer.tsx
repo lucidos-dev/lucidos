@@ -1,4 +1,3 @@
-import { signal } from '@preact/signals';
 import { useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
@@ -8,56 +7,18 @@ import { inAppBrowserAvailable } from '../../store/actions/preferences';
 import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
-import { isMobile } from '../../utils/viewport';
 import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
+import { drawerAnchor, drawerClosing, drawerOpen, drawerSide, forceCloseDrawer } from './drawerState';
 
 /** The rows this drawer lists in order. Not every menu item: Changes and
  *  Settings are rendered below with a badge of their own, and Notifications is
  *  reached from the bell rather than from here. */
 const menuItems: MenuItem[] = ['files', 'apps', 'plugins', 'triggers'];
-
-export const drawerOpen = signal(false);
-export const drawerClosing = signal(false);
-/** Hamburger button that opened the drawer. Several `.hamburger-panel` buttons
- *  exist (a per-layout copy, plus one per mobile pane header); only the one the
- *  user actually pressed fires openDrawer(), so this captures the right element
- *  for the dismiss hook's anchor exemption. */
-export const drawerAnchor = signal<HTMLElement | null>(null);
-
-export type DrawerSide = 'left' | 'right';
-
-/** Which edge the drawer slides out from. */
-export const drawerSide = signal<DrawerSide>('left');
-
-/** The drawer emerges from under the button that opened it: the mobile thread
- *  pane header keeps its hamburger at the row's trailing edge (mirroring the
- *  thread drawer toggle at the leading edge), and a panel sliding in from the
- *  far side of the screen would read as unrelated to the tap.
- *
- *  Desktop is always `left`: its single hamburger sits at the content pane's
- *  leading edge and the panel is positioned to emerge from the split divider,
- *  not from a viewport edge, so the anchor's absolute x says nothing useful
- *  there. Pure so the rule is testable without a DOM. */
-export function drawerSideFor(anchorCenterX: number, viewportWidth: number, mobile: boolean): DrawerSide {
-  if (!mobile) return 'left';
-  return anchorCenterX > viewportWidth / 2 ? 'right' : 'left';
-}
-
-/** Open the drawer, resetting any stuck closing state */
-export function openDrawer(anchor?: HTMLElement) {
-  drawerClosing.value = false;
-  drawerOpen.value = true;
-  if (anchor) {
-    drawerAnchor.value = anchor;
-    const rect = anchor.getBoundingClientRect();
-    drawerSide.value = drawerSideFor(rect.left + rect.width / 2, window.innerWidth, isMobile());
-  }
-}
 
 /** Close the drawer. Returns `false` when it is already closed or closing, so
  *  the dismiss hook keeps the paired click un-swallowed. `drawerOpen` normally
@@ -89,12 +50,6 @@ const DRAWER_SLIDE_OUT_MS = 200;
 const DRAWER_SLIDE_OUT_SLACK_MS = 100;
 /** Bumped per close, so a stale fallback cannot cut a later close short. */
 let closeGeneration = 0;
-
-/** Immediately close the drawer without animation (e.g. pane switching). */
-export function forceCloseDrawer() {
-  drawerOpen.value = false;
-  drawerClosing.value = false;
-}
 
 interface PinnedUi {
   appId: string;

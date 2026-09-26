@@ -6,6 +6,8 @@ import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
 import { previewFileName } from '../../utils/previewPath';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
+import { contentViewKey } from './contentViewKey';
+import { useArrivalFade } from '../shared/NavigationCover';
 
 export const CHANNEL_OPTIONS: { value: ThreadChannel; label: string }[] = [
   { value: 'chat', label: formatChannel('chat') },
@@ -97,6 +99,14 @@ function contentTitle(short: boolean): string {
     return settingsLabel(settingsSubview.value) || '';
   }
   return MENU_ITEM_LABELS[active] || '';
+}
+
+/** The content title's identity and its arrival fade, on both layouts. Keyed on
+ *  the pane's own view key, so the title fades in with the navigation cover
+ *  ContentPane mounts on the same key. Key the title element on `titleKey`. */
+export function useContentTitleArrival(): { titleKey: string | null; titleFade: string } {
+  const titleKey = contentViewKey(activeMenuItem.value, panelOverlay.value, settingsSubview.value);
+  return { titleKey, titleFade: useArrivalFade(titleKey) };
 }
 
 /** The full title, for every surface with room for it: the tap-tooltip on the

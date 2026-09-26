@@ -7,7 +7,7 @@ import { appliedThreadFilter } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
-import { threadFilterPanelOpen, closeThreadFilterPanel } from '../../store/threadFilterPanel';
+import { threadFilterPanelOpen, setThreadFilterPaneVisible } from '../../store/threadFilterPanel';
 import { ThreadFilterCover } from './ThreadFilterCover';
 import { focusPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
@@ -450,20 +450,12 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         highlightedKey.value = null;
     }, [activeView]);
 
-    // The filter panel is a view OF this pane, so it cannot outlive the pane
-    // being visible. Its open state is a signal and it holds an Escape-registry
-    // entry. A drawer closed with the panel up would leave an invisible surface
-    // eating the next Escape. Reopening would then land on the filter rather
-    // than the list. Mobile passes `forceVisible`, so this never fires there:
-    // the threads pane keeps whichever view it was showing, as every other pane
-    // does.
-    //
-    // It runs at mount too, which is what keeps the panel's persisted open state
-    // honest across a reload: booting with the drawer closed clears it, so the
-    // stored "showing filters" can only ever be a drawer that was visible with
-    // the panel up.
+    // The filter panel is a view OF this pane and keeps its open state through
+    // a collapse, as the drawer's other views do. Only its Escape entry follows
+    // visibility, so a hidden panel never eats the next Escape. Runs at mount
+    // too, for a boot with the drawer collapsed.
     useEffect(() => {
-        if (!visible) closeThreadFilterPanel();
+        setThreadFilterPaneVisible(visible);
     }, [visible]);
 
     return (
@@ -504,7 +496,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
                 loaded window was actually fetched against, so an unmounted list
                 reloads on its next mount. Which is what makes the four STATUS
                 views safe, since those really do replace this list. */}
-            <ThreadFilterCover />
+            <ThreadFilterCover paneVisible={visible} />
         </div>
     );
 }
@@ -936,7 +928,10 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
              aria-selected={highlighted}
              aria-expanded={!collapsed}>
             <DrawerSectionHeader Icon={Icon} title={title} hasRunning={hasRunning} />
-            <span class="section-count-badge">{count}</span>
+            <span class="section-count">
+                <span class="section-count-badge">{count}</span>
+                <span class="section-count-open">{count}</span>
+            </span>
         </div>
     );
 }

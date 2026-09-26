@@ -157,7 +157,7 @@ describe('the click and the cursor cover the same images', () => {
   });
 
   it('is delegated from the one global click handler', () => {
-    const startup = read('../../hooks/useStartup.ts');
+    const startup = read('../startup.ts');
     expect(startup).toContain('inlineMarkdownImage(target)');
     expect(startup).toContain('openImagePopupFromGroup(inlineImage.src, inlineImage)');
   });

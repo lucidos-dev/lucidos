@@ -1,5 +1,7 @@
 import { useRef } from 'preact/hooks';
 import { CrossfadeStack } from '../shared/CrossfadeStack';
+import { useArrivalFade } from '../shared/NavigationCover';
+import { drawerViewKey } from '../drawer/ThreadFilterCover';
 import { FILTER_BUTTON_GLYPHS, filterButtonState, type FilterGlyph } from './ThreadFilterPanel';
 import { threadFilterPanelOpen, toggleThreadFilterPanel } from '../../store/threadFilterPanel';
 import { threadFilterActive } from '../../store/threadFilterActive';
@@ -8,12 +10,7 @@ import { drawerView, attentionThreadCount } from '../../store/store';
 /** The glyph layers never change, so they are built once. */
 const GLYPH_LAYERS = Object.entries(FILTER_BUTTON_GLYPHS).map(([key, Icon]) => ({ key, node: <Icon /> }));
 
-/** The threads-pane title's two words, which crossfade as the filter panel
- *  opens and closes. */
-export const THREADS_TITLE_LAYERS = [
-  { key: 'threads', node: 'Threads' },
-  { key: 'filters', node: 'Filters' },
-] as const;
+const THREADS_TITLES = { threads: 'Threads', filters: 'Filters' } as const;
 
 /** The Filter button's glyph: every glyph it can wear, crossfading to `glyph`.
  *
@@ -75,13 +72,10 @@ export function ThreadFilterButton({ class: extraClass, tooltip }: { class?: str
 
 /** The threads-pane title, on both layouts. It says what the pane shows: the
  *  list, or the filter panel covering it, which carries no title row of its
- *  own. Just "Filters": the pane is already the Threads pane. */
+ *  own. Just "Filters": the pane is already the Threads pane. It arrives with
+ *  the drawer's navigation cover, on the same key (`ThreadFilterCover`). */
 export function ThreadsPaneTitle({ class: className }: { class: string }) {
-  return (
-    <CrossfadeStack
-      class={className}
-      layers={THREADS_TITLE_LAYERS}
-      current={threadFilterPanelOpen.value ? 'filters' : 'threads'}
-    />
-  );
+  const view = drawerViewKey(threadFilterPanelOpen.value);
+  const fade = useArrivalFade(view);
+  return <span key={view} class={`${className}${fade}`}>{THREADS_TITLES[view]}</span>;
 }

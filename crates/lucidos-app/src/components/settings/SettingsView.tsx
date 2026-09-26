@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
 import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
@@ -215,9 +215,13 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
   const inputRef = useCallback((el: HTMLInputElement | null) => {
     if (el) { el.focus(); el.select(); }
   }, []);
+  // Closing the field unmounts it, and that fires a trailing blur into
+  // `saveEdit`. Latched so Enter saves once and Escape saves nothing.
+  const closedRef = useRef(false);
 
   function startEditing() {
     if (!device) return;
+    closedRef.current = false;
     // `displayName` already IS the stored name when there is one. So it is the
     // single source for the prefill and for `saveEdit`'s unchanged check.
     setEditValue(displayName);
@@ -225,7 +229,8 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
   }
 
   function saveEdit() {
-    if (!device) return;
+    if (!device || closedRef.current) return;
+    closedRef.current = true;
     setEditingId?.(null);
     const next = submittedDeviceName(device.name ?? null, displayName, editValue);
     if (next !== undefined) {
@@ -234,6 +239,7 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
   }
 
   function cancelEdit() {
+    closedRef.current = true;
     setEditingId?.(null);
   }
 
@@ -261,9 +267,11 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
               onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') saveEdit();
-                if (e.key === 'Escape') cancelEdit();
+                if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
               }}
               onBlur={saveEdit}
+              // The blur saves, so the central Escape policy must not blur it.
+              data-escape-self
               ref={inputRef}
             />
           ) : (

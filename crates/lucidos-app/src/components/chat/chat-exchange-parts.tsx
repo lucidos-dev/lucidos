@@ -432,7 +432,7 @@ function CollapsedIndicator({ onToggle }: { onToggle?: (e: MouseEvent) => void }
  *
  *  It is the third of the response header's three `turnControls`, and the
  *  initiator header's only one. Everything a reader keys off is therefore
- *  shared: the glyph that turns around, the label naming the turn, and the
+ *  shared: the minus/plus glyph, the label naming the turn, and the
  *  `.turn-control-collapse` class the brightness rule excludes by name
  *  (styles/chat/input-messages.css).
  *

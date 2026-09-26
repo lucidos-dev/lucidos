@@ -23,6 +23,8 @@ pub mod codex_detect;
 mod responses;
 
 const CHUNK_TIMEOUT_SECS: u64 = 300;
+/// The `[tag]` a stream failure logs under, shared by both wire formats.
+const STREAM_LOG_TAG: &str = "OpenAI";
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 16384;
 
 /// Base URL for the direct-OpenAI API (`{base}/chat/completions`,

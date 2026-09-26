@@ -430,7 +430,10 @@ async fn execute_llm_task(
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
-            let is_transient = crate::llm::is_transient_error(&err_str);
+            // A stream cut after text stops without a retry, yet its cause was
+            // just as transient, so it deduplicates the same way.
+            let is_transient = crate::llm::is_transient_error(&err_str)
+                || crate::llm::is_stream_cut_after_text(&err_str);
 
             // For transient errors, skip notification if we already notified
             // recently. Legacy non-UUID config.id falls back to v5 hash so the

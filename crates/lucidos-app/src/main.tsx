@@ -2,7 +2,6 @@
 // module-init localStorage read (for example store/store.ts).
 import './utils/workspaceStorage.install';
 import { render, type ComponentChildren } from 'preact';
-import { App } from './App';
 import { lazyComponent } from './utils/lazyComponent';
 import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
@@ -27,6 +26,7 @@ import { adoptGatewayDeviceId, reconcileDesktopDeviceId } from './store/actions/
 import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
 import { takePairingCodeFromUrl } from './utils/pairingCodeSeed';
 import { openAppById } from './store/actions/apps';
+import { startClient } from './store/startup';
 import { startPerfProbe } from './utils/perfProbe';
 import { installMainThreadStallProbe } from './utils/mainThreadStall';
 import './styles/global.css';
@@ -49,19 +49,22 @@ import './styles/badges.css';
 import './store/effects';
 import './store/actions/wipPreview';
 
-// The app path hands over here: reaching this line means its whole root is in
-// memory. The PICKER path must NOT, since its root arrives in later chunks
-// (see PairingGate and WorkspacePicker below). Handing over here would disarm
-// the watchdog while the thing it guards is still in flight, and that watchdog
-// is the picker's only recovery.
+// The shell chunk (ADR 0288): `<App/>` and everything only the UI reaches. It
+// is modulepreloaded from index.html and asked for here, as soon as the entry
+// evaluates. Its download and parse then overlap boot's own awaits and the
+// startup fetches, all under the boot splash.
 //
-// The gateway escape link is offered to direct-port documents alone
-// (revealGatewayEscape in index.html), and `lazyComponent`'s stale-chunk reload
-// stands down whenever sessionStorage is unavailable. So the picker hands over
-// once its chunk resolves. The two paths cannot both fire: the picker context
-// is a gateway-stamped `<base href="/~/">`, and the pre-gateway shell has no
-// base at all.
-if (!IS_PICKER) handOverBootOwnership();
+// Each path hands boot ownership over once its own root is in memory, never at
+// the top level. For the app that is when this chunk resolves, so the watchdog
+// in index.html still guards the fetch. The picker hands over from its loader
+// below, and the pre-gateway desktop splash from `stayOnStartingSplash`.
+const App = lazyComponent(() =>
+  import('./App').then((m) => {
+    handOverBootOwnership();
+    return m.App;
+  }),
+);
+if (!IS_PICKER && !isTauriPreGatewayEntry()) void App.preload();
 
 if (isTouchDevice()) {
   document.body.classList.add('is-touch');
@@ -119,9 +122,7 @@ const appRoot = document.getElementById('app')!;
 // picker in the eager entry chunk sent every workspace document ~43 kB it could
 // never mount. Code-split, the picker path fetches it while the inline boot
 // splash is still up. `lazyComponent`'s stale-chunk arm covers the hashed-URL
-// 404 that would otherwise strand it. `<App/>` deliberately stays static: it IS
-// the eager graph, so splitting it would move bytes into a second chunk without
-// shortening the critical path.
+// 404 that would otherwise strand it.
 //
 // The gate splits for the same reason: it renders only under `IS_PICKER`, so a
 // workspace document carried a screen it could never mount. The picker now
@@ -171,13 +172,15 @@ function recoverFromBrokenContext(): boolean {
  *  `<App/>` would fire API calls and a service-worker registration. Both throw
  *  WebKit's "string did not match the expected pattern". Keep the inline boot
  *  splash up instead; `desktop::launch()` navigates to the gateway once the
- *  service is healthy. Heartbeat on the cadence `useStartup` would, so the
+ *  service is healthy. Heartbeat on the cadence `startClient` would, so the
  *  WKWebView crash watchdog (crash_watchdog.rs) does not reload the splash while we wait. */
 function stayOnStartingSplash(): void {
+  // This splash's whole root is the entry chunk, so it is in memory already.
+  handOverBootOwnership();
   // Painted now rather than a poll-tick from now, and matching
   // `desktop::STARTING_LABEL`, so a fast start never sees the text change.
   setBootStatus('Starting Lucidos…');
-  // As in useStartup: the `catch` is a local no-op, and `invoke` reports bridge
+  // As in startClient: the `catch` is a local no-op, and `invoke` reports bridge
   // failures to the engine log itself (utils/ipcHealth). This splash runs on the
   // bundled `tauri://localhost` origin, which the ACL treats as LOCAL. A
   // heartbeat working here says nothing about the gateway origin (ADR 0028).
@@ -256,6 +259,8 @@ async function boot() {
     if (!IS_PICKER) {
       startPerfProbe();
       installMainThreadStallProbe();
+      const stopClient = startClient();
+      import.meta.hot?.dispose(stopClient);
     }
     render(
       IS_PICKER ? (

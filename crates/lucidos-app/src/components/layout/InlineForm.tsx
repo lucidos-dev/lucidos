@@ -10,17 +10,21 @@ const EmailConfirmModal = lazyComponent(() => import('../email/EmailConfirmModal
 const PluginInstallPanel = lazyComponent(() => import('../plugins/PluginInstallPanel').then(m => m.PluginInstallPanel));
 const PluginUninstallPanel = lazyComponent(() => import('../plugins/PluginUninstallPanel').then(m => m.PluginUninstallPanel));
 
+/** Escape closes the open form, unless an earlier handler already spent it.
+ *  The central dispatcher blurs a focused input with `preventDefault` but lets
+ *  the event bubble, so one Escape must not also drop the form's unsaved edits. */
+export function closeInlineFormOnEscape(e: Pick<KeyboardEvent, 'key' | 'defaultPrevented'>): void {
+  if (e.key === 'Escape' && !e.defaultPrevented && activeInlineForm.value) {
+    closeInlineForm();
+  }
+}
+
 export function InlineForm() {
   const form = activeInlineForm.value;
 
   useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && activeInlineForm.value) {
-        closeInlineForm();
-      }
-    }
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
+    document.addEventListener('keydown', closeInlineFormOnEscape);
+    return () => document.removeEventListener('keydown', closeInlineFormOnEscape);
   }, []);
 
   if (!form) return null;

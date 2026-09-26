@@ -166,8 +166,8 @@ function channelIcon(value: ThreadChannel): VNode {
  *  Close button down here duplicated that exit and spent a strip of the pane's
  *  height on it.
  *
- *  Mounted while open and through its fade out, inside the drawer's
- *  `.thread-filter-cover` (see `ThreadDrawer`). Hook-free at its own level so
+ *  Always mounted, inside the drawer's `.thread-filter-cover`, which hides it
+ *  while shut (see `ThreadFilterCover`). Hook-free at its own level so
  *  the unit test can invoke it directly (the nested `ExpandableChannelRow` /
  *  `TriCheckbox` use hooks; this component must not). */
 export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {

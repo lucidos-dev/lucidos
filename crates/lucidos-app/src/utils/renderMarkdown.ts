@@ -2,7 +2,7 @@ import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
 import { lucidos } from '@lucidos/sdk';
-import { CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAttr } from './markedConfig';
+import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAttr } from './markedConfig';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
@@ -15,7 +15,7 @@ import { slugifyWorkspaceName } from './slug';
  *  the peer.
  *
  *  The left-click is still intercepted by the global `.thread-link` handler
- *  (`useStartup`), which does the authoritative routing. This href is for the
+ *  (`startClient`), which does the authoritative routing. This href is for the
  *  hover tooltip, middle-click and accessibility. On a bare engine port there
  *  is no peer URL to build synchronously, so `#` stands. */
 function threadLinkHref(workspace: string | undefined, threadId: string): string {
@@ -66,7 +66,7 @@ const LINK_DEFINITION_LABEL = /\[([^\]]*)\]:/g;
  *  Raw HTML in markdown source reaches DOMPurify, which keeps `class` and every
  *  `data-*` by default. Model output could therefore write
  *  `class="copyable-block" data-copy-text="…"` itself, and the click handler in
- *  `useStartup` hands that value straight to the clipboard. The user then
+ *  `startClient` hands that value straight to the clipboard. The user then
  *  pastes a command they never read. `data-copy-text` is in `FORBID_ATTR`, so
  *  content cannot write the payload. */
 const COPY_ID_ATTR = 'data-copy-id';
@@ -147,7 +147,7 @@ function postprocessCopyBlocks(html: string): string {
  *  forbidden there, so every surviving one was written here, from a slot this
  *  render allocated and named with `COPY_ID_NONCE`. An id content invented loses
  *  its attribute. The copy handler then reads that block as having no text,
- *  and `useStartup` returns on the null. */
+ *  and `startClient` returns on the null. */
 function resolveCopyTargets(html: string, copyTexts: Map<number, string>): string {
   return inDom(html, [COPY_ID_ATTR], (body) => {
     for (const el of Array.from(body.querySelectorAll(`[${COPY_ID_ATTR}]`))) {
@@ -513,6 +513,18 @@ function wrapImagesIn(body: HTMLElement): void {
   }
 }
 
+/** A bare email autolink right after a `/`. marked's GFM autolinker reads any
+ *  `local@domain.tld` run as an email, even inside a path. A home folder like
+ *  `/Users/me.x@example.com/` then grows a `mailto:` link mid-path, and a click
+ *  opens Mail. Only the renderer's `BARE_EMAIL_ATTR` marks such a link, so an
+ *  authored `<x@y>` or `[x](mailto:x)` keeps its link. */
+const PATH_EMAIL_AUTOLINK = new RegExp(`/<a ${BARE_EMAIL_ATTR} [^>]*>([^<]*)</a>`, 'g');
+const BARE_EMAIL_MARK = new RegExp(`<a ${BARE_EMAIL_ATTR} `, 'g');
+
+export function unwrapPathEmailAutolinks(html: string): string {
+  return html.replace(PATH_EMAIL_AUTOLINK, '/$1').replace(BARE_EMAIL_MARK, '<a ');
+}
+
 // LRU cache for parsed markdown. `renderMarkdown` is pure, but the chat
 // timeline calls it INLINE on every render of every exchange, so one thread
 // re-render re-parses every block synchronously. On a heavy thread that storm
@@ -541,6 +553,7 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
     const copyTexts = new Map<number, string>();
     const preprocessed = preprocessCopyBlocks(md, copyTexts);
     let html = marked.parse(preprocessed, { async: false }) as string;
+    html = unwrapPathEmailAutolinks(html);
     // Before the sanitizer, because DOMPurify drops the HTML comments the
     // multiline marker rides on. It carries the slot id, not the payload.
     html = postprocessCopyBlocks(html);

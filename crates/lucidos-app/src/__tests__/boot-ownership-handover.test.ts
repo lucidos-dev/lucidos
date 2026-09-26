@@ -45,13 +45,28 @@ const codeLines: string[] = src
   .map((l: string) => l.replace(/\/\/.*$/, ''))
   .filter((l: string) => l.trim() !== '');
 
-/** The `lazyComponent(() => import('./components/picker/WorkspacePicker')…)`
- *  expression, from the loader's dynamic import to the end of that statement. */
-function pickerLoaderBody(): string | null {
-  const at = src.indexOf("import('./components/picker/WorkspacePicker')");
+/** A `lazyComponent(() => import('<target>')…)` expression, from the loader's
+ *  dynamic import to the end of that statement. */
+function loaderBody(target: string): string | null {
+  const at = src.indexOf(`import('${target}')`);
   if (at === -1) return null;
   const end = src.indexOf('\n);', at);
   return end === -1 ? src.slice(at) : src.slice(at, end);
+}
+const pickerLoaderBody = () => loaderBody('./components/picker/WorkspacePicker');
+const shellLoaderBody = () => loaderBody('./App');
+
+/** The body of `function stayOnStartingSplash()`, by brace matching. */
+function startingSplashBody(): string {
+  const at = src.indexOf('function stayOnStartingSplash(');
+  expect(at, 'main.tsx should declare stayOnStartingSplash').toBeGreaterThan(-1);
+  const open = src.indexOf('{', at);
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(open + 1, i);
+  }
+  throw new Error('unbalanced braces in stayOnStartingSplash');
 }
 
 describe('boot ownership handover', () => {
@@ -60,32 +75,34 @@ describe('boot ownership handover', () => {
     expect(src).toMatch(/const WorkspacePicker = lazyComponent\(/);
   });
 
-  it('never hands over unconditionally at the top level', () => {
+  it('never hands over at the top level', () => {
     // A handover statement at column 0 is the regression: it disarms the
-    // watchdog before the picker chunk has landed. The `if (!IS_PICKER)` form
-    // below is the one sanctioned unindented call, and the next test pins it.
+    // watchdog while the chunk it guards is still in flight. Both roots are
+    // lazy now (the picker and the shell chunk), so no top-level call is right.
     //
     // Both spellings are scanned. `handOverBootOwnership` is the one main.tsx
     // uses today, and the raw `__lucidosBootLoaded?.()` is what re-inlining the
     // helper here would bring back. Matching only the raw hook is how this guard
     // went vacuous the moment the helper moved to `utils/bootSplash.ts`.
-    const unconditional = codeLines.filter(
-      (l: string) =>
-        /^\S/.test(l) &&
-        /(handOverBootOwnership|__lucidosBootLoaded\?\.)\(\)/.test(l) &&
-        !l.startsWith('if ('),
+    const topLevel = codeLines.filter(
+      (l: string) => /^\S/.test(l) && /(handOverBootOwnership|__lucidosBootLoaded\?\.)\(\)/.test(l),
     );
-    expect(
-      unconditional,
-      'gate the top-level handover: the picker path hands over from its lazy loader instead',
-    ).toEqual([]);
+    expect(topLevel, 'each path hands over once its own root is in memory').toEqual([]);
   });
 
-  it('hands over eagerly only on the non-picker path', () => {
+  it('keeps the shell code-split, and hands over once its chunk resolves', () => {
+    expect(src).toMatch(/const App = lazyComponent\(/);
+    expect(src, 'a static import would put the shell back in the entry chunk').not.toMatch(
+      /^import \{ App \} from '\.\/App';$/m,
+    );
     expect(
-      codeLines.some((l: string) => /^if \(!IS_PICKER\) handOverBootOwnership\(\);$/.test(l.trim())),
-      'main.tsx should call handOverBootOwnership() eagerly only when !IS_PICKER',
+      /handOverBootOwnership\(\);/.test(shellLoaderBody() ?? ''),
+      'the app path must hand over once the shell chunk resolves',
     ).toBe(true);
+  });
+
+  it('hands over on the pre-gateway desktop splash, whose root is the entry itself', () => {
+    expect(startingSplashBody()).toMatch(/handOverBootOwnership\(\);/);
   });
 
   it('hands over from inside the picker lazy loader', () => {

@@ -6,15 +6,44 @@ function getUserTimezone(): string | undefined {
   return prefs.status === 'loaded' ? prefs.data.timezone || undefined : undefined;
 }
 
+const formatters = new WeakMap<Intl.DateTimeFormatOptions, Map<string, Intl.DateTimeFormat>>();
+
+/** `date` formatted with `options` in the user's timezone. The formatter is
+ *  built once per timezone: building one costs about 100µs, and a drawer page
+ *  formats a stamp for every row it re-renders. `options` must be a module
+ *  constant, because it is the cache key. An invalid date reads "Invalid Date",
+ *  as `toLocaleString` does, where `format` would throw. */
+function formatInUserTz(options: Intl.DateTimeFormatOptions, date: Date): string {
+  if (Number.isNaN(date.getTime())) return 'Invalid Date';
+  const tz = getUserTimezone();
+  let byTz = formatters.get(options);
+  if (!byTz) {
+    byTz = new Map();
+    formatters.set(options, byTz);
+  }
+  const key = tz ?? '';
+  let formatter = byTz.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat([], tz ? { ...options, timeZone: tz } : options);
+    byTz.set(key, formatter);
+  }
+  return formatter.format(date);
+}
+
+const DATE_TIME: Intl.DateTimeFormatOptions = {
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false,
+};
+const TIME_HM: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', hour12: false };
+const TIME_HMS: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+const MONTH_DAY: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' };
+const MONTH_DAY_YEAR: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' };
+const CALENDAR_DAY: Intl.DateTimeFormatOptions = {};
+
 /** "2026-03-12 04:02:29" — full date+time in user's timezone, 24h format */
 export function formatDateTime(date: Date): string {
-  const tz = getUserTimezone();
-  return date.toLocaleString([], {
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-    ...(tz ? { timeZone: tz } : {}),
-  });
+  return formatInUserTz(DATE_TIME, date);
 }
 
 /** How long something has been running: "8s", "2m 14s", "1h 03m".
@@ -117,32 +146,18 @@ export function elapsedSeconds(since: number, now: number): number {
 
 /** "14:30" — short HH:MM time in user's timezone */
 export function formatShortTime(date: Date): string {
-  const tz = getUserTimezone();
-  return date.toLocaleTimeString([], {
-    hour: '2-digit', minute: '2-digit',
-    hour12: false,
-    ...(tz ? { timeZone: tz } : {}),
-  });
+  return formatInUserTz(TIME_HM, date);
 }
 
 /** "Feb 28" — short month + day in user's timezone */
 export function formatShortDate(date: Date): string {
-  const tz = getUserTimezone();
-  return date.toLocaleDateString([], {
-    month: 'short', day: 'numeric',
-    ...(tz ? { timeZone: tz } : {}),
-  });
+  return formatInUserTz(MONTH_DAY, date);
 }
 
 /** "Feb 28" for current year, "Feb 28, 2025" for past years. */
 export function formatShortDateWithYear(date: Date): string {
-  const tz = getUserTimezone();
   const sameYear = date.getFullYear() === new Date().getFullYear();
-  return date.toLocaleDateString([], {
-    month: 'short', day: 'numeric',
-    ...(sameYear ? {} : { year: 'numeric' }),
-    ...(tz ? { timeZone: tz } : {}),
-  });
+  return formatInUserTz(sameYear ? MONTH_DAY : MONTH_DAY_YEAR, date);
 }
 
 /** Do two instants fall on the same calendar day in the user's configured
@@ -154,9 +169,7 @@ export function formatShortDateWithYear(date: Date): string {
  *  answer, and so does the deadline on an *event row*, so the comparison lives
  *  here once instead of being inlined at each site. */
 export function isSameDayInUserTz(a: Date, b: Date): boolean {
-  const tz = getUserTimezone();
-  const opts = tz ? { timeZone: tz } : {};
-  return a.toLocaleDateString([], opts) === b.toLocaleDateString([], opts);
+  return formatInUserTz(CALENDAR_DAY, a) === formatInUserTz(CALENDAR_DAY, b);
 }
 
 /** "Today 14:30", "Yesterday 14:30", or "Feb 28 14:30" */
@@ -180,12 +193,7 @@ export function formatNotificationDate(date: Date): string {
 /** "Today 14:30:05" or "Feb 28 14:30:05" — includes seconds */
 export function formatMessageTimestamp(isoTimestamp: string): string {
   const date = new Date(isoTimestamp);
-  const tz = getUserTimezone();
-  const time = date.toLocaleTimeString([], {
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-    ...(tz ? { timeZone: tz } : {}),
-  });
+  const time = formatInUserTz(TIME_HMS, date);
   const isToday = isSameDayInUserTz(date, new Date());
 
   if (isToday) {

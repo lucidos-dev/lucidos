@@ -1378,3 +1378,34 @@ describe('renderMarkdown tables', () => {
     expect(labels(html)).toEqual(['A', 'B', 'C', 'D']);
   });
 });
+
+// marked's GFM autolinker reads any `local@domain.tld` run as an email, even
+// inside a path. A home directory like `/Users/me.x@example.com/` then renders
+// a `mailto:` link in the middle of the path, and a click opens Mail.
+describe('renderMarkdown email autolinks inside a path', () => {
+  it('leaves an email-shaped path segment as plain text', () => {
+    const html = renderMarkdown('DMG: file:///Users/me.x@example.com/p/Lucidos.dmg', { cache: false });
+    expect(html).not.toContain('mailto:');
+    expect(html).toContain('file:///Users/me.x@example.com/p/Lucidos.dmg');
+  });
+
+  it('leaves an absolute path with an email-shaped segment as plain text', () => {
+    const html = renderMarkdown('open "/Users/me.x@example.com/p/Lucidos.dmg"', { cache: false });
+    expect(html).not.toContain('mailto:');
+  });
+
+  it('keeps an authored email link after a slash', () => {
+    for (const md of ['/[me.x@example.com](mailto:me.x@example.com)', '/<me.x@example.com>']) {
+      expect(renderMarkdown(md, { cache: false })).toContain('<a href="mailto:me.x@example.com">');
+    }
+  });
+
+  it('leaves no autolink marker in the output', () => {
+    expect(renderMarkdown('Write to me.x@example.com today', { cache: false })).not.toContain('data-');
+  });
+
+  it('still autolinks an email in prose', () => {
+    const html = renderMarkdown('Write to me.x@example.com today', { cache: false });
+    expect(html).toContain('<a href="mailto:me.x@example.com">me.x@example.com</a>');
+  });
+});

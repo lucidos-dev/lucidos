@@ -601,7 +601,7 @@ async function routeToDeepLink(targetUrl, tapData) {
     // Bring the tab forward (focus() also unfreezes a Chrome-frozen page so it
     // can process the message below), then hand the page the structured deep
     // link. postMessage → the page's navigator.serviceWorker 'message' listener
-    // (onServiceWorkerMessage in useStartup) → dispatchDeepLink, the SAME
+    // (onServiceWorkerMessage in startClient) → dispatchDeepLink, the SAME
     // router the URL path uses.
     //
     // We deliberately do NOT use a fragment-only client.navigate('/#…') here.

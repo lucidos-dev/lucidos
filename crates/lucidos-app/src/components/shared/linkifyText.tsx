@@ -17,7 +17,7 @@ const TRAILING_PUNCT = /[.,;:!?]+$/;
  *  back unchanged, so a link-free caller allocates nothing.
  *
  *  The anchor carries NO click handler, deliberately. `onGlobalClick`
- *  (hooks/useStartup.ts) claims every absolute http(s) anchor and routes it
+ *  (store/startup.ts) claims every absolute http(s) anchor and routes it
  *  through `openUrl`. That is where the in-app browser, the packaged client's
  *  OS opener and the iOS PWA Safari hand-off live.
  *

@@ -947,9 +947,12 @@
        (--nav-focus-reach). scroll-margin-top handles navigated MID-thread turns,
        but the boundary turns can't be scrolled clear (already at top/bottom), so
        the padding is what gives them room. Mobile zeroes padding-top (uses a
-       ::before header spacer) and re-sets padding-bottom in mobile.css. */
+       ::before header spacer) and re-sets padding-bottom in mobile.css.
+
+       --anchor-subpixel is the scroll anchor's sub-pixel rest, under 1px, set
+       inline by withScrollAnchor. Both top reserves add it (ADR 0286). */
     padding:
-        calc(var(--thread-top-fade) + var(--nav-focus-reach))
+        calc(var(--thread-top-fade) + var(--nav-focus-reach) + var(--anchor-subpixel, 0px))
         var(--thread-pane-gutter)
         calc(var(--prompt-fade) + var(--nav-focus-reach));
 }
@@ -1162,14 +1165,27 @@
     margin-left: 0.75rem;
 }
 
+/* A timestamp after a status never holds the status off the executor's line.
+   The zero width takes it out of the cluster's minimum. The cluster then keeps
+   its place beside the controls while the status alone fits there. The
+   max-content basis still wraps it to line two whenever the pair does not fit.
+   On that line it is wider than the cluster, and `justify-content: flex-end`
+   lets it overflow to the left, under the controls, flush right. */
+.exchange-status-label + .response-timestamp,
+.exchange-status-label + .initiator-timestamp {
+    width: 0;
+    flex: 0 0 max-content;
+}
+
 /* Clips only what lies past the right edge, where a stacked status puts its
    dot. The 0.25rem slack keeps the focus ring of the rightmost field. The dot
-   centres 0.625rem past the edge, so it stays outside the slack. A cluster
-   holding a glyph draws no dot, so it skips the clip: the queued bin's chip
-   and focus ring reach further past the edge than the slack allows. */
+   centres 0.625rem past the edge, so it stays outside the slack. The left
+   inset is wide open for the stacked timestamp that overflows leftward. A
+   cluster holding a glyph draws no dot, so it skips the clip: the queued bin's
+   chip and focus ring reach further past the edge than the slack allows. */
 .response-meta:not(:has(.exchange-status-glyph)),
 .initiator-meta:not(:has(.exchange-status-glyph)) {
-    clip-path: inset(-1rem -0.25rem -1rem -1rem);
+    clip-path: inset(-1rem -0.25rem -1rem -100vw);
 }
 
 .exchange-status-x {
@@ -1632,11 +1648,10 @@ button.initiator-actor,
        min-height. */
     min-height: var(--turn-header-line);
     /* Pulled back out of the header's 0.5rem gap, because that gap is measured
-       between BOXES and the eye measures ink. The button adds its 0.125rem
-       padding and the glyph its own inset (the chevron starts 5/24 of the way
-       in), so the flex gap alone left ~10px of white between the label's last
-       letter and the first stroke: the controls read as adrift rather than as
-       the label's. At 0.25rem it is ~8px.
+       between BOXES and the eye measures ink. The button adds 0.125rem of
+       padding, and the bubbles glyph starts 3/24 of the way in. With the flex
+       gap alone, ~9px of white sits between the label's last letter and the
+       first stroke, and the controls read as adrift. At 0.25rem it is ~7px.
 
        Bounded on both sides, and the floor is now the binding one. With the
        group break gone this is the ONE gap in the run that differs, so it is

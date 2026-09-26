@@ -336,7 +336,7 @@ async function pollEngineVersion(): Promise<void> {
   // The switch dismissal is now a GLOBAL preference (not synchronous
   // localStorage), so until preferences load we can't tell whether this on-disk
   // build was already dismissed. Skip rather than flash an already-dismissed
-  // Switch toast on cold start — the 4s poll and useStartup's post-load
+  // Switch toast on cold start: the 4s poll and startClient's post-load
   // checkEngineVersion re-run it once preferences are known. A 'failed' load
   // proceeds (fail-open surfacing is the safe default).
   if (preferences.value.status === 'not-loaded' || preferences.value.status === 'loading') return;

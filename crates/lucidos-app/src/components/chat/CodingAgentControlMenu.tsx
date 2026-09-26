@@ -80,6 +80,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const optionsListRef = useRef<HTMLDivElement>(null);
   const retryTimerRef = useRef<number | null>(null);
   const retryCountRef = useRef(0);
+  // Only the newest `loadCommands` may apply its response. A scope or backend
+  // switch fires a second fetch, and the first can land after it.
+  const loadSeqRef = useRef(0);
   const open = useSignal(false);
   const activeCommand = useSignal<string | null>(null);
   const paramValues = useSignal<Record<string, string>>({});
@@ -179,8 +182,10 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     // list vs Codex model list) the server returns. Thread-bound menus
     // resolve the backend server-side from thread_summaries.
     const requestCodingAgent = threadId ? undefined : resolvedCodingAgent;
+    const seq = ++loadSeqRef.current;
     fetchCodingAgentCommands(threadId, repoId, requestCodingAgent)
       .then((res: CodingAgentCommandsResponse) => {
+        if (seq !== loadSeqRef.current) return;
         // Always update control commands (always present from backend)
         persistedControlCommands.value = res.control_commands;
         controlCommands.value = res.control_commands;
@@ -223,6 +228,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         }
       })
       .catch((err: unknown) => {
+        if (seq !== loadSeqRef.current) return;
         // Retry both views: iOS PWA HTTP/2 connections go stale after
         // backgrounding and the first wake fetch rejects with
         // TypeError("Load failed"). The threadId guard in the empty-response

@@ -4,6 +4,7 @@ import {
   openThreadFilterPanel,
   closeThreadFilterPanel,
   toggleThreadFilterPanel,
+  setThreadFilterPaneVisible,
 } from './threadFilterPanel';
 import { overlayStack, dismissTopOverlay, pushOverlay, _resetOverlayStackForTesting } from './overlayStack';
 
@@ -18,6 +19,7 @@ import { overlayStack, dismissTopOverlay, pushOverlay, _resetOverlayStackForTest
  *  Reset through the real closer rather than by writing the signal, so the
  *  persisted key is cleared with it and no case inherits the previous one's. */
 beforeEach(() => {
+  setThreadFilterPaneVisible(true);
   closeThreadFilterPanel();
   _resetOverlayStackForTesting();
 });
@@ -60,6 +62,21 @@ describe('thread filter panel state', () => {
     dismissTopOverlay();
     expect(menuClosed).toBe(true);
     expect(threadFilterPanelOpen.value).toBe(true);
+  });
+
+  it('stays open while the drawer is collapsed, but takes no Escape until it shows again', () => {
+    openThreadFilterPanel();
+    setThreadFilterPaneVisible(false);
+    expect(threadFilterPanelOpen.value).toBe(true);
+    expect(overlayStack.value).toHaveLength(0);
+    setThreadFilterPaneVisible(true);
+    expect(overlayStack.value.map(e => e.id)).toEqual(['thread-filter-panel']);
+  });
+
+  it('does not register a panel opened while the drawer is collapsed', () => {
+    setThreadFilterPaneVisible(false);
+    openThreadFilterPanel();
+    expect(overlayStack.value).toHaveLength(0);
   });
 
   it('does not double-register when opened twice', () => {

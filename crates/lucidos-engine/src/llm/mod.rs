@@ -193,6 +193,38 @@ pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u3
     true
 }
 
+/// A stream failure, made final once `on_token` has shown the user something.
+///
+/// The caller's retry re-sends the whole request, so text already on screen
+/// would render a second time (ADR 0089). This covers a dropped connection, a
+/// chunk timeout and a mid-stream `error` frame. The cause is logged, because
+/// the returned message must carry no retryable wording.
+pub(crate) fn stream_failure(
+    err: String,
+    rendered_any: bool,
+    provider_tag: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if !rendered_any || !is_retryable_error(&err) {
+        return err.into();
+    }
+    crate::log!(
+        "[{}] Stream failed after text had streamed, so not retrying: {}",
+        provider_tag,
+        err
+    );
+    STREAM_FAILED_AFTER_TEXT.into()
+}
+
+const STREAM_FAILED_AFTER_TEXT: &str = "The reply was cut off after it had started \
+     streaming. Retrying would render that text twice, so the turn stops here.";
+
+/// Whether `err` is a [`stream_failure`] that stopped a turn after text had
+/// rendered. The cause was transient, but the wording must not read as
+/// retryable, so a caller deduplicating transient failures asks this too.
+pub fn is_stream_cut_after_text(err: &str) -> bool {
+    err.contains(STREAM_FAILED_AFTER_TEXT)
+}
+
 /// Wrap a final error with retry context so logs/notifications show what was attempted.
 pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String {
     if attempts > 1 {
@@ -387,6 +419,14 @@ mod tests {
             is_retryable_error(body),
             "intermittent adaptive-thinking validation 400 must be retryable"
         );
+    }
+
+    #[test]
+    fn a_stream_cut_after_text_is_recognised_but_never_retried() {
+        let err = stream_failure("Stream read error: reset".to_string(), true, "Test").to_string();
+        assert!(is_stream_cut_after_text(&with_retry_context(&err, 2)));
+        assert!(!is_retryable_error(&err));
+        assert!(!is_stream_cut_after_text("Stream read error: reset"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ import {
   popupImage,
   searchEverywhereOpen,
 } from '../store/store';
-import { drawerOpen } from '../components/layout/Drawer';
+import { drawerOpen } from '../components/layout/drawerState';
 import { isMobileOrTouch } from '../utils/viewport';
 
 const anyOverlayOpen = computed(() =>

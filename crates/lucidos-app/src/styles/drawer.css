@@ -61,14 +61,13 @@
    `.flip-portal` is fixed inside it and has to escape all app chrome), so a
    row's own z-index competes directly with the panel's. The list tops out at 1
    (the family rail and the status dot), and the panel sits at 3. So "the panel
-   covers the list" is never one layer against one layer. A row FLYING between sections is a different thing and does
-   cross the panel on purpose: it is cloned into `.flip-portal`,
-   which is fixed at nearly the fullscreen layer on purpose so a flying thread
-   clears all app chrome. Rare and sub-second, and never on the user's own facet
-   toggles, since the filter is the hook's reset key. It carries neither a title
-   row nor a footer: the pane header above says "Filters" while this is up, and
-   the same header's Filter button is the way out, held down while the panel
-   is open (Escape closes it too).
+   covers the list" is never one layer against one layer. A row FLYING between
+   sections is cloned into `.flip-portal`, fixed at nearly the fullscreen layer,
+   which z-index alone would let cross the panel. It does not, because the list
+   is `visibility: hidden` while the panel is up (below), and the portal inherits
+   that. It carries neither a title row nor a footer: the pane header above says
+   "Filters" while this is up, and the same header's Filter button is the way
+   out, held down while the panel is open (Escape closes it too).
 
    With nothing docked above or below it, the cover IS the pane's scroller while
    the panel is up, which is what lets it take `.thread-drawer-list`'s own padding
@@ -89,37 +88,27 @@
        last row. */
     padding-top: var(--space-md);
     padding-bottom: 0.25rem;
-    /* Shut: hidden, but only once the fade layer below has faded out. So on a
-       close the list shows exactly as the last option goes, never under it. */
     visibility: hidden;
     pointer-events: none;
-    transition: visibility 0s linear var(--duration-fast);
 }
 
-/* Open: the cover lands at once, opaque, and the options fade in over it. */
+/* The two views swap at once, and the navigation cover over both (below)
+   fades the arriving one in, exactly as a content-pane navigation does. Never
+   a crossfade: the panel wears the list's geometry, so both drawn at once
+   print rows and options on the same lines. */
 .thread-filter-cover[data-open] {
     visibility: visible;
     pointer-events: auto;
-    transition: visibility 0s;
 }
 
-/* The fade runs on this layer, INSIDE the scroller, so the scrollbar never
-   fades with the options. It stays mounted, so a close during the fade in
-   reverses from where it is, and so does a reopen during the fade out. */
-.thread-filter-fade {
-    opacity: 0;
-    transition: opacity var(--duration-fast) ease;
+.thread-drawer:has(> .thread-filter-cover[data-open]) > .thread-drawer-list {
+    visibility: hidden;
 }
 
-.thread-filter-cover[data-open] .thread-filter-fade {
-    opacity: 1;
-}
-
-/* Instant, not merely short: a scaled transition still waits for its start
-   (see .crossfade-layer in global/host-components.css). */
-:root[data-motion="reduce"] .thread-filter-cover,
-:root[data-motion="reduce"] .thread-filter-fade {
-    transition: none;
+/* The navigation cover's host (global/host-components.css). Over the filter
+   cover, so it hides both views' swap frame. */
+.thread-drawer > .nav-cover {
+    z-index: 4;
 }
 
 /* The panel's two section headings, "Status" and "By thread types". Deliberately
@@ -229,10 +218,11 @@
 
 /* Filter rows sit on the pane's content column (`--drawer-row-inset`, the same
    token `.thread-row` and the list's section headers take their left padding
-   from) and 0.5rem from the trailing edge, with the hover band running full
-   width to the pane's edges instead of floating inset with a radius. The panel
-   covers that list, so a row here and a row there have to land on the same
-   grid. */
+   from) and 0.5rem from the trailing edge. The panel covers that list, so a row
+   here and a row there have to land on the same grid.
+
+   No hover band: a checkbox toggles one setting, and the band belongs to the
+   status rows, which select and switch the list at once. */
 .thread-filter-option {
     display: flex;
     align-items: center;
@@ -242,14 +232,6 @@
     color: var(--text-primary);
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
-}
-
-/* Pointer hover only. A touch screen keeps `:hover` on the last row tapped, so
-   an unguarded band stayed behind on that row after the tap. */
-@media (hover: hover) {
-    .thread-filter-option:hover {
-        background: var(--bg-hover);
-    }
 }
 
 /* "Include deleted" while a status view is active. It sits inside the
@@ -344,9 +326,9 @@
 }
 
 /* Every row of the Filter panel's single-select set: the four statuses above the
-   "or" rule and "All statuses" below it. Same column and same full-width band as
-   the `.thread-filter-option` channel rows further down, and as the thread rows
-   the panel covers. */
+   "or" rule and "All statuses" below it. Same column as the
+   `.thread-filter-option` channel rows further down, and as the thread rows the
+   panel covers. */
 .drawer-view-option {
     display: flex;
     align-items: center;
@@ -366,7 +348,8 @@
     -webkit-tap-highlight-color: transparent;
 }
 
-/* Pointer hover only, as on `.thread-filter-option` above. */
+/* Pointer hover only. A touch screen keeps `:hover` on the last row tapped, so
+   an unguarded band stayed behind on that row after the tap. */
 @media (hover: hover) {
     .drawer-view-option:hover {
         background: var(--bg-hover);
@@ -655,13 +638,20 @@
  * brighter than the date. Light mode keeps more accent, since its darker blue
  * mixed half-and-half turns slate grey. Hover lifts it to a stronger blue, with
  * no underline. One chevron rotates between the two states. The chevron turn
- * is the only tap feedback, so this rule turns off iOS's grey tap flash. */
+ * is the only tap feedback, so this rule turns off iOS's grey tap flash.
+ *
+ * The link never wraps. A wide chip column squeezes the title column, and a
+ * button centres wrapped text, so "threads" landed alone under "Hide 2 sub-".
+ * On one line it may run past the title column. That only happens when a wide
+ * chip squeezes the column, and the same chip leaves free space left of the
+ * pin and ⋯ on the link's line, so the link runs into that space. */
 .family-disclosure {
     align-self: flex-start;
     -webkit-tap-highlight-color: transparent;
     display: inline-flex;
     align-items: center;
     gap: 0.1875rem;
+    white-space: nowrap;
     margin-top: auto;
     margin-bottom: -0.125rem;
     padding: 0.125rem 0;
@@ -1243,45 +1233,60 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     line-height: 1rem;
 }
 
-.list-section-title-collapsible > .section-count-badge {
+/* The section count: the pill with its own small number, and an open copy
+ * of the number one type step larger. Only one copy shows at a time, and
+ * each one rests untransformed. Chromium draws a scaling glyph from a bitmap,
+ * so a copy resting at a scale would stay soft until the scale ended. */
+.list-section-title-collapsible > .section-count {
     position: relative;
+    display: inline-flex;
     /* A hand-tuned lift, and the block below retires it wherever it can. The
        label's caps ride above its own line box's middle, by whatever the font's
        ascent and descent are worth, while the count sits at its pill's middle.
        This nudge stood in for that gap, and being a constant it was right at one
        ui-scale and one font. */
     top: -0.0625rem;
-    /* Extra breathing room after the section name, on top of the flex `gap`
-       (0.25rem) — sets the name-to-count spacing apart from the icon-to-name
-       gap so the badge doesn't crowd the label. */
+    /* Extra room after the section name, on top of the flex `gap` (0.25rem),
+       so the name-to-count spacing differs from the icon-to-name gap. */
     margin-left: 0.25rem;
+    /* The open copy's step, and how far the pill's number grows to meet it. */
+    --section-count-open-scale: 1.2;
+}
+
+.list-section-title-collapsible > .section-count > .section-count-badge {
+    position: relative;
     /* The pill moves to `::before`, so it can animate apart from the digits.
        `isolation` keeps the layer above the header's own background and below
        the digits. */
     isolation: isolate;
     background: none;
-    /* The bare number grows to the `--font-size-sm` step (12/10). A transform,
-       not a font-size, so the row keeps its height and the size animates. It
-       scales from the box's centre, so the digits keep the pill's centre. */
-    transform: scale(1.2);
-    transition: transform var(--duration-slow) ease-out;
+    /* An open section draws its number with the open copy. This one grows
+       out of sight, so the pill it carries fades from the right place.
+       `visibility`, not a transparent colour, which forced colours repaint. */
+    visibility: hidden;
+    scale: var(--section-count-open-scale);
+    transition: scale var(--duration-slow) ease-out;
 }
 
-.list-section-title-collapsible.collapsed > .section-count-badge {
-    transform: none;
-    transition: transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+/* Collapsing, this number springs down from the open copy's size. */
+.list-section-title-collapsible.collapsed > .section-count > .section-count-badge {
+    visibility: visible;
+    scale: none;
+    transition: scale var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 /* An open section shows its rows, so its count is a bare number. A collapsed
  * one hides them, and the pill marks that. The pill shrinks away on open and
  * springs back on collapse. Reduced motion collapses both to a swap. */
-.list-section-title-collapsible > .section-count-badge::before {
+.list-section-title-collapsible > .section-count > .section-count-badge::before {
     content: '';
     position: absolute;
     inset: 0;
     z-index: -1;
     border-radius: inherit;
     background: var(--section-count-fill);
+    /* Shown through the hidden badge, so it can still fade on open. */
+    visibility: visible;
     opacity: 0;
     transform: scale(0.5);
     transition:
@@ -1289,12 +1294,35 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
         transform var(--duration-normal) ease-in;
 }
 
-.list-section-title-collapsible.collapsed > .section-count-badge::before {
+.list-section-title-collapsible.collapsed > .section-count > .section-count-badge::before {
     opacity: 1;
     transform: scale(1);
     transition:
         opacity var(--duration-normal) ease-out,
         transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* The open copy, over the pill's box. Opening, it grows from the pill's
+   number up to its own size, which it rests at. */
+.section-count-open {
+    position: absolute;
+    inset: 0;
+    align-content: center;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1rem;
+    letter-spacing: normal;
+    white-space: nowrap;
+    text-align: center;
+    color: var(--text-secondary);
+    transition: scale var(--duration-slow) ease-out;
+}
+
+.list-section-title-collapsible.collapsed > .section-count > .section-count-open {
+    visibility: hidden;
+    scale: calc(1 / var(--section-count-open-scale));
+    transition: none;
 }
 
 /* The label, its icon and its count on ONE cap band, derived instead of nudged.
@@ -1320,8 +1348,30 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
         text-box-edge: cap alphabetic;
     }
 
-    .list-section-title-collapsible > .section-count-badge {
+    .list-section-title-collapsible > .section-count {
         top: 0;
+    }
+
+    /* Both copies grow from their baselines, each on a whole pixel. WebKit
+       repaints a scaling glyph every frame and snaps its baseline to the pixel
+       grid. A baseline that crosses pixel fractions mid-animation therefore
+       makes the number dip a pixel before it lands. The two baselines differ,
+       so the number takes that step once, on the frame the copies swap. */
+    .list-section-title-collapsible > .section-count > .section-count-badge {
+        transform-origin: 50% calc(100% - var(--badge-baseline-inset));
+    }
+
+    /* Trimmed to its baseline, the open copy's bottom edge IS the baseline.
+       `bottom` puts its caps on the box's middle, rounded to a whole pixel.
+       Centring the trimmed line instead lands a pixel apart in the two
+       engines. */
+    .section-count-open {
+        top: auto;
+        bottom: round(50% - 0.5 * 1cap, 1px);
+        align-content: normal;
+        text-box-trim: trim-end;
+        text-box-edge: cap alphabetic;
+        transform-origin: 50% 100%;
     }
 }
 

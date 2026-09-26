@@ -195,7 +195,7 @@ function runResumeSync(): void {
   // nothing until the reader opened the What's New page by hand.
   void loadReleaseNotices();
   // Re-send any compose draft the engine never received. Paired with the same
-  // flush in `useStartup`'s onResume, and needed separately from it: this path
+  // flush in `startClient`'s onResume, and needed separately from it: this path
   // runs on a reconnect the 5s health poll notices with no wake at all (a
   // desktop client, or a phone that stayed awake through the outage), where no
   // resume event ever fires. Idempotent, and a no-op when nothing is parked.
@@ -270,7 +270,7 @@ function runResumeSync(): void {
  *  visibilitychange, focus, and pageshow simultaneously on wake, causing
  *  three concurrent SSE disconnect/reconnect cycles.
  *
- *  Still load-bearing after `useStartup`'s `onResumeCoalesced` gate, which
+ *  Still load-bearing after `startClient`'s `onResumeCoalesced` gate, which
  *  collapses that same three-event burst before it reaches here. The two cover
  *  different windows: the gate is a fixed ~1s leading edge, while this flag
  *  lasts exactly as long as the `checkConnection` round-trip, which on a slow
@@ -403,7 +403,7 @@ let connectionCheckInFlight: Promise<boolean> | null = null;
  *
  *  Coalesced, because the failure/success counters below are module state
  *  carrying a documented tolerance (four bad ticks to red) and there are five
- *  ways in: the 5s poll and the startup probe in `useStartup`, `handleResume`,
+ *  ways in: the 5s poll and the startup probe in `startClient`, `handleResume`,
  *  `handleRestartTimeout`, and the `ThreadView` Retry button. Two of those
  *  routinely land together. An iOS wake fires `visibilitychange`, `focus` AND
  *  `pageshow` at the same moment the frozen 5s timer unfreezes, so `handleResume`
@@ -414,7 +414,7 @@ let connectionCheckInFlight: Promise<boolean> | null = null;
  *
  *  It returns the in-flight promise rather than a placeholder because the
  *  verdict is load-bearing for two callers: `handleResume` parks the whole sync
- *  on `false`, and `useStartup` arms the cold-start picker bounce on it. A
+ *  on `false`, and `startClient` arms the cold-start picker bounce on it. A
  *  second probe would answer the same question about the same moment, so
  *  sharing the first one's answer is not an approximation. Same shape as
  *  `loadAllThreads`' `loadingAll` guard, which returns early rather than

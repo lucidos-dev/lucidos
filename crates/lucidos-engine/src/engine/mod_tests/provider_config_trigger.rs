@@ -30,6 +30,20 @@ fn a_provider_credential_triggers_a_rebuild() {
     }
 }
 
+/// The boot pass scopes a legacy `local` key after the first build, and that
+/// build dropped the key as out of scope. Without a rebuild here, local chat
+/// runs keyless until the next restart.
+#[test]
+fn an_inferred_provider_scope_triggers_a_rebuild() {
+    let inferred = BusEvent::System(SystemEvent::CredentialScopeInferred {
+        service_name: "local".to_string(),
+        base_url: "http://localhost:11434/v1".to_string(),
+        actor: None,
+    });
+    let trigger = provider_config_trigger(&inferred);
+    assert!(trigger.is_some_and(|t| t.contains("local")));
+}
+
 /// The keyless tier has no credential, so its toggle is the only thing that can
 /// install it. Without this arm, turning it on would need a restart.
 #[test]

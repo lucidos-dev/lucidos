@@ -12,7 +12,7 @@ import { openNewTab } from '../../utils/newTab';
 import { workspaceTabName } from '../../utils/workspaceWindow';
 
 /** Hash-channel deep link to a thread. Hash (not `?thread=`) is deliberate:
- *  `useStartup` strips `?thread=` unconditionally to defuse stale SW deep-
+ *  `startClient` strips `?thread=` unconditionally to defuse stale SW deep-
  *  links, so the query channel can't be repurposed for user-initiated
  *  cross-workspace navigation. */
 export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
@@ -205,7 +205,7 @@ export async function openThreadInWorkspace(workspace: string, threadId: string)
  *  focuses the thread in place; a cross-workspace link hops to the target
  *  workspace's UI (its thread isn't in our `threadMap`). `workspace` undefined
  *  (an untagged link) is always treated as same-workspace. Shared by the global
- *  `.thread-link` click handler (useStartup) and the message-route popover's
+ *  `.thread-link` click handler (startClient) and the message-route popover's
  *  Workspace-origin link so the two routing decisions can't drift. */
 export function openThreadAcrossWorkspaces(workspace: string | undefined, threadId: string): void {
   if (workspace && workspaceName.value && workspace !== workspaceName.value) {

@@ -8,7 +8,7 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
-import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
+import { getContentTitle, getContentTitleShort, getDiffDescription, useContentTitleArrival } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
@@ -169,10 +169,6 @@ function MobileThreadHeader() {
  *  we do not author: files, apps, web pages, threads. Either way the tap
  *  tooltip carries the full title. */
 function MobileContentHeader() {
-  const title = getContentTitleShort();
-  const titleFull = getContentTitle();
-  const diffDesc = getDiffDescription();
-
   return (
     <div class="mobile-content-header">
       <div class="mobile-header-row">
@@ -180,20 +176,30 @@ function MobileContentHeader() {
         <div class="pane-header-spacer" />
         <div class="header-nav-cluster header-title-cluster">
           <ContentBackButton />
-          {title && (
-            <span
-              class="pane-header-title mobile-content-title"
-              data-tooltip={diffDesc || titleFull}
-              data-tooltip-tap
-            >
-              {title}
-            </span>
-          )}
+          <MobileContentTitle />
           <ContentForwardButton />
         </div>
         <ContentHeaderActions layout="mobile" />
       </div>
     </div>
+  );
+}
+
+/** The content title between the chevrons. Its own component, so the fade's
+ *  hook stays out of the header row, which tests walk by calling it. */
+function MobileContentTitle() {
+  const title = getContentTitleShort();
+  const { titleKey, titleFade } = useContentTitleArrival();
+  if (!title) return null;
+  return (
+    <span
+      key={titleKey}
+      class={`pane-header-title mobile-content-title${titleFade}`}
+      data-tooltip={getDiffDescription() || getContentTitle()}
+      data-tooltip-tap
+    >
+      {title}
+    </span>
   );
 }
 
@@ -237,7 +243,7 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadStatusIcon status={visualStatus} />
-      <ThreadTitleEditor threadId={threadId} title={threadTitle} />
+      <ThreadTitleEditor key={threadId} threadId={threadId} title={threadTitle} />
       <span class="thread-view-header-actions">
         {eventThread.meta.state !== 'composing' && (
           <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />

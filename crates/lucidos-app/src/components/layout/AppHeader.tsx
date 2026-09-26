@@ -21,7 +21,7 @@ import { ContentHeaderActions } from './ContentHeaderActions';
 import { ThreadHeaderActions } from './ThreadHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
 import { WorkspaceNameLabel } from './WorkspaceNameLabel';
-import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
+import { getContentTitle, getContentTitleShort, getDiffDescription, useContentTitleArrival } from './headerHelpers';
 import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
@@ -222,6 +222,7 @@ export function AppHeader() {
   const headerTitleFull = getContentTitle();
   const diffDesc = getDiffDescription();
   const showContentTitle = !!headerTitle;
+  const { titleKey, titleFade } = useContentTitleArrival();
 
   const startEditingUrl = useCallback(() => {
     if (!showUrlPreview || !url) return;
@@ -347,14 +348,15 @@ export function AppHeader() {
                   />
                 ) : showUrlPreview ? (
                   <span
-                    class="panel-url-title"
+                    key={titleKey}
+                    class={`panel-url-title${titleFade}`}
                     onClick={startEditingUrl}
                     data-tooltip={url!}
                   >
                     {headerTitle}
                   </span>
                 ) : (
-                  <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
+                  <span key={titleKey} class={`pane-header-title-text${titleFade}`} data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
                 )
               )}
               <ContentForwardButton />

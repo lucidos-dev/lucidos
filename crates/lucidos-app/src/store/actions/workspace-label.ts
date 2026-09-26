@@ -37,7 +37,7 @@
  * `canList`, the stricter of that component's two gates), so on a direct-port
  * page it never lists and this module is the only adopter.
  *
- * WHICH IS WHY BOTH ROUTES ARE ALSO RE-RUN ON RESUME (`useStartup.ts`'s
+ * WHICH IS WHY BOTH ROUTES ARE ALSO RE-RUN ON RESUME (`startup.ts`'s
  * `onResume`). "The next load picks it up" is a promise the reporting device
  * cannot keep: an installed iOS PWA does not reload when it returns from
  * background, which is the premise of that whole handler. Behind the gateway

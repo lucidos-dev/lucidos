@@ -475,7 +475,7 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
 - `install.sh`, `uninstall.sh`, `scripts/lib/{service,stage_runtime,headless_tarball,install_common}.sh` → also `bash scripts/lib/install_test.sh` (20 s, offline)
 - `scripts/release.sh`, `scripts/lib/release_draft.sh` → also `bash scripts/lib/release_draft_test.sh` (25 s) and `bash scripts/lib/release_rc_gate_test.sh` (5 s), both offline against a stubbed `gh`
-- `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
+- `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test && npx vite build` (the build is the only local gate that runs the entry chunk budget, ADR 0288)
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
 - `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
 - `crates/lucidos-app/src/components/settings/LocaleSection.tsx` → `./scripts/test-engine.sh -- -- voice::language` (subsumed by `make test` when the diff also touches Rust)

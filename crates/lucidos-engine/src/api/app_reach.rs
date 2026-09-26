@@ -411,6 +411,10 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
 /// the security switches: the command guard, the tool-call cap and the network
 /// bind. An app is no more trusted than the agent, so it may not write them
 /// either. Every `key` parameter counts, so a repeated one cannot hide a key.
+///
+/// [`APP_REFUSED_PREFERENCES`] adds keys the agent may write but an app may not.
+/// The engine's own bookkeeping (`preference_catalog::SILENT_PREF_KEYS`) is no
+/// setting at all. An app overwriting `vapid_keys` stops every push.
 fn human_only_preference(
     mounted: &str,
     method: &axum::http::Method,
@@ -425,8 +429,26 @@ fn human_only_preference(
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             (form_decode(name) == "key").then(|| form_decode(value))
         })
-        .find(|key| crate::core::preference_catalog::internal_hint(key).is_some())
+        .find(|key| {
+            crate::core::preference_catalog::internal_hint(key).is_some()
+                || crate::core::preference_catalog::is_silent_key(key)
+                || APP_REFUSED_PREFERENCES.contains(&key.as_str())
+        })
 }
+
+/// Preferences that choose what a coding-agent session spawns and what it may
+/// do unasked. An app writes files under its own folder, which is the app
+/// thread's working directory. So a path pointed at `/bin/sh` runs the app's
+/// own script as the user when the next session starts.
+///
+/// `local_base_url` chooses where local-model chat is sent. An app pointing it
+/// at its own host would receive every prompt and the conversation behind it.
+const APP_REFUSED_PREFERENCES: &[&str] = &[
+    crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+    crate::core::PREF_CODING_AGENT_CODEX_PATH,
+    crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+    crate::core::PREF_LOCAL_BASE_URL,
+];
 
 /// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`
 /// does. An undecodable one stays raw, and `Query` refuses that request anyway.

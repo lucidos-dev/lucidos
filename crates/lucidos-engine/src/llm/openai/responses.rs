@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::{
     AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
-    DEFAULT_MAX_COMPLETION_TOKENS,
+    DEFAULT_MAX_COMPLETION_TOKENS, STREAM_LOG_TAG,
 };
 
 impl OpenAiProvider {
@@ -217,14 +217,23 @@ impl OpenAiProvider {
         'outer: loop {
             let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
                 Ok(Some(Ok(bytes))) => bytes,
-                Ok(Some(Err(e))) => return Err(format!("Stream read error: {}", e).into()),
+                Ok(Some(Err(e))) => {
+                    return Err(crate::llm::stream_failure(
+                        format!("Stream read error: {}", e),
+                        on_token.is_some() && !content.is_empty(),
+                        STREAM_LOG_TAG,
+                    ))
+                }
                 Ok(None) => break,
                 Err(_) => {
-                    return Err(format!(
-                        "OpenAI stream timed out (no data for {}s)",
-                        CHUNK_TIMEOUT_SECS
-                    )
-                    .into())
+                    return Err(crate::llm::stream_failure(
+                        format!(
+                            "OpenAI stream timed out (no data for {}s)",
+                            CHUNK_TIMEOUT_SECS
+                        ),
+                        on_token.is_some() && !content.is_empty(),
+                        STREAM_LOG_TAG,
+                    ))
                 }
             };
 
@@ -252,7 +261,14 @@ impl OpenAiProvider {
                         &mut tool_calls,
                         &mut item_id_map,
                         &mut meta,
-                    )?;
+                    )
+                    .map_err(|e| {
+                        crate::llm::stream_failure(
+                            e.to_string(),
+                            on_token.is_some() && prev_len > 0,
+                            STREAM_LOG_TAG,
+                        )
+                    })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
                             // Floor defensively — `prev_len` is a byte length

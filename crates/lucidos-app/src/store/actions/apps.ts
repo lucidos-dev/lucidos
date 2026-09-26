@@ -45,7 +45,7 @@ import { openExternal } from '../../utils/tauri';
 
 // Shared in-flight load so concurrent callers await the SAME fetch instead of
 // racing duplicate GETs: the compose destination picker's render-path kick-off
-// and useStartup's eager load both fire on a cold start. An early `return`
+// and startClient's eager load both fire on a cold start. An early `return`
 // would resolve immediately while the real fetch is still in flight, so an
 // `await loadApps()` caller (openAppById) would then read a still-'loading'
 // Loadable and falsely report failure — hence sharing the promise, not skipping.

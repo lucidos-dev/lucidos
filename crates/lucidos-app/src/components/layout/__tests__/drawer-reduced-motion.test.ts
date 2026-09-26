@@ -14,9 +14,8 @@
  * event and no timer may stand between the call and the closed state.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  closeDrawer, drawerClosing, drawerOpen, forceCloseDrawer, openDrawer,
-} from '../Drawer';
+import { closeDrawer } from '../Drawer';
+import { drawerClosing, drawerOpen, forceCloseDrawer, openDrawer } from '../drawerState';
 import { motionPreference, osReducesMotion } from '../../../utils/motion';
 import type { MotionPref } from '@lucidos/appearance';
 

@@ -3,7 +3,7 @@
 // even on the threads list (no thread focused) the device should report as
 // visible so the backend can suppress cross-device push notifications.
 //
-// Triggers (driven by useStartup wiring):
+// Triggers (driven by startClient wiring):
 // - `visibilitychange` → always POST current visibility (forceRefresh) — iOS
 //   WebKit fires this on JS-suspend resume even when the page stayed visible,
 //   so the lastReported dedupe would silently skip the post and let the

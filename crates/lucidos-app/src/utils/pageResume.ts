@@ -125,7 +125,7 @@ function onClickCapture(e: MouseEvent): void {
 function install(): void {
   if (installed || !isWebKit()) return;
   installed = true;
-  // Match useStartup's canonical resume set — iOS often restores a PWA via
+  // Match startClient's canonical resume set: iOS often restores a PWA via
   // `pageshow` (bfcache) or `focus` with no `visible` `visibilitychange`, which
   // left the old visibilitychange-only repaint silent and the content black
   // until a tap.

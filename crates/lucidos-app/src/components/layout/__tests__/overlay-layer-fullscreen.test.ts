@@ -31,7 +31,7 @@ const layerSrc = src('../OverlayLayer.tsx');
 const appUiSrc = src('../../apps/AppUiInline.tsx');
 const headerSrc = src('../ContentHeaderActions.tsx');
 const appsActionsSrc = src('../../../store/actions/apps.ts');
-const startupSrc = src('../../../hooks/useStartup.ts');
+const startupSrc = src('../../../store/startup.ts');
 const modalCss = src('../../../styles/global/modal-overlay.css');
 const previewsCss = src('../../../styles/panels/previews.css');
 

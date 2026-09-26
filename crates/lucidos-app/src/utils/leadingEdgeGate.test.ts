@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createLeadingEdgeGate } from './leadingEdgeGate';
 
 /** The gate exists for one measured symptom: an iOS PWA wake fires
- *  `visibilitychange`, `focus` and `pageshow` together, so `useStartup`'s
+ *  `visibilitychange`, `focus` and `pageshow` together, so `startClient`'s
  *  `onResume` ran its whole reconciliation fan-out three times per wake. The
  *  gateway log showed it as 3x `engine/version-status`, 3x
  *  `memory/embedding-model-status` and 3-4x `notifications` inside one second.

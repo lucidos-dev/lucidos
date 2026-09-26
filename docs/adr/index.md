@@ -293,3 +293,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0283: The slowness warning opens on a slow engine as well as on memory, and names memory only on evidence; amends 0274](0283-slowness-opens-the-warning.md)
 - [0284: A card awaiting the user draws at the bottom; once resolved it sits at its resolution point, in every lane](0284-pending-card-pins-to-the-bottom.md)
 - [0285: Right-click follows one rule: an object with actions opens its own ⋯ menu, content keeps the native menu, and empty chrome shows none in the desktop app, where Option+right-click is the escape.](0285-right-click-follows-one-rule.md)
+- [0286: The scroll-anchor correction carries its sub-pixel remainder in a top spacer, so a turn-control press moves nothing](0286-anchor-carries-its-sub-pixel-remainder.md)
+- [0287: The drawer's Threads/Filters swap, and every pane title, move like a page navigation: the shared navigation cover clears off the arriving view, and the title arrives on the same key and curve. Partly supersedes 0276's one-timing, always-mounted fades.](0287-drawer-filter-swap-is-a-navigation.md)
+- [0288: The entry chunk holds the data layer and startup only; the UI shell is a preloaded parallel chunk the splash covers, and interaction-only popovers are idle-prefetched](0288-entry-chunk-is-the-data-layer.md)

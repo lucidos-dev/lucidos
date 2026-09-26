@@ -4,7 +4,7 @@
  * A leaf for the same reason as `deviceIdHeader.ts`: the API client and the
  * store both need it, and `store/actions/devices.ts` imports the client.
  *
- * `useStartup` registers the device without awaiting it, and the engine refuses
+ * `startClient` registers the device without awaiting it, and the engine refuses
  * a mutation from a device it cannot resolve (ADR 0169). So a first keystroke,
  * a presence report or a first send could race the registration and come back
  * 401. A refused compose start cleared the reader's draft.

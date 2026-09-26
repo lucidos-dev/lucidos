@@ -27,20 +27,20 @@ import { randomUUID } from 'crypto';
  * A BROWSER test and not a unit test, deliberately: the rounding is the
  * platform's, and jsdom has no layout to round.
  *
- * The bound is half a pixel because that is the floor. Layout is fractional and
- * a scroll offset is not, so some residual is unavoidable; what the fix removes
- * is the part that was ours. Half a pixel is the guarantee `Math.round` gives,
- * rather than a number read off a run.
+ * The bound is layout precision, not half a pixel. A scroll offset holds only
+ * whole pixels, so the correction carries its sub-pixel rest in a top spacer
+ * on the transcript (ADR 0286). A half-pixel rest still re-landed every line on
+ * its own device-pixel row, reported as elements twitching on each press.
  *
  * NON-INTEGER ROOT FONT SIZES are the point of the scales below. At a whole-pixel
  * root every rem-authored height is a whole number too, the two roundings cancel
  * and the bug is invisible; the shipped mobile default is 112.5%.
  */
 
-/** How far the reader's content may move on a press. See the header: this is the
- *  guarantee of rounding one number, not an observed value. A hair of slack for
+/** How far the reader's content may move on a press. Layout lengths are
+ *  multiples of 1/64px, so the hold is exact up to that; this leaves slack for
  *  float noise in the comparison itself. */
-const MAX_DRIFT_PX = 0.51;
+const MAX_DRIFT_PX = 0.05;
 
 const TURNS = 12;
 
@@ -162,7 +162,7 @@ async function park(page: Page, frac: number): Promise<void> {
 }
 
 test.describe('A turn control holds itself still', () => {
-  test("the full-response toggle moves the control by under half a pixel, at a fractional root font size", async ({ page }) => {
+  test("the full-response toggle leaves the control where it was, at a fractional root font size", async ({ page }) => {
     await assertHealthy(page);
     const threadId = seedThread('Turn control anchor');
     try {
@@ -191,7 +191,7 @@ test.describe('A turn control holds itself still', () => {
         .toBeGreaterThan(500);
 
       let measured = 0;
-      for (const scale of ['105%', '112.5%']) {
+      for (const scale of ['105%', '112.5%', '137.5%']) {
         await page.evaluate((s) => document.documentElement.style.setProperty('--user-ui-scale', s), scale);
         await page.waitForTimeout(500);
         const rootPx = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));

@@ -162,7 +162,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     expect(opened, 'Filter threads button not visible in the mobile threads header').toBe(true);
 
     await page.waitForFunction(() => {
-      const row = document.querySelector('.mobile-swipe-pane .thread-filter-panel .drawer-view-option');
+      const row = document.querySelector('.mobile-swipe-pane .thread-filter-cover[data-open] .drawer-view-option');
       return !!row && row.getBoundingClientRect().height > 0;
     }, undefined, { timeout: 10_000 });
 

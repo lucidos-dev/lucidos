@@ -1878,8 +1878,9 @@ export function ThreadView() {
     // transcript, an ordinary state a collapsed desktop split produces, and
     // neither has another way back. The restore holds its own wait open across
     // the same state (`onDeadline`), so a pane revealed later still lands the
-    // reader. Keyed on the thread alone, so a streaming append does not churn
-    // the observer.
+    // reader. Keyed on the thread, so a streaming append does not churn the
+    // observer. `threadInMap` too: the cold-open return carries no `areaRef`,
+    // so the first run finds nothing and must re-run once the thread lands.
     useLayoutEffect(() => {
         const el = areaRef.current;
         if (!el || !threadId) return;
@@ -1889,7 +1890,7 @@ export function ThreadView() {
         });
         observer.observe(el);
         return () => observer.disconnect();
-    }, [threadId]);
+    }, [threadId, threadInMap]);
 
     if (!threadId) return null;
 
@@ -1955,7 +1956,7 @@ export function ThreadView() {
         <div class="thread-view">
             <div class="thread-view-header">
                 <ThreadStatusIcon status={visualStatus} />
-                <ThreadTitleEditor threadId={threadId} title={threadTitle} />
+                <ThreadTitleEditor key={threadId} threadId={threadId} title={threadTitle} />
                 <span class="thread-view-header-actions">
                     {eventThread.meta.state !== 'composing' && (
                         <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />

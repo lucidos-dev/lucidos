@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, type APIRequestContext } from './fixtures';
 import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
@@ -43,8 +43,47 @@ function placeholderOverflowPx(el: Element): number {
   probe.remove();
   return Math.max(0, needed - ta.clientHeight);
 }
+
+/** An answer resumes the agent: the engine starts a real Claude Code process
+ *  for the thread. End it, and wait until the engine lets it go, before the
+ *  rows are deleted. Left running, it writes events for about a minute. Each
+ *  one re-creates the deleted row under a LATER spec. See
+ *  docs/e2e-test-decisions.md § "A spec ends every session it starts". */
+async function endResumedSession(request: APIRequestContext, threadId: string): Promise<void> {
+  const answered = psql(`SELECT COUNT(*) FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered'`);
+  if (answered === '0') return;
+  const live = async () => {
+    const res = await request.get(`/api/v1/claude-code/commands?thread_id=${threadId}`);
+    expect(res.ok(), `commands for thread ${threadId}: HTTP ${res.status()}`).toBe(true);
+    return (await res.json()).has_active_session === true;
+  };
+  // Before the session registers, a stop has nothing to reach and the spawn
+  // goes ahead. A resume that already ended by itself needs no stop.
+  const endedAfterAnswer = () => psql(
+    `SELECT COUNT(*) FROM events e JOIN events a ON a.thread_id = e.thread_id
+     WHERE a.thread_id = '${threadId}' AND a.event_type = 'UserQuestionAnswered' AND e.created > a.created
+       AND e.event_type IN ('CodingAgentIdled', 'ResponseCanceled', 'ResponseAborted', 'ResponseFailed')`,
+  ) !== '0';
+  await expect.poll(async () => (await live()) || endedAfterAnswer(), {
+    message: `the session the answer resumed on thread ${threadId} neither started nor ended`,
+    intervals: [250],
+    timeout: 30_000,
+  }).toBe(true);
+  if (await live()) {
+    // A 404 means it ended between the poll and the stop. The poll below is
+    // the check that counts.
+    const stop = await request.post(`/api/v1/claude-code/stop?thread_id=${threadId}&discard=true`);
+    expect([200, 404], `stop thread ${threadId}: HTTP ${stop.status()}`).toContain(stop.status());
+  }
+  await expect.poll(live, {
+    message: `the session the answer resumed on thread ${threadId} is still live after the stop`,
+    intervals: [250],
+    timeout: 30_000,
+  }).toBe(false);
+}
+
 test.describe('CC AskUserQuestion — interactive answer flow', () => {
-  test('clicking an option flips the divider initiator panel in place', async ({ page }) => {
+  test('clicking an option flips the divider initiator panel in place', async ({ page, request }) => {
     await assertHealthy(page);
 
     const suffix = randomUUID().slice(0, 8);
@@ -175,6 +214,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         page.locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Pick option ${suffix}"))`),
       ).toHaveCount(1);
     } finally {
+      await endResumedSession(request, threadId);
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
         `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
@@ -256,7 +296,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }
   });
 
-  test('multi-select: toggle two options, submit, panel flips to multi-resolved', async ({ page }) => {
+  test('multi-select: toggle two options, submit, panel flips to multi-resolved', async ({ page, request }) => {
     await assertHealthy(page);
 
     const suffix = randomUUID().slice(0, 8);
@@ -331,6 +371,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(answered.locator('.question-option-selected')).toHaveCount(2);
       await expect(answered.locator('.question-option-dimmed')).toHaveCount(1);
     } finally {
+      await endResumedSession(request, threadId);
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
         `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
@@ -470,7 +511,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
   // rather than the prompt. That is `threadEntryFocusTarget` winning over the
   // prompt's own thread-switch focus, which is the half that races if either
   // side decides independently.
-  test('first option takes visible keyboard focus, arrows step, Enter answers', async ({ page }) => {
+  test('first option takes visible keyboard focus, arrows step, Enter answers', async ({ page, request }) => {
     test.skip(isMobileViewport(page), 'choice-card keyboard focus is desktop-only (no hardware keyboard on mobile)');
     await assertHealthy(page);
 
@@ -544,6 +585,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         { intervals: [400], timeout: 10_000 },
       ).toBe('opt-2');
     } finally {
+      await endResumedSession(request, threadId);
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
         `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,

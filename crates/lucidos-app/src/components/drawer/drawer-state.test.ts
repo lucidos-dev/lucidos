@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { drawerOpen, drawerClosing, closeDrawer, openDrawer } from '../layout/Drawer';
+import { closeDrawer } from '../layout/Drawer';
+import { drawerOpen, drawerClosing, openDrawer } from '../layout/drawerState';
 
 /** Simulate the burger click handler logic from AppHeader */
 function burgerClick() {

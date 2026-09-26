@@ -59,11 +59,12 @@ describe('a stacked pair draws no dot', () => {
 
   it('both meta clusters clip past their right edge, and only a little', () => {
     // The right inset is the focus-ring slack. The dot centres 0.625rem past
-    // the edge, so a wider slack would let a stacked status show its dot.
+    // the edge, so a wider slack would let a stacked status show its dot. The
+    // left stays open: a stacked timestamp overflows the cluster leftward.
     for (const cluster of ['response-meta', 'initiator-meta']) {
       const clip = rulesTargeting(chatCss, cluster).find((r) => r.props.has('clip-path'));
       expect(clip?.props.get('clip-path'), `${cluster} does not clip`)
-        .toBe('inset(-1rem -0.25rem -1rem -1rem)');
+        .toBe('inset(-1rem -0.25rem -1rem -100vw)');
       // A glyph draws no dot, and the queued bin's chip needs more slack.
       expect(clip?.selector).toContain(`.${cluster}:not(:has(.exchange-status-glyph))`);
     }

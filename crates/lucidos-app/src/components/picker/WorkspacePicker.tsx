@@ -405,7 +405,8 @@ export function WorkspacePicker() {
   async function fetchWorkspaces(): Promise<void> {
     const list = await listWorkspaces();
     workspaces.value = { status: 'loaded', data: list };
-    error.value = null;
+    // Never clears `error`: the 2s poll runs this too, and would wipe a failed
+    // action's message before the user read it. `withBusy` clears it instead.
     // Remember the count so a future load can size its skeleton to this list
     // (no skeleton→list bounce on the next visit).
     rememberLastWorkspaceCount(list.length);

@@ -37,9 +37,22 @@ function setPanelOpen(open: boolean): void {
   syncEscapeRegistration();
 }
 
+/** False while the thread drawer is collapsed. The panel stays open through a
+ *  collapse, so reopening the drawer lands back on the filters. But a panel
+ *  nobody can see must not take the next Escape. */
+let paneVisible = true;
+
+export function setThreadFilterPaneVisible(visible: boolean): void {
+  paneVisible = visible;
+  syncEscapeRegistration();
+}
+
 function syncEscapeRegistration(): void {
-  if (threadFilterPanelOpen.value) pushOverlay({ id: OVERLAY_ID, dismiss: closeThreadFilterPanel, hasPanel: false });
-  else removeOverlay(OVERLAY_ID);
+  if (threadFilterPanelOpen.value && paneVisible) {
+    pushOverlay({ id: OVERLAY_ID, dismiss: closeThreadFilterPanel, hasPanel: false });
+  } else {
+    removeOverlay(OVERLAY_ID);
+  }
 }
 
 // A panel RESTORED open has to take its Escape entry here, at load, because

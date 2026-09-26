@@ -215,6 +215,20 @@ describe('turn header meta stacking', () => {
     });
   }
 
+  it('keeps a timestamp after a status out of the cluster minimum', () => {
+    // The timestamp is wider than "Working". Counted in the cluster's minimum,
+    // it wrapped the whole pair onto its own row on a phone, where the pair then
+    // fit on one line: "Working · Today 21:26:33" under the controls. A zero
+    // width drops it from the minimum; the max-content basis still wraps it.
+    for (const ts of ['response-timestamp', 'initiator-timestamp']) {
+      const rule = cssRules(INITIATOR_CSS)
+        .find(r => r.selector.split(',').some(s => s.trim() === `.exchange-status-label + .${ts}`));
+      expect(rule, `.exchange-status-label + .${ts} must be sized`).toBeDefined();
+      expect(rule?.props.get('width')).toBe('0');
+      expect(rule?.props.get('flex')).toBe('0 0 max-content');
+    }
+  });
+
   it('defines the row unit the fields are sized to', () => {
     // Every assertion above names `var(--turn-header-line)`, and an undefined
     // custom property in a `min-height` is invalid at computed-value time: the

@@ -36,7 +36,7 @@ export function appIdForFrame(frame: HTMLIFrameElement | null): string | null {
 }
 
 /** True when `source` is the content window of a currently mounted app iframe.
- *  Shared by the SDK confirm bridge (`useStartup.ts`), the app-frame keyboard
+ *  Shared by the SDK confirm bridge (`startup.ts`), the app-frame keyboard
  *  shortcut forwarder (`useKeyboardShortcuts.ts`) and the app bridge. */
 export function isKnownAppFrame(source: MessageEventSource | null): boolean {
   return appFrameFor(source) !== null;

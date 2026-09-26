@@ -28,7 +28,7 @@ import {
   updateBadge,
   systemAttentionBadge,
 } from '../../../store/systemAttentionBadge';
-import { drawerClosing, drawerOpen } from '../../layout/Drawer';
+import { drawerClosing, drawerOpen } from '../../layout/drawerState';
 
 const DRAWER = readFileSync(
   fileURLToPath(new URL('../../layout/Drawer.tsx', import.meta.url)), 'utf8',

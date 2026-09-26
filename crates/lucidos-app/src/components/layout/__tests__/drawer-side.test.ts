@@ -17,7 +17,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   drawerSide, drawerSideFor, openDrawer, forceCloseDrawer,
-} from '../Drawer';
+} from '../drawerState';
 
 /** Minimal stand-in for the hamburger element: openDrawer only measures it. */
 function anchorAt(left: number, width = 28): HTMLElement {

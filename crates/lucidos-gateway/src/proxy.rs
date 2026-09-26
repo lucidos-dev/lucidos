@@ -572,7 +572,7 @@ pub fn starting_page(label: &str) -> Response {
 ///
 /// This page is also the ONLY place the "install a newer version" remedy can reach
 /// the user: the packaged in-app update toast is started from the workspace app's
-/// startup hook (`useStartup.ts` → `startAppUpdateChecks`), which never runs while
+/// startup hook (`store/startup.ts` → `startAppUpdateChecks`), which never runs while
 /// the workspace is stuck on this splash.
 pub fn failed_page(message: &str) -> Response {
     // `Retry-After` still advertises a sane poll interval for well-behaved clients

@@ -1,15 +1,15 @@
 // @vitest-environment jsdom
 /**
- * The thread filter panel's fade through (`ThreadFilterCover`).
+ * The thread filter panel's swap with the thread list (`ThreadFilterCover`).
  *
- * The cover and its fade layer stay mounted, so the CSS fades run on elements
- * that already exist. The panel mounts on open and stays for the fade out.
- * The open SIGNAL still drives everything else at once: the overlay stack,
- * the pressed Filter button, and the cover's `inert`.
+ * The cover and the panel inside it stay mounted, so opening costs no render.
+ * The open SIGNAL drives everything at once: the overlay stack, the pressed
+ * Filter button, and the cover's `data-open` and `inert`. Each swap mounts a
+ * fresh navigation cover, the same one a content-pane navigation gets.
  *
- * jsdom runs no transitions, so these tests pin the DOM states the CSS keys on
- * (`data-open`, `inert`, the panel's presence). The frames themselves are
- * covered by `e2e/threads-header-filter-transitions.spec.ts`.
+ * jsdom runs no animations, so these tests pin the DOM states the CSS keys on.
+ * The frames themselves are covered by
+ * `e2e/threads-header-filter-transitions.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -18,96 +18,100 @@ import { ThreadFilterCover } from '../ThreadFilterCover';
 import { threadFilterPanelOpen, openThreadFilterPanel, closeThreadFilterPanel } from '../../../store/threadFilterPanel';
 import { overlayStack } from '../../../store/overlayStack';
 import { filterButtonState } from '../../layout/ThreadFilterPanel';
-import { motionPreference } from '../../../utils/motion';
 
-/** Past the 150ms fade and its 50ms slack, at 1x. */
-const PAST_EXIT_MS = 201;
-
-describe('the filter panel fades through, and the signal still leads', () => {
+describe('the filter panel swaps under a navigation cover, and the signal leads', () => {
   let host: HTMLElement;
   const cover = () => host.querySelector('.thread-filter-cover') as HTMLElement;
   const panel = () => host.querySelector('.thread-filter-panel');
+  const navCover = () => host.querySelector('.nav-cover');
   const onStack = () => overlayStack.value.some(e => e.id === 'thread-filter-panel');
   const pressed = () => filterButtonState({
     view: 'all', panelOpen: threadFilterPanelOpen.value, channelFilterActive: false, attentionCount: 0,
   }).pressed;
 
   beforeEach(() => {
-    vi.useFakeTimers();
     closeThreadFilterPanel();
     host = document.createElement('div');
     document.body.appendChild(host);
-    act(() => { render(<ThreadFilterCover />, host); });
+    act(() => { render(<ThreadFilterCover paneVisible />, host); });
   });
 
   afterEach(() => {
     act(() => { render(null, host); });
     host.remove();
     closeThreadFilterPanel();
-    motionPreference.value = 'system';
-    vi.useRealTimers();
   });
 
-  it('keeps an empty, inert cover mounted while shut', () => {
-    expect(cover()).not.toBeNull();
+  it('keeps the panel mounted under an inert cover while shut', () => {
     expect(cover().hasAttribute('data-open')).toBe(false);
     expect(cover().hasAttribute('inert')).toBe(true);
-    expect(cover().querySelector('.thread-filter-fade')).not.toBeNull();
-    expect(panel()).toBeNull();
+    expect(panel()).not.toBeNull();
+    expect(panel()!.parentElement).toBe(cover());
   });
 
-  it('opens the cover and mounts the panel in the same render', () => {
+  it('opens on the same panel, with no remount', () => {
+    const shut = panel();
     act(() => { openThreadFilterPanel(); });
     expect(cover().hasAttribute('data-open')).toBe(true);
     expect(cover().hasAttribute('inert')).toBe(false);
-    expect(panel()).not.toBeNull();
+    expect(panel()).toBe(shut);
   });
 
-  it('keeps the panel for the fade out, while the signal has already moved on', () => {
+  it('closes at once: the stack entry, the pressed state and the cover', () => {
     act(() => { openThreadFilterPanel(); });
+    const open = panel();
     act(() => { closeThreadFilterPanel(); });
-    // At once: the stack entry, the pressed state and the cover's state.
     expect(onStack()).toBe(false);
     expect(pressed()).toBe(false);
     expect(cover().hasAttribute('data-open')).toBe(false);
     // A leaving cover takes no pointer and no focus.
     expect(cover().hasAttribute('inert')).toBe(true);
-    // But the options are still there to fade.
-    expect(panel()).not.toBeNull();
-
-    act(() => { vi.advanceTimersByTime(PAST_EXIT_MS); });
-    expect(panel()).toBeNull();
+    expect(panel()).toBe(open);
   });
 
-  it('reopens during the fade out on the same panel, with no remount', () => {
+  it('reopens straight away on the same panel', () => {
     act(() => { openThreadFilterPanel(); });
     const first = panel();
     act(() => { closeThreadFilterPanel(); });
-    act(() => { vi.advanceTimersByTime(100); });
     act(() => { openThreadFilterPanel(); });
     expect(panel()).toBe(first);
     expect(cover().hasAttribute('data-open')).toBe(true);
     expect(onStack()).toBe(true);
-    // The old exit timer must not unmount the reopened panel.
-    act(() => { vi.advanceTimersByTime(PAST_EXIT_MS); });
-    expect(panel()).toBe(first);
   });
 
-  it('closes during the fade in straight into the fade out', () => {
-    act(() => { openThreadFilterPanel(); });
-    const first = panel();
-    act(() => { closeThreadFilterPanel(); });
-    expect(cover().hasAttribute('data-open')).toBe(false);
-    expect(panel()).toBe(first);
+  it('mounts no navigation cover on the first render, so a restored panel shows at once', () => {
+    expect(navCover()).toBeNull();
   });
 
-  it('does not keep the panel for a fade under reduced motion', () => {
-    // Reduced motion scales the fade to next to nothing. Only the fixed slack
-    // is left, and CSS has already hidden the cover for all of it.
-    motionPreference.value = 'reduce';
+  it('covers each swap with a fresh cover, over the filter cover', () => {
     act(() => { openThreadFilterPanel(); });
+    const opening = navCover();
+    expect(opening).not.toBeNull();
+    // After the filter cover, so it paints over it at any equal z-index too.
+    expect(cover().nextElementSibling).toBe(opening);
+    expect(opening!.getAttribute('aria-hidden')).toBe('true');
     act(() => { closeThreadFilterPanel(); });
-    act(() => { vi.advanceTimersByTime(51); });
-    expect(panel()).toBeNull();
+    // A new element, so its animation restarts from opaque.
+    expect(navCover()).not.toBeNull();
+    expect(navCover()).not.toBe(opening);
+  });
+
+  it('unmounts the cover on its fuse, animation or not', () => {
+    vi.useFakeTimers();
+    try {
+      act(() => { openThreadFilterPanel(); });
+      expect(navCover()).not.toBeNull();
+      act(() => { vi.advanceTimersByTime(1_000); });
+      expect(navCover()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stays open but inert on a collapsed drawer, so its controls take no focus', () => {
+    act(() => { openThreadFilterPanel(); });
+    act(() => { render(<ThreadFilterCover paneVisible={false} />, host); });
+    expect(cover().hasAttribute('data-open')).toBe(true);
+    expect(cover().hasAttribute('inert')).toBe(true);
   });
 });

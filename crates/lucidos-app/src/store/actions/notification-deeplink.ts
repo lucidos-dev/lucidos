@@ -139,7 +139,7 @@ function validateTap(raw: unknown): Tap | null {
  *  notification tap (`routeToDeepLink` in `sw.js`) — the deterministic warm-tab
  *  delivery that replaced a fragment-only `client.navigate('/#…')` (Chrome
  *  doesn't fire `hashchange` for it; see system-knowhow/notifications.md §4.5).
- *  The message handler in `useStartup` routes it through `dispatchDeepLink` —
+ *  The message handler in `startClient` routes it through `dispatchDeepLink`,
  *  the same dispatcher the cold-open URL path (`handleHashLocation`) uses.
  *
  *  `tap` arrives as a structured object (the engine puts it on the push

@@ -6,7 +6,8 @@
  *  moment the chevrons moved to flank the title: the hamburger leads the row
  *  and they sit in its middle, so the three are no longer adjacent on either
  *  viewport. Each header composes them itself. */
-import { drawerOpen, drawerClosing, closeDrawer, openDrawer } from './Drawer';
+import { closeDrawer } from './Drawer';
+import { drawerOpen, drawerClosing, openDrawer } from './drawerState';
 import { webviewHasHistory } from '../../store/store';
 import { canGoBack, canGoForward, navBack, navForward, navHistory, navGoTo } from '../../store/actions/navigation';
 import type { NavEntry } from '../../store/actions/navigation';

@@ -61,9 +61,11 @@ pub(crate) fn validate_server_id(id: &str) -> Result<(), Box<dyn std::error::Err
     if !crate::llm::validate::is_wire_safe_tool_name(id) {
         return Err(format!("MCP server id '{}' is not usable: {}", id, shape).into());
     }
-    if id.contains("__") {
+    // A trailing `_` joins the separator: `mcp__srv___run` parses back as
+    // server `srv`, tool `_run`.
+    if id.contains("__") || id.ends_with('_') {
         return Err(format!(
-            "MCP server id '{}' must not contain '__', which separates the id from the tool name: {}",
+            "MCP server id '{}' must not contain '__' or end in '_', since '__' separates the id from the tool name: {}",
             id, shape
         )
         .into());
@@ -418,7 +420,7 @@ mod tests {
         for ok in ["backstage", "dev-docs", "roblox_studio", "bq2"] {
             assert!(validate_server_id(ok).is_ok(), "{ok} should be accepted");
         }
-        for bad in ["", "back.stage", "my server", "a__b", "café"] {
+        for bad in ["", "back.stage", "my server", "a__b", "srv_", "café"] {
             assert!(
                 validate_server_id(bad).is_err(),
                 "{bad:?} should be refused"

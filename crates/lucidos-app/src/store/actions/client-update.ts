@@ -82,7 +82,7 @@ export async function syncClientUpdateFromBuild(): Promise<void> {
   // The refresh dismissal is now a GLOBAL preference (not synchronous
   // localStorage), so until preferences load we can't tell whether this build was
   // already dismissed. Skip rather than fail-open into a flash of an
-  // already-dismissed toast on cold start — useStartup re-runs this right after
+  // already-dismissed toast on cold start; startClient re-runs this right after
   // loadPreferences, and resume / PreferencesChanged re-derive thereafter. A
   // 'failed' load proceeds (fail-open surfacing is the safe default).
   if (preferences.value.status === 'not-loaded' || preferences.value.status === 'loading') return;

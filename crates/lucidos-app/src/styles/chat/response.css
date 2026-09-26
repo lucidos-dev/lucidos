@@ -103,10 +103,11 @@
    three are pinned together in the test.
 
    `flex: 1 1 0` is a basis, not a minimum: `min-width` is still `auto`, so the
-   item cannot be laid out narrower than its widest field, and where even THAT
-   will not fit beside the controls the whole pair still wraps to its own row.
-   That is the right last resort, since the alternative is a timestamp
-   overhanging the icons to its left.
+   item cannot be laid out narrower than its status. A timestamp after a status
+   adds nothing to that minimum (see its rule in chat/input-messages.css). So
+   the status keeps the executor's line and the timestamp drops under it. The
+   whole pair wraps to its own row only where the status alone will not fit
+   beside the controls. The alternative there is a status over the icons.
 
    `white-space: nowrap` picks WHERE the break lands. Without it the elastic
    box shrinks by breaking the timestamp's own space first ("Today" over

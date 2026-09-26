@@ -207,9 +207,11 @@ PRIVATE_DATA_HOMEPATH_NAME_CHARS='A-Za-z0-9._@&-'
 # character, so the name ENDS there and the full `a&amp;b` would never be a
 # whole name. `Anne` pairs with the `/Users/Anne Doe` shell-quoting fixture — a
 # Jane-Doe stand-in, not a real person. `u` and `user` are the Linux stand-ins
-# (`/home/u`, `/home/user`). One list, interpolated into an allow-regex covering
-# both roots — a per-root copy would drift.
-PRIVATE_DATA_HOMEPATH_PLACEHOLDER_RE='me|alex|x|u|k|dev|user|Anne|someone|a&b|a&amp|\.\.\.'
+# (`/home/u`, `/home/user`). `me.x@example.com` is the one email-shaped name,
+# for the autolink fixtures. Keep it exact and on the RFC 2606 reserved domain:
+# a registrable domain is an address someone can own. One list, interpolated
+# into an allow-regex covering both roots, because a per-root copy would drift.
+PRIVATE_DATA_HOMEPATH_PLACEHOLDER_RE='me|alex|x|u|k|dev|user|Anne|someone|a&b|a&amp|me\.x@example\.com|\.\.\.'
 PRIVATE_DATA_HOMEPATH_RE="${PRIVATE_DATA_HOMEPATH_BOUNDARY_RE}${PRIVATE_DATA_HOMEPATH_ROOT_RE}[${PRIVATE_DATA_HOMEPATH_NAME_CHARS}]+"
 PRIVATE_DATA_HOMEPATH_ALLOW_RE="${PRIVATE_DATA_HOMEPATH_BOUNDARY_RE}${PRIVATE_DATA_HOMEPATH_ROOT_RE}(${PRIVATE_DATA_HOMEPATH_PLACEHOLDER_RE})([^${PRIVATE_DATA_HOMEPATH_NAME_CHARS}]|\$)"
 

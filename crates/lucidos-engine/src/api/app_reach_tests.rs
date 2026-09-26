@@ -500,6 +500,89 @@ async fn a_stamped_write_of_a_human_only_preference_is_refused() {
     }
 }
 
+/// The coding-agent binary paths choose what a session spawns, and the
+/// permission mode chooses what it may do unasked. Say an app sets the Codex
+/// path to `/bin/sh` and writes `apps/<id>/app-server`. The next Codex thread
+/// on that app then runs the app's script as the user. The agent may still set
+/// these keys, so they are refused to an app alone.
+#[tokio::test]
+async fn a_stamped_write_of_a_coding_agent_spawn_preference_is_refused() {
+    use axum::http::StatusCode;
+    for query in [
+        "key=coding_agent_codex_path",
+        "key=coding_agent_claude_path",
+        "key=coding_agent_claude_permission_mode",
+        "key=coding%5Fagent%5Fcodex%5Fpath",
+        "key=theme&key=coding_agent_codex_path",
+    ] {
+        assert_eq!(
+            status_of(
+                "PUT",
+                &format!("/api/v1/preferences?{query}"),
+                Some("habit-tracker")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an app wrote the coding-agent preference in `{query}`"
+        );
+    }
+    assert_eq!(
+        status_of(
+            "PUT",
+            "/api/v1/preferences?key=coding_agent_codex_path",
+            None
+        )
+        .await,
+        StatusCode::OK,
+        "Settings writes the coding-agent paths through this same route"
+    );
+}
+
+/// `local_base_url` chooses where local-model chat goes. An app setting it to
+/// its own host would read every prompt. Settings still writes it.
+#[tokio::test]
+async fn a_stamped_write_of_the_local_model_host_is_refused() {
+    use axum::http::StatusCode;
+    assert_eq!(
+        status_of(
+            "PUT",
+            "/api/v1/preferences?key=local_base_url",
+            Some("habit-tracker")
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an app redirected local-model chat"
+    );
+    assert_eq!(
+        status_of("PUT", "/api/v1/preferences?key=local_base_url", None).await,
+        StatusCode::OK,
+        "Settings writes the local host through this same route"
+    );
+}
+
+/// `vapid_keys` is the Web Push signing keypair. An app replacing it with
+/// garbage makes every later push fail to sign, on every device.
+#[tokio::test]
+async fn a_stamped_write_of_engine_bookkeeping_is_refused() {
+    use axum::http::StatusCode;
+    for query in [
+        "key=vapid_keys",
+        "key=backfill_repo_names_from_changes_done",
+        "key=theme&key=vapid_keys",
+    ] {
+        assert_eq!(
+            status_of(
+                "PUT",
+                &format!("/api/v1/preferences?{query}"),
+                Some("habit-tracker")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an app wrote the engine's own state in `{query}`"
+        );
+    }
+}
+
 /// The bridge stamps the decoded app id, and `fetch` sends a Latin-1 character
 /// as one raw byte. A stamp that is not ASCII is still a stamp.
 #[tokio::test]

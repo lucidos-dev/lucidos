@@ -41,7 +41,7 @@ describe('toast suppression while engine is restarting', () => {
   });
 
   it('suppresses the SW "New version available" refresh prompt while restarting', () => {
-    // Mirrors useStartup's onUpdateFound: the post-restart frontend rebuild
+    // Mirrors startClient's onUpdateFound: the post-restart frontend rebuild
     // activates a new service worker, which would otherwise stack a Refresh
     // toast on top of the "Restarting engine..." status.
     engineRestarting.value = true;

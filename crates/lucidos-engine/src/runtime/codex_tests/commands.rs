@@ -138,7 +138,26 @@ fn resume_turn_places_global_flags_before_subcommand() {
         );
     }
     assert_eq!(args[resume_idx + 1], "sid-123");
-    assert_eq!(args[resume_idx + 2], "follow up");
+    assert_eq!(args[resume_idx + 2], "--");
+    assert_eq!(args[resume_idx + 3], "follow up");
+}
+
+/// A message that opens with a markdown bullet is still a prompt. Without the
+/// `--` separator codex parses `- also add tests` as a flag and refuses the
+/// whole turn, on the fresh and the resume path alike.
+#[test]
+fn a_prompt_starting_with_a_dash_follows_the_separator() {
+    let config = test_config(Path::new("/tmp/wt"));
+    for resume in [None, Some("sid-123")] {
+        let cmd = build_codex_turn_command(&config, None, None, resume, "- also add tests", &[]);
+        let args = collect_args(&cmd);
+        let n = args.len();
+        assert_eq!(
+            &args[n - 2..],
+            ["--", "- also add tests"],
+            "resume {resume:?}: the prompt must follow `--`; got {args:?}"
+        );
+    }
 }
 
 /// Every per-turn child must wire the lucidos MCP server so the model can

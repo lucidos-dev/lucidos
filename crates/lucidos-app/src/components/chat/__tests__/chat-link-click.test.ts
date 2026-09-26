@@ -14,7 +14,7 @@
  *   1. linkifyPaths.rewriteAppAnchor — turns `<a href="apps/<id>/index.html">`
  *      into `<a href="#" class="app-link" data-app-id="<id>">` at render
  *      time. Verified directly by the linkifyPaths.test.ts suite.
- *   2. ChatExchange.handleLinkClick fallback — intercepts a click on ANY
+ *   2. handleMarkdownLinkClick fallback (components/shared/markdownLinkClick.ts): intercepts a click on ANY
  *      anchor whose href is `apps/<id>/...` even when the rewriter didn't
  *      run (stale memo, iOS PWA bundle predating the rewriter, apps list
  *      not loaded at first render). Verified here.
@@ -35,7 +35,7 @@ import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
-const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
+const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
 
 const APPS: App[] = [
   { id: 'work-tracker', name: 'Lucidos Work', description: 'x' },
@@ -86,7 +86,7 @@ function mkEvent(target: MockAnchor): { target: MockAnchor; defaultPrevented: bo
   return e;
 }
 
-/** Mirror of handleLinkClick's branch order from ChatExchange.tsx. Pinned
+/** Mirror of handleMarkdownLinkClick's branch order (markdownLinkClick.ts). Pinned
  *  by the source-regex test below — any structural change in the real
  *  handler must also update this mirror, and the regex assertion will
  *  catch a divergence. */
@@ -174,7 +174,7 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       return;
     }
     // Terminal guard: an href the browser cannot act on reaches nothing, so
-    // it must never navigate. Mirrors ChatExchange's `deadLinkMessage`.
+    // it must never navigate. Mirrors the router's `deadLinkMessage`.
     if (!browserHandlesHref(href) && !href.startsWith('#')) {
       e.preventDefault();
       if (!href) cb.toast('This link has no destination');
@@ -731,9 +731,9 @@ describe('chat link click — the bug-report scenario', () => {
 
 describe('chat link click — handler structure pin', () => {
   // Catches a future edit that quietly changes the branch structure of the
-  // real handleLinkClick in ChatExchange.tsx, which would let the in-test
+  // real handleMarkdownLinkClick, which would let the in-test
   // mirror (runHandleLinkClick above) drift and give us false confidence.
-  it('handleLinkClick has the six branches in the documented order, each terminated by return;', () => {
+  it('handleMarkdownLinkClick has the six branches in the documented order, each terminated by return;', () => {
     // The six branches must appear in this order: image → artifact → app →
     // trigger → nav → anchor-fallback. Each branch must close with `return;` before
     // the next `.closest(...)` opens — otherwise a refactor that swaps two
@@ -741,36 +741,36 @@ describe('chat link click — handler structure pin', () => {
     // in another) would slip past a simpler text-order pin. The lazy
     // quantifier guarantees the first `return;` after each selector is the
     // boundary, so reordering forces a regex break.
-    const m = chatExchangeSource.match(/function handleLinkClick[\s\S]*?\n  \}\n/);
-    expect(m, 'handleLinkClick not found in ChatExchange.tsx').not.toBeNull();
+    const m = routerSource.match(/function handleMarkdownLinkClick[\s\S]*?\n\}\n/);
+    expect(m, 'handleMarkdownLinkClick not found in markdownLinkClick.ts').not.toBeNull();
     const body = m![0];
     const sequence =
       /closest\('\.image-thumbnail'\)[\s\S]+?return;[\s\S]+?closest\('\.artifact-link'\)[\s\S]+?return;[\s\S]+?closest\('\.app-link'\)[\s\S]+?return;[\s\S]+?closest\('\.trigger-link'\)[\s\S]+?return;[\s\S]+?closest\('\.nav-link'\)[\s\S]+?return;[\s\S]+?closest\('a'\)/;
     expect(body).toMatch(sequence);
   });
 
-  it('handleLinkClick uses all six href extractors in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppTargetFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*extractTriggerIdFromHref.*from.*linkifyPaths/);
-    expect(chatExchangeSource).toMatch(/extractAppTargetFromHref\(rawHref\)/);
-    expect(chatExchangeSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
-    expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
-    expect(chatExchangeSource).toMatch(/extractBareAppRef\(rawHref\)/);
-    expect(chatExchangeSource).toMatch(/extractDataPathTarget\(rawHref\)/);
-    expect(chatExchangeSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
+  it('handleMarkdownLinkClick uses all six href extractors in the fallback branch', () => {
+    expect(routerSource).toMatch(/import[\s\S]*?extractAppTargetFromHref[\s\S]*?extractNavTargetFromHref[\s\S]*?extractLocalFileTarget[\s\S]*?extractBareAppRef[\s\S]*?extractDataPathTarget[\s\S]*?extractTriggerIdFromHref[\s\S]*?from '..\/..\/utils\/linkifyPaths'/);
+    expect(routerSource).toMatch(/extractAppTargetFromHref\(rawHref\)/);
+    expect(routerSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
+    expect(routerSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
+    expect(routerSource).toMatch(/extractBareAppRef\(rawHref\)/);
+    expect(routerSource).toMatch(/extractDataPathTarget\(rawHref\)/);
+    expect(routerSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
   it('fallback branch calls openAppById, openApp, handleNavigationRequest, openFilePreview and openLocalFile with preventDefault', () => {
-    const m = chatExchangeSource.match(/closest\('a'\)[\s\S]*?\n  \}\n/);
+    const m = routerSource.match(/closest\('a'\)[\s\S]*?\n\}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
     // The extractAppTargetFromHref arm resolves through openAppById, not a
     // cache lookup. That is the bug fix this file guards. It hands over the
     // app fragment too, so a link can name a place inside the app.
     expect(body).toContain(
-      'openAppById(appTargetRef.appId, undefined, appTargetRef.fragment ?? undefined)',
+      'openAppById(appTargetRef.appId, source, appTargetRef.fragment ?? undefined)',
     );
     expect(body).toContain('openApp(app)');
-    expect(body).toContain('navigateToTrigger(triggerId)');
+    expect(body).toContain('navigateToTrigger(triggerId, source)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
     expect(body).toContain('openFilePreview(dataPath)');
     expect(body).toContain('openLocalFile(localFile)');
@@ -780,7 +780,7 @@ describe('chat link click — handler structure pin', () => {
   it('the app extractor arm never gates on the cached apps list before opening', () => {
     // Pins the fix. A cache gate here would let a miss fall through to the
     // terminal guard, which blames the href's SCHEME for a stale cache.
-    const m = chatExchangeSource.match(/const appTargetRef = extractAppTargetFromHref\(rawHref\);[\s\S]*?\n      const triggerId/);
+    const m = routerSource.match(/const appTargetRef = extractAppTargetFromHref\(rawHref\);[\s\S]*?\n    const triggerId/);
     expect(m, 'extractAppTargetFromHref arm not found').not.toBeNull();
     expect(m![0]).not.toContain('apps.find');
   });
@@ -797,12 +797,12 @@ describe('chat link click — handler structure pin', () => {
     // than a disk path.
     // The trigger extractor claims `trigger:` and nothing else, so its slot is
     // for narrative order rather than for resolving a collision.
-    const appIdx = chatExchangeSource.indexOf('extractAppTargetFromHref(rawHref)');
-    const trigIdx = chatExchangeSource.indexOf('extractTriggerIdFromHref(rawHref)');
-    const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
-    const bareIdx = chatExchangeSource.indexOf('extractBareAppRef(rawHref)');
-    const dataIdx = chatExchangeSource.indexOf('extractDataPathTarget(rawHref)');
-    const fileIdx = chatExchangeSource.indexOf('extractLocalFileTarget(rawHref)');
+    const appIdx = routerSource.indexOf('extractAppTargetFromHref(rawHref)');
+    const trigIdx = routerSource.indexOf('extractTriggerIdFromHref(rawHref)');
+    const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
+    const bareIdx = routerSource.indexOf('extractBareAppRef(rawHref)');
+    const dataIdx = routerSource.indexOf('extractDataPathTarget(rawHref)');
+    const fileIdx = routerSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
     expect(trigIdx).toBeGreaterThan(appIdx);
     expect(navIdx).toBeGreaterThan(trigIdx);
@@ -815,8 +815,8 @@ describe('chat link click — handler structure pin', () => {
     // The whole point of the guard is that nothing follows it: it is the
     // bottom of the whitelist. A new extractor added AFTER it would be dead
     // code, and, worse, would read as covering a shape the guard already ate.
-    const m = chatExchangeSource.match(/function handleLinkClick[\s\S]*?\n  \}\n/);
-    expect(m, 'handleLinkClick not found in ChatExchange.tsx').not.toBeNull();
+    const m = routerSource.match(/function handleMarkdownLinkClick[\s\S]*?\n\}\n/);
+    expect(m, 'handleMarkdownLinkClick not found in markdownLinkClick.ts').not.toBeNull();
     const body = m![0];
     const guard = body.indexOf('showToast(');
     expect(guard, 'terminal guard toast not found').toBeGreaterThan(0);
@@ -834,7 +834,7 @@ describe('chat link click — handler structure pin', () => {
     // the two extractors, and the preview bridge. They are one exported
     // `hasUrlScheme` now; an inline copy drifts the routers apart silently.
     const sources = [
-      ['ChatExchange.tsx', chatExchangeSource],
+      ['markdownLinkClick.ts', routerSource],
       ['linkifyPaths.ts', readFileSync(resolve(here, '../../../utils/linkifyPaths.ts'), 'utf-8')],
       ['previewIframeLinks.ts', readFileSync(resolve(here, '../../files/previewIframeLinks.ts'), 'utf-8')],
     ] as const;

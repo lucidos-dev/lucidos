@@ -1013,7 +1013,20 @@ pub(super) async fn get_preferences(
         )
     })?;
 
-    Ok(Json(PreferencesResponse { preferences }))
+    Ok(Json(PreferencesResponse {
+        preferences: settings_only(preferences),
+    }))
+}
+
+/// Drop the engine's own bookkeeping rows from a preference map.
+///
+/// `GET /preferences` is an `App` route, and `vapid_keys` holds the Web Push
+/// private signing key. Silent keys are not settings, so no client reads them.
+fn settings_only(
+    mut preferences: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    preferences.retain(|key, _| !crate::core::preference_catalog::is_silent_key(key));
+    preferences
 }
 
 /// Set a preference (optionally per-device)
@@ -2361,5 +2374,30 @@ mod hand_over_guard_tests {
     #[test]
     fn a_blank_header_asserts_nothing_and_is_allowed() {
         assert_eq!(foreign_hand_over(&headers_with(Some("   ")), "dev-a"), None);
+    }
+}
+
+#[cfg(test)]
+mod preferences_read_tests {
+    use super::*;
+
+    /// An app reads `GET /preferences`, so the Web Push private key must not
+    /// ride along. Every other row is a setting, and it still does.
+    #[test]
+    fn the_preference_read_leaves_out_engine_bookkeeping() {
+        let stored: std::collections::HashMap<String, String> = [
+            ("theme", "dark"),
+            ("vapid_keys", r#"{"private_key_pem":"secret"}"#),
+            ("backfill_repo_names_from_changes_done", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let served = settings_only(stored);
+
+        assert_eq!(served.get("theme").map(String::as_str), Some("dark"));
+        assert!(!served.contains_key("vapid_keys"));
+        assert!(!served.contains_key("backfill_repo_names_from_changes_done"));
     }
 }

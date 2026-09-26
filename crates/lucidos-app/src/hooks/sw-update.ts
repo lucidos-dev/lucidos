@@ -144,7 +144,7 @@ const SW_UPDATE_CHECK_DELAYS_MS = [3_000, 8_000, 15_000, 30_000];
  *  Either way `registration.update()` then detects the new worker and fires the
  *  "New version available → Refresh" toast (`surfaceUpdateToast` in
  *  store/actions/client-update.ts, reached through `syncClientUpdateFromBuild`;
- *  useStartup.ts routes to it rather than deciding). Without this
+ *  startup.ts routes to it rather than deciding). Without this
  *  nudge the toast would only appear on the next resume or the 5-min SW health
  *  probe — this makes "push Apply → get told when it's ready" prompt and hands-free.
  *
@@ -396,7 +396,7 @@ export async function getServedBuildId(): Promise<string | null> {
 
 /** Ask the active service worker for its stamped BUILD_ID (vite.config.ts
  *  `lucidos-sw-stamp`). The reply arrives as a `lucidos:build-id` message,
- *  handled in useStartup.ts where it lands in the `serviceWorkerBuildId` signal.
+ *  handled in startup.ts where it lands in the `serviceWorkerBuildId` signal.
  *  Its one reader is the System > Overview page's "Service worker" row.
  *
  *  We query the SW rather than baking the id into the app bundle so the reported

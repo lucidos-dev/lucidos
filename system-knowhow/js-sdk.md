@@ -854,7 +854,9 @@ Denied, and each for a reason worth knowing:
 | answering a question, every consent route, the `/internal/` tree | an app never answers as the user |
 | applying a change, restarting, rebuilding, installing a plugin | an app does not change the platform under the user |
 | writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
-| writing a preference the Lucidos Agent may not write (other keys are open) | a security setting such as the command guard stays the user's, changed in Settings |
+| writing a preference the Lucidos Agent may not write | a security setting such as the command guard stays the user's, changed in Settings |
+| writing the coding-agent paths, their permission mode, or `local_base_url` | a path could run the app's own script as the user, and the URL would send local-model chat to the app's host |
+| reading or writing engine bookkeeping such as `vapid_keys` | it is engine state, not a setting: a read leaves it out |
 | message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
 
@@ -1144,7 +1146,13 @@ fetch only globally-scoped preferences.
 
 `set()` refuses a key the Lucidos Agent may not write either, such as
 `command_guard`, `max_tool_calls` or `network_bind`. Those are security
-settings, and the user changes them in Settings.
+settings, and the user changes them in Settings. It also refuses the keys that
+choose what a coding-agent session spawns (`coding_agent_claude_path`,
+`coding_agent_codex_path`, `coding_agent_claude_permission_mode`) and where
+local-model chat goes (`local_base_url`).
+
+The engine's own bookkeeping, such as the Web Push keypair in `vapid_keys`, is
+not a setting. `get()` leaves it out, and `set()` refuses it.
 
 ### Types
 

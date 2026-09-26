@@ -13,6 +13,9 @@
 #
 # LUCIDOS_NO_GATEWAY=1 falls back to the legacy direct-engine model, the same
 # fork web-dev.sh has. The window then loads the engine root.
+#
+# The window rebuilds and restarts itself when the desktop app's Rust code
+# changes. Frontend changes arrive through the engine, as in any browser.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,23 +75,9 @@ show_banner "tauri"
 WINDOW_URL="$(desktop_window_url \
     "${GATEWAY_MODE:-}" "$PROTO" "$GATEWAY_PORT" "${GATEWAY_WS_ID:-}" "$ENGINE_PORT")"
 
-# Kill old Tauri process before launching a new one.
-#
-# `pgrep -f` proposes candidates; the EXECUTABLE decides. A coding agent
-# carries the engine's thread history inside a roughly 22 KB
-# `--append-system-prompt` argument, so a thread quoting this phrase matches
-# the pattern and used to be killed by it. Same class as ADR 0025, and as
-# `select_cargo_lock_holders` in scripts/lib/workspace.sh.
-while IFS= read -r tauri_pid; do
-    [ -z "$tauri_pid" ] && continue
-    tauri_comm="$(ps -p "$tauri_pid" -o comm= 2>/dev/null || true)"
-    [ "${tauri_comm##*/}" = "cargo" ] || continue
-    if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$tauri_pid"; then
-        continue
-    fi
-    echo "Killing old Tauri process (PID $tauri_pid)..."
-    kill "$tauri_pid" 2>/dev/null || true
-done < <(pgrep -f "cargo tauri dev" 2>/dev/null || true)
+# Replace this checkout's previous window, if one is still running. With the
+# watcher on, a survivor would mean two watchers rebuilding on every change.
+stop_tauri_dev_watchers "$FRONTEND_DIR"
 
 # Leaves the shared gateway and every peer workspace running. See
 # cleanup_processes, which releases only this workspace's own markers.
@@ -96,13 +85,22 @@ trap 'cleanup_processes; exit 0' SIGINT SIGTERM
 
 echo "Launching Tauri desktop app at $WINDOW_URL ..."
 
-# Run Tauri in foreground — when user closes the window, cleanup trap fires.
+# Run Tauri in the foreground. Closing the window ends `cargo tauri dev` and
+# this script; Ctrl-C signals the whole process group and fires the trap.
+#
+# The watcher is on: a change to the app's Rust inputs, or to a path crate it
+# depends on, rebuilds and restarts the window. The allow-list in
+# crates/.taurignore scopes it, so frontend edits and engine or gateway rebuilds
+# never restart it.
+# The old reason for `--no-watch` is gone: a restart once killed the live Vite
+# server, which ADR 0014 removed. Why it is safe now:
+# docs/plans/2026-09-25-tauri-dev-window-rebuilds-on-app-changes.md.
+#
 # --config: override devUrl to the door serving this workspace.
 # Trailing `-- --locked` reaches the inner cargo build, so this window is built
 # strictly from the committed Cargo.lock and errors on manifest drift instead of
 # rewriting it (ADR 0020). Same form as `cargo tauri build` in build-dmg.sh.
 cd "$FRONTEND_DIR"
 cargo tauri dev \
-    --no-watch \
     --config "{\"build\":{\"devUrl\":\"$WINDOW_URL\"}}" \
     -- --locked

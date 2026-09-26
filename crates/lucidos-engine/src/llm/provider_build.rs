@@ -278,8 +278,17 @@ struct StoredInputs {
     xai: Option<(AuthType, String)>,
     opencode_free_pref: Option<String>,
     local_base: Option<String>,
-    local_key: Option<String>,
+    local_key: Option<StoredLocalKey>,
     switches: ProviderSwitches,
+}
+
+/// The stored `local` key and the hosts it may be sent to.
+///
+/// `local_base_url` is a preference the agent and an app can write, so the key
+/// must never follow it on trust (ADR 0144 decision 4).
+struct StoredLocalKey {
+    value: String,
+    base_urls: Vec<String>,
 }
 
 /// Read every stored credential and preference the build needs, in one place.
@@ -331,7 +340,12 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         }
     }
     match CredentialStore::get(pool, "local").await {
-        Ok(cred) => stored.local_key = cred.map(|c| c.auth_value),
+        Ok(cred) => {
+            stored.local_key = cred.map(|c| StoredLocalKey {
+                value: c.auth_value,
+                base_urls: c.base_urls,
+            })
+        }
         Err(e) => {
             crate::log!(
                 "[Startup] Failed to read local provider credential, omitting local: {}",
@@ -963,33 +977,39 @@ fn build_opencode_free_provider(
 /// Build the local OpenAI-compatible provider (Ollama / LM Studio / vLLM /
 /// llama.cpp). Opt-in: only built when the user signalled local use via the
 /// `local_base_url` preference (`base_url_pref`), a `local` credential
-/// (`api_key_cred`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
+/// (`stored_key`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
 /// env vars — otherwise `None`, so a default localhost backend isn't conjured
 /// for users who never asked for it (and the "no provider configured" guard
 /// stays honest). The base URL resolves pref → env → [`DEFAULT_LOCAL_BASE_URL`];
-/// the key is optional (the `Authorization` header is omitted when empty).
+/// the key is optional (the `Authorization` header is omitted when empty), and
+/// is presented only inside its scope: see [`local_key_in_scope`].
 fn build_local_provider(
     base_url_pref: Option<String>,
-    api_key_cred: Option<String>,
+    stored_key: Option<StoredLocalKey>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
     let base_pref = base_url_pref.filter(|s| !s.trim().is_empty());
     let base_env = std::env::var("LUCIDOS_LOCAL_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let key = api_key_cred.filter(|s| !s.trim().is_empty()).or_else(|| {
-        std::env::var("LUCIDOS_LOCAL_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    });
+    let stored_key = stored_key.filter(|k| !k.value.trim().is_empty());
+    let env_key = std::env::var("LUCIDOS_LOCAL_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
-    if base_pref.is_none() && base_env.is_none() && key.is_none() {
+    if base_pref.is_none() && base_env.is_none() && stored_key.is_none() && env_key.is_none() {
         return None;
     }
 
+    // An env key is pinned to the env base URL, or the default, never to the
+    // preference. Same pairing as `api::proxy_builtin::resolve_local`.
+    let env_key_host = base_env
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
     let base = base_pref
         .or(base_env)
         .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+    let key = local_key_in_scope(&base, stored_key, env_key.map(|k| (k, env_key_host)));
     match OpenAiProvider::new_with_base_url(
         key.unwrap_or_default(),
         default_model.to_string(),
@@ -1008,6 +1028,47 @@ fn build_local_provider(
             crate::log!("[Startup] Failed to build local provider: {}", e);
             None
         }
+    }
+}
+
+/// The `local` key the provider may present to `base`, if any.
+///
+/// A stored key goes only where its credential's scope covers `base`. An env
+/// key goes only to the host it is pinned to. Anything else is dropped with a
+/// log line, and the provider runs keyless. The stored key wins over the env
+/// one, as in `api::proxy_builtin::resolve_local`.
+fn local_key_in_scope(
+    base: &str,
+    stored_key: Option<StoredLocalKey>,
+    env_key: Option<(String, String)>,
+) -> Option<String> {
+    match (stored_key, env_key) {
+        (Some(stored), _) => {
+            if crate::core::credential_scope_covers(&stored.base_urls, base) {
+                Some(stored.value)
+            } else {
+                crate::log!(
+                    "[Startup] Not sending the stored 'local' key to {}: its scope is {:?}. \
+                     Re-save the key in Settings → Models → Providers to scope it to this URL",
+                    base,
+                    stored.base_urls
+                );
+                None
+            }
+        }
+        (None, Some((key, host))) => {
+            if crate::core::credential_scope_covers(std::slice::from_ref(&host), base) {
+                Some(key)
+            } else {
+                crate::log!(
+                    "[Startup] Not sending LUCIDOS_LOCAL_API_KEY to {}: it is pinned to {}",
+                    base,
+                    host
+                );
+                None
+            }
+        }
+        (None, None) => None,
     }
 }
 
@@ -1046,6 +1107,57 @@ mod tests {
             ProviderBuildOutcome::Install { web_search, .. } => web_search,
             ProviderBuildOutcome::FailFast => panic!("expected Install, got FailFast"),
         }
+    }
+
+    fn stored_local_key(scope: &[&str]) -> Option<StoredLocalKey> {
+        Some(StoredLocalKey {
+            value: "local-secret".to_string(),
+            base_urls: scope.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// The key reaches the host the user saved it for.
+    #[test]
+    fn a_stored_local_key_is_sent_inside_its_scope() {
+        let key = local_key_in_scope(
+            "http://localhost:11434/v1",
+            stored_local_key(&["http://localhost:11434/v1"]),
+            None,
+        );
+        assert_eq!(key.as_deref(), Some("local-secret"));
+    }
+
+    /// `local_base_url` is writable by the agent and by an app. Pointing it at
+    /// another host must not carry the stored key there.
+    #[test]
+    fn a_rewritten_base_url_does_not_carry_the_stored_local_key() {
+        let key = local_key_in_scope(
+            "https://attacker.example/v1",
+            stored_local_key(&["http://localhost:11434/v1"]),
+            None,
+        );
+        assert_eq!(key, None);
+    }
+
+    /// An unscoped key goes nowhere, as it does on the proxy path.
+    #[test]
+    fn an_unscoped_stored_local_key_is_not_sent() {
+        let key = local_key_in_scope("http://localhost:11434/v1", stored_local_key(&[]), None);
+        assert_eq!(key, None);
+    }
+
+    /// An env key follows the env base URL, never the preference.
+    #[test]
+    fn an_env_local_key_is_pinned_to_its_own_host() {
+        let env = || Some(("env-secret".to_string(), DEFAULT_LOCAL_BASE_URL.to_string()));
+        assert_eq!(
+            local_key_in_scope(DEFAULT_LOCAL_BASE_URL, None, env()).as_deref(),
+            Some("env-secret")
+        );
+        assert_eq!(
+            local_key_in_scope("https://attacker.example/v1", None, env()),
+            None
+        );
     }
 
     /// Whether an ambient provider source could pre-configure a provider in this

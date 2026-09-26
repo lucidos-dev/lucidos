@@ -86,8 +86,9 @@ fraction is only an engine-dependent error term.
   answer the new value. The deficit measured that way was intermittent, and the
   reverse press paid out a debt nobody owed. Kept as history: the read-back trap
   is a property of the platform, not of the debt.
-- The correction still carries a sub-pixel residual, bounded at half a pixel on
-  both engines. That is the floor, not a defect.
+- The scroll write still carries a sub-pixel residual, bounded at half a pixel
+  on both engines. ADR 0286 carries it in a top spacer, so the reader no longer
+  sees it.
 - `scrollTop` is a double on the way in and out, which makes the rounding look
   unnecessary at the type level. It is not: neither engine stores what it was
   handed.

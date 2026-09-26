@@ -565,41 +565,11 @@
     outline: none;
 }
 
-/* The content-pane navigation cover: an opaque theme surface that every
-   arriving content-pane view fades in from. Generalises `.app-ui-cover`
-   (panels/previews.css), which did the same for an app open; the difference is
-   what ends it. The app cover waits on the frame's `load` because it is hiding
-   a document the host does not author, while this one is purely the switch
-   frame and clears on its own animation. Mounted keyed by ContentPane.tsx,
-   which says why it is a cover rather than a fade on the content.
-
-   Named a cover, never a "reveal": `revealContentPane()` is an established and
-   entirely different thing in this pane (swipe to it on mobile, focus its pane
-   group on desktop), and one word for two mechanisms is drift. Every other
-   surface that hides a not-yet-ready view is a cover too (`.app-ui-cover`, the
-   quiet boot cover).
-
-   z-index over `.content-pane-body`, and far below `--z-app-fullscreen`: a
-   fullscreen app must not be covered by the pane it escaped. */
-.content-nav-cover {
-    position: absolute;
-    inset: 0;
+/* The navigation cover's host (global/host-components.css). Over
+   `.content-pane-body`, and far below `--z-app-fullscreen`: a fullscreen app
+   must not be covered by the pane it escaped. */
+.content-pane > .nav-cover {
     z-index: 1;
-    background: var(--bg-primary);
-    pointer-events: none;
-    animation: content-nav-cover-clear var(--duration-normal) ease-out forwards;
-}
-
-@keyframes content-nav-cover-clear {
-    from { opacity: 1; }
-    to { opacity: 0; }
-}
-
-/* No animation, and transparent from the first frame: the element is still
-   mounted for NAV_COVER_MS, so it must not be visible while it waits. */
-:root[data-motion="reduce"] .content-nav-cover {
-    animation: none;
-    opacity: 0;
 }
 
 
@@ -1301,12 +1271,6 @@
         color: var(--text-primary);
         white-space: nowrap;
         text-align: center;
-        overflow: hidden;
-    }
-
-    /* The title is a crossfade stack (ThreadsPaneTitle), a grid, so its words
-       live in the layers, and each layer ellipsises its own. */
-    .threads-header-title > .crossfade-layer {
         overflow: hidden;
         text-overflow: ellipsis;
     }

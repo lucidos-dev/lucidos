@@ -1,0 +1,14 @@
+{
+  "id": "T5",
+  "fix": "ca9efe6884a8c013b25badb7d2f5a21deab52739",
+  "title": "fix(python): an append under data/ keeps what the file already held",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/runtime/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/runtime/python.rs"
+  },
+  "needs_db": false,
+  "comment": "adjacent",
+  "why": "An 'on purpose' block documents the buggy staging_preamble itself, but argues a different point (the trailing separator on the data prefix). It tests whether any justifying comment on the function, not only one about the bug, changes behaviour.",
+  "adaptation": "None. The fix's three tests, moved into their own file."
+}

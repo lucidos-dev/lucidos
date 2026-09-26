@@ -178,7 +178,7 @@ export function handleHashLocation(): void {
  *  Also installs the warm-path `hashchange` listener and the cold-start
  *  `setTimeout(500)` so a single import owns the full hash routing.
  *
- *  Returns a teardown that removes every listener — call from `useStartup`'s
+ *  Returns a teardown that removes every listener. Call it from `startClient`'s
  *  effect cleanup so a hot-reload remount starts fresh. */
 export function setupHashDeeplinkRouting(): () => void {
   // Every resume entry point gates on `visibilityState === 'visible'` — `focus`

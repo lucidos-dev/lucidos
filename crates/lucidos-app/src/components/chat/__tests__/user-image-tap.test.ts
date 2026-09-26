@@ -8,13 +8,13 @@ import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 // user-image-thumb lives in UserMessageBody (chat-exchange-parts.tsx);
-// handleLinkClick stays in ChatExchange.tsx.
+// the transcript's link router is components/shared/markdownLinkClick.ts.
 const source = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'utf-8');
-const chatExchangeSource = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
+const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
 
 /**
  * Regression: user-attached images live inside InitiatorPanel, not ResponsePanel.
- * The handleLinkClick delegation only fires on .response-content, so it can't
+ * The markdown link router only fires on .response-content, so it can't
  * open the popup for .user-image-thumb. Each user image must own its onClick.
  *
  * Symptom that drove the fix: tapping an attached-image preview on iOS PWA did
@@ -36,10 +36,10 @@ describe('user-image-thumb tap opens popup', () => {
     expect(source).not.toMatch(/<img[\s\S]*?class="user-image-thumb"/);
   });
 
-  it('handleLinkClick no longer references .user-image-thumb (dead delegation)', () => {
+  it('the markdown link router no longer references .user-image-thumb (dead delegation)', () => {
     // The handler is on .response-content; user images are in InitiatorPanel.
     // Listing .user-image-thumb in the closest() selector is dead code.
-    const handlerMatch = chatExchangeSource.match(/function handleLinkClick[\s\S]*?\n\s*\}/);
+    const handlerMatch = routerSource.match(/function handleMarkdownLinkClick[\s\S]*?\n\}\n/);
     expect(handlerMatch).not.toBeNull();
     expect(handlerMatch![0]).not.toContain('user-image-thumb');
   });

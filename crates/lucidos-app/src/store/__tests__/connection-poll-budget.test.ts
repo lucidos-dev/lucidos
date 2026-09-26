@@ -9,7 +9,7 @@
  * exists to report.
  *
  * Pinned here rather than left to a comment because the two constants have
- * different consumers (`hooks/useStartup.ts` and `api/client/chat.ts`) and
+ * different consumers (`store/startup.ts` and `api/client/chat.ts`) and
  * neither can see the relation from where it sits.
  */
 import { describe, it, expect } from 'vitest';

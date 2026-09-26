@@ -240,10 +240,10 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   const [groupId, setGroupId] = useServerBackedField(existingTrigger?.group_id ?? '');
   // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
-  // Enter and blur BOTH call commitNewGroupDraft; committing hides the field,
-  // whose trailing blur would POST the same name again (409). Submit-once flag,
-  // reset when the inline-create field reopens.
-  const creatingGroupRef = useRef(false);
+  // Set once the draft is submitted or cancelled. Hiding the field fires a
+  // trailing blur into commitNewGroupDraft, which would POST again (409) or
+  // create the group Escape cancelled. Reset when the field reopens.
+  const groupDraftSettledRef = useRef(false);
 
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
@@ -395,7 +395,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
 
   function handleGroupChange(value: string) {
     if (value === NEW_GROUP_SENTINEL) {
-      creatingGroupRef.current = false;
+      groupDraftSettledRef.current = false;
       setNewGroupDraft('');
       return;
     }
@@ -404,10 +404,10 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   }
 
   async function commitNewGroupDraft() {
-    if (creatingGroupRef.current) return;
+    if (groupDraftSettledRef.current) return;
     const trimmed = (newGroupDraft ?? '').trim();
     if (!trimmed) { setNewGroupDraft(null); return; }
-    creatingGroupRef.current = true;
+    groupDraftSettledRef.current = true;
     const group = await createTriggerGroup(trimmed);
     if (group) setGroupId(group.id);
     setNewGroupDraft(null);
@@ -487,9 +487,12 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 {...PROSE_TEXT_ATTRS}
                 onInput={e => setNewGroupDraft((e.target as HTMLInputElement).value)}
                 onBlur={commitNewGroupDraft}
+                // Escape cancels. The central Escape policy would blur the
+                // field first, and the blur commits, so the field handles it.
+                data-escape-self
                 onKeyDown={e => {
                   if (e.key === 'Enter') { e.preventDefault(); void commitNewGroupDraft(); }
-                  else if (e.key === 'Escape') setNewGroupDraft(null);
+                  else if (e.key === 'Escape') { e.preventDefault(); groupDraftSettledRef.current = true; setNewGroupDraft(null); }
                 }}
               />
             )}

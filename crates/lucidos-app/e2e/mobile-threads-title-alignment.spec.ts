@@ -80,9 +80,7 @@ async function measure(
     for (const el of header.querySelectorAll(titleSel)) {
       const rect = el.getBoundingClientRect();
       if (rect.width === 0) continue;
-      // A crossfading title keeps every word mounted; match the one on show.
-      const shown = el.querySelector('[data-current]') ?? el;
-      if (text != null && (shown.textContent ?? '').trim() !== text) continue;
+      if (text != null && (el.textContent ?? '').trim() !== text) continue;
       const h = el as HTMLElement;
       return {
         center: rect.left + rect.width / 2,

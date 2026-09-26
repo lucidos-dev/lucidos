@@ -480,14 +480,23 @@ pub(crate) async fn parse_claude_stream(
     loop {
         let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
             Ok(Some(Ok(bytes))) => bytes,
-            Ok(Some(Err(e))) => return Err(format!("Stream read error: {}", e).into()),
+            Ok(Some(Err(e))) => {
+                return Err(crate::llm::stream_failure(
+                    format!("Stream read error: {}", e),
+                    rendered_any,
+                    provider_tag,
+                ))
+            }
             Ok(None) => break, // Stream ended
             Err(_) => {
-                return Err(format!(
-                    "Claude stream timed out (no data for {}s)",
-                    CLAUDE_STREAM_CHUNK_TIMEOUT_SECS
-                )
-                .into())
+                return Err(crate::llm::stream_failure(
+                    format!(
+                        "Claude stream timed out (no data for {}s)",
+                        CLAUDE_STREAM_CHUNK_TIMEOUT_SECS
+                    ),
+                    rendered_any,
+                    provider_tag,
+                ))
             }
         };
 
@@ -508,7 +517,9 @@ pub(crate) async fn parse_claude_stream(
                     })
                     .sum();
                 let stopped_block =
-                    process_sse_data(data_str, &mut blocks, &mut turn_meta, provider_tag)?;
+                    process_sse_data(data_str, &mut blocks, &mut turn_meta, provider_tag).map_err(
+                        |e| crate::llm::stream_failure(e.to_string(), rendered_any, provider_tag),
+                    )?;
                 let finished_note = stopped_block
                     .filter(|&index| settle_progress_note(&mut blocks, index, display));
                 if let Some(cb) = on_token {
@@ -2886,6 +2897,99 @@ mod tests {
             msg.contains("already sending text"),
             "the error must say why it will not retry, got: {msg}"
         );
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "retrying would render the streamed text twice, got: {msg}"
+        );
+    }
+
+    /// Text that has streamed, then a mid-stream `error` frame. The frame reads
+    /// as retryable, and a retry re-sends the whole request.
+    const TEXT_THEN_OVERLOADED: &str = concat!(
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"#,
+        r#""content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"#,
+        r#""delta":{"type":"text_delta","text":"Here is the plan."}}"#,
+        "\n\n",
+        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        "\n\n"
+    );
+
+    /// ADR 0089 covers every way a stream can die, not only a truncation. An
+    /// overload frame after streamed text must stop the turn, or the retry
+    /// renders the reply twice.
+    #[tokio::test]
+    async fn an_error_frame_after_streamed_text_reports_instead_of_retrying() {
+        let (on_token, seen) = recording_callback();
+        let err = parse_claude_stream(
+            sse_response(TEXT_THEN_OVERLOADED),
+            &Some(on_token),
+            ThinkingDisplay::Hidden,
+            "Test",
+        )
+        .await
+        .expect_err("an error frame fails the parse");
+
+        assert_eq!(seen.lock().unwrap().as_str(), "Here is the plan.");
+        let msg = err.to_string();
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "retrying would render the streamed text twice, got: {msg}"
+        );
+    }
+
+    /// A caller with no callback rendered nothing, so the same frame still
+    /// reaches the retry path.
+    #[tokio::test]
+    async fn an_error_frame_with_nothing_rendered_still_retries() {
+        let err = parse_claude_stream(
+            sse_response(TEXT_THEN_OVERLOADED),
+            &None,
+            ThinkingDisplay::Hidden,
+            "Test",
+        )
+        .await
+        .expect_err("an error frame fails the parse");
+
+        let msg = err.to_string();
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "nothing reached the user, so the overload must retry, got: {msg}"
+        );
+    }
+
+    /// A connection that drops after text has streamed is the same case.
+    #[tokio::test]
+    async fn a_dropped_connection_after_streamed_text_reports_instead_of_retrying() {
+        let head = TEXT_THEN_OVERLOADED
+            .split("data: {\"type\":\"error\"")
+            .next()
+            .expect("the body has a text prefix")
+            .to_string();
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from(head)),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ];
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks));
+
+        let (on_token, seen) = recording_callback();
+        let err = parse_claude_stream(
+            sse_response(body),
+            &Some(on_token),
+            ThinkingDisplay::Hidden,
+            "Test",
+        )
+        .await
+        .expect_err("a dropped connection fails the parse");
+
+        assert_eq!(seen.lock().unwrap().as_str(), "Here is the plan.");
+        let msg = err.to_string();
         assert!(
             !crate::llm::is_retryable_error(&msg),
             "retrying would render the streamed text twice, got: {msg}"

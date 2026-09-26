@@ -211,7 +211,7 @@ describe('parseDeepLinkFromUrl', () => {
 
   it('surfaces the bare #thread=UUID channel (cross-workspace landing)', () => {
     // `openThreadInWorkspace` ships users to `#thread=<uuid>` without a
-    // `notification=` key. THREAD_HASH_RE in useStartup owns that shape and
+    // `notification=` key. THREAD_HASH_RE in startClient owns that shape and
     // runs first — `parseDeepLinkFromUrl` still surfaces the thread id, but
     // a notification deep-link without a `notification` key is moot.
     const url = new URL('https://localhost:5174/#thread=abc-123');
@@ -349,7 +349,7 @@ describe('stripDeepLinkFromUrl', () => {
   });
 
   it('strips a bare #thread=UUID once cross-workspace handling has passed it on', () => {
-    // useStartup runs THREAD_HASH_RE first; whatever reaches strip is either
+    // startClient runs THREAD_HASH_RE first; whatever reaches strip is either
     // the SW deep-link (notification + ...) or stale state safe to remove.
     const url = new URL('https://localhost:5174/#thread=abc-123');
     expect(stripDeepLinkFromUrl(url).hash).toBe('');

@@ -11,8 +11,9 @@
  *  How each states its state is the split that took the most goes. The PAIR
  *  keeps a fixed glyph and brightens (`FullResponseIcon` records why a moving
  *  glyph was wrong for them). The COLLAPSE control is the mirror image: its
- *  glyph flips and its brightness never moves. Both halves and the reasons are
- *  pinned below, since either one drifting silently re-breaks a reported bug.
+ *  glyph flips between a circled minus and plus, and its brightness never
+ *  moves. Both halves and the reasons are pinned below, since either one
+ *  drifting silently re-breaks a reported bug.
  */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
@@ -165,113 +166,52 @@ describe('turnControls', () => {
 
   /** Invoke the icon with the props the CONTROL handed it, so these cover the
    *  control forwarding its state as well as the icon drawing on it. */
-  const arrows = (collapsed: boolean) => {
+  const drawn = (collapsed: boolean) => {
     const icon = findByRole(controls({ collapsed }), 'toggle-collapsed')!.props.children as AnyVNode;
     const draw = icon.type as (props: Record<string, unknown>) => AnyVNode;
-    return (draw(icon.props).props.children as AnyVNode[]).map((p) => {
-      const n = String(p.props.points).trim().split(/\s+/).map(Number);
-      return { wings: [n[1], n[5]], apex: n[3], left: n[0], right: n[4] };
-    });
+    return (draw(icon.props).props.children as ComponentChildren[])
+      .filter((c): c is AnyVNode => typeof c === 'object' && c !== null);
   };
+  const strokes = (collapsed: boolean) => drawn(collapsed)
+    .filter((n) => n.type === 'line')
+    .map((l) => ({ x1: Number(l.props.x1), y1: Number(l.props.y1), x2: Number(l.props.x2), y2: Number(l.props.y2) }));
+  const ring = (collapsed: boolean) => drawn(collapsed)
+    .filter((n) => n.type === 'circle')
+    .map((c) => ({ cx: Number(c.props.cx), cy: Number(c.props.cy), r: Number(c.props.r) }));
+  const isHorizontal = (l: ReturnType<typeof strokes>[number]) => l.y1 === l.y2 && l.x1 !== l.x2;
+  const isVertical = (l: ReturnType<typeof strokes>[number]) => l.x1 === l.x2 && l.y1 !== l.y2;
 
-  it('turns the collapse arrows around, so direction says which way the click goes', () => {
-    // The one control whose glyph moves, because it is the one with no colour
-    // to move: it is exempt from the brightness rule (styles/chat/response.css)
-    // since bright-means-folded would invert the pair's own bright-means-more
-    // 0.125rem away, and would restate a fold the `⋯` stub already shows.
-    //
-    // Assert the MEANING, not just that something changed. Converging (each
-    // apex between the two wings, vertically) is "Collapse this turn";
-    // diverging is "Expand this turn". The tooltip says the same words, so a
-    // silent swap of the two point sets would put the mark and its own label
-    // in contradiction, which nothing else here would catch.
-    const [top, bottom] = arrows(false);
-    expect(top.apex, 'expanded: top arrowhead points down').toBeGreaterThan(Math.max(...top.wings));
-    expect(bottom.apex, 'expanded: bottom arrowhead points up').toBeLessThan(Math.min(...bottom.wings));
+  it('draws a circled minus to collapse and a circled plus to expand, matching the tooltip', () => {
+    // The one control whose glyph changes, because it is the one with no colour
+    // to change: it is exempt from the brightness rule. Assert the MEANING, so
+    // a swap of the two forms would contradict its own label and fail here.
+    const expanded = strokes(false);
+    expect(expanded.length, 'expanded: a lone minus').toBe(1);
+    expect(isHorizontal(expanded[0])).toBe(true);
 
-    const [ctop, cbottom] = arrows(true);
-    expect(ctop.apex, 'collapsed: top arrowhead points up').toBeLessThan(Math.min(...ctop.wings));
-    expect(cbottom.apex, 'collapsed: bottom arrowhead points down').toBeGreaterThan(Math.max(...cbottom.wings));
+    const collapsed = strokes(true);
+    expect(collapsed.length, 'collapsed: a plus').toBe(2);
+    expect(collapsed.filter(isHorizontal).length).toBe(1);
+    expect(collapsed.filter(isVertical).length).toBe(1);
   });
 
-  it('keeps the mark small, which is the half of the old complaint that still binds', () => {
-    // `3e8c8f6f6` removed a moving glyph for TWO reasons, and only one of them
-    // is answered by this control having no other state cue. The other was
-    // plain size: that mark's ink spanned 22 of 24 units against the log
-    // glyph's 12, so it "towered over both the label and its neighbour".
-    //
-    // Note what this does NOT claim. The banned pair was ALSO two arrowheads
-    // each reflected about its own midline, with the same span, the same
-    // summed segment length and the same stroke count across its two forms
-    // (x 5 to 19, y 2 to 22, 4 segments of sqrt(74)). So none of those
-    // properties distinguishes the permitted case from the prohibited one, and
-    // a test asserting them would pass on the banned coordinates and guard
-    // nothing. The envelope is the one thing that genuinely differs, so it is
-    // the one thing pinned: keep this mark nearer its neighbours than the mark
-    // that was removed for being too big.
-    //
-    // The ceiling started at 18 and came down to 14 when the gap between the
-    // two arrowheads was reported as too much air, which had the mark standing
-    // half again as tall as the step-log glyph (12) beside it. 14 is therefore
-    // the size someone asked for rather than a round number, and the reason it
-    // is an equality in spirit: drifting back UP re-opens the complaint.
-    const BANNED_ENVELOPE = 22; // y 2..22 plus a 1-unit round cap each end.
-    const CAP = 2;              // stroke-width 2, so 1 unit of cap top and bottom.
+  it('keeps the ring identical across the flip, with the sign inside it', () => {
+    // The circle is what sets the mark's size. If it moved with the state, the
+    // flip would read as a resize while the turn under it folds.
+    expect(ring(false).length).toBe(1);
+    expect(ring(true)).toEqual(ring(false));
+    const { cx, cy, r } = ring(false)[0];
+    // 20 of 24 units with the stroke is the ceiling this row's glyphs share
+    // (see `FollowLiveEdgeIcon`). A bigger mark towers over its neighbours.
+    const STROKE = 2;
+    expect(2 * r + STROKE).toBeLessThanOrEqual(20);
     for (const collapsed of [false, true]) {
-      const ys = arrows(collapsed).flatMap((a) => [...a.wings, a.apex]);
-      const envelope = Math.max(...ys) - Math.min(...ys) + CAP;
-      expect(envelope, `collapsed=${collapsed}`).toBeLessThan(BANNED_ENVELOPE);
-      expect(envelope, `collapsed=${collapsed}`).toBeLessThanOrEqual(14);
+      for (const l of strokes(collapsed)) {
+        for (const [x, y] of [[l.x1, l.y1], [l.x2, l.y2]]) {
+          expect(Math.hypot(x - cx, y - cy), `collapsed=${collapsed}`).toBeLessThan(r);
+        }
+      }
     }
-  });
-
-  it('keeps a channel between the two arrowheads, whichever way they point', () => {
-    // The floor to the ceiling above, and the two are one decision: the
-    // envelope is depth + gap + depth + caps, so a test that only caps the
-    // total invites the next slimming pass to buy depth out of the gap. That
-    // is the direction the original smudge lies in, and it is the 14px box a
-    // plain desktop root gives this that it has to survive, which is not what
-    // anyone is looking at while they nudge the coordinates.
-    //
-    // 4 units of gap is 2 of daylight once the 2-unit stroke is taken off,
-    // ~1.2px in that box, against the banned three-mark version's ~0.9px. That
-    // is the whole margin, so it is worth being exact about how small it is:
-    // the banned mark pinched at a single x as well, so the difference is not
-    // its shape, it is that 2 units clears a device pixel where 1.5 did not,
-    // that there is one pinch here rather than two, and that this one opens to
-    // 10 units of daylight at its widest against that one's 5.5.
-    //
-    // Sampled at the apexes and at the wing tips because those are the two
-    // extremes, and the pair is a mirror image about its own midline: the gap
-    // runs linearly between them, so its minimum is at one end or the other.
-    // Converging pinches at the apexes, diverging at the wing tips.
-    const waist = (a: ReturnType<typeof arrows>) => {
-      const [top, bottom] = a;
-      return Math.min(bottom.apex - top.apex, Math.min(...bottom.wings) - Math.max(...top.wings));
-    };
-    for (const collapsed of [false, true]) {
-      expect(waist(arrows(collapsed)), `collapsed=${collapsed}`).toBeGreaterThanOrEqual(4);
-    }
-  });
-
-  it('moves the box and the weight not at all, only the direction', () => {
-    // Weaker than it looks (see the envelope test above for why), but still
-    // worth holding: whatever the next redraw does, the two forms must not
-    // differ in extent or in how much stroke is inside it, or the flip starts
-    // costing a size change ON TOP of the direction change.
-    const extent = (a: ReturnType<typeof arrows>) => {
-      const ys = a.flatMap((p) => [...p.wings, p.apex]);
-      const xs = a.flatMap((p) => [p.left, p.right]);
-      return [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-    };
-    /** Summed segment length, to three decimals. */
-    const ink = (a: ReturnType<typeof arrows>) => Number(a.reduce((total, p) => total
-      + Math.hypot((p.left + p.right) / 2 - p.left, p.apex - p.wings[0])
-      + Math.hypot(p.right - (p.left + p.right) / 2, p.wings[1] - p.apex), 0).toFixed(3));
-
-    expect(extent(arrows(false))).toEqual(extent(arrows(true)));
-    expect(ink(arrows(false))).toBe(ink(arrows(true)));
-    expect(arrows(false).length).toBe(arrows(true).length);
   });
 
   it('reads the three controls as three different actions', () => {

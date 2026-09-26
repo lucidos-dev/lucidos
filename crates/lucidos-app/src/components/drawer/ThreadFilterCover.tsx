@@ -1,34 +1,33 @@
 import { threadFilterPanelOpen, closeThreadFilterPanel } from '../../store/threadFilterPanel';
-import { scaledDurationMs } from '../../utils/motion';
-import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadFilterPanel } from '../layout/ThreadFilterPanel';
+import { NavigationCover } from '../shared/NavigationCover';
 
-/** The panel's fade, the 1x `--duration-fast` (global/base.css). The slack is
- *  a fixed margin past it, so it stays outside the scaled term. */
-const FILTER_PANEL_FADE_MS = 150;
-const FILTER_PANEL_FADE_SLACK_MS = 50;
+/** The drawer's two views, Threads and Filters, as a navigation cover key. The
+ *  pane title (`ThreadsPaneTitle`) arrives on the same key. */
+export function drawerViewKey(filtersOpen: boolean): 'filters' | 'threads' {
+  return filtersOpen ? 'filters' : 'threads';
+}
 
-/** The box the thread filter panel shows in, over the drawer's list.
+/** The box the thread filter panel shows in, over the drawer's list, and the
+ *  navigation cover that hides the swap between them.
  *
- *  A fade THROUGH, never a crossfade: the panel wears the list's own geometry,
- *  so both drawn at once print rows and options on the same lines. The opaque
- *  cover shows at once, and hides only when the fade layer inside it has
- *  finished (drawer.css).
+ *  The swap moves exactly like a content-pane navigation: the leaving view goes
+ *  at once, and the arriving one fades in from behind the same cover. The
+ *  filter cover itself only shows or hides.
  *
- *  The cover and the fade layer are always mounted, so each fade runs on an
- *  element that already exists: it reverses mid-way, and it starts in the
- *  same frame as the header's. The panel mounts on open and stays for the
- *  fade out. Everything else (Escape, the overlay stack, the drawer's keys,
- *  the pressed Filter button) follows the open SIGNAL at once. A leaving cover
- *  is `inert`, so it takes no pointer and no focus. */
-export function ThreadFilterCover() {
+ *  The cover and the panel inside it are always mounted, and hidden while
+ *  shut, so opening costs no render. Everything else (Escape, the overlay
+ *  stack, the drawer's keys, the pressed Filter button) follows the open
+ *  SIGNAL. A shut cover is `inert`, so it takes no pointer and no focus. So is
+ *  an open one on a collapsed drawer, since the panel stays open there. */
+export function ThreadFilterCover({ paneVisible }: { paneVisible: boolean }) {
   const open = threadFilterPanelOpen.value;
-  const rendered = useLingeringFlag(open, scaledDurationMs(FILTER_PANEL_FADE_MS) + FILTER_PANEL_FADE_SLACK_MS);
   return (
-    <div class="thread-filter-cover" data-open={open ? '' : undefined} inert={!open}>
-      <div class="thread-filter-fade">
-        {rendered && <ThreadFilterPanel onClose={closeThreadFilterPanel} />}
+    <>
+      <div class="thread-filter-cover" data-open={open ? '' : undefined} inert={!open || !paneVisible}>
+        <ThreadFilterPanel onClose={closeThreadFilterPanel} />
       </div>
-    </div>
+      <NavigationCover viewKey={drawerViewKey(open)} />
+    </>
   );
 }

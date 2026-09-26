@@ -18,7 +18,7 @@ const TOAST_TYPES = ['success', 'info', 'warning', 'error'] as const;
 /** Handle the app-facing toast bridge (`lucidos.ui.toast` / `lucidos.ui.dismissToast`).
  *  Returns true when it owned the message, so the caller can stop routing.
  *
- *  Split out of `useStartup`'s `onAppFrameMessage` so these two branches are
+ *  Split out of `startClient`'s `onAppFrameMessage` so these two branches are
  *  reachable from a unit test: the hook itself wires SSE, service workers and a
  *  dozen timers, and the frontend test environment is deliberately non-jsdom, so
  *  standing it up to prove that a dismiss removes a toast is not practical. The

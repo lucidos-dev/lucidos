@@ -54,7 +54,7 @@ type Loadable<T> =
 - Store signals: `signal<Loadable<T>>({ status: 'not-loaded' })`, never bare arrays
 - Handle **all four states** — `loaded ? data : []` is a bug (masks loading as empty)
 - Failed must look different from empty (error styling); never fake errors as `loaded` with empty data
-- Tab data must load on page reload via `useStartup.ts`
+- Tab data must load on page reload via `store/startup.ts`
 - Use `ApiError` + `toFailed()`. Use `useDelayedLoading(loadable)` for loaders — true only after the load has been pending `SPINNER_DELAY_MS` (300ms), so fast loads never flash a loader. Loaders are **delay-only**: a *minimum-visible* floor was tried and rejected — holding a loader means withholding already-loaded content, which feels sluggish. The smooth skeleton **exit** is `<LoadingFade>` instead.
 
 **Never render a bare loading indicator (`<div class="loading-spinner" />`, a skeleton) immediately.** Gate it on `useDelayedLoading(loadable)` (Loadable) or `useDelayedFlag(active, delayMs?)` (boolean) from `hooks/useDelayedLoading.ts` — both delay past `SPINNER_DELAY_MS`. `useDelayedFlag` also backs non-loader fuses (e.g. the 8s "tap to reload" timeout); there it's purely the delay.
@@ -194,7 +194,9 @@ The rule has a sharp shape:
 
 When you add a new navigation entry point, add it to the test mirror in `crates/lucidos-app/src/store/actions/menu.test.ts` (or the equivalent suite) so the regression is pinned.
 
-**The view swap itself is already smoothed, so do NOT add a per-callsite fade.** `revealContentPane()` is about *which pane the user is looking at*; the crossfade between the outgoing and incoming views is the **content-pane navigation cover** (`docs/glossary.md`), which `ContentPane` mounts centrally on every change of the **content view key**, whatever caused it. A new navigation entry point inherits it for free. What a new *view* owes is identity, not animation: if it is a `PanelOverlay` variant whose payload picks out one of several things (which file, which notification, which inline form), resolve it in `components/layout/contentViewKey.ts` so two of them are told apart. A variant that returns its bare type while displaying more than one thing is the bug this replaced, and it breaks the scroll memory in the same stroke.
+**The view swap itself is already smoothed, so do NOT add a per-callsite fade.** `revealContentPane()` is about *which pane the user is looking at*. The crossfade between the outgoing and incoming views is the **navigation cover** (`docs/glossary.md`). `ContentPane` mounts it on every change of the **content view key**, whatever caused it. The header title arrives with it on the same key. A new navigation entry point inherits both for free.
+
+What a new *view* owes is identity, not animation. Take a `PanelOverlay` variant whose payload picks out one of several things (which file, which notification, which inline form). Resolve it in `components/layout/contentViewKey.ts`, so two of them are told apart. A variant that returns its bare type while displaying several things is the bug this replaced. It breaks the scroll memory in the same stroke.
 
 ## Pane Resize: Clamped Dividers & Header Sync
 

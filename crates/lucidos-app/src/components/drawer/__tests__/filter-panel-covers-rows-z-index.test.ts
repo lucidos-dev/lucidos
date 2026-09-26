@@ -49,15 +49,32 @@ describe('the filter panel covers every positioned layer inside the thread list'
 
   it('outranks EVERY other local layer in the file, whatever gets added next', () => {
     // The general form of the same bug: any new positioned layer on a row would
-    // paint over the panel. `.flip-portal` is the one deliberate exception (a
-    // flying thread crosses the panel on purpose) and is token-valued, so the
-    // plain-number filter above already excludes it.
-    const others = localZIndexes(drawerCss).filter(r => r.selector !== '.thread-filter-cover');
+    // paint over the panel. `.flip-portal` is token-valued, so the plain-number
+    // filter above already excludes it. It never crosses the panel anyway: it
+    // sits inside the list, which is hidden while the panel is up. The
+    // navigation cover is the one layer meant to be above it (next test).
+    const others = localZIndexes(drawerCss)
+      .filter(r => r.selector !== '.thread-filter-cover' && r.selector !== NAV_COVER);
     if (others.length === 0) return; // Nothing to outrank: vacuously covered.
     const highest = others.reduce((a, b) => (b.z > a.z ? b : a));
     expect(
       panel!.z,
       `.thread-filter-cover (${panel!.z}) must outrank ${highest.selector} (${highest.z})`,
     ).toBeGreaterThan(highest.z);
+  });
+});
+
+/** The navigation cover hides the swap between the list and the panel, so it
+ *  has to paint over both. Under the panel, opening would show the options at
+ *  once with the cover fading behind them. */
+const NAV_COVER = '.thread-drawer > .nav-cover';
+
+describe('the navigation cover lies over the filter panel', () => {
+  it('outranks the filter cover', () => {
+    const layers = localZIndexes(drawerCss);
+    const cover = layers.find(r => r.selector === NAV_COVER);
+    const panel = layers.find(r => r.selector === '.thread-filter-cover');
+    expect(cover, `${NAV_COVER} has no plain-number z-index`).toBeDefined();
+    expect(cover!.z).toBeGreaterThan(panel!.z);
   });
 });

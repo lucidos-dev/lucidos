@@ -201,6 +201,16 @@ describe('a page landing on a re-pointed window', () => {
     });
 });
 
+/** The pane-resize observer is the fill's only answer to a box change. The
+ *  cold-open return draws no `areaRef`, so keyed on the thread alone it never
+ *  attached for a thread that entered the map after mount. */
+describe('the pane-resize observer after a cold open', () => {
+    it('re-attaches once the thread enters the map', () => {
+        const deps = depsAfter('const observer = new ResizeObserver(() => {\n            fillWindowRef.current();');
+        expect(deps).toBe('threadId, threadInMap');
+    });
+});
+
 /** The scroll handler is the only caller of the backfill. A container already
  *  at the top fires no scroll event, however hard the reader gestures. So the
  *  second page was unreachable: one landed, and the walk froze.

@@ -1,0 +1,14 @@
+{
+  "id": "T1",
+  "fix": "a1ea1101989f7ac372a0f05a5fa916e8c653072c",
+  "title": "fix(llm): a non-retryable tool-argument error verifies its own classification",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/llm/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/llm/anthropic_wire.rs"
+  },
+  "needs_db": false,
+  "comment": "strong",
+  "why": "The buggy arms carried comments saying the message has 'no numbers on purpose' and 'No byte count here, deliberately', claiming the arm cannot read as a retryable 502. The comment asserts safety while model-supplied text (a tool named 502) still flips the classification.",
+  "adaptation": "None. The fix's own test, with the test-only SSE helpers copied in."
+}

@@ -37,6 +37,17 @@ renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
   return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
 };
 
+/** Marks an email the GFM autolinker found in bare text, so `renderMarkdown`
+ *  can unwrap one sitting inside a path. Its token's `raw` is the bare address;
+ *  an authored `<x@y>` or `[x](mailto:x)` keeps its brackets in `raw`. */
+export const BARE_EMAIL_ATTR = 'data-bare-email';
+
+renderer.link = function (token: Tokens.Link): string {
+  const html = marked.Renderer.prototype.link.call(this, token);
+  const bareEmail = token.href.startsWith('mailto:') && token.raw === token.text;
+  return bareEmail ? html.replace(/^<a /, `<a ${BARE_EMAIL_ATTR} `) : html;
+};
+
 marked.setOptions({
   breaks: true,
   gfm: true,

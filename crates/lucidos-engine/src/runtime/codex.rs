@@ -520,11 +520,12 @@ fn build_codex_turn_command(
         cmd.arg("-i").arg(img);
     }
     // Global exec flags must precede the `resume` subcommand; the prompt is
-    // positional in both forms.
+    // positional in both forms. The `--` keeps a prompt that starts with `-`
+    // (a markdown bullet) from being parsed as a flag, which fails the turn.
     if let Some(sid) = resume_session_id {
         cmd.arg("resume").arg(sid);
     }
-    cmd.arg(prompt);
+    cmd.arg("--").arg(prompt);
     cmd.current_dir(&config.worktree_path)
         // /dev/null stdin — codex falls back to reading the prompt from
         // stdin when it considers the arg incomplete; an inherited fd would

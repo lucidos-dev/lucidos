@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, ComponentType, VNode } from 'preact';
-import { todoListIndicatorBody, todoListPanelBody } from '../TodoListPanel';
+import { todoListPanelBody } from '../TodoListPanel';
+import { todoListIndicatorBody } from '../todoIndicator';
 import { TodoListIcon } from '../../shared/icons';
 import type { TodoItem } from '../../../store/thread-events';
 

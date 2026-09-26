@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { todoIndicatorSummary } from '../TodoListPanel';
+import { todoIndicatorSummary } from '../todoIndicator';
 import { waitingIndicatorSummary } from '../WaitingPanel';
 import type { TodoItem } from '../../../store/thread-events';
 
@@ -111,9 +111,9 @@ describe('the composer wires both indicators as foldable members', () => {
   /** A panel cannot live inside the control that folds away. Both are mounted
    *  by the composer and portal out of it. */
   it('mounts both panels outside the fold cluster', () => {
-    expect(prompt).toMatch(/<TodoPanelHost \/>/);
+    expect(prompt).toMatch(/<TodoPanelSlot \/>/);
     expect(prompt).toMatch(/<WaitingPanelHost \/>/);
-    expect(prompt.indexOf('<TodoPanelHost />')).toBeGreaterThan(prompt.indexOf('<OverflowMenu'));
+    expect(prompt.indexOf('<TodoPanelSlot />')).toBeGreaterThan(prompt.indexOf('<OverflowMenu'));
   });
 
   /** Two ways a panel's anchor stops being a box worth pointing at. A fold step

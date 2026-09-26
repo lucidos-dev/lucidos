@@ -1206,6 +1206,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`whenLoaded`'s document `pointerdown` listener is not a hand-rolled
+  dismiss.** `utils/lazyComponent.tsx` adds a capture listener while a surface
+  waits on its chunk. A reviewer reads it against the frontend rule that every
+  overlay dismisses through `<Overlay>`. Nothing is open yet at that
+  point: the listener cancels an open still waiting on the network, so a late
+  open cannot land on whatever the user moved to. It removes itself once the
+  open lands or is cancelled, and the surface then opens through `<Overlay>`
+  like any other (ADR 0288). Re-flag only if it outlives the pending open.
+
+- **A bare URL in `linkifyPaths` never ends in `.`, `,`, `;`, `:`, `!` or `?`,
+  and that is the GFM rule, not a truncation bug.** A reviewer points at a URL
+  that genuinely ends in one (`…/wiki/Hello!`) and reads `URL_IN_TEXT`'s last
+  character class as changing its destination. GFM's extended autolink trims
+  the same trailing punctuation, so marked already does this to every
+  `https://` URL in prose. The linkifier only sees what marked left alone, and
+  it must agree with marked. Sentence-final `file:///tmp/a.pdf.` is the common
+  case, and an agent can still write `[x](url!)` for the rare one.
+
 - **A failed confirm fetch that parks the repository list on `failed` is the
   Loadable contract, not a lost cache.** `installUnregisteredRepoTargetReset`
   in `store/actions/compose.ts` refetches the list before dropping a compose
@@ -1872,7 +1890,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   2026-08-04, and `schedulePendingCleanup` reads its `Promise<boolean>` return
   instead (a `.catch` there had made the force-drop unconditional). Don't
   reintroduce one.
-- **The heartbeat's `invoke('heartbeat').catch(() => {})` (useStartup, main.tsx)
+- **The heartbeat's `invoke('heartbeat').catch(() => {})` (startClient, main.tsx)
   is a local no-op, not a swallowed IPC failure.** Since the tauri 2.11 ACL
   regression, `invoke` itself (`utils/tauri.ts`) records every outcome through
   `utils/ipcHealth`, which writes durable `[Client/ipc]` lines to engine.log —
@@ -2818,7 +2836,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   transform.
 
 - **A settings component may read `credentials.value` with no loader of its
-  own.** The obvious call sites look conditional: `useStartup.ts` fetches
+  own.** The obvious call sites look conditional: `store/startup.ts` fetches
   credentials only for `settingsSubview === 'accounts'`, and
   `openSettingsSubview` only for `key === 'accounts'`. A reviewer reading those
   two concludes a component on Models or Permissions renders against a

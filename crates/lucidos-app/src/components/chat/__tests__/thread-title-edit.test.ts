@@ -64,6 +64,19 @@ describe('ThreadTitleEditor — display vs edit fields', () => {
   });
 });
 
+describe('ThreadTitleEditor call sites remount per thread', () => {
+  // Neither host remounts on a thread switch, so an unkeyed editor kept its
+  // open edit. The next blur then renamed the thread the user landed on.
+  for (const host of ['../ThreadView.tsx', '../../layout/MobileAppHeader.tsx']) {
+    it(`${host} keys the editor on threadId`, () => {
+      const hostSource = readFileSync(resolve(here, host), 'utf-8');
+      const tags = hostSource.match(/<ThreadTitleEditor\b[^>]*>/g) ?? [];
+      expect(tags.length).toBeGreaterThan(0);
+      for (const tag of tags) expect(tag).toMatch(/\bkey=\{threadId\}/);
+    });
+  }
+});
+
 describe('normalizeRename', () => {
   // Production case: thread b046ae3e on 2026-05-15. The user clicked the title
   // editor while the title was still the pre-LLM previewText fallback. SSE

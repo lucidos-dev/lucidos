@@ -23,7 +23,7 @@
  * Source-scan rather than a mounted render: `SettingsView` pulls in the whole
  * store, the model registry, OAuth and device state, so standing it up to
  * observe one section's position would pin the mechanism instead of the
- * requirement (the same reasoning as `useStartup.test.ts`).
+ * requirement (the same reasoning as `startup.test.ts`).
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

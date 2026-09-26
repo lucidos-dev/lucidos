@@ -1,16 +1,17 @@
 /**
- * The Filter button, its badge, the pane title and the filter panel change
- * together, on one timing: an opacity fade over `--duration-fast`. This scan
- * pins the rules that make that true, since jsdom runs no CSS.
+ * The threads Filter's fades, which jsdom cannot run, pinned by a CSS scan.
  *
- * Two of them guard a specific failure:
- * - THE RIM. The header paints a resting icon in translucent white. Two
- *   translucent shapes stacked mid-crossfade paint their overlap twice, so the
- *   funnel's rim flares. The translucency lives on the glyph WRAPPER instead,
- *   and the shapes paint opaque.
- * - THE FADE THROUGH. The panel wears the list's geometry, so a crossfade
- *   prints rows and options on the same lines. The opaque cover shows at once
- *   and hides only after the fade layer inside it is done.
+ * Two timings, on purpose:
+ * - THE BUTTON. The glyph, its badge and the pressed highlight are button
+ *   feedback, on `--duration-fast` like every header icon.
+ * - THE VIEW. Threads and Filters swap like a content-pane navigation: the
+ *   shared navigation cover clears off the arriving view, and the pane title
+ *   arrives on the same curve.
+ *
+ * One guard is a specific failure: THE RIM. The header paints a resting icon in
+ * translucent white. Two translucent shapes stacked mid-crossfade paint their
+ * overlap twice, so the funnel's rim flares. The translucency lives on the
+ * glyph WRAPPER instead, and the shapes paint opaque.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -35,11 +36,10 @@ function rule(rules: CssRule[], selector: string): CssRule {
   return found[0];
 }
 
-describe('one timing for every Filter fade', () => {
+describe('the button fades on --duration-fast', () => {
   it.each([
-    ['the glyph and title crossfade', host, '.crossfade-layer', 'opacity var(--duration-fast) ease'],
+    ['the glyph crossfade', host, '.crossfade-layer', 'opacity var(--duration-fast) ease'],
     ['the glyph wrapper (hover and pressed)', shell, '.app-header .filter-glyph', 'opacity var(--duration-fast) ease'],
-    ['the panel options', drawer, '.thread-filter-fade', 'opacity var(--duration-fast) ease'],
   ])('%s fade on --duration-fast', (_what, rules, selector, transition) => {
     expect(rule(rules, selector).props.get('transition')).toBe(transition);
   });
@@ -54,6 +54,23 @@ describe('one timing for every Filter fade', () => {
       const transition = rule(shell, selector).props.get('transition') ?? '';
       expect(transition).toContain('opacity var(--duration-fast) ease');
       expect(transition).toContain('box-shadow var(--duration-fast)');
+    }
+  });
+});
+
+describe('the view and its title move like a page navigation', () => {
+  it('the cover clears and the title arrives on one timing', () => {
+    expect(rule(host, '.nav-cover').props.get('animation'))
+      .toBe('nav-cover-clear var(--duration-normal) ease-out forwards');
+    expect(rule(host, '.nav-arrive').props.get('animation'))
+      .toBe('nav-arrive var(--duration-normal) ease-out forwards');
+  });
+
+  it('the drawer hosts the shared cover rather than a copy', () => {
+    const hostRule = rule(drawer, '.thread-drawer > .nav-cover');
+    expect([...hostRule.props.keys()]).toEqual(['z-index']);
+    for (const r of drawer.filter(r => r.selector.includes('cover'))) {
+      expect(r.props.has('animation'), r.selector).toBe(false);
     }
   });
 });
@@ -97,54 +114,86 @@ describe('the badge takes no pointer while hidden', () => {
   });
 });
 
-describe('the panel fades through', () => {
-  it('the shut cover hides only once the fade out is done', () => {
+describe('the views swap at once under the cover', () => {
+  it('the shut cover is hidden and takes no pointer', () => {
     const shut = rule(drawer, '.thread-filter-cover');
     expect(shut.props.get('visibility')).toBe('hidden');
     expect(shut.props.get('pointer-events')).toBe('none');
-    expect(shut.props.get('transition')).toBe('visibility 0s linear var(--duration-fast)');
+    expect(shut.props.get('background')).toBe('var(--bg-primary)');
   });
 
-  it('the open cover lands at once, opaque', () => {
+  it('the open cover shows at once', () => {
     const open = rule(drawer, '.thread-filter-cover[data-open]');
     expect(open.props.get('visibility')).toBe('visible');
-    expect(open.props.get('transition')).toBe('visibility 0s');
-    expect(rule(drawer, '.thread-filter-cover').props.get('background')).toBe('var(--bg-primary)');
+    expect(open.props.get('pointer-events')).toBe('auto');
   });
 
-  it('the options fade on a layer inside the scroller, so the scrollbar never fades', () => {
-    expect(rule(drawer, '.thread-filter-cover').props.get('overflow-y')).toBe('scroll');
-    expect(rule(drawer, '.thread-filter-fade').props.get('opacity')).toBe('0');
-    expect(rule(drawer, '.thread-filter-cover[data-open] .thread-filter-fade').props.get('opacity')).toBe('1');
-    expect(rule(drawer, '.thread-filter-cover').props.has('opacity')).toBe(false);
+  it('the list hides while the panel is up, since both wear the same geometry', () => {
+    const hides = rule(drawer, '.thread-drawer:has(> .thread-filter-cover[data-open]) > .thread-drawer-list');
+    expect(hides.props.get('visibility')).toBe('hidden');
+  });
+
+  it('nothing in the swap carries a fade of its own: the cover is the one fade', () => {
+    // The rules styling the two views' own boxes, not the rows inside them.
+    const swapping = /(\.thread-filter-cover|\.thread-drawer-list)(\[data-open\])?$/;
+    const boxes = drawer.filter(r => selectorList(r.selector).some(s => swapping.test(s)));
+    // Guard the guard: the cover, the open cover and the hidden list at least.
+    expect(boxes.length).toBeGreaterThanOrEqual(3);
+    for (const r of boxes) {
+      expect(r.props.has('opacity'), r.selector).toBe(false);
+      expect(r.props.has('transition'), r.selector).toBe(false);
+    }
   });
 });
 
 describe('reduced motion', () => {
+  const reduce = (rules: CssRule[], selector: string) => {
+    const found = rules.find(r => selectorList(r.selector).includes(`${REDUCED_MOTION_ROOT} ${selector}`));
+    expect(found, `no reduced-motion rule for ${selector}`).toBeDefined();
+    return found!;
+  };
+
   // A scaled duration is short, not instant: the transition still waits for
   // its start, and Chromium held a fade at its old value for a frame under
-  // load. So every Filter fade is cancelled outright.
+  // load. So every button fade is cancelled outright.
   it.each([
     [host, '.crossfade-layer'],
     [shell, '.app-header .filter-glyph'],
     [shell, '.app-header .badge.filter-badge'],
-    [drawer, '.thread-filter-cover'],
-    [drawer, '.thread-filter-fade'],
-  ])('cancels the fade on %#', (rules, selector) => {
-    const cancel = rules.find(r => selectorList(r.selector).includes(`${REDUCED_MOTION_ROOT} ${selector}`));
-    expect(cancel, `no reduced-motion rule for ${selector}`).toBeDefined();
-    expect(cancel!.props.get('transition')).toBe('none');
+  ])('cancels the button fade on %#', (rules, selector) => {
+    expect(reduce(rules, selector).props.get('transition')).toBe('none');
+  });
+
+  it('drops the cover to transparent and shows the title at once', () => {
+    const cover = reduce(host, '.nav-cover');
+    expect(cover.props.get('animation')).toBe('none');
+    expect(cover.props.get('opacity')).toBe('0');
+    const title = reduce(host, '.nav-arrive');
+    expect(title.props.get('animation')).toBe('none');
+    expect(title.props.get('opacity')).toBe('1');
   });
 });
+
+const hoversOf = (row: string) =>
+  drawer.filter(r => selectorList(r.selector).some(s => s.startsWith(`${row}:hover`)));
 
 describe('panel rows paint no band on touch', () => {
   // A touch screen keeps :hover on the last row tapped, so an unguarded hover
   // band stayed on that row after the tap. iOS also flashes its own grey tap
   // highlight on a label or button unless it is turned off.
-  it.each(['.thread-filter-option', '.drawer-view-option'])('%s hovers on a pointer only', (row) => {
-    const hovers = drawer.filter(r => selectorList(r.selector).some(s => s.startsWith(`${row}:hover`)));
-    expect(hovers.length, `no hover rule for ${row}`).toBeGreaterThan(0);
+  it('.drawer-view-option hovers on a pointer only', () => {
+    const hovers = hoversOf('.drawer-view-option');
+    expect(hovers.length, 'no hover rule for .drawer-view-option').toBeGreaterThan(0);
     for (const h of hovers) expect(h.atRules, h.selector).toContain('@media (hover: hover)');
+  });
+
+  it.each(['.thread-filter-option', '.drawer-view-option'])('%s turns off the iOS tap highlight', (row) => {
     expect(rule(drawer, row).props.get('-webkit-tap-highlight-color')).toBe('transparent');
   });
+});
+
+// The band says "this row selects and switches the list at once", which is
+// true of a status row and false of a checkbox.
+it('checkbox rows paint no hover band', () => {
+  expect(hoversOf('.thread-filter-option')).toEqual([]);
 });

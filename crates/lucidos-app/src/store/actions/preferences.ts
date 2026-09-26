@@ -228,7 +228,7 @@ async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<v
   writeFailures.recordFailure();
 }
 
-/** Re-send every parked preference write. Called from `useStartup`'s resume
+/** Re-send every parked preference write. Called from `startClient`'s resume
  *  handler, which is the moment a suspended iOS PWA can reach the engine again.
  *  A write that fails transiently here stays parked for the next resume. */
 export async function flushPendingPreferenceWrites(): Promise<void> {

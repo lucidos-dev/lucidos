@@ -1371,7 +1371,7 @@ export function normalizeLineRange(
 
 export const SELECTED_CHANGE_KEY = 'lucidos-repo-selected-change-id';
 // Hydrated from localStorage so the persistence effect's first synchronous
-// fire doesn't wipe a saved ID before useStartup can call restore on it.
+// fire doesn't wipe a saved ID before startClient can call restore on it.
 export const repoSelectedChangeId = signal<string | null>(localStorage.getItem(SELECTED_CHANGE_KEY));
 export const repoChanges = signal<Loadable<import('../api/client').RepoChangesState>>({ status: 'not-loaded' });
 export const repoChangesLoadingMore = signal(false);

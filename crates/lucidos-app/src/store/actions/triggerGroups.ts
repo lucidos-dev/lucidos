@@ -17,7 +17,7 @@ function byPanelOrder(a: TriggerGroup, b: TriggerGroup): number {
   return a.order - b.order || (instantMicros(a.created) ?? 0) - (instantMicros(b.created) ?? 0);
 }
 
-/** Fetch the trigger-group registry from the engine. Called from `useStartup`
+/** Fetch the trigger-group registry from the engine. Called from `startClient`
  *  and re-fetched after group mutations to keep the panel in sync. */
 export async function loadTriggerGroups(): Promise<void> {
   setLoadingIfFresh(triggerGroups);

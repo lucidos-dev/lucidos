@@ -19,6 +19,8 @@ if (typeof (globalThis as any).MutationObserver === 'undefined') {
 }
 
 import { withScrollAnchor } from '../CreateThreadView';
+import { mockStyle } from './scroll-test-helpers';
+import { anchorSpacer } from '../anchorCorrection';
 import { setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
 /**
@@ -61,7 +63,7 @@ describe('a turn control holds its control across a clamp', () => {
     const listeners = new Set<() => void>();
     const el: any = {
       isConnected: true,
-      style: { overflow: '' },
+      style: mockStyle(),
       clientHeight: VIEWPORT,
       clientWidth: 800,
       offsetHeight: VIEWPORT,
@@ -94,14 +96,15 @@ describe('a turn control holds its control across a clamp', () => {
    *
    *  The correction measures through rects rather than the platform's
    *  whole-pixel `offsetTop` (see `contentOffsetTop`). Each case MOVES the
-   *  control by assigning `offsetTop`, and the rect follows from it. */
+   *  control by assigning `offsetTop`, and the rect follows from it. The
+   *  anchor's spacer sits above every turn, so the rect follows it too. */
   function makeAnchor(container: any, offsetTop: number) {
     const a: any = {
       isConnected: true,
       offsetTop,
       closest: (sel: string) => (sel === '.thread-content' ? container : null),
       getBoundingClientRect: () => {
-        const top = container.getBoundingClientRect().top + a.offsetTop - container.scrollTop;
+        const top = container.getBoundingClientRect().top + a.offsetTop + anchorSpacer(container) - container.scrollTop;
         return { width: 800, height: 0, top, bottom: top, left: 0, right: 800 };
       },
     };
@@ -189,6 +192,29 @@ describe('a turn control holds its control across a clamp', () => {
     expect(el.scrollTop).toBe(SHORT_MAX + (1200 - 900));
   });
 
+  it('holds a FRACTIONAL move exactly, carrying the rest in the spacer', () => {
+    // At a fractional root every height is a fraction. A whole-pixel offset
+    // alone left the control up to half a pixel off. Every line of text then
+    // re-landed on its own device-pixel row (ADR 0286).
+    const el = makeContainer(1000, TALL);
+    const anchor: any = makeAnchor(el, 1500.25);
+    setActiveScrollElement(el);
+    const before = controlTop(anchor);
+
+    press(el, anchor, 1200.6, TALL);
+    expect(Number.isInteger(el.scrollTop)).toBe(true);
+    expect(anchorSpacer(el)).toBeGreaterThan(0);
+    expect(anchorSpacer(el)).toBeLessThan(1);
+    expect(controlTop(anchor)).toBeCloseTo(before, 9);
+
+    // The press back reads the spacer as part of its own two measurements, so
+    // it lands exactly too and needs no spacer at all.
+    press(el, anchor, 1500.25, TALL);
+    expect(el.scrollTop).toBe(1000);
+    expect(anchorSpacer(el)).toBe(0);
+    expect(controlTop(anchor)).toBeCloseTo(before, 9);
+  });
+
   it('never moves a transcript too short to scroll', () => {
     const el = makeContainer(0, VIEWPORT);
     const anchor: any = makeAnchor(el, 30);
@@ -210,8 +236,11 @@ describe('a turn control holds its control across a clamp', () => {
       'utf8',
     );
     expect(source).toMatch(
-      /return reachableScrollTop\(scrollBefore \+ \(offset - offsetBefore\)\);/,
+      /return splitAnchorCorrection\(scrollBefore \+ \(offset - anchorSpacer\(container\) - offsetBefore\)\);/,
     );
+    // The re-assert compares whole pixels exactly now, so it must discount the
+    // WebKit repaint nudge's in-flight pixel or it writes against it (ADR 0286).
+    expect(source).toMatch(/if \(settledScrollTop\(container\) !== target\.scrollTop\)/);
     for (const symbol of ['anchorDebt', 'carriedAnchorDebt', 'rememberAnchorDebt', 'landingScrollTop']) {
       expect(source, `${symbol} is back in CreateThreadView.tsx`).not.toContain(symbol);
     }

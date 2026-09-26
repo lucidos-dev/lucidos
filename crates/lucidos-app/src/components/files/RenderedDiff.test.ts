@@ -251,3 +251,12 @@ Para B.
     expect(html).not.toContain('<script>');
   });
 });
+
+describe('renderDiffMarked email autolinks inside a path', () => {
+  it('leaves an email-shaped path segment as plain text, with no marker left behind', () => {
+    const html = renderDiffMarked('See /Users/me.x@example.com/p/a.dmg and write me.x@example.com', []);
+    expect(html).toContain('/Users/me.x@example.com/p/a.dmg');
+    expect(html.match(/mailto:/g)).toHaveLength(1);
+    expect(html).not.toContain('data-bare-email');
+  });
+});

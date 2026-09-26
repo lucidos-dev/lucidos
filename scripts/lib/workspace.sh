@@ -1588,6 +1588,55 @@ select_cargo_lock_holders() {
     done
 }
 
+# ── select_tauri_dev_watchers ───────────────────────────────────────────
+# Print the PID of every `cargo tauri dev` watcher running from <app_dir>.
+#
+# Cargo execs an external subcommand, so the live process is `cargo-tauri
+# tauri dev ...`: argv[0] is `cargo-tauri`, and the phrase "cargo tauri dev"
+# appears nowhere in it. Selection is on argv[0] plus the `tauri dev`
+# subcommand (ADR 0025), and the cwd decides ownership, so a Tauri project
+# elsewhere on this machine is never selected.
+#
+# Test seams: `_tauri_dev_ps_feed` prints `<pid> <args>` lines, and
+# `_tauri_dev_cwd` prints one process's cwd.
+_tauri_dev_ps_feed() {
+    ps -Ao pid=,args= 2>/dev/null || true
+}
+
+_tauri_dev_cwd() {
+    lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+select_tauri_dev_watchers() {
+    local app_dir pid exe sub1 sub2 _rest
+    app_dir="$(cd "$1" 2>/dev/null && pwd -P)" || return 0
+    while read -r pid exe sub1 sub2 _rest; do
+        [ "${exe##*/}" = "cargo-tauri" ] || continue
+        [ "$sub1 $sub2" = "tauri dev" ] || continue
+        # `if`, never `&&`: the caller reads this under `set -e`.
+        if [ "$(_tauri_dev_cwd "$pid")" = "$app_dir" ]; then printf '%s\n' "$pid"; fi
+    done < <(_tauri_dev_ps_feed)
+}
+
+# ── stop_tauri_dev_watchers ─────────────────────────────────────────────
+# Stop the previous `cargo tauri dev` for <app_dir>, and the window it runs.
+# The watcher goes first so it cannot respawn the window. It installs no
+# signal handler (tauri.conf's beforeDevCommand is empty), so it dies without
+# passing the signal on, and its children are stopped by PID.
+stop_tauri_dev_watchers() {
+    local watcher children
+    for watcher in $(select_tauri_dev_watchers "$1"); do
+        if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$watcher"; then
+            continue
+        fi
+        children="$(pgrep -P "$watcher" 2>/dev/null || true)"
+        echo "Stopping the previous Tauri window (watcher PID $watcher)..."
+        kill "$watcher" 2>/dev/null || true
+        # shellcheck disable=SC2086 # one PID per word
+        [ -z "$children" ] || kill $children 2>/dev/null || true
+    done
+}
+
 # ── Published launch binaries (ADR 0022) ────────────────────────────────
 # `target/<profile>/lucidos-engine` is ONE output path that EVERY cargo variant
 # in the checkout uplifts to, and the last writer wins: a workspace-scope

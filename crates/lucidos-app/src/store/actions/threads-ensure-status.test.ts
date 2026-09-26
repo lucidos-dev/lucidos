@@ -30,7 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { PENDING_TITLE_PLACEHOLDER, type ThreadState } from '../thread-events';
 import { fetchThreads, fetchThreadById } from '../../api/threads';
-import { drawerOpen } from '../../components/layout/Drawer';
+import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
 import { archivingThreadIds, awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
 import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';

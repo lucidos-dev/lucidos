@@ -1036,7 +1036,10 @@ fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
         BusEvent::System(
             SystemEvent::CredentialCreated { service_name, .. }
             | SystemEvent::CredentialUpdated { service_name, .. }
-            | SystemEvent::CredentialDeleted { service_name, .. },
+            | SystemEvent::CredentialDeleted { service_name, .. }
+            // The boot pass scopes a legacy `local` key after the first
+            // provider build, and the build sends a key only inside its scope.
+            | SystemEvent::CredentialScopeInferred { service_name, .. },
         ) if crate::llm::PROVIDER_CREDENTIAL_SERVICES.contains(&service_name.as_str()) => {
             Some(format!("the '{service_name}' credential"))
         }

@@ -679,7 +679,7 @@ function dropUndeliveredComposeDraft(threadId: string): void {
   if (undeliveredComposeDrafts.size === 0) removeToast(COMPOSE_UNREACHABLE_TOAST);
 }
 
-/** Re-send every draft the engine never accepted. Called from `useStartup`'s
+/** Re-send every draft the engine never accepted. Called from `startClient`'s
  *  resume handler and from `runResumeSync` on reconnect, the two moments a
  *  suspended or disconnected client can reach the engine again. Re-enters
  *  through `schedulePush` rather than issuing its own request, so all the

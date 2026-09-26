@@ -16,6 +16,7 @@ if (typeof (globalThis as any).MutationObserver === 'undefined') {
 }
 
 import { withScrollAnchor } from '../CreateThreadView';
+import { mockStyle } from './scroll-test-helpers';
 import {
   followingLiveEdge,
   setActiveScrollElement,
@@ -43,7 +44,7 @@ describe('a turn-control toggle holds the pressed control, riding or not', () =>
       isConnected: true,
       parentElement: null,
       children: [],
-      style: { overflow: '', transform: '' },
+      style: mockStyle({ overflow: '', transform: '' }),
       clientWidth: 800,
       clientHeight: opts.clientHeight,
       offsetHeight: opts.clientHeight,

@@ -1247,7 +1247,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Settings row, `lucidos.ui.openExternal` plus its cache, and `openExternalUrl`
   itself even once it collapses to a lone `window.open`. It is the single choke
   point every external-link surface routes through, and the delegation guard in
-  `useStartup.test.ts` is pinned to that funnel for reasons that outlive this
+  `startup.test.ts` is pinned to that funnel for reasons that outlive this
   measure.
 - **Status:** active
 - **Investigation:** n/a (the cause is known and upstream; nothing is being

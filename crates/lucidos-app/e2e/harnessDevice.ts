@@ -65,7 +65,7 @@ export function registerHarnessDevice(ctx: APIRequestContext): Promise<void> {
  * for a mutating call.
  *
  * The app mints the id into `localStorage` synchronously at boot but registers
- * it server-side fire-and-forget (`useStartup` does not await
+ * it server-side fire-and-forget (`startClient` does not await
  * `registerCurrentDevice`). `api::mutating_gate` refuses a device id that names
  * no row (ADR 0169). So a mutating call fired right after navigation can beat
  * the registration and come back 401. That is the mobile-webkit

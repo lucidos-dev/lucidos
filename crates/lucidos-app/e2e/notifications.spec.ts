@@ -606,7 +606,7 @@ test.describe('Declarative Web Push payload', () => {
     //     on. Navigation waited until now so the test browser did not count as
     //     an active device during the PresenceCheck above.
     await gotoWithRetry(page, navigateUrl);
-    // Confirm the SPA actually mounted (so useStartup's cold-start hash router
+    // Confirm the SPA actually mounted (so startClient's cold-start hash router
     // runs and reads the query params). The deep-link targets a fake thread, so
     // a "Thread not found" toast is expected, and mark-read fires regardless.
     await waitForVisibleInput(page);

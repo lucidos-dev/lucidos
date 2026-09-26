@@ -146,11 +146,12 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-09-24. Every
-`eslint-disable` site was unchanged. `too_many_arguments` rose by one and
-`@ts-expect-error` by nine. The run also removed five `cfg_attr(...,
-allow(dead_code))` silencers from the gateway's slowness watcher, which
-the first grep above had missed. The cfg_attr grep now covers that form.
+The currently-accepted categories, re-counted on 2026-09-25. Every Rust
+allow and every `eslint-disable` site was unchanged, and the cfg_attr grep
+printed nothing. Only `@ts-expect-error` moved, up 21 with the test suite.
+The 2026-09-24 run removed five `cfg_attr(..., allow(dead_code))`
+silencers from the gateway's slowness watcher, which the first grep above
+had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 52 files,
@@ -185,8 +186,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 688 sites across 238 files, every one of them
-  test-only code: 228 `*.test.ts`, nine `*.test.tsx`
+  `@types/node` in project**, 709 sites across 245 files, every one of them
+  test-only code: 235 `*.test.ts`, nine `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -303,217 +304,30 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   devDependency of `packages/lucidos-sdk` would make that solid. That is a
   dependency plus lockfile change (ADR 0020), and belongs in its own commit.
 
-- **Phase 4's entry chunk is 836.16 kB against its 600 kB ceiling, and the
-  2026-09-24 run left it there.** `vite build` exits 0 and prints no code
-  diagnostic. What fires is Rollup's size advisory against
-  `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
-  `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
-  it. Both halves of that instruction stand. This entry reports one run,
-  and never licenses the next one to skip the phase.
+- **Phase 4's entry chunk is no longer an exception.** It sat at 857.58 kB
+  against its 600 kB ceiling until 2026-09-26, when the first-paint split
+  took it to 488 kB (ADR 0288). The entry chunk is now the data layer and
+  startup. The UI is the shell chunk, loaded beside it under the boot splash.
 
-  **Clearing it IS clean-build's job when a clean cut exists.** Look for
-  that shape first: eagerly imported, never mounted on the path that pays
-  for it. `94d1dd817` found it in the workspace picker and took the chunk
-  from 607 kB to 585 kB. The 2026-08-24 run found one more of that shape in
-  `PairingGate`, which `main.tsx` still imported statically while rendering
-  it only under `IS_PICKER`. Splitting it took 664.98 kB to 657.02 kB.
+  `entryChunkBudget` (`crates/lucidos-app/vite/entryChunkBudget.ts`) now
+  FAILS a single-shot `vite build` whose entry chunk passes
+  `chunkSizeWarningLimit`, naming the measured size. So this phase fails
+  outright rather than printing an advisory, and never lands here again.
 
-  That cut costs the picker one extra round trip, which `main.tsx` explains
-  at the split.
+  When it fires, move the next thing the first frame does not need behind a
+  dynamic import. Never raise the number. The usual cause is a new static
+  import from the data layer into UI code. It pulls that code and its imports
+  back into the entry.
 
-  **The on-demand surfaces can no longer close the gap, and the shortfall is
-  widening.** That is new since 2026-08-19, when the same list was 36 kB
-  against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 39.20 kB, against a 236.16 kB gap,
-  re-measured on 2026-09-24:
-
-  | Surface | kB of the built chunk |
-  |---|---|
-  | `PermissionCard` | 10.35 |
-  | `CodingAgentControlMenu` | 8.58 |
-  | `ThreadFilterPanel` | 6.06 |
-  | `WorkspaceSwitcher` | 4.50 |
-  | `QuestionCard` | 3.95 |
-  | `TodoListPanel` | 3.12 |
-  | `OverflowMenu` | 2.64 |
-
-  So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 197 kB of it. The next
-  cut has to come out of first-paint code instead, which is a wider decision
-  than this skill makes. The 2026-09-23 run read the whole 422-module ranking
-  looking for a fresh module of the cut's shape, and found none. The
-  2026-09-24 run read the top of the 430-module ranking and found none either.
-
-  Two smaller menus of the same shape sit beside them, `ThreadOverflowMenu` at
-  1.64 kB and `DraftOverflowMenu` at 0.41 kB. They are left out of the table so
-  its total stays comparable with the `manualChunks` measurement below, which
-  covers the seven.
-
-  **The two composer diagnostics are 14.61 kB of the entry chunk and are NOT a
-  cut.** Measured on the 2026-09-24 run: `deadPressProbe.ts` at 13.27,
-  `deadKeystrokeProbe.ts` at 0.99, `probeViewport.ts` at 0.35. That outweighs
-  every surface in the table above, so it reads as the obvious lift. It is not
-  one. `main.tsx` installs both before the first render, on purpose, because a
-  probe that arms behind a dynamic import misses the gesture it exists to
-  catch. Both are registered in `docs/temporary-measures.md` § 1, and that row
-  owns when they leave.
-
-  Growth is diffuse rather than one mistake. The 2026-08-30 run added 21.18 kB
-  and re-ran the check for the usual culprit, a component gone from lazy to
-  eager. There was none, for the fifth run running. That run's growth arrived
-  with a wide batch of merged feature work, not from one module.
-
-  The 2026-09-23 run spread the same way, over a 22.00 kB rise. Three files
-  added since the run before reach the chunk: `StoppedChildNotice.tsx`,
-  `dividerDrag.ts` and the SDK's `textEntry.ts`, 1.34 KiB together. That run
-  did not trace the other seven new entries. The rest of the rise came from
-  existing modules growing, `store/thread-events/` by 1.13 KiB among them. No
-  single module answers for the run.
-
-  The 2026-09-24 run rose 16.84 kB and added eight modules to the chunk. It
-  did not trace which ones.
-
-  Every run since has re-run the check and found no lazy-to-eager regression:
-
-  | Run | Entry chunk | Change |
-  |---|---|---|
-  | 2026-08-30 | 713.53 kB | +21.18 kB |
-  | 2026-09-05 | 733.21 kB | +19.68 kB |
-  | 2026-09-06 | 743.87 kB | +10.66 kB |
-  | 2026-09-07 | 743.87 kB | 0 kB |
-  | 2026-09-08 | 744.63 kB | +0.76 kB |
-  | 2026-09-11 | 744.77 kB | +0.14 kB |
-  | 2026-09-12 | 744.75 kB | -0.02 kB |
-  | 2026-09-15 | 750.02 kB | +5.27 kB |
-  | 2026-09-16 | 752.92 kB | +2.90 kB |
-  | 2026-09-17 | 763.13 kB | +10.21 kB |
-  | 2026-09-19 | 769.95 kB | +6.82 kB |
-  | 2026-09-21 | 797.32 kB | +27.37 kB |
-  | 2026-09-23 | 819.32 kB | +22.00 kB |
-  | 2026-09-24 | 836.16 kB | +16.84 kB |
-
-  The 2026-09-24 run makes eighteen in a row with no regression. Sourcemap
-  attribution put 430 of our own modules in the entry chunk, eight more than the
-  run before, and zero `node_modules` bytes.
-
-  Both regression questions came back clean. No module sits in both the entry
-  chunk and a separate one. All 32 non-test relative `import()` targets have
-  their own emitted chunk. They are reached from `App.tsx`, `main.tsx`,
-  `PairingGate.tsx`, `ContentPane.tsx` and `InlineForm.tsx`, and not one of
-  the 32 sits in the entry chunk. The per-surface figures above were
-  re-measured on this run.
-
-  **That check is two questions, not one.** Does any module sit in both the
-  entry chunk and a separately emitted chunk? And does any target of a
-  `lazy(() => import(...))` sit in the entry chunk at all? The second catches
-  a lazy view that a static import has quietly pulled forward. That shape
-  leaves no duplicate, so the first question misses it.
-
-  The 2026-08-29 run widened the second question to every relative `import()`
-  in the app source and the SDK. Scan the whole file list, not
-  a `src/**/*.ts` pathspec: git's default globbing lets `*` cross a slash, so
-  `**/` costs you the top-level files, and `main.tsx` holds the lazy views.
-
-  **Two filters make that scan answerable, and the 2026-08-30 run needed both.**
-  It counted 462 relative `import()` sites, of which 420 sit in test files. A
-  test importing a module dynamically says nothing about bundling, so drop
-  `*.test.*`, `__tests__/` and `*.spec.ts` first. That leaves 42 sites across 9
-  files.
-
-  Then drop TypeScript's type-position `import('...').Type`, which is erased at
-  compile time and reaches no bundle. All 6 apparent entry-chunk hits were that
-  form, in `api/threads.ts`, `api/types.ts`, `store/actions/navigation.ts` and
-  `store/store.ts`. So the real answer was zero. The six runs from 2026-09-15
-  on all found the same four files holding 8 of them. The 2026-09-24 run saw 40
-  non-test sites across the same 9 files, so 32 value imports once the 8 go.
-
-  **Write that second filter carefully.** "The character after the closing
-  paren is a dot" also drops every `import('./x').then(...)` site, which is
-  the entire value-import population. The 2026-09-15 run hit that and read 1
-  site where there were 32. Keep `.then`, `.catch` and `.finally`; drop only
-  the other dotted forms.
-
-  `icons.tsx` still leads, at 22.37 kB on 2026-09-24.
-  `thread-events/exchange-grouping.ts` keeps second at 21.17 kB. Then come
-  `exchange-render.ts` at 18.89, `ThreadDrawer.tsx` at 17.79 and `store.ts` at
-  17.67.
-
-  The three `thread-events/exchange*` modules add 54.40 kB between them on
-  2026-09-24. On 2026-09-23 the whole `store/thread-events/` directory put
-  seven modules and 58.85 kB in the chunk. A first paint reaches all of them.
-
-  The next tier is `ChatExchange.tsx` at 15.95 kB, then `PromptInput.tsx`
-  at 15.93 and `chat/scrollState.ts` at 15.79. Margins that thin were never a
-  ranking, so do not read a swap here as a signal.
-
-  **Attribute built bytes, not source bytes.** Ranking the sourcemap's
-  `sourcesContent` lengths answers a different question and reorders the
-  table. It put `scrollState.ts` first at 175 kB, because the file is heavily
-  commented and minification strips all of that. Decode the `mappings` field
-  and charge each generated segment's span to its source instead. That
-  reproduces the figures above and accounts for 99.5% of the chunk.
-
-  **Two units meet here, so do not chase the gap between them.** Vite divides
-  by 1000, so the 836.16 kB it reports is 836,160 bytes, which is 816.56 KiB.
-  Sourcemap columns count UTF-16 units, and every per-module figure above is
-  KiB. The history table quotes vite and the attribution does not, so the two
-  never sum to the same number.
-
-  **The entry chunk carries no `node_modules` code at all**, measured again on
-  the 2026-09-23 run by grouping the sourcemap's sources. Every byte of it is
-  code we wrote, so no vendor-chunking idea can buy anything here.
-
-  **The SDK's `tooltip.ts` is 6.23 kB of the entry chunk and is NOT a cut**,
-  measured on the 2026-08-28 run. It looks like one. `ui.ts` pulls the whole
-  module in for `disableTooltips`, and `ui` rides the `lucidos` barrel that
-  `api/client/settings.ts` imports at first paint. But the host shell installs
-  tooltips itself, through `hooks/useTooltip.ts`. So the bytes are used rather
-  than dragged, and moving the opt-out to its own module would free none.
-
-  The whole SDK is 20.00 kB of the entry chunk across 19 modules, measured on
-  the 2026-09-23 run. That bounds the barrel: dropping every SDK byte still
-  leaves the advisory firing.
-
-  **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
-  the lever.** A barrel is the one shape that splits with no loading flash.
-  The entry chunk holds every icon a lazy view reaches. Moving those out
-  costs no round trip, because the lazy chunk already loads.
-
-  Only three of the 66 icons are reached by lazy chunks alone. They are
-  `FolderUpIcon`, `FolderIcon` and `EyeOffIcon`, worth 3.58 kB of source and
-  less once minified. The list was five until 2026-09-21, when
-  `ChevronLeftIcon` and `ChevronRightIcon` both gained an entry-chunk caller.
-  So the lever is shrinking as the barrel grows. Re-measure before spending the
-  churn, rather than assuming the split is free money.
-
-  **`api/client.ts` is a second barrel, and the 2026-08-27 run measured it. It
-  is not a lever either.** 27.03 kB of `api/*` lands in the entry chunk across 17
-  modules, and tree-shaking still works, though it now keeps less out: only
-  `mcp.ts` and `data.ts`. `webhooks.ts` joined the entry chunk by the
-  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.85 kB,
-  which first paint genuinely needs. It exports `getPreferences`,
-  `setPreference` and the notification calls beside the backup, memory and
-  OAuth ones. Splitting it is an API-client refactor rather than a clean cut.
-
-  To attribute bytes, run
-  `npx vite build --sourcemap --outDir dist.smap` in `crates/lucidos-app`,
-  read `dist.smap/assets/index-*.js.map`, then delete `dist.smap`. Use the
-  CLI flag, not `build.sourcemap` in `vite.config.ts`. A config edit can be
-  left behind, and a scratch outDir keeps the served `dist/` untouched.
-
-  Each on-demand split also needs a preparatory move, because the panels
-  export first-paint state from the same module as the component:
-  `hooks/useThreadsHeaderState.ts` imports `filterButtonState` from
-  `ThreadFilterPanel`, and `PromptInput.tsx` imports
-  `codingAgentMenuOpenRequest` from `CodingAgentControlMenu`. The signal
-  has to move to its own module first or the component stays eager.
-
-  **Do not reach for `manualChunks` here.** Measured: forcing those eight
-  components into a named chunk drops the entry chunk to 243.26 kB, which
-  looks like a fix and is not one. Rollup relocates the shared core into
-  the named chunk, which the entry statically imports, so first paint
-  downloads the same bytes in two files. It clears the advisory while
-  changing nothing the advisory is about.
+  - **Attribute built bytes, not source bytes.** Run
+    `npx vite build --sourcemap --outDir /tmp/<dir>` in `crates/lucidos-app`
+    and decode the entry map's `mappings`, charging each segment to its
+    source. Use a scratch outDir, never a `build.sourcemap` config edit.
+  - **Ask the two regression questions.** Does any module sit in two chunks?
+    Does any `import()` target sit in the entry chunk?
+  - **Do not reach for `manualChunks` for our own code.** It moves shared code
+    into a chunk the entry imports statically, so first paint loads the same
+    bytes in series.
 
 ## Out of scope
 

@@ -409,7 +409,13 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
                 take the Cancel away from an install still downloading. */}
             {updateNarration
               ? (updateNarration.cancellable
-                  ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
+                  ? <button
+                      class="action-btn action-btn-danger"
+                      onClick={() => {
+                        cancelAppUpdate().catch((e) =>
+                          showToast(`Could not cancel the update: ${errorDetail(e)}`, 'error'));
+                      }}
+                    >Cancel Update</button>
                   : <button class="action-btn" disabled>Updating…</button>)
               : offersUpdateControl && (
                 <button

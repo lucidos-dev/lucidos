@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
@@ -16,7 +16,13 @@ import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
 import { NotificationsMenuGroup } from './NotificationsMenuRows';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
-import { WorkspacesMenuRow } from './WorkspaceSwitcher';
+import { lazyComponent, whenLoaded, type PendingOpen } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
+
+/** The workspace switcher's chunk, fetched once the boot splash lifts (ADR 0288).
+ *  The brand menu opens only once it is in memory, so the row never pops in. */
+const WorkspacesMenuRow = lazyComponent(() => import('./WorkspaceSwitcher').then((m) => m.WorkspacesMenuRow));
+prefetchWhenIdle(WorkspacesMenuRow);
 
 /** The notice at the head of the panel: a statement, not a row.
  *
@@ -299,6 +305,9 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
 export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluster' | 'brand' | 'row' }) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [open, setOpen] = useState(false);
+  // An open still waiting on the switcher's chunk, and how to take it back.
+  const pendingOpen = useRef<PendingOpen | null>(null);
+  useEffect(() => () => pendingOpen.current?.cancel(), []);
   const status = connectionStatus.value;
   const inRow = placement === 'row';
   const onDesktop = placement === 'brand';
@@ -351,7 +360,7 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
           // Only the cluster mark is the connection light, so only it carries
           // the attribute the state rules key on (see the component doc).
           data-conn={inRow ? undefined : status}
-          onClick={() => {
+          onClick={(e) => {
             // Re-read the peer counts on the way in, so the notifications group
             // is current rather than as of the last resume or tick.
             //
@@ -360,8 +369,13 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
             // cached, so a fetch there would put Refresh and Restart behind a
             // spinner. The group does have a cache, renders from it instantly,
             // and this only corrects it.
-            if (!open) void refreshOtherWorkspacesUnread();
-            setOpen(!open);
+            if (open) { setOpen(false); return; }
+            if (pendingOpen.current?.pending) {
+              pendingOpen.current.cancel();
+              return;
+            }
+            void refreshOtherWorkspacesUnread();
+            pendingOpen.current = whenLoaded(WorkspacesMenuRow, () => setOpen(true), e.currentTarget);
           }}
           aria-haspopup="menu"
           aria-expanded={open}

@@ -222,11 +222,18 @@ test.describe('Drawer section disclosure', () => {
         await openThreadDrawer(page);
         const header = page.locator('.thread-drawer [data-flip-id="__section_archive"]');
         const badge = header.locator('.section-count-badge');
+        const open = header.locator('.section-count-open');
 
+        // One copy of the number shows at a time: the bare, larger one while
+        // open, and the pill's own while shut.
         await expect(header).toHaveAttribute('aria-expanded', 'true');
-        await expect(badge).toHaveText('2');
+        await expect(open).toBeVisible();
+        await expect(open).toHaveText('2');
+        await expect(badge).toBeHidden();
         await header.click();
         await expect(header).toHaveAttribute('aria-expanded', 'false');
+        await expect(badge).toBeVisible();
         await expect(badge).toHaveText('2');
+        await expect(open).toBeHidden();
     });
 });

@@ -293,8 +293,12 @@ function schemeEndsAt(text: string, colonIndex: number): boolean {
 }
 
 /** A bare URL in a text segment. Shared by the URL linkifier and by
- *  `overlapsUrl`, so both agree on where a URL starts and ends. */
-const URL_IN_TEXT = /https?:\/\/[^\s<>"')\]]+/g;
+ *  `overlapsUrl`, so both agree on where a URL starts and ends. `file://` is
+ *  included because marked's autolinker skips it, and the click router hands
+ *  it to the OS opener (`extractLocalFileTarget`). The last character is never
+ *  sentence punctuation, matching GFM's autolink rule, so `file:///tmp/a.pdf.`
+ *  opens `a.pdf`. */
+const URL_IN_TEXT = /(?:https?|file):\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?]/g;
 
 /** Spans of every bare URL in `text`. */
 function urlSpans(text: string): Array<[number, number]> {

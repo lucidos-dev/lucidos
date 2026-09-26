@@ -32,7 +32,7 @@ import { type ThreadState } from '../thread-events';
 import { archiveThread } from '../../api/threads';
 import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { drawerOpen } from '../../components/layout/Drawer';
+import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
 import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';

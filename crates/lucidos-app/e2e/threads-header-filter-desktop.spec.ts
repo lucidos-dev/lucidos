@@ -193,7 +193,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // title row of its own. It needs no footer either: the header's Filter
     // button is the way out, held down while the panel is up (asserted in its
     // own test below).
-    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Filters');
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Filters');
     await expect(panel.locator('.thread-filter-panel-header')).toHaveCount(0);
     await expect(panel.locator('.thread-filter-panel-footer')).toHaveCount(0);
     await expect(panel.locator('.thread-filter-close')).toHaveCount(0);
@@ -268,7 +268,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Taking All statuses closes the panel and KEEPS the types narrowing it:
     // one choice, so the row cannot throw away the state it is describing.
     await allStatuses.click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     await filterBtn.click();
     await expect(panel).toBeVisible();
     await expect(panel.locator(
@@ -282,7 +282,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // while the type selection is STILL narrow, so reopening exercises the gate
     // below rather than a neutral filter.
     await panel.locator('.drawer-view-option', { hasText: 'Review' }).click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
 
     // Reopening under a non-All status shows the type section DIMMED in place,
     // since that view bypasses it. Dim only: every knob in it stays live, here
@@ -321,7 +321,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // a status view is what the `all` view lands on.
     await lucidos.click();
     await panel.locator('.drawer-view-option', { hasText: 'All statuses' }).click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     await filterBtn.click();
     await expect(panel).toBeVisible();
     await expect(lucidos.locator('input[type="checkbox"]')).not.toBeChecked();
@@ -335,7 +335,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(panel.locator('.thread-filter-title-check')).toHaveCount(0);
 
     await page.keyboard.press('Escape');
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
   });
 
   test('the Filter button is held down while the panel is up, and pressing it again is the way out', async ({ page }) => {
@@ -369,8 +369,8 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Pressing it again closes the panel, and closing is not a commit: the list
     // is back, the pane title says so, and the button is released.
     await filterBtn.click();
-    await expect(panel).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
+    await expect(panel).toBeHidden();
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
     await expect(page.locator('.thread-drawer .thread-drawer-list')).toBeVisible();
     expect(await glyph.innerHTML()).toBe(funnel);
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
@@ -392,7 +392,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // button comes back released, wearing that status's own glyph.
     await filterBtn.click();
     await panel.locator('.drawer-view-option', { hasText: 'Review' }).click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
     const review = await glyph.innerHTML();
     expect(review, 'the closed button stopped reporting the status').not.toBe(funnel);
@@ -409,14 +409,14 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
 
     // Closing releases it and keeps the glyph.
     await filterBtn.click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
     expect(await glyph.innerHTML(), 'closing swapped the status glyph').toBe(review);
 
     // Back on All statuses, the plain funnel returns.
     await filterBtn.click();
     await panel.locator('.drawer-view-option', { hasText: 'All statuses' }).click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     expect(await glyph.innerHTML()).toBe(funnel);
     await expect(glyph).toHaveAttribute('fill', 'none');
 
@@ -429,7 +429,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await lucidos.click();
     await expect(glyph).toHaveAttribute('fill', 'currentColor');
     await filterBtn.click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
     await expect(glyph).toHaveAttribute('fill', 'currentColor');
 
@@ -438,7 +438,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await lucidos.click();
     await expect(glyph).toHaveAttribute('fill', 'none');
     await filterBtn.click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
     expect(await glyph.innerHTML()).toBe(funnel);
   });
 
@@ -520,36 +520,41 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
 
     // Re-clicking the toggle closes it, and the pane title goes back.
     await filterBtn.click();
-    await expect(panel).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
+    await expect(panel).toBeHidden();
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
 
     // And it opens again on the next click.
     await filterBtn.click();
     await expect(panel).toBeVisible();
   });
 
-  test('closing the drawer closes the panel, so nothing invisible holds Escape', async ({ page }) => {
+  test('closing the drawer keeps the panel open, but nothing invisible holds Escape', async ({ page }) => {
     await sizeAndOpen(page);
 
     const filterBtn = page.locator('.threads-header button[aria-label="Filter threads"]');
     const panel = page.locator('.thread-drawer .thread-filter-panel');
+    const openCover = page.locator('.thread-filter-cover[data-open]');
     await filterBtn.click();
     await expect(panel).toBeVisible();
 
-    // Hide the whole pane the panel is a view of. Its state is a signal and it
-    // holds an Escape-registry entry, so leaving it "open" behind a hidden
-    // drawer would eat the user's next Escape and reopen onto the filter.
-    // The desktop toggle is one element in both drawer states, but the mobile
-    // header's copy stays mounted under a desktop viewport, so click whichever
-    // one is actually on screen.
+    // Hide the whole pane the panel is a view of. The mobile header's toggle
+    // stays mounted under a desktop viewport, so click whichever copy is on
+    // screen.
     const toggled = await clickVisibleElement(page, 'button[aria-label^="Show or hide thread drawer"]');
     expect(toggled, 'drawer toggle was visible').toBe(true);
-    await expect(page.locator('.thread-filter-panel')).toHaveCount(0);
 
-    // Reopening lands on the thread list, and the title says so.
+    // The panel stays open behind the hidden drawer, but an Escape must not
+    // close a panel nobody can see.
+    await expect(openCover).toHaveCount(1);
+    await page.keyboard.press('Escape');
+    await expect(openCover).toHaveCount(1);
+
+    // Reopening lands back on the filters, and Escape reaches them again.
     await openThreadDrawer(page);
-    await expect(page.locator('.thread-filter-panel')).toHaveCount(0);
-    await expect(page.locator('.threads-header .threads-header-title > [data-current]')).toHaveText('Threads');
+    await expect(panel).toBeVisible();
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Filters');
+    await page.keyboard.press('Escape');
+    await expect(openCover).toHaveCount(0);
   });
 
   test('is a pane view, not an overlay: a click elsewhere acts normally and leaves it open', async ({ page }) => {
@@ -578,6 +583,6 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
 
     // Opening search does put it away: they compete for the same pane body.
     await page.locator('.threads-header button[aria-label="Search threads"]').click();
-    await expect(panel).toHaveCount(0);
+    await expect(panel).toBeHidden();
   });
 });

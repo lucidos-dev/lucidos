@@ -66,8 +66,7 @@ describe('mobile fixed-header spacer', () => {
    * that change fails here rather than silently making the guard wrong.
    *
    * The panel shows in ONE scroll box, its cover, so the `::before` is the
-   * cover's first scrolling child, exactly as in the list it covers. The panel
-   * fades on a layer inside that box, which keeps the scroll where it was.
+   * cover's first scrolling child, exactly as in the list it covers.
    */
   it('the panel really is a cover, not a child of the list', () => {
     const panel = block(drawerCss, '.thread-filter-cover {');

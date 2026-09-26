@@ -18,6 +18,7 @@
  * gets a fresh, present splash.
  */
 import { scaledDurationMs } from './motion';
+import { startIdlePrefetch } from './idlePrefetch';
 
 const SPLASH_SELECTOR = '.boot-splash';
 const STATUS_SELECTOR = '.boot-splash-status';
@@ -133,6 +134,8 @@ export function handOverBootOwnership(): void {
 export function dismissBootSplash(): void {
   if (dismissed) return;
   dismissed = true;
+  // The first frame is up, so on-demand surfaces may load now (ADR 0288).
+  startIdlePrefetch();
   // Revert the html + body backgrounds the boot document painted with the brand
   // gradient for iOS safe-area coverage, so the app shell's own
   // var(--bg-primary) backgrounds show once the splash is gone — otherwise the

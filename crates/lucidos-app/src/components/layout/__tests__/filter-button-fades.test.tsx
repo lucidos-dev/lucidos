@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 /**
- * The Filter button's glyph and badge, and the pane title, fade rather than
- * swap. Each keeps every state it can show MOUNTED and flips which one is
- * shown, so the CSS transition runs on nodes that already exist.
+ * The Filter button's glyph and badge fade rather than swap. Each keeps every
+ * state it can show MOUNTED and flips which one is shown, so the CSS transition
+ * runs on nodes that already exist. The pane title is the other shape: it
+ * arrives with the drawer's navigation cover, as a fresh keyed element.
  *
- * These tests pin that shape: the same nodes survive a state change, and the
- * attribute the CSS keys on moves. The frames are covered by
+ * These tests pin both shapes. The frames are covered by
  * `e2e/threads-header-filter-transitions.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -99,29 +99,35 @@ describe('the needs-attention badge fades both ways', () => {
   });
 });
 
-describe('the pane title crossfades between Threads and Filters', () => {
+describe('the pane title arrives with the drawer view', () => {
   const show = (filters: boolean) => act(() => {
     if (filters) openThreadFilterPanel(); else closeThreadFilterPanel();
     render(<ThreadsPaneTitle class="threads-header-title" />, host);
   });
+  const title = () => host.firstElementChild as HTMLElement;
 
-  it('keeps both words mounted and moves the shown flag', () => {
+  afterEach(() => closeThreadFilterPanel());
+
+  it('says what the pane shows, and does not fade on the first render', () => {
     show(false);
-    const before = layers();
-    expect(before.map(l => l.textContent)).toEqual(['Threads', 'Filters']);
-    expect(current().map(l => l.textContent)).toEqual(['Threads']);
-    show(true);
-    expect(layers()).toEqual(before);
-    expect(current().map(l => l.textContent)).toEqual(['Filters']);
-    expect(before[0].getAttribute('aria-hidden')).toBe('true');
-    show(false);
-    expect(current().map(l => l.textContent)).toEqual(['Threads']);
+    expect(title().textContent).toBe('Threads');
+    expect(title().classList.contains('threads-header-title')).toBe(true);
+    expect(title().classList.contains('nav-arrive')).toBe(false);
   });
 
-  it('puts the title class on the stack itself, so the header centring still applies', () => {
+  it('arrives as a fresh element on each swap, so its fade replays', () => {
     show(false);
-    const root = host.firstElementChild!;
-    expect(root.classList.contains('threads-header-title')).toBe(true);
-    expect(root.classList.contains('crossfade-stack')).toBe(true);
+    const threads = title();
+    show(true);
+    expect(title()).not.toBe(threads);
+    expect(title().textContent).toBe('Filters');
+    expect(title().classList.contains('nav-arrive')).toBe(true);
+    // The header centring still applies to the arriving word.
+    expect(title().classList.contains('threads-header-title')).toBe(true);
+    const filters = title();
+    show(false);
+    expect(title()).not.toBe(filters);
+    expect(title().textContent).toBe('Threads');
+    expect(title().classList.contains('nav-arrive')).toBe(true);
   });
 });

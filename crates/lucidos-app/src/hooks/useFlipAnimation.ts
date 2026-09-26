@@ -197,6 +197,14 @@ export function startTogetherOnNextFrame(anims: Animation[], live: () => boolean
     });
 }
 
+/** Run a departure layer's exits from the next frame, then remove the layer.
+ *  No batch takes these over: the rows they stand for are gone either way, and
+ *  a newer batch would only drop a copy mid-exit. */
+function playOutDeparture(layer: HTMLElement, exits: Animation[]) {
+    startTogetherOnNextFrame(exits, () => layer.isConnected);
+    Promise.allSettled(exits.map(a => a.finished)).then(() => layer.remove());
+}
+
 /** Base duration for a row that moves `distance` px, before scaling. */
 function flightDurationMs(distance: number): number {
     return Math.max(MIN_MS, Math.min(MAX_MS, distance / PX_PER_SEC * 1000));
@@ -239,7 +247,8 @@ export function ghostOf(row: HTMLElement): HTMLElement {
  *
  * A row that leaves on any other render departs as a copy. An archived thread
  * that lands in a collapsed section flies into that section's header. Any
- * other row folds away where it stood.
+ * other row folds away where it stood. The copy finishes its exit even when a
+ * newer render starts another batch.
  *
  * Speed setting: slider 0 = normal (1x), +10 = 10x faster, -10 = 10x slower.
  */
@@ -265,6 +274,8 @@ export function useFlipTransitions(
     // What a running disclosure shows in place of each thread (its row copy),
     // and of each section's divider (its carried line).
     const standIns = useRef(new Map<string, HTMLElement>());
+    // Each thread whose copy is still leaving, and that copy's exit.
+    const departing = useRef(new Map<string, { ghost: HTMLElement; exit: Animation }>());
 
     // ── Build flat ordered list and section map ──
     const currentOrder: string[] = [];
@@ -387,6 +398,14 @@ export function useFlipTransitions(
         if (!el || !portal || !hasChanges || oldRects.size === 0) return;
 
         if (isReducedMotion()) return;
+
+        // A row back in the list takes over from its own leaving copy.
+        for (const id of currentOrder) {
+            const copy = departing.current.get(id);
+            if (!copy) continue;
+            copy.exit.cancel();
+            copy.ghost.remove();
+        }
 
         // Cancel previous animations and restore hidden elements
         for (const a of runningAnims.current) {
@@ -583,27 +602,36 @@ export function useFlipTransitions(
         // would report its old box, not the one the copy must land on.
         if (departures.size > 0) {
             const leaving = [...departures].map(([id, ghost]) => ({ id, ghost, rect: oldRects.get(id)! }));
-            clones.push(mountDepartureLayer(el, leaving));
+            const layer = mountDepartureLayer(el, leaving);
+            const exits: Animation[] = [];
             for (const { id, ghost, rect } of leaving) {
                 const header = tuckTarget(id, sections);
                 const target = header ? rowById.get(header)?.getBoundingClientRect() : undefined;
+                let exit: Animation;
                 if (target) {
                     const dy = target.top - rect.top;
                     ghost.style.background = 'var(--bg-primary)';
                     ghost.style.zIndex = '1';
-                    newAnims.push(ghost.animate([
+                    exit = ghost.animate([
                         { transform: 'translateY(0) scale(1)', opacity: '1' },
                         LINGER,
                         { transform: `translateY(${dy}px) scale(0.92)`, opacity: '0' },
-                    ], { duration: flightDurationMs(Math.abs(dy)) * scale, easing, fill: 'forwards' }));
+                    ], { duration: flightDurationMs(Math.abs(dy)) * scale, easing, fill: 'forwards' });
                 } else {
-                    newAnims.push(ghost.animate([
+                    exit = ghost.animate([
                         { transform: 'scaleY(1)', transformOrigin: 'top', opacity: '1' },
                         LINGER,
                         { transform: 'scaleY(0)', transformOrigin: 'top', opacity: '0' },
-                    ], { duration: MIN_MS * scale, easing, fill: 'forwards' }));
+                    ], { duration: MIN_MS * scale, easing, fill: 'forwards' });
                 }
+                exits.push(exit);
+                departing.current.set(id, { ghost, exit });
+                const forget = () => {
+                    if (departing.current.get(id)?.exit === exit) departing.current.delete(id);
+                };
+                exit.finished.then(forget, forget);
             }
+            playOutDeparture(layer, exits);
         }
 
         for (const row of rows) {

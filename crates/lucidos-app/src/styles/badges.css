@@ -104,7 +104,8 @@
             var(--badge-floor));
         height: var(--badge-box);
         min-height: 0;
-        padding-block: 0 round((var(--badge-box) - 1cap) / 2, 1px);
+        --badge-baseline-inset: round((var(--badge-box) - 1cap) / 2, 1px);
+        padding-block: 0 var(--badge-baseline-inset);
     }
 
     /* The one badge whose content is not text. While the engine is building,

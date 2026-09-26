@@ -12,7 +12,7 @@
  * All / Unread toggle and the row skeleton both stuck inside the chunk. The
  * detail carries the same hole, and its skeleton is what the chunk swallows.
  *
- * A source scan, for the reason `useStartup.test.ts` gives: standing the pane up
+ * A source scan, for the reason `startup.test.ts` gives: standing the pane up
  * in jsdom to observe a chunk that never loads would pin the mechanism rather
  * than the requirement.
  */

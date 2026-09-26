@@ -75,7 +75,7 @@ function currentThemePreference(): ThemePref {
  *  frame could resolve a pending `confirm` as OK, with no dialog ever shown.
  *
  *  The host guards the request direction the same way, and against the same
- *  threat (`isKnownAppFrame` in `hooks/useStartup.ts`). This is the reply
+ *  threat (`isKnownAppFrame` in `store/startup.ts`). This is the reply
  *  half. */
 function fromHost(event: MessageEvent): boolean {
   return event.source === window.parent;

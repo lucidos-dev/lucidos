@@ -158,8 +158,10 @@ describe('the pill and the baseline sit on whole pixels', () => {
   });
 
   it('lifts the baseline by a whole-pixel bottom padding', () => {
-    expect(shared!.props.get('padding-block'))
-      .toBe('0 round((var(--badge-box) - 1cap) / 2, 1px)');
+    // Named, because the section count scales from exactly this baseline.
+    expect(shared!.props.get('--badge-baseline-inset'))
+      .toBe('round((var(--badge-box) - 1cap) / 2, 1px)');
+    expect(shared!.props.get('padding-block')).toBe('0 var(--badge-baseline-inset)');
   });
 
   it('has every badge with a pill state the height it was designed at', () => {
@@ -332,11 +334,12 @@ describe('a drawer section and its count share one cap band', () => {
   it('retires the hand-tuned lift wherever the trim lands, and only there', () => {
     // The nudge stood in for the gap the trim now closes. It stays outside the
     // gate, because a browser without the trim still has the gap to correct.
+    // It sits on the wrapper, so it moves both copies of the number.
     const retired = gated.find(r =>
-      r.selector === '.list-section-title-collapsible > .section-count-badge');
+      r.selector === '.list-section-title-collapsible > .section-count');
     expect(retired?.props.get('top')).toBe('0');
     const base = cssRules(drawerCss).find(r =>
-      r.selector === '.list-section-title-collapsible > .section-count-badge'
+      r.selector === '.list-section-title-collapsible > .section-count'
       && r.atRules === '');
     expect(base?.props.get('top'), 'the untrimmed fallback keeps its lift').toBe('-0.0625rem');
   });

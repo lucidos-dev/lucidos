@@ -1,7 +1,7 @@
 /**
  * Regression guard for the resume-reconciliation set.
  *
- * `useStartup`'s `onResume` is what a long-resident client relies on to notice
+ * `startClient`'s `onResume` is what a long-resident client relies on to notice
  * anything that changed while the user was away: it fires on window `focus`,
  * `visibilitychange` and `pageshow`. Several separate update surfaces reconcile
  * there (the list below is the set, so it cannot go stale against a count in
@@ -15,7 +15,7 @@
  * published (`store/actions/app-update.ts`). This test exists so the set can only
  * shrink deliberately.
  *
- * A source scan rather than a mounted-hook test: `useStartup` wires SSE, service
+ * A source scan rather than a live start: `startClient` wires SSE, service
  * workers, timers, presence and push, so standing it up in jsdom to observe one
  * call would cost far more than the invariant is worth, and would pin the
  * mechanism instead of the requirement.
@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SOURCE = resolve(here, 'useStartup.ts');
+const SOURCE = resolve(here, 'startup.ts');
 
 /** Strip `//` and block comments so a surviving comment can never stand in for
  *  a deleted call. Dropping the call and leaving the prose that explains it is
@@ -49,7 +49,7 @@ function stripComments(src: string): string {
 function handlerBody(src: string, declaration: string): string {
   const stripped = stripComments(src);
   const start = stripped.indexOf(declaration);
-  expect(start, `useStartup.ts must declare \`${declaration}\``).toBeGreaterThan(-1);
+  expect(start, `startup.ts must declare \`${declaration}\``).toBeGreaterThan(-1);
   const open = stripped.indexOf('{', start);
   let depth = 0;
   for (let i = open; i < stripped.length; i++) {
@@ -70,7 +70,7 @@ const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
   ['flushUndeliveredComposeDrafts(', 'a draft whose PUT failed while offline is never re-sent, and since a draft lives only in memory it dies with the next iOS eviction'],
 ];
 
-describe('useStartup resume reconciliation', () => {
+describe('startClient resume reconciliation', () => {
   const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onResume()');
 
   // Proves the brace match actually bounded the handler.
@@ -101,7 +101,7 @@ describe('useStartup resume reconciliation', () => {
  * the branch and the platform fix silently stops reaching the surfaces the user
  * actually taps. Same source-scan reasoning as the resume guard above.
  */
-describe('useStartup external-link delegation', () => {
+describe('startClient external-link delegation', () => {
   const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onGlobalClick(');
 
   it('bounds the handler rather than swallowing the whole effect', () => {
@@ -137,12 +137,12 @@ describe('useStartup external-link delegation', () => {
  * failures in a row, and one bad wake was spending all three on its own, which
  * is why the stale-unread-count card appeared constantly.
  *
- * A source scan for the same reason as the guard above: standing `useStartup` up
+ * A source scan for the same reason as the guard above: standing `startClient` up
  * in jsdom to count listener invocations would pin the mechanism rather than the
  * requirement. The gate's own behaviour is unit-tested in
  * `utils/leadingEdgeGate.test.ts`.
  */
-describe('useStartup coalesces the iOS wake burst', () => {
+describe('startClient coalesces the iOS wake burst', () => {
   const src = stripComments(readFileSync(SOURCE, 'utf8'));
 
   it('routes all three wake events through the gate, never at onResume directly', () => {
@@ -158,8 +158,8 @@ describe('useStartup coalesces the iOS wake burst', () => {
 
   it('tears down the same references it added, so the listeners cannot leak', () => {
     // `removeEventListener` matches on function identity: leaving these pointing
-    // at `onResume` would silently keep the old listeners alive across remounts,
-    // and each remount would add a fresh set on top.
+    // at `onResume` would silently keep the old listeners alive across restarts,
+    // and each restart would add a fresh set on top.
     expect(src).toContain(`window.removeEventListener('focus', onResumeCoalesced)`);
     expect(src).toContain(`window.removeEventListener('pageshow', onResumeCoalesced)`);
     expect(src).not.toContain(`window.removeEventListener('focus', onResume)`);
@@ -186,9 +186,9 @@ describe('useStartup coalesces the iOS wake burst', () => {
  * What the bridge DOES once reached is behaviour, tested as behaviour in
  * `components/shared/__tests__/toast-app-bridge.test.tsx`. Only the two ordering
  * facts that live in this file are pinned here, for the same reason as the
- * guards above: the routing is unreachable without standing the whole hook up.
+ * guards above: the routing is unreachable without starting the whole client.
  */
-describe('useStartup app toast bridge wiring', () => {
+describe('startClient app toast bridge wiring', () => {
   const src = stripComments(readFileSync(SOURCE, 'utf8'));
   const body = handlerBody(src, 'function onAppFrameMessage(');
 
@@ -230,7 +230,7 @@ describe('useStartup app toast bridge wiring', () => {
  * so no effect outruns it. And the Unread tab renders `unreadNotifications`, so
  * a browse list cannot surface there whatever filter fetched it.
  */
-describe('useStartup notifications cold start', () => {
+describe('startClient notifications cold start', () => {
   const src = stripComments(readFileSync(SOURCE, 'utf8'));
   const eagerAt = src.indexOf('void loadNotifications()');
   const preferencesAt = src.indexOf('loadPreferences().then(');
@@ -255,5 +255,33 @@ describe('useStartup notifications cold start', () => {
     // seed into an effect or an await and the eager load starts guessing.
     const store = readFileSync(resolve(dirname(SOURCE), '../store/store.ts'), 'utf8');
     expect(store).toContain(`localStorage.getItem('lucidos-notifications-filter')`);
+  });
+});
+
+/**
+ * The ordering that makes the shell chunk a real first-paint split (ADR 0288).
+ * `boot()` starts the client before it renders the lazy shell, so the startup
+ * fetches run while the shell chunk downloads and parses. Moved back into the
+ * UI tree, every fetch would wait for the whole UI again. The entry chunk
+ * budget cannot see that.
+ */
+describe('startClient runs before the shell renders', () => {
+  const main = stripComments(readFileSync(resolve(dirname(SOURCE), '../main.tsx'), 'utf8'));
+  const app = stripComments(readFileSync(resolve(dirname(SOURCE), '../App.tsx'), 'utf8'));
+
+  it('is called by boot() ahead of render()', () => {
+    const startAt = main.indexOf('startClient()');
+    expect(startAt, 'main.tsx must start the client').toBeGreaterThan(-1);
+    expect(startAt).toBeLessThan(main.indexOf('render('));
+  });
+
+  it('is not started from inside the UI tree', () => {
+    expect(app).not.toContain('startClient');
+  });
+
+  it('asks for the shell chunk before boot() awaits anything', () => {
+    const preloadAt = main.indexOf('App.preload()');
+    expect(preloadAt, 'main.tsx must preload the shell chunk').toBeGreaterThan(-1);
+    expect(preloadAt).toBeLessThan(main.indexOf('async function boot('));
   });
 });

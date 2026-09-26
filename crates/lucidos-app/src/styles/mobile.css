@@ -562,21 +562,13 @@
         );
         text-align: center;
         overflow: hidden;
+        text-overflow: ellipsis;
         white-space: nowrap;
         pointer-events: none;
     }
 
     .mobile-header-title > * {
         pointer-events: auto;
-    }
-
-    /* The threads title is a crossfade stack (ThreadsPaneTitle), a grid, so
-       each word ellipsises in its own layer. The words are plain text, so
-       they stay out of the tap path the way the bare word was. */
-    .mobile-header-title > .crossfade-layer {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        pointer-events: none;
     }
 
     /* No `.pane-header-brand` rules here any more. That was the mobile thread
@@ -1003,7 +995,10 @@
         content: '';
         display: block;
         flex-shrink: 0;
-        height: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+        /* The transcript's spacer also carries the scroll anchor's sub-pixel
+           rest, as the desktop padding-top does (ADR 0286). Only
+           `.thread-content` sets the variable, so it is 0 on the rest. */
+        height: calc(var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))) + var(--anchor-subpixel, 0px));
     }
 
     /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the

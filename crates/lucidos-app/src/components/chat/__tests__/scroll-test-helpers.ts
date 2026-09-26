@@ -2,6 +2,17 @@
 // scroll-*.test.ts.
 import { vi } from 'vitest';
 
+/** A container's inline style: plain fields, plus the custom-property methods
+ *  the scroll anchor uses for its sub-pixel spacer. */
+export function mockStyle(fields: Record<string, string> = { overflow: '' }) {
+  const props = new Map<string, string>();
+  return Object.assign(fields, {
+    getPropertyValue: (name: string) => props.get(name) ?? '',
+    setProperty: (name: string, value: string) => { props.set(name, value); },
+    removeProperty: (name: string) => { props.delete(name); },
+  });
+}
+
 export class MockMutationObserver {
   observe = vi.fn();
   disconnect = vi.fn();
@@ -45,7 +56,7 @@ export function mockContainer(opts: {
     scrollTop: opts.scrollTop ?? 0,
     scrollHeight: opts.scrollHeight ?? 1000,
     clientHeight: opts.clientHeight ?? 500,
-    style: { overflow: '' } as Record<string, string>,
+    style: mockStyle(),
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
     scrollTo: vi.fn((arg: any) => {

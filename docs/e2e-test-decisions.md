@@ -379,6 +379,29 @@ removes the four CC-destination spec files (14 tests) that otherwise sit between
 unsharded alphabetical pass, where those tests (each spawning its own CC subprocess)
 push `drafts:65` well past it. Nothing about WebKit itself was involved.
 
+#### A spec ends every session it starts
+
+Selecting by id kept `drafts.spec.ts` on its own thread. It left the leak open, and
+the leak then broke a spec that selects by id. `drawer-archive-departure.spec.ts`
+failed every first attempt after the permission-prompt and question specs. The
+resurrected "Untitled Thread" row landed during the archive exit. That render
+started a new flip batch, which cancelled the departing copy mid-flight.
+
+So the leak is closed where it opens. `endResumedSession` in
+`coding-agent-question.spec.ts` runs in the `finally` of each test whose answer
+resumes the agent, before the rows are deleted. It works in three steps:
+
+1. Wait until `GET /api/v1/claude-code/commands?thread_id=` reports
+   `has_active_session`, or a terminal event follows the answer. A stop sent before
+   the session registers has nothing to reach, and the spawn goes ahead anyway.
+2. Stop it with `POST /api/v1/claude-code/stop?thread_id=&discard=true`.
+3. Wait until `has_active_session` is false.
+
+The rule for any new spec: **a spec that makes the engine start a coding-agent
+session ends that session before it deletes the rows.** Deleting the rows does not
+stop anything, because `clearAllThreads()` truncates the projection behind the
+engine's back.
+
 #### WebKit RSS reaper — host-resource safety net (distinct from the test-suite self-heal)
 
 The mitigations above (`gotoWithRetry` + `retries: 1`) protect the **test result**:

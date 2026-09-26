@@ -237,7 +237,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
   it('skips entirely until preferences load (durable global dismissal not yet known)', async () => {
     // Before preferences load, the global switch-dismissal is unknown — surfacing
     // would flash an already-dismissed toast on cold start. Skip without even
-    // fetching; useStartup re-runs checkEngineVersion after loadPreferences.
+    // fetching; startClient re-runs checkEngineVersion after loadPreferences.
     preferences.value = { status: 'loading' };
     await checkEngineVersion();
     expect(mockStatus).not.toHaveBeenCalled();

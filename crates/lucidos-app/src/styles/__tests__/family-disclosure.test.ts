@@ -1,5 +1,7 @@
 /**
- * The drawer's "Show / Hide N sub-threads" chevron rotates 90 degrees on
+ * Source scans over the drawer's "Show / Hide N sub-threads" link.
+ *
+ * The chevron rotates 90 degrees on
  * expand. In the packaged macOS app it then jumped a little to the right once
  * the rotation finished. WebKit drops the compositing layer a transition runs
  * on and repaints the rotated chevron into the row, snapped to a different
@@ -40,5 +42,15 @@ describe('the sub-thread chevron keeps one layer through its turn', () => {
   it('turns by changing that value, not by adding a new property', () => {
     expect(rule('.family-disclosure[aria-expanded="true"] svg').get('transform'))
       .toBe('rotate(90deg)');
+  });
+});
+
+describe('the sub-thread link stays on one line', () => {
+  // A wide chip squeezed the title column, and the button centred its wrapped
+  // text, leaving "threads" alone under "Hide 2 sub-".
+  it('never wraps its label, and the mobile rule does not undo that', () => {
+    const rules = cssRules(drawerCss).filter(r => r.selector === '.family-disclosure');
+    expect(rules[0].props.get('white-space')).toBe('nowrap');
+    for (const r of rules.slice(1)) expect(r.props.has('white-space')).toBe(false);
   });
 });

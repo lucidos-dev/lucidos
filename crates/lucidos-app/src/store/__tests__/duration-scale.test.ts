@@ -92,14 +92,9 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "keeps the drawer's list mounted through its width collapse",
   },
   {
-    file: '../../components/drawer/ThreadFilterCover.tsx',
-    expr: /scaledDurationMs\(FILTER_PANEL_FADE_MS\) \+ FILTER_PANEL_FADE_SLACK_MS/,
-    what: 'keeps the filter panel mounted through its fade out',
-  },
-  {
-    file: '../../components/layout/ContentPane.tsx',
+    file: '../../components/shared/NavigationCover.tsx',
     expr: /scaledDurationMs\(NAV_COVER_ANIM_MS\) \+ NAV_COVER_SLACK_MS/,
-    what: 'unmounts the navigation cover after its clear animation',
+    what: 'ends a navigation arrival (the cover and the title fade) after its animation',
   },
   {
     file: '../../components/chat/ThreadView.tsx',

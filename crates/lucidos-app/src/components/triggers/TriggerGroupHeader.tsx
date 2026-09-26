@@ -70,9 +70,11 @@ export function TriggerGroupHeader({ group }: Props) {
             onClick={e => e.stopPropagation()}
             onInput={e => setDraft((e.target as HTMLInputElement).value)}
             onBlur={editing ? commit : undefined}
+            // The blur commits, so the central Escape policy must not blur it.
+            data-escape-self
             onKeyDown={e => {
               if (e.key === 'Enter') void commit();
-              else if (e.key === 'Escape') cancel();
+              else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
             }}
           />
         </span>

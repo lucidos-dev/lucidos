@@ -4,7 +4,7 @@ import {
   DEFAULT_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
   MOBILE_VIEWS, PANE_INDEX, setMobileView, getInitialMobileView, type MobileView,
 } from '../store';
-import { drawerOpen } from '../../components/layout/Drawer';
+import { drawerOpen } from '../../components/layout/drawerState';
 import { DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX } from '../../components/layout/splitHelpers';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../paneMinimums';
 import {

@@ -1,7 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -1399,6 +1399,10 @@ export async function loadOlderThreads(): Promise<boolean> {
       // arbitrarily old. Letting one drive the cursor would jump natural
       // pagination over every intervening thread.
       if (familyExtensionIds.has(t.meta.id)) continue;
+      // Drafts and discarded drafts never come from the archive window, and the
+      // drawer shows them in no section. So their date says nothing about how
+      // far the archive has been paged, and must not drive the cursor.
+      if (isExcludedFromSections(t)) continue;
       // Same predicate AND the same *applied thread filter* the display reads.
       // The cursor is then the oldest loaded thread matching what is on screen,
       // and cannot drift from it.

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::{
     AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
-    DEFAULT_MAX_COMPLETION_TOKENS,
+    DEFAULT_MAX_COMPLETION_TOKENS, STREAM_LOG_TAG,
 };
 
 impl OpenAiProvider {
@@ -230,14 +230,23 @@ impl OpenAiProvider {
         'outer: loop {
             let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
                 Ok(Some(Ok(bytes))) => bytes,
-                Ok(Some(Err(e))) => return Err(format!("Stream read error: {}", e).into()),
+                Ok(Some(Err(e))) => {
+                    return Err(crate::llm::stream_failure(
+                        format!("Stream read error: {}", e),
+                        on_token.is_some() && !content.is_empty(),
+                        STREAM_LOG_TAG,
+                    ))
+                }
                 Ok(None) => break,
                 Err(_) => {
-                    return Err(format!(
-                        "OpenAI stream timed out (no data for {}s)",
-                        CHUNK_TIMEOUT_SECS
-                    )
-                    .into())
+                    return Err(crate::llm::stream_failure(
+                        format!(
+                            "OpenAI stream timed out (no data for {}s)",
+                            CHUNK_TIMEOUT_SECS
+                        ),
+                        on_token.is_some() && !content.is_empty(),
+                        STREAM_LOG_TAG,
+                    ))
                 }
             };
 
@@ -257,12 +266,14 @@ impl OpenAiProvider {
                     }
 
                     let prev_len = content.len();
-                    Self::process_chat_chunk(
-                        data_str,
-                        &mut content,
-                        &mut tool_call_map,
-                        &mut meta,
-                    )?;
+                    Self::process_chat_chunk(data_str, &mut content, &mut tool_call_map, &mut meta)
+                        .map_err(|e| {
+                            crate::llm::stream_failure(
+                                e.to_string(),
+                                on_token.is_some() && prev_len > 0,
+                                STREAM_LOG_TAG,
+                            )
+                        })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
                             // Floor defensively — `prev_len` is a byte length
@@ -731,6 +742,58 @@ mod tests {
         // this into the retry loop rather than failing the turn.
         assert!(err.contains("stream truncated"), "wording: {err}");
         assert!(crate::llm::is_retryable_error(&err), "wording: {err}");
+    }
+
+    /// Text that has streamed, then a mid-stream `error` frame that reads as
+    /// retryable. A retry re-sends the whole request.
+    const TEXT_THEN_SERVER_ERROR: &str = concat!(
+        r#"data: {"choices":[{"delta":{"content":"Here is the plan."}}]}"#,
+        "\n\n",
+        r#"data: {"error":{"type":"server_error","message":"The server had an error"}}"#,
+        "\n\n"
+    );
+
+    fn sse_response(body: &'static str) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::new(reqwest::Body::from(body)))
+    }
+
+    /// ADR 0089 on the OpenAI-compatible path: once text has rendered, a
+    /// retryable stream error stops the turn, or the retry renders it twice.
+    #[tokio::test]
+    async fn an_error_frame_after_streamed_text_reports_instead_of_retrying() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let on_token: Option<TokenCallback> = Some(Box::new(move |t: &str| {
+            sink.lock().unwrap().push_str(t);
+        }));
+
+        let err = provider
+            .parse_chat_stream(sse_response(TEXT_THEN_SERVER_ERROR), &on_token)
+            .await
+            .expect_err("an error frame fails the parse");
+
+        assert_eq!(seen.lock().unwrap().as_str(), "Here is the plan.");
+        let msg = err.to_string();
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "retrying would render the streamed text twice, got: {msg}"
+        );
+    }
+
+    /// With no callback nothing reached the user, so the same frame retries.
+    #[tokio::test]
+    async fn an_error_frame_with_nothing_rendered_still_retries() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
+        let err = provider
+            .parse_chat_stream(sse_response(TEXT_THEN_SERVER_ERROR), &None)
+            .await
+            .expect_err("an error frame fails the parse");
+        let msg = err.to_string();
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "nothing reached the user, so the error must retry, got: {msg}"
+        );
     }
 
     /// A stream that already streamed text stays a success even with no usage
