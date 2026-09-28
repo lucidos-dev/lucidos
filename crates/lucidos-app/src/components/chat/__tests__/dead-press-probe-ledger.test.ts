@@ -176,6 +176,8 @@ interface Line {
   /** Why no watchable face took a press attributed to the row. */
   under?: string;
   underFace?: string | null;
+  /** Where the browser dispatched the touch, beside what answers at the point. */
+  dispatchedTo?: string | null;
   faceCount?: number;
   watchableCount?: number;
   /** Where the finger landed, and the nearest face it failed to reach. */
@@ -849,6 +851,40 @@ describe('a dead composer tap runs the recovery the user runs by hand', () => {
     fire('touchcancel', touch(row, 10, 420));
     vi.advanceTimersByTime(700);
     expect(writes).toEqual([]);
+  });
+
+  /** The eleven-forty-three episode. The finger is on Send and the hit test
+   *  answers with Send, yet the browser dispatched the touch to another node. */
+  function tapSendDispatchedTo(target: FakeEl) {
+    atPoint = send;
+    fire('touchstart', touch(target, 350, 420));
+    fire('touchend', touch(target, 350, 420));
+  }
+
+  it('relays out for a tap on live Send that the browser sent elsewhere', () => {
+    settleHealthy();
+    tapSendDispatchedTo(elsewhere);
+    vi.advanceTimersByTime(700);
+    expect(lines().find((l) => l.verdict === 'missed')?.under).toBe('live-face');
+    expect(writes).toEqual(['108px', '476px']);
+  });
+
+  it('logs and toasts where the touch went, apart from what answers there', () => {
+    settleHealthy();
+    tapSendDispatchedTo(elsewhere);
+    expect(lines().find((l) => l.verdict === 'missed')?.dispatchedTo).toBe('button.thread-content');
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('sent it to button.thread-content, while button.action-btn answers'),
+      'warning',
+    );
+  });
+
+  it('says so when the touch went to a node the page had already removed', () => {
+    settleHealthy();
+    elsewhere.isConnected = false;
+    tapSendDispatchedTo(elsewhere);
+    expect(lines().find((l) => l.verdict === 'missed')?.dispatchedTo)
+      .toBe('button.thread-content (detached)');
   });
 
   it('leaves a press the app drops on purpose alone', () => {

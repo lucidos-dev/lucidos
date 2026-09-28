@@ -128,7 +128,7 @@ function needsLiveThinkingRow(opts: {
   // The `SessionStarted` scan runs only in the start window, where
   // `hasCCContent` is false and everything cheaper has already passed.
   return hasCCContent
-    || exchange.inputRead === true
+    || !!exchange.inputRead
     || exchange.steps.some(({ event }) => event.type === 'SessionStarted');
 }
 
@@ -1798,15 +1798,17 @@ function chatReadMarkers(exchanges: Exchange[]): Map<number, ReadMarker> {
  *
  *  Markers start at the first message the agent acknowledged. Messages before
  *  it predate read events or sit before the loaded window, and marking those
- *  "Sent" would claim they were never read. */
+ *  "Sent" would claim they were never read. A read child wake does not count:
+ *  only a message carries a marker. */
 function codingAgentReadMarkers(exchanges: Exchange[]): Map<number, ReadMarker> {
   const markers = new Map<number, ReadMarker>();
-  const first = exchanges.findIndex(ex => ex.inputRead);
+  const isMessage = ({ userEvent }: Exchange) =>
+    userEvent.type === 'MessageReceived' && !!userEvent._eventId;
+  const first = exchanges.findIndex(ex => ex.inputRead && isMessage(ex));
   if (first === -1) return markers;
   for (let i = first; i < exchanges.length; i++) {
-    const { userEvent, inputRead } = exchanges[i];
-    if (userEvent.type !== 'MessageReceived' || !userEvent._eventId) continue;
-    markers.set(i, inputRead ? 'read' : 'sent');
+    if (!isMessage(exchanges[i])) continue;
+    markers.set(i, exchanges[i].inputRead ? 'read' : 'sent');
   }
   return markers;
 }

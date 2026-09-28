@@ -112,7 +112,9 @@ export function Disclosure({ open, instant = false, children, class: className, 
       // Reads only: the start returned below is the one write.
       const interrupted = running.current.length > 0;
       if (!interrupted && offScreen(box)) return snap;
-      const height = content.offsetHeight;
+      // Unrounded, unlike `offsetHeight`: the box takes this height as the roll
+      // lands, so a rounded one jumps by the rounding there.
+      const height = content.getBoundingClientRect().height;
       const rect = box.getBoundingClientRect();
       const from = interrupted ? rect.height : open ? 0 : height;
       const fromOpacity = interrupted ? getComputedStyle(content).opacity : open ? '0' : '1';

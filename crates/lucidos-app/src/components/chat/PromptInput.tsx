@@ -21,11 +21,12 @@ import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
+import { askSideQuestion, routeSideQuestion, withSideQuestionPrefix } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
-import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
+import { codingAgentMenuComposerText, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { PromptRowControls, promptRowToggles } from './PromptRowControls';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
@@ -627,6 +628,27 @@ export function PromptInput() {
     if (threadId && resolved.storeWrite !== null) {
       updateCompose(threadId, { text: resolved.storeWrite });
     }
+    const thread = threadId ? threadMap.value.get(threadId) : undefined;
+    const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
+    const sideQuestion = routeSideQuestion(msg, {
+      codingAgent: useCodingAgent,
+      started: threadId !== null && thread !== undefined && thread.meta.state !== 'composing',
+      hasImages: currentImages.length > 0 || pendingForThread.length > 0,
+    });
+    if (sideQuestion.kind === 'refuse') {
+      showToast(sideQuestion.toast, 'info');
+      return;
+    }
+    if (sideQuestion.kind === 'ask' && threadId) {
+      if (el) {
+        writeComposerValue(el, '');
+        el.style.height = 'auto';
+      }
+      updateCompose(threadId, { text: '' });
+      void askSideQuestion(threadId, sideQuestion.question);
+      restoreComposerFocus();
+      return;
+    }
     // Backend reroutes typed text to the pending question's answer (see
     // chat/process/run.rs free-form path), but the answer payload drops images.
     // Refuse the send so the user can remove the images instead of silently
@@ -636,8 +658,6 @@ export function PromptInput() {
       showToast('Remove attached images to answer this question: answers are text only.', 'info');
       return;
     }
-    const thread = threadId ? threadMap.value.get(threadId) : undefined;
-    const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
     const context = currentChatContext();
     if (threadId && uploadInFlight) {
       // A queued send still flips the button to the optimistic Cancel — settle.
@@ -696,6 +716,22 @@ export function PromptInput() {
     if (active && active !== document.body) return;
     focusIfNeeded(inputRef.current);
   }
+
+  // The command menu hands a side question back, to be finished and sent here.
+  useSignalEffect(() => {
+    const handoff = codingAgentMenuComposerText.value;
+    if (handoff === null) return;
+    codingAgentMenuComposerText.value = null;
+    const el = inputRef.current;
+    const threadId = ensureFocusedComposeThread();
+    const text = withSideQuestionPrefix(handoff, el ? el.value : getDraft(threadId).text);
+    updateCompose(threadId, { text });
+    if (!el) return;
+    writeComposerValue(el, text);
+    autoResize();
+    focusIfNeeded(el);
+    el.setSelectionRange(text.length, text.length);
+  });
 
   useSignalEffect(() => {
     const queued = queuedUploadSends.value;

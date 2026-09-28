@@ -17,7 +17,7 @@ vi.mock('../../api/client', async () => {
 
 import { AppUiEditModal } from '../apps/AppUiEditModal';
 import { TriggerGroupHeader } from '../triggers/TriggerGroupHeader';
-import { appsList, panelOverlay, collapsedTriggerGroupIds } from '../../store/store';
+import { appsList, panelOverlay, collapsedTriggerSectionIds } from '../../store/store';
 import type { App, TriggerGroup } from '../../store/types';
 
 const APP_ID = 'habit-tracker';
@@ -110,7 +110,7 @@ describe('the trigger group header follows the TriggerGroupRenamed frame', () =>
     document.body.innerHTML = '';
     host = document.createElement('div');
     document.body.appendChild(host);
-    collapsedTriggerGroupIds.value = new Set();
+    collapsedTriggerSectionIds.value = new Set();
   });
 
   afterEach(() => {

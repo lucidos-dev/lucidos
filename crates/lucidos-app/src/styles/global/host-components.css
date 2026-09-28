@@ -848,7 +848,12 @@ html[data-theme-mode="dark"] .split-button.open::before {
     left: 0;
     min-width: 100%;
     max-width: min(24rem, calc(100vw - 1rem));
-    max-height: 18.75rem;
+    /* `--anchor-room` is the room between the trigger and the screen edge on
+       the side the menu opens, above the keyboard and below the status bar.
+       `useAnchoredPosition` measures it. Capped to it, a tall menu scrolls
+       instead of covering its trigger or the Dynamic Island. The fallback
+       covers a menu that publishes no room, such as the nav history. */
+    max-height: min(18.75rem, var(--anchor-room, calc(var(--app-height, 100dvh) - 1rem)));
     overflow-y: auto;
     z-index: calc(var(--z-control-panel) + 1);
 }
@@ -1486,7 +1491,9 @@ html[data-theme-mode="dark"] .split-button.open::before {
    the shell's bottom-bar default. */
 .explainer-popover {
     width: min(24rem, var(--anchored-popover-fit));
-    max-height: min(24rem, calc(var(--app-height, 100dvh) - 4rem));
+    /* The safe area comes off too: the position keeps the head below the
+       status bar, and the foot must still clear the keyboard. */
+    max-height: min(24rem, calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px)));
 }
 
 /* Explainer copy is the whole point of the popover, so it reads at full

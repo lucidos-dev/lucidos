@@ -459,3 +459,43 @@ The static half does not ask, and needs no model.
 Implementation: `engine/cc_permission.rs` (`attended_escalation_allowed`,
 `judge_escalation_lane`, `lane_allows_escalation`). Full reconnaissance:
 `docs/plans/2026-09-21-codex-sandbox-escapes-are-classified-before-carding.md`.
+
+## Addendum (2026-09-28): a human act in the spawn tree makes the session interactive
+
+**Context.** A trigger asked the user a question, the user answered, and the
+trigger's agent spawned a coding-agent child to do what the user chose. The user
+then wrote in the child and answered its questions. The child still auto-denied
+two out-of-workspace deletes as "unattended under a trigger". The walk read only
+each thread's originating origin, so it found the scheduler at the root and
+never saw the human.
+
+**Decision.** The walk checks every thread it visits before reading its origin.
+`human_acted_in` looks for a `MessageReceived` with a human origin or a
+`UserQuestionAnswered` with a human actor. Either gives `Interactive`. Both read
+the mode through `MessageOrigin::mode`, so "human" has one definition.
+
+Timing does not matter: the walk runs per request, so it answers for the thread
+as it is now. An unreadable answer counts as a human, as
+`was_moved_to_top_level` already does.
+
+**What interactive means here.** The session is treated exactly like one a
+human started. The trigger's grant no longer applies, and a request it would
+have settled shows a card. The workspace's "Always allow" grants and the Codex
+escalation classifier now apply, as in every human-rooted thread, whether or
+not the human is still looking.
+
+A trigger run nobody touched keeps its grant exactly as before. An engine-actor
+answer (orphan recovery) and an agent-mode spawn message do not count.
+
+**Accepted cost.** A human act anywhere in the tree, at any time, reads as
+attended. A human-mode origin is self-reported, so a token-less HTTP caller can
+claim one. That caller can already start an interactive top thread with the
+same grants, so this opens nothing new.
+
+**Non-goals.** No change to the Lucidos Agent command guard, which already asks
+on a human turn: a reply typed into a trigger thread runs as a chat turn. No new
+event or migration.
+
+Implementation: `engine/cc_permission.rs` (`human_acted_in`,
+`resolve_attend_mode`). Plan:
+`docs/plans/2026-09-28-a-human-in-the-spawn-tree-attends-the-session.md`.

@@ -533,7 +533,9 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // clamp moves the reader there as readily as anywhere else.
     if (anchored) {
       let framesLeft = ANCHOR_SETTLE_FRAMES;
-      const rollsLandAt = pressedAt + scaledDurationMs(DISCLOSURE_MAX_MS) + ROLL_SETTLE_SLACK_MS;
+      // Timed from now, not from the press: the rolls start once the render
+      // has committed, and a slow render lands well after the press.
+      const rollsLandAt = nowMs() + scaledDurationMs(DISCLOSURE_MAX_MS) + ROLL_SETTLE_SLACK_MS;
       let lastFrameAt = -Infinity;
       const reassert = (frameAt: number) => {
         if (!held.isConnected || isOtherNavigationScroll(container)) return;

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import type { JSX } from 'preact';
-import { isMobile } from '../../utils/viewport';
-import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { hasCoarsePointer, isMobile } from '../../utils/viewport';
+import { useAnchoredPosition, type AnchorPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { SkeletonProvider, SkText } from './Skeleton';
@@ -68,18 +68,19 @@ export function filterDropdownOptions(options: DropdownOption[], query: string):
  *  the mouse left focus where it already was. In the Tauri app that is usually
  *  the prompt textarea, where the filter query landed instead of filtering.
  *
- *  `null` leaves focus alone, in two cases. On mobile, moving it would only pop
- *  the on-screen keyboard, and there is no keyboard to type-to-search with.
+ *  `null` leaves focus alone, in two cases. On a touch device, an iPad as much
+ *  as a phone, moving focus blurs the field being typed in. That drops the
+ *  on-screen keyboard, and there is no keyboard to type-to-search with anyway.
  *  Before the panel is positioned it is `visibility: hidden`, and unfocusable.
  *  Pure, exported for testing. */
 export function openMenuFocusTarget(opts: {
   freeText: boolean;
   searching: boolean;
   positioned: boolean;
-  mobile: boolean;
+  touch: boolean;
 }): 'input' | 'filter' | 'trigger' | null {
   if (opts.freeText) return 'input';
-  if (opts.mobile) return null;
+  if (opts.touch) return null;
   if (opts.searching) return opts.positioned ? 'filter' : null;
   return 'trigger';
 }
@@ -112,17 +113,20 @@ export function dropdownMenuClass(trigger: { closest(selector: string): unknown 
  *  `width: max-content`; a min-width would have beaten that, so this one is
  *  answered where it is set.) `fixed` plus the zeroed offsets keep the hidden
  *  measurement box inside the viewport rather than 100vh down the document,
- *  so it measures at exactly the geometry it will be shown at. */
+ *  so it measures at exactly the geometry it will be shown at. `--anchor-room`
+ *  is the room on the side the menu opens, which `.dropdown-menu` folds into
+ *  its height cap. It is absent while measuring, so the first measurement sees
+ *  the menu's natural height. */
 export function dropdownPanelStyle(
   anchorWidth: number | null,
-  pos: { top: number; left: number } | null,
+  pos: Pick<AnchorPosition, 'top' | 'left' | 'maxHeight'> | null,
 ): JSX.CSSProperties {
   if (anchorWidth === null) return { visibility: 'hidden' };
   return {
     position: 'fixed',
     minWidth: `${anchorWidth}px`,
     ...(pos
-      ? { top: `${pos.top}px`, left: `${pos.left}px` }
+      ? { top: `${pos.top}px`, left: `${pos.left}px`, '--anchor-room': `${pos.maxHeight}px` }
       : { top: '0px', left: '0px', visibility: 'hidden' }),
   };
 }
@@ -219,7 +223,7 @@ export function Dropdown({
   useEffect(() => {
     if (!open) return;
     const target = openMenuFocusTarget({
-      freeText: !!freeText, searching, positioned: pos !== null, mobile: isMobile(),
+      freeText: !!freeText, searching, positioned: pos !== null, touch: isMobile() || hasCoarsePointer(),
     });
     if (target === 'input') {
       requestAnimationFrame(() => {
@@ -391,6 +395,11 @@ export function Dropdown({
           disabled={disabled}
           aria-haspopup="listbox"
           aria-expanded={open}
+          // Focus stays where it is. On iOS a mousedown on a button blurs the
+          // focused field, and a keyboard sliding away mid-open moves the menu
+          // under the reader. The open effect still focuses the trigger on
+          // desktop.
+          onMouseDown={(e) => e.preventDefault()}
           onClick={() => {
             if (disabled) return;
             if (open) closeDropdown(); else openDropdown();

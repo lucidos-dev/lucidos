@@ -1033,8 +1033,12 @@ export type ThreadEvent =
   | {
       type: 'CodingAgentInputRead';
       /** The event that carried the input: the `MessageReceived` for a
-       *  message. */
+       *  message, the `ChildThreadCompleted` for a child wake. */
       input_event_id: string;
+      /** The read opened a turn on a session whose last turn had already
+       *  ended, as when a queued message outlives a Stop. Such a read is a
+       *  start event: the thread runs again (ADR 0268). */
+      started_turn?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

@@ -690,6 +690,19 @@ async fn remove_queued_message(
     Ok(StatusCode::OK)
 }
 
+/// Whether the normal chat route refuses `message`: a `/btw` side question
+/// bound for a coding agent. That is an existing coding-agent thread (its
+/// `thread_summaries.source`), or any thread the request sends through one,
+/// including a thread it creates.
+fn refuses_side_question_message(
+    existing_source: Option<&str>,
+    use_coding_agent: Option<bool>,
+    message: &str,
+) -> bool {
+    (existing_source == Some("claude_code") || use_coding_agent == Some(true))
+        && crate::engine::agent_session::side_question::is_side_question(message)
+}
+
 /// POST endpoint for chat with progress updates.
 /// Returns immediately with an `event_id` (the response's only field; the
 /// legacy `message_id` name survives solely as a request-body serde alias on
@@ -775,6 +788,17 @@ pub(super) async fn chat_submit(
             );
             return Err(ApiError::not_found(unknown_thread_message(tid)));
         }
+    }
+
+    // A side question never becomes a turn in the main session (ADR 0318).
+    let existing_source = existing_thread_row
+        .as_ref()
+        .map(|(_, source, _, _)| source.as_str());
+    if refuses_side_question_message(existing_source, request.use_coding_agent, &request.message) {
+        return Err(ApiError::bad_request(
+            crate::engine::agent_session::side_question::SIDE_QUESTION_ON_CHAT_ROUTE,
+        )
+        .with_reason("side-question"));
     }
 
     // Subprocess gate: see `subprocess_chat_legitimate` for the matrix, and

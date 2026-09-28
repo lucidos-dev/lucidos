@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.42.0
+
+### Added
+- Ask a side question in a coding-agent thread with `/btw <question>`. Claude Code answers on a card at the end of the thread while its turn keeps running. The answer is not saved, and Codex threads do not offer it.
+- The Ungrouped section on the Triggers page folds like a group. A link to a trigger opens the section when it is folded.
+
+### Changed
+- Search everywhere opens wider on desktop, up to 36rem.
+- A theme card shows the theme count under the name, with the chevron at the right edge. A long theme name wraps onto two lines.
+- A refresh that finishes at once settles in about a second.
+
+### Fixed
+- Opening a dropdown menu keeps the keyboard up on iPhone and iPad, and the menu fits above the keys.
+- A dropdown on iPhone opens below the status bar and stays on the side it opened on. A tall list scrolls and leaves its button in view.
+- A tap on Send just after the iPhone keyboard closes no longer leaves the next tap dead.
+- A tap outside the open theme grid folds it and does not press the control under it. A tap on another theme still picks it, a scroll leaves the grid open, and a keyboard press still reaches its control. Toasts stay tappable over the grid.
+- Settings stays still when the theme grid opens or folds with classic scrollbars shown.
+- Search everywhere on a phone uses its phone size again.
+- The Read label on a message shows when the agent read it. The message details list both Sent and Read.
+- A coding-agent thread that picks up a queued message or a child's result after a Stop shows as running.
+- A coding-agent session that a trigger started asks you for permission once you have answered or written in its thread.
+- An unfolding section lands without a jump.
+- Wrapped thread titles in the drawer have more line spacing.
 ## v0.41.1
 
 ### Fixed

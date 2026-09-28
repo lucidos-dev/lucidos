@@ -3492,6 +3492,8 @@ Wider than the *child follow-up* edge, which stops at direct children, and delib
 
 Enforced on all fourteen routes carrying seven of clause 4's eight verbs, per verb rather than per route: Apply, Discard, answering a question card, restarting a turn (Continue), creating a top-thread, archiving and cancelling. Three of them arrive by more than one path, and gating the first path of each is how the ungated set grew. Three LLM tools press Apply in-process (`apply_change`, `apply_when_settled`, `apply_as_they_settle`). They carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. The eighth verb, resolving a permission card, is still ungated and recorded as such in the plan. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
 
+Two more verbs aim at a live coding-agent session rather than at the tree's shape: controlling it (`POST /api/v1/claude-code/control`) and asking it a *side question* (`POST /api/v1/coding-agents/side-question`), which reads the session's whole context.
+
 **Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
 
 ### Owner-device gate

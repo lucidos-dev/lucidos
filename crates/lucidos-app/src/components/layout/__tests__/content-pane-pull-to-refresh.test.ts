@@ -77,13 +77,13 @@ describe('content pane pull to refresh', () => {
 
   it('fades the check out at full size, on both rows', () => {
     // The exit resets `scale` only once the check is invisible, so it fades rather than shrinks.
-    const exit = 'transition: opacity var\\(--duration-emphasis\\) ease-in-out, scale 0s var\\(--duration-emphasis\\);';
+    const exit = 'transition: opacity var\\(--duration-slow\\) ease-in-out, scale 0s var\\(--duration-slow\\);';
     expect(mobileCss).toMatch(new RegExp(`\\.mobile-refresh-indicator \\.refresh-check\\s*\\{[^}]*${exit}`));
     expect(shellCss).toMatch(new RegExp(`\\.app-header \\.content-refresh-btn \\.refresh-check\\s*\\{[^}]*${exit}`));
   });
 
   it('brings the desktop arrow back only once the check has faded', () => {
-    expect(shellCss).toMatch(/\.app-header \.content-refresh-btn\[data-state="idle"\] svg:not\(\.refresh-check\)\s*\{\s*transition-delay: var\(--duration-emphasis\);/);
+    expect(shellCss).toMatch(/\.app-header \.content-refresh-btn\[data-state="idle"\] svg:not\(\.refresh-check\)\s*\{\s*transition-delay: var\(--duration-slow\);/);
   });
 
   it('never fades the phone slot itself, which would compound the check\'s fade', () => {

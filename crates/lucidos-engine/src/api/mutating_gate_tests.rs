@@ -43,6 +43,7 @@ const GATED_ROUTES: &[&str] = &[
     "/claude-code/discard",
     "/claude-code/interrupt",
     "/claude-code/stop",
+    "/coding-agents/side-question",
     "/command-checkpoint/undo",
     "/command-permission/consent",
     "/credential-base-urls",

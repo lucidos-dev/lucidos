@@ -180,6 +180,16 @@ pub enum ControlRequest {
     SetReasoningEffort { effort: String },
 }
 
+/// A side question (`/btw`) for a live agent. The driver asks it beside the
+/// running turn, which it never touches, and nothing of it enters the session.
+/// `reply` gets the answer or the agent's refusal. A dropped `reply` means the
+/// process ended before it answered.
+#[derive(Debug)]
+pub struct SideQuestionRequest {
+    pub question: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
 /// Parameters for spawning an agent. Borrowed for the duration of `spawn`.
 #[derive(Clone)]
 pub struct SpawnArgs<'a> {
@@ -309,6 +319,9 @@ pub struct RunningAgent {
     /// for backends whose permissions flow out-of-band (Claude Code's MCP
     /// HTTP path, the Codex exec driver's sandbox-only model).
     pub permission_rx: Option<mpsc::UnboundedReceiver<AgentPermissionRequest>>,
+    /// Side questions (see [`SideQuestionRequest`]). `None` for backends with
+    /// no side-question call: both Codex drivers.
+    pub side_question_tx: Option<mpsc::UnboundedSender<SideQuestionRequest>>,
 }
 
 #[async_trait]

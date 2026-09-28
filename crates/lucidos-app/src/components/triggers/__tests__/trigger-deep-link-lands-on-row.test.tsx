@@ -21,7 +21,8 @@ import {
   triggers,
   triggerGroups,
   triggerScrollTarget,
-  collapsedTriggerGroupIds,
+  collapsedTriggerSectionIds,
+  UNGROUPED_TRIGGER_SECTION_ID,
 } from '../../../store/store';
 import { clearNavFocus } from '../../shared/focusMarker';
 import type { TriggerInfo } from '../../../store/types';
@@ -102,7 +103,7 @@ describe('a trigger deep link lands on the ROW, not on the link pointing at it',
       ],
     };
     triggerGroups.value = { status: 'loaded', data: [] };
-    collapsedTriggerGroupIds.value = new Set();
+    collapsedTriggerSectionIds.value = new Set();
     mountChatPane();
     contentPane = mountContentPane();
   });
@@ -152,7 +153,7 @@ describe('a trigger deep link lands on the ROW, not on the link pointing at it',
         status: 'loaded',
         data: [{ ...trigger(TRIGGER_ID, 'Scheduled CI result'), group_id: 'ci' }],
       };
-      collapsedTriggerGroupIds.value = new Set(['ci']);
+      collapsedTriggerSectionIds.value = new Set(['ci']);
 
       triggerScrollTarget.value = TRIGGER_ID;
       render(<TriggersView />, contentPane);
@@ -166,6 +167,25 @@ describe('a trigger deep link lands on the ROW, not on the link pointing at it',
     } finally {
       delete (HTMLElement.prototype as unknown as { animate?: unknown }).animate;
     }
+  });
+
+  it('opens a collapsed Ungrouped section to land on a row inside it', async () => {
+    triggerGroups.value = {
+      status: 'loaded',
+      data: [{ id: 'ci', name: 'CI', order: 0, created: '2026-01-01T00:00:00Z', member_count: 0 }],
+    };
+    collapsedTriggerSectionIds.value = new Set([UNGROUPED_TRIGGER_SECTION_ID]);
+
+    triggerScrollTarget.value = TRIGGER_ID;
+    render(<TriggersView />, contentPane);
+    await waitFor(() => triggerScrollTarget.value === null);
+
+    const row = contentPane.querySelector<HTMLElement>(
+      `.trigger-row[data-trigger-id="${TRIGGER_ID}"]`,
+    );
+    expect(row).not.toBeNull();
+    expect(scrolled).toEqual([row]);
+    expect(collapsedTriggerSectionIds.value.has(UNGROUPED_TRIGGER_SECTION_ID)).toBe(false);
   });
 
   it('leaves the target unspent while no panel is mounted', async () => {

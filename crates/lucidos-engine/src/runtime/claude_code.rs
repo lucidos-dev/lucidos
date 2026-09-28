@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
-    AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
+    AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent,
+    SideQuestionRequest, SpawnArgs,
 };
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
@@ -204,6 +205,199 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
     .expect("ControlRequest serialization cannot fail")
 }
 
+/// The `side_question` control request: CC's headless form of `/btw`. CC
+/// answers it from a fork of the live context, beside any running turn, with
+/// every tool denied and nothing written to the transcript.
+fn cc_side_question_request_json(question: &str, request_id: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "side_question", "question": question },
+    }))
+    .expect("side question serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// Read a `control_response` line as a side-question reply: its request id,
+/// then the answer or CC's error. `None` for any other line.
+fn side_question_reply(line: &str) -> Option<(String, Result<String, String>)> {
+    if !line.contains("\"control_response\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type")?.as_str()? != "control_response" {
+        return None;
+    }
+    let response = value.get("response")?;
+    let request_id = response.get("request_id")?.as_str()?.to_string();
+    let answer = if response.get("subtype").and_then(|s| s.as_str()) == Some("success") {
+        response
+            .pointer("/response/response")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "Claude Code sent an empty side answer".to_string())
+    } else {
+        Err(response
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("Claude Code refused the side question")
+            .to_string())
+    };
+    Some((request_id, answer))
+}
+
+/// Side questions the driver has written and CC has not answered yet, by
+/// request id. Dropping one tells its asker the process ended first.
+type PendingSideQuestions =
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>;
+
+/// Parse one stdout line. A reply to a pending side question goes to its asker
+/// and yields no event, so the answer never reaches the session's history.
+fn route_stdout_line(
+    state: &mut CcStreamState,
+    pending: &mut PendingSideQuestions,
+    line: &str,
+) -> Vec<AgentEvent> {
+    if let Some((request_id, answer)) = side_question_reply(line) {
+        if let Some(reply) = pending.remove(&request_id) {
+            // An asker that gave up dropped its receiver; the answer has nowhere to go.
+            let _ = reply.send(answer);
+            return Vec::new();
+        }
+    }
+    parse_line(state, line)
+}
+
+/// How long a side question may take, live and cold paths together. The cold
+/// path is the slow one: its resume reads the whole transcript, and its model
+/// call is likely uncached.
+pub const SIDE_QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What the asker reads when a side question runs past its deadline.
+pub fn side_question_timeout_message() -> String {
+    format!(
+        "Claude Code did not answer within {} seconds",
+        SIDE_QUESTION_TIMEOUT.as_secs()
+    )
+}
+
+/// A cold side-question process group, killed if its asker goes away before
+/// the normal teardown runs, as when the browser abandons the request.
+struct ColdProcessGroup(Option<u32>);
+
+impl ColdProcessGroup {
+    /// Hand the leader's pid to the normal teardown, which reaps it.
+    fn disarm(&mut self) -> Option<u32> {
+        self.0.take()
+    }
+}
+
+impl Drop for ColdProcessGroup {
+    fn drop(&mut self) {
+        // Armed means nothing has reaped the leader yet, so its pid is still ours.
+        if let Some(pid) = self.0 {
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+    }
+}
+
+/// Ask a side question of an idle thread's session, which has no live process.
+///
+/// Spawns a short-lived `--resume` process that persists nothing and sends only
+/// the control request. Its process group dies once it answers, fails, passes
+/// `deadline` or loses its asker. `args.resume_session_id` names the session
+/// and is required.
+pub async fn ask_side_question_cold(
+    args: SpawnArgs<'_>,
+    question: &str,
+    deadline: tokio::time::Instant,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if args.resume_session_id.is_none() {
+        return Err("This thread has no Claude Code session to ask yet".into());
+    }
+    if let Some(path) = args.binary_override {
+        super::spawn_env::resolve_binary_override(
+            path,
+            "Claude Code (`claude`)",
+            crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+        )?;
+    }
+    let child = build_side_question_command(&args, lucidos_cli_dir()).spawn()?;
+    ask_side_question_of(child, question, deadline).await
+}
+
+/// The cold side-question command: the session's own flags, so the model and
+/// tool list match, plus `--no-session-persistence` so CC writes no transcript.
+fn build_side_question_command(
+    args: &SpawnArgs<'_>,
+    cli_dir: Option<&Path>,
+) -> tokio::process::Command {
+    let mut cmd = build_command(args, cli_dir);
+    cmd.arg("--no-session-persistence");
+    cmd
+}
+
+/// Send one side question to `child` and wait for its answer, then tear the
+/// process group down whatever happened. `child` must lead its own group.
+async fn ask_side_question_of(
+    mut child: Child,
+    question: &str,
+    deadline: tokio::time::Instant,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut group = ColdProcessGroup(child.id());
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let exchange = async {
+        stdin
+            .write_all(cc_side_question_request_json(question, &request_id).as_bytes())
+            .await?;
+        stdin.flush().await?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err::<String, Box<dyn std::error::Error + Send + Sync>>(
+                    "Claude Code exited before it answered".into(),
+                );
+            }
+            if let Some((id, answer)) = side_question_reply(&line) {
+                if id == request_id {
+                    return answer.map_err(Into::into);
+                }
+            }
+        }
+    };
+    let outcome = tokio::time::timeout_at(deadline, exchange).await;
+
+    // Signal the group only while the child is unreaped: a reaped pid may be recycled.
+    if let (Some(pid), Ok(None)) = (group.disarm(), child.try_wait()) {
+        crate::runtime::spawn_env::kill_child_process_group_now(pid);
+    }
+    let _ = child.start_kill();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        log!("[ClaudeCode] cold side-question process did not exit after SIGKILL");
+    }
+
+    let answer = outcome.map_err(|_| side_question_timeout_message())?;
+    if let Err(e) = &answer {
+        if let Some(mut stderr) = child.stderr.take().map(BufReader::new) {
+            let tail = drain_stderr(&mut stderr).await;
+            log!(
+                "[ClaudeCode] cold side question failed: {} (stderr: {})",
+                e,
+                tail.trim()
+            );
+        }
+    }
+    answer
+}
+
 fn is_valid_effort(value: &str) -> bool {
     cc_reasoning_effort_options()
         .iter()
@@ -342,6 +536,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlRequest>();
+        let (side_question_tx, side_question_rx) = mpsc::unbounded_channel::<SideQuestionRequest>();
 
         let initial_session_id = args.resume_session_id.map(str::to_string);
         tokio::spawn(driver_task(
@@ -352,6 +547,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             events_tx,
             input_rx,
             control_rx,
+            side_question_rx,
             cancel,
             initial_session_id,
             stream_state,
@@ -365,6 +561,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             // CC permissions flow out-of-band: its MCP permission-prompt
             // subprocess POSTs /api/v1/internal/permission-prompt directly.
             permission_rx: None,
+            side_question_tx: Some(side_question_tx),
         })
     }
 }
@@ -877,6 +1074,7 @@ async fn driver_task(
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
+    mut side_question_rx: mpsc::UnboundedReceiver<SideQuestionRequest>,
     cancel: CancellationToken,
     mut session_id: Option<String>,
     mut stream_state: CcStreamState,
@@ -903,6 +1101,7 @@ async fn driver_task(
     // arrives in several chunks. `read_until` keeps the chunks already read in
     // `line_buf`. `read_line` holds them inside its future and loses them.
     let mut line_buf: Vec<u8> = Vec::new();
+    let mut pending_side_questions = PendingSideQuestions::new();
     loop {
         tokio::select! {
             read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
@@ -912,8 +1111,11 @@ async fn driver_task(
                         // read can leave a last line that EOF ends without a
                         // newline, so forward what `line_buf` still holds.
                         if !line_buf.is_empty() {
-                            let events =
-                                parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                            let events = route_stdout_line(
+                                &mut stream_state,
+                                &mut pending_side_questions,
+                                &String::from_utf8_lossy(&line_buf),
+                            );
                             for ev in events {
                                 let _ = events_tx.send(ev);
                             }
@@ -922,8 +1124,11 @@ async fn driver_task(
                         break;
                     }
                     Ok(_) => {
-                        let events =
-                            parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                        let events = route_stdout_line(
+                            &mut stream_state,
+                            &mut pending_side_questions,
+                            &String::from_utf8_lossy(&line_buf),
+                        );
                         for ev in events {
                             if let AgentEvent::Init { session_id: ref sid, .. } = ev {
                                 session_id = Some(sid.clone());
@@ -972,6 +1177,22 @@ async fn driver_task(
                     break;
                 }
             }
+            // A dropped sender only disables this arm: side questions are optional.
+            Some(side_question) = side_question_rx.recv() => {
+                // The one line a side question writes. It never interrupts,
+                // queues behind or adds to the running turn.
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let line = cc_side_question_request_json(&side_question.question, &request_id);
+                pending_side_questions.insert(request_id, side_question.reply);
+                if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                    log!("[ClaudeCode] failed to write side question to stdin: {}", e);
+                    break;
+                }
+                if let Err(e) = stdin.flush().await {
+                    log!("[ClaudeCode] failed to flush stdin after side question: {}", e);
+                    break;
+                }
+            }
             _ = cancel.cancelled() => {
                 log!("[ClaudeCode] cancellation signalled — terminating CC process");
                 break;
@@ -1012,8 +1233,11 @@ async fn driver_task(
                     {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(_)) => {
-                            let events =
-                                parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                            let events = route_stdout_line(
+                                &mut stream_state,
+                                &mut pending_side_questions,
+                                &String::from_utf8_lossy(&line_buf),
+                            );
                             for ev in events {
                                 if events_tx.send(ev).is_err() {
                                     line_buf.clear();
@@ -1026,8 +1250,11 @@ async fn driver_task(
                 }
                 // A last line CC wrote with no newline before it exited.
                 if !line_buf.is_empty() {
-                    let events =
-                        parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                    let events = route_stdout_line(
+                        &mut stream_state,
+                        &mut pending_side_questions,
+                        &String::from_utf8_lossy(&line_buf),
+                    );
                     for ev in events {
                         let _ = events_tx.send(ev);
                     }

@@ -68,6 +68,7 @@ fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
             input_tx,
             control_tx,
             permission_rx: None,
+            side_question_tx: None,
         },
         cancel,
     }

@@ -6,11 +6,11 @@ import { renderHeaderAction, type HeaderActionSpec } from './headerActions';
 
 /** How long the spinner shows at least, so a quick refresh reads as one before
  *  it turns into the check. Holds only this status icon, never the content. */
-export const REFRESH_MIN_SPIN_MS = 800;
+export const REFRESH_MIN_SPIN_MS = 400;
 
 /** How long the check stays up after a refresh lands. The fade out starts
  *  when this ends. */
-export const REFRESH_DONE_HOLD_MS = 600;
+export const REFRESH_DONE_HOLD_MS = 400;
 
 // Both holds are for legibility, not animation, so the speed setting leaves them alone.
 

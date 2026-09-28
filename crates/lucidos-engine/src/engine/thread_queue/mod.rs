@@ -331,6 +331,10 @@ fn affects_user_running(event: &ThreadEvent) -> bool {
             | ThreadEvent::CommandPermissionResolved { .. }
             | ThreadEvent::McpPermissionResolved { .. }
             | ThreadEvent::CodingAgentPromptSent { .. }
+            | ThreadEvent::CodingAgentInputRead {
+                started_turn: true,
+                ..
+            }
             // → waiting_for_user_answer (parked on the user).
             | ThreadEvent::UserQuestionAsked { .. }
             | ThreadEvent::CodingAgentPermissionRequest { .. }

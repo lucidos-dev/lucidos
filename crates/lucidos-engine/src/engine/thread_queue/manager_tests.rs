@@ -1995,6 +1995,14 @@ fn affects_user_running_selects_status_transitions() {
         tool_use_id: String::new(),
     }));
     assert!(!affects_user_running(&ThreadEvent::ThreadSaved));
+
+    // An input read moves status only when it started a turn.
+    let read = |started_turn| ThreadEvent::CodingAgentInputRead {
+        input_event_id: Uuid::new_v4(),
+        started_turn,
+    };
+    assert!(affects_user_running(&read(true)));
+    assert!(!affects_user_running(&read(false)));
 }
 
 // ---- Event-trigger chain depth ----

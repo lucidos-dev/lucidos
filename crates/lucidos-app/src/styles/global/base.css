@@ -153,8 +153,9 @@ html {
        (.brand-menu, styles/header-mark.css), the Search everywhere palette
        (components/search/SearchEverywhere.css) and file search. */
     --header-surface-gap: 0.5rem;
-    /* The one width every surface hung from the header shares: the Lucidos
-       menu, Search everywhere and file search. Its size is a budget: the
+    /* The width the surfaces hung from the header share: the Lucidos menu,
+       file search, and Search everywhere on a phone (desktop gives Search
+       everywhere more room). Its size is a budget: the
        menu's Workspaces row must spell an ordinary workspace name whole. On a
        phone the `min()` keeps a 1rem margin to each screen edge. */
     --header-surface-width: min(22rem, calc(100vw - 2 * var(--space-lg)));

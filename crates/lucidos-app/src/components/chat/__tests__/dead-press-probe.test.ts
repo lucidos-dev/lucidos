@@ -13,6 +13,7 @@ import {
   pressWasAlone,
   faceExclusion,
   underFingerReason,
+  missEarnsRelayout,
   distanceOutside,
   nearestFaceMiss,
   missVector,
@@ -51,6 +52,7 @@ function facts(over: Partial<LandingFacts> = {}): LandingFacts {
     point: { x: 330, y: 434 },
     faceRect: FACE_RECT,
     targetIsFace: true,
+    dispatchedTo: 'button.action-btn',
     elementAtPoint: 'button.action-btn',
     pointerEventsAtPoint: 'auto',
     viewport: VIEWPORT,
@@ -81,6 +83,19 @@ describe('landingReport: did the press reach the button it was aimed at', () => 
     }));
     expect(report).toContain('the tap was on the button');
     expect(report).toContain('div.thread-content');
+  });
+
+  it('names where the touch went apart from what answers at the point', () => {
+    // The eleven-forty-three toast said the browser "sent it to" the element at
+    // the point, which was the Send button itself. Where the touch actually
+    // went was never recorded, and that is the reading that settles the case.
+    const report = landingReport(facts({
+      targetIsFace: false,
+      dispatchedTo: 'div.app-shell',
+      elementAtPoint: 'button.action-btn',
+    }));
+    expect(report).toContain('sent it to div.app-shell');
+    expect(report).toContain('button.action-btn answers at that point');
   });
 
   it('names the face, so the report says WHICH button died', () => {
@@ -323,9 +338,31 @@ describe('underFingerReason: why no watchable face took the press', () => {
       .toBe('disabled-face');
   });
 
-  it('calls a watchable face nothing, since it would have claimed the press', () => {
+  it('names a live face that the touch never reached', () => {
+    // A live face under the finger claims the press, unless the browser sent
+    // the touch somewhere else. The hit test answers with the face, which is a
+    // button, so reading that as a control button hid the one case that matters.
+    expect(underFingerReason({ actionFace: 'watchable', otherButton: true }))
+      .toBe('live-face');
     expect(underFingerReason({ actionFace: 'watchable', otherButton: false }))
-      .toBe('nothing');
+      .toBe('live-face');
+  });
+});
+
+describe('missEarnsRelayout: which missed presses the lift relays out for', () => {
+  it('relays out for empty row space and for a live face the touch missed', () => {
+    expect(missEarnsRelayout('nothing')).toBe(true);
+    // The eleven-forty-three episode: Send under the finger, the touch sent
+    // elsewhere after a keyboard close. The relayout is what frees the next tap.
+    expect(missEarnsRelayout('live-face')).toBe(true);
+  });
+
+  it('leaves a control button and an excluded face alone', () => {
+    // An icon button ran its own action. An excluded face drops the press on
+    // purpose. Neither is a dead composer.
+    expect(missEarnsRelayout('other-button')).toBe(false);
+    expect(missEarnsRelayout('disabled-face')).toBe(false);
+    expect(missEarnsRelayout('placeholder-face')).toBe(false);
   });
 });
 

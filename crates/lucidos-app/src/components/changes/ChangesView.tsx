@@ -280,8 +280,8 @@ export function ChangesView() {
   const showLoadingMore = useDelayedFlag(loadingMore);
 
   // Infinite scroll: observe a sentinel at the bottom of the applied list. The
-  // real scroll container is the ancestor `.content-pane-body` (overflow-y: auto
-  // in panels/shell.css), NOT this view's `.panel-content` — an `onScroll`
+  // real scroll container is the ancestor `.content-pane-body` (it scrolls,
+  // per panels/shell.css), NOT this view's `.panel-content`: an `onScroll`
   // listener on `.panel-content` never fired because that element doesn't scroll
   // (scroll events don't bubble). Rooting the observer at `.content-pane-body`
   // (mirrors NotificationsView) loads the next page as the sentinel comes into

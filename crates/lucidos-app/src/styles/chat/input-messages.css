@@ -1463,6 +1463,68 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
+/* `/btw` answers (ADR 0318) close the feed on the same edge as the notice.
+   Each is a raised neutral box, never an accent stripe, and stacks. */
+.side-questions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+}
+
+.side-question-card {
+    padding: var(--space-sm) var(--space-md) var(--space-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    min-width: 0;
+}
+
+.side-question-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.side-question-label {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-strong);
+}
+
+.side-question-note {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* 44px at the 16px root: the platform's minimum touch target. */
+.side-question-dismiss {
+    flex: none;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    margin-right: calc(-1 * var(--space-sm));
+    border-radius: var(--radius-control);
+}
+
+.side-question-question {
+    margin-bottom: var(--space-sm);
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.side-question-thinking {
+    min-height: 1lh;
+    color: var(--text-muted);
+}
+
+.side-question-error {
+    color: var(--accent-red);
+    overflow-wrap: anywhere;
+}
+
 /* `flex-start` plus a row unit on every field, exactly as `.response-header`
    (chat/response.css), which is where the reasoning lives: the fields are all
    one --turn-header-line tall and centre their own content, so a one-row header

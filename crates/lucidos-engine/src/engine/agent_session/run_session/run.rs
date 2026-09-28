@@ -761,6 +761,7 @@ impl LucidosEngine {
             mut events_rx,
             input_tx: agent_input_tx,
             control_tx: agent_control_tx,
+            side_question_tx: agent_side_question_tx,
             kind: _,
             // In-band approval requests (Codex app-server). `None` for CC and
             // the Codex exec escape hatch, where the matching select arm below
@@ -895,6 +896,7 @@ impl LucidosEngine {
                 external_terminal_emitted: external_terminal_emitted.clone(),
                 external_continuation_requested: external_continuation_requested.clone(),
                 control_tx: agent_control_tx.clone(),
+                side_question_tx: agent_side_question_tx,
                 builtin_commands: prev_builtin,
                 skill_commands: prev_skill,
                 current_model: normalized_model.clone(),
@@ -1130,7 +1132,9 @@ impl LucidosEngine {
                     // Only a read that settles an owed input can start a turn. A
                     // stray replay with nothing owed settles nothing.
                     let read_owed_input = matches!(ev, AgentEvent::InputRead(_)) && inputs.owed() > 0;
-                    announce_reads(&self.event_bus, thread_id, &meta, inputs.observe(&ev)).await;
+                    // Announced once the new-turn check below knows whether
+                    // this read opened a turn. `Exited` reads nothing.
+                    let read_input_ids = inputs.observe(&ev);
                     if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
                         killed_by_signal = ev_killed_by_signal;
                         // Final flush of any pending reasoning: surface what the
@@ -1283,6 +1287,14 @@ impl LucidosEngine {
                             &mut meta.actor,
                         );
                     }
+                    announce_reads(
+                        &self.event_bus,
+                        thread_id,
+                        &meta,
+                        read_input_ids,
+                        new_turn_after_terminal && read_owed_input,
+                    )
+                    .await;
                     match ev {
                         AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills } => {
                             log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
@@ -2315,8 +2327,10 @@ impl LucidosEngine {
                         text: agent_text,
                         images,
                     };
-                    // A child wake carries no message to mark read.
-                    inputs.forwarded(user_input.user_origin().into_iter().collect(), &agent_input);
+                    // A child wake owes its `ChildThreadCompleted`, so its read
+                    // can say it started a turn. Only an engine-made prompt
+                    // with no starter event (auto-harden) owes nothing.
+                    inputs.forwarded(user_input.origin_event_id.into_iter().collect(), &agent_input);
                     if agent_input_tx.send(agent_input).is_err() {
                         log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
@@ -2438,7 +2452,7 @@ impl LucidosEngine {
                     if let Some((count, settled)) = settled {
                         log!("[AgentSession] {} input(s) were answered without a read report on thread {}; terminating the idle subprocess", count, thread_id);
                         agent_cancel.cancel();
-                        announce_reads(&self.event_bus, thread_id, &meta, settled).await;
+                        announce_reads(&self.event_bus, thread_id, &meta, settled, false).await;
                     }
                 }
 

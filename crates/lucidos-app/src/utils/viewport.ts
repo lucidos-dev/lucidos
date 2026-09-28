@@ -13,6 +13,12 @@ export const isMobile = (): boolean => window.innerWidth <= MOBILE_BREAKPOINT;
 export const isTouchDevice = (): boolean =>
   'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
+/** True when the primary pointer is a finger. Unlike `isMobile()` this holds
+ *  on an iPad wider than the breakpoint, and unlike `isTouchDevice()` it stays
+ *  false on a touchscreen laptop driven by its trackpad. */
+export const hasCoarsePointer = (): boolean =>
+  window.matchMedia?.('(pointer: coarse)').matches ?? false;
+
 /** True when the device is mobile-sized OR confirmed touch-capable. The
  *  scroll-lock helper keys off this — iOS Safari ignores overflow:hidden on
  *  body and needs the position:fixed trick. Uses the STRICT touch check

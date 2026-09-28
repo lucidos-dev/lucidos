@@ -70,6 +70,23 @@ export function getRemPx(): number {
   return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
 }
 
+let safeAreaProbe: HTMLElement | null = null;
+
+/** The top safe area in px: the band the status bar and the Dynamic Island
+ *  draw over. Script cannot read `env()`, so a hidden probe resolves it as
+ *  padding. 0 where there is no inset, or no DOM. */
+export function safeAreaTopPx(): number {
+  if (typeof document === 'undefined' || !document.body) return 0;
+  if (!safeAreaProbe?.isConnected) {
+    safeAreaProbe = document.createElement('div');
+    safeAreaProbe.setAttribute('aria-hidden', 'true');
+    safeAreaProbe.style.cssText =
+      'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top, 0px)';
+    document.body.appendChild(safeAreaProbe);
+  }
+  return parseFloat(getComputedStyle(safeAreaProbe).paddingTop) || 0;
+}
+
 /** The viewport clamps live in `@lucidos/geometry`, because the shared tooltip
  *  runs in an app iframe and needs them too. Re-exported here so the host's own
  *  callers keep one import site, and there is still one definition. */

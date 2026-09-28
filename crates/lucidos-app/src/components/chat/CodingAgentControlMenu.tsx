@@ -22,11 +22,23 @@ import { ControlOptionList, type ControlOption } from '../shared/ControlOptionLi
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 import { FrontendPreviewSection } from './FrontendPreviewSection';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
+import { SIDE_QUESTION_COMMAND, isSideQuestionFilter } from '../../store/sideQuestions';
 import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
 export const codingAgentMenuOpenRequest = signal<string | null>(null);
+
+/** Text the menu hands back to the composer, which consumes it: a side
+ *  question is typed in the composer, never sent from the menu. */
+export const codingAgentMenuComposerText = signal<string | null>(null);
+
+/** The builtin commands to list. A live Claude Code thread also offers `/btw`,
+ *  which headless Claude Code does not register as a command. */
+export function withSideQuestionCommand(builtin: readonly string[], offered: boolean): string[] {
+  if (!offered || builtin.includes(SIDE_QUESTION_COMMAND)) return [...builtin];
+  return [SIDE_QUESTION_COMMAND, ...builtin];
+}
 
 /** What the last commands read answered, kept across remounts. */
 interface CommandCache {
@@ -125,7 +137,10 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     ? (draftOverride.ccReasoningEffort ?? null)
     : codingAgentPendingReasoningEffort.value;
   const menuLabel = isClaudeCode ? 'Claude Code' : 'Codex';
-  const effectiveBuiltinCommands = isClaudeCode ? builtinCommands.value : [];
+  const offersSideQuestion = isClaudeCode && !!threadId;
+  const effectiveBuiltinCommands = isClaudeCode
+    ? withSideQuestionCommand(builtinCommands.value, offersSideQuestion)
+    : [];
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
   const effectiveModel = pendingModel ?? currentModel.value;
   const selectedReasoningEffort = pendingReasoningEffort ?? currentReasoningEffort.value;
@@ -445,8 +460,18 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     highlightIndex.value = -1;
   }
 
+  /** Close the menu and put `/<text>` in the composer, to finish there. */
+  function handBackSideQuestion(text: string) {
+    close();
+    codingAgentMenuComposerText.value = `/${text}`;
+  }
+
   function sendSlashCommand(cmd: string) {
     if (!isClaudeCode) return;
+    if (cmd === SIDE_QUESTION_COMMAND && offersSideQuestion) {
+      handBackSideQuestion(`${SIDE_QUESTION_COMMAND} `);
+      return;
+    }
     close();
     sendMessage(`/${cmd}`, undefined, { useCodingAgent: true }).catch((err) => {
       showToast(`Failed to send /${cmd}: ${errorDetail(err)}`, 'error');
@@ -694,7 +719,15 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
                   placeholder="Filter commands..."
                   value={filter.value}
                   ref={filterRef}
-                  onInput={(e: Event) => { filter.value = (e.target as HTMLInputElement).value; highlightIndex.value = 0; }}
+                  onInput={(e: Event) => {
+                    const value = (e.target as HTMLInputElement).value;
+                    if (offersSideQuestion && isSideQuestionFilter(value)) {
+                      handBackSideQuestion(value);
+                      return;
+                    }
+                    filter.value = value;
+                    highlightIndex.value = 0;
+                  }}
                 />
               </div>
               {sections.map(section => (
@@ -716,6 +749,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
                       >
                         {label}
                         {currentVal && <span class="control-current-value"> · {currentVal}</span>}
+                        {item.type === 'slash' && item.name === SIDE_QUESTION_COMMAND && (
+                          <span class="control-current-value"> · Side question</span>
+                        )}
                       </button>
                     );
                   })}

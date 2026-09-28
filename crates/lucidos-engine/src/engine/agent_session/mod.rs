@@ -14,6 +14,7 @@ mod reconstruct;
 pub(crate) mod resume;
 mod run_session;
 mod runtime_helpers;
+pub(crate) mod side_question;
 mod spawn;
 pub(crate) mod spawn_dispatcher;
 mod spawns_in_flight;

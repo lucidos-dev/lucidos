@@ -49,6 +49,9 @@ pub(crate) enum ThreadReachVerb {
     /// reasoning effort or permission mode (`POST /api/v1/claude-code/control`).
     /// Controlling another thread's session is as much a reach as cancelling it.
     Control,
+    /// Asking a side question of a coding-agent session, which reads the
+    /// session's whole context (`POST /api/v1/coding-agents/side-question`).
+    AskSideQuestion,
     Apply,
     Discard,
     Revert,
@@ -71,6 +74,7 @@ impl ThreadReachVerb {
             Self::Archive => "archive",
             Self::Cancel => "cancel",
             Self::Control => "control the session on",
+            Self::AskSideQuestion => "ask a side question of",
             Self::Apply => "apply a change from",
             Self::Discard => "discard a change from",
             Self::Revert => "revert a change from",
@@ -89,6 +93,7 @@ impl ThreadReachVerb {
             Self::Archive => "archiving a thread",
             Self::Cancel => "cancelling a turn",
             Self::Control => "controlling a session",
+            Self::AskSideQuestion => "asking a side question",
             Self::Apply => "applying a change",
             Self::Discard => "discarding a change",
             Self::Revert => "reverting a change",

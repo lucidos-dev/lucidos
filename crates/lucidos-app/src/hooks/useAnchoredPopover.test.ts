@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   anchoredPanelStyle, computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers,
-  installPairedSwallow, pointAnchor,
+  installPairedSwallow, naturalPanelHeight, pointAnchor,
 } from './useAnchoredPopover';
 import { notePressOutcome, takePressOutcome } from '../utils/tapGesture';
 
@@ -126,9 +126,82 @@ describe('computeAnchorPosition', () => {
     });
   });
 
+  /** The status bar and the Dynamic Island draw over the top safe area, so a
+   *  panel head pinned to the viewport top sits under them. */
+  describe('under the status bar', () => {
+    const island = 59;
+
+    // A short viewport, as with the keyboard up: no room below the trigger.
+    it('never pins a panel head inside the top safe area', () => {
+      setViewport(393, 400);
+      const pos = computeAnchorPosition(fakeAnchor({ top: 300, bottom: 336, left: 20, right: 56 }), 324, 240, null, 'start', island);
+      expect(pos.top).toBe(island + 8);
+    });
+
+    it('caps the panel to the room above the anchor, so it scrolls instead of covering it', () => {
+      setViewport(393, 400);
+      const anchor = fakeAnchor({ top: 300, bottom: 336, left: 20, right: 56 });
+      const pos = computeAnchorPosition(anchor, 600, 240, null, 'start', island);
+      expect(pos.placement).toBe('top-start');
+      expect(pos.maxHeight).toBe(300 - 4 - (island + 8));
+      // Once capped it sits flush above the trigger, still clear of the island.
+      const capped = computeAnchorPosition(anchor, pos.maxHeight, 240, null, 'start', island);
+      expect(capped.top).toBe(island + 8);
+      expect(capped.top + pos.maxHeight).toBe(300 - 4);
+    });
+  });
+
+  it('opens on the roomier side when the panel fits neither', () => {
+    setViewport(393, 852);
+    const anchor = fakeAnchor({ top: 200, bottom: 236, left: 20, right: 56 });
+    const pos = computeAnchorPosition(anchor, 900, 240);
+    expect(pos.placement).toBe('bottom-start');
+    expect(pos.maxHeight).toBe(852 - 8 - 240);
+    // Measured again at its capped height, it stays put below the trigger.
+    const capped = computeAnchorPosition(anchor, pos.maxHeight, 240);
+    expect(capped.placement).toBe('bottom-start');
+    expect(capped.top).toBe(240);
+  });
+
+  /** The panel is re-measured at its capped height, so the fit test and the
+   *  room must agree to the pixel. Otherwise a panel capped above reads as
+   *  fitting below on the next frame and jumps sides. */
+  it('keeps a panel capped above on top when the room below is nearly as big', () => {
+    setViewport(393, 600);
+    const anchor = fakeAnchor({ top: 300, bottom: 336, left: 20, right: 56 });
+    // Room above: 300 - 4 - 8 = 288. Room below: 600 - 8 - 340 = 252.
+    const pos = computeAnchorPosition(anchor, 400, 240);
+    expect(pos.placement).toBe('top-start');
+    const capped = computeAnchorPosition(anchor, 254, 240);
+    expect(capped.placement).toBe('top-start');
+  });
+
+  /** Measured under its own room cap, a panel always fits the side that capped
+   *  it. So a menu that moved below on a narrowed filter stays below after the
+   *  filter clears, scrolling, though the room above could show it whole. */
+  it('measures a panel without the room cap it wears', () => {
+    const props = new Map<string, string>([['--anchor-room', '252px']]);
+    const panel = {
+      style: {
+        getPropertyValue: (k: string) => props.get(k) ?? '',
+        removeProperty: (k: string) => { props.delete(k); return ''; },
+        setProperty: (k: string, v: string) => { props.set(k, v); },
+      },
+      get offsetHeight() { return props.has('--anchor-room') ? 252 : 300; },
+    } as unknown as HTMLElement;
+    expect(naturalPanelHeight(panel)).toBe(300);
+    expect(props.get('--anchor-room')).toBe('252px');
+  });
+
+  it('never caps a panel that fits below it', () => {
+    setViewport(1280, 800);
+    const pos = computeAnchorPosition(fakeAnchor({ top: 100, bottom: 120, left: 50, right: 100 }), 200, 300);
+    expect(pos.maxHeight).toBeGreaterThanOrEqual(200);
+  });
+
   it('hands the container cap to the panel style, and hides it until measured', () => {
     expect(anchoredPanelStyle(null)).toEqual({ visibility: 'hidden' });
-    expect(anchoredPanelStyle({ top: 84, left: 12, placement: 'top-start', maxWidth: 484 }))
+    expect(anchoredPanelStyle({ top: 84, left: 12, placement: 'top-start', maxWidth: 484, maxHeight: 300 }))
       .toEqual({ top: '84px', left: '12px', maxWidth: '484px' });
   });
 

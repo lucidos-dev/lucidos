@@ -69,10 +69,14 @@
 }
 
 .theme-card-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     min-width: 0;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    line-height: 1.3;
 }
 
 .theme-card-modes {
@@ -81,12 +85,26 @@
     color: var(--text-muted);
 }
 
-/* The folded summary's hint that the card unfolds the whole gallery. */
-.theme-toggle-count {
-    display: inline-flex;
-    flex-shrink: 0;
+/* The folded summary stacks the name over the count, with a chevron pinned
+   right across both: the hint that the card unfolds the whole gallery. */
+.theme-toggle .theme-card-meta {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
+    row-gap: 0.125rem;
+}
+
+.theme-toggle-count {
+    grid-column: 1;
     white-space: nowrap;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.theme-toggle-chevron {
+    display: inline-flex;
+    grid-column: 2;
+    grid-row: 1 / span 2;
     font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }

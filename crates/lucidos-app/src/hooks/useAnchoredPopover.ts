@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
-import { clampWithin } from '../utils/dom';
+import { clampWithin, safeAreaTopPx } from '../utils/dom';
 import { notePressOutcome } from '../utils/tapGesture';
 import { primaryPointerIsDown } from '../utils/pointerPress';
 
@@ -25,12 +25,24 @@ export interface AnchorPosition {
    *  `top` does NOT, because narrowing reflows the content taller, so the
    *  hook watches the panel's size and re-measures once the cap lands. */
   maxWidth: number;
+  /** Tallest the panel may be and still fit between its anchor and the
+   *  viewport edge on the side it opens, margins already deducted. A surface
+   *  that publishes it as `--anchor-room` and caps against it scrolls instead
+   *  of covering its anchor. `.dropdown-menu` does. */
+  maxHeight: number;
 }
+
+/** The smallest height cap worth giving a panel, in px. Below it a list shows
+ *  a row or two, so the panel keeps its height and overlaps the anchor. */
+const MIN_PANEL_ROOM_PX = 96;
 
 /** Breathing room left at either end of the clamp range. Passed to
  *  `clampWithin` explicitly (rather than leaning on its default) so the margin
  *  the position is clamped by and the margin `maxWidth` deducts cannot drift. */
 const CLAMP_MARGIN = 8;
+
+/** The gap between the anchor and the panel's near edge, in px. */
+const ANCHOR_GAP = 4;
 
 /** Horizontal alignment of the panel relative to its anchor.
  *  - `'start'` (default): the panel's LEFT edge aligns with the anchor's left
@@ -79,26 +91,36 @@ export function pointAnchor({ x, y }: ViewportPoint): AnchorBox {
  *  the panel's head off the screen where its content cannot be scrolled back
  *  into view. The clamp never re-flips: a panel too tall for the space pins to
  *  the top margin and overlaps its anchor, which is strictly better than being
- *  unreachable. Surfaces should still cap their own `max-height` against the
- *  viewport so that overlap stays rare (see `.anchored-popover`). */
+ *  unreachable. `maxHeight` is what keeps that overlap rare: a surface that
+ *  caps itself against it always fits on the side it opens.
+ *
+ *  A panel that fits below opens below. One that fits neither side opens on
+ *  the roomier one. `topInset` is the top safe area, which the status bar
+ *  and the Dynamic Island draw over, so no panel head goes there. */
 export function computeAnchorPosition(
   anchor: AnchorBox,
   panelHeight: number,
   panelWidth: number,
   container?: HTMLElement | null,
   align: AnchorAlign = 'start',
+  topInset = 0,
 ): AnchorPosition {
   const rect = anchor.getBoundingClientRect();
   // The VISUAL viewport, in the layout-viewport coordinates `fixed` uses. iOS
   // shrinks only it for the keyboard, so `innerHeight` counts screen the keys
   // cover, and a panel measured against it opens behind them.
   const vv = window.visualViewport;
-  const viewTop = vv?.offsetTop ?? 0;
+  const viewTop = (vv?.offsetTop ?? 0) + topInset;
   const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
-  const wantBelow = rect.bottom + panelHeight + CLAMP_MARGIN <= viewBottom;
-  const desiredTop = wantBelow ? rect.bottom + 4 : rect.top - panelHeight - 4;
+  const roomBelow = viewBottom - CLAMP_MARGIN - (rect.bottom + ANCHOR_GAP);
+  const roomAbove = rect.top - ANCHOR_GAP - (viewTop + CLAMP_MARGIN);
+  // The fit test reads the same room the cap is taken from. A panel re-measured
+  // at its cap must fit on the side that capped it, or it jumps sides.
+  const wantBelow = panelHeight <= roomBelow || roomBelow >= roomAbove;
+  const desiredTop = wantBelow ? rect.bottom + ANCHOR_GAP : rect.top - panelHeight - ANCHOR_GAP;
   const top = clampWithin(desiredTop, panelHeight, viewTop, viewBottom, CLAMP_MARGIN);
   const placement: AnchorPosition['placement'] = wantBelow ? 'bottom-start' : 'top-start';
+  const maxHeight = Math.max(wantBelow ? roomBelow : roomAbove, Math.min(panelHeight, MIN_PANEL_ROOM_PX));
   const bounds = container?.getBoundingClientRect();
   const boundsLeft = bounds?.left ?? 0;
   const boundsRight = bounds?.right ?? window.innerWidth;
@@ -116,7 +138,7 @@ export function computeAnchorPosition(
   // same box used when no container was given at all.
   const containerFit = boundsRight - boundsLeft - 2 * CLAMP_MARGIN;
   const maxWidth = containerFit > 0 ? containerFit : Math.max(0, window.innerWidth - 2 * CLAMP_MARGIN);
-  return { top, left, placement, maxWidth };
+  return { top, left, placement, maxWidth, maxHeight };
 }
 
 const TOAST_LAYER_SELECTOR = '.toast-container';
@@ -178,13 +200,16 @@ export function useAnchoredPosition(
       rafId = null;
       const panel = panelRef.current;
       if (!panel) return;
-      const next = computeAnchorPosition(anchor, panel.offsetHeight, panel.offsetWidth, container, align);
+      const next = computeAnchorPosition(
+        anchor, naturalPanelHeight(panel), panel.offsetWidth, container, align, safeAreaTopPx(),
+      );
       setPos(prev =>
         prev &&
         prev.top === next.top &&
         prev.left === next.left &&
         prev.placement === next.placement &&
-        prev.maxWidth === next.maxWidth
+        prev.maxWidth === next.maxWidth &&
+        prev.maxHeight === next.maxHeight
           ? prev
           : next,
       );
@@ -222,9 +247,9 @@ export function useAnchoredPosition(
     // measurement is the only one until an unrelated scroll or resize, and an
     // upward-opening panel that grew after being measured hangs down over the
     // anchor that opened it. The observer's initial callback is free: an
-    // unchanged position hits the equality guard above and re-renders nothing,
-    // and a position change cannot itself change the panel's size, so this
-    // cannot cycle.
+    // unchanged position hits the equality guard above and re-renders nothing.
+    // A new `--anchor-room` does resize a capped panel, but the position reads
+    // the uncapped height (`naturalPanelHeight`), so this cannot cycle.
     const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     if (ro && panelRef.current) ro.observe(panelRef.current);
     return () => {
@@ -239,6 +264,19 @@ export function useAnchoredPosition(
     };
   }, [anchor, panelRef, containerSelector, align]);
   return pos;
+}
+
+/** The panel's height without the `--anchor-room` cap its caller applies.
+ *  Measured under that cap, a panel always fits the side that capped it. It
+ *  could then never move back to a roomier side once its content grew. The var
+ *  goes and comes back in one task, so nothing paints in between. */
+export function naturalPanelHeight(panel: HTMLElement): number {
+  const room = panel.style.getPropertyValue('--anchor-room');
+  if (!room) return panel.offsetHeight;
+  panel.style.removeProperty('--anchor-room');
+  const height = panel.offsetHeight;
+  panel.style.setProperty('--anchor-room', room);
+  return height;
 }
 
 /** The inline style that places a `position: fixed` panel at `pos`, no wider

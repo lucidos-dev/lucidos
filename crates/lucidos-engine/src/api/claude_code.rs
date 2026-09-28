@@ -343,6 +343,44 @@ pub(super) async fn claude_code_control(
 }
 
 #[derive(Deserialize)]
+pub(super) struct SideQuestionBody {
+    thread_id: String,
+    question: String,
+}
+
+/// `POST /api/v1/coding-agents/side-question`: answer a `/btw` side question
+/// in a Claude Code thread, beside any running turn. The answer is returned,
+/// never recorded (ADR 0318).
+pub(super) async fn coding_agent_side_question(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SideQuestionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::engine::agent_session::side_question::SideQuestionFailure;
+    let thread_id = uuid::Uuid::parse_str(&body.thread_id)
+        .map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_id),
+        super::thread_reach::ThreadReachVerb::AskSideQuestion,
+    )
+    .await
+    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
+    match state
+        .engine
+        .ask_side_question(thread_id, &body.question)
+        .await
+    {
+        Ok(answer) => Ok(Json(serde_json::json!({ "answer": answer }))),
+        Err(SideQuestionFailure::Refused(refusal)) => Err(ApiError::bad_request(refusal)),
+        Err(SideQuestionFailure::Failed(message)) => {
+            Err(ApiError::new(StatusCode::BAD_GATEWAY, message))
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub(super) struct CommandsQuery {
     thread_id: Option<String>,
     /// Compose-view repo selector. Empty string ("") = the workspace's default
@@ -542,6 +580,10 @@ pub(super) async fn coding_agent_binaries(
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/coding-agents/binaries", get(coding_agent_binaries))
+        .route(
+            "/coding-agents/side-question",
+            post(coding_agent_side_question),
+        )
         .route("/claude-code/stop", post(claude_code_stop))
         .route("/claude-code/interrupt", post(claude_code_interrupt))
         .route("/claude-code/control", post(claude_code_control))

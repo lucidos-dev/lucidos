@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // Stub HTMLElement before importing the modules that reference it, exactly as
 // the sibling scroll suites do.
@@ -18,6 +18,7 @@ if (typeof (globalThis as any).cancelAnimationFrame === 'undefined') {
 import { mockContainer, mockDynamicAnchor, useMockMO } from './scroll-test-helpers';
 import { withScrollAnchor } from '../CreateThreadView';
 import { resumeFollowingBottom, setActiveScrollElement, stopFollowingBottom } from '../scrollState';
+import { DISCLOSURE_MAX_MS } from '../../../utils/disclosureMotion';
 
 /**
  * **The anchor is the element the reader clicked.**
@@ -104,6 +105,39 @@ describe('a turn control holds the element the reader clicked', () => {
       }
       expect(viewportTop(control)).toBe(before);
     } finally {
+      (globalThis as any).requestAnimationFrame = syncFrame;
+      restoreMO();
+    }
+  });
+
+  it('holds it until a roll that started after a slow render has landed', () => {
+    // The rolls start only once the render has committed. On a long transcript
+    // that render can take a few hundred ms. A hold timed from the press let go
+    // while the rows above were still rolling.
+    const restoreMO = useMockMO();
+    const container = mockContainer({ scrollTop: 1000, scrollHeight: 9000 });
+    const control = mockDynamicAnchor(container, 1300);
+    const before = viewportTop(control);
+    const frames: FrameRequestCallback[] = [];
+    const syncFrame = globalThis.requestAnimationFrame;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { frames.push(cb); return 0; };
+    const pressedAt = performance.now();
+    const renderMs = 300;
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(pressedAt);
+    try {
+      withScrollAnchor(control as any, () => {
+        clock.mockReturnValue(pressedAt + renderMs);
+        control._setOffset(1310);
+      });
+      const rollStart = pressedAt + renderMs;
+      const rollFrames = Math.ceil(DISCLOSURE_MAX_MS / 8.33);
+      for (let frame = 1; frame <= rollFrames && frames.length > 0; frame++) {
+        control._setOffset(1310 + (frame / rollFrames) * 490);
+        frames.shift()!(rollStart + frame * 8.33);
+      }
+      expect(viewportTop(control)).toBe(before);
+    } finally {
+      clock.mockRestore();
       (globalThis as any).requestAnimationFrame = syncFrame;
       restoreMO();
     }

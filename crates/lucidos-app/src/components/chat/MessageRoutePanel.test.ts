@@ -676,6 +676,25 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
+  // The header of a read message shows the read time, so the sent time lives
+  // here or nowhere.
+  it('lists when a read message was sent and when it was read', () => {
+    const message: StoredEvent = {
+      type: 'MessageReceived', text: 'hi', mode: 'human',
+      origin: { kind: 'device', device_id: 'd1' },
+      created: '2026-09-24T06:13:01Z',
+    };
+    const read = JSON.stringify(renderOriginSection(
+      exch(message), undefined, () => undefined, undefined, 'claude-code', '2026-09-24T06:19:30Z',
+    ));
+    expect(read).toContain('"Sent"');
+    expect(read).toContain('"Read"');
+
+    const unread = origin(message);
+    expect(unread).not.toContain('"Sent"');
+    expect(unread).not.toContain('"Read"');
+  });
+
   it('keeps the engine attribution when a legacy resume recorded no reason', () => {
     const s = origin({ type: 'ContinuationStarted', branch: '' });
     expect(s).toContain('Lucidos Engine');

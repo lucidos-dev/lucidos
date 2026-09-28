@@ -115,7 +115,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   // WebKit paint loss (see utils/webkitRepaint.ts for the mechanism), reported
   // first on the iOS PWA and since on the packaged desktop app.
-  // `.content-pane-body` is an `overflow-y: auto` scroll container, so WKWebView
+  // `.content-pane-body` is a scroll container, so WKWebView
   // gives it its own compositing layer, and a backgrounded PWA (the phone locked)
   // leaves that layer frozen on a stale-or-empty backing texture: the panel is
   // fully rendered and laid out in the DOM, and nothing is on screen. Same blank

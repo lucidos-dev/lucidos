@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 // iOS PWA paint loss on the CONTENT pane.
 //
-// `.content-pane-body` (styles/panels/shell.css) is an `overflow-y: auto` scroll
+// `.content-pane-body` (styles/panels/shell.css) is a scroll
 // container, so WKWebView gives it its own compositing layer. While the PWA is
 // backgrounded (the phone locked) WebKit stops committing the layer tree and that
 // layer freezes on a stale-or-empty backing texture: the panel is fully built and

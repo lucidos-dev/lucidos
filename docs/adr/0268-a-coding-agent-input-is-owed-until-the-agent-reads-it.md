@@ -31,6 +31,11 @@ Each read emits `CodingAgentInputRead`, naming the event that carried the
 input. The transcript marks a message "Sent" until then, and "Read" after. The
 rule lives in `engine/agent_session/input_ledger.rs`.
 
+A read that opens a turn after the last one ended carries `started_turn`. It is
+that turn's start event, because the input's own `CodingAgentPromptSent` landed
+before the terminal that ended the old turn. Without it, a queued message that
+outlives a Stop ran on a thread still marked idle and stopped.
+
 ## Rationale
 
 **The replay is exact.** Probes against the real CLI showed Claude Code replays

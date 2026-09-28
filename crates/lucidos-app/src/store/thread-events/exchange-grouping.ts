@@ -1382,9 +1382,21 @@ export function isUningestedMessage(exchange: Exchange): boolean {
   // waits on the loop to take it. Counted as awaiting, it would take the
   // running turn's stream the moment a caller drew breath.
   if (isLiveUtteranceRow(exchange.userEvent)) return false;
-  return exchange.steps.every(
-    s => VOICE_ONLY_STEP_TYPES.has(s.event.type) || UNANCHORABLE_ASYNC_EVENTS.has(s.event.type),
-  );
+  return !exchange.steps.some(isLoopStep);
+}
+
+/** A step the agentic loop put in its exchange, as against one a call or an
+ *  unanchored async row filed there. */
+function isLoopStep({ event }: SequencedEvent): boolean {
+  return !VOICE_ONLY_STEP_TYPES.has(event.type) && !UNANCHORABLE_ASYNC_EVENTS.has(event.type);
+}
+
+/** When the agent read the message that opened this exchange, or undefined
+ *  while it waits. A coding agent reports its read. The Lucidos Agent reads a
+ *  message with the first step its loop lands here. */
+export function messageReadTimestamp(exchange: Exchange): string | undefined {
+  if (exchange.inputRead) return exchange.inputRead.created;
+  return exchange.steps.find(isLoopStep)?.event.created;
 }
 
 /** The narrower half: a message the reader may RETRACT.
@@ -1854,7 +1866,7 @@ function foldEvent(
     if (event.type === 'CodingAgentInputRead') {
       const read = exchanges.find(ex => ex.userEvent._eventId === event.input_event_id);
       if (read && !read.inputRead) {
-        read.inputRead = true;
+        read.inputRead = event;
         touched?.add(read);
       }
       // A waiting message takes the turn from here: the agent's later steps

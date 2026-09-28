@@ -53,9 +53,9 @@ export type Exchange = {
    *  still holds a turn, and `exchangeHoldsNoTurn` has to say so, or the
    *  status machinery steps over the card the work is in. */
   tookTheTurn?: boolean;
-  /** True once the coding agent read the message that opened this exchange,
-   *  set by its `CodingAgentInputRead`. Drives the Sent / Read marker. */
-  inputRead?: true;
+  /** The coding agent's `CodingAgentInputRead` for the message that opened
+   *  this exchange. Drives the Sent / Read marker and dates the read. */
+  inputRead?: StoredEvent;
   /** True while a message sent behind a running coding-agent turn waits for
    *  the agent to read it. It takes no steps meanwhile and renders in the
    *  bottom queue. See `docs/plans/2026-09-24-unread-coding-agent-messages-queue.md`. */

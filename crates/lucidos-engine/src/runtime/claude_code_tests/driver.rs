@@ -17,6 +17,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (side_question_tx, side_question_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         child,
@@ -26,6 +27,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         events_tx,
         input_rx,
         control_rx,
+        side_question_rx,
         cancel.clone(),
         None,
         CcStreamState::default(),
@@ -37,6 +39,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
             input_tx,
             control_tx,
             permission_rx: None,
+            side_question_tx: Some(side_question_tx),
         },
         cancel,
     )
@@ -149,6 +152,7 @@ async fn driver_task_flags_stray_signal_kill() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::unbounded_channel();
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (_side_question_tx, side_question_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         child,
@@ -158,6 +162,7 @@ async fn driver_task_flags_stray_signal_kill() {
         events_tx,
         input_rx,
         control_rx,
+        side_question_rx,
         cancel,
         None,
         CcStreamState::default(),
@@ -494,5 +499,261 @@ async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
             .iter()
             .any(|ev| matches!(ev, AgentEvent::Result { text, .. } if text == "done")),
         "the last line must arrive, got {events:?}"
+    );
+}
+
+// ── side questions ───────────────────────────────────────────────────────
+
+#[test]
+fn side_question_reply_reads_success_and_error() {
+    let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"response":"forty-two","synthetic":false}}}"#;
+    assert_eq!(
+        side_question_reply(ok),
+        Some(("r1".to_string(), Ok("forty-two".to_string())))
+    );
+    let err = r#"{"type":"control_response","response":{"subtype":"error","request_id":"r2","error":"no context"}}"#;
+    assert_eq!(
+        side_question_reply(err),
+        Some(("r2".to_string(), Err("no context".to_string())))
+    );
+    assert_eq!(
+        side_question_reply(r#"{"type":"result","result":"x"}"#),
+        None
+    );
+}
+
+/// A shell stand-in for Claude Code that answers the first `side_question`
+/// on stdin with `answer`, echoing its request id. Lines it reads go to `log`.
+fn answer_side_question_script(log: &Path, answer: &str) -> String {
+    format!(
+        r#"read l; printf '%s\n' "$l" >> {log}; id=$(printf '%s' "$l" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"response":"{answer}","synthetic":false}}}}}}\n' "$id""#,
+        log = log.display(),
+    )
+}
+
+/// The running turn is never touched: a side question asked mid-turn writes
+/// exactly one `side_question` line, is answered before the turn's `Result`,
+/// and its answer reaches the asker only, never `events_rx`.
+#[tokio::test]
+async fn a_side_question_mid_turn_leaves_the_turn_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stdin.log");
+    let script = format!(
+        r#"read l; printf '%s\n' "$l" >> {log}; printf '{init}\n'; {answer}; printf '{result}\n'"#,
+        log = log.display(),
+        init = r#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
+        answer = answer_side_question_script(&log, "forty-two"),
+        result = r#"{"type":"result","result":"main done","duration_ms":5}"#,
+    );
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+    agent
+        .input_tx
+        .send(AgentInput {
+            text: "do the main work".into(),
+            images: vec![],
+        })
+        .unwrap();
+    let init = tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(init, AgentEvent::Init { .. }), "got {init:?}");
+
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    agent
+        .side_question_tx
+        .as_ref()
+        .expect("Claude Code takes side questions")
+        .send(SideQuestionRequest {
+            question: "what is the codeword?".into(),
+            reply,
+        })
+        .unwrap();
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .expect("answered within 5s")
+        .expect("reply not dropped");
+    assert_eq!(answer, Ok("forty-two".to_string()));
+
+    let mut rest = Vec::new();
+    while let Some(ev) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
+            .await
+            .expect("driver finishes")
+    {
+        rest.push(ev);
+    }
+    assert!(
+        matches!(&rest[0], AgentEvent::Result { text, error: None, .. } if text == "main done"),
+        "the turn's own Result follows unchanged, got {rest:?}"
+    );
+    assert!(
+        !format!("{rest:?}").contains("forty-two"),
+        "the side answer must never reach the session's events"
+    );
+
+    let stdin_log = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = stdin_log.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one user line, one side question: {stdin_log}"
+    );
+    assert!(lines[0].contains(r#""type":"user""#));
+    assert!(lines[1].contains(r#""subtype":"side_question""#));
+    assert!(lines[1].contains("what is the codeword?"));
+    assert!(!stdin_log.contains("interrupt"));
+}
+
+/// A process that exits with a side question pending drops its reply, which
+/// tells the engine to fall back to a cold process.
+#[tokio::test]
+async fn a_pending_side_question_is_dropped_when_the_process_exits() {
+    let (agent, _cancel) = spawn_driver_for_test("sh", &["-c", "read l; exit 0"]).await;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    agent
+        .side_question_tx
+        .as_ref()
+        .unwrap()
+        .send(SideQuestionRequest {
+            question: "q".into(),
+            reply,
+        })
+        .unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+        .await
+        .expect("resolves once the driver ends");
+    assert!(
+        outcome.is_err(),
+        "reply dropped unanswered, got {outcome:?}"
+    );
+}
+
+fn spawn_cold_fake(script: &str) -> Child {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+    cmd.spawn().expect("spawn fake")
+}
+
+fn deadline_in(wait: std::time::Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + wait
+}
+
+/// True once `pid` names no process. Polls briefly: an orphan zombie lingers
+/// until init reaps it.
+#[cfg(unix)]
+async fn process_gone(pid: i32) -> bool {
+    for _ in 0..40 {
+        // SAFETY: signal 0 only probes; no pointer arguments.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_cold_side_question_is_answered_past_unrelated_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stdin.log");
+    let script = format!(
+        r#"printf '{{"type":"system","subtype":"init","session_id":"s"}}\n'; {}; sleep 30"#,
+        answer_side_question_script(&log, "from the transcript")
+    );
+    let child = spawn_cold_fake(&script);
+    let pid = child.id().unwrap() as i32;
+    let answer =
+        ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(5))).await;
+    assert_eq!(answer.unwrap(), "from the transcript");
+    #[cfg(unix)]
+    assert!(
+        process_gone(pid).await,
+        "the cold process must not outlive the answer"
+    );
+    let stdin_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        stdin_log.lines().count(),
+        1,
+        "only the control request: {stdin_log}"
+    );
+    assert!(!stdin_log.contains(r#""type":"user""#));
+}
+
+/// The cold process never outlives the request: a timeout kills its whole
+/// process group, grandchildren included.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cold_side_question_that_never_answers_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild = dir.path().join("grandchild.pid");
+    let script = format!(
+        "sleep 30 & echo $! > {}; cat > /dev/null",
+        grandchild.display()
+    );
+    let child = spawn_cold_fake(&script);
+    let pid = child.id().unwrap() as i32;
+    let outcome = ask_side_question_of(
+        child,
+        "q",
+        deadline_in(std::time::Duration::from_millis(500)),
+    )
+    .await;
+    let err = outcome.expect_err("times out").to_string();
+    assert!(err.contains("did not answer"), "got {err}");
+    assert!(process_gone(pid).await, "the cold process is reaped");
+    let grandchild_pid: i32 = std::fs::read_to_string(&grandchild)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        process_gone(grandchild_pid).await,
+        "the group kill reaches the grandchild"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_process_that_exits_first_reports_it() {
+    let child = spawn_cold_fake("read l; exit 3");
+    let err = ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(5)))
+        .await
+        .expect_err("no answer")
+        .to_string();
+    assert!(err.contains("exited before it answered"), "got {err}");
+}
+
+/// An asker that goes away mid-question, such as an HTTP request the browser
+/// abandoned, still takes the cold process group down with it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_abandoned_cold_side_question_kills_its_process_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild = dir.path().join("grandchild.pid");
+    let script = format!(
+        "sleep 30 & echo $! > {}; cat > /dev/null",
+        grandchild.display()
+    );
+    let child = spawn_cold_fake(&script);
+    let pid = child.id().unwrap() as i32;
+    let asked = ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(60)));
+    let abandoned = tokio::time::timeout(std::time::Duration::from_millis(500), asked).await;
+    assert!(abandoned.is_err(), "the asker gave up before any answer");
+    assert!(
+        process_gone(pid).await,
+        "the cold process dies with its asker"
+    );
+    let grandchild_pid: i32 = std::fs::read_to_string(&grandchild)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        process_gone(grandchild_pid).await,
+        "the group kill reaches the grandchild"
     );
 }

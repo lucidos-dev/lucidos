@@ -235,6 +235,68 @@ async fn a_stopped_child_that_continues_reports_its_next_turn_once() {
     teardown_test_db(&db_name).await;
 }
 
+fn input_read(started_turn: bool) -> ThreadEvent {
+    ThreadEvent::CodingAgentInputRead {
+        input_event_id: Uuid::new_v4(),
+        started_turn,
+    }
+}
+
+/// The user sends a message mid-turn, then cancels the question the agent
+/// asked. The cancel is a Stop, but the agent then reads the queued message
+/// and starts a turn for it. That read is new work: the thread runs again and
+/// is no longer a stopped child.
+#[tokio::test]
+async fn a_queued_message_read_after_a_stop_ends_the_stopped_state() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_response_canceled_with_cause(&bus, child_id, CancelCause::UserStop).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(read_stop_state(&pool, child_id).await, (true, true));
+
+    let emit_read = |started_turn| {
+        bus.emit(BusEvent::Thread {
+            thread_id: child_id,
+            event: input_read(started_turn),
+            meta: EventMeta::NONE,
+        })
+    };
+    emit_read(false).await.unwrap();
+    assert_eq!(
+        read_stop_state(&pool, child_id).await,
+        (true, true),
+        "a read that opens no turn changes nothing"
+    );
+
+    emit_read(true).await.unwrap();
+    assert_eq!(
+        read_stop_state(&pool, child_id).await,
+        (false, true),
+        "the turn the read opened ends the stopped state and owes the parent a card"
+    );
+    assert_eq!(read_status(&pool, child_id).await, "running");
+    assert_eq!(
+        read_descendant_counts(&pool, parent_id).await.1,
+        0,
+        "and takes the child out of the parent's attention"
+    );
+    drain_callbacks(&mut callback_rx);
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        count_events(&pool, parent_id, "ChildThreadCompleted").await,
+        1,
+        "the resumed turn reports once"
+    );
+    assert_eq!(drain_callbacks(&mut callback_rx), 1);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Archive and Discard are the acts that mean "done". Each sends the one
 /// canceled card the parent was owed and wakes it. A second settle is a no-op.
 #[tokio::test]

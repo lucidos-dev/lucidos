@@ -30,8 +30,8 @@ pub(crate) struct InputLedger {
 /// One write to the agent.
 #[derive(Debug)]
 struct OwedInput {
-    /// The events that carried it: none for a child wake, several for
-    /// coalesced messages.
+    /// The events that carried it: none for an engine-made prompt, several
+    /// for coalesced messages.
     event_ids: Vec<Uuid>,
     /// What the agent was sent, to match against a replay.
     text: String,
@@ -101,17 +101,22 @@ impl InputLedger {
 }
 
 /// Record each input the agent read, so the transcript can mark it "Read".
+/// `started_turn` says the read opened a turn after the last one ended.
 pub(crate) async fn announce_reads(
     bus: &EventBus,
     thread_id: Uuid,
     meta: &EventMeta,
     input_event_ids: Vec<Uuid>,
+    started_turn: bool,
 ) {
     for input_event_id in input_event_ids {
         bus.emit_or_log(
             BusEvent::Thread {
                 thread_id,
-                event: ThreadEvent::CodingAgentInputRead { input_event_id },
+                event: ThreadEvent::CodingAgentInputRead {
+                    input_event_id,
+                    started_turn,
+                },
                 meta: meta.clone(),
             },
             "[AgentSession] CodingAgentInputRead",

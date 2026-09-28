@@ -67,6 +67,7 @@ it('opens shut, showing only the active theme as a preview card and how many the
   expect(toggle().querySelector('.theme-preview')).not.toBeNull();
   expect(toggle().querySelector('.theme-card-name')?.textContent).toBe('Lucidos');
   expect(toggle().querySelector('.theme-toggle-count')?.textContent).toBe('3 themes');
+  expect(toggle().querySelector('.theme-toggle-chevron svg')).not.toBeNull();
   expect(host.querySelectorAll('.theme-card')).toHaveLength(1);
   expect(radios()).toHaveLength(0);
 });
@@ -168,14 +169,154 @@ it('stays open on a click that answers an overlay, such as the mode-switch confi
   expect(radios()).toHaveLength(3);
 });
 
+it('stays open on the tap that dismisses an overlay, which closes before the tap lifts', () => {
+  act(() => { toggle().click(); });
+  document.documentElement.setAttribute('data-overlay-open', '');
+  document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true }));
+  document.documentElement.removeAttribute('data-overlay-open');
+  mouseClick(document.body);
+  expect(radios()).toHaveLength(3);
+  act(() => { document.body.click(); });
+  expect(radios()).toHaveLength(0);
+});
+
 it('folds on a click whose control stops its propagation', () => {
   const control = document.createElement('button');
   control.addEventListener('click', e => e.stopPropagation());
   document.body.appendChild(control);
   act(() => { toggle().click(); });
-  act(() => { control.click(); });
+  mouseClick(control);
   expect(radios()).toHaveLength(0);
   control.remove();
+});
+
+/** A mouse click, which counts one press in `detail`. A bare `.click()` is
+ *  what a keyboard press dispatches, with `detail` 0. */
+function mouseClick(target: Element): void {
+  act(() => { target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 })); });
+}
+
+it('swallows the click that folds it, so the control under it does not fire', () => {
+  const pressed = vi.fn();
+  const control = document.createElement('button');
+  control.addEventListener('click', pressed);
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  mouseClick(control);
+  expect(radios()).toHaveLength(0);
+  expect(pressed).not.toHaveBeenCalled();
+  mouseClick(control);
+  expect(pressed).toHaveBeenCalledOnce();
+  control.remove();
+});
+
+it('folds on a keyboard press elsewhere and still presses that control', () => {
+  const pressed = vi.fn();
+  const control = document.createElement('button');
+  control.addEventListener('click', pressed);
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  act(() => { control.click(); });
+  expect(radios()).toHaveLength(0);
+  expect(pressed).toHaveBeenCalledOnce();
+  control.remove();
+});
+
+function touchTap(target: Element, moveY = 0): Event {
+  target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, screenX: 10, screenY: 10 }));
+  if (moveY) target.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, isPrimary: true, screenX: 10, screenY: 10 + moveY }));
+  const end = new Event('touchend', { bubbles: true, cancelable: true });
+  act(() => { target.dispatchEvent(end); });
+  return end;
+}
+
+it('swallows a touch tap that folds it, before a control that acts on touchend', () => {
+  const pressed = vi.fn();
+  const control = document.createElement('button');
+  control.addEventListener('touchend', pressed);
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  const end = touchTap(control);
+  expect(radios()).toHaveLength(0);
+  expect(pressed).not.toHaveBeenCalled();
+  expect(end.defaultPrevented).toBe(true);
+  control.remove();
+});
+
+it('stays open, swallowing nothing, when a touch scrolls the page', () => {
+  const pressed = vi.fn();
+  const control = document.createElement('button');
+  control.addEventListener('touchend', pressed);
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  const end = touchTap(control, 40);
+  expect(radios()).toHaveLength(3);
+  expect(pressed).toHaveBeenCalledOnce();
+  expect(end.defaultPrevented).toBe(false);
+  control.remove();
+});
+
+it('stays open when the system takes the touch for a scroll', () => {
+  const control = document.createElement('button');
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  control.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, screenX: 10, screenY: 10 }));
+  control.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, isPrimary: true }));
+  const end = new Event('touchend', { bubbles: true, cancelable: true });
+  act(() => { control.dispatchEvent(end); });
+  expect(radios()).toHaveLength(3);
+  expect(end.defaultPrevented).toBe(false);
+  control.remove();
+});
+
+it('ignores the click iOS sends after a touch that scrolled', () => {
+  const pressed = vi.fn();
+  const control = document.createElement('button');
+  control.addEventListener('click', pressed);
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  touchTap(control, 9);
+  mouseClick(control);
+  expect(radios()).toHaveLength(3);
+  expect(pressed).toHaveBeenCalledOnce();
+  control.remove();
+});
+
+it('folds on a toast tap and still presses the toast, as an overlay does', () => {
+  const pressed = vi.fn();
+  const toasts = document.createElement('div');
+  toasts.className = 'toast-container';
+  const dismiss = document.createElement('button');
+  dismiss.addEventListener('click', pressed);
+  toasts.appendChild(dismiss);
+  document.body.appendChild(toasts);
+  act(() => { toggle().click(); });
+  mouseClick(dismiss);
+  expect(radios()).toHaveLength(0);
+  expect(pressed).toHaveBeenCalledOnce();
+  toasts.remove();
+});
+
+it('reads a tap by its first finger, whatever a second one does', () => {
+  const control = document.createElement('button');
+  document.body.appendChild(control);
+  act(() => { toggle().click(); });
+  control.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, screenX: 10, screenY: 10 }));
+  control.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, isPrimary: false, screenX: 200, screenY: 200 }));
+  const end = new Event('touchend', { bubbles: true, cancelable: true });
+  act(() => { control.dispatchEvent(end); });
+  expect(radios()).toHaveLength(0);
+  expect(end.defaultPrevented).toBe(true);
+  control.remove();
+});
+
+it('lets a touch tap on another theme through, to pick it', () => {
+  act(() => { toggle().click(); });
+  const nord = card('Nord');
+  if (!nord) throw new Error('no Nord card');
+  const end = touchTap(nord);
+  expect(end.defaultPrevented).toBe(false);
+  expect(radios()).toHaveLength(3);
 });
 
 it('previews and checks the theme the preference picks', () => {

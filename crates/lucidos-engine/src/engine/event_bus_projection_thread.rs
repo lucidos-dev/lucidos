@@ -1115,6 +1115,29 @@ impl EventBus {
                 }
                 Vec::new()
             }
+            // The agent read a queued input after its last turn ended, and
+            // runs it as a new turn (ADR 0268). The input's own
+            // `CodingAgentPromptSent` landed while the old turn ran, so a
+            // Stop that ended that turn overwrote it. This read is the start
+            // event the new turn has: without it the thread reads idle, and
+            // a stopped child stays stopped while it works.
+            ThreadEvent::CodingAgentInputRead {
+                started_turn: true, ..
+            } => {
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                ))
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                mark_parent_callback_pending(tx, thread_id).await?;
+                if let Some(pid) =
+                    reincrement_parent_active_count_if_revived(tx, thread_id, &prev_sample).await?
+                {
+                    extra_ancestors.push(pid);
+                }
+                Vec::new()
+            }
             ThreadEvent::ContinuationRequested { .. } => {
                 // Continuation start event — bump last_activity and flip status
                 // back to running so the thread surfaces in the recents list as
@@ -1649,8 +1672,9 @@ impl EventBus {
             // `MessageReceived` is what moves the projection.
             | ThreadEvent::MessageHeld { .. }
             | ThreadEvent::HeldMessageReleased { .. }
-            // A read marks an input already recorded, so it moves nothing.
-            | ThreadEvent::CodingAgentInputRead { .. }
+            // A read marks an input already recorded, so it moves nothing,
+            // unless it started a turn (the arm above).
+            | ThreadEvent::CodingAgentInputRead { started_turn: false, .. }
             // Agent-driven curation of a prior tool result / child completion
             // in future resume context: the retired dismissal, and the record
             // of a keep. Pure bookkeeping; no projection state change.

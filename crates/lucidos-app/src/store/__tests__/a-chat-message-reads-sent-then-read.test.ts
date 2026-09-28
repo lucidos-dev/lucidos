@@ -4,7 +4,7 @@
  * message by starting its turn, or by injecting it into a running one.
  */
 import { describe, it, expect } from 'vitest';
-import { groupIntoExchanges, queuedFollowupRun, readMarkers, type StoredEvent, type ThreadEvent } from '../thread-events';
+import { groupIntoExchanges, messageReadTimestamp, queuedFollowupRun, readMarkers, type StoredEvent, type ThreadEvent } from '../thread-events';
 
 function ev(seq: number, e: ThreadEvent, id?: string): readonly [number, StoredEvent] {
   const created = `2026-09-24T06:13:${String(seq).padStart(2, '0')}Z`;
@@ -50,6 +50,23 @@ describe('the read marker on a chat thread', () => {
     expect(exchanges[1].steps).toHaveLength(0);
     expect(queuedFollowupRun(exchanges, true).queuedOrder).toEqual([1]);
     expect(readMarkers(exchanges, CHAT).get(1)).toBe('sent');
+  });
+
+  it('dates the read by the loop taking the message, not by the message', () => {
+    const waiting = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }, 'm1'),
+      ev(3, { type: 'MessageReceived', text: 'also check the totals' }, 'm2'),
+    ]));
+    const m2 = waiting.findIndex(ex => ex.userEvent._eventId === 'm2');
+    expect(messageReadTimestamp(waiting[m2])).toBeUndefined();
+
+    const injected = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'start' }, 'm1'),
+      ev(3, { type: 'MessageReceived', text: 'also check the totals' }, 'm2'),
+      ev(8, { type: 'UserPromptInjected', text: 'also check the totals', mode: 'human', injected_message_id: 'm2' } as ThreadEvent),
+    ]));
+    const read = injected.find(ex => ex.userEvent._eventId === 'm2')!;
+    expect(messageReadTimestamp(read)).toBe('2026-09-24T06:13:08Z');
   });
 
   it('marks nothing a caller said on a call', () => {

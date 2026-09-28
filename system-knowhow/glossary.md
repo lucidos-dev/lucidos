@@ -704,6 +704,8 @@ The set of irreversible side-effect categories a *trigger* is pre-authorized to 
 
 The spawn tree here means *child* spawns. A *top-thread* is not in its spawning thread's tree, so a coding agent a trigger starts as a top spawn asks a human.
 
+A human in the tree also ends the inheritance. Once you send a message or answer a question in the coding-agent thread, or in any thread above it, its cards ask you instead.
+
 The grant does not govern everything an unattended session is denied. A command the *command guard* cannot read is denied whatever the grant holds, and no category grants it. Those are the shapes where the command's head is not what runs: a substitution, a `VAR=` preamble that loads code, a path-qualified head, a write outside the workspace. An unrecognised command (`cargo build`) is not one of them, and still runs.
 
 ### Signer manifest
@@ -1289,6 +1291,10 @@ A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated 
 - **External-repo coding-agent thread** — works on a user-registered external git *repository*. Uses a different worktree-creation path and a minimal system prompt; **skips** the Lucidos change-proposal flow on session end.
 
 See also: `system-knowhow/coding-agent-events.md`.
+
+### Side question
+A quick question put to a Claude Code *coding-agent thread* by typing `/btw <question>` in its composer. Claude Code answers from the session's full context, beside any running turn, with no tools. The answer shows on a dismissible card at the end of the thread and is **never recorded**: it is not a message, not an event, and never part of the conversation, so it is gone after a reload (ADR 0318). An idle thread is answered by a short-lived resumed process that writes nothing. Codex threads cannot take side questions and say so.
+See also: `system-knowhow/coding-agent-events.md` § Side questions record nothing.
 
 ### External-repo coding-agent thread
 A *coding-agent thread* (see) running against a user-registered external git *repository* rather than the Lucidos workspace itself. No Apply / Discard surface — the user reviews diffs via the external-repo diff viewer. Worktree creation and system prompt differ from the Lucidos-internal variant; documented in `docs/plans/2026-03-17-external-repos-plan.md`.

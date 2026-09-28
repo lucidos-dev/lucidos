@@ -1141,3 +1141,29 @@ fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
     resumed_args.resume_session_id = Some("sess-1");
     assert!(replays(&build_command(&resumed_args, None)));
 }
+
+/// The cold side-question process resumes the thread's session with the main
+/// session's own flags, and must write nothing to its transcript.
+#[test]
+fn side_question_command_resumes_without_persisting() {
+    let worktree = PathBuf::from("/tmp/wt");
+    let workspace = PathBuf::from("/tmp/ws");
+    let mut args = test_spawn_args(&worktree, &workspace, uuid::Uuid::new_v4());
+    args.resume_session_id = Some("sess-9");
+    args.model = Some("opus");
+    let cmd = build_side_question_command(&args, None);
+    let argv: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let resume_at = argv.iter().position(|a| a == "--resume").expect("--resume");
+    assert_eq!(argv[resume_at + 1], "sess-9");
+    assert!(argv.iter().any(|a| a == "--no-session-persistence"));
+    let model_at = argv.iter().position(|a| a == "--model").expect("--model");
+    assert_eq!(argv[model_at + 1], "opus");
+    assert!(
+        !argv.iter().any(|a| a == "--append-system-prompt"),
+        "the resumed conversation carries the context"
+    );
+}

@@ -9,6 +9,7 @@ import { replaceDocument } from '../../utils/documentNavigation';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
+import { SideQuestionCards } from './SideQuestionCard';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { PinThreadButton } from '../shared/PinThreadButton';
@@ -1991,6 +1992,7 @@ export function ThreadView() {
                             {/* Last, and boxed, as `readScrollAnchor` requires of
                                 every non-turn child in the feed. */}
                             <StoppedChildNotice meta={eventThread.meta} />
+                            <SideQuestionCards threadId={threadId!} />
                         </div>
                     ) : (
                         <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />

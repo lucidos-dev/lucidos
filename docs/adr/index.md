@@ -325,3 +325,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0315: After a hardened branch gains commits, /harden reviews only what no hardening has reviewed](0315-incremental-hardening.md)
 - [0316: The palette is a theme and light/dark is the theme mode, renamed in every layer](0316-look-becomes-theme.md)
 - [0317: A drawn caret where the browser has no caret-shape: a layout copy of the textarea places a real inline caret, which steps aside for IME; amends 0313](0317-drawn-caret.md)
+- [0318: A /btw side question and its answer are never recorded as thread events: ephemeral by construction, so no context builder can read them, at the cost of no card after reload or on another device](0318-side-questions-are-never-recorded.md)

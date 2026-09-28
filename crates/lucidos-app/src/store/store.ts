@@ -1881,34 +1881,40 @@ export const historicalTriggers = signal<Loadable<HistoricalTriggerInfo[]>>({ st
  *  and kept live via SSE handlers in `thread-events.ts`. */
 export const triggerGroups = signal<Loadable<TriggerGroup[]>>({ status: 'not-loaded' });
 
-/** Per-device collapsed state for trigger-group sections, keyed by group_id.
- *  localStorage-backed, so a collapsed section stays collapsed across reloads
- *  and engine restarts on this device without syncing to any other. */
-const COLLAPSED_TRIGGER_GROUPS_KEY = 'lucidos-collapsed-trigger-groups';
+/** The section id of the Triggers panel's Ungrouped section. Group ids are
+ *  UUIDs, so this can never collide with one. */
+export const UNGROUPED_TRIGGER_SECTION_ID = '__ungrouped__';
 
-export const collapsedTriggerGroupIds = signal<Set<string>>(restoreIdSet(COLLAPSED_TRIGGER_GROUPS_KEY));
+/** Per-device collapsed state for Triggers panel sections: a group_id, or
+ *  `UNGROUPED_TRIGGER_SECTION_ID`. localStorage-backed, so a collapsed section
+ *  stays collapsed across reloads and engine restarts on this device without
+ *  syncing to any other. The key predates the Ungrouped entry; keep it so saved
+ *  state survives. */
+const COLLAPSED_TRIGGER_SECTIONS_KEY = 'lucidos-collapsed-trigger-groups';
 
-function persistCollapsedTriggerGroups(next: Set<string>): void {
-  collapsedTriggerGroupIds.value = next;
-  persistIdSet(COLLAPSED_TRIGGER_GROUPS_KEY, next);
+export const collapsedTriggerSectionIds = signal<Set<string>>(restoreIdSet(COLLAPSED_TRIGGER_SECTIONS_KEY));
+
+function persistCollapsedTriggerSections(next: Set<string>): void {
+  collapsedTriggerSectionIds.value = next;
+  persistIdSet(COLLAPSED_TRIGGER_SECTIONS_KEY, next);
 }
 
-export function toggleTriggerGroupCollapsed(groupId: string): void {
-  const next = new Set(collapsedTriggerGroupIds.value);
-  if (next.has(groupId)) next.delete(groupId);
-  else next.add(groupId);
-  persistCollapsedTriggerGroups(next);
+export function toggleTriggerSectionCollapsed(sectionId: string): void {
+  const next = new Set(collapsedTriggerSectionIds.value);
+  if (next.has(sectionId)) next.delete(sectionId);
+  else next.add(sectionId);
+  persistCollapsedTriggerSections(next);
 }
 
-/** Open a collapsed group, never close an open one. A deep link to a trigger
- *  inside a collapsed group has to expand it: `TriggersView` renders no members
- *  of a collapsed group, so the row's anchor does not exist to scroll to.
- *  Toggling instead would hide the row it was trying to reveal. */
-export function expandTriggerGroup(groupId: string): void {
-  if (!collapsedTriggerGroupIds.value.has(groupId)) return;
-  const next = new Set(collapsedTriggerGroupIds.value);
-  next.delete(groupId);
-  persistCollapsedTriggerGroups(next);
+/** Open a collapsed section, never close an open one. A deep link to a trigger
+ *  inside a collapsed section has to expand it: `TriggersView` renders no
+ *  members of a collapsed section, so the row's anchor does not exist to scroll
+ *  to. Toggling instead would hide the row it was trying to reveal. */
+export function expandTriggerSection(sectionId: string): void {
+  if (!collapsedTriggerSectionIds.value.has(sectionId)) return;
+  const next = new Set(collapsedTriggerSectionIds.value);
+  next.delete(sectionId);
+  persistCollapsedTriggerSections(next);
 }
 
 /** A trigger id the Triggers panel should scroll to and mark once it renders.

@@ -52,14 +52,15 @@ function stubAnimate() {
 let boxTop = 0;
 
 /** jsdom lays nothing out, so the body reports a fixed height and the box a
- *  place in the viewport. */
+ *  place in the viewport. `offsetHeight` rounds, as a browser's does. */
 function stubLayout() {
   Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
     configurable: true,
-    get(this: HTMLElement) { return this.classList.contains('disclosure-body') ? bodyHeight : 0; },
+    get(this: HTMLElement) { return this.classList.contains('disclosure-body') ? Math.round(bodyHeight) : 0; },
   });
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
-    const height = this.classList.contains('disclosure') ? bodyHeight : 0;
+    const rolls = this.classList.contains('disclosure') || this.classList.contains('disclosure-body');
+    const height = rolls ? bodyHeight : 0;
     return { top: boxTop, bottom: boxTop + height, height } as DOMRect;
   };
 }
@@ -111,10 +112,11 @@ describe('Disclosure', () => {
       log.push('start');
       return animate.apply(this, args);
     };
-    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
-      configurable: true,
-      get(this: HTMLElement) { log.push('read'); return bodyHeight; },
-    });
+    const rect = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      if (this.classList.contains('disclosure-body')) log.push('read');
+      return rect.call(this);
+    };
     const pair = (open: boolean) => (
       <div>
         <Disclosure open={open}><div class="row">a</div></Disclosure>
@@ -181,6 +183,20 @@ describe('Disclosure', () => {
     expect(body.keyframes[0].transform).toBe('translateY(-120px)');
     expect(body.keyframes[1].transform).toBe('translateY(0px)');
     expect(body.keyframes.map(k => k.opacity)).toEqual(['0', '1']);
+  });
+
+  it('lands at the fractional height the content lays out at', async () => {
+    // A roll to a rounded height snaps by the rounding as it lands, and every
+    // row above the pressed control adds its own snap.
+    bodyHeight = 120.4;
+    await show(false);
+    await show(true);
+    const opening = anims.find(a => a.el.classList.contains('disclosure'))!;
+    expect(opening.keyframes.map(k => k.height)).toEqual(['0px', '120.4px']);
+    await finishAll();
+    await show(false);
+    const closing = anims.filter(a => a.el.classList.contains('disclosure')).pop()!;
+    expect(closing.keyframes.map(k => k.height)).toEqual(['120.4px', '0px']);
   });
 
   it('runs the drawer curve and length, shared by height and roll', async () => {

@@ -224,7 +224,7 @@ export function MessageRoutePanel() {
   const pos = useAnchoredPosition(state?.anchor ?? null, ref, '.thread-pane');
 
   if (!state) return null;
-  const { exchange, threadId, section, priorModel, priorEffort, pausedBy } = state;
+  const { exchange, threadId, section, priorModel, priorEffort, pausedBy, readAt } = state;
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
 
@@ -241,7 +241,7 @@ export function MessageRoutePanel() {
       panelRef={ref}
     >
       {section === 'origin'
-        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, thread.meta.codingAgent)
+        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, thread.meta.codingAgent, readAt)
         : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
     </Overlay>
   );
@@ -261,6 +261,7 @@ export function renderOriginSection(
   getLiveTitle: (threadId: string) => string | undefined,
   pausedBy?: StoredEvent,
   codingAgent: CodingAgent = 'claude-code',
+  readAt?: string,
 ) {
   const userEvent = exchange.userEvent;
   // TriggerStarted keeps its richer renderer (invocation kind + event link).
@@ -299,6 +300,7 @@ export function renderOriginSection(
       : unrecordedSeed ? renderExplainer('Why the engine acted', UNRECORDED_ENGINE_SEED_EXPLAINER)
         : null);
   const paused = pausedBy ? renderFoldedPause(pausedBy) : null;
+  const delivery = readAt ? renderDelivery(userEvent, readAt) : null;
 
   // System-driven `ResponseAborted` (safety_net, engine_shutdown, …): the
   // device/api/v1/workspace/engine renderers above all return null for
@@ -340,6 +342,7 @@ export function renderOriginSection(
       <section class="route-section">
         <h4>Origin</h4>
         <div class="muted">Unknown</div>
+        {delivery}
       </section>
     );
   }
@@ -351,10 +354,31 @@ export function renderOriginSection(
       {issuer}
       {engineRows}
       {channel}
+      {delivery}
       {audit}
       {explainer}
       {paused}
     </section>
+  );
+}
+
+/** When a read message was sent and when the agent read it. Its header shows
+ *  the read time, so this is where the sent time stays visible. */
+function renderDelivery(message: StoredEvent, readAt: string): preact.JSX.Element {
+  const sentAt = message.created || message._displayCreated;
+  return (
+    <>
+      {sentAt && (
+        <div class="route-row">
+          <strong>Sent</strong>
+          <span>{formatMessageTimestamp(sentAt)}</span>
+        </div>
+      )}
+      <div class="route-row">
+        <strong>Read</strong>
+        <span>{formatMessageTimestamp(readAt)}</span>
+      </div>
+    </>
   );
 }
 

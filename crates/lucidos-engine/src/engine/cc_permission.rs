@@ -470,8 +470,9 @@ async fn hydrate_session_allows(
 
 /// Whether a coding-agent session has a human reachable to answer a permission
 /// card. [`resolve_attend_mode`] decides it by walking the spawn tree to its
-/// root. A human device there renders a card and waits. Any engine origin there
-/// auto-resolves and never hangs.
+/// root. A human act on the way, or a human device at the root, renders a card
+/// and waits. Otherwise an engine origin at the root auto-resolves and never
+/// hangs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttendMode {
     /// A human is reachable at the root of the spawn tree — render a card and
@@ -554,9 +555,44 @@ async fn was_moved_to_top_level(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     })
 }
 
+/// Whether a human has written or answered a question in `thread_id`: a
+/// `MessageReceived` with a human origin, or a `UserQuestionAnswered` with a
+/// human actor. An unreadable answer counts as a human, so a database error
+/// asks rather than lending a trigger's grant.
+async fn human_acted_in(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    let rows: Result<Vec<serde_json::Value>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT CASE event_type WHEN 'MessageReceived' THEN payload->'origin' \
+                                ELSE payload->'actor' END \
+         FROM events \
+         WHERE thread_id = $1 \
+           AND ((event_type = 'MessageReceived' AND payload ? 'origin') \
+             OR (event_type = 'UserQuestionAnswered' AND payload ? 'actor'))",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(actors) => actors.into_iter().any(|actor| {
+            serde_json::from_value::<MessageOrigin>(actor)
+                .is_ok_and(|origin| origin.mode() == ActorMode::Human)
+        }),
+        Err(e) => {
+            crate::log!(
+                "[CCPermission] Could not read whether a human acted in {}: {}",
+                thread_id,
+                e
+            );
+            true
+        }
+    }
+}
+
 /// Decide whether this coding-agent session is interactive or unattended, and
 /// what side-effect grant an unattended one inherits. Walks the spawn tree from
-/// `thread_id` up to its root through the persisted `MessageOrigin` chain:
+/// `thread_id` up to its root through the persisted `MessageOrigin` chain.
+/// At every thread on the way, a human who wrote or answered a question there
+/// (see [`human_acted_in`]) gives `Interactive` before its origin is read.
+/// Otherwise the thread's originating origin decides:
 ///
 ///   * a `Device`, a human-mode `Api`, or any `Workspace` gives `Interactive`.
 ///     A `Workspace` origin is a top spawn through `caller_*`: the CLI's, or
@@ -588,8 +624,9 @@ pub async fn resolve_attend_mode(
         }
         // A thread moved to top level left its old tree (ADR 0278). Its spawn
         // event still names the old parent, and events are never rewritten,
-        // so the walk stops here and a human answers.
-        if was_moved_to_top_level(pool, current).await {
+        // so the walk stops here and a human answers. So it does where a human
+        // has already written or answered: that human is reachable.
+        if was_moved_to_top_level(pool, current).await || human_acted_in(pool, current).await {
             return AttendMode::Interactive;
         }
         let Some((origin, callback_linkage)) = fetch_thread_origin_and_linkage(pool, current).await
@@ -2190,6 +2227,31 @@ mod tests {
         .expect("insert child spawn event");
     }
 
+    /// A `UserQuestionAnswered` on `thread_id`, answered by `actor`.
+    async fn insert_answer_event(pool: &sqlx::PgPool, thread_id: Uuid, actor: &MessageOrigin) {
+        let payload = serde_json::json!({
+            "actor": actor,
+            "answer": { "kind": "Selected", "option_id": "opt-0" },
+            "tool_use_id": Uuid::new_v4().to_string(),
+        });
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, 'UserQuestionAnswered', $3, NOW(), $2::uuid)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("insert answer event");
+    }
+
+    fn device(device_id: &str) -> MessageOrigin {
+        MessageOrigin::Device {
+            device_id: device_id.into(),
+        }
+    }
+
     fn parent_link(parent: Uuid) -> MessageOrigin {
         MessageOrigin::ThreadLink {
             thread_id: parent,
@@ -3300,6 +3362,72 @@ mod tests {
         let mode = resolve_attend_mode(&pool, &cfgs, child).await;
         assert_eq!(
             mode,
+            AttendMode::Unattended {
+                grant: vec![SideEffectCategory::Email]
+            }
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The trigger asked the user a question, the user answered it, and the
+    /// agent spawned a coding-agent child on the strength of that answer. The
+    /// user is reachable, so the child asks instead of inheriting the grant.
+    #[tokio::test]
+    async fn resolve_attend_mode_human_answer_on_the_trigger_run_attends_its_child() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-answered";
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_answer_event(&pool, root, &device("d1")).await;
+        insert_child_spawn_event(&pool, child, root).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        assert_eq!(
+            resolve_attend_mode(&pool, &cfgs, child).await,
+            AttendMode::Interactive
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Nobody touched the trigger run, but the user is now writing in the
+    /// coding-agent thread itself.
+    #[tokio::test]
+    async fn resolve_attend_mode_human_message_in_the_child_attends_it() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-messaged";
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_child_spawn_event(&pool, child, root).await;
+        insert_origin_event(&pool, child, "MessageReceived", &device("d1")).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        assert_eq!(
+            resolve_attend_mode(&pool, &cfgs, child).await,
+            AttendMode::Interactive
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Orphan recovery answers a question as the engine, and an agent writes
+    /// the spawn message. Neither is a human, so the grant still flows.
+    #[tokio::test]
+    async fn resolve_attend_mode_engine_answer_keeps_the_trigger_grant() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-engine-answer";
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_answer_event(&pool, root, &MessageOrigin::System).await;
+        insert_child_spawn_event(&pool, child, root).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        assert_eq!(
+            resolve_attend_mode(&pool, &cfgs, child).await,
             AttendMode::Unattended {
                 grant: vec![SideEffectCategory::Email]
             }

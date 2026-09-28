@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -201,6 +201,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const userMessage = exchangeUserMessage(exchange);
   const userImageHashes = exchangeUserImageHashes(exchange);
   const timestamp = exchangeTimestamp(exchange);
+  // A "Read" label dates the read, so the time beside it agrees with it. The
+  // origin popover keeps the sent time.
+  const readAt = readMarker === 'read' ? messageReadTimestamp(exchange) : undefined;
   const responseTextRaw = exchangeResponseText(exchange);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
@@ -298,6 +301,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
       priorModel,
       priorEffort,
       pausedBy,
+      readAt,
     });
   }
 
@@ -595,7 +599,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           // in this slot, and both facts are true of a queued utterance.
           ? { ...initiator, status: initiatorStatus }
           : initiator}
-        timestamp={formatMessageTimestamp(timestamp)}
+        timestamp={formatMessageTimestamp(readAt ?? timestamp)}
         onActorClick={initiator.actorClickable === false
           ? undefined
           : (e) => openInfoPanel('origin', e)}

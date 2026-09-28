@@ -1,5 +1,13 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
-import { triggers, triggerGroups, collapsedTriggerGroupIds, expandTriggerGroup, triggerScrollTarget, showToast } from '../../store/store';
+import {
+  triggers,
+  triggerGroups,
+  collapsedTriggerSectionIds,
+  expandTriggerSection,
+  triggerScrollTarget,
+  showToast,
+  UNGROUPED_TRIGGER_SECTION_ID,
+} from '../../store/store';
 import { loadTriggers, openAddTrigger } from '../../store/actions/triggers';
 import { createTriggerGroup, loadTriggerGroups } from '../../store/actions/triggerGroups';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
@@ -7,7 +15,7 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { hasNoMoreRuns, loadedOr } from '../../store/types';
 import type { TriggerInfo } from '../../store/types';
 import { TriggerItem } from './TriggerItem';
-import { TriggerGroupHeader } from './TriggerGroupHeader';
+import { TriggerGroupHeader, UngroupedHeader } from './TriggerGroupHeader';
 import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
@@ -18,7 +26,7 @@ import { resolveTriggerScrollStep } from './triggerScrollStep';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { scrollBehavior } from '../../utils/motion';
 
-const UNGROUPED_KEY = '__ungrouped__';
+const NO_COLLAPSED_SECTIONS: ReadonlySet<string> = new Set();
 
 function sortByCompletion(a: TriggerInfo, b: TriggerInfo): number {
   // Stopped triggers sink to the bottom within their section, preserving the
@@ -115,35 +123,41 @@ function TriggersLoaded({
   const groups = loadedOr(groupsLoadable, []);
   const knownGroupIds = new Set(groups.map(g => g.id));
 
-  // Bucket triggers by group id (null → ungrouped). A trigger whose group_id
-  // doesn't resolve to a known group (e.g. concurrent delete landed between
-  // the trigger's group_id update and the panel refetch) falls back to the
-  // Ungrouped section so the row can never go invisible.
-  const byGroup = new Map<string, TriggerInfo[]>();
+  // Bucket triggers by section: their group id, or Ungrouped. A trigger whose
+  // group_id doesn't resolve to a known group (e.g. concurrent delete landed
+  // between the trigger's group_id update and the panel refetch) falls back to
+  // the Ungrouped section so the row can never go invisible.
+  const sectionOf = (t: TriggerInfo) =>
+    t.group_id && knownGroupIds.has(t.group_id) ? t.group_id : UNGROUPED_TRIGGER_SECTION_ID;
+  const sectionRows = triggersData.map(t => ({ id: t.id, section: sectionOf(t) }));
+  const bySection = new Map<string, TriggerInfo[]>();
   for (const t of triggersData) {
-    const key = t.group_id && knownGroupIds.has(t.group_id) ? t.group_id : UNGROUPED_KEY;
-    const bucket = byGroup.get(key);
+    const key = sectionOf(t);
+    const bucket = bySection.get(key);
     if (bucket) bucket.push(t);
-    else byGroup.set(key, [t]);
+    else bySection.set(key, [t]);
   }
-  for (const bucket of byGroup.values()) bucket.sort(sortByCompletion);
+  for (const bucket of bySection.values()) bucket.sort(sortByCompletion);
 
-  const collapsed = collapsedTriggerGroupIds.value;
-  const ungroupedTriggers = byGroup.get(UNGROUPED_KEY) ?? [];
+  // With no groups there are no headings, so nothing can be collapsed or
+  // reopened. A saved Ungrouped collapse must not hide the whole panel.
+  const collapsed = groups.length > 0 ? collapsedTriggerSectionIds.value : NO_COLLAPSED_SECTIONS;
+  const ungroupedTriggers = bySection.get(UNGROUPED_TRIGGER_SECTION_ID) ?? [];
+  const ungroupedCollapsed = collapsed.has(UNGROUPED_TRIGGER_SECTION_ID);
 
   // Trigger deep link: once the rows have rendered, scroll the targeted one
   // into view and mark it. `resolveTriggerScrollStep` owns the decision and is
   // unit-tested without a DOM; this effect only carries it out. Mirrors
   // StoreTab's `pluginScrollTarget` effect.
   useEffect(() => {
-    const step = resolveTriggerScrollStep(triggerScrollTarget.value, triggersData, collapsed);
+    const step = resolveTriggerScrollStep(triggerScrollTarget.value, sectionRows, collapsed);
     if (step.kind === 'idle') return;
     if (step.kind === 'drop') {
       triggerScrollTarget.value = null;
       return;
     }
     if (step.kind === 'expand') {
-      expandTriggerGroup(step.groupId);
+      expandTriggerSection(step.sectionId);
       return; // The anchor mounts on the next render; the target survives.
     }
     // Scoped to THIS panel's list, never `document`. A trigger link in a chat
@@ -160,7 +174,9 @@ function TriggersLoaded({
     el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
     applyNavFocus(el);
     triggerScrollTarget.value = null;
-  }, [triggerScrollTarget.value, triggersData, collapsed, listRef]);
+    // `sectionRows` is rebuilt every render; the two loadables it derives from
+    // are the stable deps.
+  }, [triggerScrollTarget.value, triggersData, groupsLoadable, collapsed, listRef]);
 
   const creatingGroup = newGroupName !== null;
   const createInputRef = useRef<HTMLInputElement>(null);
@@ -175,7 +191,7 @@ function TriggersLoaded({
   return (
     <>
       {groups.map(group => {
-        const members = byGroup.get(group.id) ?? [];
+        const members = bySection.get(group.id) ?? [];
         const isCollapsed = collapsed.has(group.id);
         return (
           <div class="trigger-group-section" key={group.id}>
@@ -195,14 +211,17 @@ function TriggersLoaded({
       {ungroupedTriggers.length > 0 && (
         <div class="trigger-group-section trigger-group-section-ungrouped">
           {groups.length > 0 && (
-            <div class="trigger-group-header trigger-group-header-ungrouped">
-              <span class="trigger-group-name">Ungrouped</span>
-              <span class="trigger-group-count">({ungroupedTriggers.length})</span>
-            </div>
+            <UngroupedHeader count={ungroupedTriggers.length} collapsed={ungroupedCollapsed} />
           )}
-          {ungroupedTriggers.map(trigger => (
-            <TriggerItem key={trigger.id} trigger={trigger} />
-          ))}
+          <Disclosure
+            open={!ungroupedCollapsed}
+            instant={triggerScrollTarget.value !== null}
+            bodyClass="trigger-group-members"
+          >
+            {ungroupedTriggers.map(trigger => (
+              <TriggerItem key={trigger.id} trigger={trigger} />
+            ))}
+          </Disclosure>
         </div>
       )}
       {/* Mounted whether or not the field is open, clipped to nothing until it

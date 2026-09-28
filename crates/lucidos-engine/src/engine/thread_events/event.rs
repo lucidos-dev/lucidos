@@ -525,8 +525,13 @@ pub enum ThreadEvent {
     /// the input is owed, and the session keeps its subprocess (ADR 0268).
     CodingAgentInputRead {
         /// The event that carried the input: the `MessageReceived` for a
-        /// message.
+        /// message, the `ChildThreadCompleted` for a child wake.
         input_event_id: uuid::Uuid,
+        /// The read opened a turn on a session whose last turn had already
+        /// ended, as when a queued message outlives a Stop. Such a read is a
+        /// start event: the thread runs again (ADR 0268).
+        #[serde(default, skip_serializing_if = "is_false")]
+        started_turn: bool,
     },
     /// Emitted when the engine detects that a coding-agent session ended without
     /// running the required hardening. A recovery hardening session is spawned

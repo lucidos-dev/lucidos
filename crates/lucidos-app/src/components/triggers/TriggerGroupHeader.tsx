@@ -1,5 +1,9 @@
 import type { TriggerGroup } from '../../store/types';
-import { collapsedTriggerGroupIds, toggleTriggerGroupCollapsed } from '../../store/store';
+import {
+  collapsedTriggerSectionIds,
+  toggleTriggerSectionCollapsed,
+  UNGROUPED_TRIGGER_SECTION_ID,
+} from '../../store/store';
 import { deleteTriggerGroup, renameTriggerGroup } from '../../store/actions/triggerGroups';
 import { useInlineRename } from '../../hooks/useInlineRename';
 import { EditIcon, TrashIcon } from '../shared/icons';
@@ -7,6 +11,30 @@ import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 interface Props {
   group: TriggerGroup;
+}
+
+function Chevron({ collapsed }: { collapsed: boolean }) {
+  return <span class="trigger-group-chevron">{collapsed ? '▸' : '▾'}</span>;
+}
+
+/** Heading for the synthetic Ungrouped section: the same collapse toggle as a
+ *  group's, with no rename or delete, since there is no group to act on. */
+export function UngroupedHeader({ count, collapsed }: { count: number; collapsed: boolean }) {
+  return (
+    <div class={`trigger-group-header trigger-group-header-ungrouped${collapsed ? ' trigger-group-collapsed' : ''}`}>
+      <button
+        class="trigger-group-toggle"
+        type="button"
+        onClick={() => toggleTriggerSectionCollapsed(UNGROUPED_TRIGGER_SECTION_ID)}
+        aria-expanded={!collapsed}
+        data-tooltip={collapsed ? 'Expand' : 'Collapse'}
+      >
+        <Chevron collapsed={collapsed} />
+        <span class="trigger-group-name">Ungrouped</span>
+        <span class="trigger-group-count">({count})</span>
+      </button>
+    </div>
+  );
 }
 
 /** Section header for one trigger group in the panel.
@@ -18,7 +46,7 @@ interface Props {
  *    action handler surfaces that refusal as a toast.
  */
 export function TriggerGroupHeader({ group }: Props) {
-  const collapsed = collapsedTriggerGroupIds.value.has(group.id);
+  const collapsed = collapsedTriggerSectionIds.value.has(group.id);
   const {
     renaming: editing,
     draft,
@@ -36,11 +64,11 @@ export function TriggerGroupHeader({ group }: Props) {
       <button
         class="trigger-group-toggle"
         type="button"
-        onClick={() => toggleTriggerGroupCollapsed(group.id)}
+        onClick={() => toggleTriggerSectionCollapsed(group.id)}
         aria-expanded={!collapsed}
         data-tooltip={collapsed ? 'Expand' : 'Collapse'}
       >
-        <span class="trigger-group-chevron">{collapsed ? '▸' : '▾'}</span>
+        <Chevron collapsed={collapsed} />
         {/* The field is MOUNTED whether or not we are editing, transparent and
             pointer-inert over the name until then. iOS opens the keyboard only
             for a focus() that happens inside the user's gesture, and a field

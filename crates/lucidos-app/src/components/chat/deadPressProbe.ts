@@ -67,6 +67,8 @@ export interface LandingFacts {
   faceRect: ProbeRect | null;
   /** Whether the `touchstart` was dispatched to the face, or inside it. */
   targetIsFace: boolean;
+  /** Where the browser dispatched the `touchstart`. See `describeDispatched`. */
+  dispatchedTo: string | null;
   /** What the browser reports at `point`, for the disagreement case. */
   elementAtPoint: string | null;
   /** The computed `pointer-events` of whatever answered at `point`. `none` there
@@ -156,8 +158,8 @@ export function landingReport(f: LandingFacts): string | null {
   if (!inside(f.faceRect, f.point.x, f.point.y)) return null;
   const centreY = Math.round((f.faceRect.top + f.faceRect.bottom) / 2);
   return `${f.face} did not register: the tap was on the button but the browser `
-    + `sent it to ${f.elementAtPoint ?? 'nothing'} `
-    + `(pointer-events ${f.pointerEventsAtPoint ?? 'unknown'}). `
+    + `sent it to ${f.dispatchedTo ?? 'nothing'}, while ${f.elementAtPoint ?? 'nothing'} `
+    + `answers at that point (pointer-events ${f.pointerEventsAtPoint ?? 'unknown'}). `
     + `Button centre y ${centreY}, touch y ${Math.round(f.point.y)}. `
     + viewportSuffix(f.viewport);
 }
@@ -441,6 +443,9 @@ function recordPress({ at, ...facts }: {
   movedPx: number;
   connectedAtLift?: boolean;
   rowMutations?: number;
+  /** Where the browser dispatched the touch. Read beside `elementAtPoint`:
+   *  the two disagree exactly when the hit test is stale. */
+  dispatchedTo?: string | null;
   elementAtPoint?: string | null;
   pointerEventsAtPoint?: string | null;
   toasted?: boolean;
@@ -780,8 +785,13 @@ export function faceExclusion(face: { disabled: boolean; placeholder: boolean })
  *  bug.
  *
  *  `actionFace` is the exclusion of an `.action-btn` whose painted box holds the
- *  point, and null when none does. */
-export type UnderFinger = 'placeholder-face' | 'disabled-face' | 'other-button' | 'nothing';
+ *  point, and null when none does.
+ *
+ *  `live-face` is a watchable face under the finger that the touch never
+ *  reached: the browser dispatched it elsewhere. Asked before `otherButton`,
+ *  because the hit test at the point answers with that face, and it is a
+ *  button. */
+export type UnderFinger = 'placeholder-face' | 'disabled-face' | 'live-face' | 'other-button' | 'nothing';
 
 export function underFingerReason(f: {
   actionFace: FaceExclusion | null;
@@ -789,8 +799,20 @@ export function underFingerReason(f: {
 }): UnderFinger {
   if (f.actionFace === 'placeholder') return 'placeholder-face';
   if (f.actionFace === 'disabled') return 'disabled-face';
+  if (f.actionFace === 'watchable') return 'live-face';
   if (f.otherButton) return 'other-button';
   return 'nothing';
+}
+
+/** Does a missed press earn the relayout at its lift?
+ *
+ *  Yes when the composer could not be pressed: the finger reached nothing, or
+ *  it was on a live face and the touch went elsewhere. That second one is the
+ *  stale geometry a keyboard close leaves behind, which the relayout frees.
+ *  No for an icon button, which ran its own action, and for an excluded face,
+ *  which drops the press on purpose. */
+export function missEarnsRelayout(under: UnderFinger): boolean {
+  return under === 'nothing' || under === 'live-face';
 }
 
 /** How far a point falls outside a rect, per axis and SIGNED. Zero on an axis
@@ -920,6 +942,16 @@ function describe(el: Element | null): string | null {
   if (!el) return null;
   const cls = el.classList.item(0);
   return cls ? `${el.tagName.toLowerCase()}.${cls}` : el.tagName.toLowerCase();
+}
+
+/** Where the browser dispatched a touch, as a line and a toast carry it.
+ *
+ *  A detached target says so. That tells a node the page replaced under the
+ *  finger apart from a live node the browser chose by stale geometry. */
+function describeDispatched(el: Element | null): string | null {
+  const name = describe(el);
+  if (!name || !el) return name;
+  return el.isConnected ? name : `${name} (detached)`;
 }
 
 function pointerEventsOf(el: Element | null): string | null {
@@ -1574,11 +1606,13 @@ export function installDeadPressProbe(): void {
       // and the log line want the same answer.
       const elementAtPoint = describe(at);
       const pointerEventsAtPoint = pointerEventsOf(at);
+      const dispatchedTo = describeDispatched(target);
       const report = aimedAt ? landingReport({
         face: aimedAt.name,
         point: { x: touch.clientX, y: touch.clientY },
         faceRect: aimedAt.rect,
         targetIsFace: false,
+        dispatchedTo,
         elementAtPoint,
         pointerEventsAtPoint,
         viewport: readViewport(),
@@ -1602,6 +1636,7 @@ export function installDeadPressProbe(): void {
         face: aimedAt ? aimedAt.name : 'the row',
         verdict: 'missed',
         movedPx: 0,
+        dispatchedTo,
         elementAtPoint,
         pointerEventsAtPoint,
         under,
@@ -1620,10 +1655,8 @@ export function installDeadPressProbe(): void {
       // Rule it at the lift, where the travel is known. The user recovers this
       // state by hand, and the lift runs the same relayout for them.
       //
-      // `nothing` under the finger is the whole trigger. An `other-button` tap
-      // ran an icon button's action, and an excluded face is a press the app
-      // drops on purpose. Only a tap that reached NOTHING is a dead composer.
-      missedPress = under !== 'nothing' ? null : {
+      // `missEarnsRelayout` says which taps are a dead composer.
+      missedPress = !missEarnsRelayout(under) ? null : {
         touchId: touch.identifier,
         startX: touch.screenX,
         startY: touch.screenY,

@@ -287,8 +287,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // A held message and its release are markers. The status stays where
         // the open question put it; the release's `MessageReceived` moves it.
         "MessageHeld" | "HeldMessageReleased" => EventClass::Metadata,
-        // A read acknowledges an input already recorded. It starts no work and
-        // moves no status.
+        // A read acknowledges an input already recorded, so it opens no
+        // exchange. One that started a turn after a Stop still sets running:
+        // see its row in `status_transitions`.
         "CodingAgentInputRead" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
@@ -1378,6 +1379,15 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // Projection skips empty-text payloads: see event_bus_projection_thread.rs.
         (
             "CodingAgentPromptSent",
+            StatusTransition {
+                status: StatusRule::Set(ThreadStatus::Running),
+                cc_flags: CcFlagRule::None,
+            },
+        ),
+        // Only a read with `started_turn` moves status; every other read
+        // moves nothing. See event_bus_projection_thread.rs.
+        (
+            "CodingAgentInputRead",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,

@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { resolveTriggerScrollStep } from './triggerScrollStep';
+import { UNGROUPED_TRIGGER_SECTION_ID } from '../../store/store';
 
 const ROWS = [
-  { id: 'ungrouped-1' },
-  { id: 'in-group', group_id: 'g1' },
+  { id: 'ungrouped-1', section: UNGROUPED_TRIGGER_SECTION_ID },
+  { id: 'in-group', section: 'g1' },
 ];
 
 describe('resolveTriggerScrollStep', () => {
@@ -16,6 +17,11 @@ describe('resolveTriggerScrollStep', () => {
       .toEqual({ kind: 'scroll', triggerId: 'ungrouped-1' });
   });
 
+  it('expands a collapsed Ungrouped section like any other', () => {
+    expect(resolveTriggerScrollStep('ungrouped-1', ROWS, new Set([UNGROUPED_TRIGGER_SECTION_ID])))
+      .toEqual({ kind: 'expand', sectionId: UNGROUPED_TRIGGER_SECTION_ID });
+  });
+
   it('scrolls to a grouped row whose group is open', () => {
     expect(resolveTriggerScrollStep('in-group', ROWS, new Set(['other'])))
       .toEqual({ kind: 'scroll', triggerId: 'in-group' });
@@ -26,12 +32,12 @@ describe('resolveTriggerScrollStep', () => {
     // members, so the anchor does not exist. Scrolling would find nothing and
     // the link would silently do nothing, which is the original bug.
     expect(resolveTriggerScrollStep('in-group', ROWS, new Set(['g1'])))
-      .toEqual({ kind: 'expand', groupId: 'g1' });
+      .toEqual({ kind: 'expand', sectionId: 'g1' });
   });
 
   it('scrolls on the next pass, once the group has been expanded', () => {
     const first = resolveTriggerScrollStep('in-group', ROWS, new Set(['g1']));
-    expect(first).toEqual({ kind: 'expand', groupId: 'g1' });
+    expect(first).toEqual({ kind: 'expand', sectionId: 'g1' });
     // The target deliberately survives an expand, so the re-run lands it.
     expect(resolveTriggerScrollStep('in-group', ROWS, new Set()))
       .toEqual({ kind: 'scroll', triggerId: 'in-group' });

@@ -78,24 +78,25 @@ describe('dropdownPanelStyle (the panel is measured before it is placed)', () =>
   });
 
   it('places the panel at the computed offsets once measured, and reveals it', () => {
-    const style = dropdownPanelStyle(180, { top: 42, left: 96 });
+    const style = dropdownPanelStyle(180, { top: 42, left: 96, maxHeight: 210 });
     expect(style).toMatchObject({
       position: 'fixed',
       top: '42px',
       left: '96px',
       minWidth: '180px',
+      '--anchor-room': '210px',
     });
     expect(style.visibility).toBeUndefined();
   });
 
   it('stays hidden with no anchor at all', () => {
-    expect(dropdownPanelStyle(null, { top: 1, left: 2 })).toEqual({ visibility: 'hidden' });
+    expect(dropdownPanelStyle(null, { top: 1, left: 2, maxHeight: 3 })).toEqual({ visibility: 'hidden' });
   });
 });
 
 describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () => {
   const target = (over: Partial<Parameters<typeof openMenuFocusTarget>[0]> = {}) =>
-    openMenuFocusTarget({ freeText: false, searching: false, positioned: true, mobile: false, ...over });
+    openMenuFocusTarget({ freeText: false, searching: false, positioned: true, touch: false, ...over });
 
   it('holds focus on the trigger while the menu is open and unsearched', () => {
     // The trigger's own keydown handler is what seeds the typeahead, so it has
@@ -114,12 +115,12 @@ describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () 
 
   it('focuses the freeText input in every state, since its trigger IS the input', () => {
     expect(target({ freeText: true })).toBe('input');
-    expect(target({ freeText: true, mobile: true })).toBe('input');
+    expect(target({ freeText: true, touch: true })).toBe('input');
     expect(target({ freeText: true, searching: true, positioned: false })).toBe('input');
   });
 
-  it('never moves focus on mobile, where it would only pop the on-screen keyboard', () => {
-    expect(target({ mobile: true })).toBeNull();
-    expect(target({ mobile: true, searching: true })).toBeNull();
+  it('never moves focus on a touch device, where it would drop the on-screen keyboard', () => {
+    expect(target({ touch: true })).toBeNull();
+    expect(target({ touch: true, searching: true })).toBeNull();
   });
 });

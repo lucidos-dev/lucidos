@@ -121,9 +121,10 @@ describe('the submit paths are wired to that one source', () => {
     // Every return owes the user a word. A press that produces neither a
     // message nor a toast is the whole bug. The last one to fall was the empty
     // composer. It now speaks whenever the box holds characters, and stays
-    // quiet only for Enter on a genuinely empty desktop composer.
+    // quiet only for Enter on a genuinely empty desktop composer. A side
+    // question speaks through its card rather than a toast.
     const before = submitBody().split(/\breturn;/).slice(0, -1);
-    const silent = before.filter((seg) => !/showToast\(/.test(seg.slice(-400)));
+    const silent = before.filter((seg) => !/showToast\(|askSideQuestion\(/.test(seg.slice(-400)));
     expect(silent).toHaveLength(0);
   });
 

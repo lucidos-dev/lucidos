@@ -13,6 +13,7 @@ import { THEME_FAMILIES, dataMountUrl, type Theme, type ThemeFamily } from '../.
 import { themeGallery, loadThemeGallery, pickTheme } from '../../store/actions/themes';
 import { currentThemeId, paintedThemeMode } from '../../store/actions/preferences';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { TOUCH_CLICK_WINDOW_MS, createTapGate, notePressOutcome } from '../../utils/tapGesture';
 import { Disclosure } from '../shared/Disclosure';
 import { ChevronRightIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -90,18 +91,72 @@ export function ThemePicker() {
   }, [open]);
   useEffect(() => {
     if (!open) return;
-    // Any click but one on a theme folds the grid. A theme card answers its own
-    // click: another theme is picked, and the active one folds or offers its
-    // mode switch. A click while an overlay is open belongs to that overlay,
-    // such as the mode-switch confirm a pick raises. Capture phase, so a
-    // control that stops its click's propagation still folds it.
-    const foldUnlessTheme = (e: MouseEvent) => {
-      if (document.documentElement.hasAttribute('data-overlay-open')) return;
-      if (e.target instanceof Element && e.target.closest('.theme-card[role="radio"]')) return;
+    // Any tap but one on a theme folds the grid and is spent doing so, as an
+    // overlay's outside tap is: the control under it does not fire. A theme
+    // card answers its own tap: another theme is picked, and the active one
+    // folds or offers its mode switch. A tap while an overlay is open belongs
+    // to that overlay, such as the mode-switch confirm a pick raises. A toast
+    // stays live, as it does over an overlay: its tap folds and still presses.
+    // So does a keyboard press, which is no tap: its click has `detail` 0.
+    //
+    // Capture phase, so the swallow precedes the target's own handler. The
+    // `touchend` arm covers a button that acts there and cancels its click. A
+    // touch that scrolled the page is no tap, and leaves the grid open. The
+    // `touchend` rules for its gesture, so the click iOS may still send after
+    // a scroll is ignored rather than folding.
+    //
+    // An overlay's own dismiss closes it at `pointerdown`, before the paired
+    // lift. So the press remembers whether an overlay was open when it began.
+    const press = createTapGate();
+    let folded = false;
+    let lastTouchAt: number | null = null;
+    let overlayAtPress = false;
+    const overlayOpen = () => document.documentElement.hasAttribute('data-overlay-open');
+    const fold = (e: Event, tapped: boolean) => {
+      const overlayOwnsPress = overlayAtPress || overlayOpen();
+      overlayAtPress = false;
+      if (folded || overlayOwnsPress) return;
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest('.theme-card[role="radio"]')) return;
+      folded = true;
       toggleOpen(false);
+      if (!tapped || target?.closest('.toast-container')) return;
+      notePressOutcome('swallowed');
+      e.stopPropagation();
+      e.preventDefault();
     };
-    document.addEventListener('click', foldUnlessTheme, true);
-    return () => document.removeEventListener('click', foldUnlessTheme, true);
+    const onPointerDown = (e: PointerEvent) => {
+      if (!e.isPrimary) return;
+      press.down(e);
+      overlayAtPress = overlayOpen();
+    };
+    const onPointerMove = (e: PointerEvent) => { if (e.isPrimary) press.move(e); };
+    const onPointerCancel = (e: PointerEvent) => { if (e.isPrimary) press.cancel(); };
+    const onTouchEnd = (e: TouchEvent) => {
+      lastTouchAt = Date.now();
+      const aborted = press.wasAborted();
+      if (press.isTap() && !aborted) fold(e, true);
+      overlayAtPress = false;
+    };
+    const onClick = (e: MouseEvent) => {
+      if (lastTouchAt !== null && Date.now() - lastTouchAt < TOUCH_CLICK_WINDOW_MS) {
+        lastTouchAt = null;
+        return;
+      }
+      fold(e, e.detail > 0);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('pointermove', onPointerMove, { capture: true, passive: true });
+    document.addEventListener('pointercancel', onPointerCancel, true);
+    document.addEventListener('touchend', onTouchEnd, { capture: true, passive: false });
+    document.addEventListener('click', onClick, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('pointermove', onPointerMove, true);
+      document.removeEventListener('pointercancel', onPointerCancel, true);
+      document.removeEventListener('touchend', onTouchEnd, true);
+      document.removeEventListener('click', onClick, true);
+    };
   }, [open]);
   const gallery = themeGallery.value;
   const showSkeleton = useDelayedLoading(gallery);
@@ -229,7 +284,10 @@ function ThemeCard({ theme, defaults, mode, selected = false, themeCount, onClic
       <span class="theme-card-meta" style={theme ? themeFontStyle(theme) : undefined}>
         <SkText class="theme-card-name" w="50%">{theme?.name}</SkText>
         {summary
-          ? <span class="theme-toggle-count">{themeCount} themes<ChevronRightIcon size="1em" /></span>
+          ? <>
+              <span class="theme-toggle-count">{themeCount} themes</span>
+              <span class="theme-toggle-chevron"><ChevronRightIcon size="1em" /></span>
+            </>
           : label && <span class="theme-card-modes">{label}</span>}
       </span>
     </button>

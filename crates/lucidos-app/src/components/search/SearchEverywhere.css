@@ -28,17 +28,6 @@
     background: none;
 }
 
-@media (max-width: 768px) {
-    .modal-overlay.search-everywhere-overlay {
-        bottom: auto;
-        height: var(--app-height, 100dvh);
-    }
-
-    .search-everywhere-modal {
-        max-height: calc(var(--app-height, 100dvh) - var(--search-everywhere-top));
-    }
-}
-
 .search-everywhere-overlay.search-everywhere-hidden {
     opacity: 0;
     visibility: hidden;
@@ -49,11 +38,28 @@
     pointer-events: auto;
     display: flex;
     flex-direction: column;
-    /* Narrowed to its pane, so it never straddles the divider (usePaneCentre). */
-    max-width: min(var(--header-surface-width), var(--pane-fit, 100%));
+    /* Wider than the Lucidos menu on desktop, because result titles and paths
+       need the room. Narrowed to its pane, so it never straddles the divider
+       (usePaneCentre). */
+    max-width: min(36rem, var(--pane-fit, 100%));
     width: 100%;
     max-height: min(32rem, 80vh);
     overflow: hidden;
+}
+
+/* Must stay BELOW the base rule: it has the same specificity, so source order
+   is the only thing that lets it win. */
+@media (max-width: 768px) {
+    .modal-overlay.search-everywhere-overlay {
+        bottom: auto;
+        height: var(--app-height, 100dvh);
+    }
+
+    /* A phone has no room to spare, so here it takes the shared header width. */
+    .search-everywhere-modal {
+        max-width: min(var(--header-surface-width), var(--pane-fit, 100%));
+        max-height: calc(var(--app-height, 100dvh) - var(--search-everywhere-top));
+    }
 }
 
 /* The row is a `.surface-head`, so it takes the surface inset from there. The

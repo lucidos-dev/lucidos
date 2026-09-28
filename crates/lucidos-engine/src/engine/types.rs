@@ -768,6 +768,10 @@ pub struct AgentSession {
     /// Channel for sending control requests (set_model, set_permission_mode, etc.)
     /// from outside the event loop. The event loop forwards them to the runtime.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
+    /// Side questions for the live process (`RunningAgent::side_question_tx`).
+    /// `None` for Codex, which has no side-question call.
+    pub side_question_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::runtime::SideQuestionRequest>>,
     /// Built-in CC commands (compact, clear, cost, etc.) — slash_commands minus skills.
     pub builtin_commands: Vec<String>,
     /// Skill commands (from plugins and user .claude/skills/).
@@ -906,6 +910,7 @@ impl AgentSession {
             external_terminal_emitted: Arc::new(AtomicBool::new(false)),
             external_continuation_requested: Arc::new(AtomicBool::new(false)),
             control_tx: tokio::sync::mpsc::unbounded_channel().0,
+            side_question_tx: None,
             builtin_commands: vec![],
             skill_commands: vec![],
             current_model: None,

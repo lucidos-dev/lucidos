@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { block, decl } from './css-rule-helpers';
+import { block, decl, rulesTargeting } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf8');
@@ -187,10 +187,22 @@ describe('the header palettes are one shape, over their own pane', () => {
       .toMatch(/^calc\(var\(--app-header-bottom\) \+ var\(--header-surface-gap\)\)/);
   });
 
-  it('gives every header palette the one shared width', () => {
+  it('gives the menu and file search the one shared width', () => {
     expect(decl(rule(css.mark, '.brand-menu'), 'width')).toBe('var(--header-surface-width)');
-    expect(decl(rule(css.search, '.search-everywhere-modal'), 'max-width')).toMatch(/^min\(var\(--header-surface-width\),/);
     expect(decl(rule(css.content, '.file-search-modal'), 'max-width')).toMatch(/^min\(var\(--header-surface-width\),/);
+  });
+
+  // Both rules share one specificity, so the one LATER in the sheet wins. The
+  // last rule setting a property is what a phone renders.
+  it('widens Search everywhere past the menu on desktop, but not on a phone', () => {
+    const modal = rulesTargeting(css.search, 'search-everywhere-modal').filter(r => r.props.has('max-width'));
+    const desktop = modal.filter(r => r.atRules === '');
+    expect(desktop).toHaveLength(1);
+    expect(desktop[0].props.get('max-width')).not.toMatch(/--header-surface-width/);
+    expect(desktop[0].props.get('max-width')).toMatch(/^min\(\d+(\.\d+)?rem,/);
+    const last = modal[modal.length - 1];
+    expect(last.atRules).toBe('@media (max-width: 768px)');
+    expect(last.props.get('max-width')).toMatch(/^min\(var\(--header-surface-width\),/);
   });
 
   it('narrows both to their pane, so neither straddles the divider', () => {

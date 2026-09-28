@@ -559,6 +559,16 @@
     position: relative;
 }
 
+/* A column view reserves the scrollbar's gutter even while it fits, as
+   `.thread-content` does. Growing past one screen then never slides the
+   column sideways. Both declarations are needed: WebKit reserves only once a
+   scrollbar is drawn. The idle track paints `--bg-primary`, so an empty gutter
+   is invisible. A full-bleed view keeps its right edge. */
+.content-pane-body:has(> .content-view.active:not(.content-view-full-bleed), > .panel-content) {
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+}
+
 /* Focusable scroll region (tabindex=0, mirror of .thread-content): pane focus
    lands DOM focus here so scroll keys work, but the active-pane cue is the header
    wash — never a ring around the whole pane body. Same rationale as the
@@ -1124,7 +1134,7 @@
        the spin animation owns. */
     .app-header .content-refresh-btn svg {
         grid-area: 1 / 1;
-        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+        transition: opacity var(--duration-normal) ease, scale var(--duration-normal) ease;
     }
 
     /* An activity indicator, so a literal duration. It runs through the
@@ -1148,19 +1158,19 @@
        Its `scale` resets only once it is invisible. */
     .app-header .content-refresh-btn .refresh-check {
         color: var(--header-fg);
-        transition: opacity var(--duration-emphasis) ease-in-out, scale 0s var(--duration-emphasis);
+        transition: opacity var(--duration-slow) ease-in-out, scale 0s var(--duration-slow);
     }
 
     .app-header .content-refresh-btn[data-state="done"] .refresh-check {
         opacity: 1;
         scale: 1;
-        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+        transition: opacity var(--duration-normal) ease, scale var(--duration-normal) ease;
     }
 
     /* The arrow waits for the check to finish fading. Keyed on `idle` alone,
        so a new refresh still brings it straight back. */
     .app-header .content-refresh-btn[data-state="idle"] svg:not(.refresh-check) {
-        transition-delay: var(--duration-emphasis);
+        transition-delay: var(--duration-slow);
     }
 
     /* The chevrons bracketing the title hold their size; only the title gives

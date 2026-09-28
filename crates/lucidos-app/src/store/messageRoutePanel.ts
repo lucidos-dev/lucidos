@@ -14,6 +14,8 @@ export interface MessageRoutePanelState {
   priorEffort?: string;
   /** The restart pause folded into this resume (`restartPauseFoldsInto`). */
   pausedBy?: StoredEvent;
+  /** When the agent read the message, for a message whose marker says Read. */
+  readAt?: string;
 }
 export const messageRoutePanel = signal<MessageRoutePanelState | null>(null);
 /** Click semantics for the route badge: opens the panel for the given exchange +

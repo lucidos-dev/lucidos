@@ -281,7 +281,7 @@ pub(crate) async fn resolve_worktree_path(
 /// globally-newest session (a legacy thread with no recorded config dir). Scoping
 /// is what stops a resume from targeting a session created under a *different*
 /// account after a mid-thread toggle flip.
-async fn resume_sid_for_account(
+pub(crate) async fn resume_sid_for_account(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
     pinned_config_dir: Option<&str>,

@@ -154,6 +154,21 @@ export async function sendControlRequest(threadId: string, request: Record<strin
   });
 }
 
+/** How long the side-question POST may take. The engine's own limit is 120
+ *  seconds, so this outlasts it and the engine's error is what the user reads. */
+export const SIDE_QUESTION_TIMEOUT_MS = 130_000;
+
+/** Ask a `/btw` side question in a coding-agent thread. The engine answers
+ *  beside any running turn and records nothing (ADR 0318). */
+export async function askSideQuestion(threadId: string, question: string): Promise<string> {
+  const body = await json<{ answer: string }>(`${API}/coding-agents/side-question`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thread_id: threadId, question }),
+  }, SIDE_QUESTION_TIMEOUT_MS);
+  return body.answer;
+}
+
 export interface CodingAgentCommandOption {
   value: string;
   label: string;

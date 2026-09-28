@@ -500,11 +500,11 @@
      *
      * `--thread-row-title-line` is the height of ONE line of the row title,
      * stated rather than left at `line-height: normal`, which is font metrics.
-     * The row actions sit in a line of this height too. 0.9375rem
-     * is 1.15x the title's 0.8125rem, which is what Fira Code's `normal`
-     * resolved to. */
+     * The row actions sit in a line of this height too. 1.0625rem
+     * is about 1.3x the title's 0.8125rem, so a wrapped title has room
+     * between its two lines. */
     --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth, 0) * 1rem);
-    --thread-row-title-line: 0.9375rem;
+    --thread-row-title-line: 1.0625rem;
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: var(--thread-row-pad-right);
